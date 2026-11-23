@@ -105,7 +105,8 @@ The script performs these steps:
    guest records the attempt on the host and refuses any second attempt, so
    a retried launch cannot rerun on disks the first attempt changed.
 6. The guest mounts each component, with `catalog` and `oracle` disks
-   read-only. With `--verify-hashes stores` or `all`, it reads every listed
+   read-only and without journal recovery (`noload` on ext4, `norecovery` on
+   XFS). With `--verify-hashes stores` or `all`, it reads every listed
    file of the selected components and compares it with the component's
    listing. The listing itself must match the SHA-256 in `fixture.json`.
    Reading the files fetches the restored disk blocks that hold them, so
@@ -129,7 +130,9 @@ The script performs these steps:
 11. The guest writes its outcome for this attempt once, on success or at any
     failing step. The workstation polls for it until `--guest-timeout`
     (three hours by default), then checks the guest receipt against the
-    fixture and writes the receipt.
+    fixture and writes the receipt. Every `gcloud` and ssh call ends within
+    15 minutes, and the launch, status, and diagnostic calls also end at
+    `--guest-timeout`.
 
 A fixture without a `signed_history` entry restores as before. Its reader
 serves block ranges from the canonical store and from its in-memory live tail,
@@ -169,6 +172,10 @@ these hold:
 - **Trust identity.** The same reader configuration with a different, valid
   publisher key exits before it serves, with `shielded range manifest
   signature verification failed`.
+
+Each probe request has a 10-minute deadline, and the whole check ends within
+two hours. A reader that stalls fails the check, and the guest then records
+the failure and stops the reader.
 
 When the fixture pins a wallet sample and the catalog holds heights 1,730,000
 to 1,730,099, the covered response must also equal the sample's copy. The

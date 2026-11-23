@@ -70,13 +70,14 @@ chown -R zinder:zinder "$out"
 mark mount
 network=$(jq -er .network "$fixture")
 while read -r c; do
-  name=$(jq -r .name <<< "$c") dir=$(jq -r .mount_path <<< "$c") kind=$(jq -r .kind <<< "$c")
+  name=$(jq -r .name <<< "$c") dir=$(jq -r .mount_path <<< "$c")
   dev=/dev/disk/by-id/google-$name
   [[ -e $dev ]] || { log "component $name has no attached disk at $dev"; exit 1; }
   install -d "$dir"
   # Catalog and oracle disks are only read. Hyperdisk Balanced attaches
-  # read-write, so the mount itself keeps them unchanged.
-  opts=noatime; [[ $kind == catalog || $kind == oracle ]] && opts=ro,noload
+  # read-write, so the mount itself keeps them unchanged, with the no-recovery
+  # option of the component's filesystem.
+  opts=$(python3 -I "$here/fixture-gate.py" mount-options "$fixture" "$name" 2>&1) || { log "$opts"; exit 1; }
   mountpoint -q "$dir" || mount -o "$opts" "$dev" "$dir"
 done < <(jq -c '.components[]' "$fixture")
 
@@ -132,7 +133,7 @@ systemctl daemon-reload
 systemctl start zfx-zebrad
 want_height=$(jq -er .chain.visible_height "$fixture") want_hash=$(jq -er .chain.visible_block_hash "$fixture")
 rpc() {
-  curl -s -u "$(cat /run/zebra-cookie/.cookie)" -H 'content-type: application/json' \
+  curl -s --max-time 30 -u "$(cat /run/zebra-cookie/.cookie)" -H 'content-type: application/json' \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" http://127.0.0.1:8232
 }
 for _ in $(seq 1 120); do
@@ -155,16 +156,16 @@ REORG_WINDOW_BLOCKS=$(jq -r '.chain.reorg_window_blocks // 1000' "$fixture") \
 chown zinder:zinder "$stores/.zfx-run"
 serving_started=true
 systemctl start zfx-fixture-ingest
-for _ in $(seq 1 120); do curl -sf 127.0.0.1:9105/readyz >/dev/null && break; sleep 2; done
+for _ in $(seq 1 120); do curl -sf --max-time 10 127.0.0.1:9105/readyz >/dev/null && break; sleep 2; done
 systemctl start zfx-fixture-projector zfx-fixture-query zfx-fixture-compat
 
 mark wait_ready
-for _ in $(seq 1 600); do curl -sf 127.0.0.1:9107/readyz >/dev/null && break; sleep 2; done
-curl -sf 127.0.0.1:9107/readyz > "$out/compat-readyz.json" \
+for _ in $(seq 1 600); do curl -sf --max-time 10 127.0.0.1:9107/readyz >/dev/null && break; sleep 2; done
+curl -sf --max-time 10 127.0.0.1:9107/readyz > "$out/compat-readyz.json" \
   || { log "lightwalletd compatibility reader did not become ready"; exit 1; }
 
 mark wallet_request
-latest=$(grpcurl -plaintext -format json -d '{}' 127.0.0.1:9067 cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock)
+latest=$(timeout -k 5 70 grpcurl -plaintext -max-time 60 -format json -d '{}' 127.0.0.1:9067 cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock)
 got_height=$(jq -r .height <<< "$latest")
 got_hash=$(jq -r .hash <<< "$latest" | base64 -d | od -An -v -tx1 | tr -d ' \n' | fold -w2 | tac | tr -d '\n')
 [[ $got_height == "$want_height" && $got_hash == "$want_hash" ]] \
@@ -184,7 +185,9 @@ if [[ $history != null ]]; then
   reference=()
   [[ -z $want_sample ]] || reference=(--sample-reference "$out/wallet-sample/block-range-1730000-1730099.json")
   route_report=$out/route-check/route-check.json
-  /opt/zfx/route-check.py --grpc 127.0.0.1:9067 --ops 127.0.0.1:9107 \
+  # Each request inside is bounded; this bounds the whole check as well, so a
+  # stall reaches the exit handler, which records it and stops the reader.
+  timeout -k 30 7200 /opt/zfx/route-check.py --grpc 127.0.0.1:9067 --ops 127.0.0.1:9107 \
     --pid "$(systemctl show -p MainPID --value zfx-fixture-compat)" --bounds "$out/history-bounds.json" \
     --tip "$want_height" --out "$out/route-check" "${reference[@]}" \
     --refusal-binary /opt/zfx/bin/zinder-compat-lightwalletd --refusal-config /etc/zfx/fixture/compat.toml \

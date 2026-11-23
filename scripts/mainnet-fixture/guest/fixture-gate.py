@@ -16,6 +16,10 @@ usage:
       Exits 0 only when route-check.py's report, read from REPORT or from
       standard input for -, passes every part when judged from its recorded
       measurements against the verified BOUNDS.
+  fixture-gate.py mount-options FIXTURE COMPONENT
+      Prints the mount options for a component: read-only without journal
+      recovery for catalog and oracle disks, chosen for the component's
+      declared filesystem, and noatime for every other disk.
   fixture-gate.py accept FIXTURE OUTCOME ATTEMPT VERIFY
       Exits 0 only when the guest OUTCOME of attempt ATTEMPT, restored with
       --verify-hashes VERIFY, proves what the fixture requires.
@@ -30,6 +34,8 @@ files the reader process holds open.
 import hashlib, json, os, re, sys
 from pathlib import Path
 
+# The local import must not write __pycache__ next to the stage's sources.
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from route_proof import failures as route_failures, is_int  # noqa: E402
 
@@ -174,6 +180,23 @@ def verify_manifest(fixture, out):
     return report
 
 
+# Read-only disks are mounted without journal recovery, which each filesystem
+# spells differently.
+NO_RECOVERY = {'ext4': 'noload', 'ext4-verity': 'noload', 'xfs': 'norecovery'}
+
+
+def mount_options(fixture, name):
+    component = next((c for c in fixture.get('components', []) if isinstance(c, dict) and c.get('name') == name), None)
+    if component is None:
+        raise GateError(f'fixture has no component {name}')
+    if component.get('kind') not in ('catalog', 'oracle'):
+        return 'noatime'
+    filesystem = component.get('filesystem')
+    if filesystem not in NO_RECOVERY:
+        raise GateError(f'component {name} has filesystem {filesystem!r}, which the restore cannot mount read-only')
+    return f'ro,{NO_RECOVERY[filesystem]}'
+
+
 def route_verdict(fixture, bounds, report):
     """Judges a route report from its measurements against the bounds verified before startup."""
     errors = route_failures(report, {'first': bounds.get('first_height'), 'last': bounds.get('last_height'),
@@ -258,6 +281,9 @@ def main(argv):
             return 0
         elif command == 'verify-manifest' and len(args) == 2:
             print(json.dumps({k: v for k, v in verify_manifest(load(args[0]), args[1]).items() if k != 'segment_files'}))
+            return 0
+        elif command == 'mount-options' and len(args) == 2:
+            print(mount_options(load(args[0]), args[1]))
             return 0
         elif command == 'route-verdict' and len(args) == 3:
             report = json.load(sys.stdin) if args[2] == '-' else load(args[2])

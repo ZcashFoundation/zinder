@@ -120,7 +120,7 @@ case $cmd in
   *"storage cp"*) exit 0 ;;
   *"/dev/stdin /root/.gcs-token"*) cat > /dev/null; exit 0 ;;
   *"tee /tmp/zfx-stage/fixture.json"*) cat > /dev/null; exit 0 ;;
-  *systemd-run*) echo launch >> "$d/launches"; exit 0 ;;
+  *systemd-run*) sleep "${STUB_LAUNCH_DELAY:-0}"; echo launch >> "$d/launches"; exit 0 ;;
   *outcome.json*)
     sleep "${STUB_STATUS_DELAY:-0}"
     attempt=$(sed -E 's#.*/attempts/([^/ ]+)/outcome\.json.*#\1#' <<< "$cmd")
@@ -128,7 +128,7 @@ case $cmd in
     elif [[ -f $d/outcome.json ]]; then jq -c --arg a "$attempt" '.attempt = $a | if (.receipt | type) == "object" then .receipt.attempt = $a else . end' "$d/outcome.json"
     else cat "$d/status" 2>/dev/null || echo RUNNING; fi
     exit 0 ;;
-  *journalctl*) echo "journal tail"; exit 0 ;;
+  *journalctl*) sleep "${STUB_JOURNAL_DELAY:-0}"; echo "journal tail"; exit 0 ;;
 esac
 exit 1
 '''
@@ -279,6 +279,25 @@ exit 1
         self.assertFalse(receipt.exists())
         self.assertIn('did not finish within 2 seconds', self.failure(receipt)['reason'])
 
+    def test_blocked_launch_respects_the_deadline(self):
+        """Review comment 4: a launch call that stalls after starting the guest ends at --guest-timeout."""
+        started = time.monotonic()
+        done, receipt = self.restore(outcome=genuine_outcome(), extra=['--guest-timeout', '2'],
+                                     env_extra={'STUB_LAUNCH_DELAY': '60'})
+        self.assertLess(time.monotonic() - started, 25)
+        self.assertEqual(done.returncode, 1)
+        self.assertFalse(receipt.exists())
+        self.assertIn('did not finish within 2 seconds', self.failure(receipt)['reason'])
+
+    def test_failed_guest_with_a_blocked_journal_fetch(self):
+        """Review comment 5: the failure receipt comes first, and the journal fetch keeps the deadline."""
+        started = time.monotonic()
+        done, receipt = self.restore(outcome={'status': 'failed', 'step': 'route_check', 'reason': 'stalled', 'receipt': None},
+                                     extra=['--guest-timeout', '3'], env_extra={'STUB_JOURNAL_DELAY': '60'})
+        self.assertLess(time.monotonic() - started, 25)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(self.failure(receipt)['guest_outcome']['step'], 'route_check')
+
     def test_concurrent_restores_reserve_the_receipt_path(self):
         """Re-check item 4: of two restores given one path, only one proceeds."""
         receipt = self.tmp / 'shared.json'
@@ -351,6 +370,34 @@ exit 1
         done, receipt = self.restore(fixture=self.no_catalog_fixture(), status='GONE')
         self.assertEqual(done.returncode, 1)
         self.assertIn('rebuild the stage', self.failure(receipt)['reason'])
+
+
+class MountOptions(Workspace):
+    """fixture-gate.py mount-options, which restore-guest.sh mounts each component with."""
+
+    def options(self, kind, filesystem):
+        fixture = copy(GENUINE_FIXTURE)
+        fixture['components'].append({'name': 'extra', 'kind': kind, 'snapshot': 's', 'disk_size_gb': 1,
+                                      'filesystem': filesystem, 'mount_path': '/srv/extra'})
+        return run([sys.executable, '-I', GATE, 'mount-options', write_json(self.tmp / 'f.json', fixture), 'extra'])
+
+    def test_read_only_disks_use_their_filesystem_option(self):
+        """Review comment 2: XFS catalog and oracle disks mount with norecovery, ext4 with noload."""
+        for kind in ('catalog', 'oracle'):
+            for filesystem, expected in (('ext4', 'ro,noload'), ('ext4-verity', 'ro,noload'), ('xfs', 'ro,norecovery')):
+                with self.subTest(kind=kind, filesystem=filesystem):
+                    done = self.options(kind, filesystem)
+                    self.assertEqual((done.returncode, done.stdout.strip()), (0, expected), done.stderr)
+
+    def test_writable_disks_keep_noatime(self):
+        for filesystem in ('ext4', 'ext4-verity', 'xfs'):
+            with self.subTest(filesystem=filesystem):
+                self.assertEqual(self.options('stores', filesystem).stdout.strip(), 'noatime')
+
+    def test_unknown_read_only_filesystem_is_refused(self):
+        done = self.options('catalog', 'btrfs')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('cannot mount read-only', done.stderr)
 
 
 class GenuineReplay(Workspace):
@@ -445,6 +492,9 @@ class FakeReader:
 import json, os, sys
 state_path = os.environ['FAKE_READER_STATE']
 state = json.load(open(state_path))
+if state.get('stall'):
+    import time
+    time.sleep(3600)
 request = json.loads(sys.argv[sys.argv.index('-d') + 1])
 start, end = request['start']['height'], request['end']['height']
 native = bool(request.get('poolTypes'))
@@ -461,11 +511,11 @@ for height in range(start, end + 1):
 json.dump(state, open(state_path, 'w'))
 '''
 
-    def __init__(self, tmp, first, last, files, served_last=None, tail_warm=False, drop=(), reset=None):
+    def __init__(self, tmp, first, last, files, served_last=None, tail_warm=False, drop=(), reset=None, stall=False):
         self.state_path = tmp / 'reader-state.json'
         tickers = {t: 1000.0 for t in TICKERS if t not in drop}
         state = {'first': first, 'last': last, 'served_last': last if served_last is None else served_last,
-                 'tail_warm': tail_warm, 'tickers': tickers}
+                 'tail_warm': tail_warm, 'tickers': tickers, 'stall': stall}
         if reset:
             state['reset_ticker'], state['reset_on'] = reset
         write_json(self.state_path, state)
@@ -526,16 +576,16 @@ class RouteCheck(Workspace):
         refusal.chmod(0o755)
         self.refusal = refusal
 
-    def check(self, hold=None, reference=None, **reader):
+    def check(self, hold=None, reference=None, extra_args=(), timeout=900, **reader):
         files = [self.mount / 'catalog' / name for name in (hold if hold is not None else self.bounds['segment_files'])]
         fake = FakeReader(self.tmp, self.bounds['first_height'], self.last, files, **reader)
         self.addCleanup(fake.close)
         out = self.tmp / 'route'
-        extra = ['--sample-reference', reference] if reference else []
+        extra = (['--sample-reference', reference] if reference else []) + list(extra_args)
         done = run([sys.executable, '-I', ROUTE, '--grpc', 'fake:0', '--ops', fake.ops, '--pid', fake.process.pid,
                     '--bounds', self.tmp / 'bounds.json', '--tip', self.last + 500, '--out', out,
                     '--refusal-binary', self.refusal, '--refusal-config', '/dev/null', '--refusal-timeout', '120', *extra],
-                   env=dict(os.environ, PATH=f'{fake.bin}:{os.environ["PATH"]}', FAKE_READER_STATE=str(fake.state_path)), timeout=900)
+                   env=dict(os.environ, PATH=f'{fake.bin}:{os.environ["PATH"]}', FAKE_READER_STATE=str(fake.state_path)), timeout=timeout)
         return done, json.loads((out / 'route-check.json').read_text())
 
     def gate(self, report):
@@ -614,6 +664,15 @@ class RouteCheck(Workspace):
         self.assertIn('admission', report['failed'])
         self.assertFalse(report['admission']['manifest_unchanged'])
         self.assertEqual(report['manifest_sha256'], self.bounds['manifest_sha256'])
+
+    def test_stalled_reader_fails_closed(self):
+        """Review comment 3: a request the reader never finishes fails the check within its bound."""
+        started = time.monotonic()
+        done, report = self.check(stall=True, extra_args=['--request-timeout', '2'], timeout=120)
+        self.assertLess(time.monotonic() - started, 60)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('did not finish within 2 seconds', report['error'])
+        self.assertNotEqual(self.gate(report).returncode, 0)
 
     def test_verdict_needs_every_part(self):
         """Finding 7: a report that says passed but lacks a part does not pass."""
@@ -704,6 +763,39 @@ echo reached-the-end
         self.assertNotIn('reached-the-end', done.stdout)
         self.assertFalse((out / 'outcome.json').exists())
         self.assertIn('stop zfx-fixture-compat', stops)
+
+
+class SourceTree(Workspace):
+    """The checks run from a source checkout must leave it as the stage builder expects."""
+
+    def test_checks_write_no_bytecode(self):
+        """Review comment 1: importing route_proof.py must not create guest/__pycache__."""
+        cache = ROOT / 'guest' / '__pycache__'
+        shutil.rmtree(cache, ignore_errors=True)
+        run([sys.executable, '-I', GATE, 'preflight', ROOT / 'testdata' / 'fixture-905dac4e-signed-history-6cd01968.json'])
+        run([sys.executable, '-I', ROUTE, '--help'])
+        self.assertFalse(cache.exists())
+
+    def test_stage_copies_only_source_files(self):
+        """Review comment 1: build-stage.sh copies regular files, so a stray cache cannot break it."""
+        line = next(line for line in (ROOT / 'build-stage.sh').read_text().splitlines() if 'mainnet-fixture/guest' in line)
+        repo = self.tmp / 'repo'
+        guest = repo / 'scripts' / 'mainnet-fixture' / 'guest'
+        shutil.copytree(ROOT / 'guest', guest, ignore=shutil.ignore_patterns('__pycache__'))
+        (guest / '__pycache__').mkdir()
+        (guest / '__pycache__' / 'route_proof.cpython-312.pyc').write_bytes(b'stale')
+        stage = self.tmp / 'stage'
+        (stage / 'guest').mkdir(parents=True)
+        done = run(['bash', '-c', f'set -euo pipefail; repo={repo}; stage={stage}; {line}'])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(sorted(p.name for p in (stage / 'guest').iterdir()),
+                         sorted(p.name for p in guest.iterdir() if p.is_file()))
+
+
+def tearDownModule():
+    # The suite must leave no bytecode cache where the stage builder copies from.
+    if (ROOT / 'guest' / '__pycache__').exists():
+        raise AssertionError('the tests left scripts/mainnet-fixture/guest/__pycache__ behind')
 
 
 class StackConfig(Workspace):

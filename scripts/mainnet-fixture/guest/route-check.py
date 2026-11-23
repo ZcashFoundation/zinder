@@ -2,7 +2,7 @@
 """Prove which route a restored lightwalletd-compatible reader serves block ranges from.
 
 usage: route-check.py --grpc ADDR --ops ADDR --pid PID --bounds FILE --tip T --out DIR
-                      [--sample-reference FILE]
+                      [--sample-reference FILE] [--request-timeout SECONDS]
                       [--refusal-binary BIN --refusal-config FILE [--run-as USER]]
 
 --bounds is the JSON that `fixture-gate.py verify-manifest` wrote before the
@@ -38,12 +38,16 @@ probe is bracketed by two refreshes, and every counter used must be present
 and must not decrease. Segment page residency (mincore after eviction advice)
 and point lookups are reported as supporting evidence only. The pass and fail
 decisions come from route_proof.py, which fixture-gate.py applies again to the
-recorded measurements. Writes route-check.json to --out and exits 1 when any
-part fails.
+recorded measurements. Every block-range request carries a gRPC deadline of
+--request-timeout seconds (default 600) and is killed shortly after it; a
+request that runs out of time fails the check. Writes route-check.json to
+--out and exits 1 when any part fails.
 """
 import argparse, ctypes, hashlib, json, mmap, os, pwd, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path
 
+# The local import must not write __pycache__ next to the stage's sources.
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from route_proof import NATIVE_POOLS, PAYLOAD_READ_TICKERS, PROOF, covered_range, part_errors, reference_range  # noqa: E402
 
@@ -165,14 +169,19 @@ def plan(first, last, tip, sample_pinned):
             'boundary_last': (last, last), 'boundary_next': (last + 1, last + 1)}
 
 
-def block_range(grpc, start, end, path, pools=None):
+def block_range(grpc, start, end, path, seconds, pools=None):
+    """Streams one GetBlockRange into path, bounded by a gRPC deadline and a process timeout."""
     request = {'start': {'height': start}, 'end': {'height': end}}
     if pools:
         request['poolTypes'] = pools
-    with path.open('wb') as out:
-        subprocess.run(['grpcurl', '-plaintext', '-max-msg-sz', '268435456', '-format', 'json', '-d',
-                        json.dumps(request), grpc, 'cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange'],
-                       check=True, stdout=out)
+    try:
+        with path.open('wb') as out:
+            subprocess.run(['grpcurl', '-plaintext', '-max-time', str(seconds), '-max-msg-sz', '268435456',
+                            '-format', 'json', '-d', json.dumps(request), grpc,
+                            'cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange'],
+                           check=True, stdout=out, timeout=seconds + 10)
+    except subprocess.TimeoutExpired as error:
+        raise ProbeError(f'GetBlockRange {start}..{end} did not finish within {seconds} seconds') from error
     text, decoder, at, heights = path.read_text(), json.JSONDecoder(), 0, []
     while True:
         while at < len(text) and text[at].isspace():
@@ -189,7 +198,7 @@ def probe(args, name, span, files, pools=None):
     path = Path(args.out) / f'{name}-{start}-{end}.json'
     evict(files)
     (before, refreshed_before), pages_before = settled_tickers(args.ops), resident_bytes(files)
-    heights = block_range(args.grpc, start, end, path, pools) if span else None
+    heights = block_range(args.grpc, start, end, path, args.request_timeout, pools) if span else None
     (after, refreshed_after), pages_after = settled_tickers(args.ops), resident_bytes(files)
     report = {'canonical_payload_read_delta': deltas(before, after, PAYLOAD_READ_TICKERS),
               'canonical_point_read_delta': {t: after[t] - before[t] for t in POINT_READ_TICKERS if t in before and t in after},
@@ -214,7 +223,7 @@ def refusal(args, trusted_key):
     work = Path(tempfile.mkdtemp(prefix='refusal-', dir=args.out))
     try:
         der = subprocess.run('openssl genpkey -algorithm ed25519 | openssl pkey -pubout -outform DER',
-                             shell=True, check=True, capture_output=True).stdout
+                             shell=True, check=True, capture_output=True, timeout=60).stdout
         wrong = work / 'wrong-publisher.pub'
         wrong.write_bytes(der[-32:])
         if wrong.read_bytes() == Path(trusted_key).read_bytes():
@@ -267,7 +276,7 @@ def run(args):
                            'missing_segments': sorted(expected - held_segments)[:5]}
     # The first range after startup can check its settled anchor against canonical storage.
     for span in (chosen['covered'], chosen['boundary_last']):
-        block_range(args.grpc, *span, Path(args.out) / 'warm-up.json')
+        block_range(args.grpc, *span, Path(args.out) / 'warm-up.json', args.request_timeout)
     report['idle'] = probe(args, 'idle', None, files)
     report['covered'] = probe(args, 'covered', chosen['covered'], files)
     report['boundary_last'] = probe(args, 'boundary-last', chosen['boundary_last'], files)
@@ -306,11 +315,12 @@ def main():
     parser.add_argument('--refusal-config')
     parser.add_argument('--run-as')
     parser.add_argument('--refusal-timeout', type=int, default=900)
+    parser.add_argument('--request-timeout', type=int, default=600)
     args = parser.parse_args()
     Path(args.out).mkdir(parents=True, exist_ok=True)
     try:
         report = run(args)
-    except (ProbeError, OSError, subprocess.CalledProcessError, ValueError, KeyError) as error:
+    except (ProbeError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, KeyError) as error:
         report = {'proof': 'external', 'passed': False, 'failed': ['error'], 'error': f'{type(error).__name__}: {error}'}
     tmp = Path(args.out) / 'route-check.json.partial'
     tmp.write_text(json.dumps(report, indent=2) + '\n')

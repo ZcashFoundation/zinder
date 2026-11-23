@@ -82,19 +82,22 @@ attempt=$name-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM
 ( set -o noclobber; printf '%s\n' "$attempt" > "$receipt.reservation" ) 2>/dev/null \
   || die "$receipt.reservation exists: another restore holds this receipt path; choose a new --receipt path"
 
+# Every cloud call ends: a gcloud or ssh call that runs longer than
+# call_seconds is killed and fails with 124.
+call_seconds=900
+gc() { timeout -k 10 "$call_seconds" gcloud "$@"; }
 # IAP connections drop now and then. Retry when ssh itself fails (exit 255);
 # standard input is buffered so a retry resends it. While gssh_deadline (a
-# SECONDS value) is set, every call, retry, and wait ends by then, and a call
-# cut off by it returns 124.
+# SECONDS value) is set, every call, retry, and wait also ends by then.
 gssh_deadline=""
 gssh() {
   local input rc=124 attempt budget
   input=$(mktemp)
   cat > "$input"
   for attempt in 1 2 3 4 5; do
-    budget=86400
+    budget=$call_seconds
     if [[ -n $gssh_deadline ]]; then
-      budget=$((gssh_deadline - SECONDS))
+      budget=$((gssh_deadline - SECONDS < call_seconds ? gssh_deadline - SECONDS : call_seconds))
       (( budget > 0 )) || { rc=124; break; }
     fi
     timeout -k 5 "$budget" gcloud compute ssh "$name" --project "$project" --zone "$zone" --tunnel-through-iap --quiet \
@@ -138,11 +141,11 @@ jsonschema.Draft202012Validator(json.load(open(sys.argv[1]))).validate(json.load
     "$schema" "$fixture" || die "fixture does not match fixture.schema.json"
 fi
 while read -r snap; do
-  status=$(gcloud compute snapshots describe "$snap" --project "$project" --format='value(status)' 2>/dev/null) \
+  status=$(gc compute snapshots describe "$snap" --project "$project" --format='value(status)' 2>/dev/null) \
     || die "snapshot $snap not found in $project"
   [[ $status == READY ]] || die "snapshot $snap is $status"
 done < <(jq -r '.components[].snapshot' "$fixture")
-stage_sha=$(gcloud storage cat "$stage.sha256" | awk '{print $1}')
+stage_sha=$(gc storage cat "$stage.sha256" | awk '{print $1}')
 [[ $stage_sha =~ ^[0-9a-f]{64}$ ]] || die "no SHA-256 at $stage.sha256"
 # A fixture that pins its stage accepts only that exact tarball.
 want_stage=$(jq -r '.stage_sha256 // empty' "$fixture")
@@ -165,8 +168,8 @@ while read -r c; do
   comp=$(jq -r .name <<< "$c") snap=$(jq -r .snapshot <<< "$c") size=$(jq -r .disk_size_gb <<< "$c")
   disk_args+=("--create-disk=name=$name-$comp,auto-delete=yes,size=$size,type=hyperdisk-balanced,provisioned-iops=$iops,provisioned-throughput=$throughput,source-snapshot=$snap,device-name=$comp,interface=NVME")
 done < <(jq -c '.components[]' "$fixture")
-image=$(gcloud compute images describe-from-family ubuntu-2404-lts-amd64 --project ubuntu-os-cloud --format='value(selfLink)')
-gcloud compute instances create "$name" --project "$project" --zone "$zone" \
+image=$(gc compute images describe-from-family ubuntu-2404-lts-amd64 --project ubuntu-os-cloud --format='value(selfLink)')
+gc compute instances create "$name" --project "$project" --zone "$zone" \
   --machine-type "$machine" --threads-per-core 1 \
   --network-interface="subnet=$subnet,nic-type=GVNIC,no-address" \
   --no-service-account --no-scopes --metadata enable-oslogin=TRUE --labels "$labels" \
@@ -175,11 +178,14 @@ gcloud compute instances create "$name" --project "$project" --zone "$zone" \
   --create-disk="name=$name-boot,boot=yes,auto-delete=yes,size=64,type=hyperdisk-balanced,provisioned-iops=3000,provisioned-throughput=140,image=$image,device-name=boot,interface=NVME" \
   "${disk_args[@]}" >&2
 mark host_running
-for _ in $(seq 1 60); do gssh true < /dev/null 2>/dev/null && break; sleep 10; done
+# The new host gets ten minutes to accept ssh.
+gssh_deadline=$((SECONDS + 600))
+for _ in $(seq 1 60); do gssh true < /dev/null 2>/dev/null && break; (( SECONDS < gssh_deadline )) || break; sleep 10; done
+gssh_deadline=""
 gssh true < /dev/null
 
 mark stage
-gcloud auth print-access-token | gssh 'sudo install -m 0600 /dev/stdin /root/.gcs-token'
+gc auth print-access-token | gssh 'sudo install -m 0600 /dev/stdin /root/.gcs-token'
 gssh "trap 'sudo rm -f /root/.gcs-token' EXIT; set -e
   sudo gcloud storage cp --access-token-file=/root/.gcs-token '$stage' /tmp/zfx-stage.tar.zst >/dev/null 2>&1; sudo rm -f /root/.gcs-token
   echo '$stage_sha  /tmp/zfx-stage.tar.zst' | sha256sum --quiet -c
@@ -189,10 +195,11 @@ gssh 'sudo tee /tmp/zfx-stage/fixture.json >/dev/null' < "$fixture"
 mark guest_restore
 # The guest restore runs as its own unit, so a dropped ssh session cannot stop
 # it. A repeated launch is harmless: the guest refuses an attempt directory
-# that exists and a host that already ran an attempt.
-gssh "sudo systemd-run --unit zfx-restore-$attempt --collect bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/attempts/$attempt" < /dev/null >&2 || true
+# that exists and a host that already ran an attempt. The launch call shares
+# the guest deadline, so a stalled session cannot outlast --guest-timeout.
 deadline=$((SECONDS + guest_timeout)) gone=0 outcome=""
 gssh_deadline=$deadline
+gssh "sudo systemd-run --unit zfx-restore-$attempt --collect bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/attempts/$attempt" < /dev/null >&2 || true
 while :; do
   status=$(gssh "sudo cat /var/log/zfx/attempts/$attempt/outcome.json 2>/dev/null || { systemctl is-active -q zfx-restore-$attempt && echo RUNNING || echo GONE; }" < /dev/null 2>/dev/null) || status=""
   if jq -e 'type == "object" and (.status == "succeeded" or .status == "failed")' >/dev/null 2>&1 <<< "$status"; then
@@ -204,12 +211,13 @@ while :; do
   if (( SECONDS >= deadline )); then fail_receipt guest_restore "the guest restore did not finish within $guest_timeout seconds"; die "guest restore timed out"; fi
   sleep "$(( deadline - SECONDS < poll ? deadline - SECONDS : poll ))"
 done
-gssh_deadline=""
 if [[ $(jq -r .status <<< "$outcome") != succeeded ]]; then
-  gssh "sudo journalctl -u zfx-restore-$attempt -o cat --no-pager | tail -20" < /dev/null >&2 || true
   fail_receipt guest_restore "guest failed at $(jq -r .step <<< "$outcome"): $(jq -r .reason <<< "$outcome")" "$outcome"
+  # Best effort, within what is left of the guest deadline.
+  gssh "sudo journalctl -u zfx-restore-$attempt -o cat --no-pager | tail -20" < /dev/null >&2 || true
   die "guest restore failed; see $receipt.failed"
 fi
+gssh_deadline=""
 mark accept
 guest_file=$(mktemp) outcome_file=$(mktemp)
 trap '[[ $finished == true || -e $receipt.failed ]] || fail_receipt "${current:-unknown}" "restore-fixture.sh exited early"; rm -f "$guest_file" "$outcome_file"' EXIT
