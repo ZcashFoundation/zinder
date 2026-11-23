@@ -1,6 +1,0 @@
-kind: added
-body: Operators can verify that Zingo CLI and Zallet recover shielded Regtest payments after a disconnect or shallow rollback, and compare the observed balances, fees, and spendability with the release baseline.
-time: 2026-11-21T16:05:19.907066734Z
-custom:
-    Bump: patch
-    PR: "449"

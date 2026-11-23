@@ -1,6 +1,0 @@
-kind: fixed
-body: Wallet qualification verifies the Vizor driver and fixture identity, stops on Zingo connection errors, and requires Zingo to discover each newly confirmed shielding transaction.
-time: 2026-11-21T05:32:43.016373271Z
-custom:
-    Bump: patch
-    PR: "441"
