@@ -624,18 +624,17 @@ fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
 }
 
 #[test]
-fn positional_reads_fill_all_slabs_and_report_a_short_final_frame() -> eyre::Result<()> {
+fn positional_reads_fill_a_slab_exactly_and_report_a_short_final_frame() -> eyre::Result<()> {
     let mut file = tempfile::tempfile()?;
     file.write_all(b"prefix")?;
-    let expected: Vec<_> = (0_u16..1025).map(u16::to_be_bytes).collect();
-    file.write_all(expected.as_flattened())?;
+    let expected: Vec<_> = (0_u16..1025).flat_map(u16::to_be_bytes).collect();
+    file.write_all(&expected)?;
+    file.write_all(b"suffix")?;
 
-    let mut buffers = vec![[0; 2]; expected.len()];
-    read_slabs_at(&file, buffers.iter_mut().map(<[_; 2]>::as_mut_slice), 6)?;
-    assert_eq!(buffers, expected);
+    assert_eq!(read_slab_at(&file, expected.len(), 6)?, expected);
 
-    file.set_len(6 + u64::try_from(expected.as_flattened().len())? - 1)?;
-    let error = read_slabs_at(&file, buffers.iter_mut().map(<[_; 2]>::as_mut_slice), 6)
+    file.set_len(6 + u64::try_from(expected.len())? - 1)?;
+    let error = read_slab_at(&file, expected.len(), 6)
         .err()
         .ok_or_else(|| invalid("served a truncated frame"))?;
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
