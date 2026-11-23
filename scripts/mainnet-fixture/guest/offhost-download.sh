@@ -8,7 +8,15 @@
 set -euo pipefail
 prefix=${1%/} name=$2 dest=$3
 source "$(dirname "$0")/objstore.sh"
-mkdir -p "$dest"; cd "$dest"
+# A private backup carries the cursor authentication key, and object storage
+# does not keep file modes, so everything downloaded is owner-only.
+umask 077
+[[ -d $(dirname "$dest") ]] || { echo "parent of $dest does not exist" >&2; exit 1; }
+[[ ! -e $dest/$name ]] || { echo "$dest/$name already exists; choose a new destination" >&2; exit 1; }
+[[ -d $dest ]] || mkdir -m 0700 "$dest"
+[[ $(stat -c %u "$dest") == "$(id -u)" && $(( 0$(stat -c %a "$dest") & 077 )) == 0 ]] \
+  || { echo "$dest must be owned by $(id -un) and closed to other users" >&2; exit 1; }
+cd "$dest"
 obj_get "$prefix/$name.manifest.json" "$name.manifest.json"
 obj_get "$prefix/$name.SHA256SUMS" "$name.SHA256SUMS"
 obj_get "$prefix/$name.SHA256SUMS.sha256" "$name.SHA256SUMS.sha256"

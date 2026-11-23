@@ -119,7 +119,8 @@ gssh true < /dev/null
 
 mark stage
 gcloud auth print-access-token | gssh 'sudo install -m 0600 /dev/stdin /root/.gcs-token'
-gssh "set -e; sudo gcloud storage cp --access-token-file=/root/.gcs-token '$stage' /tmp/zfx-stage.tar.zst >/dev/null 2>&1; sudo rm -f /root/.gcs-token
+gssh "trap 'sudo rm -f /root/.gcs-token' EXIT; set -e
+  sudo gcloud storage cp --access-token-file=/root/.gcs-token '$stage' /tmp/zfx-stage.tar.zst >/dev/null 2>&1; sudo rm -f /root/.gcs-token
   echo '$stage_sha  /tmp/zfx-stage.tar.zst' | sha256sum --quiet -c
   zstd -dc /tmp/zfx-stage.tar.zst | sudo tar -x -C /tmp" < /dev/null
 gssh 'sudo tee /tmp/zfx-stage/fixture.json >/dev/null' < "$fixture"

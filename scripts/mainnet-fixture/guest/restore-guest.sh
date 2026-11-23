@@ -102,6 +102,8 @@ taddr=$(jq -r '.wallet_sample.transparent_address // empty' "$fixture")
 /opt/zfx/wallet-sample.sh 127.0.0.1:9067 /var/log/zfx/wallet-sample "$taddr" >&2
 sample_digest=$(sha256sum /var/log/zfx/wallet-sample/SHA256SUMS | cut -d' ' -f1)
 want_sample=$(jq -r '.wallet_sample.sha256sums_sha256 // empty' "$fixture")
+sample_ok=true
+[[ -z $want_sample || $sample_digest == "$want_sample" ]] || sample_ok=false
 mark finished
 
 steps=$(for k in "${!at[@]}"; do printf '%s\t%s\n' "$k" "${at[$k]}"; done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add')
@@ -116,5 +118,11 @@ jq -n --arg fixture_id "$(jq -r .fixture_id "$fixture")" --arg network "$network
     served_tip: {height: $height, hash: $hash}, compat_readyz: $ready,
     wallet_sample_sha256sums_sha256: $sample,
     wallet_sample_matches_fixture: (if $want_sample == "" then null else ($sample == $want_sample) end),
-    binaries_listing_sha256: $binaries}' > "$receipt"
+    binaries_listing_sha256: $binaries}' > "$receipt.partial"
+if [[ $sample_ok != true ]]; then
+  mv "$receipt.partial" "$receipt.failed"
+  log "wallet responses differ from the fixture: SHA256SUMS digest $sample_digest, fixture records $want_sample"
+  exit 1
+fi
+mv "$receipt.partial" "$receipt"
 cat "$receipt"
