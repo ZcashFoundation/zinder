@@ -128,12 +128,20 @@ fn mined_reply(id: TransactionId, block: zinder_core::BlockId, hex: &str) -> Rpc
     }))
 }
 
-#[tokio::test]
-async fn forwarded_transactions_refuse_extra_calls_until_a_slot_returns() -> Result<()> {
+#[test]
+fn forwarded_transactions_refuse_extra_calls_until_a_slot_returns() -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(forwarded_transaction_admission())
+}
+
+async fn forwarded_transaction_admission() -> Result<()> {
     use parking_lot::{Condvar, Mutex};
 
     let id = TransactionId::from_bytes([0x55; 32]);
-    let timeout = Duration::from_secs(15);
+    let timeout = Duration::from_mins(2);
     let (entered, mut calls) = tokio::sync::mpsc::unbounded_channel();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let node_gate = Arc::clone(&gate);
@@ -145,6 +153,33 @@ async fn forwarded_transactions_refuse_extra_calls_until_a_slot_returns() -> Res
             mined_reply(id, served, "55")
         })]
     })?;
+
+    let (occupied, entered_blocking_pool) = tokio::sync::oneshot::channel();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let blocking_slot = tokio::task::spawn_blocking(move || {
+        let _ = occupied.send(());
+        let _ = blocked.blocking_recv();
+    });
+    entered_blocking_pool.await?;
+    let mut replay_requests: Vec<_> = (0..8)
+        .map(|_| Box::pin(fixture.adapter.get_transaction(transaction(id))))
+        .collect();
+    for request in &mut replay_requests {
+        assert!(futures_util::poll!(request).is_pending());
+    }
+    assert_transaction_refused(fixture.adapter.get_transaction(transaction(id)).await)?;
+    drop(replay_requests);
+    assert_transaction_refused(fixture.adapter.get_transaction(transaction(id)).await)?;
+    release
+        .send(())
+        .map_err(|()| eyre!("blocking pool gate closed early"))?;
+    blocking_slot.await?;
+    // The single blocking worker runs all admitted evidence before this marker.
+    tokio::task::spawn_blocking(|| ()).await?;
+    assert!(
+        fixture.node.requests()?.is_empty(),
+        "cancelled evidence forwarded to the node"
+    );
 
     let mut pending = tokio::task::JoinSet::new();
     for _ in 0..8 {
@@ -161,17 +196,24 @@ async fn forwarded_transactions_refuse_extra_calls_until_a_slot_returns() -> Res
     *released.lock() = true;
     ready.notify_all();
 
-    let status = extra
-        .err()
-        .ok_or_else(|| eyre!("ninth lookup was admitted"))?;
-    assert_eq!(status.code(), Code::ResourceExhausted);
-    assert!(status.message().contains("retry with backoff"));
+    assert_transaction_refused(extra)?;
     while let Some(reply) = pending.join_next().await {
         assert_eq!(reply??.into_inner().data, [0x55]);
     }
     assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 8);
     let reply = fixture.adapter.get_transaction(transaction(id)).await?;
     assert_eq!(reply.into_inner().data, [0x55]);
+    Ok(())
+}
+
+fn assert_transaction_refused(
+    response: Result<tonic::Response<lightwalletd::RawTransaction>, Status>,
+) -> Result<()> {
+    let status = response
+        .err()
+        .ok_or_else(|| eyre!("ninth lookup was admitted"))?;
+    assert_eq!(status.code(), Code::ResourceExhausted);
+    assert!(status.message().contains("retry with backoff"));
     Ok(())
 }
 

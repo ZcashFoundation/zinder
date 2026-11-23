@@ -22,7 +22,7 @@ use zinder_query::{
     ArtifactKey, BlockTransactionDigests, CanonicalReader,
     MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, MinedTransactionDigest, QualificationNodeTarget,
     QualificationWalletQuery, QueryError, RocksDbCanonicalReader, StorageReadError, SubtreeRoots,
-    parse_receivable_transparent_address, status_from_query_error,
+    parse_receivable_transparent_address, read_on_blocking_thread, status_from_query_error,
 };
 use zinder_runtime::hold_grpc_response_permit;
 use zinder_source::{
@@ -185,25 +185,32 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
         reader: Arc<RocksDbCanonicalReader>,
         id: TransactionId,
     ) -> Result<lightwalletd::RawTransaction, Status> {
-        let _permit = self
-            .query_api
-            .transaction_slots
-            .try_acquire()
+        let permit = Arc::clone(&self.query_api.transaction_slots)
+            .try_acquire_owned()
             .map_err(|_| {
                 Status::resource_exhausted(
                     "forwarded transaction lookup limit reached; retry with backoff",
                 )
             })?;
         let view = served_view(&reader)?;
-        let miss = match reader.mined_transaction_location(id).await {
-            Ok(Some(location)) => {
-                let mined = self
-                    .query_api
-                    .block_digests
-                    .digest_of(&reader, location)
-                    .await?;
-                drop(reader);
-                let node = self.query_api.node(&view).await?;
+        let digests = self.query_api.block_digests.clone();
+        let span = tracing::Span::current();
+        // The storage read owns admission even if the caller drops the
+        // request. Only the caller can proceed from evidence to the node.
+        let (evidence, _permit) = tokio::task::spawn_blocking(move || {
+            let evidence = span.in_scope(|| {
+                read_on_blocking_thread(forwarded_transaction_evidence(&reader, &digests, id))
+            });
+            (evidence, permit)
+        })
+        .await
+        .map_err(|error| {
+            Status::unavailable(format!("transaction evidence read failed: {error}"))
+        })?;
+        let evidence = evidence?;
+        let node = self.query_api.node(&view).await?;
+        match evidence {
+            ForwardedTransactionEvidence::Mined(mined) => {
                 let reported = node
                     .fetch_mined_transaction_bytes(id)
                     .await
@@ -213,22 +220,39 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
                             "node does not mine the transaction in the served block",
                         )
                     })?;
-                return served_transaction(mined, reported);
+                served_transaction(mined, reported)
             }
-            Ok(None) => CanonicalTransactionMiss::NotInChain {
-                at_epoch_id: reader.chain_epoch().id,
-            },
-            Err(error @ StorageReadError::CanonicalHistoryUnavailable { .. }) => {
-                CanonicalTransactionMiss::BelowHistoryFloor(storage_status(error))
-            }
-            Err(error) => return Err(storage_status(error)),
-        };
-        drop(reader);
-        // A forwarded lookup reports an unverified node the same way for
-        // every transaction, including ones the served view does not mine.
-        self.query_api.node(&view).await?;
-        self.pending_transaction(id, miss).await
+            // A forwarded lookup reports an unverified node the same way for
+            // every transaction, including ones the served view does not mine.
+            ForwardedTransactionEvidence::Missing(miss) => self.pending_transaction(id, miss).await,
+        }
     }
+}
+
+enum ForwardedTransactionEvidence {
+    Mined(MinedTransactionDigest),
+    Missing(CanonicalTransactionMiss),
+}
+
+async fn forwarded_transaction_evidence(
+    reader: &RocksDbCanonicalReader,
+    digests: &BlockDigestCache,
+    id: TransactionId,
+) -> Result<ForwardedTransactionEvidence, Status> {
+    let miss = match reader.mined_transaction_location(id).await {
+        Ok(Some(location)) => {
+            let digest = digests.digest_of(reader, location).await?;
+            return Ok(ForwardedTransactionEvidence::Mined(digest));
+        }
+        Ok(None) => CanonicalTransactionMiss::NotInChain {
+            at_epoch_id: reader.chain_epoch().id,
+        },
+        Err(error @ StorageReadError::CanonicalHistoryUnavailable { .. }) => {
+            CanonicalTransactionMiss::BelowHistoryFloor(storage_status(error))
+        }
+        Err(error) => return Err(storage_status(error)),
+    };
+    Ok(ForwardedTransactionEvidence::Missing(miss))
 }
 
 impl QualificationWallet {
