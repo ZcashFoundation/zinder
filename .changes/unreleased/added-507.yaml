@@ -1,5 +1,5 @@
 kind: added
-body: Set `deployment.profile = "light-wallet"` in the standard ingest and compatibility binaries to serve wallets with complete compact history and without raw blobs or a wallet projection. Configure one node with transparent address indexes. Existing schema 7 stores can serve readers whose minimum requirements they meet. Use a fresh store to reduce writer retention.
+body: Set `deployment.profile = "light-wallet"` in the standard ingest and compatibility binaries to serve wallets with complete compact history and without raw blobs or a wallet projection. Configure one node with transparent address indexes. Existing schema 7 stores can serve readers whose minimum requirements they meet. A canonical layout change requires a fresh store. A seven-day build-beside rollback period is optional. Keep the previous binaries and their matching store if you need a fallback.
 time: 2026-11-23T14:58:50.718318161Z
 custom:
     Bump: minor
