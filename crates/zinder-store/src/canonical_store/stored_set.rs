@@ -269,12 +269,8 @@ impl CanonicalStoredSet {
         self.subtree_root_coverage
     }
 
-    pub(super) const fn first_subtree_root_index(&self, protocol: ShieldedProtocol) -> u32 {
-        match protocol {
-            ShieldedProtocol::Sapling => self.first_subtree_root_indices[0],
-            ShieldedProtocol::Orchard => self.first_subtree_root_indices[1],
-            ShieldedProtocol::Ironwood => self.first_subtree_root_indices[2],
-        }
+    pub(super) fn first_subtree_root_index(&self, protocol: ShieldedProtocol) -> u32 {
+        self.first_subtree_root_indices[usize::from(protocol.id()) - 1]
     }
 
     pub(super) fn require(
