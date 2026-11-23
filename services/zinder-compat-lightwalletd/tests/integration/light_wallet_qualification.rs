@@ -821,6 +821,14 @@ async fn wallet_pair_bootstraps_and_serves_with_a_missing_early_root() -> Result
             .stderr(File::create(&log_path)?)
             .spawn()?;
     let mut client = wait_for_compat(&mut wallet, addr, &log_path).await?;
+    assert_checkpointed_wallet_reads(&mut client).await?;
+    wallet.kill().await?;
+    Ok(())
+}
+
+async fn assert_checkpointed_wallet_reads(
+    client: &mut CompactTxStreamerClient<Channel>,
+) -> Result<()> {
     let retained = lightwalletd::BlockId {
         height: 2,
         hash: Vec::new(),
@@ -853,7 +861,6 @@ async fn wallet_pair_bootstraps_and_serves_with_a_missing_early_root() -> Result
             .map(|detail| detail.reason.as_str()),
         Some("ARTIFACT_UNAVAILABLE")
     );
-    wallet.kill().await?;
     Ok(())
 }
 
