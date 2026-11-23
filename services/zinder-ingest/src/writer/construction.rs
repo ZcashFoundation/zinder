@@ -136,17 +136,27 @@ impl CanonicalPipelineLimits {
             )
             .unwrap_or(NonZeroU32::MIN),
             source_fetch_max_in_flight_bytes,
-            block_prepare_concurrency: NonZeroU32::new(
-                logical_core_count
-                    .get()
-                    .min(BLOCK_PREPARE_CONCURRENCY_CEILING),
-            )
-            .unwrap_or(NonZeroU32::MIN),
+            block_prepare_concurrency: core_bounded_concurrency(logical_core_count),
             block_prepare_memory_watermark_bytes: pipeline_memory_watermark(
                 memory_budget_bytes,
                 FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES,
             ),
             tree_hashing_workers: NonZeroU32::MIN,
+        }
+    }
+
+    /// Returns these limits with one tree-hashing thread per logical core, up
+    /// to the block-preparation ceiling.
+    ///
+    /// Construction that stores checkpoints beyond the cadence and build tip
+    /// spends most of its loader time hashing, so it defaults to this. Sparse
+    /// construction keeps hashing on the loader thread, where extra threads
+    /// slowed hosts with two cores.
+    #[must_use]
+    pub fn with_checkpoint_hashing(self, logical_core_count: NonZeroU32) -> Self {
+        Self {
+            tree_hashing_workers: core_bounded_concurrency(logical_core_count),
+            ..self
         }
     }
 
@@ -214,6 +224,11 @@ pub enum CanonicalPipelineLimitsError {
         /// Maximum response accepted from the node.
         max_response_bytes: NonZeroU64,
     },
+}
+
+fn core_bounded_concurrency(logical_core_count: NonZeroU32) -> NonZeroU32 {
+    logical_core_count
+        .min(NonZeroU32::new(BLOCK_PREPARE_CONCURRENCY_CEILING).unwrap_or(NonZeroU32::MIN))
 }
 
 fn pipeline_memory_watermark(

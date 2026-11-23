@@ -1892,37 +1892,94 @@ source = "zebra-json-rpc"
     }
 
     #[test]
-    fn canonical_writer_config_resolves_construction_tree_state_checkpoints_from_densification_config()
+    fn canonical_writer_config_resolves_construction_tree_state_checkpoints_from_coverage_and_densification_config()
     -> Result<(), Box<dyn std::error::Error>> {
         use zinder_store::TreeStateCheckpointSelection::{CommitmentBudget, EveryBlock};
 
+        let budget = |commitments| std::num::NonZeroU32::new(commitments).map(CommitmentBudget);
+        // Each case lists [ingest] settings, [ingest.tree_state_densification]
+        // settings, and the expected selection under explicit and
+        // wallet-serving coverage.
         let cases = [
-            ("", None),
-            ("during_construction = true", Some(EveryBlock)),
+            ("", "", None, Some(EveryBlock)),
             (
-                "during_construction = true
-enabled = false",
+                "",
+                "during_construction = true",
+                Some(EveryBlock),
+                Some(EveryBlock),
+            ),
+            ("", "during_construction = false", None, None),
+            (
+                "",
+                "during_construction = true\nenabled = false",
+                None,
                 None,
             ),
-            ("selection = \"commitment-budget\"", None),
+            ("", "enabled = false", None, None),
+            ("", "selection = \"commitment-budget\"", None, budget(1_024)),
             (
-                "during_construction = true
-selection = \"commitment-budget\"",
-                std::num::NonZeroU32::new(1_024).map(CommitmentBudget),
+                "",
+                "during_construction = true\ncommitment_budget = 256",
+                budget(256),
+                budget(256),
             ),
-            (
-                "during_construction = true
-commitment_budget = 256",
-                std::num::NonZeroU32::new(256).map(CommitmentBudget),
-            ),
+            ("explorer_views = true", "", None, None),
         ];
-        for (section, expected) in cases {
-            let temporary = tempdir()?;
-            let config_path = temporary.path().join("zinder-ingest.toml");
-            fs::write(
-                &config_path,
-                format!(
-                    r#"[network]
+        let core_bounded_workers = std::num::NonZeroU32::new(
+            std::thread::available_parallelism()
+                .map_or(8, std::num::NonZeroUsize::get)
+                .min(16)
+                .try_into()?,
+        )
+        .ok_or("no logical cores")?;
+        for (ingest, densification, explicit, wallet_serving_selection) in cases {
+            for (wallet_serving, expected) in [(false, explicit), (true, wallet_serving_selection)]
+            {
+                let (selection, tree_hashing_workers) =
+                    resolve_construction_checkpoints(ingest, densification, wallet_serving)?;
+                let context = format!(
+                    "wallet_serving={wallet_serving}, ingest={ingest:?}, densification={densification:?}"
+                );
+                assert_eq!(selection, expected, "{context}");
+                let expected_workers = if expected.is_some() {
+                    core_bounded_workers
+                } else {
+                    std::num::NonZeroU32::MIN
+                };
+                assert_eq!(tree_hashing_workers, expected_workers, "{context}");
+            }
+        }
+
+        let (selection, tree_hashing_workers) = resolve_construction_checkpoints(
+            "",
+            "\n[ingest.construction]\ntree_hashing_workers = 2",
+            true,
+        )?;
+        assert_eq!(selection, Some(EveryBlock));
+        assert_eq!(tree_hashing_workers.get(), 2);
+        Ok(())
+    }
+
+    /// Resolves the construction checkpoint selection and tree-hashing
+    /// workers for a regtest config with the given `[ingest]` and
+    /// `[ingest.tree_state_densification]` settings.
+    fn resolve_construction_checkpoints(
+        ingest: &str,
+        densification: &str,
+        wallet_serving: bool,
+    ) -> Result<
+        (
+            Option<zinder_store::TreeStateCheckpointSelection>,
+            std::num::NonZeroU32,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let temporary = tempdir()?;
+        let config_path = temporary.path().join("zinder-ingest.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"[network]
 name = "zcash-regtest"
 
 [node]
@@ -1933,26 +1990,31 @@ path = "{}"
 
 [ingest]
 source = "zebra-json-rpc"
+{ingest}
 
 [ingest.tree_state_densification]
-{section}"#,
-                    temporary.path().join("store").display()
-                ),
-            )?;
-            let command_config = super::config::load_ingest_config(
-                Some(config_path),
-                super::IngestConfigOverrides::default(),
-            )?;
-            let writer_config = super::canonical_writer_config(
-                &command_config,
-                Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
-            );
-            assert_eq!(
-                writer_config.tree_state_checkpoint_selection, expected,
-                "unexpected construction checkpoint setting for section:\n{section}"
-            );
-        }
-        Ok(())
+{densification}"#,
+                temporary.path().join("store").display()
+            ),
+        )?;
+        let command_config = super::config::load_ingest_config(
+            Some(config_path),
+            super::IngestConfigOverrides {
+                wallet_serving: Some(wallet_serving),
+                ..Default::default()
+            },
+        )?;
+        let writer_config = super::canonical_writer_config(
+            &command_config,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+        );
+        Ok((
+            writer_config.tree_state_checkpoint_selection,
+            writer_config
+                .construction
+                .pipeline_limits
+                .tree_hashing_workers,
+        ))
     }
 
     /// Loads an ingest config whose `[node]` accepts 16 MiB responses and

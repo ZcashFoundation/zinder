@@ -767,6 +767,62 @@ fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn packaged_wallet_configs_select_dense_construction_unless_overridden_or_serving_explorer()
+-> Result<(), Box<dyn Error>> {
+    let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config");
+    let temporary = tempdir()?;
+    let token = temporary.path().join("fixture.token");
+    fs::write(&token, "fixture-token\n")?;
+    let core_bounded_workers = std::thread::available_parallelism()
+        .map_or(8, std::num::NonZeroUsize::get)
+        .min(16);
+
+    for file in ["ingest.toml", "wallet-serving/ingest.toml"] {
+        for (setting, dense) in [
+            (None, true),
+            (Some(("ZINDER_INGEST__EXPLORER_VIEWS", "true")), false),
+            (
+                Some((
+                    "ZINDER_INGEST__TREE_STATE_DENSIFICATION__DURING_CONSTRUCTION",
+                    "false",
+                )),
+                false,
+            ),
+        ] {
+            let output = zinder_ingest_command()
+                .args(["--print-config", "--config"])
+                .arg(configs.join(file))
+                .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+                .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+                .env("ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH", &token)
+                .env(
+                    "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
+                    &token,
+                )
+                .envs(setting)
+                .output()?;
+            assert!(output.status.success(), "{file}: {output:?}");
+            let config: toml::Table = toml::from_str(std::str::from_utf8(&output.stdout)?)?;
+            let policy = &config["ingest"]["tree_state_densification"];
+            assert_eq!(policy["enabled"].as_bool(), Some(true), "{file}");
+            assert_eq!(policy["selection"].as_str(), Some("every-block"), "{file}");
+            assert_eq!(
+                policy["during_construction"].as_bool(),
+                Some(dense),
+                "{file}, override={setting:?}"
+            );
+            let expected_workers = if dense { core_bounded_workers } else { 1 };
+            assert_eq!(
+                config["ingest"]["construction"]["tree_hashing_workers"].as_integer(),
+                Some(i64::try_from(expected_workers)?),
+                "{file}, override={setting:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn explorer_views_can_be_enabled_through_environment_without_changing_coverage()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempdir()?;
