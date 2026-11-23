@@ -135,19 +135,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-explorer",
         ],
         requirement: Requirement::ConditionalOn(
-            "running zinder-ingest, or broadcasting transactions or reading the recommended fee from a reader",
+            "running ingest or light-wallet serving, broadcasting, or reading wallet fees",
         ),
         sensitive: false,
-        description: "Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` \
-                      and wallet-mode `zinder-compat-lightwalletd` broadcast transactions \
-                      through it, compatibility also reads the recommended fee for \
-                      `GetStandardFee` through it, and both start without contacting it. \
-                      Without it they serve \
-                      storage only and advertise no broadcast, and compatibility answers \
-                      `GetStandardFee` with `UNIMPLEMENTED`. Compact-blocks compatibility \
-                      rejects every `ZINDER_NODE__*` variable. Optional for \
-                      `zinder-explorer`: without it the upstream-observation probe stays \
-                      off and `ExplorerFreshness.chain_view.upstream_tip` is always unset.",
+        description: "Upstream node JSON-RPC URL. Light-wallet serving forwards transparent \
+                      address reads, omitted transaction bodies, broadcasts, and fee reads to \
+                      this node. Query and wallet-mode compatibility use a configured node for \
+                      broadcasts, and wallet-mode compatibility also reads the fee. \
+                      Compact-blocks serving rejects node settings. Explorer uses the address \
+                      for upstream tip observation. See [The node sections](#the-node-sections).",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_GRPC_ADDR",
@@ -1392,12 +1388,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Boolean request for the complete bundled Explorer materialized-view \
-                      workload. Defaults to `false` for every coverage. `true` requires \
-                      genesis-complete canonical history or the authenticated \
-                      `checkpoint_height = 0`; checkpoint heights above zero are rejected before \
-                      storage mutation. The request appears in `--print-config`; admission \
-                      evidence appears only after the Explorer store opens successfully.",
+        description: "Requests the bundled Explorer materialized views. Defaults to `false`. \
+                      `true` requires genesis-complete canonical history or the authenticated \
+                      `checkpoint_height = 0`. Without a profile, `--print-config` shows the request. \
+                      The light-wallet profile disables the views and omits this field. \
+                      Admission evidence appears after the Explorer store opens successfully.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES",
