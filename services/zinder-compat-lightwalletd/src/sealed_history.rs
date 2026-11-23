@@ -414,7 +414,8 @@ impl SealedHistory {
         for row in rows {
             let start = verified_row_start(row, &slab, first_frame)?;
             // The checked length field becomes the gRPC message prefix, so the
-            // row is sent from the slab without a copy.
+            // generated server's response body returns the row as a slice of
+            // the slab instead of copying it into an encode buffer.
             slab[start - EncodedBlock::PREFIX_LEN] = 0;
             starts.push(start);
         }

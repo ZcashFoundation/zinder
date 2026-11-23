@@ -141,7 +141,7 @@ fn mixed_payload_sizes_send_the_same_bytes_and_trailers_as_tonic() -> eyre::Resu
 }
 
 #[test]
-fn messages_of_a_batch_or_more_reach_the_transport_without_a_copy() -> eyre::Result<()> {
+fn the_body_returns_messages_of_a_batch_or_more_without_a_copy() -> eyre::Result<()> {
     let large = framed(&payload(97_000, 7))?;
     let small = framed(&payload(10, 1))?;
     let script = [Some(Ok(small)), Some(Ok(large.clone()))];
@@ -269,7 +269,7 @@ fn a_slow_reader_pins_only_the_message_it_was_handed() -> eyre::Result<()> {
 }
 
 #[test]
-fn small_messages_reach_the_transport_in_the_same_chunks_as_tonic() -> eyre::Result<()> {
+fn the_body_returns_small_messages_in_the_same_chunks_as_tonic() -> eyre::Result<()> {
     let mut script = Vec::new();
     for tag in 0..200_u8 {
         script.push(Some(Ok(framed(&payload(

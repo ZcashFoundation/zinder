@@ -240,13 +240,14 @@ impl<'a> ServerStreamingService<BlockRange> for TakeMessages<'a> {
     }
 }
 
-/// Messages of at least this many bytes go to HTTP/2 as their own buffer.
+/// Messages of at least this many bytes leave the response body as their own
+/// buffer.
 ///
 /// Shorter ones are copied together up to this size, as tonic batches them,
 /// because HTTP/2 writes each large DATA frame with its own system call.
-/// This matches tonic's default yield threshold, so a range of only short
-/// messages reaches HTTP/2 in the same chunks as before. A batch stays under
-/// twice this size, because each message added to it is shorter than this.
+/// This matches tonic's default yield threshold, so the body returns a range
+/// of only short messages in the same chunks as tonic's encoder. A batch stays
+/// under twice this size, because each message added to it is shorter than this.
 const BATCH_BYTES: usize = 32 * 1024;
 
 /// An uncompressed gRPC server response body over encoded messages.
