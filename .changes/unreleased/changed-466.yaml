@@ -1,6 +1,0 @@
-kind: changed
-body: Compact-block gRPC services now always expose a decoupled single-flight shielded live-tail buffer with exact stored block byte lengths so standalone deployments serve hot uncovered ranges on demand without requiring a published signed catalog.
-time: 2026-11-22T11:10:00.000000000Z
-custom:
-    Bump: patch
-    PR: "466"

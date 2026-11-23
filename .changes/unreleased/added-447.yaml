@@ -1,6 +1,0 @@
-kind: added
-body: Wallet-load benchmark reports record the tip before and after a run and a digest that preserves how reads were distributed across wallets. Operators can check the served tip and workload before comparing latency.
-time: 2026-11-21T16:24:50.550790954Z
-custom:
-    Bump: minor
-    PR: "447"

@@ -1,6 +1,0 @@
-kind: security
-body: Zinder binaries use a patched URL parser that avoids a stack overflow when computing the origin of nested blob URLs (RUSTSEC-2026-0592).
-time: 2026-11-22T14:23:15.216935343Z
-custom:
-    Bump: patch
-    PR: "467"

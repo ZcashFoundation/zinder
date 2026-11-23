@@ -1,6 +1,0 @@
-kind: changed
-body: Published shielded range chunks now group dense multi-block payloads into slabs targeting 64 KiB, cache up to 16 verified settled tips with single-flight anchor checks, use range_fence retention checks without redundant block-hash reads, and propagate cooperative cancellation to queued blocking reads. Compose admission checks signed history mount and file-grant sources outside the publisher and rejects inherited mounts and unsupported volume backing options.
-time: 2026-11-22T10:45:00.000000000Z
-custom:
-    Bump: patch
-    PR: "465"
