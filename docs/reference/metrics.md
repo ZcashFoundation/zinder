@@ -431,7 +431,7 @@ bidirectional calls.
 | `zinder_grpc_request_receive_slots_held_at_admission` | histogram | `pool` | Slots the pool held once it admitted a request, the request's own included. Its buckets are 1, 2, 4, 8, 16, 24, 31, and 32, so with the default 32 slots a sample above `le="31"` is a request that left the pool full, by taking its last free slot or another client's slot. |
 | `zinder_grpc_request_receive_slot_hold_duration_seconds` | histogram | `pool` | Time an admitted request held its slot, until its request arrived, its client stream ended, or another client's request took the slot. Each hold is recorded whole when it ends, so `_sum` does not show how many slots were held during a range; `zinder_grpc_request_receive_slots_held` does. |
 | `zinder_grpc_proxy_client_address_fallbacks_total` | counter | `reason` | Requests on a listener with `trust_proxy_client_address` set that used the transport peer because the `x-zinder-client-address` header was `missing`, `repeated` (sent more than once or as a list), or `invalid` (not one IP address and port). Excludes headerless loopback `grpc.health.v1.Health/Check` calls. |
-| `zinder_grpc_response_send_stalls_total` | counter | | Responses ended because the client stopped reading for 60 seconds. |
+| `zinder_grpc_response_send_stalls_total` | counter | | Responses abandoned because the client stopped reading for 60 seconds. |
 
 ## zinder-compat-lightwalletd
 

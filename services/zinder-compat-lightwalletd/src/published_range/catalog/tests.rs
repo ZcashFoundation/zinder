@@ -1449,7 +1449,7 @@ async fn tail_and_transparent_ranges_stream_while_every_published_read_permit_is
             stream_published(&methods, &reads, &catalog, (first, last, transparent)),
         )
         .await??;
-        assert_eq!(u64::try_from(frames)?, last - first + 1);
+        assert_eq!(frames as u64, last - first + 1);
     }
     assert_eq!(
         *reads.rows.lock(),
