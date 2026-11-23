@@ -204,9 +204,9 @@ protobuf message, and in the `cause` label of `zinder_readiness_state`. Only
 | `node_unavailable` | Refused | The node or its transport failed. Detail: `failure_class`, `last_reason`, `consecutive_failures`, `outage_seconds`. | Check the node, its address, and its credentials. |
 | `node_capability_missing` | Refused | The node lacks a capability the runtime needs. Detail: `capability`. | Configure or upgrade the node to provide it. |
 | `upstream_not_ready` | Refused | The node answers but is not synchronized. Detail: node heights, verification progress, and the health source and reason. | Wait for the node to sync. |
-| `storage_unavailable` | Refused | A required store cannot be opened or read. | Check the volume, free space, and permissions. If the store is damaged, rebuild it; see [Recovery](../architecture/service-operations.md#recovery). |
+| `storage_unavailable` | Refused | A required store cannot be opened or read. | Check the volume, free space, and permissions. If the store is damaged, rebuild it; see [Recovery](../architecture/service-operations.md#recovery). After an in-place canonical store replacement, restart the reader; see [Canonical store replacement](#canonical-store-replacement). |
 | `canonical_store_damaged` | Refused | Ingest found a stored row of the canonical store that fails verification. Ingest and the store's wallet-serving readers report it. Detail: `height`, absent when ingest cannot read its verification record, and, when one pool's frontier failed, `pool`. | Rebuild the canonical store; see [Recovery](../architecture/service-operations.md#recovery). Restarting does not help: ingest reports the recorded damage again until it checks it. |
-| `schema_mismatch` | Refused | A store's identity or schema differs from what the binary expects. | Run a binary that matches the store, or rebuild the store. See [Recovery](../architecture/service-operations.md#recovery). |
+| `schema_mismatch` | Refused | A store's identity or schema differs from what the binary expects. | Run a binary that matches the store, or rebuild the store. See [Recovery](../architecture/service-operations.md#recovery). After an in-place canonical store replacement, restart the reader; see [Canonical store replacement](#canonical-store-replacement). |
 | `reorg_window_exceeded` | Refused | Ingest refused a reorg deeper than its reorg window and stopped following. Detail: `depth`, `configured`, and `covered`. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores; see [Recovery](../architecture/service-operations.md#recovery). Restarting ingest parks it again. |
 | `wallet_transition_limit_exceeded` | Refused | The projector parked because its next wallet update needs more memory than `projector.follow.max_transition_logical_bytes` allows. Detail: `required_bytes`, `configured_bytes`. | Restart the projector with a larger limit, as in [Wallet transition exceeds its logical-byte limit](../runbooks/deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit). It resumes without a rebuild. |
 | `replica_lagging` | Refused | A reader's copy of a store is more chain epochs behind the writer than allowed. Detail: `lag_chain_epochs`. | Check the writer and projector, then disk and CPU pressure. |
@@ -352,8 +352,9 @@ schedule and reports the `node_source` and `ingest_control` dependencies under
 
 Readers pin the canonical stored set they admit at startup. A replacement
 with a different workload, raw-blob retention, first retained block height,
-subtree-root coverage mode, or first retained subtree-root index for either
-pool cannot take over while the reader is running. Compact-blocks and
+subtree-root coverage mode, or first retained subtree-root index for any
+shielded pool (Sapling, Orchard, or Ironwood) cannot take over while the
+reader is running. Compact-blocks and
 light-wallet compatibility report `schema_mismatch` when a replacement
 passes normal admission and then fails the pin. Native query and wallet-mode
 compatibility report `storage_unavailable` for that refusal.

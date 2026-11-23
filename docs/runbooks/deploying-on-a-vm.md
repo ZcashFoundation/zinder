@@ -317,7 +317,9 @@ its chain view matches. Uncovered blocks use canonical storage. On a compatible 
 for coverage, tail reads, and fs-verity requirements.
 
 If you customize the canonical reorg window, match it
-in `deploy/config/history-publisher.toml`. The publisher inherits the compatibility
+in `deploy/config/history-publisher.toml`. The publisher ignores
+`storage.raw_blob_policy`, but earlier releases require it to match ingest,
+so keep it equal to ingest's value if you might roll back. The publisher inherits the compatibility
 reader's memory limit. Set `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` to size its
 container separately. The wallet reader keeps one file open per admitted
 segment alongside its database files and sockets. Compose sets its soft and
@@ -441,7 +443,8 @@ volume or store paths, and wait for the required runtimes to report
 
 When replacing a canonical store at the same path, restart the readers if the
 workload, raw-blob retention, first retained block height, subtree-root
-coverage mode, or either pool's first retained subtree-root index changes.
+coverage mode, or first retained subtree-root index of any shielded pool
+changes.
 If the replacement passes normal admission but differs from the pinned
 layout, compact-blocks and light-wallet compatibility report
 `schema_mismatch`, and native query and wallet-mode compatibility report
