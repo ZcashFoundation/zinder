@@ -787,6 +787,12 @@ retention. The script writes results to
 standard output and standard error, and removes its checkouts and fixtures
 on exit.
 
+To check a second schema v7 revision after merging upstream, fetch it and
+pass it explicitly. The default baseline remains `00030603`.
+
+```bash
+scripts/test-canonical-v7-interop.sh --baseline origin/main
+```
 
 ### Reorg sweep
 

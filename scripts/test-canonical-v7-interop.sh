@@ -4,6 +4,20 @@ set -euo pipefail
 
 repo=$(git rev-parse --show-toplevel)
 baseline=00030603b10a1efc202246303af8816c098edc27
+case $# in
+  0) ;;
+  2)
+    if [[ $1 != --baseline ]]; then
+      printf 'Usage: %s [--baseline <commit>]\n' "$0" >&2
+      exit 2
+    fi
+    baseline=$(git -C "$repo" rev-parse --verify --end-of-options "${2}^{commit}")
+    ;;
+  *)
+    printf 'Usage: %s [--baseline <commit>]\n' "$0" >&2
+    exit 2
+    ;;
+esac
 candidate=$(git -C "$repo" rev-parse HEAD)
 scratch=$(mktemp -d)
 probe=crates/zinder-store/src/canonical_store/v7_interop_probe.rs
