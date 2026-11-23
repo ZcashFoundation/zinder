@@ -493,9 +493,7 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
         reads.clone(),
         view,
         chunks,
-        conversion.clone(),
-        max_bytes,
-        first_cancel,
+        (conversion.clone(), max_bytes, first_cancel),
     );
     let (first_messages, later_chunks) = stream_slot
         .hold_during(async move {
@@ -796,9 +794,7 @@ async fn read_first_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     reads: Reads,
     view: Reads::View,
     mut chunks: BlockRangeChunks,
-    conversion: Source,
-    max_bytes: usize,
-    cancel: CancellationToken,
+    (conversion, max_bytes, cancel): (Source, usize, CancellationToken),
 ) -> Result<(ChunkMessages<Source::Message>, LaterChunks), Status> {
     let Some(chunk) = chunks.next_chunk() else {
         return Ok((Vec::new(), None));
