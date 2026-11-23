@@ -69,10 +69,11 @@ ztreamer and Go lightwalletd each follow one validator, and ztreamer is the
 only indexer here that can also run that validator in its own process. Zingod
 accepts 1 to 64 validators.
 zinder-ingest follows one validator at a time from an ordered list of `[node]`
-and optional `[node_fallbacks.N]` endpoints. zinder-query and
-zinder-compat-lightwalletd use their own node list only to broadcast and, in
-wallet-mode compatibility, to read the recommended fee. zinder-explorer reads
-only `[node]`.
+and optional `[node_fallbacks.N]` endpoints. Native query uses its list for
+broadcast. Wallet-mode compatibility also uses its list for fee reads.
+Light-wallet compatibility uses one node for its
+[forwarded methods](lightwalletd-compatibility.md#runtime-serving-selection).
+Explorer observes the tip from `[node]`.
 
 ## Interfaces
 
