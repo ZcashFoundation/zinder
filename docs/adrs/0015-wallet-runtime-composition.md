@@ -19,7 +19,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 1. **One composition, one capability set.** The native wallet runtime has one production composition. After composition and admission it derives an immutable capability set from concrete evidence: the pair's persisted raw-blob retention, the methods the query implements, the configured node endpoints, and the admitted ingest-control methods. A deployment profile, or a serving setting, selects which composition a process runs ([ADR-0023](0023-deployment-profiles.md)), but neither is capability evidence. There are no capability profiles, setters, or support flags. The protocol's capability registry defines identifiers and versions, not which subset a process supports. `WalletQuery.ServerInfo` and the ops endpoint publish the same value. Each protocol adapter derives its own set, because a shared domain method is not a claim that a given adapter supports it.
 2. **Adapters enforce what they advertise.** Every native RPC except `ServerInfo` checks its capability before it touches storage or a dependency. An advertised range method still has enforced limits.
 3. **Support is fixed for the process lifetime.** A supported operation stays advertised while a dependency is down. Only requests that call the dependency fail ([ADR-0016](0016-wallet-serving-readiness.md)). Discovery is not a health check.
-4. **Ingest control is admitted once.** Before opening storage or binding traffic, the reader connects to `IngestControl` once and requires the `zinder-ingest` identity, the same network and contract revision, and the methods it needs. Every component shares that channel.
+4. **The ingest-control identity is admitted once.** Native query, wallet-mode compatibility, and light-wallet compatibility admit `IngestControl` before opening storage or binding traffic. Admission requires the `zinder-ingest` identity, the same network and contract revision, and the required methods. Native query shares the admitted channel across components. Compatibility uses separate channels for mempool reads and the tip watcher.
 5. **Broadcast is advertised from configuration and gated by verification.** `wallet.broadcast.transaction_v1` is advertised exactly when at least one node endpoint is configured. Each endpoint is verified in the background on first contact, and only verified endpoints receive transactions, so a transaction never reaches a node on another network or chain. [Node source boundary](../architecture/node-source-boundary.md#capabilities) lists the checks.
 6. **Broadcast fails over in order and stays put.** A broadcast moves to the next verified endpoint only when one is unreachable or rejects the consensus branch, and the endpoint that answers becomes preferred, with no timed failback.
 7. **Replaced pairs are retained by time, not by count.** A replaced pair stays readable for a fixed time however fast blocks arrive, so a pinned workflow's deadline does not depend on block rate. [Wallet data plane](../architecture/wallet-data-plane.md#how-reads-stay-consistent) gives the durations.
@@ -34,6 +34,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 ## Evidence
 
 - Decision 1, deployment profiles and serving settings are not capability evidence: judgment. The rejected alternative on capability profiles records the reason.
+- Decision 4, ingest-control admission: judgment. Checking the service before storage admission refuses an endpoint with the wrong identity, network, or contract before it can supply writer evidence.
 
 ## Consequences
 
@@ -71,3 +72,4 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - 2026-11-23. Decision 1 separates deployment profiles, which select a composition, from capability evidence.
 - 2026-11-23. Decision 11 links the current signed settled-history section.
 - 2026-11-23. Evidence records what decision 1 rests on.
+- 2026-11-23. Decision 4 specifies which readers admit ingest control and how they use its channels.

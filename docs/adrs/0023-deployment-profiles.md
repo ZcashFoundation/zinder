@@ -17,7 +17,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
    - which composition each reader serves; and
    - the minimum data its readers require ([ADR-0004](0004-storage-and-deployment-topologies.md) decision 2).
 
-   A setting the profile fixes may be repeated with the same value. A conflicting value fails at startup. `--print-config` shows the profile and omits the settings it supplies.
+   A setting the profile fixes may be repeated with the same value. A conflicting value fails at startup. For ingest and the compatibility listener, `--print-config` shows the profile and omits the settings it supplies. `publish-shielded-history --print-config` renders only the publisher's effective settings.
 2. **A profile is not a capability, a readiness input, or a store identity.** Capabilities derive from the composition and its admitted evidence ([ADR-0015](0015-wallet-runtime-composition.md) decision 1). Readiness follows each runtime's admission rules ([ADR-0016](0016-wallet-serving-readiness.md)). A store records what it holds, not a profile name, and a reader admits any store that meets its requirements.
 3. **The light-wallet profile serves lightwalletd clients without transaction bodies or a wallet projection.** Operators run standalone `zinder-ingest` and `zinder-compat-lightwalletd`, and run no projector and no native query. Ingest builds complete wallet-serving history from height 1, with no raw blobs and no Explorer views. Compatibility serves the light-wallet composition:
    - It requires complete block history and a complete subtree-root prefix, and it also admits a store that retains blobs.
@@ -65,3 +65,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
 - **Ship the light-wallet composition only behind a build feature.** Releases ship one reproducible build of each binary ([ADR-0022](0022-release-artifacts.md)), so a feature-gated composition never reaches operators.
 - **Forward every read the store lacks.** It is the node fallback that [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) and [ADR-0014](0014-consumer-neutral-wallet-data-plane.md) reject. Each node-backed method is declared, and each has its own binding to the served tip.
 - **Forward transparent reads in the wallet deployment.** Its consumers need exact transparent history and spend status at one epoch, which a local index gives and the node does not.
+
+## Revision history
+
+- 2026-11-23. Decision 1 distinguishes listener and ingest config output from the publisher's effective settings.
