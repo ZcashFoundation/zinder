@@ -350,17 +350,19 @@ impl http_body::Body for SendStallBoundBody {
     type Error = Status;
 
     fn poll_frame(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        let mut sending = this.sending.lock();
+        let mut sending = self.sending.lock();
         sending.handed_out_at = None;
         if !sending.unsent.is_empty() {
             return Poll::Ready(Some(Ok(Frame::data(sending.hand_out_piece()))));
         }
-        let handler_body = match &mut sending.source {
-            Source::Handler(handler_body) => handler_body,
+        let (finish_admitted_response, outcome) = match &mut sending.source {
+            Source::Handler(handler) => (
+                handler.permit.is_some(),
+                Pin::new(&mut handler.body).poll_frame(cx),
+            ),
             Source::Abandoned(status) => {
                 let trailers = trailers_reporting(status);
                 sending.source = Source::Reported;
@@ -368,13 +370,13 @@ impl http_body::Body for SendStallBoundBody {
             }
             Source::Reported => return Poll::Ready(None),
         };
-        let final_trailers = match Pin::new(&mut handler_body.body).poll_frame(cx) {
+        let final_trailers = match outcome {
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(chunk) => {
                     sending.unsent = chunk;
                     let piece = sending.hand_out_piece();
                     drop(sending);
-                    this.start_watchdog();
+                    self.start_watchdog();
                     return Poll::Ready(Some(Ok(Frame::data(piece))));
                 }
                 Err(frame) if frame.is_trailers() => Some(frame),
@@ -389,27 +391,27 @@ impl http_body::Body for SendStallBoundBody {
                 return Poll::Pending;
             }
             failed @ Poll::Ready(Some(Err(_))) => {
-                if handler_body.permit.is_some() {
-                    sending.source = Source::Reported;
-                }
+                let finished = finish_admitted_response
+                    .then(|| mem::replace(&mut sending.source, Source::Reported));
+                drop(sending);
+                drop(finished);
                 return failed;
             }
         };
         // The handler has ended its response. A request-side failure it did
         // not report becomes the response's status.
-        let receive_failure = this
+        let receive_failure = self
             .cancellation
             .as_ref()
             .and_then(ResponseCancellation::failure);
-        if handler_body.permit.is_some() || receive_failure.is_some() {
-            sending.source = Source::Reported;
-        }
-        if let Some(status) = receive_failure {
-            drop(sending);
-            return Poll::Ready(Some(trailers_reporting(&status)));
-        }
+        let finished = (finish_admitted_response || receive_failure.is_some())
+            .then(|| mem::replace(&mut sending.source, Source::Reported));
         drop(sending);
-        Poll::Ready(final_trailers.map(Ok))
+        drop(finished);
+        Poll::Ready(receive_failure.map_or_else(
+            || final_trailers.map(Ok),
+            |status| Some(trailers_reporting(&status)),
+        ))
     }
 
     fn is_end_stream(&self) -> bool {
