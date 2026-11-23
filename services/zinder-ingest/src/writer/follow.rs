@@ -30,8 +30,9 @@ use zinder_store::{
 
 use crate::{
     CanonicalBlockConstructionError, CanonicalConstructionError, CommitmentTreeSizes, IngestError,
-    MempoolReadyGate, NodeEndpointSwitch, NodeFailover, position_canonical_block,
-    prepare_canonical_block,
+    MempoolReadyGate, NodeEndpointSwitch, NodeFailover,
+    artifact_builder::prepare_canonical_block_for_retention,
+    position_canonical_block,
     source_recovery::{
         SourceOutage, SourceRecoveryDecision, decide_recovery, default_recovery_backoff,
     },
@@ -46,7 +47,6 @@ use crate::{
         answer_canonical_control_read, apply_following_canonical_control_command,
         apply_parked_canonical_control_command,
     },
-    writer::raw_blob_policy_for_retention,
 };
 
 /// Polling and bounded-source settings for canonical following.
@@ -1456,10 +1456,10 @@ fn prepare_live_block(
     raw_blob_retention: zinder_store::RawBlobRetention,
 ) -> Result<PreparedLiveBlock, CanonicalFollowError> {
     let height = source_block.height;
-    let prepared = prepare_canonical_block(
+    let prepared = prepare_canonical_block_for_retention(
         source_block,
         network_upgrade_activations,
-        raw_blob_policy_for_retention(raw_blob_retention),
+        raw_blob_retention,
     )?;
     let commitments = compact_block_commitments(&prepared)?;
     let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(

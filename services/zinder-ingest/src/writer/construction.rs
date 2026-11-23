@@ -32,19 +32,17 @@ use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{
     CanonicalBlockLoadEvidence, CanonicalBuildBlock, CanonicalBuildSubtreeRoot,
     CanonicalStoreBuildError, CanonicalStoreError, CanonicalStoreWorkload,
-    CanonicalSubtreeRootLoadEvidence, RocksDbCanonicalBuilder, TREE_STATE_CHECKPOINT_STRIDE,
-    TreeStateCheckpointSelection,
+    CanonicalSubtreeRootLoadEvidence, RawBlobRetention, RocksDbCanonicalBuilder,
+    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
 };
 
 use crate::{
-    RawBlobPolicy,
     artifact_builder::{
         CommitmentTreeSizes, PositionedCanonicalBlock, PreparedCanonicalBlock, RetainedRawBlobs,
-        position_canonical_block, prepare_canonical_block,
+        position_canonical_block, prepare_canonical_block_for_retention,
     },
     chain_ingest::IngestError,
     subtree_verification::SubtreeVerificationObservation,
-    writer::raw_blob_policy_for_retention,
 };
 use source_fetch::{
     CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
@@ -473,12 +471,8 @@ where
         usize::try_from(config.pipeline_limits.block_prepare_concurrency.get())
             .unwrap_or(usize::MAX)
             .max(1);
-    let prepared_blocks = build_prepared_block_stream(
-        source,
-        &build_plan,
-        config,
-        raw_blob_policy_for_retention(builder.raw_blob_retention()),
-    );
+    let prepared_blocks =
+        build_prepared_block_stream(source, &build_plan, config, builder.raw_blob_retention());
     let checkpoint_selection = builder.tree_state_checkpoint_selection();
     let outcome = drive_block_loader(
         builder,
@@ -792,7 +786,7 @@ fn build_prepared_block_stream<'source, Source>(
     source: &'source Source,
     build_plan: &zinder_store::CanonicalStoreBuildPlan,
     config: &CanonicalConstructionConfig,
-    raw_blob_policy: RawBlobPolicy,
+    raw_blob_retention: RawBlobRetention,
 ) -> impl Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>>
 + Send
 + use<'source, Source>
@@ -856,8 +850,12 @@ where
                 memory_permit,
             } = admitted_source_block?;
             let prepared = tokio::task::spawn_blocking(move || {
-                prepare_canonical_block(&source_block, &activations, raw_blob_policy)
-                    .map_err(IngestError::from)
+                prepare_canonical_block_for_retention(
+                    &source_block,
+                    &activations,
+                    raw_blob_retention,
+                )
+                .map_err(IngestError::from)
             })
             .await
             .map_err(|join_error| CanonicalConstructionError::Source {

@@ -22,20 +22,12 @@ use zinder_store::{
 
 use crate::{
     CanonicalConstructionConfig, CanonicalConstructionError, CanonicalControlCommand,
-    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, RawBlobPolicy,
-    follow_canonical_tip, follow_canonical_tip_with_control,
+    CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, follow_canonical_tip,
+    follow_canonical_tip_with_control,
 };
 use construction::{
     load_fresh_canonical_until_cancelled, record_construction_cancelled, record_construction_phase,
 };
-
-pub(super) const fn raw_blob_policy_for_retention(retention: RawBlobRetention) -> RawBlobPolicy {
-    match retention {
-        RawBlobRetention::None => RawBlobPolicy::None,
-        RawBlobRetention::Transactions => RawBlobPolicy::Transactions,
-        RawBlobRetention::All => RawBlobPolicy::All,
-    }
-}
 
 /// Complete concrete configuration for the first `RocksDB` single-host writer.
 #[derive(Clone, Debug)]
