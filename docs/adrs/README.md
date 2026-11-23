@@ -39,7 +39,7 @@ stop the debate from being repeated.
 | --- | --- | --- |
 | [0001](0001-rocksdb-canonical-store.md) | Store chain data in RocksDB | RocksDB is the storage engine for chain, wallet, and view data in the supported single-host topology. |
 | [0002](0002-serialization-and-byte-order.md) | Serialization and byte order | Each boundary chooses its own serialization, and hashes on the wire use RPC byte order. |
-| [0003](0003-epoch-bound-reads-and-storage-roles.md) | Epoch-bound reads and storage roles | Every read binds to one chain epoch, and each store has exactly one writer with secondary readers. |
+| [0003](0003-epoch-bound-reads-and-storage-roles.md) | Epoch-bound reads and storage roles | Every read of stored data binds to one chain epoch, node-backed reads bind to the served tip, and each store has exactly one writer with secondary readers. |
 | [0004](0004-storage-and-deployment-topologies.md) | Storage and deployment topologies | Canonical and projection storage stay separate, and each deployment runs one topology. Single-host RocksDB is supported; a multi-host PostgreSQL topology for hosted fleets is decided but not implemented. |
 | [0005](0005-bounded-process-memory.md) | Bounded process memory | Process memory is bounded independently of store size, and service binaries allocate through jemalloc. |
 | [0006](0006-node-source-boundary.md) | Node source boundary | Node adapters sit behind one source boundary, separate from the protocols Zinder serves. |
