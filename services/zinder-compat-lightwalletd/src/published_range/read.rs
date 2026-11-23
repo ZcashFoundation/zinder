@@ -207,7 +207,7 @@ impl PublishedRangeRead {
         let coverage = history.bounds();
         coverage.start <= chunk.start
             && chunk.end <= coverage.end
-            && CompactBlockShape::for_range(&[]).ok() == Some(self.shape)
+            && self.shape == CompactBlockShape::DEFAULT_RANGE
     }
 
     async fn resolve_plan<Reads: CompactBlockReads>(
