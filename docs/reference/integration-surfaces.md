@@ -37,14 +37,14 @@ Regtest is a private chain for local development and exists only on a Zinder you
 
 Use the endpoint that matches both choices. On your own deployment, that is the Compose port from the protocol table. Compose adds 10000 to each port on Testnet and 20000 on Regtest. [Deploying Zinder](../runbooks/deploying.md) starts a deployment beside your own node.
 
-The Zcash Foundation runs these endpoints for a pilot:
+The Zcash Foundation runs these public endpoints, which any client can use:
 
 | Protocol | Mainnet | Testnet |
 | --- | --- | --- |
 | lightwalletd `CompactTxStreamer` | `https://lwd.zfnd.org:443` | `https://testnet.lwd.zfnd.org:443` |
 | Native `WalletQuery`, including `zinder-client` | `https://zinder.zfnd.org:443` | `https://testnet.zinder.zfnd.org:443` |
 
-The pilot endpoints admit specific clients and are not open to the public. Use one only after the Foundation admits your client. Otherwise, run your own Zinder and use its address.
+Each address is a gRPC endpoint over TLS, not a website. Give it to a gRPC client, such as a wallet, `grpcurl`, or `zinder-client`. A browser that opens it gets no page.
 
 ## What every client must handle
 
@@ -176,7 +176,13 @@ This quickstart builds a small program that connects to a native endpoint, confi
    }
    ```
 
-3. Run it with the endpoint and the network you expect it to serve. For a Zinder you run with the [Compose quickstart](../runbooks/deploying.md#quickstart-with-docker-compose) on Testnet:
+3. Run it with the endpoint and the network you expect it to serve. Against the Foundation's public Testnet endpoint:
+
+   ```bash
+   cargo run -- https://testnet.zinder.zfnd.org:443 testnet
+   ```
+
+   Against a Zinder you run with the [Compose quickstart](../runbooks/deploying.md#quickstart-with-docker-compose) on Testnet:
 
    ```bash
    cargo run -- http://127.0.0.1:19102 testnet
@@ -199,7 +205,7 @@ The endpoint and the network are separate arguments, and the client checks that 
 Error: NetworkMismatch { expected: ZcashTestnet, actual: "zcash-mainnet" }
 ```
 
-For a local endpoint, pass the network of your own deployment. For a Foundation pilot endpoint, pass `Network::ZcashMainnet` or `Network::ZcashTestnet` to match the column you took the address from in [Endpoints](#endpoints).
+For a local endpoint, pass the network of your own deployment. For a Foundation endpoint, pass `Network::ZcashMainnet` or `Network::ZcashTestnet` to match the column you took the address from in [Endpoints](#endpoints).
 
 ### TLS
 
