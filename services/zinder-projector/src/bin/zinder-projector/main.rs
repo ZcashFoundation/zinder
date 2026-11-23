@@ -462,6 +462,7 @@ async fn project_wallet(
         sst_target_logical_bytes: config.build.sst_target_logical_bytes,
         max_accounted_reorg_undo_bytes: config.build.max_accounted_reorg_undo_bytes,
         supported_reorg_depth: config.reorg_window_blocks,
+        accumulator_hashing_workers: config.build.accumulator_hashing_workers,
     };
     let lease_duration = config.lease_duration;
     let build_cancel = cancel.clone();

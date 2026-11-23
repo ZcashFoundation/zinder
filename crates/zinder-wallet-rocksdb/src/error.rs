@@ -3,7 +3,10 @@
 use std::{io, path::PathBuf};
 
 use thiserror::Error;
-use zinder_core::{CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis};
+use zinder_core::{
+    CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis,
+    UtxoSetCommitmentSchemeMismatch,
+};
 use zinder_rocksdb_bulk_load::BulkLoadError;
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
@@ -202,6 +205,37 @@ pub enum RocksDbWalletError {
     /// The monotonic lease-generation domain is exhausted.
     #[error("wallet projection build lease generation exceeds u64::MAX")]
     WalletProjectionBuildLeaseGenerationOverflow,
+    /// The build options ask for more accumulator hashing threads than a build
+    /// may use.
+    #[error(
+        "accumulator_hashing_workers is {workers}; a wallet build uses at most {maximum} hashing threads"
+    )]
+    AccumulatorHashingWorkersOutOfRange {
+        /// Requested `accumulator_hashing_workers`.
+        workers: u32,
+        /// [`crate::MAX_ACCUMULATOR_HASHING_WORKERS`].
+        maximum: u32,
+    },
+    /// The build's accumulator hashing threads could not be started.
+    #[error("could not start {workers} wallet accumulator hashing threads: {reason}")]
+    AccumulatorHashingWorkersUnavailable {
+        /// Configured `accumulator_hashing_workers`.
+        workers: u32,
+        /// Thread-pool construction failure.
+        reason: String,
+    },
+    /// Partial UTXO set commitments of different schemes could not be combined.
+    #[error(transparent)]
+    UtxoSetCommitmentScheme(#[from] UtxoSetCommitmentSchemeMismatch),
+    /// Cold validation could not start one of its scan threads.
+    #[error("could not start a wallet cold-validation thread: {reason}")]
+    ColdValidationThreadUnavailable {
+        /// Thread-start failure reported by the operating system.
+        reason: String,
+    },
+    /// An accumulator hashing thread stopped before returning its batch.
+    #[error("a wallet accumulator hashing thread stopped before finishing its rows")]
+    AccumulatorHashingWorkerStopped,
     /// A caller stopped a projection build before READY promotion.
     #[error("wallet projection build was cancelled")]
     ProjectionBuildCancelled,

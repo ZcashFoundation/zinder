@@ -950,6 +950,30 @@ fn acquire_owner_canonical_lease(
 }
 
 #[test]
+fn an_over_limit_hashing_worker_count_is_refused_before_building_state_exists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let wallet_path = temporary.path().join("wallet-over-limit-workers");
+    let options = RocksDbWalletBuildOptions {
+        accumulator_hashing_workers: std::num::NonZeroU32::new(65)
+            .ok_or("the test worker count must be nonzero")?,
+        ..RocksDbWalletBuildOptions::for_local_tests()
+    };
+
+    assert!(matches!(
+        build_wallet_from_canonical(&canonical_store, &wallet_path, options),
+        Err(RocksDbWalletError::AccumulatorHashingWorkersOutOfRange {
+            workers: 65,
+            maximum: 64,
+        })
+    ));
+    assert!(!wallet_path.exists());
+    Ok(())
+}
+
+#[test]
 fn pre_promotion_error_releases_its_exact_lease_for_immediate_discard_and_retry()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
@@ -1798,10 +1822,34 @@ fn assert_phase_breakdowns_fit_their_parents(report: &RocksDbWalletBuildReport) 
     );
 
     let stages = report.stage_durations();
-    let mut stage_names = stages.iter().map(|stage| stage.stage).collect::<Vec<_>>();
-    stage_names.sort_unstable();
-    stage_names.dedup();
-    assert_eq!(stage_names.len(), stages.len());
+    // The metrics reference documents exactly these stages, in this order.
+    assert_eq!(
+        stages.iter().map(|stage| stage.stage).collect::<Vec<_>>(),
+        [
+            "store_initialization",
+            "canonical_scan",
+            "outpoint_run_spill",
+            "outpoint_sort",
+            "outpoint_drain",
+            "primary_sst_write",
+            "address_index_run_spill",
+            "address_transaction_run_spill",
+            "address_index_sort",
+            "address_index_drain",
+            "address_index_sst_write",
+            "address_transaction_sort",
+            "address_transaction_drain",
+            "address_transaction_sst_write",
+            "reorg_undo_write",
+            "logical_evidence",
+            "row_load",
+            "flush_and_close",
+            "cold_reopen",
+            "cold_validation_family_readback",
+            "cold_validation_reorg_undo_readback",
+            "ready_publication",
+        ]
+    );
     let stage_total = stages
         .iter()
         .map(|stage| stage.duration)

@@ -36,7 +36,7 @@ pub mod wire;
 
 pub use utxo_set_commitment::{
     TransparentUtxoSetCommitment, UTXO_SET_COMMITMENT_DIGEST_LEN, UTXO_SET_COMMITMENT_LEN,
-    UtxoSetCommitmentScheme,
+    UtxoSetCommitmentScheme, UtxoSetCommitmentSchemeMismatch,
 };
 
 pub use block_artifact::{

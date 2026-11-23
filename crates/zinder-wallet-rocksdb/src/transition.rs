@@ -2840,6 +2840,8 @@ mod tests {
                 ready_evidence,
                 WalletColdValidationConfig {
                     max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
+                    primary_output_scan_ranges: std::num::NonZeroU32::MIN,
+                    min_primary_rows_per_scan_range: std::num::NonZeroU64::MIN,
                 },
             )?
             .publish_ready_at(UnixTimestampMillis::new(0))?;

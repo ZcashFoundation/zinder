@@ -765,6 +765,8 @@ fn park_config(
             max_temporary_file_bytes_per_sorter: 256 * 1024 * 1024,
             sst_target_logical_bytes: 1024 * 1024,
             max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
+            accumulator_hashing_workers: std::num::NonZeroU32::new(2)
+                .ok_or("the test hashing worker count must be nonzero")?,
         },
         follow: ProjectorFollowConfig {
             max_transition_logical_bytes: NonZeroU64::new(TRANSITION_LIMIT_BYTES)

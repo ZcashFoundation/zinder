@@ -4,9 +4,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     mem::size_of,
-    num::{NonZeroU16, NonZeroU64},
+    num::{NonZeroU16, NonZeroU32, NonZeroU64},
+    ops::Range,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use zinder_rocksdb_bulk_load::{SortedVariableValues, VariableValueSorter};
@@ -19,8 +23,8 @@ use rust_rocksdb::{
 };
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFactsSequenceDigest, Network,
-    TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
-    ValidatedCanonicalBlockReplay,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentUtxoSetCommitment,
+    UnixTimestampMillis, ValidatedCanonicalBlockReplay,
 };
 use zinder_store::{
     BoundedRocksDbOpen, CanonicalEventFence, CanonicalRetainedEvent, CanonicalStoreError,
@@ -190,7 +194,21 @@ pub(crate) struct ValidatedRocksDbWalletBuild {
 #[derive(Clone, Copy)]
 pub(crate) struct WalletColdValidationConfig {
     pub(crate) max_accounted_reorg_undo_bytes: u64,
+    /// Requested outpoint key ranges the primary output families are read
+    /// back in, each on its own thread.
+    pub(crate) primary_output_scan_ranges: NonZeroU32,
+    /// Fewest primary output rows each requested range must cover; smaller
+    /// stores use fewer ranges.
+    pub(crate) min_primary_rows_per_scan_range: NonZeroU64,
 }
+
+/// Fewest primary output rows a production cold-validation range covers.
+///
+/// A store with fewer rows than this reads its primary families on one thread.
+pub(crate) const MIN_PRIMARY_ROWS_PER_SCAN_RANGE: NonZeroU64 = match NonZeroU64::new(1 << 16) {
+    Some(rows) => rows,
+    None => NonZeroU64::MIN,
+};
 
 /// Explicit bounded resources for one independent cold semantic re-derivation.
 #[derive(Clone, Copy)]
@@ -2099,6 +2117,67 @@ impl ExpectedReorgUndoSuffix {
     }
 }
 
+/// The expected reorg-undo suffix shared by concurrent primary-output scans.
+///
+/// The suffix's heights are fixed when it is created, so a row outside them
+/// is skipped without taking the lock. Rows inside them update one suffix,
+/// and because each key is admitted once whatever the order, the suffix ends
+/// with the same keys and accounted bytes as after one serial scan.
+#[derive(Debug)]
+struct SharedExpectedReorgUndoSuffix {
+    heights: Range<u64>,
+    suffix: parking_lot::Mutex<ExpectedReorgUndoSuffix>,
+}
+
+impl SharedExpectedReorgUndoSuffix {
+    fn new(suffix: ExpectedReorgUndoSuffix) -> Self {
+        let heights = match (
+            suffix.undo_by_height.first_key_value(),
+            suffix.undo_by_height.last_key_value(),
+        ) {
+            (Some((first, _)), Some((last, _))) => u64::from(*first)..u64::from(*last) + 1,
+            _ => 0..0,
+        };
+        Self {
+            heights,
+            suffix: parking_lot::Mutex::new(suffix),
+        }
+    }
+
+    fn tracks(&self, height: BlockHeight) -> bool {
+        self.heights.contains(&u64::from(height.value()))
+    }
+
+    fn observe_address_transaction(
+        &self,
+        key: WalletAddressTransactionKey,
+        block: zinder_core::BlockId,
+    ) -> Result<(), RocksDbWalletError> {
+        if !self.tracks(block.height) {
+            return Ok(());
+        }
+        self.suffix.lock().observe_address_transaction(key, block)
+    }
+
+    fn observe_created(&self, output: &WalletUnspentOutput) -> Result<(), RocksDbWalletError> {
+        if !self.tracks(output.created_at.block.height) {
+            return Ok(());
+        }
+        self.suffix.lock().observe_created(output)
+    }
+
+    fn observe_spent(&self, spent: &WalletSpentOutput) -> Result<(), RocksDbWalletError> {
+        if !self.tracks(spent.spent_at.block.height) {
+            return Ok(());
+        }
+        self.suffix.lock().observe_spent(spent)
+    }
+
+    fn into_inner(self) -> ExpectedReorgUndoSuffix {
+        self.suffix.into_inner()
+    }
+}
+
 fn validate_spent_position(spent: &WalletSpentOutput) -> Result<(), RocksDbWalletError> {
     let created = spent.output.created_at;
     let consumed = spent.spent_at;
@@ -2163,8 +2242,9 @@ fn require_ready_evidence_matches_rows(
 ///
 /// Every family is scanned once in stored key order. The primary output
 /// families, the address-ordered families, and the address-transaction family
-/// are scanned on separate threads, each accumulating its own rows, and the
-/// order-independent partial accumulators are then combined. The scan recomputes the
+/// are scanned on separate threads, the primary output families split into
+/// outpoint key ranges with a thread each. Each scan accumulates its own rows,
+/// and the order-independent partial accumulators are then combined. The scan recomputes the
 /// accumulator and the six row counts and compares them with the values
 /// emitted while the SST files were written, so a row that was lost, altered,
 /// duplicated, or added between SST writing and publication changes the
@@ -2180,11 +2260,11 @@ fn validate_ready_rows_by_readback(
 ) -> Result<WalletColdValidationEvidence, RocksDbWalletError> {
     let counts = evidence.row_counts;
     require_address_index_covers_unspent_outputs(&counts)?;
-    let mut expected_undo = ExpectedReorgUndoSuffix::new(
+    let expected_undo = SharedExpectedReorgUndoSuffix::new(ExpectedReorgUndoSuffix::new(
         evidence.settled_tip,
         counts.reorg_undo_count,
         config.max_accounted_reorg_undo_bytes,
-    )?;
+    )?);
     let readback_started = Instant::now();
     let ConcurrentFamilyReadback {
         mut digest,
@@ -2192,8 +2272,15 @@ fn validate_ready_rows_by_readback(
         primary_output_scan,
         address_index_and_balance_readback,
         address_transaction_readback,
-    } = read_back_large_families(bounded_open, network, &counts, &mut expected_undo)?;
+    } = read_back_large_families(
+        bounded_open,
+        network,
+        &counts,
+        &expected_undo,
+        primary_output_scan_range_count(&config, &counts),
+    )?;
     let concurrent_family_readback = readback_started.elapsed();
+    let expected_undo = expected_undo.into_inner();
 
     let phase_started = Instant::now();
     validate_reorg_undo_rows(
@@ -2235,23 +2322,26 @@ struct ConcurrentFamilyReadback {
 /// Scans the three large families on separate threads and combines their
 /// order-independent partial accumulators.
 ///
-/// The retained reorg-undo suffix is validated afterwards because it depends
-/// on the effects observed by the primary output scan.
+/// The primary output families are scanned in `primary_output_scan_ranges`
+/// outpoint key ranges, each on its own thread. The retained reorg-undo suffix
+/// is validated afterwards because it depends on the effects observed by the
+/// primary output scan.
 fn read_back_large_families(
     bounded_open: &BoundedRocksDbOpen,
     network: Network,
     counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
-    expected_undo: &mut ExpectedReorgUndoSuffix,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
+    primary_output_scan_ranges: NonZeroU32,
 ) -> Result<ConcurrentFamilyReadback, RocksDbWalletError> {
     let (primary, address_index, address_transactions) = std::thread::scope(|scope| {
-        let address_index_worker = scope.spawn(|| {
+        let address_index_worker = spawn_validation_scan(scope, || {
             let started = Instant::now();
             let mut family_digest = WalletProjectionDigestBuilder::new();
             let balance_total_zat =
                 read_back_address_index_and_balance_rows(bounded_open, &mut family_digest, counts)?;
             Ok::<_, RocksDbWalletError>((family_digest, balance_total_zat, started.elapsed()))
-        });
-        let address_transaction_worker = scope.spawn(|| {
+        })?;
+        let address_transaction_worker = spawn_validation_scan(scope, || {
             let started = Instant::now();
             let mut family_digest = WalletProjectionDigestBuilder::new();
             read_back_address_transaction_rows(
@@ -2260,28 +2350,22 @@ fn read_back_large_families(
                 counts.transparent_address_transaction_count,
             )?;
             Ok::<_, RocksDbWalletError>((family_digest, started.elapsed()))
-        });
+        })?;
         let started = Instant::now();
-        let mut family_digest = WalletProjectionDigestBuilder::new();
-        let primary = validate_primary_output_rows(
+        let primary = read_back_primary_output_rows(
             bounded_open,
             network,
-            &mut family_digest,
-            None,
             expected_undo,
             counts,
+            primary_output_scan_ranges,
         )
-        .map(|utxo_summary| (family_digest, utxo_summary, started.elapsed()));
-        (
+        .map(|(family_digest, utxo_summary)| (family_digest, utxo_summary, started.elapsed()));
+        Ok::<_, RocksDbWalletError>((
             primary,
-            address_index_worker
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-            address_transaction_worker
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-        )
-    });
+            join_validation_scan(address_index_worker),
+            join_validation_scan(address_transaction_worker),
+        ))
+    })?;
     let (mut digest, utxo_summary, primary_output_scan) = primary?;
     let (address_index_digest, indexed_balance_zat, address_index_and_balance_readback) =
         address_index?;
@@ -2300,6 +2384,50 @@ fn read_back_large_families(
         address_index_and_balance_readback,
         address_transaction_readback,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests set this to refuse a cold-validation thread started from this
+    /// thread, as an operating system does when it has no thread left. It
+    /// holds how many more starts succeed before the refused one.
+    static REFUSED_VALIDATION_THREAD: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Starts one cold-validation scan on its own thread in `scope`.
+///
+/// A refused thread start is an error, not a panic, so the build fails through
+/// its ordinary error path and releases its lease.
+fn spawn_validation_scan<'scope, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    scan: impl FnOnce() -> T + Send + 'scope,
+) -> Result<std::thread::ScopedJoinHandle<'scope, T>, RocksDbWalletError> {
+    #[cfg(test)]
+    match REFUSED_VALIDATION_THREAD.get() {
+        Some(0) => {
+            REFUSED_VALIDATION_THREAD.set(None);
+            return Err(RocksDbWalletError::ColdValidationThreadUnavailable {
+                reason: "thread start refused by the test".to_owned(),
+            });
+        }
+        Some(remaining) => REFUSED_VALIDATION_THREAD.set(Some(remaining - 1)),
+        None => {}
+    }
+    std::thread::Builder::new()
+        .name("zinder-wallet-validate".to_owned())
+        .spawn_scoped(scope, scan)
+        .map_err(
+            |source| RocksDbWalletError::ColdValidationThreadUnavailable {
+                reason: source.to_string(),
+            },
+        )
+}
+
+fn join_validation_scan<T>(worker: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    worker
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// Re-derives the address-ordered families from the primary output rows through
@@ -2330,20 +2458,19 @@ fn validate_ready_rows_by_semantic_rederivation(
             config.max_temporary_file_bytes_per_sorter,
         )?,
     };
-    let mut expected_undo = ExpectedReorgUndoSuffix::new(
+    let expected_undo = SharedExpectedReorgUndoSuffix::new(ExpectedReorgUndoSuffix::new(
         evidence.settled_tip,
         counts.reorg_undo_count,
         config.max_accounted_reorg_undo_bytes,
-    )?;
-    let mut digest = WalletProjectionDigestBuilder::new();
-    let utxo_summary = validate_primary_output_rows(
+    )?);
+    let (mut digest, utxo_summary) = validate_primary_output_rows(
         bounded_open,
         network,
-        &mut digest,
         Some(&mut sorters),
-        &mut expected_undo,
+        &expected_undo,
         &counts,
     )?;
+    let expected_undo = expected_undo.into_inner();
     let AddressDerivationSorters {
         index: address_index_sorter,
         transaction: address_transaction_sorter,
@@ -2495,40 +2622,291 @@ struct AddressDerivationSorters {
     transaction: VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the ordered two-family merge keeps every derived relation tied to its decoded primary row"
-)]
+/// One contiguous range of outpoint keys, bounded by key prefixes.
+///
+/// A missing bound leaves that end of the key space open.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OutpointKeyRange {
+    lower: Option<[u8; 2]>,
+    upper: Option<[u8; 2]>,
+}
+
+impl OutpointKeyRange {
+    const ALL: Self = Self {
+        lower: None,
+        upper: None,
+    };
+
+    fn read_options(&self) -> ReadOptions {
+        let mut options = validation_read_options();
+        if let Some(upper) = self.upper {
+            options.set_iterate_upper_bound(upper.to_vec());
+        }
+        options
+    }
+
+    fn start(&self) -> IteratorMode<'_> {
+        self.lower.as_ref().map_or(IteratorMode::Start, |lower| {
+            IteratorMode::From(lower.as_slice(), Direction::Forward)
+        })
+    }
+}
+
+/// Splits the outpoint key space into `count` contiguous ranges of equal
+/// width by the keys' first two bytes, at most one range per prefix.
+///
+/// Outpoint keys start with a transaction id, a hash, so the ranges hold
+/// about the same number of rows.
+fn outpoint_key_ranges(count: NonZeroU32) -> Vec<OutpointKeyRange> {
+    const PREFIXES: u64 = 1 << 16;
+    let count = u64::from(count.get()).min(PREFIXES);
+    let boundary = |index: u64| {
+        let prefix = u16::try_from(index * PREFIXES / count).unwrap_or(u16::MAX);
+        prefix.to_be_bytes()
+    };
+    (0..count)
+        .map(|index| OutpointKeyRange {
+            lower: (index > 0).then(|| boundary(index)),
+            upper: (index + 1 < count).then(|| boundary(index + 1)),
+        })
+        .collect()
+}
+
+/// Accumulators and totals of the primary output rows in one key range.
+struct PrimaryOutputTotals {
+    digest: WalletProjectionDigestBuilder,
+    unspent_count: u64,
+    spent_count: u64,
+    total_value_zat: u64,
+    commitment: TransparentUtxoSetCommitment,
+}
+
+impl PrimaryOutputTotals {
+    fn new() -> Self {
+        Self {
+            digest: WalletProjectionDigestBuilder::new(),
+            unspent_count: 0,
+            spent_count: 0,
+            total_value_zat: 0,
+            commitment: TransparentUtxoSetCommitment::empty(),
+        }
+    }
+
+    /// Adds the totals of a disjoint key range.
+    fn combine(&mut self, other: &Self) -> Result<(), RocksDbWalletError> {
+        let overflow = |reason| RocksDbWalletError::AdmissionChanged { reason };
+        let unspent_count = self
+            .unspent_count
+            .checked_add(other.unspent_count)
+            .ok_or_else(|| overflow("unspent row count overflow"))?;
+        let spent_count = self
+            .spent_count
+            .checked_add(other.spent_count)
+            .ok_or_else(|| overflow("spent row count overflow"))?;
+        let total_value_zat = self
+            .total_value_zat
+            .checked_add(other.total_value_zat)
+            .ok_or_else(|| overflow("unspent value total overflow"))?;
+        self.digest.combine(&other.digest)?;
+        self.commitment.combine(&other.commitment)?;
+        self.unspent_count = unspent_count;
+        self.spent_count = spent_count;
+        self.total_value_zat = total_value_zat;
+        Ok(())
+    }
+
+    /// Checks the row counts against the READY evidence and returns the
+    /// digest and the UTXO set summary.
+    fn finish(
+        self,
+        counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
+    ) -> Result<(WalletProjectionDigestBuilder, WalletUtxoSetSummary), RocksDbWalletError> {
+        if self.unspent_count != counts.transparent_unspent_output_count {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "unspent row count differs from READY evidence",
+            });
+        }
+        if self.spent_count != counts.transparent_spent_output_count {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "spent row count differs from READY evidence",
+            });
+        }
+        Ok((
+            self.digest,
+            WalletUtxoSetSummary {
+                utxo_count: self.unspent_count,
+                total_value_zat: self.total_value_zat,
+                commitment: self.commitment,
+            },
+        ))
+    }
+}
+
+/// Validates both primary output families in one ordered merged scan and
+/// re-derives their address rows into `address_sorters` when given.
 fn validate_primary_output_rows(
     bounded_open: &BoundedRocksDbOpen,
     network: Network,
-    digest: &mut WalletProjectionDigestBuilder,
-    mut address_sorters: Option<&mut AddressDerivationSorters>,
-    expected_undo: &mut ExpectedReorgUndoSuffix,
+    address_sorters: Option<&mut AddressDerivationSorters>,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
     counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
-) -> Result<WalletUtxoSetSummary, RocksDbWalletError> {
+) -> Result<(WalletProjectionDigestBuilder, WalletUtxoSetSummary), RocksDbWalletError> {
+    let range = PrimaryScanRange {
+        keys: &OutpointKeyRange::ALL,
+        stop: None,
+    };
+    scan_primary_output_range(bounded_open, network, range, address_sorters, expected_undo)?
+        .ok_or(RocksDbWalletError::AdmissionChanged {
+            reason: "an unstoppable primary output scan stopped",
+        })?
+        .finish(counts)
+}
+
+/// Returns how many outpoint key ranges cold validation reads the primary
+/// output families in.
+///
+/// The count is the requested one, at most
+/// [`crate::MAX_ACCUMULATOR_HASHING_WORKERS`], and at most one range per
+/// `min_primary_rows_per_scan_range` primary rows, so a small store starts few
+/// threads whatever the setting.
+fn primary_output_scan_range_count(
+    config: &WalletColdValidationConfig,
+    counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
+) -> NonZeroU32 {
+    let primary_rows = counts
+        .transparent_unspent_output_count
+        .saturating_add(counts.transparent_spent_output_count);
+    let ranges_by_rows = primary_rows / config.min_primary_rows_per_scan_range;
+    let ranges = u64::from(config.primary_output_scan_ranges.get())
+        .min(u64::from(crate::MAX_ACCUMULATOR_HASHING_WORKERS))
+        .min(ranges_by_rows);
+    NonZeroU32::new(u32::try_from(ranges).unwrap_or(u32::MAX)).unwrap_or(NonZeroU32::MIN)
+}
+
+/// Reads both primary output families back in `ranges` outpoint key ranges,
+/// each on its own thread, and combines their totals.
+///
+/// Both families share the outpoint key, so each range sees every row of an
+/// outpoint and runs the same per-row checks as one scan of the whole store.
+/// Once one range fails, or a range thread cannot start, the others stop at
+/// their next row, and the first failure is returned.
+fn read_back_primary_output_rows(
+    bounded_open: &BoundedRocksDbOpen,
+    network: Network,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
+    counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
+    ranges: NonZeroU32,
+) -> Result<(WalletProjectionDigestBuilder, WalletUtxoSetSummary), RocksDbWalletError> {
+    let ranges = outpoint_key_ranges(ranges);
+    let stop = AtomicBool::new(false);
+    let scan = |keys: &OutpointKeyRange| {
+        let range = PrimaryScanRange {
+            keys,
+            stop: Some(&stop),
+        };
+        let scanned = scan_primary_output_range(bounded_open, network, range, None, expected_undo);
+        if scanned.is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        scanned
+    };
+    let scanned = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(ranges.len());
+        let mut start_failure = None;
+        for keys in ranges.iter().skip(1) {
+            match spawn_validation_scan(scope, move || scan(keys)) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    stop.store(true, Ordering::Relaxed);
+                    start_failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let mut scanned = Vec::with_capacity(ranges.len());
+        if start_failure.is_none() {
+            scanned.push(
+                ranges
+                    .first()
+                    .map_or_else(|| Ok(Some(PrimaryOutputTotals::new())), scan),
+            );
+        }
+        for worker in workers {
+            scanned.push(join_validation_scan(worker));
+        }
+        start_failure.map_or(Ok(scanned), Err)
+    })?;
+    let mut totals = PrimaryOutputTotals::new();
+    let mut stopped = false;
+    for range_totals in scanned {
+        match range_totals? {
+            Some(range_totals) => totals.combine(&range_totals)?,
+            None => stopped = true,
+        }
+    }
+    if stopped {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "a primary output scan range stopped without a failing range",
+        });
+    }
+    totals.finish(counts)
+}
+
+/// One key range of a primary output scan and the flag that stops it early.
+#[derive(Clone, Copy)]
+struct PrimaryScanRange<'scan> {
+    keys: &'scan OutpointKeyRange,
+    /// Set once another range has failed, so this one stops at its next row.
+    stop: Option<&'scan AtomicBool>,
+}
+
+impl PrimaryScanRange<'_> {
+    fn stopped(&self) -> bool {
+        self.stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered two-family merge keeps every derived relation tied to its decoded primary row"
+)]
+/// Scans both primary output families over one key range, or returns `None`
+/// when another range's failure stopped it first.
+fn scan_primary_output_range(
+    bounded_open: &BoundedRocksDbOpen,
+    network: Network,
+    range: PrimaryScanRange<'_>,
+    mut address_sorters: Option<&mut AddressDerivationSorters>,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
+) -> Result<Option<PrimaryOutputTotals>, RocksDbWalletError> {
     use zinder_core::wire::UtxoSetCommitmentElement;
 
     let unspent_family = column_family(bounded_open, TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY)?;
     let spent_family = column_family(bounded_open, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY)?;
     let mut unspent_rows = bounded_open.db.iterator_cf_opt(
         &unspent_family,
-        validation_read_options(),
-        IteratorMode::Start,
+        range.keys.read_options(),
+        range.keys.start(),
     );
     let mut spent_rows = bounded_open.db.iterator_cf_opt(
         &spent_family,
-        validation_read_options(),
-        IteratorMode::Start,
+        range.keys.read_options(),
+        range.keys.start(),
     );
     let mut next_unspent = next_validation_row(&mut unspent_rows, "unspent validation scan")?;
     let mut next_spent = next_validation_row(&mut spent_rows, "spent validation scan")?;
-    let mut unspent_count = 0u64;
-    let mut spent_count = 0u64;
-    let mut total_value_zat = 0u64;
-    let mut commitment = zinder_core::TransparentUtxoSetCommitment::empty();
+    let PrimaryOutputTotals {
+        digest: mut range_digest,
+        mut unspent_count,
+        mut spent_count,
+        mut total_value_zat,
+        mut commitment,
+    } = PrimaryOutputTotals::new();
+    let digest = &mut range_digest;
     while next_unspent.is_some() || next_spent.is_some() {
+        if range.stopped() {
+            return Ok(None);
+        }
         let take_unspent = match (&next_unspent, &next_spent) {
             (Some((unspent_key, _)), Some((spent_key, _))) => {
                 match unspent_key.as_ref().cmp(spent_key.as_ref()) {
@@ -2628,26 +3006,18 @@ fn validate_primary_output_rows(
             next_spent = next_validation_row(&mut spent_rows, "spent validation scan")?;
         }
     }
-    if unspent_count != counts.transparent_unspent_output_count {
-        return Err(RocksDbWalletError::AdmissionChanged {
-            reason: "unspent row count differs from READY evidence",
-        });
-    }
-    if spent_count != counts.transparent_spent_output_count {
-        return Err(RocksDbWalletError::AdmissionChanged {
-            reason: "spent row count differs from READY evidence",
-        });
-    }
-    Ok(WalletUtxoSetSummary {
-        utxo_count: unspent_count,
+    Ok(Some(PrimaryOutputTotals {
+        digest: range_digest,
+        unspent_count,
+        spent_count,
         total_value_zat,
         commitment,
-    })
+    }))
 }
 
 fn stage_expected_address_transaction(
     sorter: Option<&mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>>,
-    expected_undo: &mut ExpectedReorgUndoSuffix,
+    expected_undo: &SharedExpectedReorgUndoSuffix,
     address_script_hash: TransparentAddressScriptHash,
     position: zinder_wallet_projection::WalletTransactionPosition,
 ) -> Result<(), RocksDbWalletError> {
@@ -3083,7 +3453,22 @@ mod tests {
     const fn validation_config() -> WalletColdValidationConfig {
         WalletColdValidationConfig {
             max_accounted_reorg_undo_bytes: TEST_VALIDATION_REORG_UNDO_BYTES,
+            primary_output_scan_ranges: NonZeroU32::MIN.saturating_add(1),
+            min_primary_rows_per_scan_range: NonZeroU64::MIN,
         }
+    }
+
+    /// Primary output scan range counts the readback tests cover: one range,
+    /// two, and enough to put most fixture outpoints in ranges of their own.
+    const PRIMARY_OUTPUT_SCAN_RANGES: [u32; 4] = [1, 2, 8, 64];
+
+    fn validation_config_with_ranges(
+        ranges: u32,
+    ) -> Result<WalletColdValidationConfig, Box<dyn std::error::Error>> {
+        Ok(WalletColdValidationConfig {
+            primary_output_scan_ranges: NonZeroU32::new(ranges).ok_or("zero scan ranges")?,
+            ..validation_config()
+        })
     }
 
     fn semantic_validation_config(staging_path: &Path) -> WalletSemanticValidationConfig<'_> {
@@ -3472,7 +3857,7 @@ mod tests {
         })
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum SemanticTamper {
         OrphanAddressIndex,
         MissingAddressIndex,
@@ -3841,29 +4226,50 @@ mod tests {
             );
             assert_eq!(admission_reason(semantic)?, tamper.expected_reason());
 
-            let readback = validate_ready_rows_by_readback(
-                &cold.bounded_open,
-                network,
-                &evidence,
-                validation_config(),
-            );
-            if tamper.is_visible_only_to_semantic_rederivation() {
-                readback?;
-            } else {
-                assert_eq!(admission_reason(readback)?, tamper.expected_reason());
+            for ranges in PRIMARY_OUTPUT_SCAN_RANGES {
+                let readback = validate_ready_rows_by_readback(
+                    &cold.bounded_open,
+                    network,
+                    &evidence,
+                    validation_config_with_ranges(ranges)?,
+                );
+                if tamper.is_visible_only_to_semantic_rederivation() {
+                    readback?;
+                } else {
+                    assert_eq!(
+                        admission_reason(readback)?,
+                        tamper.expected_reason(),
+                        "{tamper:?} with {ranges} ranges"
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    /// Builds a store with several addresses, shared transactions, and a mix of
+    /// unspent and spent outputs, plus the exact READY evidence of its rows.
+    fn multi_address_fixture(
+        retain_tip_undo: bool,
+    ) -> Result<
+        (SemanticValidationFixture, WalletProjectionReadyEvidence),
+        Box<dyn std::error::Error>,
+    > {
+        let transaction_ids = (0u8..40)
+            .map(|index| TransactionId::from_bytes([index + 1; 32]))
+            .collect::<Vec<_>>();
+        fixture_for_transactions(retain_tip_undo, &transaction_ids)
     }
 
     #[allow(
         clippy::too_many_lines,
         reason = "one fixture keeps every derived family and the READY evidence visibly consistent"
     )]
-    /// Builds a store with several addresses, shared transactions, and a mix of
-    /// unspent and spent outputs, plus the exact READY evidence of its rows.
-    fn multi_address_fixture(
+    /// Builds a valid store over `transaction_ids`: every fourth transaction
+    /// has two outputs, and the first output of every third is spent.
+    fn fixture_for_transactions(
         retain_tip_undo: bool,
+        transaction_ids: &[TransactionId],
     ) -> Result<
         (SemanticValidationFixture, WalletProjectionReadyEvidence),
         Box<dyn std::error::Error>,
@@ -3875,8 +4281,8 @@ mod tests {
         let mut balance_by_address = BTreeMap::<[u8; 32], u64>::new();
         let mut commitment = TransparentUtxoSetCommitment::empty();
         let mut total_value_zat = 0u64;
-        for index in 0u8..40 {
-            let transaction_id = TransactionId::from_bytes([index + 1; 32]);
+        for (index, transaction_id) in transaction_ids.iter().copied().enumerate() {
+            let index = u8::try_from(index)?;
             let address_byte = index % 5 + 1;
             let address = TransparentAddressScriptHash::from_bytes([address_byte; 32]);
             let created_at = WalletTransactionPosition::new(transaction_id, u32::from(index), tip);
@@ -4176,12 +4582,6 @@ mod tests {
             corrupt_stored_family(&builder, family_name, corruption)?;
             let (cold, _) = builder.reopen_for_validation()?;
 
-            let readback = validate_ready_rows_by_readback(
-                &cold.bounded_open,
-                network,
-                &evidence,
-                validation_config(),
-            );
             let semantic = validate_ready_rows_by_semantic_rederivation(
                 &cold.bounded_open,
                 network,
@@ -4192,18 +4592,420 @@ mod tests {
                 semantic.is_err(),
                 "semantic re-derivation admitted {family_name} {corruption:?}"
             );
-            match expected_reason {
-                Some(reason) => assert_eq!(
-                    admission_reason(readback)?,
-                    reason,
-                    "{family_name} {corruption:?}"
-                ),
-                None => assert!(
-                    readback.is_err(),
-                    "digest readback admitted {family_name} {corruption:?}"
-                ),
+            for ranges in PRIMARY_OUTPUT_SCAN_RANGES {
+                let readback = validate_ready_rows_by_readback(
+                    &cold.bounded_open,
+                    network,
+                    &evidence,
+                    validation_config_with_ranges(ranges)?,
+                );
+                match expected_reason {
+                    Some(reason) => assert_eq!(
+                        admission_reason(readback)?,
+                        reason,
+                        "{family_name} {corruption:?} with {ranges} ranges"
+                    ),
+                    None => assert!(
+                        readback.is_err(),
+                        "digest readback admitted {family_name} {corruption:?} with {ranges} ranges"
+                    ),
+                }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_validation_thread_fails_the_build_and_releases_its_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let wallet_path = temporary.path().join("wallet");
+        let (fixture, evidence) = multi_address_fixture(true)?;
+        let builder = cold_store_for(&wallet_path, &fixture)?;
+        let lease = builder.lease();
+        let (cold, _) = builder.reopen_for_validation()?;
+
+        REFUSED_VALIDATION_THREAD.set(Some(0));
+        let refused = cold.validate_rows(evidence, validation_config());
+        REFUSED_VALIDATION_THREAD.set(None);
+        let Err(build_error) = refused else {
+            return Err("a refused validation thread must fail cold validation".into());
+        };
+        assert!(matches!(
+            build_error,
+            RocksDbWalletError::ColdValidationThreadUnavailable { .. }
+        ));
+
+        let other_owner = WalletProjectionBuildOwner::from_bytes([0x66; 16]);
+        let now = UnixTimestampMillis::new(1);
+        assert!(
+            RocksDbWalletBuildStore::open(&wallet_path, Network::ZcashRegtest, test_budget())?
+                .discard_unpublished(other_owner, now)
+                .is_err(),
+            "the failed build's live lease must block another owner until it is released"
+        );
+        let mut cleanup = crate::build::FailedWalletBuildLeaseCleanup::new(
+            &wallet_path,
+            Network::ZcashRegtest,
+            test_budget(),
+            now,
+        );
+        cleanup.arm(lease, now);
+        assert!(matches!(
+            crate::build::finish_failed_wallet_build::<()>(&mut cleanup, build_error),
+            Err(RocksDbWalletError::ColdValidationThreadUnavailable { .. })
+        ));
+        RocksDbWalletBuildStore::open(&wallet_path, Network::ZcashRegtest, test_budget())?
+            .discard_unpublished(other_owner, now)?;
+        assert!(!wallet_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_range_thread_fails_validation_with_a_typed_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let (fixture, evidence) = multi_address_fixture(true)?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        // The two address-family threads start first; the fifth start is the
+        // third primary range thread.
+        for refused_start in [2, 4] {
+            REFUSED_VALIDATION_THREAD.set(Some(refused_start));
+            let refused = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                Network::ZcashRegtest,
+                &evidence,
+                validation_config_with_ranges(8)?,
+            );
+            REFUSED_VALIDATION_THREAD.set(None);
+            assert!(
+                matches!(
+                    refused,
+                    Err(RocksDbWalletError::ColdValidationThreadUnavailable { .. })
+                ),
+                "refused start {refused_start}"
+            );
+        }
+        validate_ready_rows_by_readback(
+            &cold.bounded_open,
+            Network::ZcashRegtest,
+            &evidence,
+            validation_config_with_ranges(8)?,
+        )?;
+        Ok(())
+    }
+
+    /// Transaction ids whose outpoint keys sit at the ends of the key space
+    /// and just below, at, and above the two-range split and the first
+    /// eight-range split.
+    fn split_boundary_transactions() -> Vec<TransactionId> {
+        let mut ids = Vec::new();
+        for (prefix, fill) in [
+            ([0x00, 0x00], 0x00),
+            ([0x1f, 0xff], 0xff),
+            ([0x20, 0x00], 0x00),
+            ([0x20, 0x00], 0x01),
+            ([0x7f, 0xff], 0xff),
+            ([0x7f, 0xff], 0xfe),
+            ([0x80, 0x00], 0x01),
+            ([0x80, 0x00], 0x00),
+            ([0x80, 0x01], 0x00),
+            ([0xff, 0xff], 0xff),
+            ([0xff, 0xff], 0xfe),
+            ([0x40, 0x00], 0x00),
+        ] {
+            let mut id = [fill; 32];
+            id[..2].copy_from_slice(&prefix);
+            ids.push(TransactionId::from_bytes(id));
+        }
+        ids
+    }
+
+    #[test]
+    fn readback_counts_every_key_at_and_around_range_splits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::ZcashRegtest;
+        let (fixture, evidence) = fixture_for_transactions(true, &split_boundary_transactions())?;
+        assert!(fixture.spent_outputs.len() >= 3);
+        assert!(fixture.unspent_outputs.len() >= 8);
+        let temporary = TempDir::new()?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        let single = validate_ready_rows_by_readback(
+            &cold.bounded_open,
+            network,
+            &evidence,
+            validation_config_with_ranges(1)?,
+        )?;
+        for ranges in [2, 3, 8, 64] {
+            let partitioned = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config_with_ranges(ranges)?,
+            )?;
+            assert_eq!(
+                partitioned.peak_accounted_reorg_undo_bytes, single.peak_accounted_reorg_undo_bytes,
+                "{ranges} ranges"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_overlap_at_the_range_split_is_rejected_with_matching_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::ZcashRegtest;
+        let (mut fixture, mut evidence) =
+            fixture_for_transactions(false, &split_boundary_transactions())?;
+        // The unspent output keyed exactly at the two-range split prefix.
+        let split_key = fixture
+            .unspent_outputs
+            .iter()
+            .position(|(key, _)| key.as_bytes().starts_with(&[0x80, 0x00, 0x00]))
+            .ok_or("the fixture needs an unspent output at the split")?;
+        let output = fixture.unspent_outputs[split_key].1.clone();
+        let spent = WalletSpentOutput::new(
+            output.clone(),
+            WalletTransactionPosition::new(
+                TransactionId::from_bytes([0x55; 32]),
+                u32::MAX,
+                output.created_at.block,
+            ),
+            0,
+        );
+        fixture
+            .spent_outputs
+            .push((WalletOutpointKey::new(output.outpoint), spent));
+        fixture.spent_outputs.sort_unstable_by_key(|(key, _)| *key);
+        refresh_prepared_evidence(&mut fixture, &mut evidence)?;
+        let temporary = TempDir::new()?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        for ranges in [1, 2, 8] {
+            let readback = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config_with_ranges(ranges)?,
+            );
+            assert_eq!(
+                admission_reason(readback)?,
+                "one outpoint appears in both unspent and spent output families",
+                "{ranges} ranges"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_commitment_only_change_to_ready_evidence_is_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::ZcashRegtest;
+        let (fixture, mut evidence) =
+            fixture_for_transactions(false, &split_boundary_transactions())?;
+        let mut altered = evidence.utxo_summary.commitment.accumulator().to_vec();
+        altered[2047] ^= 1;
+        evidence.utxo_summary.commitment = TransparentUtxoSetCommitment::from_parts(
+            evidence.utxo_summary.commitment.scheme(),
+            &altered,
+        )
+        .ok_or("the altered commitment keeps its length")?;
+        let temporary = TempDir::new()?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        for ranges in [1, 2, 8] {
+            let readback = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config_with_ranges(ranges)?,
+            );
+            assert_eq!(
+                admission_reason(readback)?,
+                "READY evidence differs from cold wallet rows",
+                "{ranges} ranges"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_readback_refuses_an_undo_suffix_over_its_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (fixture, evidence) = multi_address_fixture(true)?;
+        let temporary = TempDir::new()?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        // Room for the suffix entry and one key, while the ranges observe many
+        // distinct created outpoints and address-history keys.
+        let limit = u64::try_from(
+            size_of::<(u32, ExpectedReorgUndoEffects)>() + size_of::<WalletOutpointKey>(),
+        )?;
+        for ranges in [1, 2, 8] {
+            let readback = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                Network::ZcashRegtest,
+                &evidence,
+                WalletColdValidationConfig {
+                    max_accounted_reorg_undo_bytes: limit,
+                    ..validation_config_with_ranges(ranges)?
+                },
+            );
+            assert!(
+                matches!(
+                    readback,
+                    Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit { limit_bytes, .. })
+                        if limit_bytes == limit
+                ),
+                "{ranges} ranges"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scan_ranges_are_capped_by_the_maximum_and_the_row_count() {
+        let ranges = |requested: u32, primary_rows: u64, min_rows: u64| {
+            let config = WalletColdValidationConfig {
+                max_accounted_reorg_undo_bytes: TEST_VALIDATION_REORG_UNDO_BYTES,
+                primary_output_scan_ranges: NonZeroU32::new(requested).unwrap_or(NonZeroU32::MIN),
+                min_primary_rows_per_scan_range: NonZeroU64::new(min_rows)
+                    .unwrap_or(NonZeroU64::MIN),
+            };
+            let counts = WalletProjectionFamilyRowCounts {
+                transparent_unspent_output_count: primary_rows / 2,
+                transparent_spent_output_count: primary_rows - primary_rows / 2,
+                ..WalletProjectionFamilyRowCounts::default()
+            };
+            primary_output_scan_range_count(&config, &counts).get()
+        };
+        let production = MIN_PRIMARY_ROWS_PER_SCAN_RANGE.get();
+        assert_eq!(ranges(4, 17_086_503, production), 4);
+        assert_eq!(ranges(64, 10, production), 1);
+        assert_eq!(ranges(64, 0, production), 1);
+        assert_eq!(ranges(64, 3 * production, production), 3);
+        assert_eq!(ranges(64, u64::MAX, production), 64);
+        assert_eq!(
+            ranges(u32::MAX, u64::MAX, 1),
+            crate::MAX_ACCUMULATOR_HASHING_WORKERS
+        );
+        assert_eq!(ranges(8, 3, 1), 3);
+    }
+
+    fn test_budget() -> RocksDbResourceBudget {
+        RocksDbResourceBudget::for_local_tests()
+    }
+
+    #[test]
+    fn outpoint_key_ranges_cover_the_key_space_once() -> Result<(), Box<dyn std::error::Error>> {
+        for count in [1, 2, 3, 7, 64, 65_536, 70_000] {
+            let ranges = outpoint_key_ranges(NonZeroU32::new(count).ok_or("zero ranges")?);
+            assert_eq!(ranges.len(), usize::try_from(count.min(65_536))?);
+            assert_eq!(ranges.first().and_then(|range| range.lower), None);
+            assert_eq!(ranges.last().and_then(|range| range.upper), None);
+            for pair in ranges.windows(2) {
+                let [current, next] = pair else {
+                    return Err("windows of two".into());
+                };
+                assert!(current.upper.is_some(), "{count} ranges");
+                assert_eq!(current.upper, next.lower, "{count} ranges");
+                if let (Some(lower), Some(upper)) = (current.lower, current.upper) {
+                    assert!(lower < upper, "{count} ranges");
+                }
+            }
+        }
+        assert_eq!(
+            outpoint_key_ranges(NonZeroU32::MIN.saturating_add(1)),
+            vec![
+                OutpointKeyRange {
+                    lower: None,
+                    upper: Some([0x80, 0x00]),
+                },
+                OutpointKeyRange {
+                    lower: Some([0x80, 0x00]),
+                    upper: None,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_readback_matches_one_range_on_valid_stores()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::ZcashRegtest;
+        for retain_tip_undo in [false, true] {
+            let temporary = TempDir::new()?;
+            let (fixture, evidence) = multi_address_fixture(retain_tip_undo)?;
+            let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+            let (cold, _) = builder.reopen_for_validation()?;
+            let single = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config_with_ranges(1)?,
+            )?;
+            assert_eq!(single.peak_accounted_reorg_undo_bytes > 0, retain_tip_undo);
+            for ranges in [2, 3, 8, 64, 256] {
+                let partitioned = validate_ready_rows_by_readback(
+                    &cold.bounded_open,
+                    network,
+                    &evidence,
+                    validation_config_with_ranges(ranges)?,
+                )?;
+                assert_eq!(
+                    partitioned.peak_accounted_reorg_undo_bytes,
+                    single.peak_accounted_reorg_undo_bytes,
+                    "{ranges} ranges"
+                );
+                assert_eq!(partitioned.random_read_count, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_undo_suffix_admits_each_key_once_across_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let admitted_bytes = size_of::<(u32, ExpectedReorgUndoEffects)>()
+            .checked_add(size_of::<WalletOutpointKey>())
+            .ok_or("test reorg undo memory overflow")?;
+        let memory_limit = u64::try_from(admitted_bytes)?;
+        let shared = SharedExpectedReorgUndoSuffix::new(ExpectedReorgUndoSuffix::new(
+            settled_tip(),
+            1,
+            memory_limit,
+        )?);
+        let output = sample_output(0x22, 12_345)?;
+        std::thread::scope(|scope| {
+            let observers = (0..4)
+                .map(|_| scope.spawn(|| shared.observe_created(&output)))
+                .collect::<Vec<_>>();
+            observers
+                .into_iter()
+                .map(|observer| {
+                    observer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        let outside = sample_output(0x23, 1)?;
+        let mut outside = outside;
+        outside.created_at =
+            WalletTransactionPosition::new(outside.created_at.transaction_id, 0, settled_tip());
+        shared.observe_created(&outside)?;
+
+        let suffix = shared.into_inner();
+        let undo = suffix
+            .undo_by_height
+            .get(&source_position().tip.height.value())
+            .ok_or("test undo suffix disappeared")?;
+        assert_eq!(undo.created_outpoints.len(), 1);
+        assert_eq!(suffix.memory.current, memory_limit);
+        assert_eq!(suffix.memory.peak, memory_limit);
         Ok(())
     }
 

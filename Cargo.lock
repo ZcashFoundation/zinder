@@ -6724,7 +6724,9 @@ name = "zinder-wallet-rocksdb"
 version = "0.23.0"
 dependencies = [
  "metrics",
+ "parking_lot 0.13.0",
  "prost",
+ "rayon",
  "rust-rocksdb",
  "tempfile",
  "thiserror 2.0.21",

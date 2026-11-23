@@ -13,6 +13,8 @@ publish.workspace = true
 
 [dependencies]
 metrics.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
 rust-rocksdb.workspace = true
 thiserror.workspace = true
 zinder-core.workspace = true

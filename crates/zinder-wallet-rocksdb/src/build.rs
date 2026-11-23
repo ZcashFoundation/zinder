@@ -3,6 +3,7 @@
 use std::{
     ffi::OsString,
     fs,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -29,10 +30,18 @@ use crate::{
     projection_load::{
         PreparedWalletProjectionLoad, WalletProjectionLoadConfig, write_projection_ssts,
     },
-    store::{RocksDbWalletBuilder, WalletColdValidationConfig},
+    store::{MIN_PRIMARY_ROWS_PER_SCAN_RANGE, RocksDbWalletBuilder, WalletColdValidationConfig},
 };
 
 const DEFAULT_BUILD_LEASE_DURATION_MILLIS: u64 = 60 * 60 * 1000;
+const AUTOMATIC_ACCUMULATOR_HASHING_WORKERS_CEILING: u32 = 4;
+
+/// Most accumulator hashing threads a wallet build uses.
+///
+/// Cold validation reads the primary output families in at most this many key
+/// ranges as well, so the setting also bounds its threads. A build that asks
+/// for more is refused before it creates any wallet state.
+pub const MAX_ACCUMULATOR_HASHING_WORKERS: u32 = 64;
 const BUILD_STAGE_DURATION_METRIC: &str = "zinder_wallet_projection_build_stage_duration_seconds";
 
 /// Read-only canonical source sufficient for one fixed-tip wallet projection build.
@@ -232,10 +241,22 @@ pub struct RocksDbWalletBuildOptions {
     pub max_accounted_reorg_undo_bytes: u64,
     /// Number of exact tip undo records retained for reorg handling.
     pub supported_reorg_depth: u32,
+    /// Threads that hash wallet rows into the projection accumulator and the
+    /// UTXO set commitment.
+    ///
+    /// One hashes on the build's own thread. More hash bounded batches of rows
+    /// on that many threads while the build thread drains the sorters and
+    /// writes SST files. Cold validation also reads the unspent and spent
+    /// output families back in up to this many outpoint key ranges at once.
+    /// The accumulators do not depend on the row order, so the published
+    /// evidence does not change. At most [`MAX_ACCUMULATOR_HASHING_WORKERS`].
+    pub accumulator_hashing_workers: NonZeroU32,
 }
 
 impl RocksDbWalletBuildOptions {
     /// Small deterministic limits for unit and deployment-smoke fixtures.
+    ///
+    /// They hash on two threads, so fixtures cover the parallel path.
     #[must_use]
     pub const fn for_local_tests() -> Self {
         Self {
@@ -246,8 +267,29 @@ impl RocksDbWalletBuildOptions {
             sst_target_logical_bytes: 1024 * 1024,
             max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
             supported_reorg_depth: 100,
+            accumulator_hashing_workers: NonZeroU32::MIN.saturating_add(1),
         }
     }
+
+    /// Returns one accumulator hashing thread per logical CPU this process
+    /// may use, at most 4, or one thread when the count cannot be detected.
+    ///
+    /// Beyond about three workers the build thread, which decodes, sorts, and
+    /// writes every row, limits the drains instead of hashing.
+    #[must_use]
+    pub fn automatic_accumulator_hashing_workers() -> NonZeroU32 {
+        accumulator_hashing_workers_for(
+            std::thread::available_parallelism()
+                .ok()
+                .and_then(|cpus| NonZeroU32::new(u32::try_from(cpus.get()).unwrap_or(u32::MAX))),
+        )
+    }
+}
+
+fn accumulator_hashing_workers_for(detected_logical_cpus: Option<NonZeroU32>) -> NonZeroU32 {
+    let ceiling =
+        NonZeroU32::new(AUTOMATIC_ACCUMULATOR_HASHING_WORKERS_CEILING).unwrap_or(NonZeroU32::MIN);
+    detected_logical_cpus.map_or(NonZeroU32::MIN, |cpus| cpus.min(ceiling))
 }
 
 /// Wall-clock duration of each family scan inside cold validation.
@@ -256,7 +298,9 @@ impl RocksDbWalletBuildOptions {
 /// primary output, address-index, and address-transaction scans run
 /// concurrently, so their three durations overlap: each is the wall time of
 /// its own scan, and `concurrent_family_readback` is the wall time of all
-/// three together. The reorg-undo scan runs after them.
+/// three together. The primary output scan reads its outpoint key ranges
+/// concurrently, and its duration covers all of them. The reorg-undo scan
+/// runs after them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WalletColdValidationPhaseDurations {
     /// Merged scan of the unspent and spent primary output families.
@@ -536,7 +580,7 @@ pub struct RocksDbWalletBuildOutcome {
 /// delegates authorization to its compare-exact lease boundary. A stale owner,
 /// generation, or expiry therefore cannot clear a lease acquired by another
 /// build after a recovery race.
-struct FailedWalletBuildLeaseCleanup {
+pub(crate) struct FailedWalletBuildLeaseCleanup {
     wallet_path: PathBuf,
     network: Network,
     resource_budget: RocksDbResourceBudget,
@@ -545,7 +589,7 @@ struct FailedWalletBuildLeaseCleanup {
 }
 
 impl FailedWalletBuildLeaseCleanup {
-    fn new(
+    pub(crate) fn new(
         wallet_path: &Path,
         network: Network,
         resource_budget: RocksDbResourceBudget,
@@ -560,7 +604,7 @@ impl FailedWalletBuildLeaseCleanup {
         }
     }
 
-    fn arm(&mut self, lease: WalletProjectionBuildLease, now: UnixTimestampMillis) {
+    pub(crate) fn arm(&mut self, lease: WalletProjectionBuildLease, now: UnixTimestampMillis) {
         self.lease = Some(lease);
         self.now = now;
     }
@@ -601,7 +645,7 @@ impl FailedWalletBuildLeaseCleanup {
     }
 }
 
-fn finish_failed_wallet_build<T>(
+pub(crate) fn finish_failed_wallet_build<T>(
     cleanup: &mut FailedWalletBuildLeaseCleanup,
     build_error: RocksDbWalletError,
 ) -> Result<T, RocksDbWalletError> {
@@ -708,6 +752,12 @@ where
     let lease_request = execution.lease_request();
     let now = execution.initial_now();
     let total_started = Instant::now();
+    if options.accumulator_hashing_workers.get() > MAX_ACCUMULATOR_HASHING_WORKERS {
+        return Err(RocksDbWalletError::AccumulatorHashingWorkersOutOfRange {
+            workers: options.accumulator_hashing_workers.get(),
+            maximum: MAX_ACCUMULATOR_HASHING_WORKERS,
+        });
+    }
     let wallet_path = wallet_path.as_ref();
     let build_lock = WalletBuildLock::acquire(wallet_path)?;
     remove_abandoned_build_paths(wallet_path, &build_lock)?;
@@ -765,6 +815,7 @@ where
                 max_temporary_file_bytes_per_sorter: options.max_temporary_file_bytes_per_sorter,
                 sst_target_logical_bytes: options.sst_target_logical_bytes,
                 max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
+                accumulator_hashing_workers: options.accumulator_hashing_workers,
             },
             canonical_store
                 .wallet_projection_scan()
@@ -822,6 +873,8 @@ where
             ready_evidence,
             WalletColdValidationConfig {
                 max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
+                primary_output_scan_ranges: options.accumulator_hashing_workers,
+                min_primary_rows_per_scan_range: MIN_PRIMARY_ROWS_PER_SCAN_RANGE,
             },
         )?;
         let cold_validation = phase_started.elapsed();
@@ -1073,6 +1126,18 @@ mod tests {
             default_build_lease_heartbeat(now, current_expires_at),
             WalletBuildLeaseHeartbeat::renew(now, expected_expires_at)
         );
+    }
+
+    #[test]
+    fn automatic_accumulator_hashing_follows_the_cpu_count_up_to_four() {
+        let workers = |cpus: Option<u32>| {
+            accumulator_hashing_workers_for(cpus.and_then(NonZeroU32::new)).get()
+        };
+        assert_eq!(workers(None), 1);
+        assert_eq!(workers(Some(1)), 1);
+        assert_eq!(workers(Some(2)), 2);
+        assert_eq!(workers(Some(4)), 4);
+        assert_eq!(workers(Some(32)), 4);
     }
 
     #[test]
