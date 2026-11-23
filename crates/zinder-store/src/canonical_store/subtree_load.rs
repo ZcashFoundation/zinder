@@ -1,7 +1,4 @@
-use std::{
-    num::NonZeroU32,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use rust_rocksdb::{DB, IteratorMode, ReadOptions, WriteBatch};
 use serde::{Deserialize, Serialize};

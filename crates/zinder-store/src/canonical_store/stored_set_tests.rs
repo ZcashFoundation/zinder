@@ -1,11 +1,10 @@
-use std::path::Path;
-
 use tempfile::TempDir;
-use zinder_core::{BlockHeight, Network, NetworkUpgradeActivations};
+use zinder_core::{BlockHeight, Network};
 
 use super::{
-    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreRequirements,
-    CanonicalStoreWorkload, CanonicalStoredData, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError,
+    CanonicalStoreRequirements, CanonicalStoreWorkload, CanonicalStoredData,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     construction_manifest::validate_ready_construction_manifest,
     live_replacement_tests::published_store_with_retention,
 };
@@ -52,30 +51,18 @@ fn published_sets_admit_reader_supersets_and_require_exact_writer_and_manifest_i
                     reorg_policy,
                     RocksDbResourceBudget::for_local_tests(),
                 );
-                match writer {
-                    Ok(writer) => {
-                        assert!(exact, "{retained} / {workload:?} / {requested}");
-                        assert_eq!(writer.event_fence(), fence);
-                    }
-                    Err(error) => {
-                        assert!(!exact, "{error}");
-                        assert!(
-                            matches!(error, CanonicalStoreError::AdmissionRefused { .. }),
-                            "{error:?}"
-                        );
-                    }
-                }
+                assert_writer_admission(writer, exact.then_some(fence));
 
                 let secondary_path = temporary
                     .path()
                     .join(format!("secondary-{workload:?}-{requested}"));
-                let reader = open_reader(
+                let reader = RocksDbCanonicalSecondary::open_ready_requiring(
                     &path,
-                    &secondary_path,
+                    secondary_path,
                     &activations,
-                    workload,
-                    requested,
+                    reader_requirements(workload, requested),
                     reorg_policy,
+                    RocksDbResourceBudget::for_local_tests(),
                 );
                 match (reader, missing_requirement(workload, retained, requested)) {
                     (Ok(mut reader), None) => {
@@ -111,18 +98,26 @@ fn published_sets_admit_reader_supersets_and_require_exact_writer_and_manifest_i
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the matrix exercises both named family requirements and the persisted reorg identity"
-)]
-fn open_reader(
-    path: &Path,
-    secondary_path: &Path,
-    activations: &NetworkUpgradeActivations,
+fn assert_writer_admission(
+    writer: Result<RocksDbCanonicalStore, CanonicalStoreError>,
+    expected_fence: Option<CanonicalEventFence>,
+) {
+    match writer {
+        Ok(writer) => assert_eq!(Some(writer.event_fence()), expected_fence),
+        Err(error) => {
+            assert!(expected_fence.is_none(), "{error}");
+            assert!(
+                matches!(error, CanonicalStoreError::AdmissionRefused { .. }),
+                "{error:?}"
+            );
+        }
+    }
+}
+
+fn reader_requirements(
     workload: CanonicalStoreWorkload,
     requested: RawBlobRetention,
-    reorg_policy: CanonicalReorgPolicy,
-) -> Result<RocksDbCanonicalSecondary, CanonicalStoreError> {
+) -> CanonicalStoreRequirements {
     let mut required = match requested {
         RawBlobRetention::None => vec![],
         RawBlobRetention::Transactions => vec![CanonicalStoredData::TransactionBodies],
@@ -134,14 +129,7 @@ fn open_reader(
     if workload == CanonicalStoreWorkload::Explorer {
         required.push(CanonicalStoredData::FinalNoteCommitmentRoots);
     }
-    RocksDbCanonicalSecondary::open_ready_requiring(
-        path,
-        secondary_path,
-        activations,
-        CanonicalStoreRequirements::new(&required),
-        reorg_policy,
-        RocksDbResourceBudget::for_local_tests(),
-    )
+    CanonicalStoreRequirements::new(&required)
 }
 
 fn missing_requirement(
