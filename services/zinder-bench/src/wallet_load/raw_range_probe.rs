@@ -1010,6 +1010,7 @@ pub(crate) async fn run_raw_range_probe(
     args: RawRangeProbeArgs,
 ) -> Result<ProbeOutput, BenchError> {
     let timeout = Duration::from_secs(args.request_timeout_secs);
+    counters::validate_aliases(&args.server_counters).map_err(BenchError::invalid_argument)?;
     let (oracle, oracle_source) = load_oracle(&args, timeout).await?;
     let jobs: Arc<[OracleJob]> = oracle.jobs.clone().into();
 

@@ -8,7 +8,10 @@
 //! scrape. A server that never publishes the witness reports the counters as
 //! unavailable, never as zero.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use serde::Serialize;
 use tokio::time::Instant;
@@ -64,6 +67,20 @@ pub(super) fn parse_selector(text: &str) -> Result<Selector, String> {
         name: name.to_owned(),
         labels,
     })
+}
+
+/// Each requested counter needs its own key in the report's increases map.
+pub(super) fn validate_aliases(selectors: &[Selector]) -> Result<(), String> {
+    let mut aliases = BTreeSet::new();
+    for selector in selectors {
+        if !aliases.insert(&selector.alias) {
+            return Err(format!(
+                "duplicate server counter alias `{}`",
+                selector.alias
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The `RocksDB` `MultiGet` tickers of a read-only canonical secondary.
@@ -131,6 +148,18 @@ impl CounterSource {
     /// Waits for the witness to advance, then reads every counter from that
     /// scrape.
     pub(super) async fn fresh_snapshot(&self) -> Snapshot {
+        let started = Instant::now();
+        match tokio::time::timeout(self.wait, self.wait_for_publication()).await {
+            Ok(snapshot) if started.elapsed() < self.wait => snapshot,
+            _ => Err(format!(
+                "witness `{}` did not advance with every counter present within {}s",
+                self.witness.describe(),
+                self.wait.as_secs_f64()
+            )),
+        }
+    }
+
+    async fn wait_for_publication(&self) -> Snapshot {
         let witness_total = |samples: &[MetricSample]| self.witness.total(samples).unwrap_or(0.0);
         let start = witness_total(&server_metrics::scrape(&self.url).await?);
         if !start.is_finite() {
@@ -139,8 +168,7 @@ impl CounterSource {
                 self.witness.describe()
             ));
         }
-        let deadline = Instant::now() + self.wait;
-        while Instant::now() < deadline {
+        loop {
             tokio::time::sleep(POLL_INTERVAL).await;
             let samples = server_metrics::scrape(&self.url).await?;
             let current = witness_total(&samples);
@@ -155,11 +183,6 @@ impl CounterSource {
                 return Ok(totals);
             }
         }
-        Err(format!(
-            "witness `{}` did not advance with every counter present within {}s",
-            self.witness.describe(),
-            self.wait.as_secs_f64()
-        ))
     }
 }
 
@@ -249,6 +272,31 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn counter_aliases_must_be_unique() -> Result<(), Box<dyn Error>> {
+        let reads = parse_selector("reads=a_total")?;
+        let other = parse_selector("other=a_total")?;
+        super::validate_aliases(&[reads.clone(), other])?;
+        assert!(
+            super::validate_aliases(&[reads, parse_selector("reads=b_total")?])
+                .is_err_and(|reason| reason.contains("reads"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_budget_includes_the_initial_scrape() -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let source = source(
+            format!("http://{}/metrics", listener.local_addr()?),
+            Duration::from_millis(50),
+        )?;
+        let snapshot =
+            tokio::time::timeout(Duration::from_secs(2), source.fresh_snapshot()).await?;
+        assert!(snapshot.is_err_and(|reason| reason.contains("within 0.05s")));
+        Ok(())
+    }
+
     /// A metrics server whose publication witness advances every second
     /// scrape and whose multiget ticker grows by 7 per publication. Other
     /// roles and tickers carry different values that must not be summed in.
@@ -314,6 +362,15 @@ mod tests {
             .increases
             .and_then(|map| map.get("multiget_get").copied());
         assert!(increase.is_some_and(|value| value >= 7.0 && value % 7.0 == 0.0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_publication_after_the_poll_budget_is_unavailable() -> Result<(), Box<dyn Error>> {
+        let (url, _) = serve_metrics(true).await?;
+        let source = source(url, super::POLL_INTERVAL / 2)?;
+        let snapshot = source.fresh_snapshot().await;
+        assert!(snapshot.is_err_and(|reason| reason.contains("did not advance")));
         Ok(())
     }
 

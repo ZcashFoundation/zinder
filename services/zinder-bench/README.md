@@ -1265,7 +1265,8 @@ The report (`schema` `zinder-bench/raw-range-probe/v1`) records:
 - `counters`: with `--server-metrics-url`, `--server-freshness-counter`, and
   `--server-counter` or `--rocksdb-multiget-counters`, each series' increase
   over the timed interval in `increases`, summed over every label the selector
-  leaves out. A selector is `[ALIAS=]NAME[{label=value,...}]`.
+  leaves out. A selector is `[ALIAS=]NAME[{label=value,...}]`. Each selector
+  needs a unique report key (its alias, or the whole selector if omitted).
   `--rocksdb-multiget-counters` reports the canonical secondary's
   `multiget_get`, `multiget_keys_read`, and `multiget_bytes_read` tickers. A
   server may publish these tickers on a timer, so each read waits, outside the
