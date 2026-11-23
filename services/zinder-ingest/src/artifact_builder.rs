@@ -519,7 +519,7 @@ fn prepare_canonical_transactions_from_parsed(
         )?;
         let fact_set = transaction_public_fact_set_from_parsed(
             transaction,
-            raw_transaction_bytes,
+            raw_transaction_bytes.len(),
             Some(source_block.height),
             activations,
         )
