@@ -79,7 +79,7 @@
         "required": ["kind", "location", "manifest_sha256"],
         "additionalProperties": false,
         "properties": {
-          "kind": { "enum": ["private-state-bundle", "catalog-generation", "oracle"] },
+          "kind": { "enum": ["private-state-bundle", "node-state", "catalog-generation", "oracle"] },
           "location": { "type": "string" },
           "manifest_sha256": { "$ref": "#/$defs/sha256" },
           "bytes": { "type": "integer", "minimum": 0 }

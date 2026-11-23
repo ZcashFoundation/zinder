@@ -65,7 +65,22 @@ receipt=${receipt:-./restore-receipt-$name.json}
 for tool in gcloud jq; do command -v "$tool" >/dev/null || die "missing $tool"; done
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-gssh() { gcloud compute ssh "$name" --project "$project" --zone "$zone" --tunnel-through-iap --quiet --command "$1"; }
+# IAP connections drop now and then. Retry when ssh itself fails (exit 255);
+# standard input is buffered so a retry resends it.
+gssh() {
+  local input rc attempt
+  input=$(mktemp)
+  cat > "$input"
+  for attempt in 1 2 3 4 5; do
+    gcloud compute ssh "$name" --project "$project" --zone "$zone" --tunnel-through-iap --quiet \
+      --command "$1" < "$input" && rc=0 || rc=$?
+    [[ $rc -ne 255 ]] && break
+    echo "ssh attempt $attempt failed; retrying" >&2
+    sleep 10
+  done
+  rm -f "$input"
+  return "$rc"
+}
 ts() { date -u +%FT%T.%3NZ; }
 declare -A at
 mark() { at[$1]=$(ts); echo "$(date -u +%T) $1" >&2; }
@@ -99,21 +114,25 @@ gcloud compute instances create "$name" --project "$project" --zone "$zone" \
   --create-disk="name=$name-boot,boot=yes,auto-delete=yes,size=64,type=hyperdisk-balanced,provisioned-iops=3000,provisioned-throughput=140,image=$image,device-name=boot,interface=NVME" \
   "${disk_args[@]}" >&2
 mark host_running
-for _ in $(seq 1 60); do gssh true 2>/dev/null && break; sleep 10; done
-gssh true
+for _ in $(seq 1 60); do gssh true < /dev/null 2>/dev/null && break; sleep 10; done
+gssh true < /dev/null
 
 mark stage
 gcloud auth print-access-token | gssh 'sudo install -m 0600 /dev/stdin /root/.gcs-token'
 gssh "set -e; sudo gcloud storage cp --access-token-file=/root/.gcs-token '$stage' /tmp/zfx-stage.tar.zst >/dev/null 2>&1; sudo rm -f /root/.gcs-token
   echo '$stage_sha  /tmp/zfx-stage.tar.zst' | sha256sum --quiet -c
-  zstd -dc /tmp/zfx-stage.tar.zst | sudo tar -x -C /tmp"
+  zstd -dc /tmp/zfx-stage.tar.zst | sudo tar -x -C /tmp" < /dev/null
 gssh 'sudo tee /tmp/zfx-stage/fixture.json >/dev/null' < "$fixture"
 gssh 'sudo tee /tmp/zfx-stage/guest/restore-guest.sh >/dev/null' < "$script_dir/guest/restore-guest.sh"
 
 mark guest_restore
-gssh "sudo bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/restore-receipt.json >/dev/null"
+# The guest restore runs as its own unit, so a dropped ssh session cannot stop it.
+gssh "sudo systemd-run --unit zfx-restore-guest --collect bash /tmp/zfx-stage/guest/restore-guest.sh /tmp/zfx-stage/fixture.json $verify /var/log/zfx/restore-receipt.json" < /dev/null
+until gssh 'sudo test -s /var/log/zfx/restore-receipt.json || ! systemctl is-active -q zfx-restore-guest' < /dev/null; do sleep 20; done
+gssh 'sudo test -s /var/log/zfx/restore-receipt.json' < /dev/null \
+  || { gssh 'sudo journalctl -u zfx-restore-guest -o cat --no-pager | tail -20' < /dev/null >&2; die "guest restore failed"; }
 mark finished
-guest=$(gssh 'sudo cat /var/log/zfx/restore-receipt.json')
+guest=$(gssh 'sudo cat /var/log/zfx/restore-receipt.json' < /dev/null)
 
 steps=$(for k in "${!at[@]}"; do printf '%s\t%s\n' "$k" "${at[$k]}"; done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add')
 jq -n --argjson guest "$guest" --argjson steps "$steps" --arg name "$name" --arg project "$project" \
