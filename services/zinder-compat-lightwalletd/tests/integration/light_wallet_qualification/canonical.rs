@@ -149,8 +149,13 @@ async fn forwarded_transaction_admission() -> Result<()> {
         [method("getrawtransaction").reply_with(move |_| {
             let _ = entered.send(());
             let (released, ready) = &*node_gate;
-            ready.wait_while_for(&mut released.lock(), |released| !*released, timeout);
-            mined_reply(id, served, "55")
+            let mut released = released.lock();
+            ready.wait_while_for(&mut released, |released| !*released, timeout);
+            if *released {
+                mined_reply(id, served, "55")
+            } else {
+                RpcReply::error("test node gate did not release")
+            }
         })]
     })?;
 
