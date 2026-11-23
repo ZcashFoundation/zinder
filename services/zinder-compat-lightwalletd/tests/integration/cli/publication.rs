@@ -37,6 +37,10 @@ fn history_publisher_prints_its_effective_configuration() -> Result<()> {
             ])
             .output()
     };
+    let defaults = render(&base, &[("ZINDER_NETWORK__NAME", "zcash-regtest")])?;
+    assert!(defaults.status.success(), "{defaults:?}");
+    assert!(String::from_utf8(defaults.stdout)?.contains("reorg_window_blocks = 1000"));
+
     let output = render(
         &base,
         &[
