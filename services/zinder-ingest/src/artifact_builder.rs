@@ -1,13 +1,24 @@
 //! Deterministic source-block artifact builders.
 
-use std::{fmt, io::Cursor, time::Instant};
+use std::{
+    fmt,
+    io::{Cursor, Read as _},
+    sync::Arc,
+    time::Instant,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zebra_chain::{
-    block::{Block as ZebraBlock, merkle::Root as ZebraMerkleRoot},
-    serialization::{ZcashDeserialize, ZcashSerialize},
-    transaction::Transaction as ZebraTransaction,
+    block::{
+        Block as ZebraBlock, Header as ZebraBlockHeader, MAX_BLOCK_BYTES,
+        merkle::Root as ZebraMerkleRoot,
+    },
+    serialization::{
+        CompactSizeMessage, SerializationError, TrustedPreallocate, ZcashDeserializeInto,
+        ZcashSerialize as _,
+    },
+    transaction::{MIN_TRANSPARENT_TX_SIZE, Transaction as ZebraTransaction},
     transparent::Input as ZebraTransparentInput,
 };
 use zinder_core::{
@@ -351,14 +362,17 @@ pub(crate) fn prepare_canonical_block_for_retention(
     raw_blob_retention: RawBlobRetention,
 ) -> Result<PreparedCanonicalBlock, CanonicalBlockConstructionError> {
     validate_source_block_payload(source_block)?;
-    let parsed_block =
-        measure_canonical_construction_stage("block_parse", || parse_source_block(source_block))?;
+    let ParsedSourceBlock {
+        block: parsed_block,
+        transaction_layout,
+    } = measure_canonical_construction_stage("block_parse", || parse_source_block(source_block))?;
     measure_canonical_construction_stage("identity_validation", || {
         validate_parsed_block_identity(&parsed_block, source_block)
     })?;
     let prepared_transactions = measure_canonical_construction_stage("transaction_facts", || {
         prepare_canonical_transactions_from_parsed(
             &parsed_block,
+            &transaction_layout,
             source_block,
             activations,
             raw_blob_retention.retains_transaction_blobs(),
@@ -495,20 +509,25 @@ struct PreparedCanonicalTransactions {
 
 fn prepare_canonical_transactions_from_parsed(
     parsed_block: &ZebraBlock,
+    transaction_layout: &TransactionByteLayout,
     source_block: &SourceBlock,
     activations: &NetworkUpgradeActivations,
     retain_transaction_blobs: bool,
 ) -> Result<PreparedCanonicalTransactions, CanonicalBlockConstructionError> {
     let mut transactions = Vec::with_capacity(parsed_block.transactions.len());
     let mut transaction_blobs = Vec::new();
-    let (mut transaction_byte_offset, serialized_transaction_sizes_bytes) =
-        transaction_byte_layout(parsed_block, source_block)?;
+    validate_transaction_byte_layout(
+        transaction_layout,
+        parsed_block.transactions.len(),
+        source_block.raw_block_bytes.len(),
+    )?;
+    let mut transaction_byte_offset = transaction_layout.first_transaction_offset;
 
-    for ((tx_index_in_block, transaction), serialized_size) in parsed_block
+    for ((tx_index_in_block, transaction), &serialized_size) in parsed_block
         .transactions
         .iter()
         .enumerate()
-        .zip(serialized_transaction_sizes_bytes)
+        .zip(&transaction_layout.transaction_sizes)
     {
         let tx_index_in_block = u32::try_from(tx_index_in_block)
             .map_err(|_| CanonicalBlockConstructionError::TransactionIndexOverflow)?;
@@ -566,37 +585,40 @@ fn prepare_canonical_transactions_from_parsed(
     })
 }
 
-fn transaction_byte_layout(
-    parsed_block: &ZebraBlock,
-    source_block: &SourceBlock,
-) -> Result<(usize, Vec<usize>), CanonicalBlockConstructionError> {
-    let mut serialized_transaction_sizes_bytes =
-        Vec::with_capacity(parsed_block.transactions.len());
-    let mut total_transaction_bytes = 0usize;
-    for transaction in &parsed_block.transactions {
-        let serialized_size_bytes = transaction.zcash_serialized_size();
-        total_transaction_bytes = total_transaction_bytes
-            .checked_add(serialized_size_bytes)
-            .ok_or(
-                CanonicalBlockConstructionError::TransactionByteRangeMismatch {
-                    block_byte_count: source_block.raw_block_bytes.len(),
-                },
-            )?;
-        serialized_transaction_sizes_bytes.push(serialized_size_bytes);
+/// Where each transaction's bytes sit in the source block.
+///
+/// The block parse records these as it consumes the bytes, so a slice is
+/// exactly the bytes the parser read for its transaction.
+struct TransactionByteLayout {
+    /// Bytes before the first transaction: the header and transaction count.
+    first_transaction_offset: usize,
+    /// Bytes the parser consumed for each transaction, in block order.
+    transaction_sizes: Vec<usize>,
+}
+
+/// Checks that the recorded transaction byte ranges tile the block's
+/// transaction region: one range per parsed transaction, starting right
+/// after the transaction count and ending at the last block byte.
+fn validate_transaction_byte_layout(
+    transaction_layout: &TransactionByteLayout,
+    parsed_transaction_count: usize,
+    block_byte_count: usize,
+) -> Result<(), CanonicalBlockConstructionError> {
+    let layout_mismatch =
+        CanonicalBlockConstructionError::TransactionByteRangeMismatch { block_byte_count };
+    if transaction_layout.transaction_sizes.len() != parsed_transaction_count {
+        return Err(layout_mismatch);
     }
-    let first_transaction_byte_offset = source_block
-        .raw_block_bytes
-        .len()
-        .checked_sub(total_transaction_bytes)
-        .ok_or(
-            CanonicalBlockConstructionError::TransactionByteRangeMismatch {
-                block_byte_count: source_block.raw_block_bytes.len(),
-            },
-        )?;
-    Ok((
-        first_transaction_byte_offset,
-        serialized_transaction_sizes_bytes,
-    ))
+    let transaction_region_end = transaction_layout
+        .transaction_sizes
+        .iter()
+        .try_fold(transaction_layout.first_transaction_offset, |end, size| {
+            end.checked_add(*size)
+        });
+    if transaction_region_end != Some(block_byte_count) {
+        return Err(layout_mismatch);
+    }
+    Ok(())
 }
 
 fn take_transaction_bytes<'a>(
@@ -662,14 +684,69 @@ fn validate_source_block_payload(
     Ok(())
 }
 
+/// A parsed source block with the byte range of each of its transactions.
+struct ParsedSourceBlock {
+    block: ZebraBlock,
+    transaction_layout: TransactionByteLayout,
+}
+
+/// Parses the block as `zebra_chain`'s `Block` deserializer does, recording
+/// how many bytes each transaction consumed.
+///
+/// The limits match `Block::zcash_deserialize` in zebra-chain 16: at most
+/// `MAX_BLOCK_BYTES`, a transaction count within `max_allocation`, and
+/// transactions that average at least `MIN_TRANSPARENT_TX_SIZE` bytes. Each
+/// transaction goes through zebra-chain's own deserializer and its checks.
 fn parse_source_block(
     source_block: &SourceBlock,
-) -> Result<ZebraBlock, CanonicalBlockConstructionError> {
-    let mut source_bytes = Cursor::new(source_block.raw_block_bytes.as_slice());
-    let parsed_block = ZebraBlock::zcash_deserialize(&mut source_bytes)
-        .map_err(|source| CanonicalBlockConstructionError::BlockParseFailed { source })?;
-    let consumed_byte_count = usize::try_from(source_bytes.position()).unwrap_or(usize::MAX);
+) -> Result<ParsedSourceBlock, CanonicalBlockConstructionError> {
+    let parse_failed = |source| CanonicalBlockConstructionError::BlockParseFailed { source };
     let source_byte_count = source_block.raw_block_bytes.len();
+    let mut reader = Cursor::new(source_block.raw_block_bytes.as_slice()).take(MAX_BLOCK_BYTES);
+    let header: Arc<ZebraBlockHeader> = (&mut reader)
+        .zcash_deserialize_into()
+        .map_err(parse_failed)?;
+    let transaction_count: CompactSizeMessage = (&mut reader)
+        .zcash_deserialize_into()
+        .map_err(parse_failed)?;
+    let transaction_count = u64::try_from(usize::from(transaction_count)).map_err(|_| {
+        parse_failed(SerializationError::Parse(
+            "transaction count doesn't fit in a u64",
+        ))
+    })?;
+    if transaction_count > ZebraTransaction::max_allocation() {
+        return Err(parse_failed(SerializationError::Parse(
+            "Vector longer than max_allocation",
+        )));
+    }
+
+    let remaining_at_first_transaction = reader.limit();
+    let first_transaction_offset = bytes_consumed(&reader);
+    let mut transactions = Vec::new();
+    let mut transaction_sizes = Vec::new();
+    for parsed_count in 1..=transaction_count {
+        let remaining_before_transaction = reader.limit();
+        let transaction: Arc<ZebraTransaction> = (&mut reader)
+            .zcash_deserialize_into()
+            .map_err(parse_failed)?;
+        let transaction_size =
+            usize::try_from(remaining_before_transaction - reader.limit()).unwrap_or(usize::MAX);
+        debug_assert_eq!(
+            transaction.zcash_serialized_size(),
+            transaction_size,
+            "a transaction's parsed byte count must equal its serialized size",
+        );
+        transactions.push(transaction);
+        transaction_sizes.push(transaction_size);
+        if remaining_at_first_transaction - reader.limit() < parsed_count * MIN_TRANSPARENT_TX_SIZE
+        {
+            return Err(parse_failed(SerializationError::Parse(
+                "block transactions are smaller than the smallest valid transaction",
+            )));
+        }
+    }
+
+    let consumed_byte_count = bytes_consumed(&reader);
     if consumed_byte_count != source_byte_count {
         return Err(
             CanonicalBlockConstructionError::SourcePayloadNotFullyConsumed {
@@ -678,7 +755,21 @@ fn parse_source_block(
             },
         );
     }
-    Ok(parsed_block)
+    Ok(ParsedSourceBlock {
+        block: ZebraBlock {
+            header,
+            transactions,
+        },
+        transaction_layout: TransactionByteLayout {
+            first_transaction_offset,
+            transaction_sizes,
+        },
+    })
+}
+
+/// Bytes a `MAX_BLOCK_BYTES`-limited reader has consumed so far.
+fn bytes_consumed<R>(reader: &std::io::Take<R>) -> usize {
+    usize::try_from(MAX_BLOCK_BYTES - reader.limit()).unwrap_or(usize::MAX)
 }
 
 fn validate_parsed_block_identity(
@@ -922,9 +1013,19 @@ fn format_block_hash(bytes: [u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, io::Cursor};
 
+    use proptest::{
+        arbitrary::any,
+        prop_oneof,
+        strategy::{Just, Strategy},
+        test_runner::{Config, TestCaseError, TestRng, TestRunner},
+    };
     use serde_json::Value;
+    use zebra_chain::serialization::{
+        CompactSizeMessage, SerializationError, TrustedPreallocate, ZcashDeserialize,
+        ZcashSerialize,
+    };
     use zinder_core::{
         BlockHeight, CompactShieldedAction, CompactTransactionData, Network, TransactionId,
     };
@@ -933,8 +1034,10 @@ mod tests {
 
     use super::{
         COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, CanonicalBlockConstructionError, CommitmentTreeSizes,
-        CompactTransaction, RawBlobPolicy, ShieldedProtocol, compact_note_ciphertext_prefix,
-        compact_transaction_has_payload, prepare_canonical_block,
+        CompactTransaction, MAX_BLOCK_BYTES, MIN_TRANSPARENT_TX_SIZE, ParsedSourceBlock,
+        RawBlobPolicy, ShieldedProtocol, TransactionByteLayout, ZebraBlock, ZebraTransaction,
+        compact_note_ciphertext_prefix, compact_transaction_has_payload, parse_source_block,
+        prepare_canonical_block, validate_transaction_byte_layout,
     };
 
     #[test]
@@ -995,6 +1098,382 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    /// Every block fixture the repository holds: Sprout, Sapling (v4), NU5
+    /// and NU6.2 (v5), and Ironwood and NU7 (v6) transactions.
+    const BLOCK_FIXTURES: [&str; 10] = [
+        include_str!("../tests/fixtures/zcash-mainnet-sprout-block-396.json"),
+        include_str!("../tests/fixtures/zcash-mainnet-sapling-spend-block-419202.json"),
+        include_str!("../tests/fixtures/zcash-testnet-sapling-block-1842432.json"),
+        include_str!("../tests/fixtures/zcash-testnet-orchard-block-1842462.json"),
+        include_str!("../tests/fixtures/z3-regtest-block-1.json"),
+        include_str!("../tests/fixtures/z3-regtest-ironwood-block-603.json"),
+        include_str!("../tests/fixtures/zakura-1.8.6-regtest-orchard-block-111.json"),
+        include_str!("../tests/fixtures/zakura-1.8.6-regtest-ironwood-block-132.json"),
+        include_str!("../tests/fixtures/zakura-1.8.6-regtest-nu7-block-162.json"),
+        include_str!("../tests/fixtures/zebra-7.0.0-regtest-nu7-block-159.json"),
+    ];
+
+    fn fixture_block_bytes(fixture_json: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+        let fixture: Value = serde_json::from_str(fixture_json)?;
+        Ok(hex::decode(
+            fixture
+                .get("raw_block_hex")
+                .and_then(Value::as_str)
+                .ok_or("fixture raw_block_hex is missing")?,
+        )?)
+    }
+
+    /// Wraps bytes without parsing their header, so malformed bytes reach
+    /// the block parser.
+    fn unparsed_source_block(raw_block_bytes: Vec<u8>) -> SourceBlock {
+        SourceBlock {
+            network: Network::ZcashRegtest,
+            height: BlockHeight::new(1),
+            hash: zinder_core::BlockHash::from_bytes([0; 32]),
+            parent_hash: zinder_core::BlockHash::from_bytes([0; 32]),
+            block_time_seconds: 0,
+            raw_block_bytes,
+        }
+    }
+
+    /// How zebra-chain's own `Block` deserializer handles some bytes.
+    #[derive(Debug)]
+    enum ZebraBlockParse {
+        Rejected(String),
+        Trailing { consumed_byte_count: usize },
+        Complete(Vec<u8>),
+    }
+
+    fn zebra_block_parse(raw_block_bytes: &[u8]) -> Result<ZebraBlockParse, Box<dyn Error>> {
+        let mut cursor = Cursor::new(raw_block_bytes);
+        match ZebraBlock::zcash_deserialize(&mut cursor) {
+            Err(error) => Ok(ZebraBlockParse::Rejected(error.to_string())),
+            Ok(block) => {
+                let consumed_byte_count = usize::try_from(cursor.position())?;
+                if consumed_byte_count == raw_block_bytes.len() {
+                    Ok(ZebraBlockParse::Complete(block.zcash_serialize_to_vec()?))
+                } else {
+                    Ok(ZebraBlockParse::Trailing {
+                        consumed_byte_count,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Checks that the layout slices the block into exactly the bytes of
+    /// each transaction, and returns the block's serialization.
+    fn assert_layout_slices_each_transaction(
+        parsed: &ParsedSourceBlock,
+        raw_block_bytes: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let layout = &parsed.transaction_layout;
+        validate_transaction_byte_layout(
+            layout,
+            parsed.block.transactions.len(),
+            raw_block_bytes.len(),
+        )?;
+        let mut header_and_count = parsed.block.header.zcash_serialize_to_vec()?;
+        CompactSizeMessage::try_from(parsed.block.transactions.len())?
+            .zcash_serialize(&mut header_and_count)?;
+        assert_eq!(layout.first_transaction_offset, header_and_count.len());
+        let mut offset = layout.first_transaction_offset;
+        for (transaction, &size) in parsed
+            .block
+            .transactions
+            .iter()
+            .zip(&layout.transaction_sizes)
+        {
+            let serialized = transaction.zcash_serialize_to_vec()?;
+            assert_eq!(size, serialized.len());
+            assert_eq!(
+                raw_block_bytes.get(offset..offset + size),
+                Some(&serialized[..])
+            );
+            offset += size;
+        }
+        assert_eq!(offset, raw_block_bytes.len());
+        Ok(parsed.block.zcash_serialize_to_vec()?)
+    }
+
+    /// Checks that `parse_source_block` accepts, rejects, and reports
+    /// trailing bytes exactly as zebra-chain's `Block` deserializer does.
+    fn assert_parse_matches_zebra(raw_block_bytes: &[u8]) -> Result<bool, Box<dyn Error>> {
+        let expected = zebra_block_parse(raw_block_bytes)?;
+        let parsed = parse_source_block(&unparsed_source_block(raw_block_bytes.to_vec()));
+        match (expected, parsed) {
+            (ZebraBlockParse::Complete(expected_bytes), Ok(parsed)) => {
+                let parsed_bytes = assert_layout_slices_each_transaction(&parsed, raw_block_bytes)?;
+                assert_eq!(parsed_bytes, expected_bytes);
+                assert_eq!(parsed_bytes, raw_block_bytes);
+                Ok(true)
+            }
+            (
+                ZebraBlockParse::Rejected(expected_reason),
+                Err(CanonicalBlockConstructionError::BlockParseFailed { source }),
+            ) => {
+                assert_eq!(source.to_string(), expected_reason);
+                Ok(false)
+            }
+            (
+                ZebraBlockParse::Trailing {
+                    consumed_byte_count: expected,
+                },
+                Err(CanonicalBlockConstructionError::SourcePayloadNotFullyConsumed {
+                    consumed_byte_count,
+                    source_byte_count,
+                }),
+            ) => {
+                assert_eq!(
+                    (consumed_byte_count, source_byte_count),
+                    (expected, raw_block_bytes.len())
+                );
+                Ok(false)
+            }
+            (expected, parsed) => Err(format!(
+                "zebra-chain parse {expected:?} but parse_source_block returned {:?}",
+                parsed.map(|parsed| parsed.transaction_layout.transaction_sizes)
+            )
+            .into()),
+        }
+    }
+
+    #[test]
+    fn every_fixture_block_parses_to_zebra_blocks_and_exact_transaction_ranges()
+    -> Result<(), Box<dyn Error>> {
+        for fixture_json in BLOCK_FIXTURES {
+            assert!(assert_parse_matches_zebra(&fixture_block_bytes(
+                fixture_json
+            )?)?);
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Debug)]
+    enum BlockMutation {
+        Truncate(usize),
+        Flip(usize, u8),
+        Insert(usize, u8),
+        Append(Vec<u8>),
+    }
+
+    fn block_mutations() -> impl Strategy<Value = (usize, BlockMutation)> {
+        let mutation = prop_oneof![
+            any::<usize>().prop_map(BlockMutation::Truncate),
+            (any::<usize>(), 1_u8..=u8::MAX).prop_map(|(at, flip)| BlockMutation::Flip(at, flip)),
+            (any::<usize>(), any::<u8>()).prop_map(|(at, byte)| BlockMutation::Insert(at, byte)),
+            proptest::collection::vec(any::<u8>(), 1..64).prop_map(BlockMutation::Append),
+            Just(BlockMutation::Truncate(usize::MAX)),
+        ];
+        (0..BLOCK_FIXTURES.len(), mutation)
+    }
+
+    /// The recording parser decides every mutated block as zebra-chain does.
+    ///
+    /// Blocks are truncated, have one byte flipped or inserted, or have bytes
+    /// appended. Whatever zebra-chain's `Block` deserializer decides, the
+    /// recording parser decides the same, with the same reason, and every
+    /// accepted block's ranges slice out each transaction exactly.
+    #[test]
+    fn recording_parser_matches_zebra_block_deserialization_on_mutated_blocks()
+    -> Result<(), Box<dyn Error>> {
+        let fixtures = BLOCK_FIXTURES
+            .into_iter()
+            .map(fixture_block_bytes)
+            .collect::<Result<Vec<_>, _>>()?;
+        let accepted = std::sync::atomic::AtomicUsize::new(0);
+        let config = Config {
+            cases: 512,
+            failure_persistence: None,
+            ..Config::default()
+        };
+        let rng = TestRng::deterministic_rng(config.rng_algorithm);
+        let mut runner = TestRunner::new_with_rng(config, rng);
+        runner
+            .run(&block_mutations(), |(fixture_index, mutation)| {
+                let mut bytes = fixtures[fixture_index].clone();
+                match mutation {
+                    BlockMutation::Truncate(at) => bytes.truncate(at % bytes.len()),
+                    BlockMutation::Flip(at, flip) => {
+                        let at = at % bytes.len();
+                        bytes[at] ^= flip;
+                    }
+                    BlockMutation::Insert(at, byte) => bytes.insert(at % bytes.len(), byte),
+                    BlockMutation::Append(tail) => bytes.extend(tail),
+                }
+                let parsed = assert_parse_matches_zebra(&bytes)
+                    .map_err(|error| TestCaseError::fail(error.to_string()))?;
+                if parsed {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+        assert!(
+            accepted.load(std::sync::atomic::Ordering::Relaxed) >= 32,
+            "too few mutated blocks parsed to exercise the transaction ranges"
+        );
+        Ok(())
+    }
+
+    /// A block of `transactions` after the regtest fixture's header.
+    fn block_with_transactions(transactions: &[Vec<u8>]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let fixture = fixture_block_bytes(BLOCK_FIXTURES[4])?;
+        let header = ZebraBlock::zcash_deserialize(&mut Cursor::new(fixture))?.header;
+        let mut bytes = header.zcash_serialize_to_vec()?;
+        CompactSizeMessage::try_from(transactions.len())?.zcash_serialize(&mut bytes)?;
+        for transaction in transactions {
+            bytes.extend_from_slice(transaction);
+        }
+        Ok(bytes)
+    }
+
+    /// A version-1 transaction with one non-coinbase input and one output
+    /// whose script is `output_script_len` bytes, or no inputs or outputs.
+    fn v1_transaction(output_script_len: Option<u8>) -> Vec<u8> {
+        let mut bytes = 1_u32.to_le_bytes().to_vec();
+        match output_script_len {
+            None => bytes.extend([0, 0]),
+            Some(script_len) => {
+                bytes.push(1);
+                bytes.extend([0x42; 32]);
+                bytes.extend(0_u32.to_le_bytes());
+                bytes.push(0);
+                bytes.extend(u32::MAX.to_le_bytes());
+                bytes.push(1);
+                bytes.extend(0_u64.to_le_bytes());
+                bytes.push(script_len);
+                bytes.extend(std::iter::repeat_n(0x51, usize::from(script_len)));
+            }
+        }
+        bytes.extend(0_u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn transactions_must_average_the_smallest_transparent_transaction_size()
+    -> Result<(), Box<dyn Error>> {
+        let minimum = usize::try_from(MIN_TRANSPARENT_TX_SIZE)?;
+        let empty = v1_transaction(None);
+        assert_eq!(empty.len(), 10);
+        // A transparent transaction is 60 bytes plus its output script, so a
+        // 38-byte script makes two transactions average exactly the minimum.
+        let at_minimum = v1_transaction(Some(38));
+        assert_eq!(at_minimum.len() + empty.len(), 2 * minimum);
+        assert!(assert_parse_matches_zebra(&block_with_transactions(&[
+            at_minimum,
+            empty.clone()
+        ])?)?);
+
+        let below_minimum = block_with_transactions(&[v1_transaction(Some(37)), empty])?;
+        assert!(!assert_parse_matches_zebra(&below_minimum)?);
+        assert!(matches!(
+            parse_source_block(&unparsed_source_block(below_minimum)),
+            Err(CanonicalBlockConstructionError::BlockParseFailed {
+                source: SerializationError::Parse(
+                    "block transactions are smaller than the smallest valid transaction"
+                ),
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_counts_above_the_allocation_limit_fail_before_parsing()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = fixture_block_bytes(BLOCK_FIXTURES[4])?;
+        let header = ZebraBlock::zcash_deserialize(&mut Cursor::new(fixture))?.header;
+        let limit = usize::try_from(ZebraTransaction::max_allocation())?;
+        for (count, rejected) in [(limit, false), (limit + 1, true)] {
+            let mut bytes = header.zcash_serialize_to_vec()?;
+            CompactSizeMessage::try_from(count)?.zcash_serialize(&mut bytes)?;
+            assert!(!assert_parse_matches_zebra(&bytes)?);
+            let error = parse_source_block(&unparsed_source_block(bytes))
+                .err()
+                .ok_or("a block without its transactions parsed")?;
+            assert_eq!(
+                matches!(
+                    error,
+                    CanonicalBlockConstructionError::BlockParseFailed {
+                        source: SerializationError::Parse("Vector longer than max_allocation"),
+                    }
+                ),
+                rejected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blocks_stop_at_the_consensus_block_size_limit() -> Result<(), Box<dyn Error>> {
+        let limit = usize::try_from(MAX_BLOCK_BYTES)?;
+        let transaction = v1_transaction(Some(38));
+        let mut transaction_count = limit / transaction.len();
+        let within_limit = loop {
+            let bytes = block_with_transactions(&vec![transaction.clone(); transaction_count])?;
+            if bytes.len() <= limit {
+                break bytes;
+            }
+            transaction_count -= 1;
+        };
+        let oversized = block_with_transactions(&vec![transaction; transaction_count + 1])?;
+        assert!(oversized.len() > limit);
+
+        assert!(assert_parse_matches_zebra(&within_limit)?);
+        assert!(!assert_parse_matches_zebra(&oversized)?);
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_ranges_must_tile_the_transaction_region() {
+        let layout =
+            |first_transaction_offset, transaction_sizes: &[usize]| TransactionByteLayout {
+                first_transaction_offset,
+                transaction_sizes: transaction_sizes.to_vec(),
+            };
+        let mismatch = |result| {
+            matches!(
+                result,
+                Err(
+                    CanonicalBlockConstructionError::TransactionByteRangeMismatch {
+                        block_byte_count: 100
+                    }
+                )
+            )
+        };
+        assert!(validate_transaction_byte_layout(&layout(40, &[10, 50]), 2, 100).is_ok());
+        assert!(mismatch(validate_transaction_byte_layout(
+            &layout(40, &[10, 49]),
+            2,
+            100
+        )));
+        assert!(mismatch(validate_transaction_byte_layout(
+            &layout(40, &[10, 51]),
+            2,
+            100
+        )));
+        assert!(mismatch(validate_transaction_byte_layout(
+            &layout(39, &[10, 50]),
+            2,
+            100
+        )));
+        assert!(mismatch(validate_transaction_byte_layout(
+            &layout(40, &[60]),
+            2,
+            100
+        )));
+        assert!(mismatch(validate_transaction_byte_layout(
+            &layout(40, &[10, 50]),
+            3,
+            100
+        )));
+        assert!(mismatch(validate_transaction_byte_layout(
+            &layout(40, &[usize::MAX, 61]),
+            2,
+            100
+        )));
     }
 
     fn regtest_fixture_block() -> Result<SourceBlock, Box<dyn Error>> {
