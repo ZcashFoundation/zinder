@@ -54,8 +54,9 @@ impl<'a> ServerStreamingService<BlockRange> for &'a (dyn EncodedBlockRange + '_)
 /// length-prefixed form: an uncompressed flag byte, the big-endian payload
 /// length, and the payload.
 ///
-/// The server sends a message of at least 32 KiB as this buffer, without
-/// copying it, unless the server is configured to compress responses.
+/// Unless the server is configured to compress responses, a message of at
+/// least 32 KiB leaves the generated server as this buffer, without the copy
+/// into tonic's encode buffer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodedBlock {
     message: Bytes,
@@ -250,9 +251,10 @@ const BATCH_BYTES: usize = 32 * 1024;
 
 /// An uncompressed gRPC server response body over encoded messages.
 ///
-/// The stream ends with the trailers tonic's server encoder would send: `OK`
-/// after the last message, or the stream's error status after the messages
-/// before it.
+/// The stream sends the bytes and trailers tonic's server encoder would
+/// send: `OK` after the last message, the stream's error status after the
+/// messages before it, or `OUT_OF_RANGE` for a message over the size limit
+/// after the messages already sent.
 struct EncodedBlockBody {
     messages: EncodedBlockRangeStream,
     max_message_size: Option<usize>,
@@ -326,6 +328,9 @@ impl http_body::Body for EncodedBlockBody {
                 Poll::Ready(Some(Ok(block))) => block,
             };
             if let Err(status) = this.check_size(&block) {
+                // tonic drops the messages it has batched but not yet sent
+                // when one fails to encode.
+                this.batch.clear();
                 this.status = Some(status);
                 break;
             }

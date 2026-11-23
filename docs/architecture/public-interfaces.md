@@ -251,7 +251,7 @@ crates never expose generated types in their public APIs.
 
 ## Wire conventions
 
-The generated lightwalletd server accepts an optional `EncodedBlockRange` implementation for `GetBlockRange`. Each stream element is an `EncodedBlock`: one complete `CompactBlock` protobuf message in gRPC's length-prefixed form. Tonic decodes the request and applies the message size limits. When the server may compress responses, tonic also compresses and frames each message. Otherwise a message of 32 KiB or more goes to HTTP/2 without a copy, and shorter messages are batched as tonic batches them. Existing server implementations and generated clients use their ordinary typed interfaces.
+The generated lightwalletd server accepts an optional `EncodedBlockRange` implementation for `GetBlockRange`. Each stream element is an `EncodedBlock`: one complete `CompactBlock` protobuf message in gRPC's length-prefixed form. Tonic decodes the request and applies the message size limits. When the server may compress responses, tonic also compresses and frames each message. Otherwise a message of 32 KiB or more leaves the generated server as its own buffer, without tonic's encode-buffer copy, and shorter messages are batched as tonic batches them. Response layers outside the generated server, such as the public listener's send-stall bound, still see ordinary data chunks. Existing server implementations and generated clients use their ordinary typed interfaces.
 
 These rules apply at every protocol boundary.
 [ADR-0002](../adrs/0002-serialization-and-byte-order.md) records why.

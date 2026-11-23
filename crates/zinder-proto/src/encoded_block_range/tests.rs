@@ -191,13 +191,14 @@ fn the_message_size_limit_admits_its_exact_size_and_refuses_one_more_byte() -> e
 }
 
 #[test]
-fn a_refused_message_still_follows_the_smaller_messages_before_it() -> eyre::Result<()> {
+fn a_refused_message_drops_the_unsent_batch_as_tonic_does() -> eyre::Result<()> {
     let script = [
         Some(Ok(framed(&payload(300, 1))?)),
         Some(Ok(framed(&payload(500, 2))?)),
     ];
-    let (encoded, _) = both(&script, Some(400))?;
-    assert_eq!(encoded.bytes().len(), EncodedBlock::PREFIX_LEN + 300);
+    let (encoded, tonic) = both(&script, Some(400))?;
+    assert_eq!(encoded, tonic);
+    assert_eq!(encoded.frames, Vec::<Bytes>::new());
     assert_eq!(
         grpc_status(&encoded).map(|status| status.code()),
         Some(tonic::Code::OutOfRange)
