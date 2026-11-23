@@ -691,6 +691,82 @@ async fn light_wallet_profile_serves_canonical_and_forwarded_reads_from_the_bina
     Ok(())
 }
 
+#[tokio::test]
+async fn every_light_wallet_selection_refuses_the_same_checkpointed_history() -> Result<()> {
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+        .extend_blocks(2);
+    let baseline = CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(1));
+    let writer = CanonicalWriterFixture::publish(&baseline, &schedule)?;
+    let primary = writer.canonical_primary()?;
+    let node = verifiable_node(&schedule, served_tip(2)?.hash, [])?;
+    let files = tempfile::tempdir()?;
+    let cancel = CancellationToken::new();
+    let _cancel_on_exit = cancel.clone().drop_guard();
+    let control =
+        spawn_binary_ingest_control(primary, files.path().join("checkpoints"), cancel).await?;
+
+    let mut refusal = None;
+    for (label, selection) in [
+        ("profile", "profile = \"light-wallet\""),
+        ("serving", "[compat]\nserving = \"light-wallet\""),
+        (
+            "legacy",
+            "[compat]\nserving = \"light-wallet-qualification\"",
+        ),
+    ] {
+        let config_path = files.path().join(format!("{label}.toml"));
+        std::fs::write(&config_path, selection)?;
+        let child =
+            tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"))
+                .args([
+                    "--config",
+                    config_path
+                        .to_str()
+                        .ok_or_else(|| eyre!("non-UTF-8 config path"))?,
+                ])
+                .env_clear()
+                .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+                .env("ZINDER_NODE__JSON_RPC_ADDR", node.url())
+                .env("ZINDER_INGEST_CONTROL__ADDR", &control)
+                .env(
+                    "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+                    primary.reorg_policy().reorg_window_blocks().to_string(),
+                )
+                .env("ZINDER_OPS__LISTEN_ADDR", "127.0.0.1:0")
+                .env("ZINDER_COMPAT__LISTEN_ADDR", "127.0.0.1:0")
+                .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+                .env("ZINDER_STORAGE__SECONDARY_PATH", files.path().join(label))
+                .kill_on_drop(true)
+                .output();
+        let output = tokio::time::timeout(Duration::from_secs(10), child).await??;
+        assert!(
+            !output.status.success(),
+            "{label} accepted checkpointed history"
+        );
+        let stderr = String::from_utf8(output.stderr)?;
+        let diagnostic = stderr
+            .lines()
+            .find_map(|line| {
+                line.split_once("lacks required BlockHistory coverage")
+                    .map(|(_, tail)| tail)
+            })
+            .ok_or_else(|| eyre!("{label} missed the history refusal: {stderr}"))?;
+        assert!(
+            diagnostic.contains(
+                "required from Some(BlockHeight(1)), available from Some(BlockHeight(2))"
+            ),
+            "{diagnostic}"
+        );
+        if let Some(previous) = &refusal {
+            assert_eq!(previous, diagnostic);
+        }
+        refusal = Some(diagnostic.to_owned());
+    }
+    Ok(())
+}
+
 async fn wait_for_compat(
     child: &mut tokio::process::Child,
     addr: SocketAddr,

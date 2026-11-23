@@ -1041,6 +1041,86 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn secondary_requires_complete_subtree_prefix_from_the_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{CanonicalStoreRequirements, RocksDbCanonicalSecondary};
+
+        let temporary = tempdir()?;
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let frontiers = completed_sapling_tip_frontiers()?;
+        let pre_floor_root = complete_prefix_root(ShieldedProtocol::Sapling, 0, 0x51, PREDECESSOR);
+        let range = SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            NonZeroU32::MIN,
+        );
+        for (label, coverage) in [
+            ("complete", CanonicalSubtreeRootLoadCoverage::CompletePrefix),
+            ("retained", CanonicalSubtreeRootLoadCoverage::RetainedRange),
+        ] {
+            let path = temporary.path().join(label);
+            let mut builder = loaded_checkpointed_builder_from(
+                &path,
+                frontiers.clone(),
+                frontiers.clone(),
+                frontiers.clone(),
+            )?;
+            match coverage {
+                CanonicalSubtreeRootLoadCoverage::CompletePrefix => {
+                    builder.load_complete_subtree_root_prefix([pre_floor_root.clone()])?;
+                }
+                CanonicalSubtreeRootLoadCoverage::RetainedRange => {
+                    builder.load_subtree_roots(std::iter::empty())?;
+                }
+            }
+            builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+                BUILD_TIP,
+                BUILD_TIP.height.value(),
+                frontiers.clone(),
+            ))?;
+            let validated = builder.prepare_cold_certified_publication()?;
+            let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+                BUILD_TIP,
+                UnixTimestampMillis::new(1_750_000_000_001),
+            ))?;
+            let store = validated.publish_baseline(publication)?;
+            assert_eq!(store.stored_set().subtree_root_coverage(), Some(coverage));
+            let open = |suffix, requirements| {
+                RocksDbCanonicalSecondary::open_ready_requiring(
+                    &path,
+                    temporary.path().join(format!("{label}-{suffix}")),
+                    &activations,
+                    requirements,
+                    CanonicalReorgPolicy::new(100)?,
+                    RocksDbResourceBudget::for_local_tests(),
+                )
+            };
+            let requirements =
+                CanonicalStoreRequirements::default().from_height(FIRST_RETAINED.height);
+            let secondary = open("ordinary", requirements.clone())?;
+            assert_eq!(secondary.stored_set(), store.stored_set());
+            let prefix = open("prefix", requirements.with_complete_subtree_root_prefix());
+            match coverage {
+                CanonicalSubtreeRootLoadCoverage::CompletePrefix => {
+                    assert_eq!(
+                        prefix?.subtree_roots(range)?,
+                        std::slice::from_ref(&pre_floor_root)
+                    );
+                }
+                CanonicalSubtreeRootLoadCoverage::RetainedRange => {
+                    assert!(secondary.subtree_roots(range).is_err());
+                    assert!(matches!(
+                        prefix,
+                        Err(CanonicalStoreError::IncompleteSubtreeRootPrefix { .. })
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn retained_sapling_root(index: u32) -> SubtreeRootArtifact {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&index.to_be_bytes());

@@ -1294,17 +1294,14 @@ fn read_subtree_roots(
 ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
     let db = &store.serving_open().db;
     let family = column_family(db, SUBTREE_ROOT_COLUMN_FAMILY)?;
-    // A complete-prefix load holds every advertised root. A retained-range
-    // load holds the roots its retained blocks complete, so only an index the
-    // predecessor's trees already completed may be absent.
-    let coverage_start = match store.serving_subtree_root_coverage() {
-        CanonicalSubtreeRootLoadCoverage::CompletePrefix => 0,
-        CanonicalSubtreeRootLoadCoverage::RetainedRange => store
+    let coverage_start = super::stored_set::first_subtree_root_index(
+        store.serving_subtree_root_coverage(),
+        store
             .serving_build_plan()
             .history_predecessor()
-            .tip_metadata()
-            .completed_subtree_count(range.protocol),
-    };
+            .tip_metadata(),
+        range.protocol,
+    );
     let mut indices = range.into_iter();
     let mut roots = Vec::new();
     let read_point = |index| {

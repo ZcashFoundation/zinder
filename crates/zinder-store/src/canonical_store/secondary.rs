@@ -283,6 +283,11 @@ impl RocksDbCanonicalSecondary {
             opened_control.workload,
             &opened_control.build_plan,
         )?;
+        expectation.validate_reader_requirements(
+            &primary_path,
+            &opened_control,
+            subtree_root_coverage,
+        )?;
         let reorg_policy = opened_control.effective_reorg_policy();
         let replay_tail = validate_ready_publication(
             &bounded_open.db,
@@ -454,6 +459,16 @@ impl RocksDbCanonicalSecondary {
                 "canonical build identity changed during secondary catch-up",
             ));
         }
+        if ready_evidence.construction_manifest_version
+            != self.ready_evidence.construction_manifest_version
+            || ready_evidence.construction_manifest_sha256
+                != self.ready_evidence.construction_manifest_sha256
+        {
+            return Err(CanonicalStoreError::admission(
+                &self.primary_path,
+                "canonical construction manifest changed during secondary catch-up",
+            ));
+        }
         if opened_control.cursor_auth_key != self.cursor_auth_key {
             return Err(CanonicalStoreError::admission(
                 &self.primary_path,
@@ -535,7 +550,9 @@ impl RocksDbCanonicalSecondary {
     /// Returns the retained block data and historical floor.
     #[must_use]
     pub const fn stored_set(&self) -> super::CanonicalStoredSet {
-        self.build_plan.stored_set(self.workload)
+        self.build_plan
+            .stored_set(self.workload)
+            .with_subtree_root_coverage(self.subtree_root_coverage)
     }
 
     /// Returns the immutable raw-blob retention authenticated at admission.

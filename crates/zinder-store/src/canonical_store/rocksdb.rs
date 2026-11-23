@@ -232,6 +232,26 @@ impl CanonicalStoreAdmissionExpectation {
         }
     }
 
+    pub(super) fn validate_reader_requirements(
+        &self,
+        path: &Path,
+        control: &DecodedStoreControl,
+        subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+    ) -> Result<(), CanonicalStoreError> {
+        if let StoredDataAdmission::Minimum(requirements) = &self.stored_data {
+            control
+                .build_plan
+                .stored_set(control.workload)
+                .with_subtree_root_coverage(subtree_root_coverage)
+                .require(
+                    path,
+                    requirements,
+                    control.build_plan.history_predecessor().tip_metadata(),
+                )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn allowing_schedule_update(mut self) -> Self {
         self.allow_schedule_update = true;
         self
@@ -985,7 +1005,9 @@ impl RocksDbCanonicalStore {
     /// Returns the retained block data and historical floor.
     #[must_use]
     pub const fn stored_set(&self) -> super::CanonicalStoredSet {
-        self.build_plan.stored_set(self.workload)
+        self.build_plan
+            .stored_set(self.workload)
+            .with_subtree_root_coverage(self.subtree_root_coverage)
     }
 
     /// Returns the immutable raw-blob retention persisted by the store.
@@ -1248,14 +1270,8 @@ fn validate_stored_data(
     expectation: &CanonicalStoreAdmissionExpectation,
     persisted: &DecodedStoreControl,
 ) -> Result<(), CanonicalStoreError> {
-    let (workload, retention) = match &expectation.stored_data {
-        StoredDataAdmission::Minimum(requirements) => {
-            return persisted
-                .build_plan
-                .stored_set(persisted.workload)
-                .require(path, requirements);
-        }
-        StoredDataAdmission::Exact(workload, retention) => (*workload, *retention),
+    let StoredDataAdmission::Exact(workload, retention) = expectation.stored_data else {
+        return Ok(());
     };
     if persisted.workload != workload {
         return Err(CanonicalStoreError::admission(

@@ -323,8 +323,13 @@ the build plan and workload. Readers can specify minimum data and a starting
 height with `CanonicalStoreRequirements`. A richer store satisfies these
 requirements when it covers the requested history. Missing data or an
 insufficient history floor returns `CanonicalStoreError::MissingStoredData`.
-Artifact-specific checks still apply, such as pool activation for final roots
-and event retention for event streams. Serving capabilities also depend on
+An admitted stored set also carries authenticated subtree-root coverage from
+the construction manifest. A reader can require a complete subtree-root
+prefix from index zero in every pool. A retained-range load meets this
+requirement when its predecessor has no completed roots. Otherwise, a
+complete-prefix load is required. Insufficient coverage returns
+`CanonicalStoreError::IncompleteSubtreeRootPrefix`. Pool activation still
+governs final roots, and event retention still governs event streams. Serving capabilities also depend on
 the installed handlers and their admitted dependencies.
 
 Only the canonical writer records a new network-upgrade schedule, and readers

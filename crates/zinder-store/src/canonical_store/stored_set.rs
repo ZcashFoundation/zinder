@@ -3,10 +3,10 @@
 use std::path::Path;
 
 use rust_rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
-use zinder_core::BlockHeight;
+use zinder_core::{BlockHeight, ChainTipMetadata, ShieldedProtocol};
 
 use super::{
-    CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalStoreError, CanonicalStoreWorkload, CanonicalSubtreeRootLoadCoverage,
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
@@ -78,6 +78,7 @@ pub enum CanonicalStoredData {
 pub struct CanonicalStoreRequirements {
     additional_data: Vec<CanonicalStoredData>,
     first_required_height: Option<BlockHeight>,
+    complete_subtree_root_prefix: bool,
 }
 
 impl CanonicalStoreRequirements {
@@ -87,6 +88,7 @@ impl CanonicalStoreRequirements {
         Self {
             additional_data: additional_data.to_vec(),
             first_required_height: None,
+            complete_subtree_root_prefix: false,
         }
     }
 
@@ -94,6 +96,13 @@ impl CanonicalStoreRequirements {
     #[must_use]
     pub const fn from_height(mut self, height: BlockHeight) -> Self {
         self.first_required_height = Some(height);
+        self
+    }
+
+    /// Requires every completed subtree root from index zero in each pool.
+    #[must_use]
+    pub const fn with_complete_subtree_root_prefix(mut self) -> Self {
+        self.complete_subtree_root_prefix = true;
         self
     }
 
@@ -118,16 +127,18 @@ impl CanonicalStoreRequirements {
         Self {
             additional_data,
             first_required_height: None,
+            complete_subtree_root_prefix: false,
         }
     }
 }
 
-/// Retention policy and height floor derived from a canonical build plan.
+/// Retention, historical floor, and any admitted subtree-root evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoredSet {
     workload: CanonicalStoreWorkload,
     retention: RawBlobRetention,
     first_height: BlockHeight,
+    subtree_root_coverage: Option<CanonicalSubtreeRootLoadCoverage>,
 }
 
 impl CanonicalStoredSet {
@@ -140,6 +151,7 @@ impl CanonicalStoredSet {
             workload,
             retention,
             first_height,
+            subtree_root_coverage: None,
         }
     }
 
@@ -162,10 +174,27 @@ impl CanonicalStoredSet {
         self.first_height(kind).is_some()
     }
 
+    /// Returns the authenticated subtree-root coverage of an admitted store.
+    ///
+    /// A set derived from a build plan alone has no manifest evidence.
+    #[must_use]
+    pub const fn subtree_root_coverage(self) -> Option<CanonicalSubtreeRootLoadCoverage> {
+        self.subtree_root_coverage
+    }
+
+    pub(super) const fn with_subtree_root_coverage(
+        mut self,
+        coverage: CanonicalSubtreeRootLoadCoverage,
+    ) -> Self {
+        self.subtree_root_coverage = Some(coverage);
+        self
+    }
+
     pub(super) fn require(
         self,
         path: &Path,
         requirements: &CanonicalStoreRequirements,
+        predecessor_tip_metadata: ChainTipMetadata,
     ) -> Result<(), CanonicalStoreError> {
         for kind in std::iter::once(CanonicalStoredData::BlockHistory)
             .chain(requirements.additional_data.iter().copied())
@@ -185,6 +214,23 @@ impl CanonicalStoredSet {
                 });
             }
         }
+        if requirements.complete_subtree_root_prefix
+            && [
+                ShieldedProtocol::Sapling,
+                ShieldedProtocol::Orchard,
+                ShieldedProtocol::Ironwood,
+            ]
+            .into_iter()
+            .any(|pool| {
+                self.subtree_root_coverage.map(|coverage| {
+                    first_subtree_root_index(coverage, predecessor_tip_metadata, pool)
+                }) != Some(0)
+            })
+        {
+            return Err(CanonicalStoreError::IncompleteSubtreeRootPrefix {
+                path: path.to_path_buf(),
+            });
+        }
         Ok(())
     }
 
@@ -194,6 +240,19 @@ impl CanonicalStoredSet {
 
     pub(super) const fn requires_daily_value_pool_evidence(self) -> bool {
         matches!(self.workload, CanonicalStoreWorkload::Explorer)
+    }
+}
+
+pub(super) fn first_subtree_root_index(
+    coverage: CanonicalSubtreeRootLoadCoverage,
+    predecessor_tip_metadata: ChainTipMetadata,
+    protocol: ShieldedProtocol,
+) -> u32 {
+    match coverage {
+        CanonicalSubtreeRootLoadCoverage::CompletePrefix => 0,
+        CanonicalSubtreeRootLoadCoverage::RetainedRange => {
+            predecessor_tip_metadata.completed_subtree_count(protocol)
+        }
     }
 }
 

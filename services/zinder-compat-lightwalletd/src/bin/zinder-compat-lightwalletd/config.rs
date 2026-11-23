@@ -188,7 +188,7 @@ impl LightwalletdConfig {
         let requirements = CanonicalStoreRequirements::for_blob_retention(
             self.storage.expected_raw_blob_retention,
         );
-        if self.profile == Some(DeploymentProfile::LightWallet) {
+        if self.serving == CompatServing::LightWallet {
             requirements.from_height(zinder_core::BlockHeight::new(1))
         } else {
             requirements
@@ -480,14 +480,7 @@ fn resolve_lightwalletd_config(
 
 fn resolve_serving(config: &mut LightwalletdRawConfig) -> Result<CompatServing, ConfigError> {
     if config.profile != Some(DeploymentProfile::LightWallet) {
-        let serving = config.compat.serving.unwrap_or_default();
-        if serving == CompatServing::LightWallet {
-            config
-                .storage
-                .raw_blob_policy
-                .get_or_insert(zinder_store::RawBlobRetention::None);
-        }
-        return Ok(serving);
+        return Ok(config.compat.serving.unwrap_or_default());
     }
     if config
         .compat

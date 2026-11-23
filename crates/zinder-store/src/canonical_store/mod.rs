@@ -790,6 +790,13 @@ pub enum CanonicalStoreError {
         available_from: Option<BlockHeight>,
     },
 
+    /// The admitted store omits completed subtree roots below its retained history.
+    #[error("canonical store at {path:?} lacks the required complete subtree-root prefix")]
+    IncompleteSubtreeRootPrefix {
+        /// Canonical primary path.
+        path: PathBuf,
+    },
+
     /// A serving store open encountered an unpublished BUILDING store.
     #[error("canonical store is not READY: {path:?}")]
     StoreNotReady {

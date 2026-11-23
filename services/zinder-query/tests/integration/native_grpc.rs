@@ -943,12 +943,16 @@ async fn native_grpc_service_honors_request_epoch_pin() -> eyre::Result<()> {
 )]
 async fn native_serving_pair_capabilities_and_calls_follow_raw_blob_retention() -> eyre::Result<()>
 {
-    for raw_blob_retention in [
-        RawBlobRetention::None,
-        RawBlobRetention::Transactions,
-        RawBlobRetention::All,
+    for (retention, minimum) in [
+        (RawBlobRetention::None, RawBlobRetention::None),
+        (
+            RawBlobRetention::Transactions,
+            RawBlobRetention::Transactions,
+        ),
+        (RawBlobRetention::All, RawBlobRetention::All),
+        (RawBlobRetention::All, RawBlobRetention::Transactions),
     ] {
-        assert_native_retention_case(raw_blob_retention).await?;
+        assert_native_retention_case(retention, minimum).await?;
     }
     Ok(())
 }
@@ -957,7 +961,10 @@ async fn native_serving_pair_capabilities_and_calls_follow_raw_blob_retention() 
     clippy::too_many_lines,
     reason = "one retention case proves its capability descriptor and every canonical, live, pinned, snapshot, and full-block outcome as one contract"
 )]
-async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> eyre::Result<()> {
+async fn assert_native_retention_case(
+    raw_blob_retention: RawBlobRetention,
+    minimum: RawBlobRetention,
+) -> eyre::Result<()> {
     let (expect_transaction_bytes, expect_full_blocks) = match raw_blob_retention {
         RawBlobRetention::None => (false, false),
         RawBlobRetention::Transactions => (true, false),
@@ -998,8 +1005,21 @@ async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> e
         0,
         mined_raw_transaction_bytes.clone(),
     ));
-    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
-    let (canonical, wallet) = store_fixture.take_readers()?;
+    let mut writer =
+        CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+    let mut store_fixture = writer.serving_store_fixture()?;
+    let (matching_canonical, wallet) = store_fixture.take_readers()?;
+    let scratch = tempfile::tempdir()?;
+    let canonical = zinder_store::RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        writer.canonical_primary_path(),
+        scratch.path(),
+        Network::ZcashRegtest,
+        zinder_store::CanonicalStoreWorkload::Wallet,
+        minimum,
+        matching_canonical.reorg_policy(),
+        zinder_store::RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(canonical.raw_blob_retention(), raw_blob_retention);
     let serving_pair = Arc::new(WalletServingReadPair::new(
         Arc::new(RocksDbCanonicalReader::new(canonical)?),
         Arc::new(RocksDbWalletReader::new(wallet)),
@@ -1035,6 +1055,14 @@ async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> e
         has_capability(&server_info, WALLET_READ_FULL_BLOCK_AT_V1),
         expect_full_blocks,
         "{raw_blob_retention} retention advertised incorrect full-block support"
+    );
+
+    assert_eq!(
+        has_capability(
+            &server_info,
+            zinder_proto::capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
+        ),
+        expect_full_blocks,
     );
 
     let mempool_snapshot = WalletQueryService::mempool_snapshot(

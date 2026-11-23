@@ -79,10 +79,11 @@ rejected. Compatibility can also read an existing canonical store with
 complete history and additional retained blobs. The ingest writer must match the store's original
 retention policy.
 
-For qualification against a store that retains transaction bodies, omit the
-profile and set `compat.serving = "light-wallet"` with the reader's required
-`storage.raw_blob_policy`. The former `light-wallet-qualification` serving
-value remains an alias. See [Light-wallet serving qualification](../runbooks/testing.md#light-wallet-serving-qualification)
+The explicit `compat.serving = "light-wallet"` setting and its
+`light-wallet-qualification` alias also require complete block history.
+Without the profile, both use the reader's configured
+`storage.raw_blob_policy`, which defaults to `transactions`.
+Set it to `none` explicitly to admit a store without transaction bodies. See [Light-wallet serving qualification](../runbooks/testing.md#light-wallet-serving-qualification)
 for forwarded-read checks, limits, and outage behavior.
 
 ## How configuration is loaded
