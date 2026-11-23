@@ -18,6 +18,7 @@
 
 use blake2b_simd::Params;
 use blake2b_simd::many::{HashManyJob, hash_many};
+use thiserror::Error;
 
 use crate::wire::{
     UTXO_SET_COMMITMENT_PERSONAL, UtxoSetCommitmentElement, encode_utxo_set_commitment_element,
@@ -157,10 +158,22 @@ impl TransparentUtxoSetCommitment {
     /// Lanes are summed componentwise modulo `2^16`, so the result commits to
     /// the elements of both commitments, whatever order each was folded in.
     /// Commitments folded on separate threads over disjoint parts of a set
-    /// combine into the commitment of the whole set. `self` keeps its scheme,
-    /// so both commitments must use the same one.
-    pub fn combine(&mut self, other: &Self) {
+    /// combine into the commitment of the whole set.
+    ///
+    /// Both commitments must be [`UtxoSetCommitmentScheme::LtHash16`], the
+    /// scheme this lane sum belongs to. Otherwise this returns an error and
+    /// leaves `self` unchanged.
+    pub fn combine(&mut self, other: &Self) -> Result<(), UtxoSetCommitmentSchemeMismatch> {
+        if self.scheme != UtxoSetCommitmentScheme::LtHash16
+            || other.scheme != UtxoSetCommitmentScheme::LtHash16
+        {
+            return Err(UtxoSetCommitmentSchemeMismatch {
+                target: self.scheme,
+                added: other.scheme,
+            });
+        }
         fold_lanes(&mut self.accumulator, &other.accumulator, u16::wrapping_add);
+        Ok(())
     }
 
     /// Returns the 32-byte display digest, `BLAKE2b-256` of the accumulator.
@@ -182,6 +195,19 @@ impl TransparentUtxoSetCommitment {
         let preimage = encode_utxo_set_commitment_element(element);
         fold_lanes(&mut self.accumulator, &blake2x_expand(&preimage), combine);
     }
+}
+
+/// Two UTXO set commitments that cannot be combined, because at least one of
+/// them is not an [`UtxoSetCommitmentScheme::LtHash16`] commitment.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error(
+    "cannot combine a {added:?} UTXO set commitment into a {target:?} one; both must be LtHash16"
+)]
+pub struct UtxoSetCommitmentSchemeMismatch {
+    /// Scheme of the commitment being added to.
+    pub target: UtxoSetCommitmentScheme,
+    /// Scheme of the commitment being added.
+    pub added: UtxoSetCommitmentScheme,
 }
 
 /// Combines each little-endian `u16` lane of `lanes` into `accumulator`.
@@ -471,7 +497,8 @@ mod tests {
     }
 
     #[test]
-    fn combined_partial_commitments_equal_the_serial_fold_for_every_split() {
+    fn combined_partial_commitments_equal_the_serial_fold_for_every_split()
+    -> Result<(), UtxoSetCommitmentSchemeMismatch> {
         const PARTS: usize = 3;
         let elements: Vec<SampleUtxo> = (0..5u8)
             .map(|seed| {
@@ -497,19 +524,45 @@ mod tests {
                 assignment /= PARTS;
             }
             let [mut combined, middle, last] = parts;
-            combined.combine(&last);
-            combined.combine(&middle);
+            combined.combine(&last)?;
+            combined.combine(&middle)?;
             assert_eq!(combined, serial, "split {split}");
         }
+        Ok(())
     }
 
     #[test]
-    fn combining_an_empty_commitment_changes_nothing() {
+    fn combining_an_empty_commitment_changes_nothing() -> Result<(), UtxoSetCommitmentSchemeMismatch>
+    {
         let mut commitment = TransparentUtxoSetCommitment::empty();
         SampleUtxo::new(9, 1, 5, 2).fold_into(&mut commitment);
         let before = commitment.clone();
-        commitment.combine(&TransparentUtxoSetCommitment::empty());
+        commitment.combine(&TransparentUtxoSetCommitment::empty())?;
         assert_eq!(commitment, before);
+        Ok(())
+    }
+
+    #[test]
+    fn combine_refuses_a_commitment_of_another_scheme_without_changing_the_target() {
+        let mut lthash = TransparentUtxoSetCommitment::empty();
+        SampleUtxo::new(9, 1, 5, 2).fold_into(&mut lthash);
+        let unspecified = TransparentUtxoSetCommitment::from_parts(
+            UtxoSetCommitmentScheme::Unspecified,
+            lthash.accumulator(),
+        )
+        .unwrap_or_default();
+        let before = lthash.clone();
+        assert_eq!(
+            lthash.combine(&unspecified),
+            Err(UtxoSetCommitmentSchemeMismatch {
+                target: UtxoSetCommitmentScheme::LtHash16,
+                added: UtxoSetCommitmentScheme::Unspecified,
+            })
+        );
+        assert_eq!(lthash, before);
+        let mut target = unspecified.clone();
+        assert!(target.combine(&before).is_err());
+        assert_eq!(target, unspecified);
     }
 
     #[test]

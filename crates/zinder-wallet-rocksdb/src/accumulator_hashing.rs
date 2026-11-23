@@ -320,7 +320,7 @@ impl HashingWorkers {
             .map_err(|_| RocksDbWalletError::AccumulatorHashingWorkerStopped)?;
         let partial = partial?;
         digest.combine(&partial.digest)?;
-        commitment.combine(&partial.commitment);
+        commitment.combine(&partial.commitment)?;
         batch.clear();
         self.spare.get_or_insert(batch);
         Ok(())

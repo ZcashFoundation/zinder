@@ -3,7 +3,10 @@
 use std::{io, path::PathBuf};
 
 use thiserror::Error;
-use zinder_core::{CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis};
+use zinder_core::{
+    CanonicalBlockFactsSequenceLengthOverflow, Network, UnixTimestampMillis,
+    UtxoSetCommitmentSchemeMismatch,
+};
 use zinder_rocksdb_bulk_load::BulkLoadError;
 use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
@@ -221,6 +224,9 @@ pub enum RocksDbWalletError {
         /// Thread-pool construction failure.
         reason: String,
     },
+    /// Partial UTXO set commitments of different schemes could not be combined.
+    #[error(transparent)]
+    UtxoSetCommitmentScheme(#[from] UtxoSetCommitmentSchemeMismatch),
     /// Cold validation could not start one of its scan threads.
     #[error("could not start a wallet cold-validation thread: {reason}")]
     ColdValidationThreadUnavailable {

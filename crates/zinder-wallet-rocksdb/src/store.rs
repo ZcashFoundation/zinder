@@ -2708,7 +2708,7 @@ impl PrimaryOutputTotals {
             .checked_add(other.total_value_zat)
             .ok_or_else(|| overflow("unspent value total overflow"))?;
         self.digest.combine(&other.digest)?;
-        self.commitment.combine(&other.commitment);
+        self.commitment.combine(&other.commitment)?;
         self.unspent_count = unspent_count;
         self.spent_count = spent_count;
         self.total_value_zat = total_value_zat;
@@ -4247,14 +4247,29 @@ mod tests {
         Ok(())
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one fixture keeps every derived family and the READY evidence visibly consistent"
-    )]
     /// Builds a store with several addresses, shared transactions, and a mix of
     /// unspent and spent outputs, plus the exact READY evidence of its rows.
     fn multi_address_fixture(
         retain_tip_undo: bool,
+    ) -> Result<
+        (SemanticValidationFixture, WalletProjectionReadyEvidence),
+        Box<dyn std::error::Error>,
+    > {
+        let transaction_ids = (0u8..40)
+            .map(|index| TransactionId::from_bytes([index + 1; 32]))
+            .collect::<Vec<_>>();
+        fixture_for_transactions(retain_tip_undo, &transaction_ids)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture keeps every derived family and the READY evidence visibly consistent"
+    )]
+    /// Builds a valid store over `transaction_ids`: every fourth transaction
+    /// has two outputs, and the first output of every third is spent.
+    fn fixture_for_transactions(
+        retain_tip_undo: bool,
+        transaction_ids: &[TransactionId],
     ) -> Result<
         (SemanticValidationFixture, WalletProjectionReadyEvidence),
         Box<dyn std::error::Error>,
@@ -4266,8 +4281,8 @@ mod tests {
         let mut balance_by_address = BTreeMap::<[u8; 32], u64>::new();
         let mut commitment = TransparentUtxoSetCommitment::empty();
         let mut total_value_zat = 0u64;
-        for index in 0u8..40 {
-            let transaction_id = TransactionId::from_bytes([index + 1; 32]);
+        for (index, transaction_id) in transaction_ids.iter().copied().enumerate() {
+            let index = u8::try_from(index)?;
             let address_byte = index % 5 + 1;
             let address = TransparentAddressScriptHash::from_bytes([address_byte; 32]);
             let created_at = WalletTransactionPosition::new(transaction_id, u32::from(index), tip);
@@ -4678,6 +4693,175 @@ mod tests {
             &evidence,
             validation_config_with_ranges(8)?,
         )?;
+        Ok(())
+    }
+
+    /// Transaction ids whose outpoint keys sit at the ends of the key space
+    /// and just below, at, and above the two-range split and the first
+    /// eight-range split.
+    fn split_boundary_transactions() -> Vec<TransactionId> {
+        let mut ids = Vec::new();
+        for (prefix, fill) in [
+            ([0x00, 0x00], 0x00),
+            ([0x1f, 0xff], 0xff),
+            ([0x20, 0x00], 0x00),
+            ([0x20, 0x00], 0x01),
+            ([0x7f, 0xff], 0xff),
+            ([0x7f, 0xff], 0xfe),
+            ([0x80, 0x00], 0x01),
+            ([0x80, 0x00], 0x00),
+            ([0x80, 0x01], 0x00),
+            ([0xff, 0xff], 0xff),
+            ([0xff, 0xff], 0xfe),
+            ([0x40, 0x00], 0x00),
+        ] {
+            let mut id = [fill; 32];
+            id[..2].copy_from_slice(&prefix);
+            ids.push(TransactionId::from_bytes(id));
+        }
+        ids
+    }
+
+    #[test]
+    fn readback_counts_every_key_at_and_around_range_splits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::ZcashRegtest;
+        let (fixture, evidence) = fixture_for_transactions(true, &split_boundary_transactions())?;
+        assert!(fixture.spent_outputs.len() >= 3);
+        assert!(fixture.unspent_outputs.len() >= 8);
+        let temporary = TempDir::new()?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        let single = validate_ready_rows_by_readback(
+            &cold.bounded_open,
+            network,
+            &evidence,
+            validation_config_with_ranges(1)?,
+        )?;
+        for ranges in [2, 3, 8, 64] {
+            let partitioned = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config_with_ranges(ranges)?,
+            )?;
+            assert_eq!(
+                partitioned.peak_accounted_reorg_undo_bytes, single.peak_accounted_reorg_undo_bytes,
+                "{ranges} ranges"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_overlap_at_the_range_split_is_rejected_with_matching_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::ZcashRegtest;
+        let (mut fixture, mut evidence) =
+            fixture_for_transactions(false, &split_boundary_transactions())?;
+        // The unspent output keyed exactly at the two-range split prefix.
+        let split_key = fixture
+            .unspent_outputs
+            .iter()
+            .position(|(key, _)| key.as_bytes().starts_with(&[0x80, 0x00, 0x00]))
+            .ok_or("the fixture needs an unspent output at the split")?;
+        let output = fixture.unspent_outputs[split_key].1.clone();
+        let spent = WalletSpentOutput::new(
+            output.clone(),
+            WalletTransactionPosition::new(
+                TransactionId::from_bytes([0x55; 32]),
+                u32::MAX,
+                output.created_at.block,
+            ),
+            0,
+        );
+        fixture
+            .spent_outputs
+            .push((WalletOutpointKey::new(output.outpoint), spent));
+        fixture.spent_outputs.sort_unstable_by_key(|(key, _)| *key);
+        refresh_prepared_evidence(&mut fixture, &mut evidence)?;
+        let temporary = TempDir::new()?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        for ranges in [1, 2, 8] {
+            let readback = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config_with_ranges(ranges)?,
+            );
+            assert_eq!(
+                admission_reason(readback)?,
+                "one outpoint appears in both unspent and spent output families",
+                "{ranges} ranges"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_commitment_only_change_to_ready_evidence_is_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::ZcashRegtest;
+        let (fixture, mut evidence) =
+            fixture_for_transactions(false, &split_boundary_transactions())?;
+        let mut altered = evidence.utxo_summary.commitment.accumulator().to_vec();
+        altered[2047] ^= 1;
+        evidence.utxo_summary.commitment = TransparentUtxoSetCommitment::from_parts(
+            evidence.utxo_summary.commitment.scheme(),
+            &altered,
+        )
+        .ok_or("the altered commitment keeps its length")?;
+        let temporary = TempDir::new()?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        for ranges in [1, 2, 8] {
+            let readback = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config_with_ranges(ranges)?,
+            );
+            assert_eq!(
+                admission_reason(readback)?,
+                "READY evidence differs from cold wallet rows",
+                "{ranges} ranges"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_readback_refuses_an_undo_suffix_over_its_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (fixture, evidence) = multi_address_fixture(true)?;
+        let temporary = TempDir::new()?;
+        let builder = cold_store_for(temporary.path().join("wallet"), &fixture)?;
+        let (cold, _) = builder.reopen_for_validation()?;
+        // Room for the suffix entry and one key, while the ranges observe many
+        // distinct created outpoints and address-history keys.
+        let limit = u64::try_from(
+            size_of::<(u32, ExpectedReorgUndoEffects)>() + size_of::<WalletOutpointKey>(),
+        )?;
+        for ranges in [1, 2, 8] {
+            let readback = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                Network::ZcashRegtest,
+                &evidence,
+                WalletColdValidationConfig {
+                    max_accounted_reorg_undo_bytes: limit,
+                    ..validation_config_with_ranges(ranges)?
+                },
+            );
+            assert!(
+                matches!(
+                    readback,
+                    Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit { limit_bytes, .. })
+                        if limit_bytes == limit
+                ),
+                "{ranges} ranges"
+            );
+        }
         Ok(())
     }
 

@@ -553,16 +553,16 @@ mod tests {
             ),
         ];
         let mut serial = WalletProjectionDigestBuilder::new();
-        for (family, key, value) in &rows {
-            serial.append_row(*family, key, value)?;
+        for (family, key, encoded_value) in &rows {
+            serial.append_row(*family, key, encoded_value)?;
         }
         let split_count = PARTS.pow(u32::try_from(rows.len()).unwrap_or(u32::MAX));
         for split in 0..split_count {
             let mut parts: [WalletProjectionDigestBuilder; PARTS] =
                 core::array::from_fn(|_| WalletProjectionDigestBuilder::new());
             let mut assignment = split;
-            for (family, key, value) in &rows {
-                parts[assignment % PARTS].append_row(*family, key, value)?;
+            for (family, key, encoded_value) in &rows {
+                parts[assignment % PARTS].append_row(*family, key, encoded_value)?;
                 assignment /= PARTS;
             }
             let [mut combined, middle, last] = parts;
