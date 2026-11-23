@@ -17,22 +17,22 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
     CommitmentTreeFrontier, CommitmentTreeFrontiers, FinalNoteCommitmentRoot,
     NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
-    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, UnixTimestampMillis,
+    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
 use zinder_ingest::{
-    CanonicalConstructionConfig, CanonicalPipelineLimits, CanonicalSourceLoadOutcome,
-    load_fresh_canonical_blocks,
+    CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalPipelineLimits,
+    CanonicalSourceLoadOutcome, load_fresh_canonical_blocks,
 };
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError, SourceSubtreeRoots,
 };
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalEventFence,
-    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence, RawBlobRetention,
-    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalBuildSubtreeRoot,
+    CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
+    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence,
+    RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 
 use crate::{
@@ -686,9 +686,8 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         },
     )
     .await?;
-    let mut builder = block_load.builder;
-    let subtree_root_evidence =
-        builder.load_complete_subtree_root_prefix(admitted.manifest.subtree_root_artifacts()?)?;
+    let (mut builder, block_load_evidence, subtree_root_evidence) =
+        load_authenticated_subtree_roots(block_load, &admitted.manifest)?;
     let fixed_tip = builder.build_plan().build_tip();
     let source_tip_checkpoint = tokio::time::timeout(
         config.request_timeout,
@@ -704,7 +703,7 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
     builder.confirm_source_tip_checkpoint(&source_tip_checkpoint)?;
     let canonical_load = CanonicalSourceLoadOutcome {
         builder,
-        block_evidence: block_load.evidence,
+        block_evidence: block_load_evidence,
         subtree_root_evidence,
     };
     authenticate_canonical_fixture_load(
@@ -753,6 +752,59 @@ async fn replay_admitted_canonical_fixture<S: NodeSource + Clone>(
         published_ready_evidence: published.ready,
         reopened_ready_evidence: reopened.ready,
     })
+}
+
+/// Loads the fixture's complete subtree-root prefix after checking the roots
+/// the loaded blocks completed against it.
+fn load_authenticated_subtree_roots(
+    block_load: CanonicalBlockLoadOutcome,
+    manifest: &FixtureManifest,
+) -> Result<
+    (
+        RocksDbCanonicalBuilder,
+        CanonicalBlockLoadEvidence,
+        CanonicalSubtreeRootLoadEvidence,
+    ),
+    BenchError,
+> {
+    let CanonicalBlockLoadOutcome {
+        mut builder,
+        evidence,
+        derived_subtree_roots,
+    } = block_load;
+    let fixture_subtree_roots = manifest.subtree_root_artifacts()?;
+    authenticate_derived_subtree_roots(&derived_subtree_roots, &fixture_subtree_roots, &evidence)?;
+    let subtree_root_evidence = builder.load_complete_subtree_root_prefix(fixture_subtree_roots)?;
+    Ok((builder, evidence, subtree_root_evidence))
+}
+
+/// Requires the subtree roots derived from the loaded blocks' note commitments
+/// to be exactly the fixture's node-observed roots for the subtrees those
+/// blocks completed.
+fn authenticate_derived_subtree_roots(
+    derived: &[CanonicalBuildSubtreeRoot],
+    fixture: &[SubtreeRootArtifact],
+    block_load_evidence: &CanonicalBlockLoadEvidence,
+) -> Result<(), BenchError> {
+    let loaded_heights = block_load_evidence.first_height..=block_load_evidence.tip_height;
+    let completed_in_range = fixture
+        .iter()
+        .filter(|root| loaded_heights.contains(&root.completing_block_height))
+        .map(|root| CanonicalBuildSubtreeRoot {
+            protocol: root.protocol,
+            subtree_index: root.subtree_index,
+            root_hash: root.root_hash,
+            completing_block_height: root.completing_block_height,
+        })
+        .collect::<Vec<_>>();
+    if derived != completed_in_range.as_slice() {
+        return Err(BenchError::fixture_format(format!(
+            "canonical fixture replay derived {} subtree roots that differ from the {} roots the fixture's node reported for the loaded blocks",
+            derived.len(),
+            completed_in_range.len()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_block_load_evidence(

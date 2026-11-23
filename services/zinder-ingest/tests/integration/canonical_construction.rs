@@ -732,12 +732,26 @@ fn held_construction_chain()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_during_construction_stops_promptly_and_the_next_start_rebuilds()
 -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(assert_shutdown_during_construction_stops_promptly(1)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_with_idle_tree_hashing_workers_stops_promptly_and_the_next_start_rebuilds()
+-> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(assert_shutdown_during_construction_stops_promptly(4)).await
+}
+
+async fn assert_shutdown_during_construction_stops_promptly(
+    tree_hashing_workers: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (source_block, chain_checkpoint) = held_construction_chain()?;
     let fixed_tip = chain_checkpoint.block_id;
     let source = HeldConstructionSource::new(source_block, chain_checkpoint);
     let temporary = TempDir::new()?;
-    let config =
+    let mut config =
         held_construction_writer_config(temporary.path().join("canonical"), regtest_activations());
+    config.construction.pipeline_limits.tree_hashing_workers =
+        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
 
@@ -1180,6 +1194,20 @@ async fn every_block_construction_stores_every_height_while_sparse_construction_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commitment_budget_construction_serves_the_same_tree_states_as_every_block()
 -> Result<(), Box<dyn std::error::Error>> {
+    // The loader selects budget checkpoints in height order whether it hashes
+    // serially or ahead on workers, so both place them at the same heights.
+    for tree_hashing_workers in [1_u32, 4] {
+        Box::pin(assert_commitment_budget_matches_every_block(
+            tree_hashing_workers,
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+async fn assert_commitment_budget_matches_every_block(
+    tree_hashing_workers: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     use zinder_store::TreeStateCheckpointSelection::CommitmentBudget;
 
     let activations = regtest_activations();
@@ -1187,11 +1215,13 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
     let source = commitment_budget_construction_source(&activations)?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let directory = TempDir::new()?;
-    let dense = multi_block_writer_config(
+    let mut dense = multi_block_writer_config(
         directory.path().join("every-block"),
         Arc::clone(&activations),
         true,
     );
+    dense.construction.pipeline_limits.tree_hashing_workers =
+        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
     let budgeted = CanonicalWriterConfig {
         storage_path: directory.path().join("commitment-budget"),
         tree_state_checkpoint_selection: Some(CommitmentBudget(budget)),
@@ -1220,7 +1250,7 @@ async fn commitment_budget_construction_serves_the_same_tree_states_as_every_blo
         assert_eq!(
             matches!(lookup, Some(TreeStateLookup::Stored(_))),
             matches!(height, 0 | 95 | 98 | 100 | 102 | 104),
-            "unexpected checkpoint coverage at height {height}"
+            "unexpected checkpoint coverage at height {height} with {tree_hashing_workers} workers"
         );
         let expected = dense
             .tree_state_checkpoint_at(at, &activations)?
@@ -1343,17 +1373,31 @@ async fn every_block_construction_preserves_checkpointed_bounds()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupted_every_block_construction_discards_unpublished_staging_and_rebuilds_densely()
 -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(assert_interrupted_dense_construction_rebuilds(1)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_parallel_dense_construction_discards_unpublished_staging_and_rebuilds()
+-> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(assert_interrupted_dense_construction_rebuilds(4)).await
+}
+
+async fn assert_interrupted_dense_construction_rebuilds(
+    tree_hashing_workers: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let activations = regtest_activations();
     let source = MultiBlockConstructionSource::build(6, &activations)?;
     let reached = Arc::new(Notify::new());
     let mut interrupted_source = source.clone();
     interrupted_source.hold_checkpoint = Some((BlockHeight::new(5), Arc::clone(&reached)));
     let temporary = TempDir::new()?;
-    let config = multi_block_writer_config(
+    let mut config = multi_block_writer_config(
         temporary.path().join("canonical"),
         Arc::clone(&activations),
         true,
     );
+    config.construction.pipeline_limits.tree_hashing_workers =
+        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
 
@@ -1885,24 +1929,50 @@ async fn every_block_construction_stores_independent_checkpoints_across_ironwood
 -> Result<(), Box<dyn std::error::Error>> {
     let activations = regtest_activations();
     let source = IronwoodActivationConstructionSource::build(&activations)?;
+    let mut event_fences = Vec::new();
+    // Parallel tree hashing must store the checkpoints a serial loader stores.
+    for tree_hashing_workers in [1_u32, 4] {
+        let (_directory, store) =
+            build_ironwood_activation_store(&source, &activations, tree_hashing_workers).await?;
+        assert_ironwood_activation_checkpoints(&store, &source, &activations)?;
+        event_fences.push(store.event_fence());
+    }
+    assert_eq!(event_fences.first(), event_fences.last());
+    Ok(())
+}
+
+async fn build_ironwood_activation_store(
+    source: &IronwoodActivationConstructionSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+    tree_hashing_workers: u32,
+) -> Result<(TempDir, RocksDbCanonicalStore), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let mut config = multi_block_writer_config(
         temporary.path().join("canonical"),
-        Arc::clone(&activations),
+        Arc::clone(activations),
         true,
     );
     config.checkpoint_height = Some(BlockHeight::new(601));
+    config.construction.pipeline_limits.tree_hashing_workers =
+        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
 
     let store = admit_canonical_store(
-        &source,
-        Arc::clone(&activations),
+        source,
+        Arc::clone(activations),
         &config,
         &readiness,
         &CancellationToken::new(),
     )
     .await?;
+    Ok((temporary, store))
+}
 
+fn assert_ironwood_activation_checkpoints(
+    store: &RocksDbCanonicalStore,
+    source: &IronwoodActivationConstructionSource,
+    activations: &NetworkUpgradeActivations,
+) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         store.history_bounds().first_available_height(),
         BlockHeight::new(602)
@@ -1914,7 +1984,7 @@ async fn every_block_construction_stores_independent_checkpoints_across_ironwood
 
     for height in 601_u32..=605 {
         let expected = source.expected_checkpoint_at(height)?;
-        assert_stored_checkpoint_matches(&store, BlockHeight::new(height), expected, &activations)?;
+        assert_stored_checkpoint_matches(store, BlockHeight::new(height), expected, activations)?;
     }
 
     assert!(

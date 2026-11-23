@@ -83,6 +83,14 @@ const CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_COUNT: &str =
     "zinder_ingest_canonical_block_construction_stage_duration_seconds_count";
 const CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_SUM: &str =
     "zinder_ingest_canonical_block_construction_stage_duration_seconds_sum";
+const CANONICAL_BLOCK_LOAD_STAGE_DURATION_COUNT: &str =
+    "zinder_ingest_canonical_block_load_stage_duration_seconds_count";
+const CANONICAL_BLOCK_LOAD_STAGE_DURATION_SUM: &str =
+    "zinder_ingest_canonical_block_load_stage_duration_seconds_sum";
+const CANONICAL_BLOCK_STORE_LOAD_STAGE_DURATION_COUNT: &str =
+    "zinder_store_canonical_block_load_stage_duration_seconds_count";
+const CANONICAL_BLOCK_STORE_LOAD_STAGE_DURATION_SUM: &str =
+    "zinder_store_canonical_block_load_stage_duration_seconds_sum";
 const CANONICAL_HISTORICAL_PREVOUT_READS_TOTAL: &str =
     "zinder_ingest_canonical_historical_prevout_reads_total";
 const CANONICAL_CROSS_BLOCK_WALLET_READS_TOTAL: &str =
@@ -803,6 +811,8 @@ pub struct RocksDbCanonicalFixtureReplayResourceLimits {
     pub block_prepare_concurrency: u32,
     /// Aggregate canonical preparation memory watermark.
     pub block_prepare_memory_watermark_bytes: u64,
+    /// Threads hashing the ordered loader's commitment trees.
+    pub tree_hashing_workers: u32,
     /// Retained shallow-reorg depth used for baseline settlement.
     pub supported_reorg_depth: u32,
     /// Fixed delay applied to each outer fixture segment response.
@@ -1604,6 +1614,7 @@ fn validate_canonical_fixture_report_identity_and_resources(
         || limits.source_fetch_max_in_flight_bytes < limits.max_response_bytes
         || limits.block_prepare_concurrency == 0
         || limits.block_prepare_memory_watermark_bytes == 0
+        || limits.tree_hashing_workers == 0
         || limits.supported_reorg_depth == 0
         || limits.canonical_rocksdb
             != RocksDbResourceBudgetSummary::from(RocksDbResourceBudget::canonical_writer_defaults())
@@ -2302,11 +2313,23 @@ fn aggregate_head_of_line_wait(samples: &[MetricSample]) -> Vec<StageWaitStat> {
 }
 
 fn aggregate_stage_durations(samples: &[MetricSample]) -> Vec<StageDurationStat> {
-    let metric_families = [(
-        "canonical_block_construction",
-        CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_COUNT,
-        CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_SUM,
-    )];
+    let metric_families = [
+        (
+            "canonical_block_construction",
+            CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_COUNT,
+            CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_SUM,
+        ),
+        (
+            "canonical_block_load",
+            CANONICAL_BLOCK_LOAD_STAGE_DURATION_COUNT,
+            CANONICAL_BLOCK_LOAD_STAGE_DURATION_SUM,
+        ),
+        (
+            "canonical_block_store_load",
+            CANONICAL_BLOCK_STORE_LOAD_STAGE_DURATION_COUNT,
+            CANONICAL_BLOCK_STORE_LOAD_STAGE_DURATION_SUM,
+        ),
+    ];
     let mut counts: BTreeMap<(String, String, String), u64> = BTreeMap::new();
     let mut seconds: BTreeMap<(String, String, String), f64> = BTreeMap::new();
     for sample in samples {
@@ -2325,9 +2348,12 @@ fn aggregate_stage_durations(samples: &[MetricSample]) -> Vec<StageDurationStat>
         else {
             continue;
         };
-        let (Some(stage), Some(status)) = (sample.label("stage"), sample.label("status")) else {
+        // The ordered loader's stages record completed blocks only, so they
+        // carry no status label.
+        let Some(stage) = sample.label("stage") else {
             continue;
         };
+        let status = sample.label("status").unwrap_or("ok");
         let key = (family.to_owned(), stage.to_owned(), status.to_owned());
         if is_count {
             *counts.entry(key).or_insert(0) += round_to_u64(sample.reading);
@@ -3063,6 +3089,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 source_fetch_max_in_flight_bytes: 160 * 1024 * 1024,
                 block_prepare_concurrency: 10,
                 block_prepare_memory_watermark_bytes: 160 * 1024 * 1024,
+                tree_hashing_workers: 1,
                 supported_reorg_depth: 5,
                 source_segment_delay_millis: 0,
                 tree_state_checkpoint_coverage: super::TreeStateCheckpointCoverage::EveryBlock,

@@ -379,6 +379,7 @@ struct IngestConstructionSection {
     source_fetch_max_in_flight_bytes: Option<u64>,
     block_prepare_concurrency: Option<u32>,
     block_prepare_memory_watermark_bytes: Option<u64>,
+    tree_hashing_workers: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -570,6 +571,11 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         "ingest.construction.source_fetch_max_in_flight_bytes",
     )?
     .unwrap_or(resolved_pipeline_limits.source_fetch_max_in_flight_bytes);
+    let tree_hashing_workers = optional_nonzero_u32_config(
+        config.ingest.construction.tree_hashing_workers,
+        "ingest.construction.tree_hashing_workers",
+    )?
+    .unwrap_or(resolved_pipeline_limits.tree_hashing_workers);
     let pipeline_limits = CanonicalPipelineLimits {
         max_response_bytes: largest_node_response_bytes,
         source_segment_target_response_bytes,
@@ -578,6 +584,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         source_fetch_max_in_flight_bytes,
         block_prepare_concurrency,
         block_prepare_memory_watermark_bytes,
+        tree_hashing_workers,
     }
     .validate()
     .map_err(|error| {
@@ -891,6 +898,11 @@ impl RedactedIngestConfigToml {
                         .pipeline_limits
                         .block_prepare_memory_watermark_bytes
                         .get(),
+                    tree_hashing_workers: runtime_config
+                        .construction
+                        .pipeline_limits
+                        .tree_hashing_workers
+                        .get(),
                 },
                 mempool: IngestMempoolToml {
                     max_transaction_count: runtime_config
@@ -1026,6 +1038,7 @@ struct IngestConstructionToml {
     source_fetch_max_in_flight_bytes: u64,
     block_prepare_concurrency: u32,
     block_prepare_memory_watermark_bytes: u64,
+    tree_hashing_workers: u32,
 }
 
 #[derive(Serialize)]

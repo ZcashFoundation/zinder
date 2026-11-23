@@ -1651,6 +1651,19 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `clamp(container_memory / 64, 134217728, 536870912)`.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__CONSTRUCTION__TREE_HASHING_WORKERS",
+        toml_path: "ingest.construction.tree_hashing_workers",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Threads that hash note-commitment trees for the ordered construction \
+                      loader. The default, 1, hashes on the loader thread. A higher value \
+                      hashes each block's pools and large commitment batches in parallel, and \
+                      derives the checkpoints of up to twice that many blocks, at most 64, \
+                      while the loader writes earlier blocks. The stored trees, checkpoints, and \
+                      subtree roots do not change. Must be greater than zero.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS",
         toml_path: "ingest.follow.poll_interval_ms",
         used_by: &["zinder-ingest"],
