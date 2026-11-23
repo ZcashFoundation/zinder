@@ -17,8 +17,9 @@ on:
     # Keep this list identical in live-tests.yml and parity-compat.yml. It
     # covers every crate the live and parity tests exercise, the workspace
     # manifest and lockfile that pin the consensus cohort, the node
-    # configurations, the mining and indexer TLS scripts, the CI tool installer
-    # and its lock (which pins cargo-nextest), and both workflows.
+    # configurations, the mining and indexer TLS scripts, the CBB report
+    # validator, the CI tool installer and its lock (which pins cargo-nextest),
+    # and both workflows.
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -35,6 +36,7 @@ on:
       - "scripts/mine-live-regtest.sh"
       - "scripts/test-light-wallet-qualification.sh"
       - "scripts/generate-live-indexer-tls.sh"
+      - "scripts/validate-cbb-interop-report.sh"
       - "scripts/install-ci-tool.sh"
       - ".github/ci-tools.lock"
       - ".github/workflows/live-tests.yml"
@@ -104,6 +106,20 @@ jobs:
         run: |
           # Compile the client before starting the fixed-fence fixture.
           cargo nextest run --locked -p zinder-compat-lightwalletd --test acceptance --profile=ci-live --no-run
+
+      # CBB generates its bindings at build time. Zinder uses checked-in bindings.
+      - name: Install protoc for the CBB client
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "36.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the pinned CBB client
+        run: |
+          PROTOC="$(command -v protoc)" cargo install --locked \
+            --git https://github.com/dismad/cbb \
+            --rev a5a0899bac764cb330a442e777027a503a310197 \
+            --root "$RUNNER_TEMP/cbb"
 
       # Zebra runs as a step rather than a service container because its
       # Regtest activation heights and funding streams come from a mounted
@@ -185,12 +201,18 @@ jobs:
             --rpchost 127.0.0.1 --rpcport 39232 --rpcuser zebra --rpcpassword zebra \
             --no-tls-very-insecure \
             --data-dir /tmp/lwd --log-file /dev/stdout
+          reference_ready=""
           for _ in $(seq 1 60); do
-            if docker logs lightwalletd-reference 2>&1 | grep -q "Waiting for block: $((tip + 1))"; then
+            if docker logs lightwalletd-reference 2>&1 | grep -F "Waiting for block: $((tip + 1))" >/dev/null; then
+              reference_ready=yes
               break
             fi
             sleep 2
           done
+          if [ -z "${reference_ready}" ]; then
+            echo "::error::Reference lightwalletd did not reach the Regtest fence at height ${tip}"
+            exit 1
+          fi
 
       - name: Build fixed-fence Zinder stores and start compat
         env:
@@ -283,6 +305,26 @@ jobs:
             exit 1
           fi
 
+      - name: Run CBB interoperability smoke
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$((PARITY_REGTEST_TIP - 1))" > .tmp/cbb-tree-heights.txt
+          cbb="$RUNNER_TEMP/cbb/bin/cbb"
+          "$cbb" \
+            --endpoint zinder=http://127.0.0.1:9087 \
+            --endpoint reference=http://127.0.0.1:9088 \
+            --concurrency 1 --warmup 0 --steps 1 --chunk 3 --start-height "$((PARITY_REGTEST_TIP - 2))" \
+            --tree-every 0 --timeout 30 --json-out .tmp/cbb-range.json
+          scripts/validate-cbb-interop-report.sh .tmp/cbb-range.json GetBlockRange zinder reference
+          # The pinned CBB checks response height in tree-file mode.
+          "$cbb" \
+            --endpoint zinder=http://127.0.0.1:9087 \
+            --endpoint reference=http://127.0.0.1:9088 \
+            --tree-heights-file .tmp/cbb-tree-heights.txt \
+            --concurrency 1 --warmup 0 --steps 1 --timeout 30 \
+            --json-out .tmp/cbb-tree.json
+          scripts/validate-cbb-interop-report.sh .tmp/cbb-tree.json GetTreeState zinder reference
+
       - name: Run parity diff
         env:
           ZINDER_TEST_LIVE: "1"
@@ -312,6 +354,8 @@ jobs:
         run: |
           echo "=== ingest.log ==="; tail -n 50 .tmp/ingest.log || true
           echo "=== compat.log ==="; tail -n 50 .tmp/compat.log || true
+          echo "=== cbb-range.json ==="; cat .tmp/cbb-range.json || true
+          echo "=== cbb-tree.json ==="; cat .tmp/cbb-tree.json || true
           echo "=== lightwalletd-reference ==="; docker logs lightwalletd-reference 2>&1 | tail -n 50 || true
           echo "=== ${{ matrix.container }} ==="; docker logs ${{ matrix.container }} 2>&1 | tail -n 50 || true
 
