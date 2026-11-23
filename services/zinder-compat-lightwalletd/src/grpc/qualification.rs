@@ -1,14 +1,25 @@
 //! gRPC routes for canonical and node-backed light-wallet qualification.
 
-use std::{collections::HashSet, num::NonZeroU32, sync::Arc, time::Duration, vec::IntoIter};
+use std::{
+    collections::HashSet,
+    convert::Infallible,
+    num::NonZeroU32,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+    vec::IntoIter,
+};
 
 use futures_util::stream::try_unfold;
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     time::{Instant, timeout_at},
 };
 use tokio_stream::{self as stream, Stream, StreamExt as _};
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, body::Body, server::NamedService, service::LayerExt as _};
+use tower::{Service, util::MapResponseLayer};
 use zebra_chain::transparent::Address;
 use zinder_core::{
     BlockHeight, BlockId, ChainEpoch, Network, RawTransactionBytes, SerializedBytesDigest,
@@ -24,7 +35,6 @@ use zinder_query::{
     QualificationWalletQuery, QueryError, RocksDbCanonicalReader, StorageReadError, SubtreeRoots,
     parse_receivable_transparent_address, read_on_blocking_thread, status_from_query_error,
 };
-use zinder_runtime::hold_grpc_response_permit;
 use zinder_source::{
     SourceError, SourceTransparentUnspentOutput, SourceTransparentUtxoPage,
     TransactionBroadcaster as _, TransparentAddressLookup, TransparentAddressRowLimit,
@@ -124,6 +134,25 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
             transaction_slots: Arc::new(Semaphore::new(FORWARDED_TRANSACTION_SLOTS)),
             block_digests: BlockDigestCache::default(),
         })
+    }
+
+    /// Wraps this adapter in a tonic service with request field bounds and
+    /// body-owned admission for unary unspent-output replies.
+    #[must_use]
+    pub fn into_server(
+        self,
+    ) -> impl Service<
+        http::Request<Body>,
+        Response = http::Response<Body>,
+        Error = Infallible,
+        Future: Send + 'static,
+    > + NamedService
+    + Clone
+    + Send
+    + Sync
+    + 'static {
+        MapResponseLayer::new(reserve_utxo_response_body)
+            .named_layer(self.into_field_guarded_server())
     }
 
     /// Observes the node against the same canonical tip and schedule used for forwarding.
@@ -1093,8 +1122,11 @@ impl compact_tx_streamer_server::CompactTxStreamer
             ));
         };
         let address_utxos = rows.into_iter().map(utxo_reply).collect::<Result<_, _>>()?;
-        let response = Response::new(lightwalletd::GetAddressUtxosReplyList { address_utxos });
-        Ok(hold_grpc_response_permit(response, permit))
+        let mut response = Response::new(lightwalletd::GetAddressUtxosReplyList { address_utxos });
+        response.extensions_mut().insert(UtxoResponsePermit {
+            _permit: Arc::new(permit),
+        });
+        Ok(response)
     }
 
     type GetAddressUtxosStreamStream = GrpcStream<lightwalletd::GetAddressUtxosReply>;
@@ -1152,9 +1184,110 @@ impl compact_tx_streamer_server::CompactTxStreamer
     }
 }
 
+#[derive(Clone)]
+struct UtxoResponsePermit {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+fn reserve_utxo_response_body(mut response: http::Response<Body>) -> http::Response<Body> {
+    let Some(permit) = response.extensions_mut().remove::<UtxoResponsePermit>() else {
+        return response;
+    };
+    response.map(|body| {
+        Body::new(ReservedUtxoBody {
+            body,
+            permit: Some(permit),
+        })
+    })
+}
+
+struct ReservedUtxoBody {
+    body: Body,
+    permit: Option<UtxoResponsePermit>,
+}
+
+impl HttpBody for ReservedUtxoBody {
+    type Data = <Body as HttpBody>::Data;
+    type Error = <Body as HttpBody>::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let frame = Pin::new(&mut self.body).poll_frame(cx);
+        // The outer send-stall layer polls for trailers only after handing
+        // all pieces of the previous data frame to the transport.
+        if matches!(&frame, Poll::Ready(None))
+            || matches!(&frame, Poll::Ready(Some(Ok(frame))) if frame.is_trailers())
+        {
+            self.permit.take();
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_send_stall_releases_unary_utxo_admission_while_a_piece_is_still_held()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use http_body_util::{BodyExt as _, Full};
+        use tower::{Layer as _, ServiceExt as _};
+        use zinder_runtime::GrpcSendStallLayer;
+
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = UtxoResponsePermit {
+            _permit: Arc::new(Arc::clone(&slots).try_acquire_owned()?),
+        };
+        let data = vec![0_u8; 256 * 1024];
+        let data_len = data.len();
+        let mut response =
+            http::Response::new(Body::new(Full::new(<Body as HttpBody>::Data::from(data))));
+        response.extensions_mut().insert(permit);
+        let mut response = Some(response);
+        let service = tower::service_fn(move |_: http::Request<Body>| {
+            std::future::ready(
+                response
+                    .take()
+                    .map(reserve_utxo_response_body)
+                    .ok_or("unexpected second call"),
+            )
+        });
+        let mut body = GrpcSendStallLayer::new(Duration::from_secs(5))
+            .layer(service)
+            .oneshot(http::Request::new(Body::empty()))
+            .await?
+            .into_body();
+
+        let piece = body.frame().await.ok_or("missing first piece")??;
+        assert!(piece.data_ref().is_some_and(|data| data.len() < data_len));
+        assert_eq!(slots.available_permits(), 0);
+        let returned_permit =
+            tokio::time::timeout(Duration::from_secs(10), Arc::clone(&slots).acquire_owned())
+                .await??;
+
+        let status = body.frame().await.ok_or("missing stall status")??;
+        assert_eq!(
+            status
+                .trailers_ref()
+                .and_then(Status::from_header_map)
+                .map(|status| status.code()),
+            Some(tonic::Code::DeadlineExceeded)
+        );
+        drop((returned_permit, body, piece));
+        assert_eq!(slots.available_permits(), 1);
+        Ok(())
+    }
 
     #[test]
     fn qualification_utxo_limit_applies_to_the_requested_response() {
