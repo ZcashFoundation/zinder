@@ -11,7 +11,10 @@ use zinder_core::{
     SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionId, UnixTimestampMillis,
 };
 
-use super::live_replacement_tests::replacement_block_with_retention;
+use super::{
+    control::encode_building_store_control,
+    live_replacement_tests::replacement_block_with_retention, rocksdb::STORE_CONTROL_KEY,
+};
 use crate::{
     BlockHashLookup, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
     CanonicalBuildBlock, CanonicalEventHistoryRequest, CanonicalLiveReplacement,
@@ -29,6 +32,7 @@ const BUILD_TIP: BlockId = BlockId::new(BlockHeight::new(101), BlockHash::from_b
 const REPLACED_TIP: BlockId =
     BlockId::new(BlockHeight::new(101), BlockHash::from_bytes([0x44; 32]));
 const OBSERVED_AT: UnixTimestampMillis = UnixTimestampMillis::new(1_750_000_000_001);
+const FIXTURE_CURSOR_AUTH_KEY: [u8; 32] = [0xa5; 32];
 const MINED_ID: TransactionId = TransactionId::from_bytes([0x44; 32]);
 
 #[test]
@@ -48,6 +52,12 @@ fn v7_interop() -> ProbeResult<()> {
             fs::create_dir(&fixture)?;
             let writer = create_store(&fixture.join("primary"), &activations, retention)?;
             save_or_check_rows(&writer.bounded_open.db, &fixture, retention, true)?;
+            if !read.is_empty() {
+                compare_independent_fingerprints(
+                    &root.join(format!("{read}-{retention}")),
+                    &fixture,
+                )?;
+            }
         }
         if !read.is_empty() {
             read_store(
@@ -130,6 +140,16 @@ fn create_store(
         plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
+    // Pin fixture entropy so independent publications can compare the full control record.
+    builder.cursor_auth_key = FIXTURE_CURSOR_AUTH_KEY;
+    builder.bounded_open.db.put(
+        STORE_CONTROL_KEY,
+        encode_building_store_control(
+            CanonicalStoreWorkload::Wallet,
+            &builder.build_plan,
+            FIXTURE_CURSOR_AUTH_KEY,
+        )?,
+    )?;
     builder.bulk_load_blocks(
         activations,
         [
@@ -190,16 +210,18 @@ fn save_or_check_rows(
             "transaction_blob" => retention != RawBlobRetention::None,
             _ => true,
         };
-        let row = db
-            .iterator_cf(&family, IteratorMode::Start)
-            .next()
-            .transpose()?;
-        assert_eq!(row.is_some(), populated, "{name} under {retention}");
-        if let Some((key, bytes)) = row {
+        let mut rows = db.iterator_cf(&family, IteratorMode::Start);
+        let first = rows.next().transpose()?;
+        assert_eq!(first.is_some(), populated, "{name} under {retention}");
+        if let Some(first) = first {
             let mut digest = Sha256::new();
-            digest.update(key.len().to_le_bytes());
-            digest.update(key);
-            digest.update(bytes);
+            for row in std::iter::once(Ok(first)).chain(rows) {
+                let (key, bytes) = row?;
+                digest.update(u64::try_from(key.len())?.to_le_bytes());
+                digest.update(u64::try_from(bytes.len())?.to_le_bytes());
+                digest.update(key);
+                digest.update(bytes);
+            }
             let fingerprint = digest.finalize();
             let receipt = fixture.join(name);
             if save {
@@ -208,9 +230,25 @@ fn save_or_check_rows(
                 assert_eq!(
                     fs::read(receipt)?,
                     fingerprint.as_slice(),
-                    "representative row changed"
+                    "{name} row fingerprints changed"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+fn compare_independent_fingerprints(reference: &Path, candidate: &Path) -> ProbeResult<()> {
+    for entry in fs::read_dir(reference)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let name = entry.file_name();
+            assert_eq!(
+                fs::read(entry.path())?,
+                fs::read(candidate.join(&name))?,
+                "independent writes differ in {name:?} for {}",
+                candidate.display(),
+            );
         }
     }
     Ok(())
@@ -296,9 +334,14 @@ fn read_store(
         budget,
     )?;
     check_canonical_rows!(writer, activations, retention);
-    let replays = writer.scan_canonical_replay()?.collect::<Result<Vec<_>, _>>()?;
+    let replays = writer
+        .scan_canonical_replay()?
+        .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(replays.len(), 2);
-    assert_eq!(replays[1].facts().block_header.block_hash, REPLACED_TIP.hash);
+    assert_eq!(
+        replays[1].facts().block_header.block_hash,
+        REPLACED_TIP.hash
+    );
     assert_eq!(
         writer
             .displaced_block_by_hash(BUILD_TIP.hash)?

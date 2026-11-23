@@ -781,9 +781,9 @@ scripts/test-canonical-v7-interop.sh
 The script checks out `00030603` and the candidate's committed `HEAD` with
 separate build directories. Each revision publishes fixture stores for
 `none`, `transactions`, and `all` retention and the other opens each store
-as a writer and secondary. The test checks typed reads and fingerprints a
-representative row in each populated family. It also verifies the empty
-families dictated by the workload and retention. The script writes results to
+as a writer and secondary. The test checks typed reads, compares row fingerprints from independent
+publications, and verifies the empty families dictated by the workload and
+retention. The script writes results to
 standard output and standard error, and removes its checkouts and fixtures
 on exit.
 
