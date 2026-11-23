@@ -101,8 +101,8 @@ impl Requirement {
 /// `CLAUDE.md` and `docs/runbooks/testing.md`.
 pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
-        name: "ZINDER_PROFILE",
-        toml_path: "profile",
+        name: "ZINDER_DEPLOYMENT__PROFILE",
+        toml_path: "deployment.profile",
         used_by: &["zinder-ingest", "zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -1175,7 +1175,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Accepts `wallet`, `compact-blocks`, or `light-wallet`. Defaults to `wallet` without \
-                      a profile. `compact-blocks` rejects wallet and node settings. Prefer `profile = \
+                      a profile. `compact-blocks` rejects wallet and node settings. Prefer `deployment.profile = \
                       \"light-wallet\"` for a coordinated deployment.",
     },
     EnvVarDoc {

@@ -548,7 +548,7 @@ listener on port 9100.
 ```bash
 unset ZINDER_NETWORK
 export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232
-export ZINDER_PROFILE=light-wallet
+export ZINDER_DEPLOYMENT__PROFILE=light-wallet
 mkdir -p .tmp
 target/debug/zinder-ingest --network zcash-regtest \
   --storage-path .tmp/qualification-canonical >.tmp/qualification-ingest.log 2>&1 &
@@ -586,7 +586,7 @@ transaction, which every blob-retention policy keeps. Other bytes return
 `DATA_LOSS`. A transaction the served chain does not mine is looked up in the
 ingest mempool, as wallet serving does, even when the node has mined it in a
 later block. To exercise local mined-transaction reads, repeat with fresh store
-paths. Unset `ZINDER_PROFILE`, set `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`
+paths. Unset `ZINDER_DEPLOYMENT__PROFILE`, set `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`
 for both binaries, set `ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving`
 for ingest, and pass `--serving light-wallet` to compatibility.
 
@@ -603,7 +603,7 @@ and its wallet-serving process on port 9087. The harness calls
 `127.0.0.1:39232` inside the node container. Both compatibility processes use
 `ZINDER_COMPAT__STALE_TIP_LIMIT_MS=0` because the fixture has historical
 block timestamps and the outage removes the node witness for its tip.
-With the Regtest node authentication exported and `ZINDER_PROFILE` unset, run
+With the Regtest node authentication exported and `ZINDER_DEPLOYMENT__PROFILE` unset, run
 the following in place of the two manual processes
 above. The harness creates fresh stores for both policies. It submits one
 signed spend and compares pending `GetTransaction`, `GetMempoolTx`, and

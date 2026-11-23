@@ -95,13 +95,13 @@ start_candidate() {
   local policy=$1 port=$2
   local -a ingest_selection compat_selection
   if [[ $policy == none ]]; then
-    ingest_selection=(ZINDER_PROFILE=light-wallet)
-    compat_selection=(ZINDER_PROFILE=light-wallet)
+    ingest_selection=(ZINDER_DEPLOYMENT__PROFILE=light-wallet)
+    compat_selection=(ZINDER_DEPLOYMENT__PROFILE=light-wallet)
   else
     ingest_selection=("ZINDER_STORAGE__RAW_BLOB_POLICY=$policy" ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving)
     compat_selection=("ZINDER_STORAGE__RAW_BLOB_POLICY=$policy" ZINDER_COMPAT__SERVING=light-wallet)
   fi
-  env -u ZINDER_PROFILE -u ZINDER_STORAGE__RAW_BLOB_POLICY -u ZINDER_INGEST__RUN_OVERRIDES__COVERAGE \
+  env -u ZINDER_DEPLOYMENT__PROFILE -u ZINDER_STORAGE__RAW_BLOB_POLICY -u ZINDER_INGEST__RUN_OVERRIDES__COVERAGE \
     "${ingest_selection[@]}" \
     ZINDER_INGEST_CONTROL__LISTEN_ADDR="127.0.0.1:$port" \
     ZINDER_OPS__LISTEN_ADDR="127.0.0.1:$((port + 1))" \
@@ -110,7 +110,7 @@ start_candidate() {
   pids+=("$!")
   wait_ready "$!" "$((port + 1))" false
 
-  env -u ZINDER_PROFILE -u ZINDER_STORAGE__RAW_BLOB_POLICY -u ZINDER_COMPAT__SERVING \
+  env -u ZINDER_DEPLOYMENT__PROFILE -u ZINDER_STORAGE__RAW_BLOB_POLICY -u ZINDER_COMPAT__SERVING \
     "${compat_selection[@]}" \
     ZINDER_INGEST_CONTROL__ADDR="http://127.0.0.1:$port" \
     ZINDER_COMPAT__STALE_TIP_LIMIT_MS=0 \

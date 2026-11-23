@@ -53,7 +53,6 @@ mod bind_guard;
 mod canonical_fence_attestation;
 mod composed_readiness;
 mod config;
-mod deployment_profile;
 mod env_diagnostics;
 mod env_var_docs;
 mod http_listener;
@@ -74,8 +73,6 @@ mod runtime_supervision;
 mod sections;
 mod startup_phase;
 mod transport;
-
-pub use deployment_profile::DeploymentProfile;
 
 pub use allocator::RuntimeAllocator;
 pub use auth::{
@@ -150,13 +147,14 @@ pub use runtime_supervision::{
 };
 pub use sections::{
     CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,
-    IngestControlReaderToml, IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml,
-    ProjectorControlSection, ProjectorControlToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, ResolvedIngestControlWriter, ResolvedProjectorControl,
-    ResolvedRetention, ResolvedSecondaryStorage, RetentionSection, RetentionToml,
-    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, RuntimeService,
-    SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
-    StorageRoleSection, StorageRoleToml, defaults as section_defaults, resolve_allow_public_bind,
+    DeploymentProfile, DeploymentSection, DeploymentToml, IngestControlReaderToml,
+    IngestControlSection, IngestControlWriterToml, OpsSection, OpsToml, ProjectorControlSection,
+    ProjectorControlToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
+    ResolvedIngestControlWriter, ResolvedProjectorControl, ResolvedRetention,
+    ResolvedSecondaryStorage, RetentionSection, RetentionToml, RocksDbResourceBudgetSection,
+    RocksDbResourceBudgetToml, RuntimeService, SecondaryStorageSection, SecondaryStorageToml,
+    SecuritySection, SecurityToml, StorageRoleSection, StorageRoleToml,
+    defaults as section_defaults, resolve_allow_public_bind,
     resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
     resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_reader,
     resolve_ingest_control_writer, resolve_materialized_view_reader_rocksdb_budget,

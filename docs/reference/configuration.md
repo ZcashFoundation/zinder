@@ -61,8 +61,8 @@ your own.
 
 ## Light-wallet profile
 
-Set `profile = "light-wallet"` at the top level of both the ingest and
-lightwalletd compatibility TOML files, or set `ZINDER_PROFILE=light-wallet`
+Set `deployment.profile = "light-wallet"` in both the ingest and
+lightwalletd compatibility TOML files, or set `ZINDER_DEPLOYMENT__PROFILE=light-wallet`
 for both processes. Run `zinder-ingest` and `zinder-compat-lightwalletd` with
 the same network, canonical primary path, and canonical reorg window. Give
 compatibility its own secondary path, the ingest-control endpoint, and one
@@ -77,7 +77,8 @@ image starts a wallet projector and native query. Omit
 `compat.serving` when selecting this profile. Conflicting overrides are
 rejected. Compatibility can also read an existing canonical store with
 complete history and additional retained blobs. The ingest writer must match the store's original
-retention policy.
+retention policy. `--print-config` writes the resolved profile and omits the
+settings it supplies.
 
 The explicit `compat.serving = "light-wallet"` setting and its
 `light-wallet-qualification` alias also require complete block history.
@@ -185,7 +186,7 @@ not check descriptions or defaults.
 <!-- env-var-table:public-interfaces:start -->
 | Variable | Used by | Requirement | TOML field | Description |
 | -------- | ------- | ----------- | ---------- | ----------- |
-| `ZINDER_PROFILE` | zinder-ingest, zinder-compat-lightwalletd | Optional | `profile` | Selects `light-wallet` for both ingest and lightwalletd compatibility. See [Light-wallet profile](#light-wallet-profile). |
+| `ZINDER_DEPLOYMENT__PROFILE` | zinder-ingest, zinder-compat-lightwalletd | Optional | `deployment.profile` | Selects `light-wallet` for both ingest and lightwalletd compatibility. See [Light-wallet profile](#light-wallet-profile). |
 | `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
 | `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running zinder-ingest, or broadcasting transactions or reading the recommended fee from a reader` | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` and wallet-mode `zinder-compat-lightwalletd` broadcast transactions through it, compatibility also reads the recommended fee for `GetStandardFee` through it, and both start without contacting it. Without it they serve storage only and advertise no broadcast, and compatibility answers `GetStandardFee` with `UNIMPLEMENTED`. Compact-blocks compatibility rejects every `ZINDER_NODE__*` variable. Optional for `zinder-explorer`: without it the upstream-observation probe stays off and `ExplorerFreshness.chain_view.upstream_tip` is always unset. |
 | `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. Falls back to JSON-RPC mempool polling when unset or empty. An `https://` URL negotiates TLS, configured by the `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified against the system roots. |
@@ -267,7 +268,7 @@ not check descriptions or defaults.
 | `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS` | zinder-query | Optional | `query.trust_proxy_client_address` | Counts each WalletQuery request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
 | `ZINDER_COMPAT__LISTEN_ADDR` | zinder-compat-lightwalletd | Optional | `compat.listen_addr` | Listen address for the lightwalletd-compatible gRPC endpoint. Defaults to `127.0.0.1:9067`. |
 | `ZINDER_COMPAT__BROWSER_ORIGINS` | zinder-compat-lightwalletd | Optional | `compat.browser_origins` | Enables gRPC-Web for the listed browser origins. Use comma-separated HTTP or HTTPS origins in the environment, or an array in TOML. An empty list disables browser access (the default). Use `*` alone to allow every origin. |
-| `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Accepts `wallet`, `compact-blocks`, or `light-wallet`. Defaults to `wallet` without a profile. `compact-blocks` rejects wallet and node settings. Prefer `profile = "light-wallet"` for a coordinated deployment. |
+| `ZINDER_COMPAT__SERVING` | zinder-compat-lightwalletd | Optional | `compat.serving` | Accepts `wallet`, `compact-blocks`, or `light-wallet`. Defaults to `wallet` without a profile. `compact-blocks` rejects wallet and node settings. Prefer `deployment.profile = "light-wallet"` for a coordinated deployment. |
 | `ZINDER_COMPAT__REORG_WINDOW_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.reorg_window_blocks` | Exact canonical replacement-depth identity expected by compatibility. Must be greater than zero and match the canonical writer. Defaults to 1000. |
 | `ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY` | zinder-compat-lightwalletd | Optional | `compat.shielded_history.directory` | Follow the local publisher's checkpoint and signed catalog. Mutually exclusive with manifest. |
 | `ZINDER_COMPAT__SHIELDED_HISTORY__MANIFEST` | zinder-compat-lightwalletd | Optional | `compat.shielded_history.manifest` | Admit an existing signed catalog before serving. Mutually exclusive with directory. |

@@ -130,7 +130,7 @@ impl EnvVarContractProbe {
     /// beneath one. `known_names` lists every documented variable, whichever
     /// binary uses it. A routed name the loader rejects stops the process at
     /// startup, and an accepted name that is not routed never reaches it.
-    /// `ZINDER_PROFILE` belongs to standalone binaries. The combined image
+    /// `ZINDER_DEPLOYMENT__PROFILE` belongs to standalone binaries. The combined image
     /// always starts the wallet projector and native query.
     pub fn check_wallet_serving_routing<'a>(
         &self,
@@ -150,7 +150,7 @@ impl EnvVarContractProbe {
             let routed = config_paths
                 .iter()
                 .any(|config_path| config_path_covers(config_path, name));
-            if name == "ZINDER_PROFILE" {
+            if name == "ZINDER_DEPLOYMENT__PROFILE" {
                 if routed {
                     problems.push(format!("{name}: reaches the combined wallet deployment"));
                 }

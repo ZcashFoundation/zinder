@@ -651,7 +651,7 @@ async fn light_wallet_profile_serves_canonical_and_forwarded_reads_from_the_bina
     let mut child =
         tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"))
             .env_clear()
-            .env("ZINDER_PROFILE", "light-wallet")
+            .env("ZINDER_DEPLOYMENT__PROFILE", "light-wallet")
             .env("ZINDER_NETWORK__NAME", "zcash-regtest")
             .env("ZINDER_NODE__JSON_RPC_ADDR", node.url().as_str())
             .env("ZINDER_INGEST_CONTROL__ADDR", control)
@@ -709,7 +709,7 @@ async fn every_light_wallet_selection_refuses_the_same_checkpointed_history() ->
 
     let mut refusal = None;
     for (label, selection) in [
-        ("profile", "profile = \"light-wallet\""),
+        ("profile", "[deployment]\nprofile = \"light-wallet\""),
         ("serving", "[compat]\nserving = \"light-wallet\""),
         (
             "legacy",
