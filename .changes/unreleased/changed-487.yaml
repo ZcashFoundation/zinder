@@ -1,0 +1,6 @@
+kind: changed
+body: Fresh wallet-serving stores with Explorer views off now store a tree-state checkpoint at every height before READY, so wallets read historical tree states from stored checkpoints as soon as the store is published. When construction stores these extra checkpoints, `ingest.construction.tree_hashing_workers` defaults to the CPU count, at most 16. Set `ingest.tree_state_densification.during_construction = false` to keep a sparse first sync, which reaches READY sooner. Existing stores reopen unchanged.
+time: 2026-11-23T02:04:25.255620687Z
+custom:
+    Bump: minor
+    PR: "487"
