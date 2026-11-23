@@ -131,10 +131,19 @@ total. Otherwise the build is refused.
 
 The row digest and the UTXO set commitment are sums of per-row hashes, so they
 do not depend on the order rows are hashed in. Construction hashes rows on
-`projector.build.accumulator_hashing_workers` threads, in batches of about
-256 KiB, while the build thread drains its sorters and writes SST files. At
-most twice the worker count of batches, and never more than 64, are held at
-once. Cold validation reads the unspent and spent output families back in up
+`projector.build.accumulator_hashing_workers` threads, in batches, while the
+build thread drains its sorters and writes SST files. Each batch is allocated
+once with room for 256 KiB of keys, values, and scripts, 4,096 rows, and 2,048
+unspent outputs, 512 KiB in all, and is handed to a worker before an entry
+would overflow it. A row or script larger than a batch is hashed on the build
+thread instead. At most twice the worker count of batches, never more than 64,
+wait for or run on the workers or sit hashed in their replies, and the build
+thread holds two more. With W workers, hashing therefore holds at most
+(min(2W, 64) + 2) × 512 KiB of batches, 5 MiB at 4 workers and 33 MiB at 64.
+Each completed batch also carries two 2 KiB partial accumulators, and each
+worker builds one row's hash input at a time, at most 256 KiB plus 45 bytes.
+None of this grows with the number of rows, as
+[ADR-0005](../adrs/0005-bounded-process-memory.md) requires. Cold validation reads the unspent and spent output families back in up
 to the same number of outpoint key ranges, at most one per 65,536 of their
 rows, each on its own thread, and checks every row as one scan would. The
 setting is at most 64; a build that asks for more is refused before it creates

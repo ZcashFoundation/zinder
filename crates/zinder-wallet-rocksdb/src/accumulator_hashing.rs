@@ -4,8 +4,18 @@
 //! per-row `LtHash16` expansions, so rows hashed into separate partial
 //! accumulators on different threads combine into the same bytes as one serial
 //! pass. With one worker, every row is hashed on the calling thread. With more,
-//! the calling thread copies rows into bounded batches, and each batch is
-//! hashed into its own partial accumulators on a worker.
+//! the calling thread copies rows into batches of fixed capacity, and each
+//! batch is hashed into its own partial accumulators on a worker.
+//!
+//! Memory held for hashing is fixed by the worker count. A batch is allocated
+//! once with room for [`BATCH_PAYLOAD_BYTES`] of keys, values, and scripts,
+//! [`MAX_BATCH_ROWS`] row descriptors, and [`MAX_BATCH_UNSPENT_OUTPUTS`] output
+//! descriptors, and is handed to a worker before an entry would overflow it. A
+//! row or script larger than a whole batch is hashed on the calling thread
+//! instead of being copied. At most twice the worker count of batches, never
+//! more than [`MAX_PENDING_BATCHES`], wait for or run on the workers, or sit
+//! hashed in their reply channels, and the calling thread holds one batch it
+//! is filling and one emptied batch for reuse.
 
 use std::{
     collections::VecDeque,
@@ -23,10 +33,16 @@ use zinder_wallet_projection::{
 
 use crate::RocksDbWalletError;
 
-/// Row bytes after which a batch is handed to a worker.
-///
-/// A batch holds at most this many bytes plus its final row.
-const BATCH_TARGET_BYTES: usize = 256 * 1024;
+/// Key, value, and script bytes one batch holds.
+const BATCH_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// Rows one batch describes; enough for the smallest rows, 40-byte address
+/// balances, to fill most of the payload.
+const MAX_BATCH_ROWS: usize = 4096;
+
+/// Unspent outputs one batch describes. Each comes with an unspent-output row
+/// of at least 120 bytes, so a full payload holds about 2,000 of them.
+const MAX_BATCH_UNSPENT_OUTPUTS: usize = 2048;
 
 /// Most batches that can wait for or run on the workers, whatever the worker
 /// count.
@@ -44,19 +60,19 @@ impl ConstructionAccumulators {
     /// Starts empty accumulators that hash on `workers` threads, or on the
     /// calling thread when `workers` is one.
     pub(crate) fn start(network: Network, workers: NonZeroU32) -> Result<Self, RocksDbWalletError> {
-        Self::start_with_batch_target(network, workers, BATCH_TARGET_BYTES)
+        Self::start_with_payload_capacity(network, workers, BATCH_PAYLOAD_BYTES)
     }
 
-    fn start_with_batch_target(
+    fn start_with_payload_capacity(
         network: Network,
         workers: NonZeroU32,
-        batch_target_bytes: usize,
+        payload_capacity: usize,
     ) -> Result<Self, RocksDbWalletError> {
         Ok(Self {
             network,
             digest: WalletProjectionDigestBuilder::new(),
             commitment: TransparentUtxoSetCommitment::empty(),
-            workers: HashingWorkers::start(workers, network, batch_target_bytes)?,
+            workers: HashingWorkers::start(workers, network, payload_capacity)?,
         })
     }
 
@@ -71,8 +87,18 @@ impl ConstructionAccumulators {
             self.digest.append_row(family, key, encoded_value)?;
             return Ok(());
         };
-        workers.filling.push_row(family, key, encoded_value);
-        workers.submit_if_full(&mut self.digest, &mut self.commitment)
+        let payload_bytes = key.len().saturating_add(encoded_value.len());
+        if workers.make_room(
+            payload_bytes,
+            BatchEntry::Row,
+            &mut self.digest,
+            &mut self.commitment,
+        )? {
+            workers.filling.push_row(family, key, encoded_value);
+        } else {
+            self.digest.append_row(family, key, encoded_value)?;
+        }
+        Ok(())
     }
 
     /// Adds one unspent output to the UTXO set commitment.
@@ -80,13 +106,22 @@ impl ConstructionAccumulators {
         &mut self,
         output: &WalletUnspentOutput,
     ) -> Result<(), RocksDbWalletError> {
-        let Some(workers) = self.workers.as_mut() else {
+        let fits_a_batch = match self.workers.as_mut() {
+            Some(workers) => workers.make_room(
+                output.script_pub_key.len(),
+                BatchEntry::UnspentOutput,
+                &mut self.digest,
+                &mut self.commitment,
+            )?,
+            None => false,
+        };
+        if fits_a_batch && let Some(workers) = self.workers.as_mut() {
+            workers.filling.push_unspent_output(output);
+        } else {
             self.commitment
                 .insert(&utxo_element(self.network, output, &output.script_pub_key));
-            return Ok(());
-        };
-        workers.filling.push_unspent_output(output);
-        workers.submit_if_full(&mut self.digest, &mut self.commitment)
+        }
+        Ok(())
     }
 
     /// Waits until every row and output added so far is hashed and combined.
@@ -139,7 +174,14 @@ struct HashingWorkers {
     spare: Option<RowBatch>,
     pending: VecDeque<Receiver<HashedBatch>>,
     max_pending: usize,
-    batch_target_bytes: usize,
+    payload_capacity: usize,
+}
+
+/// The kind of entry a batch must make room for.
+#[derive(Clone, Copy)]
+enum BatchEntry {
+    Row,
+    UnspentOutput,
 }
 
 impl HashingWorkers {
@@ -148,7 +190,7 @@ impl HashingWorkers {
     fn start(
         workers: NonZeroU32,
         network: Network,
-        batch_target_bytes: usize,
+        payload_capacity: usize,
     ) -> Result<Option<Self>, RocksDbWalletError> {
         if workers.get() > crate::MAX_ACCUMULATOR_HASHING_WORKERS {
             return Err(RocksDbWalletError::AccumulatorHashingWorkersOutOfRange {
@@ -177,23 +219,45 @@ impl HashingWorkers {
         Ok(Some(Self {
             pool,
             network,
-            filling: RowBatch::default(),
+            filling: RowBatch::with_capacity(payload_capacity),
             spare: None,
             pending: VecDeque::new(),
             max_pending: threads.saturating_mul(2).min(MAX_PENDING_BATCHES),
-            batch_target_bytes,
+            payload_capacity,
         }))
     }
 
-    fn submit_if_full(
+    /// Makes room in the filling batch for one more entry of `payload_bytes`,
+    /// handing the batch to a worker first when the entry would overflow it.
+    ///
+    /// Returns `false` for an entry larger than a whole batch, which the caller
+    /// hashes on its own thread instead.
+    fn make_room(
         &mut self,
+        payload_bytes: usize,
+        entry: BatchEntry,
         digest: &mut WalletProjectionDigestBuilder,
         commitment: &mut TransparentUtxoSetCommitment,
-    ) -> Result<(), RocksDbWalletError> {
-        if self.filling.bytes.len() < self.batch_target_bytes {
-            return Ok(());
+    ) -> Result<bool, RocksDbWalletError> {
+        if payload_bytes > self.payload_capacity {
+            return Ok(false);
         }
-        self.submit(digest, commitment)
+        let payload_fits = self
+            .filling
+            .bytes
+            .len()
+            .checked_add(payload_bytes)
+            .is_some_and(|bytes| bytes <= self.payload_capacity);
+        let descriptor_fits = match entry {
+            BatchEntry::Row => self.filling.rows.len() < MAX_BATCH_ROWS,
+            BatchEntry::UnspentOutput => {
+                self.filling.unspent_outputs.len() < MAX_BATCH_UNSPENT_OUTPUTS
+            }
+        };
+        if !(payload_fits && descriptor_fits) {
+            self.submit(digest, commitment)?;
+        }
+        Ok(true)
     }
 
     /// Hands the filling batch to a worker.
@@ -205,7 +269,11 @@ impl HashingWorkers {
         if self.filling.is_empty() {
             return Ok(());
         }
-        let batch = std::mem::replace(&mut self.filling, self.spare.take().unwrap_or_default());
+        let next = self
+            .spare
+            .take()
+            .unwrap_or_else(|| RowBatch::with_capacity(self.payload_capacity));
+        let batch = std::mem::replace(&mut self.filling, next);
         let network = self.network;
         self.spawn(digest, commitment, move || batch.hash(network))
     }
@@ -277,7 +345,8 @@ struct PartialAccumulators {
 }
 
 /// Rows and unspent outputs copied out of a drain into one byte buffer.
-#[derive(Default)]
+///
+/// Its buffers are allocated once at their full capacity and never grow.
 struct RowBatch {
     bytes: Vec<u8>,
     rows: Vec<BatchedRow>,
@@ -300,6 +369,14 @@ struct BatchedUnspentOutput {
 }
 
 impl RowBatch {
+    fn with_capacity(payload_capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(payload_capacity),
+            rows: Vec::with_capacity(MAX_BATCH_ROWS),
+            unspent_outputs: Vec::with_capacity(MAX_BATCH_UNSPENT_OUTPUTS),
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.rows.is_empty() && self.unspent_outputs.is_empty()
     }
@@ -368,7 +445,10 @@ impl RowBatch {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        mem::size_of,
+        time::{Duration, Instant},
+    };
 
     use zinder_core::{BlockHash, BlockId, TransactionId, TransparentAddressScriptHash};
     use zinder_wallet_projection::WalletTransactionPosition;
@@ -404,8 +484,8 @@ mod tests {
                 let family = families[usize::try_from(index).unwrap_or(0) % families.len()];
                 let key = [seed.as_slice(), &[0x5a; 32]].concat();
                 let value_len = usize::try_from(index % 200).unwrap_or(0);
-                let value = seed.iter().copied().cycle().take(value_len).collect();
-                (family, key, value)
+                let encoded_value = seed.iter().copied().cycle().take(value_len).collect();
+                (family, key, encoded_value)
             })
             .collect();
         let outputs = (0..90u32)
@@ -437,8 +517,8 @@ mod tests {
     ) -> Result<(WalletProjectionDigestBuilder, TransparentUtxoSetCommitment), RocksDbWalletError>
     {
         let mut digest = WalletProjectionDigestBuilder::new();
-        for (family, key, value) in rows {
-            digest.append_row(*family, key, value)?;
+        for (family, key, encoded_value) in rows {
+            digest.append_row(*family, key, encoded_value)?;
         }
         let mut commitment = TransparentUtxoSetCommitment::empty();
         for output in outputs {
@@ -454,16 +534,16 @@ mod tests {
         assert_eq!(outputs.len(), 90);
         let (reference_digest, reference_commitment) = serial_reference(&rows, &outputs)?;
         for worker_count in [1, 2, 3, 4, 8] {
-            for batch_target_bytes in [1, 100, 4_096, BATCH_TARGET_BYTES] {
-                let mut accumulators = ConstructionAccumulators::start_with_batch_target(
+            for payload_capacity in [1, 100, 4_096, BATCH_PAYLOAD_BYTES] {
+                let mut accumulators = ConstructionAccumulators::start_with_payload_capacity(
                     NETWORK,
                     workers(worker_count),
-                    batch_target_bytes,
+                    payload_capacity,
                 )?;
                 assert_eq!(accumulators.workers.is_none(), worker_count == 1);
                 let mut outputs = outputs.iter();
-                for (index, (family, key, value)) in rows.iter().enumerate() {
-                    accumulators.append_row(*family, key, value)?;
+                for (index, (family, key, encoded_value)) in rows.iter().enumerate() {
+                    accumulators.append_row(*family, key, encoded_value)?;
                     if index % 3 == 0
                         && let Some(output) = outputs.next()
                     {
@@ -477,7 +557,7 @@ mod tests {
                     accumulators.insert_unspent_output(output)?;
                 }
                 let (digest, commitment) = accumulators.finish()?;
-                let case = format!("{worker_count} workers, {batch_target_bytes}-byte batches");
+                let case = format!("{worker_count} workers, {payload_capacity}-byte batches");
                 assert_eq!(digest.row_counts(), reference_digest.row_counts(), "{case}");
                 assert_eq!(
                     digest.accumulator(),
@@ -491,12 +571,87 @@ mod tests {
     }
 
     #[test]
+    fn batches_never_grow_past_their_fixed_capacity() -> Result<(), RocksDbWalletError> {
+        const PAYLOAD_BYTES: usize = BATCH_PAYLOAD_BYTES;
+        let check = |accumulators: &ConstructionAccumulators| {
+            let Some(workers) = accumulators.workers.as_ref() else {
+                return;
+            };
+            assert!(workers.pending.len() <= workers.max_pending);
+            for batch in std::iter::once(&workers.filling).chain(workers.spare.as_ref()) {
+                assert_eq!(batch.bytes.capacity(), PAYLOAD_BYTES);
+                assert_eq!(batch.rows.capacity(), MAX_BATCH_ROWS);
+                assert_eq!(batch.unspent_outputs.capacity(), MAX_BATCH_UNSPENT_OUTPUTS);
+            }
+        };
+        let (_, outputs) = sample_input();
+        let oversized_value = vec![0x42; PAYLOAD_BYTES + 1];
+        let mut rows: Vec<SampleRow> = (0..10_000u32)
+            .map(|index| {
+                (
+                    WalletProjectionRowFamily::TransparentAddressBalance,
+                    index.to_be_bytes().to_vec(),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        rows.push((
+            WalletProjectionRowFamily::ReorgUndo,
+            7u32.to_be_bytes().to_vec(),
+            vec![0x24; PAYLOAD_BYTES - 4],
+        ));
+        rows.push((
+            WalletProjectionRowFamily::ReorgUndo,
+            8u32.to_be_bytes().to_vec(),
+            oversized_value,
+        ));
+        let (reference_digest, reference_commitment) = serial_reference(&rows, &outputs)?;
+        let mut accumulators = ConstructionAccumulators::start(NETWORK, workers(2))?;
+        for (family, key, encoded_value) in &rows {
+            accumulators.append_row(*family, key, encoded_value)?;
+            check(&accumulators);
+        }
+        for output in &outputs {
+            accumulators.insert_unspent_output(output)?;
+            check(&accumulators);
+        }
+        let (digest, commitment) = accumulators.finish()?;
+        assert_eq!(digest.row_counts(), reference_digest.row_counts());
+        assert_eq!(digest.accumulator(), reference_digest.accumulator());
+        assert_eq!(commitment, reference_commitment);
+        Ok(())
+    }
+
+    #[test]
+    fn one_batch_allocates_half_a_mebibyte() {
+        // The configuration reference and the storage architecture page state
+        // this figure and the bound built from it.
+        let batch_allocation_bytes = BATCH_PAYLOAD_BYTES
+            + MAX_BATCH_ROWS * size_of::<BatchedRow>()
+            + MAX_BATCH_UNSPENT_OUTPUTS * size_of::<BatchedUnspentOutput>();
+        assert_eq!(batch_allocation_bytes, 524_288);
+    }
+
+    #[test]
+    fn the_pending_queue_is_twice_the_workers_up_to_its_cap() -> Result<(), RocksDbWalletError> {
+        for (worker_count, expected) in [(2, 4), (4, 8), (31, 62), (32, 64), (33, 64), (64, 64)] {
+            let accumulators = ConstructionAccumulators::start(NETWORK, workers(worker_count))?;
+            let max_pending = accumulators
+                .workers
+                .as_ref()
+                .map_or(0, |workers| workers.max_pending);
+            assert_eq!(max_pending, expected, "{worker_count} workers");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pending_batches_never_exceed_twice_the_worker_count() -> Result<(), RocksDbWalletError> {
         let (rows, _) = sample_input();
         let mut accumulators =
-            ConstructionAccumulators::start_with_batch_target(NETWORK, workers(3), 1)?;
-        for (family, key, value) in &rows {
-            accumulators.append_row(*family, key, value)?;
+            ConstructionAccumulators::start_with_payload_capacity(NETWORK, workers(3), 100)?;
+        for (family, key, encoded_value) in &rows {
+            accumulators.append_row(*family, key, encoded_value)?;
             let pending = accumulators
                 .workers
                 .as_ref()
@@ -536,7 +691,7 @@ mod tests {
             &mut accumulators.commitment,
             || HashedBatch {
                 partial: Err(RocksDbWalletError::BuildCounterOverflow),
-                batch: RowBatch::default(),
+                batch: RowBatch::with_capacity(0),
             },
         )?;
         assert!(matches!(
@@ -558,7 +713,7 @@ mod tests {
                 &mut accumulators.commitment,
                 || {
                     std::thread::sleep(Duration::from_millis(200));
-                    RowBatch::default().hash(NETWORK)
+                    RowBatch::with_capacity(0).hash(NETWORK)
                 },
             )?;
         }
