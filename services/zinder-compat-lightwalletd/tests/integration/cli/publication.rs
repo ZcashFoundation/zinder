@@ -23,6 +23,12 @@ use crate::common::shielded_catalog_keys;
 fn history_publisher_prints_its_effective_configuration() -> Result<()> {
     let base =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/history-publisher.toml");
+    let shipped: toml::Table = toml::from_str(&fs::read_to_string(&base)?)?;
+    assert_eq!(
+        shipped["storage"]["raw_blob_policy"].as_str(),
+        Some("transactions")
+    );
+    assert_eq!(shipped["compat"]["serving"].as_str(), Some("compact-blocks"));
     let render = |path: &Path, setup: &[(&str, &str)]| {
         super::zinder_compat_command()
             .args(["--print-config", "--config"])
@@ -54,6 +60,8 @@ fn history_publisher_prints_its_effective_configuration() -> Result<()> {
     let printed = String::from_utf8(output.stdout)?;
     let settings: toml::Table = toml::from_str(&printed)?;
     assert_eq!(settings.len(), 3);
+    assert!(settings["storage"].get("raw_blob_policy").is_none());
+    assert!(settings["compat"].get("serving").is_none());
     for field in [
         "name = \"zcash-regtest\"",
         "path = \"/var/lib/zinder/canonical\"",
