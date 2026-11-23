@@ -31,9 +31,9 @@ use zinder_runtime::{
 };
 use zinder_store::{
     CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError,
-    CanonicalStoreRequirements, ResourceGaugeThrottle, RocksDbCanonicalSecondary,
-    RocksDbOpenResources, RocksDbResourceBudget, SharedSecondaryResources, StoreRole,
-    record_instance_memory_gauges,
+    CanonicalStoreRequirements, CanonicalStoredSet, ResourceGaugeThrottle,
+    RocksDbCanonicalSecondary, RocksDbOpenResources, RocksDbResourceBudget,
+    SharedSecondaryResources, StoreRole, record_instance_memory_gauges,
 };
 
 const GENERATION_COUNT: usize = 2;
@@ -291,7 +291,7 @@ impl CompactBlockPublisher {
                 CompactBlockServingError::Runtime(failure.to_string())
             }
         })?;
-        let reader = Arc::new(admit_generation(candidate).await?);
+        let reader = Arc::new(admit_generation(candidate, None).await?);
         let slot = CanonicalReaderSlot::new(Arc::clone(&reader));
         let visible_height = reader.event_fence().visible_tip().height.value();
         let refusal = writer_attestation.observe(&attesting_status, Some(visible_height));
@@ -531,26 +531,23 @@ impl CompactBlockPublisher {
                 return;
             }
         };
-        if let Err(error) = candidate.require_stored_set(active.secondary().stored_set()) {
-            tracing::warn!(%error, "refusing compact-block replacement generation");
-            close_unpublished_generation(Some(candidate)).await;
-            self.record_failure(
-                ReadinessCause::SchemaMismatch,
-                active.event_fence().visible_tip().height.value(),
-            );
-            return;
-        }
-        let admitted = admit_generation(candidate).await;
+        let admitted = admit_generation(candidate, Some(active.secondary().stored_set())).await;
         if shutdown.is_cancelled() {
             close_unpublished_generation(admitted.ok()).await;
             return;
         }
-        let Ok(reader) = admitted else {
-            self.record_failure(
-                ReadinessCause::StorageUnavailable,
-                active.event_fence().visible_tip().height.value(),
-            );
-            return;
+        let reader = match admitted {
+            Ok(reader) => reader,
+            Err(error) => {
+                let cause = if matches!(error, CompactBlockServingError::Storage(_)) {
+                    ReadinessCause::SchemaMismatch
+                } else {
+                    ReadinessCause::StorageUnavailable
+                };
+                tracing::warn!(%error, "refusing compact-block replacement generation");
+                self.record_failure(cause, active.event_fence().visible_tip().height.value());
+                return;
+            }
         };
         let reader = Arc::new(reader);
         self.retired = Some(self.slot.publish(Arc::clone(&reader)));
@@ -677,15 +674,18 @@ async fn open_generation(
 /// chain epoch it serves.
 async fn admit_generation(
     candidate: RocksDbCanonicalSecondary,
+    admitted_stored_set: Option<CanonicalStoredSet>,
 ) -> Result<RocksDbCanonicalReader, CompactBlockServingError> {
-    tokio::task::spawn_blocking(move || RocksDbCanonicalReader::new(candidate))
-        .await
-        .map_err(|error| {
-            CompactBlockServingError::Runtime(format!(
-                "compact-block admission task failed: {error}"
-            ))
-        })?
-        .map_err(CompactBlockServingError::Admission)
+    tokio::task::spawn_blocking(move || {
+        if let Some(expected) = admitted_stored_set {
+            candidate.require_stored_set(expected)?;
+        }
+        RocksDbCanonicalReader::new(candidate).map_err(CompactBlockServingError::Admission)
+    })
+    .await
+    .map_err(|error| {
+        CompactBlockServingError::Runtime(format!("compact-block admission task failed: {error}"))
+    })?
 }
 
 async fn catch_up_generation(
