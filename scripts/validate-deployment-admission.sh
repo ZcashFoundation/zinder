@@ -884,6 +884,48 @@ EOF
     exit 1
   fi
 
+  # One line per RUN instruction that mounts the Cargo target cache, with its
+  # continuation lines joined. Cargo judges workspace crates fresh by file
+  # modification time, so each such step must refresh every copied source
+  # file before any cargo command can reuse another tree's artifacts.
+  target_cache_steps="$(
+    awk '
+      /^RUN / { in_run = 1; step = "" }
+      in_run {
+        line = $0
+        sub(/\\$/, "", line)
+        step = step " " line
+        if ($0 !~ /\\$/) {
+          in_run = 0
+          if (step ~ /target=\/workspace\/target[,[:space:]]/) print step
+        }
+      }
+    ' "$dockerfile"
+  )"
+  source_refresh='find . -path ./target -prune -o -type f -exec touch {} +'
+  stale_target_cache_step=""
+  while IFS= read -r target_cache_step; do
+    [[ -n "$target_cache_step" ]] || continue
+    before_refresh="${target_cache_step%%"$source_refresh"*}"
+    if [[ "$before_refresh" == "$target_cache_step" || "$before_refresh" == *"cargo "* ]]; then
+      stale_target_cache_step="$target_cache_step"
+      break
+    fi
+  done <<< "$target_cache_steps"
+  if [[ "$(grep -c . <<< "$target_cache_steps")" -lt 3 ]] \
+    || [[ -n "$stale_target_cache_step" ]] \
+    || grep -Fq '%T@' "$dockerfile" \
+    || ! grep -Fq -- '--message-format=json-render-diagnostics' "$dockerfile"; then
+    cat >&2 <<'EOF'
+release admission rejected: every Docker build step that mounts the Cargo
+target cache must refresh the modification time of every copied source file
+before running cargo, and the live-test stage must take its test binary from
+cargo's JSON messages rather than the newest file in the cache, so that a
+cache holding another source tree's build cannot supply stale workspace code.
+EOF
+    exit 1
+  fi
+
   # "stage NAME BASE" for each named stage and "copy STAGE SOURCE" for each
   # COPY --from inside it.
   dockerfile_stages="$(
