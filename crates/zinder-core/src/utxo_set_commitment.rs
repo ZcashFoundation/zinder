@@ -152,6 +152,17 @@ impl TransparentUtxoSetCommitment {
         self.combine_lanes(element, u16::wrapping_sub);
     }
 
+    /// Adds every element folded into `other` to this commitment.
+    ///
+    /// Lanes are summed componentwise modulo `2^16`, so the result commits to
+    /// the elements of both commitments, whatever order each was folded in.
+    /// Commitments folded on separate threads over disjoint parts of a set
+    /// combine into the commitment of the whole set. `self` keeps its scheme,
+    /// so both commitments must use the same one.
+    pub fn combine(&mut self, other: &Self) {
+        fold_lanes(&mut self.accumulator, &other.accumulator, u16::wrapping_add);
+    }
+
     /// Returns the 32-byte display digest, `BLAKE2b-256` of the accumulator.
     #[must_use]
     pub fn display_digest(&self) -> [u8; UTXO_SET_COMMITMENT_DIGEST_LEN] {
@@ -169,16 +180,24 @@ impl TransparentUtxoSetCommitment {
         combine: impl Fn(u16, u16) -> u16,
     ) {
         let preimage = encode_utxo_set_commitment_element(element);
-        let expansion = blake2x_expand(&preimage);
-        let (accumulator_lanes, _) = self.accumulator.as_chunks_mut::<2>();
-        let (element_lanes, _) = expansion.as_chunks::<2>();
-        for (accumulator_lane, element_lane) in accumulator_lanes.iter_mut().zip(element_lanes) {
-            *accumulator_lane = combine(
-                u16::from_le_bytes(*accumulator_lane),
-                u16::from_le_bytes(*element_lane),
-            )
-            .to_le_bytes();
-        }
+        fold_lanes(&mut self.accumulator, &blake2x_expand(&preimage), combine);
+    }
+}
+
+/// Combines each little-endian `u16` lane of `lanes` into `accumulator`.
+fn fold_lanes(
+    accumulator: &mut [u8; UTXO_SET_COMMITMENT_LEN],
+    lanes: &[u8; UTXO_SET_COMMITMENT_LEN],
+    combine: impl Fn(u16, u16) -> u16,
+) {
+    let (accumulator_lanes, _) = accumulator.as_chunks_mut::<2>();
+    let (other_lanes, _) = lanes.as_chunks::<2>();
+    for (accumulator_lane, other_lane) in accumulator_lanes.iter_mut().zip(other_lanes) {
+        *accumulator_lane = combine(
+            u16::from_le_bytes(*accumulator_lane),
+            u16::from_le_bytes(*other_lane),
+        )
+        .to_le_bytes();
     }
 }
 
@@ -449,6 +468,48 @@ mod tests {
             summed.accumulator[byte_index + 1] = combined[1];
         }
         assert_eq!(union, summed);
+    }
+
+    #[test]
+    fn combined_partial_commitments_equal_the_serial_fold_for_every_split() {
+        const PARTS: usize = 3;
+        let elements: Vec<SampleUtxo> = (0..5u8)
+            .map(|seed| {
+                SampleUtxo::new(
+                    seed.wrapping_mul(37).wrapping_add(1),
+                    u32::from(seed),
+                    u64::from(seed) * 1_000 + 7,
+                    u32::from(seed) * 3 + 1,
+                )
+            })
+            .collect();
+        let mut serial = TransparentUtxoSetCommitment::empty();
+        for element in &elements {
+            element.fold_into(&mut serial);
+        }
+        let split_count = PARTS.pow(u32::try_from(elements.len()).unwrap_or(u32::MAX));
+        for split in 0..split_count {
+            let mut parts: [TransparentUtxoSetCommitment; PARTS] =
+                core::array::from_fn(|_| TransparentUtxoSetCommitment::empty());
+            let mut assignment = split;
+            for element in &elements {
+                element.fold_into(&mut parts[assignment % PARTS]);
+                assignment /= PARTS;
+            }
+            let [mut combined, middle, last] = parts;
+            combined.combine(&last);
+            combined.combine(&middle);
+            assert_eq!(combined, serial, "split {split}");
+        }
+    }
+
+    #[test]
+    fn combining_an_empty_commitment_changes_nothing() {
+        let mut commitment = TransparentUtxoSetCommitment::empty();
+        SampleUtxo::new(9, 1, 5, 2).fold_into(&mut commitment);
+        let before = commitment.clone();
+        commitment.combine(&TransparentUtxoSetCommitment::empty());
+        assert_eq!(commitment, before);
     }
 
     #[test]

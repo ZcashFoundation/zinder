@@ -6725,6 +6725,7 @@ version = "0.23.0"
 dependencies = [
  "metrics",
  "prost",
+ "rayon",
  "rust-rocksdb",
  "tempfile",
  "thiserror 2.0.21",

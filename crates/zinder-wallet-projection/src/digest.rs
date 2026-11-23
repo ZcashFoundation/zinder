@@ -513,6 +513,72 @@ mod tests {
     }
 
     #[test]
+    fn combined_partial_builders_equal_the_serial_builder_for_every_split()
+    -> Result<(), WalletProjectionContractError> {
+        use WalletProjectionRowFamily::{
+            ReorgUndo, TransparentAddressBalance, TransparentAddressTransaction,
+            TransparentSpentOutput, TransparentUnspentOutput, TransparentUnspentOutputByAddress,
+        };
+        const PARTS: usize = 3;
+        let rows = [
+            (
+                TransparentUnspentOutput,
+                patterned_bytes(36, 0x31),
+                patterned_bytes(109, 0x32),
+            ),
+            (
+                TransparentUnspentOutputByAddress,
+                patterned_bytes(72, 0x33),
+                Vec::new(),
+            ),
+            (
+                TransparentSpentOutput,
+                patterned_bytes(36, 0x34),
+                patterned_bytes(185, 0x35),
+            ),
+            (
+                TransparentAddressTransaction,
+                patterned_bytes(40, 0x36),
+                patterned_bytes(64, 0x37),
+            ),
+            (
+                TransparentAddressBalance,
+                patterned_bytes(32, 0x38),
+                9u64.to_be_bytes().to_vec(),
+            ),
+            (
+                ReorgUndo,
+                42u32.to_be_bytes().to_vec(),
+                patterned_bytes(196, 0x39),
+            ),
+        ];
+        let mut serial = WalletProjectionDigestBuilder::new();
+        for (family, key, value) in &rows {
+            serial.append_row(*family, key, value)?;
+        }
+        let split_count = PARTS.pow(u32::try_from(rows.len()).unwrap_or(u32::MAX));
+        for split in 0..split_count {
+            let mut parts: [WalletProjectionDigestBuilder; PARTS] =
+                core::array::from_fn(|_| WalletProjectionDigestBuilder::new());
+            let mut assignment = split;
+            for (family, key, value) in &rows {
+                parts[assignment % PARTS].append_row(*family, key, value)?;
+                assignment /= PARTS;
+            }
+            let [mut combined, middle, last] = parts;
+            combined.combine(&last)?;
+            combined.combine(&middle)?;
+            assert_eq!(combined.row_counts(), serial.row_counts(), "split {split}");
+            assert_eq!(
+                combined.accumulator(),
+                serial.accumulator(),
+                "split {split}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn combine_rejects_row_count_overflow_without_changing_the_builder() {
         let saturated = WalletProjectionFamilyRowCounts {
             reorg_undo_count: u64::MAX,

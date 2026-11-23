@@ -2,7 +2,7 @@
 
 use std::{
     net::SocketAddr,
-    num::NonZeroU64,
+    num::{NonZeroU32, NonZeroU64},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -20,6 +20,7 @@ use zinder_runtime::{
     resolve_wallet_projection_writer_rocksdb_budget, section_defaults::DEFAULT_CANONICAL_PATH,
 };
 use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
+use zinder_wallet_rocksdb::RocksDbWalletBuildOptions;
 
 const DEFAULT_CANONICAL_SECONDARY_PATH: &str = "/var/lib/zinder/projector/canonical-secondary";
 const DEFAULT_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::Transactions;
@@ -81,6 +82,7 @@ pub(crate) struct ProjectorBuildConfig {
     pub(crate) max_temporary_file_bytes_per_sorter: u64,
     pub(crate) sst_target_logical_bytes: u64,
     pub(crate) max_accounted_reorg_undo_bytes: u64,
+    pub(crate) accumulator_hashing_workers: NonZeroU32,
 }
 
 /// Bounded resources for one atomic continuous-following transition.
@@ -459,6 +461,7 @@ struct ProjectorBuildSection {
     max_temporary_file_bytes_per_sorter: Option<u64>,
     sst_target_logical_bytes: Option<u64>,
     max_accounted_reorg_undo_bytes: Option<u64>,
+    accumulator_hashing_workers: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -551,6 +554,14 @@ fn resolve_build_config(raw: &ProjectorBuildSection) -> Result<ProjectorBuildCon
             raw.max_accounted_reorg_undo_bytes,
             "projector.build.max_accounted_reorg_undo_bytes",
         )?,
+        accumulator_hashing_workers: match raw.accumulator_hashing_workers {
+            Some(workers) => NonZeroU32::new(workers).ok_or_else(|| {
+                ConfigError::invalid(
+                    "projector.build.accumulator_hashing_workers must be greater than zero",
+                )
+            })?,
+            None => RocksDbWalletBuildOptions::automatic_accumulator_hashing_workers(),
+        },
     })
 }
 
@@ -783,6 +794,7 @@ struct ProjectorBuildToml {
     max_temporary_file_bytes_per_sorter: u64,
     sst_target_logical_bytes: u64,
     max_accounted_reorg_undo_bytes: u64,
+    accumulator_hashing_workers: u32,
 }
 
 impl From<ProjectorBuildConfig> for ProjectorBuildToml {
@@ -794,6 +806,7 @@ impl From<ProjectorBuildConfig> for ProjectorBuildToml {
             max_temporary_file_bytes_per_sorter: config.max_temporary_file_bytes_per_sorter,
             sst_target_logical_bytes: config.sst_target_logical_bytes,
             max_accounted_reorg_undo_bytes: config.max_accounted_reorg_undo_bytes,
+            accumulator_hashing_workers: config.accumulator_hashing_workers.get(),
         }
     }
 }
@@ -823,12 +836,12 @@ fn encode_hex(bytes: [u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use zinder_rocksdb_bulk_load::BulkLoadError;
-    use zinder_wallet_rocksdb::RocksDbWalletError;
+    use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, RocksDbWalletError};
 
     use super::{
         DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES, DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER,
-        MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES, ProjectorError, ProjectorFollowSection,
-        resolve_follow_config,
+        MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES, ProjectorBuildSection, ProjectorError,
+        ProjectorFollowSection, resolve_build_config, resolve_follow_config,
     };
 
     /// Largest single-sorter spill observed for a Mainnet wallet build from
@@ -934,6 +947,43 @@ mod tests {
             DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES
         );
         Ok(())
+    }
+
+    fn build_section(accumulator_hashing_workers: Option<u32>) -> ProjectorBuildSection {
+        ProjectorBuildSection {
+            max_outpoint_sort_memory_bytes: Some(1),
+            max_secondary_sort_memory_bytes_per_sorter: Some(1),
+            max_temporary_file_bytes_per_sorter: Some(1),
+            sst_target_logical_bytes: Some(1),
+            max_accounted_reorg_undo_bytes: Some(1),
+            accumulator_hashing_workers,
+        }
+    }
+
+    #[test]
+    fn accumulator_hashing_workers_default_to_the_automatic_count()
+    -> Result<(), zinder_runtime::ConfigError> {
+        assert_eq!(
+            resolve_build_config(&build_section(None))?.accumulator_hashing_workers,
+            RocksDbWalletBuildOptions::automatic_accumulator_hashing_workers()
+        );
+        assert_eq!(
+            resolve_build_config(&build_section(Some(6)))?
+                .accumulator_hashing_workers
+                .get(),
+            6
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accumulator_hashing_workers_refuse_zero() {
+        let refused = resolve_build_config(&build_section(Some(0)));
+        assert!(refused.is_err_and(|error| {
+            error
+                .to_string()
+                .contains("projector.build.accumulator_hashing_workers")
+        }));
     }
 
     #[test]

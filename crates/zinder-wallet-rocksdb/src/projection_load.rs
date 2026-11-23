@@ -3,15 +3,15 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     mem::size_of,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use zinder_core::wire::UtxoSetCommitmentElement;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion, Network,
-    TransactionId, TransparentUtxoSetCommitment, ValidatedCanonicalBlockReplay,
+    TransactionId, ValidatedCanonicalBlockReplay,
 };
 use zinder_rocksdb_bulk_load::{
     BulkLoadError, OrderedSstWriter, SortedVariableValues, SstFileSet, VariableValueSortDurations,
@@ -21,13 +21,14 @@ use zinder_store::CanonicalStoreError;
 use zinder_wallet_projection::{
     WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
     WalletAddressUnspentOutputKey, WalletOutpointKey, WalletProjectionAccumulator,
-    WalletProjectionContractError, WalletProjectionDigest, WalletProjectionDigestBuilder,
-    WalletProjectionFamilyRowCounts, WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput,
-    WalletTransactionPosition, WalletUnspentOutput, WalletUtxoSetSummary,
+    WalletProjectionContractError, WalletProjectionDigest, WalletProjectionFamilyRowCounts,
+    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletTransactionPosition,
+    WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
 use crate::{
     RocksDbWalletError, WalletSecondaryRowDerivationPhaseDurations, WalletSstWriteDurations,
+    accumulator_hashing::ConstructionAccumulators,
     store::{
         REORG_UNDO_COLUMN_FAMILY, TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
         TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
@@ -57,6 +58,7 @@ pub(crate) struct WalletProjectionLoadConfig<'options> {
     pub(crate) max_temporary_file_bytes_per_sorter: u64,
     pub(crate) sst_target_logical_bytes: u64,
     pub(crate) max_accounted_reorg_undo_bytes: u64,
+    pub(crate) accumulator_hashing_workers: NonZeroU32,
 }
 
 /// Counts proving the build used one authenticated scan and no prevout reads.
@@ -473,24 +475,23 @@ pub(crate) fn write_projection_ssts(
         WalletProjectionRowFamily::TransparentSpentOutput,
         "wallet-spent-output",
     )?;
-    let mut digest = WalletProjectionDigestBuilder::new();
+    let mut accumulators =
+        ConstructionAccumulators::start(config.network, config.accumulator_hashing_workers)?;
     let mut sst_evidence = WalletProjectionSstEvidence::default();
     let mut utxo_count = 0_u64;
     let mut total_value_zat = 0_u64;
-    let mut commitment = TransparentUtxoSetCommitment::empty();
     drain_outpoint_events(
-        config.network,
         &mut sorted_outpoints,
         &mut unspent_writer,
         &mut spent_writer,
         &mut address_index_sorter,
         &mut address_transaction_sorter,
-        &mut digest,
+        &mut accumulators,
         &mut sst_evidence,
         &mut utxo_count,
         &mut total_value_zat,
-        &mut commitment,
     )?;
+    accumulators.settle()?;
     let (unspent_files, unspent_write) = unspent_writer.finish()?;
     let (spent_files, spent_write) = spent_writer.finish()?;
     let outpoint_merge = phase_started.elapsed();
@@ -516,9 +517,10 @@ pub(crate) fn write_projection_ssts(
         &mut sorted_address_index,
         &mut address_index_writer,
         &mut address_balance_writer,
-        &mut digest,
+        &mut accumulators,
         &mut sst_evidence,
     )?;
+    accumulators.settle()?;
     let (address_index_files, address_index_write) = address_index_writer.finish()?;
     let (address_balance_files, address_balance_write) = address_balance_writer.finish()?;
     let address_index_drain = step_started.elapsed();
@@ -538,9 +540,10 @@ pub(crate) fn write_projection_ssts(
         &mut sorted_address_transactions,
         &mut address_transaction_writer,
         &mut retained_undo,
-        &mut digest,
+        &mut accumulators,
         &mut sst_evidence,
     )?;
+    accumulators.settle()?;
     let (address_transaction_files, address_transaction_write) =
         address_transaction_writer.finish()?;
     let address_transaction_drain = step_started.elapsed();
@@ -557,7 +560,7 @@ pub(crate) fn write_projection_ssts(
         let encoded_value = undo.encode_value()?;
         append_row(
             &mut reorg_undo_writer,
-            &mut digest,
+            &mut accumulators,
             &mut sst_evidence,
             WalletProjectionRowFamily::ReorgUndo,
             &key,
@@ -569,6 +572,7 @@ pub(crate) fn write_projection_ssts(
     let secondary_row_derivation = phase_started.elapsed();
 
     let phase_started = Instant::now();
+    let (digest, commitment) = accumulators.finish()?;
     let row_counts = digest.row_counts();
     let (projection_accumulator, projection_digest) = digest.finish_with_accumulator();
     let logical_evidence = phase_started.elapsed();
@@ -653,17 +657,15 @@ pub(crate) fn write_projection_ssts(
     reason = "the streaming drain owns three output sinks and exact evidence accumulators"
 )]
 fn drain_outpoint_events(
-    network: Network,
     sorted: &mut SortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
     unspent_writer: &mut TimedSstWriter<'_>,
     spent_writer: &mut TimedSstWriter<'_>,
     address_index_sorter: &mut VariableValueSorter<ADDRESS_UNSPENT_KEY_BYTES>,
     address_transaction_sorter: &mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
-    digest: &mut WalletProjectionDigestBuilder,
+    accumulators: &mut ConstructionAccumulators,
     sst_evidence: &mut WalletProjectionSstEvidence,
     utxo_count: &mut u64,
     total_value_zat: &mut u64,
-    commitment: &mut TransparentUtxoSetCommitment,
 ) -> Result<(), RocksDbWalletError> {
     let mut pending = sorted.next_record()?;
     while let Some(first) = pending.take() {
@@ -703,7 +705,7 @@ fn drain_outpoint_events(
             let encoded_value = spent_output.encode_value()?;
             append_row(
                 spent_writer,
-                digest,
+                accumulators,
                 sst_evidence,
                 WalletProjectionRowFamily::TransparentSpentOutput,
                 outpoint_key.as_bytes(),
@@ -716,17 +718,11 @@ fn drain_outpoint_events(
             *total_value_zat = total_value_zat
                 .checked_add(output.value_zat)
                 .ok_or(WalletProjectionContractError::UtxoValueOverflow)?;
-            commitment.insert(&UtxoSetCommitmentElement {
-                network_id: network.id(),
-                outpoint: output.outpoint,
-                value_zat: output.value_zat,
-                script_pub_key: &output.script_pub_key,
-                block_height: output.created_at.block.height,
-            });
+            accumulators.insert_unspent_output(&output)?;
             let encoded_value = output.encode_value()?;
             append_row(
                 unspent_writer,
-                digest,
+                accumulators,
                 sst_evidence,
                 WalletProjectionRowFamily::TransparentUnspentOutput,
                 outpoint_key.as_bytes(),
@@ -773,7 +769,7 @@ fn drain_address_index(
     sorted: &mut SortedVariableValues<ADDRESS_UNSPENT_KEY_BYTES>,
     index_writer: &mut TimedSstWriter<'_>,
     balance_writer: &mut TimedSstWriter<'_>,
-    digest: &mut WalletProjectionDigestBuilder,
+    accumulators: &mut ConstructionAccumulators,
     evidence: &mut WalletProjectionSstEvidence,
 ) -> Result<(), RocksDbWalletError> {
     let mut current_address = None;
@@ -791,7 +787,7 @@ fn drain_address_index(
                 current_address.ok_or(WalletProjectionContractError::AddressBalanceUnderflow)?,
                 current_balance,
                 balance_writer,
-                digest,
+                accumulators,
                 evidence,
             )?;
             current_balance = 0;
@@ -807,7 +803,7 @@ fn drain_address_index(
             .ok_or(WalletProjectionContractError::AddressBalanceOverflow)?;
         append_row(
             index_writer,
-            digest,
+            accumulators,
             evidence,
             WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
             &record.key,
@@ -815,7 +811,13 @@ fn drain_address_index(
         )?;
     }
     if let Some(address) = current_address {
-        write_balance(address, current_balance, balance_writer, digest, evidence)?;
+        write_balance(
+            address,
+            current_balance,
+            balance_writer,
+            accumulators,
+            evidence,
+        )?;
     }
     Ok(())
 }
@@ -824,7 +826,7 @@ fn write_balance(
     address: zinder_core::TransparentAddressScriptHash,
     balance_zat: u64,
     writer: &mut TimedSstWriter<'_>,
-    digest: &mut WalletProjectionDigestBuilder,
+    accumulators: &mut ConstructionAccumulators,
     evidence: &mut WalletProjectionSstEvidence,
 ) -> Result<(), RocksDbWalletError> {
     if balance_zat == 0 {
@@ -836,7 +838,7 @@ fn write_balance(
     };
     append_row(
         writer,
-        digest,
+        accumulators,
         evidence,
         WalletProjectionRowFamily::TransparentAddressBalance,
         &balance.encode_key(),
@@ -848,7 +850,7 @@ fn drain_address_transactions(
     sorted: &mut SortedVariableValues<ADDRESS_TRANSACTION_KEY_BYTES>,
     writer: &mut TimedSstWriter<'_>,
     retained_undo: &mut RetainedUndo,
-    digest: &mut WalletProjectionDigestBuilder,
+    accumulators: &mut ConstructionAccumulators,
     evidence: &mut WalletProjectionSstEvidence,
 ) -> Result<(), RocksDbWalletError> {
     let mut pending = sorted.next_record()?;
@@ -879,7 +881,7 @@ fn drain_address_transactions(
         retained_undo.add_address_transaction(key)?;
         append_row(
             writer,
-            digest,
+            accumulators,
             evidence,
             WalletProjectionRowFamily::TransparentAddressTransaction,
             &first.key,
@@ -911,14 +913,14 @@ fn stage_address_transaction(
 )]
 fn append_row(
     writer: &mut TimedSstWriter<'_>,
-    digest: &mut WalletProjectionDigestBuilder,
+    accumulators: &mut ConstructionAccumulators,
     evidence: &mut WalletProjectionSstEvidence,
     family: WalletProjectionRowFamily,
     key: &[u8],
     encoded_value: &[u8],
 ) -> Result<(), RocksDbWalletError> {
     writer.put(key, encoded_value)?;
-    digest.append_row(family, key, encoded_value)?;
+    accumulators.append_row(family, key, encoded_value)?;
     evidence.add_row(key, encoded_value)
 }
 
@@ -1483,6 +1485,106 @@ mod tests {
         Ok(())
     }
 
+    /// Three blocks whose outputs go to two addresses, with spends of
+    /// outputs from earlier blocks.
+    fn three_block_spend_chain() -> Vec<CanonicalBlockFacts> {
+        let first = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
+        let second = TransparentAddressScriptHash::from_bytes([0xa2; 32]);
+        let funding = TransactionId::from_bytes([0xb1; 32]);
+        let change = TransactionId::from_bytes([0xb2; 32]);
+        vec![
+            block_facts(
+                1,
+                [0; 32],
+                [0xc1; 32],
+                vec![transaction_facts(
+                    funding,
+                    Vec::new(),
+                    vec![
+                        TransparentOutputFact::new(0, 10, [0x51], first),
+                        TransparentOutputFact::new(1, 20, [0x52, 0x53], second),
+                        TransparentOutputFact::new(2, 30, [0x54], first),
+                    ],
+                )],
+            ),
+            block_facts(
+                2,
+                [0xc1; 32],
+                [0xc2; 32],
+                vec![transaction_facts(
+                    change,
+                    vec![TransparentInputFact::new(
+                        0,
+                        TransparentOutPoint::new(funding, 0),
+                    )],
+                    vec![
+                        TransparentOutputFact::new(0, 4, [0x55], second),
+                        TransparentOutputFact::new(1, 6, [0x56], first),
+                    ],
+                )],
+            ),
+            block_facts(
+                3,
+                [0xc2; 32],
+                [0xc3; 32],
+                vec![transaction_facts(
+                    TransactionId::from_bytes([0xb3; 32]),
+                    vec![
+                        TransparentInputFact::new(0, TransparentOutPoint::new(funding, 1)),
+                        TransparentInputFact::new(1, TransparentOutPoint::new(change, 0)),
+                    ],
+                    vec![TransparentOutputFact::new(0, 24, [0x57], first)],
+                )],
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_hashing_worker_count_publishes_the_serial_oracle_evidence()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let options = test_column_family_options();
+        let blocks = three_block_spend_chain();
+        let oracle = oracle_for(&blocks)?;
+        let tip = BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([0xc3; 32]));
+        for workers in [1, 2, 4, 8] {
+            let config = WalletProjectionLoadConfig {
+                accumulator_hashing_workers: NonZeroU32::new(workers).ok_or("nonzero workers")?,
+                ..test_config_with_settled_tip(
+                    temporary.path(),
+                    &options,
+                    TestByteLimits::default(),
+                    tip,
+                )
+            };
+            let prepared =
+                write_projection_ssts(config, canonical_scan(validated_replays(&blocks)?))?;
+            assert_eq!(
+                prepared.row_counts,
+                oracle.row_counts(),
+                "{workers} workers"
+            );
+            assert_eq!(
+                prepared.utxo_summary,
+                oracle.utxo_summary(),
+                "{workers} workers"
+            );
+            assert_eq!(
+                prepared.projection_digest,
+                oracle.projection_digest()?,
+                "{workers} workers"
+            );
+            assert_eq!(
+                prepared.projection_accumulator,
+                oracle.projection_accumulator()?,
+                "{workers} workers"
+            );
+            assert_eq!(prepared.row_counts.transparent_spent_output_count, 3);
+            assert_eq!(prepared.utxo_summary.total_value_zat, 60);
+        }
+        Ok(())
+    }
+
     #[test]
     fn external_loader_refuses_memory_and_temporary_file_limit_crossings()
     -> Result<(), Box<dyn Error>> {
@@ -1601,6 +1703,7 @@ mod tests {
             max_temporary_file_bytes_per_sorter: limits.temporary_files_per_sorter,
             sst_target_logical_bytes: TEST_SST_LOGICAL_BYTES,
             max_accounted_reorg_undo_bytes: TEST_REORG_UNDO_BYTES,
+            accumulator_hashing_workers: NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
         }
     }
 

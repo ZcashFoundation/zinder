@@ -202,6 +202,17 @@ pub enum RocksDbWalletError {
     /// The monotonic lease-generation domain is exhausted.
     #[error("wallet projection build lease generation exceeds u64::MAX")]
     WalletProjectionBuildLeaseGenerationOverflow,
+    /// The build's accumulator hashing threads could not be started.
+    #[error("could not start {workers} wallet accumulator hashing threads: {reason}")]
+    AccumulatorHashingWorkersUnavailable {
+        /// Configured `accumulator_hashing_workers`.
+        workers: u32,
+        /// Thread-pool construction failure.
+        reason: String,
+    },
+    /// An accumulator hashing thread stopped before returning its batch.
+    #[error("a wallet accumulator hashing thread stopped before finishing its rows")]
+    AccumulatorHashingWorkerStopped,
     /// A caller stopped a projection build before READY promotion.
     #[error("wallet projection build was cancelled")]
     ProjectionBuildCancelled,

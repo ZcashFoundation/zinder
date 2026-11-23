@@ -326,6 +326,8 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
             sst_target_logical_bytes: WALLET_SST_TARGET_LOGICAL_BYTES,
             max_accounted_reorg_undo_bytes: WALLET_ACCOUNTED_REORG_UNDO_BYTES,
             supported_reorg_depth: validated.supported_reorg_depth,
+            accumulator_hashing_workers:
+                RocksDbWalletBuildOptions::automatic_accumulator_hashing_workers(),
         },
     )?;
     let wallet_build = wallet_outcome.report.phase_durations.total;

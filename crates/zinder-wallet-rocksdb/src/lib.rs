@@ -3,6 +3,7 @@
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
 compile_error!("Zinder supports only 32-bit and 64-bit pointer-width targets.");
 
+mod accumulator_hashing;
 mod build;
 mod build_lock;
 mod error;

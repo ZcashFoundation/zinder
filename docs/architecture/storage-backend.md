@@ -129,6 +129,13 @@ cold and reads every row back. The row digest and per-family row counts must
 match what construction produced, and the balances must sum to the unspent
 total. Otherwise the build is refused.
 
+The row digest and the UTXO set commitment are sums of per-row hashes, so they
+do not depend on the order rows are hashed in. Construction hashes rows on
+`projector.build.accumulator_hashing_workers` threads, in batches of about
+256 KiB, while the build thread drains its sorters and writes SST files. At
+most twice the worker count of batches, and never more than 64, are held at
+once. Any worker count publishes the same rows and evidence.
+
 **Following.** The projector applies each canonical chain event as one atomic
 write batch that also advances the wallet's source position. A transition that
 would hold more than `projector.follow.max_transition_logical_bytes` is refused

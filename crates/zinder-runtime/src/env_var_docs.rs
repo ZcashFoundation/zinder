@@ -1561,6 +1561,22 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Defaults to 536870912.",
     },
     EnvVarDoc {
+        name: "ZINDER_PROJECTOR__BUILD__ACCUMULATOR_HASHING_WORKERS",
+        toml_path: "projector.build.accumulator_hashing_workers",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Threads that hash wallet rows into the projection digest and the UTXO \
+                      set commitment during a fresh wallet build. Defaults to the number of \
+                      logical CPUs the projector may use, at most 4, and to 1 when that count \
+                      cannot be detected. With 1, hashing runs on the build thread. A higher \
+                      value hashes batches of about 256 KiB of rows on that many threads while \
+                      the build thread drains its sorters and writes SST files. At most twice \
+                      that many batches, and never more than 64, are held at once. The \
+                      published rows, digest, and commitment do not change. Must be greater \
+                      than zero.",
+    },
+    EnvVarDoc {
         name: "ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES",
         toml_path: "projector.follow.max_transition_logical_bytes",
         used_by: &["zinder-projector"],
