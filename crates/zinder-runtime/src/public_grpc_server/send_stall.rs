@@ -231,6 +231,10 @@ impl Sending {
         let piece_len = self.unsent.len().min(RESPONSE_PIECE_BYTES);
         let piece = Bytes::copy_from_slice(self.unsent.get(..piece_len).unwrap_or_default());
         self.unsent.advance(piece_len);
+        if self.unsent.is_empty() {
+            // An advanced-out `Bytes` still owns the handler's allocation.
+            self.unsent = Bytes::new();
+        }
         self.handed_out_at = Some(Instant::now());
         piece
     }
@@ -460,6 +464,39 @@ mod tests {
             .and_then(|trailers| trailers.get("grpc-status"))
             .map(http::HeaderValue::as_bytes);
         assert_eq!(status, Some(b"14".as_slice()), "expected UNAVAILABLE");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handing_out_a_chunk_s_last_piece_frees_the_chunk()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (freed_sender, mut freed) = oneshot::channel();
+        let chunk = Bytes::from_owner(TrackedChunk {
+            bytes: vec![0; RESPONSE_PIECE_BYTES + 1],
+            _freed: freed_sender,
+        });
+        let handler_body = Body::new(StreamBody::new(
+            tokio_stream::once(Ok::<_, Status>(Frame::data(chunk))).chain(tokio_stream::pending()),
+        ));
+        let mut body = SendStallBoundBody::new(handler_body, Duration::from_hours(1), None);
+
+        let first = body
+            .frame()
+            .await
+            .ok_or("the response ended before its first piece")??;
+        assert_eq!(freed.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        let last = body
+            .frame()
+            .await
+            .ok_or("the response ended before its last piece")??;
+
+        // The transport holds both pieces and the handler is still running.
+        assert_eq!(
+            freed.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed),
+            "the sent chunk stayed alive until the next chunk"
+        );
+        drop((first, last));
         Ok(())
     }
 
