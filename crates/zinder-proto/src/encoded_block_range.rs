@@ -324,13 +324,27 @@ impl<'a> ServerStreamingService<BlockRange> for TakeMessages<'a> {
 ///
 /// Shorter ones are copied together up to this size, as tonic batches them,
 /// because HTTP/2 writes each large DATA frame with its own system call.
-/// This matches tonic's default yield threshold, so the body returns a range
-/// of only short messages in the same chunks as tonic's encoder. A batch stays
-/// under twice this size, because each message added to it is shorter than this.
+/// This matches tonic's default yield threshold, so after the first frame the
+/// body returns a range of only short messages in the same chunks as tonic's
+/// encoder. A batch stays under twice this size, because each message added to
+/// it is shorter than this.
 const BATCH_BYTES: usize = 32 * 1024;
 
 /// The largest piece a message over the retention bound is copied into.
 const COPIED_PIECE_BYTES: usize = 64 * 1024;
+
+/// The first batch is sent once it holds at least this many bytes.
+///
+/// A client behind a gateway that forwards whole HTTP/2 frames can decode the
+/// first block only after the first DATA frame arrives, and after an idle
+/// second a connection sends about 10 segments before waiting a round trip.
+/// With segments of at least 1,340 bytes, as on tunnelled paths, that flight
+/// carries about 13.4 KB. It also carries the response HEADERS frame, the
+/// DATA frame header, any `SETTINGS` or `WINDOW_UPDATE` frames, and the gateway's
+/// TLS records of about 1.2 KB with 22 bytes of overhead each, about 0.6 KB in
+/// all. The first frame holds this cap plus at most one message, so 8 KiB
+/// leaves room for a first-crossing message of about 4.6 KB.
+const FIRST_BATCH_BYTES: usize = 8 * 1024;
 
 /// An uncompressed gRPC server response body over encoded messages.
 ///
@@ -344,6 +358,12 @@ const COPIED_PIECE_BYTES: usize = 64 * 1024;
 /// of exactly its length, a large message within both bounds is sent as its
 /// own buffer, and any other large message is copied into pieces of at most
 /// [`COPIED_PIECE_BYTES`].
+///
+/// Its first data frame differs from tonic's by design: the first batch is
+/// sent at [`FIRST_BATCH_BYTES`], and the next ends where tonic's first would.
+/// So when a message over the size limit follows in tonic's first batch, the
+/// messages of the capped first frame have already been sent, where tonic
+/// would drop them with the rest of its unsent batch.
 struct EncodedBlockBody {
     messages: EncodedBlockRangeStream,
     max_message_size: Option<usize>,
@@ -354,6 +374,10 @@ struct EncodedBlockBody {
     large: Bytes,
     /// Whether `large` is sent as copied pieces instead of as itself.
     copy_large: bool,
+    /// Whether any data frame has been sent.
+    sent_data: bool,
+    /// Bytes of tonic's current batch already sent as a capped first frame.
+    sent_of_batch: usize,
     status: Option<Status>,
     is_end_stream: bool,
 }
@@ -367,6 +391,8 @@ impl EncodedBlockBody {
             batch_len: 0,
             large: Bytes::new(),
             copy_large: false,
+            sent_data: false,
+            sent_of_batch: 0,
             status: None,
             is_end_stream: false,
         }
@@ -376,6 +402,8 @@ impl EncodedBlockBody {
         // The source can yield early, so a batch's length is known only now.
         // Copying the queued messages once into an exact allocation avoids
         // both a reservation per batch and a shrink of an early one.
+        self.sent_data = true;
+        self.sent_of_batch = 0;
         let mut batch = Vec::with_capacity(self.batch_len);
         for message in self.batch.drain(..) {
             batch.extend_from_slice(&message);
@@ -395,6 +423,8 @@ impl EncodedBlockBody {
     }
 
     fn take_large(&mut self) -> Frame<Bytes> {
+        self.sent_data = true;
+        self.sent_of_batch = 0;
         if !self.copy_large {
             return Frame::data(mem::take(&mut self.large));
         }
@@ -406,6 +436,18 @@ impl EncodedBlockBody {
             self.large.advance(piece_len);
         }
         Frame::data(piece)
+    }
+
+    /// Returns the batch once it is due, as tonic would send it, except that
+    /// the first is sent early at [`FIRST_BATCH_BYTES`].
+    fn take_due_batch(&mut self) -> Option<Frame<Bytes>> {
+        let len = self.batch_len;
+        if !self.sent_data && (FIRST_BATCH_BYTES..BATCH_BYTES).contains(&len) {
+            let frame = self.take_batch();
+            self.sent_of_batch = len;
+            return Some(frame);
+        }
+        (len + self.sent_of_batch >= BATCH_BYTES).then(|| self.take_batch())
     }
 
     fn check_size(&self, block: &EncodedBlock) -> Result<(), Status> {
@@ -443,7 +485,11 @@ impl http_body::Body for EncodedBlockBody {
         }
         while this.status.is_none() {
             let block = match this.messages.as_mut().poll_next(cx) {
-                Poll::Pending if this.batch.is_empty() => return Poll::Pending,
+                Poll::Pending if this.batch.is_empty() => {
+                    // tonic would end its batch here, so the next starts afresh.
+                    this.sent_of_batch = 0;
+                    return Poll::Pending;
+                }
                 Poll::Pending => return Poll::Ready(Some(Ok(this.take_batch()))),
                 Poll::Ready(None) => {
                     this.status = Some(Status::ok(""));
@@ -471,8 +517,8 @@ impl http_body::Body for EncodedBlockBody {
                 return Poll::Ready(Some(Ok(this.take_batch())));
             }
             this.add_to_batch(block.message);
-            if this.batch_len >= BATCH_BYTES {
-                return Poll::Ready(Some(Ok(this.take_batch())));
+            if let Some(frame) = this.take_due_batch() {
+                return Poll::Ready(Some(Ok(frame)));
             }
         }
         if !this.batch.is_empty() {

@@ -13,8 +13,8 @@ use tonic::codegen::tokio_stream::Stream;
 use super::{
     BATCH_BYTES, BlockRange, BoundedChunkRetention, Bytes, COPIED_PIECE_BYTES, CompactBlock,
     EnabledCompressionEncodings, EncodedBlock, EncodedBlockBody, EncodedBlockCodec,
-    EncodedBlockRange, EncodedBlockRangeStream, Grpc, InvalidEncodedBlock, Request, Response,
-    Status, http, server_streaming,
+    EncodedBlockRange, EncodedBlockRangeStream, FIRST_BATCH_BYTES, Grpc, InvalidEncodedBlock,
+    Request, Response, Status, http, server_streaming,
 };
 
 /// A message stream that reports `Pending` once wherever the script has `None`.
@@ -213,6 +213,31 @@ fn a_refused_message_drops_the_unsent_batch_as_tonic_does() -> eyre::Result<()> 
 }
 
 #[test]
+fn a_refused_message_after_the_capped_first_frame_keeps_only_that_frame() -> eyre::Result<()> {
+    let limit = 1_000;
+    let mut script = Vec::new();
+    for tag in 0..30_u8 {
+        script.push(Some(Ok(framed(&payload(400, tag))?)));
+    }
+    script.push(Some(Ok(framed(&payload(limit + 1, 30))?)));
+    let (encoded, tonic) = both(&script, Some(limit))?;
+    // tonic drops its whole unsent batch; this body has already sent the
+    // first 21 messages and drops only the 9 after them.
+    assert_eq!(tonic.frames, Vec::<Bytes>::new());
+    assert_eq!(encoded.frames.len(), 1);
+    assert_eq!(
+        encoded.frames[0].len(),
+        21 * (400 + EncodedBlock::PREFIX_LEN)
+    );
+    assert_eq!(encoded.trailers, tonic.trailers);
+    assert_eq!(
+        grpc_status(&encoded).map(|status| status.code()),
+        Some(tonic::Code::OutOfRange)
+    );
+    Ok(())
+}
+
+#[test]
 fn encoding_keeps_compact_block_bytes_including_unknown_fields() -> eyre::Result<()> {
     // Height 42 followed by an unknown field, which decoding and re-encoding would discard.
     let stored: &'static [u8] = &[0x10, 42, 0x78, 1];
@@ -274,8 +299,24 @@ fn a_slow_reader_pins_only_the_message_it_was_handed() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Checks that `encoded` sends tonic's bytes and trailers, and that its frames
+/// differ from tonic's only where the first batch was sent at the cap.
+fn assert_tonic_chunks_after_the_first_frame(encoded: &Sent, tonic: &Sent) {
+    assert_eq!(encoded.bytes(), tonic.bytes());
+    assert_eq!(encoded.trailers, tonic.trailers);
+    if encoded.frames == tonic.frames {
+        return;
+    }
+    assert!(encoded.frames[0].len() >= FIRST_BATCH_BYTES);
+    assert_eq!(
+        [encoded.frames[0].clone(), encoded.frames[1].clone()].concat(),
+        tonic.frames[0]
+    );
+    assert_eq!(encoded.frames[2..], tonic.frames[1..]);
+}
+
 #[test]
-fn the_body_returns_small_messages_in_the_same_chunks_as_tonic() -> eyre::Result<()> {
+fn the_body_returns_small_messages_in_tonics_chunks_after_the_first_frame() -> eyre::Result<()> {
     let mut script = Vec::new();
     for tag in 0..200_u8 {
         script.push(Some(Ok(framed(&payload(
@@ -287,13 +328,60 @@ fn the_body_returns_small_messages_in_the_same_chunks_as_tonic() -> eyre::Result
         }
     }
     let (encoded, tonic) = both(&script, None)?;
-    assert_eq!(encoded, tonic);
+    assert_tonic_chunks_after_the_first_frame(&encoded, &tonic);
     assert!(
         encoded
             .frames
             .iter()
             .all(|frame| frame.len() < 2 * BATCH_BYTES)
     );
+    Ok(())
+}
+
+#[test]
+fn the_first_frame_holds_the_first_batch_cap_plus_at_most_one_message() -> eyre::Result<()> {
+    let message_len = 400 + EncodedBlock::PREFIX_LEN;
+    // Whether or not the source pauses, as tokio-stream's iterator does every
+    // 32 items without its `rt` feature.
+    for pause_every in [None, Some(32)] {
+        let mut script = Vec::new();
+        for tag in 0..100_u8 {
+            if pause_every.is_some_and(|every| tag > 0 && usize::from(tag) % every == 0) {
+                script.push(None);
+            }
+            script.push(Some(Ok(framed(&payload(400, tag))?)));
+        }
+        let (encoded, tonic) = both(&script, None)?;
+        let first = encoded.frames[0].len();
+        assert!(first >= FIRST_BATCH_BYTES && first < FIRST_BATCH_BYTES + message_len);
+        assert_tonic_chunks_after_the_first_frame(&encoded, &tonic);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_first_message_over_the_cap_is_the_first_frame() -> eyre::Result<()> {
+    let first = framed(&payload(FIRST_BATCH_BYTES + 1, 1))?;
+    let script = [Some(Ok(first.clone())), Some(Ok(framed(&payload(300, 2))?))];
+    let (encoded, _) = both(&script, None)?;
+    assert_eq!(encoded.frames[0], first.message);
+    assert_eq!(encoded.frames.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_pause_right_after_the_capped_first_frame_starts_a_full_batch() -> eyre::Result<()> {
+    // 21 messages of 405 framed bytes reach the cap exactly at the pause.
+    let mut script = Vec::new();
+    for tag in 0..21_u8 {
+        script.push(Some(Ok(framed(&payload(400, tag))?)));
+    }
+    script.push(None);
+    for tag in 21..120_u8 {
+        script.push(Some(Ok(framed(&payload(400, tag))?)));
+    }
+    let (encoded, tonic) = both(&script, None)?;
+    assert_eq!(encoded, tonic);
     Ok(())
 }
 
@@ -379,7 +467,8 @@ fn a_large_message_over_the_bound_or_of_unknown_allocation_is_sent_as_copied_pie
 
 #[test]
 fn a_sent_batch_owns_an_allocation_of_its_length() -> eyre::Result<()> {
-    // A full batch, then one sent early while the source waits.
+    // A capped first batch, the rest of tonic's first batch, then one sent
+    // early while the source waits.
     let script = [
         Some(Ok(framed(&payload(20_000, 1))?)),
         Some(Ok(framed(&payload(20_000, 2))?)),
@@ -391,7 +480,8 @@ fn a_sent_batch_owns_an_allocation_of_its_length() -> eyre::Result<()> {
         None
     ));
     for expected_len in [
-        2 * (20_000 + EncodedBlock::PREFIX_LEN),
+        20_000 + EncodedBlock::PREFIX_LEN,
+        20_000 + EncodedBlock::PREFIX_LEN,
         300 + EncodedBlock::PREFIX_LEN,
     ] {
         let Poll::Ready(Some(frame)) = body
