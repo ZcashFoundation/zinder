@@ -116,7 +116,7 @@ run their own healthcheck script, described in
 
 ## gRPC health
 
-`zinder-query`, `zinder-explorer`, and both serving modes of
+`zinder-query`, `zinder-explorer`, and all three serving modes of
 `zinder-compat-lightwalletd` serve [`grpc.health.v1.Health`](https://github.com/grpc/grpc/blob/master/doc/health-checking.md)
 (`Check` and `Watch`) on their public gRPC listeners. gRPC-aware load
 balancers, Envoy, and Kubernetes `grpc` probes can then ask the serving port
@@ -326,7 +326,9 @@ traffic stops. When the reader refuses traffic, new gRPC calls fail with
 `UNAVAILABLE`, `SERVICE_NOT_READY`, and the cause in
 `ErrorInfo.metadata["readiness_cause"]`.
 
-Two dependencies are reported under `degraded` instead of refusing traffic:
+### Reader dependency health
+
+The readiness report lists reader dependency failures under `degraded`.
 
 | Input | Used by | When degraded |
 | --- | --- | --- |
@@ -334,10 +336,8 @@ Two dependencies are reported under `degraded` instead of refusing traffic:
 | `node_source` in light-wallet serving | [Forwarded wallet calls](lightwalletd-compatibility.md#runtime-serving-selection) | The configured node fails the dependency probe. The report carries its cause under `degraded`. |
 | `ingest_control` | Mempool snapshots and events, unmined transaction lookups | Ingest control fails (`ingest_control_unavailable`), the writer's mempool waits on its node (`node_unavailable`), or the writer reports `upstream_not_ready`. |
 
-A reader verifies each node endpoint before it broadcasts through it or reads
-the recommended fee from it, as
-[Node source boundary](../architecture/node-source-boundary.md#capabilities)
-describes.
+See [Node source boundary](../architecture/node-source-boundary.md#capabilities)
+for endpoint verification.
 
 ### Canonical-only compatibility readers
 
