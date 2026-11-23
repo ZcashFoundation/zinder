@@ -1,0 +1,6 @@
+kind: added
+body: Operators can set compat.shielded_history.map_verified_segments to serve fs-verity signed-history segments from a read-only memory mapping instead of copying each block into memory. With the setting on, a protected page that fails kernel verification stops the listener process instead of ending one stream, and it does so again on each request that reaches the page until the segment is replaced. The setting is off by default.
+time: 2026-11-23T12:08:02.285580274Z
+custom:
+    Bump: minor
+    PR: "497"
