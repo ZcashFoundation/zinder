@@ -3,7 +3,9 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use eyre::{Result, eyre};
+use prost::Message as _;
 use serde_json::json;
+use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Status};
 use tonic_types::StatusExt as _;
@@ -27,6 +29,48 @@ use zinder_testkit::{
 };
 
 use super::Fixture;
+
+#[tokio::test]
+async fn light_wallet_uses_the_encoded_range_body() -> Result<()> {
+    let fixture = Fixture::new([])?;
+    let hook = fixture
+        .adapter
+        .encoded_block_range()
+        .ok_or_else(|| eyre!("light-wallet must provide the generated server's encoded range"))?;
+    let id = lightwalletd::BlockId {
+        height: 1,
+        hash: Vec::new(),
+    };
+    let request = lightwalletd::BlockRange {
+        start: Some(id.clone()),
+        end: Some(id),
+        pool_types: Vec::new(),
+    };
+    let mut encoded = hook
+        .get_encoded_block_range(Request::new(request.clone()))
+        .await?
+        .into_inner();
+    let mut decoded = fixture
+        .adapter
+        .get_block_range(Request::new(request))
+        .await?
+        .into_inner();
+    let message = encoded
+        .next()
+        .await
+        .ok_or_else(|| eyre!("missing encoded block"))??;
+    let block = decoded
+        .next()
+        .await
+        .ok_or_else(|| eyre!("missing typed block"))??;
+    assert_eq!(
+        lightwalletd::CompactBlock::decode(message.payload())?,
+        block
+    );
+    assert!(encoded.next().await.is_none());
+    assert!(decoded.next().await.is_none());
+    Ok(())
+}
 
 fn transaction(id: TransactionId) -> Request<lightwalletd::TxFilter> {
     Request::new(lightwalletd::TxFilter {

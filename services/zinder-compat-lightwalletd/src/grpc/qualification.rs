@@ -730,9 +730,24 @@ impl SubtreeRootReads for QualificationWallet {
 }
 
 #[tonic::async_trait]
+impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<QualificationWallet> {
+    async fn get_encoded_block_range(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        self.read_encoded_block_range(&self.query_api.slot, request.into_inner())
+            .await
+    }
+}
+
+#[tonic::async_trait]
 impl compact_tx_streamer_server::CompactTxStreamer
     for LightwalletdGrpcAdapter<QualificationWallet>
 {
+    fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
+        Some(self)
+    }
+
     async fn get_latest_block(
         &self,
         _request: Request<lightwalletd::ChainSpec>,
