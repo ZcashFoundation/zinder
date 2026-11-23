@@ -1311,6 +1311,95 @@ mod tests {
         encoded
     }
 
+    // Fingerprints captured at 00030603. Both records include the full build plan.
+    const SCHEMA_7_CONTROL_DIGESTS: [(CanonicalStoreWorkload, RawBlobRetention, &str, &str); 6] = [
+        (
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::None,
+            "2ba9ddc5dd6efc43dc64f9cf83dfdb4045a801de123ed7591b6fb6e6d2705ed2",
+            "4054364a3b49ad9a815192e381df0fdbc619bab04b9ee39e835430fa541167a7",
+        ),
+        (
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            "83396d7af08baeba4870087be732cff6993d93018f9687a7efab0ba78f533c7f",
+            "8ec77fb30d258d50c925a76a12b9b55d6efc1487a4d1ec9ae2814ab5efa9275d",
+        ),
+        (
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::All,
+            "50dc31256c5ef502f7fbfcf98daeab363d1c501b8880a5eec0ca987a0befb54c",
+            "a4fdfbe855f0342d8e3b634c1e31d096cc06dcdf5ce83bd69f1787ff2417bb1a",
+        ),
+        (
+            CanonicalStoreWorkload::Explorer,
+            RawBlobRetention::None,
+            "37ca6cddabddfe259177397f85b53cdd0c2799ad9a4233b9a0e8d5cf883fee76",
+            "385b5a268505d1edad43379d59f6413307a235cd51c89f1efcd65999f9860a73",
+        ),
+        (
+            CanonicalStoreWorkload::Explorer,
+            RawBlobRetention::Transactions,
+            "589774281f25ab62f22e27427fa965396c11fb96db1510784b1aad92d32179db",
+            "05ce91ae473960dcdd3decaea1e56896d1abf18aa3a284b7d4c4bb26f38d05ad",
+        ),
+        (
+            CanonicalStoreWorkload::Explorer,
+            RawBlobRetention::All,
+            "7bbc6bee68c229ddf7e7e543d7db3c863e1ebc19da0e0087e305a6e3a7de56b8",
+            "73dab9c99a7959e2484afd9afadc239b1f90dc1ea32d36def9823e5d468fcbb2",
+        ),
+    ];
+
+    #[test]
+    fn every_stored_set_round_trips_its_schema_7_control_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sha2::{Digest as _, Sha256};
+
+        let sha256_hex = |bytes: &[u8]| {
+            Sha256::digest(bytes)
+                .iter()
+                .fold(String::new(), |mut hex, byte| {
+                    use std::fmt::Write as _;
+                    let _infallible = write!(hex, "{byte:02x}");
+                    hex
+                })
+        };
+        let CanonicalStoreBuildState::Ready(ready_evidence) = expected_ready_control().build_state
+        else {
+            return Err("the READY fixture must carry READY evidence".into());
+        };
+        for (workload, retention, building_digest, ready_digest) in SCHEMA_7_CONTROL_DIGESTS {
+            let build_plan = CanonicalStoreBuildPlan {
+                raw_blob_retention: retention,
+                ..complete_build_plan(Network::ZcashTestnet)
+            };
+            let building = encode_building_store_control(workload, &build_plan, CURSOR_AUTH_KEY)?;
+            let ready = encode_ready_store_control(
+                workload,
+                &build_plan,
+                CURSOR_AUTH_KEY,
+                &ready_evidence,
+            )?;
+            assert_eq!(
+                sha256_hex(&building),
+                building_digest,
+                "{workload:?} / {retention}"
+            );
+            assert_eq!(
+                sha256_hex(&ready),
+                ready_digest,
+                "{workload:?} / {retention}"
+            );
+            for encoded in [building, ready] {
+                let decoded = decode_store_control(Path::new("canonical"), &encoded)?;
+                assert_eq!(decoded.workload, workload);
+                assert_eq!(decoded.build_plan, build_plan);
+            }
+        }
+        Ok(())
+    }
+
     fn expected_ready_control() -> DecodedStoreControl {
         DecodedStoreControl {
             network: Network::ZcashTestnet,

@@ -33,6 +33,8 @@ mod secondary_tests;
 mod served_tree_state;
 mod stored_set;
 #[cfg(test)]
+mod stored_set_tests;
+#[cfg(test)]
 mod stored_tree_state_roots_tests;
 mod subtree_load;
 mod tree_state_densification;

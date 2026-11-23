@@ -731,14 +731,6 @@ pub(in crate::canonical_store) fn decode_subtree_root(
     ))
 }
 
-const fn shielded_protocols() -> [ShieldedProtocol; 3] {
-    [
-        ShieldedProtocol::Sapling,
-        ShieldedProtocol::Orchard,
-        ShieldedProtocol::Ironwood,
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use crate::canonical_store::stored_set::required_subtree_root_ranges;
