@@ -113,26 +113,40 @@ impl CanonicalStoreRequirements {
     /// Requires canonical history and the specified raw-blob coverage.
     #[must_use]
     pub fn for_blob_retention(retention: RawBlobRetention) -> Self {
-        Self::from_legacy(CanonicalStoreWorkload::Wallet, retention)
+        Self::default().with_blob_retention(retention)
+    }
+
+    /// Adds the specified raw-blob coverage to the reader's existing requirements.
+    #[must_use]
+    pub fn with_blob_retention(mut self, retention: RawBlobRetention) -> Self {
+        for kind in [
+            CanonicalStoredData::TransactionBodies,
+            CanonicalStoredData::BlockBodies,
+        ] {
+            if retains(CanonicalStoreWorkload::Wallet, retention, kind)
+                && !self.additional_data.contains(&kind)
+            {
+                self.additional_data.push(kind);
+            }
+        }
+        self
     }
 
     pub(super) fn from_legacy(
         workload: CanonicalStoreWorkload,
         retention: RawBlobRetention,
     ) -> Self {
-        let additional_data = [
-            CanonicalStoredData::TransactionBodies,
-            CanonicalStoredData::BlockBodies,
+        let mut requirements = Self::for_blob_retention(retention);
+        if retains(
+            workload,
+            retention,
             CanonicalStoredData::FinalNoteCommitmentRoots,
-        ]
-        .into_iter()
-        .filter(|&kind| retains(workload, retention, kind))
-        .collect();
-        Self {
-            additional_data,
-            first_required_height: None,
-            complete_subtree_root_prefix: false,
+        ) {
+            requirements
+                .additional_data
+                .push(CanonicalStoredData::FinalNoteCommitmentRoots);
         }
+        requirements
     }
 }
 
@@ -140,11 +154,7 @@ impl CanonicalStoreBuildPlan {
     /// Returns the stored data policy for this construction plan and workload.
     #[must_use]
     pub const fn stored_set(&self, workload: CanonicalStoreWorkload) -> CanonicalStoredSet {
-        CanonicalStoredSet::new(
-            workload,
-            self.raw_blob_retention(),
-            self.first_retained_height(),
-        )
+        CanonicalStoredSet::for_history(workload, self.raw_blob_retention(), self.history_bounds())
     }
 
     pub(super) const fn first_retained_height(&self) -> BlockHeight {
@@ -170,6 +180,18 @@ pub struct CanonicalStoredSet {
 }
 
 impl CanonicalStoredSet {
+    /// Describes the retained data a writer builds for its workload and history.
+    ///
+    /// Coverage authenticated by a published manifest is available after admission.
+    #[must_use]
+    pub const fn for_history(
+        workload: CanonicalStoreWorkload,
+        retention: RawBlobRetention,
+        bounds: CanonicalHistoryBounds,
+    ) -> Self {
+        Self::new(workload, retention, Self::history_floor(bounds))
+    }
+
     pub(super) const fn new(
         workload: CanonicalStoreWorkload,
         retention: RawBlobRetention,
@@ -266,7 +288,9 @@ impl CanonicalStoredSet {
         Ok(())
     }
 
-    pub(super) const fn raw_blob_retention(self) -> RawBlobRetention {
+    /// Returns the raw-blob policy fixed by the canonical writer.
+    #[must_use]
+    pub const fn raw_blob_retention(self) -> RawBlobRetention {
         self.retention
     }
 

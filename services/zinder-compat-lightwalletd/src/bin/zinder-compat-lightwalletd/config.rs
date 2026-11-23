@@ -186,16 +186,12 @@ pub(crate) enum LightwalletdConfigError {
 
 impl LightwalletdConfig {
     pub(crate) fn canonical_requirements(&self) -> CanonicalStoreRequirements {
-        let requirements = CanonicalStoreRequirements::for_blob_retention(
-            self.storage.expected_raw_blob_retention,
-        );
-        if self.serving == CompatServing::LightWallet {
-            requirements
-                .from_height(zinder_core::BlockHeight::new(1))
-                .with_complete_subtree_root_prefix()
+        let requirements = if self.serving == CompatServing::LightWallet {
+            DeploymentProfile::LightWallet.canonical_requirement()
         } else {
-            requirements
-        }
+            CanonicalStoreRequirements::default()
+        };
+        requirements.with_blob_retention(self.storage.expected_raw_blob_retention)
     }
 }
 
@@ -517,9 +513,10 @@ fn resolve_reorg_policy(
 }
 
 fn resolve_serving(config: &mut LightwalletdRawConfig) -> Result<CompatServing, ConfigError> {
-    if config.deployment.profile != Some(DeploymentProfile::LightWallet) {
+    let Some(profile) = config.deployment.profile else {
         return Ok(config.compat.serving.unwrap_or_default());
-    }
+    };
+    let raw_blob_retention = profile.canonical_stored_set().raw_blob_retention();
     if config
         .compat
         .serving
@@ -527,13 +524,13 @@ fn resolve_serving(config: &mut LightwalletdRawConfig) -> Result<CompatServing, 
         || config
             .storage
             .raw_blob_policy
-            .is_some_and(|policy| policy != zinder_store::RawBlobRetention::None)
+            .is_some_and(|policy| policy != raw_blob_retention)
     {
         return Err(ConfigError::invalid(
             "deployment.profile = \"light-wallet\" requires compat.serving = \"light-wallet\" and raw_blob_policy = \"none\". To select this profile, remove conflicting overrides",
         ));
     }
-    config.storage.raw_blob_policy = Some(zinder_store::RawBlobRetention::None);
+    config.storage.raw_blob_policy = Some(raw_blob_retention);
     Ok(CompatServing::LightWallet)
 }
 

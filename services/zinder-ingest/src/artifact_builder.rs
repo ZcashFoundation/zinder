@@ -64,6 +64,16 @@ impl RawBlobPolicy {
     }
 }
 
+impl From<RawBlobRetention> for RawBlobPolicy {
+    fn from(retention: RawBlobRetention) -> Self {
+        match retention {
+            RawBlobRetention::None => Self::None,
+            RawBlobRetention::Transactions => Self::Transactions,
+            RawBlobRetention::All => Self::All,
+        }
+    }
+}
+
 /// Error returned while constructing canonical blocks from source blocks.
 #[derive(Debug, Error)]
 #[non_exhaustive]

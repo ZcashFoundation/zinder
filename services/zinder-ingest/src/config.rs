@@ -822,9 +822,10 @@ fn guard_ingest_control_bearer_token(
 }
 
 fn apply_deployment_profile(config: &mut IngestConfig) -> Result<(), ConfigError> {
-    if config.deployment.profile != Some(DeploymentProfile::LightWallet) {
+    let Some(profile) = config.deployment.profile else {
         return Ok(());
-    }
+    };
+    let raw_blob_policy = RawBlobPolicy::from(profile.canonical_stored_set().raw_blob_retention());
     if config.ingest.explorer_views
         || config
             .ingest
@@ -834,14 +835,14 @@ fn apply_deployment_profile(config: &mut IngestConfig) -> Result<(), ConfigError
         || config
             .storage
             .raw_blob_policy
-            .is_some_and(|policy| policy != RawBlobPolicy::None)
+            .is_some_and(|policy| policy != raw_blob_policy)
     {
         return Err(ConfigError::invalid(
             "deployment.profile = \"light-wallet\" requires wallet-serving coverage, raw_blob_policy = \"none\", and Explorer views disabled. To select this profile, remove conflicting overrides",
         ));
     }
     config.ingest.run_overrides.coverage = Some(IngestCoverage::WalletServing);
-    config.storage.raw_blob_policy = Some(RawBlobPolicy::None);
+    config.storage.raw_blob_policy = Some(raw_blob_policy);
     Ok(())
 }
 
