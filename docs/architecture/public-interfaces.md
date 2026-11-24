@@ -32,6 +32,11 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `ChainEvent` | A durable canonical append or replacement. | `zinder-store`, `zinder-client` |
 | `MempoolEvent` | A live-pool change: added, invalidated, or mined. | `zinder-store`, `zinder-client` |
 
+Native services advertise contract revision 1 for this baseline. Store admission
+checks the separate persistence schema. The schema v1 cutover requires fresh
+canonical, wallet, and materialized-view stores. State bundles and recovery
+archives must be captured again from the rebuilt stores.
+
 ### Serving
 
 | Term | Plain meaning | Where it lives |

@@ -1212,8 +1212,9 @@ impl CanonicalHarness {
             &store_path,
             temporary.path().join("canonical-secondary"),
             activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                zinder_store::RawBlobRetention::Transactions,
+            ),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1253,8 +1254,9 @@ impl CanonicalHarness {
                 .path()
                 .join(format!("canonical-secondary-after-{family}")),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                zinder_store::RawBlobRetention::Transactions,
+            ),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1328,8 +1330,9 @@ impl CanonicalHarness {
             self.temporary.path().join("canonical"),
             self.temporary.path().join(secondary_name),
             &sample_regtest_upgrade_activations(),
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                zinder_store::RawBlobRetention::Transactions,
+            ),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;

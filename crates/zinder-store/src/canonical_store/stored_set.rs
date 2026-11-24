@@ -131,23 +131,6 @@ impl CanonicalStoreRequirements {
         }
         self
     }
-
-    pub(super) fn from_legacy(
-        workload: CanonicalStoreWorkload,
-        retention: RawBlobRetention,
-    ) -> Self {
-        let mut requirements = Self::for_blob_retention(retention);
-        if retains(
-            workload,
-            retention,
-            CanonicalStoredData::FinalNoteCommitmentRoots,
-        ) {
-            requirements
-                .additional_data
-                .push(CanonicalStoredData::FinalNoteCommitmentRoots);
-        }
-        requirements
-    }
 }
 
 impl CanonicalStoreBuildPlan {

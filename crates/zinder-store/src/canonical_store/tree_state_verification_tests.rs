@@ -17,7 +17,7 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RocksDbCanonicalStore, RocksDbTreeStateVerifier,
+    CanonicalReorgPolicy, RocksDbCanonicalStore, RocksDbTreeStateVerifier,
     TreeStateCheckpointMismatch, TreeStateCheckpointMismatchKind,
     TreeStateCheckpointRowVerification, TreeStateCheckpointSelection,
     TreeStateCheckpointVerification,
@@ -712,7 +712,6 @@ fn open_verifier_with_budget(
         temporary.path().join("canonical"),
         temporary.path().join(secondary_dir),
         &activations()?,
-        CanonicalStoreWorkload::Wallet,
         RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(100)?,
         resource_budget,

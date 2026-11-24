@@ -79,7 +79,7 @@ pub const MATERIALIZED_VIEW_STORE_SUBDIR: &str = "materialized-views";
 /// rebuilds it from a certified recovery source. The version is persisted in
 /// the `consumer_metadata` column family on first open and validated on
 /// subsequent opens.
-pub const MATERIALIZED_VIEW_STORE_FORMAT_VERSION: u16 = 9;
+pub const MATERIALIZED_VIEW_STORE_FORMAT_VERSION: u16 = 1;
 
 /// Total attempts used to cross a primary-compaction race while a secondary
 /// catches up and validates its newly replayed manifest.
@@ -190,7 +190,7 @@ enum ManifestAdmission {
 /// budget so one buffer can rotate to immutable while another keeps absorbing
 /// puts during compaction.
 ///
-/// Every level compresses with ZSTD. View rows carry hex transaction ids and
+/// Every level compresses with ZSTD. View rows carry binary transaction IDs and
 /// repeated address prefixes that ZSTD's entropy coding shrinks and the
 /// earlier Snappy default did not, and smaller files also cut the bytes each
 /// compaction rewrites. View writes are a small share of replay time, so the
@@ -3765,17 +3765,13 @@ mod tests {
 
     #[test]
     fn lower_store_format_version_returns_mismatch_without_mutation() -> Result<()> {
-        incompatible_store_format_rejection_preserves_rows(
-            MATERIALIZED_VIEW_STORE_FORMAT_VERSION - 1,
-        )
+        incompatible_store_format_rejection_preserves_rows(0)
     }
 
     #[test]
     fn reopening_a_store_with_an_advanced_store_format_version_returns_mismatch_without_mutation()
     -> Result<()> {
-        incompatible_store_format_rejection_preserves_rows(
-            MATERIALIZED_VIEW_STORE_FORMAT_VERSION + 1,
-        )
+        incompatible_store_format_rejection_preserves_rows(2)
     }
 
     #[test]
@@ -3797,7 +3793,7 @@ mod tests {
             store.put(
                 MaterializedViewStoreTable::ConsumerMetadata,
                 STORE_FORMAT_VERSION_KEY,
-                &(MATERIALIZED_VIEW_STORE_FORMAT_VERSION - 1).to_be_bytes(),
+                &0_u16.to_be_bytes(),
             )?;
         }
 
@@ -3830,7 +3826,7 @@ mod tests {
                 Err(MaterializedViewStoreError::SchemaMismatch {
                     persisted,
                     running,
-                }) if persisted == MATERIALIZED_VIEW_STORE_FORMAT_VERSION - 1 && running == MATERIALIZED_VIEW_STORE_FORMAT_VERSION
+                }) if persisted == 0 && running == MATERIALIZED_VIEW_STORE_FORMAT_VERSION
             ));
         }
         Ok(())

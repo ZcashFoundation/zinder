@@ -28,8 +28,7 @@ use zinder_runtime::{
 };
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalReorgPolicy,
-    CanonicalRetainedEvent, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, RocksDbCanonicalSecondary,
+    CanonicalRetainedEvent, CanonicalStoreReadyEvidence, RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
@@ -321,7 +320,7 @@ async fn project_wallet(
         ))
     })?;
     *active_phase = Some(StartupPhase::OpenStorage.start());
-    let Some(mut canonical) = open_canonical_secondary(config, reorg_policy, &cancel).await? else {
+    let Some(mut canonical) = open_canonical_secondary(config, reorg_policy, &cancel)? else {
         return Ok(());
     };
     complete_pending_phase(active_phase);
@@ -1817,53 +1816,26 @@ impl WriterFence {
     }
 }
 
-/// Opens the canonical secondary, adopting the network-upgrade schedule the
-/// canonical writer admitted, or returns `None` when `cancel` fires first.
-///
-/// The writer admits its first schedule revision when it opens the store, so
-/// a READY store without one is retried until
-/// `projector.fence_convergence_timeout_seconds` passes.
-async fn open_canonical_secondary(
+/// Opens a canonical secondary that adopts the schedule bound to READY.
+fn open_canonical_secondary(
     config: &config::ProjectorConfig,
     reorg_policy: CanonicalReorgPolicy,
     cancel: &CancellationToken,
 ) -> Result<Option<RocksDbCanonicalSecondary>, ProjectorError> {
-    let deadline = tokio::time::Instant::now() + config.fence_convergence_timeout;
-    let mut delay = CANONICAL_FENCE_CONVERGENCE_INITIAL_DELAY;
-    let mut waiting_logged = false;
-    loop {
-        match RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
-            &config.canonical_path,
-            &config.canonical_secondary_path,
-            config.network,
-            CanonicalStoreWorkload::Wallet,
-            config.expected_canonical_raw_blob_retention,
-            reorg_policy,
-            config.canonical_rocksdb_budget,
-        ) {
-            Ok(canonical) => return Ok(Some(canonical)),
-            Err(CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. })
-                if tokio::time::Instant::now() < deadline =>
-            {
-                if !waiting_logged {
-                    tracing::info!(
-                        target: "zinder::projector",
-                        event = "canonical_schedule_admission_pending",
-                        "waiting for the canonical writer to admit a network-upgrade schedule"
-                    );
-                    waiting_logged = true;
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-        tokio::select! {
-            () = cancel.cancelled() => return Ok(None),
-            () = tokio::time::sleep(delay) => {}
-        }
-        delay = delay
-            .saturating_mul(2)
-            .min(CANONICAL_FENCE_CONVERGENCE_MAX_DELAY);
+    if cancel.is_cancelled() {
+        return Ok(None);
     }
+    let canonical = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &config.canonical_path,
+        &config.canonical_secondary_path,
+        config.network,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(
+            config.expected_canonical_raw_blob_retention,
+        ),
+        reorg_policy,
+        config.canonical_rocksdb_budget,
+    )?;
+    Ok(Some(canonical))
 }
 
 /// Converges the canonical secondary on the writer, returning `None` when
@@ -2736,8 +2708,9 @@ mod tests {
             &canonical_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                RawBlobRetention::Transactions,
+            ),
             reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3468,8 +3441,9 @@ mod tests {
                 &canonical_path,
                 temporary.path().join("canonical-secondary"),
                 &activations,
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::Transactions,
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    RawBlobRetention::Transactions,
+                ),
                 reorg_policy,
                 RocksDbResourceBudget::for_local_tests(),
             )?;

@@ -6,8 +6,8 @@ use eyre::{ensure, eyre};
 use tempfile::TempDir;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReorgPolicy, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletBuildOptions, RocksDbWalletSecondary, build_wallet_from_canonical,
@@ -194,8 +194,9 @@ impl WalletServingStoreFixture {
             canonical_primary_path,
             &reader_paths.canonical_secondary,
             identity.network,
-            CanonicalStoreWorkload::Wallet,
-            identity.raw_blob_retention,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                identity.raw_blob_retention,
+            ),
             identity.reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;

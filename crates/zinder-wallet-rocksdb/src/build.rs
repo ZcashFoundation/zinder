@@ -215,7 +215,9 @@ where
             observed: canonical_store.wallet_projection_network(),
         });
     }
-    let observed = canonical_source_identity(&canonical_store.wallet_projection_ready_evidence());
+    let ready = canonical_store.wallet_projection_ready_evidence();
+    validate_canonical_schema(&ready)?;
+    let observed = canonical_source_identity(&ready);
     if observed != lease.pinned_canonical_anchor() {
         return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
             reason: "canonical source changed before wallet READY promotion",
@@ -758,11 +760,12 @@ where
             maximum: MAX_ACCUMULATOR_HASHING_WORKERS,
         });
     }
+    let canonical_ready = canonical_store.wallet_projection_ready_evidence();
+    validate_canonical_schema(&canonical_ready)?;
     let wallet_path = wallet_path.as_ref();
     let build_lock = WalletBuildLock::acquire(wallet_path)?;
     remove_abandoned_build_paths(wallet_path, &build_lock)?;
     let staging = FreshWalletProjectionStaging::create(projection_staging_path(wallet_path))?;
-    let canonical_ready = canonical_store.wallet_projection_ready_evidence();
     let source_position = WalletProjectionSourcePosition::new(
         canonical_ready.visible_epoch,
         canonical_ready.visible_tip,
@@ -986,6 +989,17 @@ fn default_build_owner(now: UnixTimestampMillis) -> WalletProjectionBuildOwner {
     owner[..8].copy_from_slice(&now.value().to_be_bytes());
     owner[8..12].copy_from_slice(&std::process::id().to_be_bytes());
     WalletProjectionBuildOwner::from_bytes(owner)
+}
+
+fn validate_canonical_schema(
+    ready: &CanonicalStoreReadyEvidence,
+) -> Result<(), RocksDbWalletError> {
+    if ready.schema_version != zinder_wallet_projection::REQUIRED_CANONICAL_STORE_SCHEMA_VERSION {
+        return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
+            reason: "canonical store schema version differs from the wallet projection contract",
+        });
+    }
+    Ok(())
 }
 
 fn validate_canonical_fence(

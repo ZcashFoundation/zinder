@@ -42,9 +42,8 @@ use zinder_runtime::{
 };
 use zinder_store::{
     CanonicalBuildBlock, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalLiveAppend,
-    CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock, RawBlobRetention,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionBuildOwner};
 use zinder_wallet_rocksdb::{
@@ -687,8 +686,9 @@ impl ParkFixture {
             &canonical_path,
             root.join("canonical-secondary"),
             &zinder_testkit::sample_regtest_upgrade_activations(),
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                RawBlobRetention::Transactions,
+            ),
             reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -786,52 +786,15 @@ fn park_config(
     })
 }
 
-/// The projector brings no activation table of its own: it opens its
-/// canonical secondary once the writer admits the store's first schedule,
-/// and fails typed when the writer never does within the deadline.
-#[tokio::test]
-async fn the_canonical_secondary_waits_for_the_writers_first_schedule_admission() -> TestResult {
+#[test]
+fn the_projector_adopts_the_schedule_from_canonical_ready_publication() -> TestResult {
     let root = TempDir::new()?;
     let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?;
-    let (mut writer, _) = baseline_writer(&root.path().join("canonical"), reorg_policy)?;
-    let mut config = park_config(root.path(), "http://127.0.0.1:1", "127.0.0.1:1".parse()?)?;
-    config.fence_convergence_timeout = Duration::from_millis(200);
+    let (_writer, _) = baseline_writer(&root.path().join("canonical"), reorg_policy)?;
+    let config = park_config(root.path(), "http://127.0.0.1:1", "127.0.0.1:1".parse()?)?;
     let cancel = CancellationToken::new();
-
-    let capture = zinder_testkit::LogCapture::install_for_target("zinder::startup");
-    let refused = Box::pin(crate::run_owned_projector(
-        &config,
-        &Readiness::default(),
-        cancel.clone(),
-    ))
-    .await;
-    assert!(
-        capture.any(|event| event.field("phase") == Some("open_storage")
-            && event.field("outcome") == Some("failed")
-            && event.field("reason").is_some())
-    );
-
-    assert!(
-        matches!(
-            refused,
-            Err(crate::config::ProjectorError::CanonicalStore(
-                zinder_store::CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. }
-            ))
-        ),
-        "a store without an admitted schedule must stay refused"
-    );
-
-    config.fence_convergence_timeout = Duration::from_secs(10);
-    let admit = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        writer.admit_network_upgrade_schedule(&zinder_testkit::sample_regtest_upgrade_activations())
-    };
-    let (opened, admitted) = tokio::join!(
-        crate::open_canonical_secondary(&config, reorg_policy, &cancel),
-        admit
-    );
-    admitted?;
-    let secondary = opened?.ok_or("the open must not report cancellation")?;
+    let secondary = crate::open_canonical_secondary(&config, reorg_policy, &cancel)?
+        .ok_or("the open must not report cancellation")?;
     assert_eq!(
         secondary.network_upgrade_activations(),
         Some(&zinder_testkit::sample_regtest_upgrade_activations())

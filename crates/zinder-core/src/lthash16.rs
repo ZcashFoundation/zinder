@@ -260,7 +260,7 @@ mod tests {
 
     /// The wallet projection row personalization, owned by
     /// `zinder-wallet-projection`.
-    const PROJECTION_ROW_PERSONAL: &[u8; 16] = b"ZinderWProjRoot2";
+    const PROJECTION_ROW_PERSONAL: &[u8; 16] = b"ZinderWProjRoot1";
 
     /// Personalization, element length, block 0, and block 31 for both
     /// domains. The element is the first `len` bytes of `00, 01, ..., ff`.
@@ -269,48 +269,48 @@ mod tests {
             PROJECTION_ROW_PERSONAL,
             0,
             concat!(
-                "2ed437eb6b166bc13d77418fb1a4f8905e933ec3983026ea7336cb7d4261d682",
-                "a71802f9b8d34291d5b642a9c92206511b556e449d8058d5ea54c1dc1d47e2b8",
+                "05de8aeeb00626bb1092b90f3467d80f83c9673f4d796dd961bfabf35a17604a",
+                "5a22a195aad626e8c3ca0bdcf7ea6461e91a54c945264a68b8539337ba31fb61",
             ),
             concat!(
-                "a5988be115edb7182fe5329020c46e103fe0cfe92f319d203e161cf7b18600b7",
-                "94cfeece04f18e3a235351c61e634ed5762aae1157472a1272314bf3e0a05508",
+                "34bb5f567fd6413d5f2d4501e39a5ebe9e11a19a97ebdc3dbd8a659de6da5c85",
+                "1a70d0dccb5f8988cfc1f5018e089e3b8c95f9a7081fbdd1aa37bce547aa9a2c",
             ),
         ),
         (
             PROJECTION_ROW_PERSONAL,
             256,
             concat!(
-                "a5dc3a6e8133e583dd919820ba2268b81f3e3a7cdf5f5bf1d6b7fb78407c1a50",
-                "6e3e4c4b474050be32f47b7a3c01753343ccc6f8557ba1762d07b349fbe8620a",
+                "8817919f4735f3f2c62e6d5bb6f09597c016cc7b1ba10209574af8e52e444c8a",
+                "6a9da06dceb595239c6de0a3fca9f99366a943e25701b2acbe83220951462d4d",
             ),
             concat!(
-                "70b3cb53363ff37b8e615b1594a254e64b6d677f7a2c92bd19912862daa14291",
-                "12b1b85951b97bb219d40073e8af2a4e7a681d043572d41c8e16474501c7e57e",
+                "f1956b4e0932da812e3a4b4c0613dd5536fcb7734ca905d7f2b414f494789ab0",
+                "c804c6b1ebff41672b318fa35a02c3e77339211d7969ea13f6deb30a3a4d6956",
             ),
         ),
         (
             &crate::wire::UTXO_SET_COMMITMENT_PERSONAL,
             0,
             concat!(
-                "13827a75d088466acae443556339ba22ec26b790e222fc81a35d4893cf4d3c59",
-                "35025b1a2e2c1475a77835525ae4051b41ca2e045933143e4750cf199f5a6fd6",
+                "1011c9452d9090f342cfc2722939349a981c16a87dcfc423acf85af12d44f023",
+                "4e651dd9d90f84fb02e631eabb345f72447eef0eafc147a6c853a498a1add52a",
             ),
             concat!(
-                "c6bcd0c4a2c70f96a06f727c7d90cd1a6e7f34b770f5fc984d5e1384eb572b13",
-                "2f69a4d4ed290beb6a068d4158b5be8d6fd40d6668e56f1c73bbd579bdc01302",
+                "ece69665d65fd378a41017ad3daef7b46d858eb243d1ef93e186116bdbe3bd49",
+                "81ff93dcf9694ada33d5ca86b14bd7a3120a5429e7c083386c3cb91fa53b92f5",
             ),
         ),
         (
             &crate::wire::UTXO_SET_COMMITMENT_PERSONAL,
             256,
             concat!(
-                "e77ef3f5d9fb416eed72e27f177e98a17e43615c077c7cf8cc8df1cbb55f1348",
-                "e49b7c215f1ddcc2fc6471e3cace0d88df9c78d6d134c45062b91e8b653d2583",
+                "64015994948166acdbcfdb53e875a5888534edab0fa992d1ec2841d71f3b035e",
+                "d0b2c303e5523e7dad4a75b9b36253b9dd11a7b08f86007c58f157e1a071793a",
             ),
             concat!(
-                "068648fe48844c0333acfbd6734048ba5d4fb383d0a22a0d99c1de98652e87cf",
-                "70f50f907f5ded7c47cc601c06667dbd3e437eb79bc959bcfef9ac49c1f4b9a0",
+                "514b8f8052a2eb7ad31aa31dd1afd1b56499b58372ab94f96796e425c34dede4",
+                "fbae0babc41f258c866d42ae77cfdcb463a4294955004b580216f8a7c0349fdf",
             ),
         ),
     ];

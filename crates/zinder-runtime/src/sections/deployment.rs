@@ -114,7 +114,7 @@ mod tests {
             stored_set
         );
         let directory = tempfile::tempdir()?;
-        let reader = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
+        let reader = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
             writer.canonical_primary_path(),
             directory.path(),
             Network::ZcashRegtest,

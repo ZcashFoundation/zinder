@@ -29,7 +29,7 @@ use zinder_store::{
 };
 
 const REPORT_CONTRACT_IDENTITY: &str = "rocksdb-raw-blob-retention-comparison";
-const REPORT_FORMAT_VERSION: u16 = 3;
+const REPORT_FORMAT_VERSION: u16 = 1;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
@@ -364,8 +364,7 @@ async fn run_retention_arm(
         canonical_store_path,
         secondary_root_path,
         activations,
-        CanonicalStoreWorkload::Wallet,
-        raw_blob_retention,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(raw_blob_retention),
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         validated.reader_resource_budget,
     )?;
@@ -1049,6 +1048,6 @@ mod tests {
             REPORT_CONTRACT_IDENTITY,
             "rocksdb-raw-blob-retention-comparison"
         );
-        assert_eq!(REPORT_FORMAT_VERSION, 3);
+        assert_eq!(REPORT_FORMAT_VERSION, 1);
     }
 }

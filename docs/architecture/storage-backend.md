@@ -143,11 +143,11 @@ total. Otherwise the build is refused.
 over every row of the six families: 1,024 little-endian 16-bit lanes, summed
 modulo 2^16. The row digest is the 32-byte BLAKE2b-256 hash of it. Each row
 contributes 2,048 bytes derived from its preimage. The preimage is the
-domain `zinder:wallet-projection:row:v2\0`, the accumulator version
-`WALLET_PROJECTION_ACCUMULATOR_VERSION` (2), the value encoding version, the
+domain `zinder:wallet-projection:row:v1\0`, the accumulator version
+`WALLET_PROJECTION_ACCUMULATOR_VERSION` (1), the value encoding version, the
 family tag, and the key and value, each prefixed with its 32-bit big-endian
 length. An unkeyed 44-byte BLAKE2b hash of the preimage with the
-personalization `ZinderWProjRoot2` supplies a ChaCha12 key (32 bytes) and
+personalization `ZinderWProjRoot1` supplies a ChaCha12 key (32 bytes) and
 nonce (12 bytes). The first 2,048 keystream bytes are the row's lanes, and
 removing a row subtracts the same lanes. The control record keeps the full
 accumulator. The UTXO set commitment uses the same expansion over its own
@@ -366,7 +366,7 @@ differ from what the process expects:
 - the reorg window;
 - for the wallet store, the canonical source it was built from.
 
-Schema v7 requires every family listed above plus the default control
+Schema v1 requires every family listed above plus the default control
 family, including physically present families with no rows under the
 admitted workload and blob policy. The construction manifest must bind the
 same workload, blob policy, and build plan as the control record and have
@@ -396,8 +396,10 @@ report an unavailable historical root on the affected request. Pool activation s
 governs final roots, and event retention still governs event streams. Serving capabilities also depend on
 the installed handlers and their admitted dependencies.
 
-Only the canonical writer records a new network-upgrade schedule, and readers
-adopt it; see [ADR-0008](../adrs/0008-consensus-parameters-from-the-node.md).
+The canonical writer publishes activation schedule revision 1 with the first
+READY control record. Readers validate the schedule digest and revision in
+control against the journal, then adopt the admitted schedule. Only the writer
+records future revisions. See [ADR-0008](../adrs/0008-consensus-parameters-from-the-node.md).
 
 The recorded reorg window can grow but never shrink; see
 [Chain ingestion](chain-ingestion.md#reorgs-and-the-reorg-window).

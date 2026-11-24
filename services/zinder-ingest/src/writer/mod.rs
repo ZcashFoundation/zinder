@@ -870,7 +870,7 @@ mod tests {
             store
                 .network_upgrade_schedule()
                 .map(zinder_store::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         assert_eq!(store.network_upgrade_activations(), Some(&extended));
         assert_eq!(
@@ -906,7 +906,7 @@ mod tests {
             store
                 .network_upgrade_schedule()
                 .map(zinder_store::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         assert_eq!(store.event_fence().visible_tip().height, next_height);
         assert_eq!(
@@ -935,7 +935,7 @@ mod tests {
             reopened
                 .network_upgrade_schedule()
                 .map(zinder_store::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         assert_eq!(reopened.network_upgrade_activations(), Some(&extended));
 
@@ -943,8 +943,9 @@ mod tests {
             &store_path,
             temporary.path().join("canonical-secondary"),
             &extended,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                RawBlobRetention::Transactions,
+            ),
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -953,7 +954,7 @@ mod tests {
             secondary
                 .network_upgrade_schedule()
                 .map(zinder_store::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         Ok(())
     }
@@ -983,19 +984,18 @@ mod tests {
             let manifest_before =
                 RocksDbCanonicalStore::read_construction_manifest_binding(&store_path)?;
 
-            let premature_reader = RocksDbCanonicalSecondary::open_ready(
+            let reader = RocksDbCanonicalSecondary::open_ready(
                 &store_path,
-                temporary.path().join("premature-secondary"),
+                temporary.path().join("initial-secondary"),
                 &zebra_seven,
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::Transactions,
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    RawBlobRetention::Transactions,
+                ),
                 CanonicalReorgPolicy::new(1)?,
                 RocksDbResourceBudget::for_local_tests(),
-            );
-            assert!(
-                premature_reader.is_err(),
-                "{network:?}: a reader must not admit the Zebra 7 table before the writer does"
-            );
+            )?;
+            assert_eq!(reader.network_upgrade_activations(), Some(&zebra_six));
+            drop(reader);
 
             for rejected in [
                 swap_historical_upgrades(&zebra_seven)?,
@@ -1006,9 +1006,9 @@ mod tests {
                     &checkpointed_writer_config(&store_path, &rejected, store_tip),
                 )
                 .err()
-                .ok_or("an unprovable legacy table must be refused")?;
+                .ok_or("a historical activation change must be refused")?;
                 assert!(
-                    error.to_string().contains("exact prefix"),
+                    error.to_string().contains("at or below canonical tip"),
                     "{network:?}: {error}"
                 );
             }
@@ -1025,7 +1025,7 @@ mod tests {
             let schedule = store
                 .network_upgrade_schedule()
                 .ok_or("writer must admit the Zebra 7 schedule")?;
-            assert_eq!(schedule.revision(), 1);
+            assert_eq!(schedule.revision(), 2);
             assert_eq!(schedule.activations(), &zebra_seven);
             let admitted = admitted_network_upgrade_activations(&store)?;
             let nu7_height = admitted
@@ -1052,7 +1052,7 @@ mod tests {
                 reopened
                     .network_upgrade_schedule()
                     .map(zinder_store::CanonicalActivationSchedule::revision),
-                Some(1),
+                Some(2),
                 "{network:?}: restarting with the same table must not add a revision"
             );
             drop(reopened);
@@ -1080,8 +1080,9 @@ mod tests {
                         .path()
                         .join(format!("secondary-{}", reader_table.activations().len())),
                     reader_table,
-                    CanonicalStoreWorkload::Wallet,
-                    RawBlobRetention::Transactions,
+                    zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                        RawBlobRetention::Transactions,
+                    ),
                     CanonicalReorgPolicy::new(1)?,
                     RocksDbResourceBudget::for_local_tests(),
                 )?;
@@ -1115,9 +1116,7 @@ mod tests {
         .err()
         .ok_or("NU7 at or below the stored tip must be refused")?;
         assert!(
-            error
-                .to_string()
-                .contains("adds an activation at or below canonical tip"),
+            error.to_string().contains("at or below canonical tip"),
             "{error}"
         );
         let unchanged = open_existing_store(

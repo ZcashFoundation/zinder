@@ -30,8 +30,8 @@ use crate::{BlockHeight, TransactionId, TransparentOutPoint};
 ///
 /// Exactly 16 bytes (the full `BLAKE2b` `personal` field). Domain-separates the
 /// commitment's element expansion from every other BLAKE2 use in the codebase.
-/// Its trailing `2` matches [`crate::UtxoSetCommitmentScheme::LtHash16ChaCha12`].
-pub const UTXO_SET_COMMITMENT_PERSONAL: [u8; 16] = *b"ZinderUtxoRoot_2";
+/// Its trailing `1` matches [`crate::UtxoSetCommitmentScheme::LtHash16ChaCha12`].
+pub const UTXO_SET_COMMITMENT_PERSONAL: [u8; 16] = *b"ZinderUtxoRoot_1";
 
 /// Encoding version embedded in every commitment element preimage.
 ///

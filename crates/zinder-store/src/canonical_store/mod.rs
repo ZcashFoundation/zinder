@@ -121,16 +121,9 @@ pub use tree_state_verification::{
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
 /// Exact physical schema accepted by this canonical store implementation.
 ///
-/// Schema 2 adds the immutable reorg policy and authenticated settled-sequence
-/// checkpoint to the control record. Schema 3 adds the retention-floor and
-/// generation-bearing projection-build lease control records. Schema 4 makes
-/// every retained event carry its exact authenticated resulting fence. Schema 5
-/// binds a complete construction manifest into every READY control record.
-/// Schema 7 makes raw-blob retention an immutable construction and admission
-/// contract independent of the canonical workload.
-/// Earlier stores are refused and rebuilt; there is no compatibility decoder
-/// or migration path.
-pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 7;
+/// Schema 1 binds the initial activation schedule and the effective reorg
+/// window in the control record. Store admission requires this exact layout.
+pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
 /// Durable artifact schema version written by this binary.
 ///
 /// The current artifact contract includes structured compact blocks and shared
@@ -138,7 +131,7 @@ pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 7;
 /// complete semantic replay envelopes and projection facts.
 /// Hash-shaped protobuf fields use RPC byte order as defined by
 /// [ADR-0002](../../../docs/adrs/0002-serialization-and-byte-order.md).
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(20);
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(1);
 /// Global block-height cadence for typed commitment-tree checkpoints.
 ///
 /// A checkpoint at least every 100 blocks keeps wallet rewind anchors within the
@@ -389,6 +382,9 @@ pub enum CanonicalStoreBuildPlanError {
     /// Canonical replacement must retain at least one displaced block.
     #[error("canonical build reorg window must be greater than zero")]
     ZeroReorgWindowBlocks,
+    /// READY control has no admitted schedule binding.
+    #[error("READY control requires an activation schedule binding")]
+    MissingActivationScheduleBinding,
     /// A persisted reorg-policy revision must raise the construction window.
     #[error(
         "reorg policy revision {revised_window_blocks} does not raise the construction window {construction_window_blocks}"
@@ -664,6 +660,8 @@ impl CanonicalSequenceCheckpoint {
 /// Validation evidence that makes a constructed canonical store visible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoreReadyEvidence {
+    /// Storage schema version admitted from canonical control.
+    pub schema_version: u16,
     /// First retained canonical block.
     pub first_retained_block: BlockId,
     /// Current visible canonical tip.
@@ -795,19 +793,6 @@ pub enum CanonicalStoreError {
     #[error("canonical store is not READY: {path:?}")]
     StoreNotReady {
         /// Exact store path that remains unpublished.
-        path: PathBuf,
-    },
-
-    /// A reader that adopts the writer-admitted network-upgrade schedule
-    /// opened a READY store whose writer has not admitted one yet.
-    ///
-    /// The canonical writer admits its first schedule revision when it opens
-    /// the store, so a reader retries until that admission is visible.
-    #[error(
-        "canonical store {path:?} has no writer-admitted network-upgrade schedule yet; the canonical writer admits one when it opens the store"
-    )]
-    NetworkUpgradeScheduleNotAdmitted {
-        /// Exact READY store path without an admitted schedule.
         path: PathBuf,
     },
 
@@ -1287,7 +1272,7 @@ mod tests {
 
     #[test]
     fn reported_artifact_schema_version_is_stable() {
-        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 20);
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 1);
     }
 
     #[test]

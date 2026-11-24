@@ -29,7 +29,7 @@ pub(super) const RETENTION_FLOOR_KEY: &[u8] = b"canonical_event_retention_floor_
 pub(super) const PROJECTION_BUILD_LEASE_PREFIX: &[u8] = b"projection_build_lease_v1/";
 pub(super) const PROJECTION_BUILD_LEASE_GENERATION_KEY: &[u8] =
     b"projection_build_lease_generation_v1";
-const LEASE_VALUE_VERSION: u8 = 2;
+const LEASE_VALUE_VERSION: u8 = 1;
 const LEASE_VALUE_BYTES: usize = 1 + 8 + 8 + 8 + 8;
 /// A projector's four-hour lease fits comfortably below this hard bound.
 pub(super) const MAX_PROJECTION_BUILD_LEASE_DURATION_MILLIS: u64 = 24 * 60 * 60 * 1_000;

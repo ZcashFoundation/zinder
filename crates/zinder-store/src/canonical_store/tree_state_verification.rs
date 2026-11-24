@@ -27,7 +27,7 @@ use zinder_core::{
 
 use super::{
     CanonicalReorgPolicy, CanonicalSecondaryCatchupOutcome, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
+    CanonicalStoreReadyEvidence, RocksDbCanonicalSecondary,
     block_load::{decode_tree_state_checkpoint, encode_block_position},
     frontier_presence_mismatch,
     publication::column_family,
@@ -139,7 +139,6 @@ impl RocksDbTreeStateVerifier {
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
         expected_network_upgrade_activations: &NetworkUpgradeActivations,
-        expected_workload: CanonicalStoreWorkload,
         expected_raw_blob_retention: RawBlobRetention,
         expected_reorg_policy: CanonicalReorgPolicy,
         resource_budget: RocksDbResourceBudget,
@@ -149,10 +148,11 @@ impl RocksDbTreeStateVerifier {
             secondary_path.as_ref(),
             &CanonicalStoreAdmissionExpectation::from_activations(
                 expected_network_upgrade_activations,
-                StoredDataAdmission::Minimum(super::CanonicalStoreRequirements::from_legacy(
-                    expected_workload,
-                    expected_raw_blob_retention,
-                )),
+                StoredDataAdmission::Minimum(
+                    super::CanonicalStoreRequirements::for_blob_retention(
+                        expected_raw_blob_retention,
+                    ),
+                ),
                 expected_reorg_policy,
             ),
             resource_budget.into(),

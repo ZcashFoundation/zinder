@@ -360,8 +360,7 @@ fn read_store(
         &path,
         fixture.join("secondary"),
         Network::ZcashTestnet,
-        CanonicalStoreWorkload::Wallet,
-        retention,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(retention),
         reorg,
         budget,
     )?;

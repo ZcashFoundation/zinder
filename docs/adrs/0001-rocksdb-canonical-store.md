@@ -19,7 +19,7 @@ The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB th
 ## Decision
 
 1. Zinder stores its canonical chain data in RocksDB through `rust-rocksdb`. The wallet store and the materialized-view stores use the same engine.
-2. Column families separate artifact families. One write batch commits everything a new chain epoch changes, so a crash leaves either the previous epoch or the new one.
+2. Column families separate artifact families. One write batch commits everything a new chain epoch changes, so a crash leaves either the previous epoch or the new one. Canonical schema v1 binds the initial activation schedule in the same batch as READY. Fixed control fields carry the admitted schedule revision and digest and the effective reorg window, so admission can validate all three together.
 3. RocksDB stays inside the storage crates. Runtimes and public APIs see chain epochs, typed artifacts, and typed errors, never RocksDB handles, options, or errors.
 4. Store checkpoints use RocksDB's own checkpoint primitive. A wallet-serving backup binds a canonical and a wallet checkpoint together ([ADR-0004](0004-storage-and-deployment-topologies.md)). [Private backups](../runbooks/private-backups.md) describes capture and restore of the pair.
 
@@ -39,5 +39,7 @@ The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB th
 - **LMDB through `heed`.** It excels at memory-mapped, read-heavy access from several processes. Zinder does not need several processes to open one database as primary, and LMDB fits append-heavy, frequently replaced data less well.
 
 ## Revision history
+
+- 2026-11-24. Decision 2 binds the initial activation schedule to READY in canonical schema v1.
 
 - 2026-11-20. Updated the checkpoint decision to reference private recovery of the canonical and wallet pair.

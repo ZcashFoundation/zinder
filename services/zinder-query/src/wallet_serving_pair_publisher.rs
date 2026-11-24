@@ -147,11 +147,9 @@ pub struct WalletServingPairConfig {
     pub wallet_resource_budget: RocksDbResourceBudget,
     /// Delay between refresh attempts after initial publication.
     pub catchup_interval: Duration,
-    /// Maximum wall time allowed for pair convergence. Bootstrap also waits up
-    /// to this long for the canonical writer's first schedule admission.
+    /// Maximum wall time allowed for pair convergence.
     pub convergence_timeout: Duration,
-    /// Maximum catch-up attempts allowed for pair convergence. Rounds that
-    /// wait for the writer's first schedule admission do not count.
+    /// Maximum catch-up attempts allowed for pair convergence.
     pub convergence_attempts: NonZeroU8,
     /// Writer lag tolerated before readiness fails.
     pub replica_lag_threshold_chain_epochs: u64,
@@ -1099,9 +1097,6 @@ pub enum WalletServingConvergence {
     ProjectionBehind,
     /// The admitted networks, canonical fence, or local schema evidence is invalid.
     SchemaOrFenceMismatch,
-    /// The canonical store is READY, but its writer has not admitted a
-    /// network-upgrade schedule for the reader to adopt yet.
-    WriterScheduleNotAdmitted,
 }
 
 impl WalletServingConvergence {
@@ -1110,7 +1105,6 @@ impl WalletServingConvergence {
             Self::ReplicaBehind => "replica_behind",
             Self::ProjectionBehind => "projection_behind",
             Self::SchemaOrFenceMismatch => "schema_or_fence_mismatch",
-            Self::WriterScheduleNotAdmitted => "writer_schedule_not_admitted",
         }
     }
 }
@@ -1219,7 +1213,7 @@ impl WalletServingPairPublisher {
             #[cfg(test)]
             candidate_preparations: CandidatePreparationCounts::default(),
         };
-        publisher.prepare_candidate_awaiting_schedule(0).await?;
+        publisher.prepare_candidate(0).await?;
         publisher.converge_and_publish(0).await?;
         publisher.record_resource_gauges().await;
         let Some(serving_pair_slot) = publisher.serving_pair_slot.clone() else {
@@ -1704,49 +1698,6 @@ impl WalletServingPairPublisher {
         Ok(())
     }
 
-    /// Prepares `generation` as [`Self::prepare_candidate`] does, retrying
-    /// until `convergence_timeout` passes while the canonical writer has not
-    /// admitted its first network-upgrade schedule.
-    ///
-    /// The writer admits that schedule when it first opens the store, which
-    /// can take longer than the convergence attempts allow, so this wait is
-    /// bounded by time alone.
-    async fn prepare_candidate_awaiting_schedule(
-        &mut self,
-        generation: usize,
-    ) -> Result<(), WalletServingPairError> {
-        let deadline = Instant::now() + self.config.convergence_timeout;
-        let retry_delay = self
-            .config
-            .catchup_interval
-            .min(CONVERGENCE_RETRY_DELAY_CAP);
-        let mut waiting_logged = false;
-        loop {
-            match self.prepare_candidate(generation).await {
-                Err(WalletServingPairError::Canonical(
-                    CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
-                )) => {
-                    record_pair_convergence(WalletServingConvergence::WriterScheduleNotAdmitted);
-                    if Instant::now() >= deadline {
-                        return Err(WalletServingPairError::ConvergenceTimedOut {
-                            last_outcome: WalletServingConvergence::WriterScheduleNotAdmitted,
-                        });
-                    }
-                    if !waiting_logged {
-                        tracing::info!(
-                            target: "zinder::wallet_serving",
-                            event = "canonical_schedule_admission_pending",
-                            "waiting for the canonical writer to admit a network-upgrade schedule"
-                        );
-                        waiting_logged = true;
-                    }
-                    tokio::time::sleep(retry_delay).await;
-                }
-                outcome => return outcome,
-            }
-        }
-    }
-
     /// Opens both secondaries of `generation` and runs their full cold
     /// admission against the primaries.
     ///
@@ -1784,15 +1735,14 @@ impl WalletServingPairPublisher {
                     source,
                 }
             })?;
-            let canonical =
-                RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
-                    canonical_primary_path,
-                    canonical_secondary_path,
-                    network,
-                    requirements,
-                    canonical_reorg_policy,
-                    canonical_resources,
-                )?;
+            let canonical = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+                canonical_primary_path,
+                canonical_secondary_path,
+                network,
+                requirements,
+                canonical_reorg_policy,
+                canonical_resources,
+            )?;
             let wallet = RocksDbWalletSecondary::open_ready(
                 wallet_primary_path,
                 wallet_secondary_path,
@@ -2502,19 +2452,7 @@ impl CanonicalFenceProbe for CandidatePairFenceProbe<'_> {
     type Error = WalletServingPairError;
 
     async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, WalletServingPairError> {
-        // Bootstrap waits for the first schedule before it converges, so a
-        // generation reopened here finds the store's admitted schedule.
-        match self.publisher.prepare_candidate(self.generation).await {
-            Ok(()) => {}
-            Err(WalletServingPairError::Canonical(
-                CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
-            )) => {
-                self.last_outcome = WalletServingConvergence::WriterScheduleNotAdmitted;
-                record_pair_convergence(self.last_outcome);
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        }
+        self.publisher.prepare_candidate(self.generation).await?;
         match self.publisher.catch_up_candidate(self.generation).await? {
             Ok(()) => {
                 self.last_outcome = WalletServingConvergence::ReplicaBehind;
@@ -2663,9 +2601,6 @@ fn refresh_failure_not_ready_cause(error: &WalletServingPairError) -> Option<Rea
             last_outcome: WalletServingConvergence::SchemaOrFenceMismatch,
         } => Some(ReadinessCause::SchemaMismatch),
         WalletServingPairError::ConvergenceTimedOut {
-            last_outcome: WalletServingConvergence::WriterScheduleNotAdmitted,
-        } => Some(ReadinessCause::StorageUnavailable),
-        WalletServingPairError::ConvergenceTimedOut {
             last_outcome:
                 WalletServingConvergence::ReplicaBehind | WalletServingConvergence::ProjectionBehind,
         } => None,
@@ -2704,9 +2639,6 @@ fn wallet_serving_pair_error_class(error: &WalletServingPairError) -> &'static s
         WalletServingPairError::ConvergenceTimedOut {
             last_outcome: WalletServingConvergence::SchemaOrFenceMismatch,
         } => "schema_or_fence_mismatch",
-        WalletServingPairError::ConvergenceTimedOut {
-            last_outcome: WalletServingConvergence::WriterScheduleNotAdmitted,
-        } => "writer_schedule_not_admitted",
         WalletServingPairError::PairPublication(_) => "pair_publication",
     }
 }
@@ -4457,20 +4389,14 @@ mod tests {
         }
     }
 
-    /// A reader brings no activation table of its own: bootstrap waits for
-    /// the writer to admit the store's first schedule and then serves exactly
-    /// that schedule.
-    ///
-    /// The wait is bounded by the convergence timeout, however many attempts
-    /// it takes.
     #[tokio::test(flavor = "multi_thread")]
-    async fn bootstrap_waits_for_the_writers_first_schedule_admission()
+    async fn bootstrap_adopts_the_schedule_from_ready_publication()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let activations = lifecycle_upgrade_activations()?;
         let canonical_primary_path = temporary.path().join("canonical-primary");
         let wallet_primary_path = temporary.path().join("wallet-primary");
-        let mut canonical_primary = build_unadmitted_lifecycle_canonical_primary(
+        let canonical_primary = build_lifecycle_canonical_primary_through(
             &canonical_primary_path,
             &activations,
             BlockHeight::new(1),
@@ -4506,13 +4432,6 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !bootstrap.is_finished(),
-            "bootstrap must wait for the schedule"
-        );
-        canonical_primary.admit_network_upgrade_schedule(&activations)?;
-        control.set_writer_status(writer_status_for_store(&canonical_primary));
         let (_publisher, slot) = bootstrap.await??;
 
         let pair = slot.capture();
@@ -4524,62 +4443,6 @@ mod tests {
         );
         assert_eq!(pair.network_upgrade_activations(), &activations);
         drop(pair);
-        cancel.cancel();
-        server_task.await??;
-        Ok(())
-    }
-
-    /// A writer that never admits a schedule leaves bootstrap with a typed,
-    /// retryable outcome instead of a reader-supplied table.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn bootstrap_reports_a_store_whose_writer_admitted_no_schedule()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
-        let activations = lifecycle_upgrade_activations()?;
-        let canonical_primary_path = temporary.path().join("canonical-primary");
-        let wallet_primary_path = temporary.path().join("wallet-primary");
-        let canonical_primary = build_unadmitted_lifecycle_canonical_primary(
-            &canonical_primary_path,
-            &activations,
-            BlockHeight::new(1),
-        )?;
-        build_wallet_from_canonical(
-            &canonical_primary,
-            &wallet_primary_path,
-            RocksDbWalletBuildOptions {
-                supported_reorg_depth: 100,
-                ..RocksDbWalletBuildOptions::for_local_tests()
-            },
-        )?;
-        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
-        let (endpoint, cancel, server_task) = serve_canonical_control(control).await?;
-
-        let outcome = WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
-            WalletServingPairConfig {
-                convergence_timeout: Duration::from_millis(300),
-                ..wallet_serving_pair_config(
-                    canonical_primary_path.clone(),
-                    temporary.path().join("canonical-secondaries"),
-                    wallet_primary_path.clone(),
-                    temporary.path().join("wallet-secondaries"),
-                )?
-            },
-            WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
-            &endpoint,
-            None,
-        )
-        .await;
-
-        assert!(
-            matches!(
-                outcome,
-                Err(WalletServingPairError::ConvergenceTimedOut {
-                    last_outcome: WalletServingConvergence::WriterScheduleNotAdmitted,
-                })
-            ),
-            "unexpected bootstrap outcome: {:?}",
-            outcome.err()
-        );
         cancel.cancel();
         server_task.await??;
         Ok(())
@@ -5190,8 +5053,9 @@ mod tests {
                 .path()
                 .join("wallet-reconcile-canonical-secondary"),
             &upgraded,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                RawBlobRetention::Transactions,
+            ),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -6732,8 +6596,9 @@ mod tests {
                 .path()
                 .join("wallet-reconcile-canonical-secondary"),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                RawBlobRetention::Transactions,
+            ),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -8030,8 +7895,9 @@ mod tests {
             &canonical_primary_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                RawBlobRetention::Transactions,
+            ),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -8517,23 +8383,6 @@ mod tests {
         activations: &NetworkUpgradeActivations,
         tip_height: BlockHeight,
     ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
-        let mut store = build_unadmitted_lifecycle_canonical_primary(
-            canonical_primary_path,
-            activations,
-            tip_height,
-        )?;
-        store.admit_network_upgrade_schedule(activations)?;
-        Ok(store)
-    }
-
-    /// Builds the READY primary of
-    /// [`build_lifecycle_canonical_primary_through`] before its writer's
-    /// first schedule admission.
-    fn build_unadmitted_lifecycle_canonical_primary(
-        canonical_primary_path: &Path,
-        activations: &NetworkUpgradeActivations,
-        tip_height: BlockHeight,
-    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
         let mut blocks = Vec::new();
         let mut parent_hash = Network::ZcashRegtest.genesis_hash();
         for height in (1..=tip_height.value()).map(BlockHeight::new) {
@@ -8804,8 +8653,9 @@ mod tests {
                 &canonical_primary_path,
                 temporary.path().join("projector-canonical-secondary"),
                 &activations,
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::Transactions,
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    RawBlobRetention::Transactions,
+                ),
                 CanonicalReorgPolicy::new(100)?,
                 RocksDbResourceBudget::for_local_tests(),
             )?;
@@ -9112,8 +8962,9 @@ mod tests {
                 self.writer.canonical_primary_path(),
                 self.temporary.path().join("projector-canonical-secondary"),
                 &self.activations,
-                CanonicalStoreWorkload::Wallet,
-                self.writer.canonical_primary()?.raw_blob_retention(),
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    self.writer.canonical_primary()?.raw_blob_retention(),
+                ),
                 CanonicalReorgPolicy::new(100)?,
                 RocksDbResourceBudget::for_local_tests(),
             )?;

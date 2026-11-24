@@ -65,8 +65,8 @@ different sets can share both.
    output, including unspendable scripts. It is admission evidence and is not
    served on the wire.
 
-   The expansion is scheme 2. The root is an unkeyed 44-byte BLAKE2b hash of
-   the element with the personalization `ZinderUtxoRoot_2`. Its first 32
+   Schema v1 uses `LtHash16ChaCha12` as commitment scheme 1. The root is an unkeyed 44-byte BLAKE2b hash of
+   the element with the personalization `ZinderUtxoRoot_1`. Its first 32
    bytes are the key and its last 12 bytes the nonce of ChaCha12 in the
    RFC 8439 state layout. The 32 keystream blocks at counters 0 through 31
    are the lanes. The wallet row digest uses the same expansion with its own
@@ -166,6 +166,8 @@ Method responses and pinning rules are in
   layout, and a bad shared contribution would pass both checks.
 
 ## Revision history
+
+- 2026-11-24. Decision 6 assigns scheme 1 to BLAKE2b and ChaCha12 for the schema v1 cutover.
 
 - 2026-11-23. Decision 2 names the source of `GetTaddressBalance` in
   light-wallet serving.

@@ -1199,8 +1199,7 @@ async fn open_canonical_secondary_when_published(
             &spec.storage_path,
             &spec.secondary_path,
             &spec.activations,
-            CanonicalStoreWorkload::Wallet,
-            spec.raw_blob_retention,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(spec.raw_blob_retention),
             spec.reorg_policy,
             spec.canonical_rocksdb_budget,
         ) {

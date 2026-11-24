@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
@@ -17,10 +19,6 @@ use crate::RawBlobRetention;
 
 const BUILDING_STATE: u8 = 1;
 const READY_STATE: u8 = 2;
-const ACTIVATION_SCHEDULE_TRAILER_MAGIC: &[u8] = b"ASCH";
-const ACTIVATION_SCHEDULE_TRAILER_VERSION: u16 = 1;
-const REORG_POLICY_TRAILER_MAGIC: &[u8] = b"RPOL";
-const REORG_POLICY_TRAILER_VERSION: u16 = 1;
 const COMPLETE_HISTORY: u8 = 0;
 const CHECKPOINTED_HISTORY: u8 = 1;
 const WALLET_WORKLOAD: u8 = 1;
@@ -35,6 +33,7 @@ const HISTORY_FIXED_FIELDS_LENGTH: usize = 1 + 4 + 32 + 4 + 3;
 const BUILD_TIP_FIELDS_LENGTH: usize = 4 + 32;
 const READY_FIELDS_LENGTH: usize =
     4 + 32 + 4 + 32 + 8 + 8 + 8 + 2 + 4 + 2 + 32 + 8 + 4 + 32 + 8 + 2 + 32 + 8 + 2 + 32;
+const REVISION_FIELDS_LENGTH: usize = 8 + 32 + 4;
 const STORE_CONTROL_MINIMUM_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
     + 2
     + 4
@@ -46,7 +45,8 @@ const STORE_CONTROL_MINIMUM_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
     + BUILD_TIP_FIELDS_LENGTH
     + 32
     + 1
-    + READY_FIELDS_LENGTH;
+    + READY_FIELDS_LENGTH
+    + REVISION_FIELDS_LENGTH;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DecodedStoreControl {
@@ -75,10 +75,7 @@ impl DecodedStoreControl {
     }
 }
 
-/// Writer-admitted revisions appended to READY control after construction.
-///
-/// Construction identity stays immutable. Each revision is an optional,
-/// versioned trailer, so releases that predate it reject the control record.
+/// Writer-admitted schedule binding and reorg policy encoded in READY control.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct ControlRevisions {
     pub(super) activation_schedule_binding: Option<ActivationScheduleBinding>,
@@ -100,23 +97,14 @@ pub(super) fn encode_building_store_control(
 ) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
     let mut encoded = encode_store_control_prefix(workload, build_plan, cursor_auth_key)?;
     encoded.push(BUILDING_STATE);
-    encoded.resize(encoded.len() + READY_FIELDS_LENGTH, 0);
+    encoded.resize(encoded.len() + READY_FIELDS_LENGTH + 8 + 32, 0);
+    encoded.extend_from_slice(
+        &build_plan
+            .reorg_policy()
+            .reorg_window_blocks()
+            .to_le_bytes(),
+    );
     Ok(encoded)
-}
-
-pub(super) fn encode_ready_store_control(
-    workload: CanonicalStoreWorkload,
-    build_plan: &CanonicalStoreBuildPlan,
-    cursor_auth_key: [u8; 32],
-    ready_evidence: &CanonicalStoreReadyEvidence,
-) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
-    encode_ready_store_control_with_revisions(
-        workload,
-        build_plan,
-        cursor_auth_key,
-        ready_evidence,
-        ControlRevisions::default(),
-    )
 }
 
 pub(super) fn encode_ready_store_control_with_revisions(
@@ -155,23 +143,23 @@ pub(super) fn encode_ready_store_control_with_revisions(
     encoded.extend_from_slice(&checkpoint.logical_replay_bytes().to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.construction_manifest_version.to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.construction_manifest_sha256);
-    if let Some(binding) = revisions.activation_schedule_binding {
-        encoded.extend_from_slice(ACTIVATION_SCHEDULE_TRAILER_MAGIC);
-        encoded.extend_from_slice(&ACTIVATION_SCHEDULE_TRAILER_VERSION.to_le_bytes());
-        encoded.extend_from_slice(&binding.revision.to_le_bytes());
-        encoded.extend_from_slice(&binding.digest);
-    }
-    if let Some(reorg_policy) = revisions.revised_reorg_policy {
+    let binding = revisions
+        .activation_schedule_binding
+        .ok_or(CanonicalStoreBuildPlanError::MissingActivationScheduleBinding)?;
+    encoded.extend_from_slice(&binding.revision.to_le_bytes());
+    encoded.extend_from_slice(&binding.digest);
+    let effective = if let Some(reorg_policy) = revisions.revised_reorg_policy {
         if reorg_policy <= build_plan.reorg_policy() {
             return Err(CanonicalStoreBuildPlanError::ReorgPolicyRevisionNotRaised {
                 construction_window_blocks: build_plan.reorg_policy().reorg_window_blocks(),
                 revised_window_blocks: reorg_policy.reorg_window_blocks(),
             });
         }
-        encoded.extend_from_slice(REORG_POLICY_TRAILER_MAGIC);
-        encoded.extend_from_slice(&REORG_POLICY_TRAILER_VERSION.to_le_bytes());
-        encoded.extend_from_slice(&reorg_policy.reorg_window_blocks().to_le_bytes());
-    }
+        reorg_policy
+    } else {
+        build_plan.reorg_policy()
+    };
+    encoded.extend_from_slice(&effective.reorg_window_blocks().to_le_bytes());
     Ok(encoded)
 }
 
@@ -332,9 +320,11 @@ pub(super) fn decode_store_control(
             decoder.reject_nonzero_building_fields()?;
             CanonicalStoreBuildState::Building
         }
-        READY_STATE => CanonicalStoreBuildState::Ready(
-            decoder.decode_ready_evidence(history_bounds, build_tip)?,
-        ),
+        READY_STATE => CanonicalStoreBuildState::Ready(decoder.decode_ready_evidence(
+            schema_version,
+            history_bounds,
+            build_tip,
+        )?),
         state => {
             return Err(CanonicalStoreError::admission(
                 path,
@@ -342,29 +332,21 @@ pub(super) fn decode_store_control(
             ));
         }
     };
-    if decoder.remaining() != 0 && build_state == CanonicalStoreBuildState::Building {
-        return Err(CanonicalStoreError::admission(
-            path,
-            "BUILDING store control must not contain a revision trailer",
-        ));
-    }
-    let activation_schedule_binding = if decoder.next_is(ACTIVATION_SCHEDULE_TRAILER_MAGIC) {
-        Some(decode_activation_schedule_trailer(&mut decoder)?)
-    } else {
-        None
-    };
-    let revised_reorg_policy = if decoder.next_is(REORG_POLICY_TRAILER_MAGIC) {
-        Some(decode_reorg_policy_trailer(
-            &mut decoder,
-            build_plan.reorg_policy(),
-        )?)
-    } else {
-        None
-    };
+    let revision = decoder.read_u64("activation schedule revision")?;
+    let digest = decoder.read_array("activation schedule digest")?;
+    let effective_window = decoder.read_u32("effective reorg window blocks")?;
+    let (activation_schedule_binding, revised_reorg_policy) = decode_control_revisions(
+        path,
+        &build_state,
+        reorg_policy,
+        revision,
+        digest,
+        effective_window,
+    )?;
     if decoder.remaining() != 0 {
         return Err(CanonicalStoreError::admission(
             path,
-            "store control contains an unknown trailing extension",
+            "store control contains trailing bytes",
         ));
     }
     Ok(DecodedStoreControl {
@@ -378,63 +360,51 @@ pub(super) fn decode_store_control(
     })
 }
 
-fn decode_activation_schedule_trailer(
-    decoder: &mut Decoder<'_>,
-) -> Result<ActivationScheduleBinding, CanonicalStoreError> {
-    decoder.read_bytes(
-        ACTIVATION_SCHEDULE_TRAILER_MAGIC.len(),
-        "schedule trailer identity",
-    )?;
-    let version = decoder.read_u16("activation schedule trailer version")?;
-    if version != ACTIVATION_SCHEDULE_TRAILER_VERSION {
+#[allow(
+    clippy::too_many_arguments,
+    reason = "validates the fixed control fields against the construction policy and state"
+)]
+fn decode_control_revisions(
+    path: &Path,
+    state: &CanonicalStoreBuildState,
+    construction: super::CanonicalReorgPolicy,
+    revision: u64,
+    digest: [u8; 32],
+    effective_window: u32,
+) -> Result<
+    (
+        Option<ActivationScheduleBinding>,
+        Option<super::CanonicalReorgPolicy>,
+    ),
+    CanonicalStoreError,
+> {
+    let effective = super::CanonicalReorgPolicy::new(effective_window)
+        .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
+    if *state == CanonicalStoreBuildState::Building {
+        if revision == 0 && digest == [0; 32] && effective == construction {
+            return Ok((None, None));
+        }
         return Err(CanonicalStoreError::admission(
-            decoder.path,
-            format!("unsupported activation schedule trailer version {version}"),
+            path,
+            "BUILDING store control must use the construction policy and empty schedule binding",
         ));
     }
-    let revision = decoder.read_u64("activation schedule revision")?;
     if revision == 0 {
         return Err(CanonicalStoreError::admission(
-            decoder.path,
-            "activation schedule revision must be nonzero",
+            path,
+            "READY activation schedule revision must be nonzero",
         ));
     }
-    Ok(ActivationScheduleBinding {
-        revision,
-        digest: decoder.read_array("activation schedule digest")?,
-    })
-}
-
-fn decode_reorg_policy_trailer(
-    decoder: &mut Decoder<'_>,
-    construction_policy: super::CanonicalReorgPolicy,
-) -> Result<super::CanonicalReorgPolicy, CanonicalStoreError> {
-    decoder.read_bytes(
-        REORG_POLICY_TRAILER_MAGIC.len(),
-        "reorg policy trailer identity",
-    )?;
-    let version = decoder.read_u16("reorg policy trailer version")?;
-    if version != REORG_POLICY_TRAILER_VERSION {
+    if effective < construction {
         return Err(CanonicalStoreError::admission(
-            decoder.path,
-            format!("unsupported reorg policy trailer version {version}"),
+            path,
+            "effective reorg window is below the construction window",
         ));
     }
-    let revised_window_blocks = decoder.read_u32("revised reorg window blocks")?;
-    let revised = super::CanonicalReorgPolicy::new(revised_window_blocks)
-        .map_err(|source| CanonicalStoreError::admission(decoder.path, source.to_string()))?;
-    // A revision only ever raises the window, and an unraised policy has no
-    // trailer, so every effective window has exactly one encoding.
-    if revised <= construction_policy {
-        return Err(CanonicalStoreError::admission(
-            decoder.path,
-            format!(
-                "reorg policy revision {revised_window_blocks} does not raise the construction window {}",
-                construction_policy.reorg_window_blocks()
-            ),
-        ));
-    }
-    Ok(revised)
+    Ok((
+        Some(ActivationScheduleBinding { revision, digest }),
+        (effective > construction).then_some(effective),
+    ))
 }
 
 fn decode_raw_blob_retention(
@@ -572,12 +542,6 @@ impl<'encoded> Decoder<'encoded> {
         self.encoded.len().saturating_sub(self.position)
     }
 
-    fn next_is(&self, magic: &[u8]) -> bool {
-        self.encoded
-            .get(self.position..)
-            .is_some_and(|rest| rest.starts_with(magic))
-    }
-
     const fn new(path: &'encoded std::path::Path, encoded: &'encoded [u8]) -> Self {
         Self {
             path,
@@ -588,6 +552,7 @@ impl<'encoded> Decoder<'encoded> {
 
     fn decode_ready_evidence(
         &mut self,
+        schema_version: u16,
         history_bounds: CanonicalHistoryBounds,
         build_tip: BlockId,
     ) -> Result<CanonicalStoreReadyEvidence, CanonicalStoreError> {
@@ -643,6 +608,7 @@ impl<'encoded> Decoder<'encoded> {
             ));
         }
         let ready_evidence = CanonicalStoreReadyEvidence {
+            schema_version,
             first_retained_block: BlockId::new(
                 BlockHeight::new(first_height),
                 BlockHash::from_bytes(first_hash),
@@ -891,11 +857,12 @@ mod tests {
             return Err("ready fixture decoded as BUILDING".into());
         };
         assert_eq!(
-            encode_ready_store_control(
+            encode_ready_store_control_with_revisions(
                 decoded_ready.workload,
                 &decoded_ready.build_plan,
                 decoded_ready.cursor_auth_key,
                 &ready_evidence,
+                decoded_ready.revisions(),
             )?,
             encoded
         );
@@ -958,149 +925,43 @@ mod tests {
     }
 
     #[test]
-    fn ready_control_binds_an_additive_versioned_activation_schedule_trailer()
+    fn ready_control_rejects_missing_schedule_and_lowered_reorg_policy()
     -> Result<(), Box<dyn std::error::Error>> {
         let expected = expected_ready_control();
         let CanonicalStoreBuildState::Ready(ready) = expected.build_state else {
             return Err("expected READY test control".into());
         };
-        let binding = ActivationScheduleBinding {
-            revision: 3,
-            digest: [0x7a; 32],
+        let raised = CanonicalReorgPolicy::new(1_000)?;
+        let revisions = ControlRevisions {
+            revised_reorg_policy: Some(raised),
+            ..expected.revisions()
         };
         let encoded = encode_ready_store_control_with_revisions(
             expected.workload,
             &expected.build_plan,
             expected.cursor_auth_key,
             &ready,
-            ControlRevisions {
-                activation_schedule_binding: Some(binding),
-                revised_reorg_policy: None,
-            },
+            revisions,
         )?;
+        let path = Path::new("canonical");
+        assert_eq!(decode_store_control(path, &encoded)?.revisions(), revisions);
         assert_eq!(
-            decode_store_control(Path::new("canonical"), &encoded)?.activation_schedule_binding,
-            Some(binding)
-        );
-        // Releases before schedule admission decode exactly the legacy READY
-        // encoding and reject any trailing byte, so they also refuse this
-        // control.
-        let legacy = encode_ready_store_control(
-            expected.workload,
-            &expected.build_plan,
-            expected.cursor_auth_key,
-            &ready,
-        )?;
-        assert!(encoded.len() > legacy.len() && encoded.starts_with(&legacy));
-        let mut unknown_extension = legacy;
-        unknown_extension.extend_from_slice(b"NEXT");
-        assert!(
-            decode_store_control(Path::new("canonical"), &unknown_extension)
-                .err()
-                .ok_or("an unknown READY extension must be rejected")?
-                .to_string()
-                .contains("unknown trailing extension")
-        );
-        let mut unsupported_version = encoded;
-        let version_offset = unsupported_version.len() - 42;
-        unsupported_version[version_offset] = b'X';
-        let error = decode_store_control(Path::new("canonical"), &unsupported_version)
-            .err()
-            .ok_or("unknown trailer should be rejected")?;
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported activation schedule trailer version")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ready_control_binds_a_monotonic_reorg_policy_revision_trailer()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let expected = expected_ready_control();
-        let CanonicalStoreBuildState::Ready(ready) = expected.build_state else {
-            return Err("expected READY test control".into());
-        };
-        let construction = expected.build_plan.reorg_policy();
-        let raised = CanonicalReorgPolicy::new(1_000)?;
-        let schedule = ActivationScheduleBinding {
-            revision: 2,
-            digest: [0x5c; 32],
-        };
-        let encode = |revisions| {
-            encode_ready_store_control_with_revisions(
-                expected.workload,
-                &expected.build_plan,
-                expected.cursor_auth_key,
-                &ready,
-                revisions,
-            )
-        };
-        let scheduled = encode(ControlRevisions {
-            activation_schedule_binding: Some(schedule),
-            revised_reorg_policy: None,
-        })?;
-        let revised = ControlRevisions {
-            activation_schedule_binding: Some(schedule),
-            revised_reorg_policy: Some(raised),
-        };
-        let encoded = encode(revised)?;
-        let decoded = decode_store_control(Path::new("canonical"), &encoded)?;
-        assert_eq!(decoded.revisions(), revised);
-        assert_eq!(decoded.build_plan.reorg_policy(), construction);
-        assert_eq!(decoded.effective_reorg_policy(), raised);
-
-        // Schedule-admission releases read exactly one schedule trailer and
-        // then reject trailing bytes; earlier releases reject any trailer.
-        // Both therefore refuse a store whose window was raised.
-        let mut expected_tail = REORG_POLICY_TRAILER_MAGIC.to_vec();
-        expected_tail.extend_from_slice(&REORG_POLICY_TRAILER_VERSION.to_le_bytes());
-        expected_tail.extend_from_slice(&1_000_u32.to_le_bytes());
-        assert_eq!(
-            encoded.strip_prefix(scheduled.as_slice()),
-            Some(expected_tail.as_slice())
-        );
-
-        let without_schedule = encode(ControlRevisions {
-            activation_schedule_binding: None,
-            revised_reorg_policy: Some(raised),
-        })?;
-        assert_eq!(
-            decode_store_control(Path::new("canonical"), &without_schedule)?
-                .effective_reorg_policy(),
+            decode_store_control(path, &encoded)?.effective_reorg_policy(),
             raised
         );
 
-        assert!(matches!(
-            encode(ControlRevisions {
-                activation_schedule_binding: None,
-                revised_reorg_policy: Some(construction),
-            }),
-            Err(CanonicalStoreBuildPlanError::ReorgPolicyRevisionNotRaised { .. })
-        ));
-        let mut not_raised = scheduled.clone();
-        not_raised.extend_from_slice(REORG_POLICY_TRAILER_MAGIC);
-        not_raised.extend_from_slice(&REORG_POLICY_TRAILER_VERSION.to_le_bytes());
-        not_raised.extend_from_slice(&construction.reorg_window_blocks().to_le_bytes());
-        let mut schedule_after_policy = without_schedule;
-        schedule_after_policy.extend_from_slice(&scheduled[scheduled.len() - 42..]);
-        let mut unsupported_version = encoded;
-        let version_offset = unsupported_version.len() - 6;
-        unsupported_version[version_offset] = 2;
-        for (malformed, reason) in [
-            (not_raised, "does not raise the construction window"),
-            (schedule_after_policy, "unknown trailing extension"),
-            (
-                unsupported_version,
-                "unsupported reorg policy trailer version 2",
-            ),
-        ] {
-            let error = decode_store_control(Path::new("canonical"), &malformed)
-                .err()
-                .ok_or("malformed reorg policy trailer must be rejected")?;
-            assert!(error.to_string().contains(reason), "{error}");
-        }
+        let revision_offset = encoded.len() - REVISION_FIELDS_LENGTH;
+        let mut missing_schedule = encoded.clone();
+        missing_schedule[revision_offset..revision_offset + 8].fill(0);
+        assert!(decode_store_control(path, &missing_schedule).is_err());
+
+        let mut lowered_window = encoded.clone();
+        lowered_window[revision_offset + 40..].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(decode_store_control(path, &lowered_window).is_err());
+
+        let mut extended = encoded;
+        extended.push(0);
+        assert!(decode_store_control(path, &extended).is_err());
         Ok(())
     }
 
@@ -1136,10 +997,10 @@ mod tests {
             },
             {
                 let mut encoded = base.clone();
-                encoded[identity_end..identity_end + 2].copy_from_slice(&1_u16.to_le_bytes());
+                encoded[identity_end..identity_end + 2].copy_from_slice(&7_u16.to_le_bytes());
                 (
                     encoded,
-                    "store schema version 1 does not equal required version 7",
+                    "store schema version 7 does not equal required version 1",
                 )
             },
             {
@@ -1197,10 +1058,7 @@ mod tests {
             {
                 let mut encoded = base;
                 encoded.push(0);
-                (
-                    encoded,
-                    "BUILDING store control must not contain a revision trailer",
-                )
+                (encoded, "store control contains trailing bytes")
             },
         ];
 
@@ -1307,52 +1165,55 @@ mod tests {
             &crate::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION.to_le_bytes(),
         );
         encoded.extend_from_slice(&[6; 32]);
+        encoded.extend_from_slice(&1_u64.to_le_bytes());
+        encoded.extend_from_slice(&[8; 32]);
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
         assert_eq!(encoded.len(), STORE_CONTROL_MINIMUM_LENGTH);
         encoded
     }
 
-    // Fingerprints captured at 00030603. Both records include the full build plan.
-    const SCHEMA_7_CONTROL_DIGESTS: [(CanonicalStoreWorkload, RawBlobRetention, &str, &str); 6] = [
+    // Fingerprints of the schema 1 encoding for each workload and retention policy.
+    const SCHEMA_1_CONTROL_DIGESTS: [(CanonicalStoreWorkload, RawBlobRetention, &str, &str); 6] = [
         (
             CanonicalStoreWorkload::Wallet,
             RawBlobRetention::None,
-            "2ba9ddc5dd6efc43dc64f9cf83dfdb4045a801de123ed7591b6fb6e6d2705ed2",
-            "4054364a3b49ad9a815192e381df0fdbc619bab04b9ee39e835430fa541167a7",
+            "a0eadd365ba3e5cf89d00b8a9a09c59ca4118ff69a4088835c159a76ca1589cf",
+            "9e55f2790045c09aa59a3556e8c7e0778a31ba5a3a8362123aa5f397a2c47508",
         ),
         (
             CanonicalStoreWorkload::Wallet,
             RawBlobRetention::Transactions,
-            "83396d7af08baeba4870087be732cff6993d93018f9687a7efab0ba78f533c7f",
-            "8ec77fb30d258d50c925a76a12b9b55d6efc1487a4d1ec9ae2814ab5efa9275d",
+            "ba00efad7d773f48de397e39fa67fa161ff72950fc2b51db3803ae0315619342",
+            "1d7bce9d313fa1ae14e2483e595de3abab8affeb86ecdf4f2c0027886bbc0e8f",
         ),
         (
             CanonicalStoreWorkload::Wallet,
             RawBlobRetention::All,
-            "50dc31256c5ef502f7fbfcf98daeab363d1c501b8880a5eec0ca987a0befb54c",
-            "a4fdfbe855f0342d8e3b634c1e31d096cc06dcdf5ce83bd69f1787ff2417bb1a",
+            "156cca3b4db3d62eeb91246f3a110a31f9852196abf4d7fd89b97c106019113c",
+            "9dc50eb29e608cd17f1a0a2b4ece028d31c0b06c16e1b978409d7e69e46f4a5f",
         ),
         (
             CanonicalStoreWorkload::Explorer,
             RawBlobRetention::None,
-            "37ca6cddabddfe259177397f85b53cdd0c2799ad9a4233b9a0e8d5cf883fee76",
-            "385b5a268505d1edad43379d59f6413307a235cd51c89f1efcd65999f9860a73",
+            "2edde2a54e994f4a962617591fad533c7191945ce69486ef1b3aa2be645d7d6f",
+            "02216863d81318ce0df3c0ed5530985d9aa4ade8b444f803c0a4df16f6f6f395",
         ),
         (
             CanonicalStoreWorkload::Explorer,
             RawBlobRetention::Transactions,
-            "589774281f25ab62f22e27427fa965396c11fb96db1510784b1aad92d32179db",
-            "05ce91ae473960dcdd3decaea1e56896d1abf18aa3a284b7d4c4bb26f38d05ad",
+            "3e2afca1978108213599d5036806968d4841a9812898977f30d0a5d1d86f6016",
+            "5244b637b4cc6b061e91b724a6ccb76114d0f170f59072b24c357cb0b0108720",
         ),
         (
             CanonicalStoreWorkload::Explorer,
             RawBlobRetention::All,
-            "7bbc6bee68c229ddf7e7e543d7db3c863e1ebc19da0e0087e305a6e3a7de56b8",
-            "73dab9c99a7959e2484afd9afadc239b1f90dc1ea32d36def9823e5d468fcbb2",
+            "248b83bebcdafe78d17576a76b53437134efd78c9f0d1b2fc00f4e1c39490bf6",
+            "54aa52eca305c8c02b87cb9b17ce99bf4ac584e3c1daa325e89e5dee2b96f9bc",
         ),
     ];
 
     #[test]
-    fn every_stored_set_round_trips_its_schema_7_control_bytes()
+    fn every_stored_set_round_trips_its_schema_1_control_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
         use sha2::{Digest as _, Sha256};
 
@@ -1369,17 +1230,18 @@ mod tests {
         else {
             return Err("the READY fixture must carry READY evidence".into());
         };
-        for (workload, retention, building_digest, ready_digest) in SCHEMA_7_CONTROL_DIGESTS {
+        for (workload, retention, building_digest, ready_digest) in SCHEMA_1_CONTROL_DIGESTS {
             let build_plan = CanonicalStoreBuildPlan {
                 raw_blob_retention: retention,
                 ..complete_build_plan(Network::ZcashTestnet)
             };
             let building = encode_building_store_control(workload, &build_plan, CURSOR_AUTH_KEY)?;
-            let ready = encode_ready_store_control(
+            let ready = encode_ready_store_control_with_revisions(
                 workload,
                 &build_plan,
                 CURSOR_AUTH_KEY,
                 &ready_evidence,
+                expected_ready_control().revisions(),
             )?;
             assert_eq!(
                 sha256_hex(&building),
@@ -1406,9 +1268,13 @@ mod tests {
             workload: CanonicalStoreWorkload::Explorer,
             build_plan: complete_build_plan(Network::ZcashTestnet),
             cursor_auth_key: CURSOR_AUTH_KEY,
-            activation_schedule_binding: None,
+            activation_schedule_binding: Some(ActivationScheduleBinding {
+                revision: 1,
+                digest: [8; 32],
+            }),
             revised_reorg_policy: None,
             build_state: CanonicalStoreBuildState::Ready(CanonicalStoreReadyEvidence {
+                schema_version: CANONICAL_STORE_SCHEMA_VERSION,
                 first_retained_block: BlockId::new(
                     BlockHeight::new(1),
                     BlockHash::from_bytes([1; 32]),

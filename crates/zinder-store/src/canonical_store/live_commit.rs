@@ -71,6 +71,7 @@ impl CanonicalLiveAppend {
 /// Authenticated canonical source fence for projection construction and following.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalEventFence {
+    schema_version: u16,
     chain_epoch_id: ChainEpochId,
     chain_event_sequence: u64,
     visible_tip: BlockId,
@@ -92,6 +93,7 @@ impl CanonicalEventFence {
         sequence_digest: CanonicalBlockFactsSequenceDigest,
     ) -> Self {
         Self {
+            schema_version: super::CANONICAL_STORE_SCHEMA_VERSION,
             chain_epoch_id,
             chain_event_sequence,
             visible_tip,
@@ -107,6 +109,7 @@ impl CanonicalEventFence {
         sequence_digest: [u8; 32],
     ) -> Self {
         Self {
+            schema_version: super::CANONICAL_STORE_SCHEMA_VERSION,
             chain_epoch_id,
             chain_event_sequence,
             visible_tip,
@@ -117,6 +120,12 @@ impl CanonicalEventFence {
             ),
         }
     }
+    /// Returns the canonical store schema version admitted at this position.
+    #[must_use]
+    pub const fn schema_version(self) -> u16 {
+        self.schema_version
+    }
+
     /// Returns the durable epoch containing this transition.
     #[must_use]
     pub const fn chain_epoch_id(self) -> ChainEpochId {
@@ -443,6 +452,7 @@ pub(super) fn event_fence_from_ready(
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> CanonicalEventFence {
     CanonicalEventFence {
+        schema_version: ready_evidence.schema_version,
         chain_epoch_id: ready_evidence.visible_epoch,
         chain_event_sequence: ready_evidence.visible_event_sequence,
         visible_tip: ready_evidence.visible_tip,

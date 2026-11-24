@@ -12,9 +12,8 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, ServedTreeState, TreeStateLookup, TreeStateReplay,
-    TreeStateReplayOutcome,
+    CanonicalReorgPolicy, CanonicalStoreError, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    ServedTreeState, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
     block_load::encode_block_position,
     live_replacement_tests::published_store,
     publication::column_family,
@@ -246,8 +245,7 @@ fn a_secondary_reconstructs_with_a_node_table_its_writer_has_not_admitted_yet()
         temporary.path().join("canonical"),
         temporary.path().join("canonical-secondary"),
         &baseline,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;

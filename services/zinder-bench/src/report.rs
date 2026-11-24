@@ -19,11 +19,11 @@ use crate::{
 };
 
 /// Machine-readable report schema version for `canonical-replay-storage` reports.
-pub const REPORT_FORMAT_VERSION: u32 = 4;
+pub const REPORT_FORMAT_VERSION: u32 = 1;
 /// Machine-readable report schema version for `rocksdb-canonical-fixture-replay` reports.
-pub const ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION: u32 = 5;
+pub const ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION: u32 = 1;
 /// Machine-readable report schema version for `rocksdb-storage-lifecycle` reports.
-pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = 6;
+pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = 1;
 /// Stable identity stamped into every benchmark report.
 pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
 /// CPU envelope used to derive canonical fixture replay defaults.
@@ -1784,13 +1784,10 @@ impl RocksDbStorageLifecycleReport {
             || self.contracts.wallet_store_identity != "wallet"
             || self.contracts.wallet_store_schema_version
                 != zinder_wallet_rocksdb::WALLET_ROCKSDB_SCHEMA_VERSION
-            || self.contracts.wallet_store_schema_version != 2
             || self.contracts.wallet_projection_schema_version
                 != zinder_wallet_projection::WALLET_PROJECTION_SCHEMA_VERSION
-            || self.contracts.wallet_projection_schema_version != 2
             || self.contracts.wallet_value_encoding_version
                 != zinder_wallet_projection::WALLET_PROJECTION_VALUE_ENCODING_VERSION
-            || self.contracts.wallet_value_encoding_version != 2
         {
             return Err(BenchError::report_format(
                 "storage lifecycle report does not carry the current fixed storage contracts",
@@ -2573,7 +2570,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
 
         report.validate()?;
         let encoded = serde_json::to_value(&report)?;
-        assert_eq!(encoded["report_format_version"], 5);
+        assert_eq!(encoded["report_format_version"], 1);
         assert_eq!(
             encoded["measurement_kind"],
             "rocksdb-canonical-fixture-replay"
@@ -2708,7 +2705,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         dense.validate()?;
         let encoded = serde_json::to_value(&dense)?;
-        assert_eq!(encoded["report_format_version"], 6);
+        assert_eq!(encoded["report_format_version"], 1);
         assert_eq!(
             encoded["resource_limits"]["tree_state_checkpoint_coverage"],
             "every-block"
@@ -2725,7 +2722,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         sparse.validate()?;
         let encoded = serde_json::to_value(&sparse)?;
-        assert_eq!(encoded["report_format_version"], 6);
+        assert_eq!(encoded["report_format_version"], 1);
         assert_eq!(
             encoded["resource_limits"]["tree_state_checkpoint_coverage"],
             "cadence-and-tip"
@@ -2742,9 +2739,8 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         assert!(mismatched.validate().is_err());
 
-        // The producer emits only the current format; archived formats 4 and 5
-        // carry the wallet schema 1 contract and are checked by the shell validator.
-        for archived_version in [4, 5] {
+        // Previous report formats are rejected.
+        for archived_version in [4, 5, 6] {
             let mut wrong_version = dense.clone();
             if let super::BenchmarkReport::RocksDbStorageLifecycle(inner) = &mut wrong_version {
                 inner.report_format_version = archived_version;
@@ -3016,7 +3012,7 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
 
         assert_eq!(json["measurement_kind"], "canonical-replay-storage");
         assert_eq!(json["contract_identity"], "benchmark-report");
-        assert_eq!(json["report_format_version"], 4);
+        assert_eq!(json["report_format_version"], 1);
         assert_eq!(json["fixture"]["contract_identity"], "canonical-fixture");
         assert_eq!(
             json["storage_candidate"]["id"],

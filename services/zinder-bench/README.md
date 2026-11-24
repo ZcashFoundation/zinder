@@ -44,7 +44,7 @@ The fixture directory holds one `segment-NNNNNN.bin` file per segment plus a
 `manifest.json` recording the network, range, consensus activations,
 canonical artifact schema version, replay tip hash, per-segment SHA-256,
 and each shielded protocol's complete subtree-root prefix through the fixed
-tip. Fixture format version 3 records the exact completing block identity for
+tip. Fixture format version 1 records the exact completing block identity for
 every root, including roots completed before the captured block range, plus
 the versioned `CanonicalBlockFacts` block and ordered-sequence digest evidence
 used by both canonical-replay-storage arms. Workload totals and per-block
@@ -132,7 +132,7 @@ pipeline limits, tree-state checkpoint coverage (`cadence-and-tip` by default, o
 workload, writer budget, and reader budget for both arms. It fails instead of
 reporting if their authenticated fixture, replay plan, logical replay,
 subtree-root load coverage and digest, fence, or effective-limit identities
-differ. Report format version 3 records each retention
+differ. Report format version 1 records each retention
 contract, `effective_limits.tree_state_checkpoint_coverage`, raw-blob counts,
 physical canonical bytes, replay throughput, and a
 fresh secondary READY-admission timing. `authenticated_replay_lifecycle_seconds`
@@ -181,17 +181,13 @@ independent pipeline tuning flags. Canonical construction defaults to
 `--tree-state-checkpoint-coverage cadence-and-tip` to match fresh ingest with `explicit` coverage.
 Pass `--tree-state-checkpoint-coverage every-block` to measure the cost of
 writing dense checkpoints before READY, as wallet-serving ingest does by default. Report
-formats 5 and 6 record the actual constructed coverage in
+format 1 records the constructed coverage in
 `resource_limits.tree_state_checkpoint_coverage`, the canonical publication mode
 in `resource_limits.canonical_publication_mode` (`trusted-fresh` or
 `cold-certified`), and the persisted row count in
-`canonical_storage_ready.tree_state_checkpoint_count`. Format 6, which the
-benchmark now writes, also records wallet schema 2 and the `lthash16-chacha12`
-UTXO commitment scheme. The report validator recomputes the limits and
-checkpoint counts for formats 5 and 6. It keeps archived formats 5 and 4 under
-the contract they were produced with, wallet schema 1 and the `lthash16`
-scheme, accepts format 4 only when no coverage or publication mode is pinned,
-and rejects a report whose wallet schema or scheme belongs to another format.
+`canonical_storage_ready.tree_state_checkpoint_count`. The validator recomputes
+the limits and checkpoint counts and requires wallet schema 1 and the
+`lthash16-chacha12` UTXO commitment scheme.
 Diagnostic parameter sweeps belong to `rocksdb-canonical-fixture-replay`.
 
 By default, `--canonical-publication-mode trusted-fresh` uses the same
@@ -1351,7 +1347,7 @@ campaign case's `match` list when comparing reports that expose this flag.
   `fixture.canonical_block_facts_digest_evidence`, `fixture.tip_hash_hex`, and
   `fixture.digest_sha256`: fixture provenance required to compare candidates
   against identical source bytes and digest contracts. Each driver verifies
-  every segment SHA-256 before writing its rows. Fixture format 3 requires the
+  every segment SHA-256 before writing its rows. Fixture format 1 requires the
   exact identity `canonical-fixture`; earlier numeric versions are refused.
 - `fixture.workload_density`: the immutable workload totals and per-block
   maxima copied from the captured fixture manifest.

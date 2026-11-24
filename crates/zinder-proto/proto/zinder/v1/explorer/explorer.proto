@@ -1443,20 +1443,13 @@ message TransparentAddressDeltasResponse {
 // `(address_script_hash, ascending_height, in_block_position, kind, index)`.
 // The handler projects this onto `TransparentAddressDeltasEntry`, pulling
 // the height from the key.
-//
-// A row carries its transaction id in exactly one of `transaction_id` and
-// `internal_transaction_id`. Rows written before `internal_transaction_id`
-// existed set `transaction_id`; newer rows set `internal_transaction_id`.
 message TransparentAddressDeltasRecord {
-  // Canonical transaction id in RPC byte order (64 lowercase hex
-  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string transaction_id = 1;
+  // Canonical transaction ID as 32 bytes in internal byte order.
+  bytes transaction_id = 1;
   int64 block_time_unix_seconds = 2;
   // Signed value the event moved for the address; positive for a received
   // output, negative for a spent prevout.
   sint64 value_zat = 3;
-  // Canonical transaction id as 32 bytes in internal byte order.
-  bytes internal_transaction_id = 4;
 }
 
 // `ExplorerQuery.FeeSummary` request.
@@ -2472,14 +2465,9 @@ message NetworkUpgradeStatusResponse {
 // carries `(address_script_hash, reverse_height, in_block_position)`.
 // The handler projects this onto the wire `TransparentAddressActivityEntry`
 // shape and pulls the height + timestamp it already knows from the key.
-//
-// A row carries its transaction id in exactly one of `transaction_id` and
-// `internal_transaction_id`. Rows written before `internal_transaction_id`
-// existed set `transaction_id`; newer rows set `internal_transaction_id`.
 message TransparentAddressActivityRecord {
-  // Canonical transaction id in RPC byte order (64 lowercase hex
-  // characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-  string transaction_id = 1;
+  // Canonical transaction ID as 32 bytes in internal byte order.
+  bytes transaction_id = 1;
   int64 block_time_unix_seconds = 2;
   // Net transparent value the transaction moved for this address
   // (`sum(outputs to address) - sum(prevouts spent from address)`).
@@ -2495,8 +2483,6 @@ message TransparentAddressActivityRecord {
   // `net_value_zat`. Always present so consumers can render a chip
   // explaining why `net_value_zat` is unset rather than guessing.
   PrevoutResolutionStatus prevout_resolution_status = 6;
-  // Canonical transaction id as 32 bytes in internal byte order.
-  bytes internal_transaction_id = 7;
 }
 
 // Per-transaction record materialized by `TransactionFeesConsumer`.

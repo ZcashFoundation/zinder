@@ -86,7 +86,7 @@ pub struct RocksDbCanonicalSecondary {
 
 impl RocksDbCanonicalSecondary {
     /// Returns the writer-admitted schedule revision observed at the last
-    /// catch-up, or `None` before the writer's first admission.
+    /// catch-up.
     #[must_use]
     pub const fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule> {
         self.activation_schedule.as_ref()
@@ -102,48 +102,15 @@ impl RocksDbCanonicalSecondary {
         }
     }
 
-    /// Opens a secondary requiring at least the selected workload and blob coverage.
-    ///
-    /// `expected_network_upgrade_activations` is a node-observed table: it
-    /// must agree with the writer-admitted schedule through the visible tip,
-    /// or equal the construction table before the writer's first admission.
-    /// A reader that has no node of its own opens with
-    /// [`Self::open_ready_adopting_writer_schedule`] instead.
-    ///
-    /// Coverage is derived from the store control record. A
-    /// [`RocksDbResourceBudget`] opens the secondary on a block cache of its
-    /// own; [`RocksDbOpenResources::with_shared_block_cache`] opens it on a
-    /// cache other secondaries of the same store read through.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
-    )]
-    pub fn open_ready(
-        primary_path: impl AsRef<Path>,
-        secondary_path: impl AsRef<Path>,
-        expected_network_upgrade_activations: &NetworkUpgradeActivations,
-        expected_workload: CanonicalStoreWorkload,
-        expected_raw_blob_retention: RawBlobRetention,
-        expected_reorg_policy: super::CanonicalReorgPolicy,
-        resources: impl Into<RocksDbOpenResources>,
-    ) -> Result<Self, CanonicalStoreError> {
-        Self::open_ready_requiring(
-            primary_path,
-            secondary_path,
-            expected_network_upgrade_activations,
-            CanonicalStoreRequirements::from_legacy(expected_workload, expected_raw_blob_retention),
-            expected_reorg_policy,
-            resources,
-        )
-    }
-
     /// Opens a secondary with explicit minimum retained data and history.
-    /// See [`Self::open_ready`] for schedule admission.
+    ///
+    /// The node-observed activation table must agree with the writer-admitted
+    /// schedule through the visible tip.
     #[allow(
         clippy::too_many_arguments,
         reason = "secondary admission keeps filesystem, schedule, and reorg policy explicit"
     )]
-    pub fn open_ready_requiring(
+    pub fn open_ready(
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
         expected_network_upgrade_activations: &NetworkUpgradeActivations,
@@ -164,46 +131,15 @@ impl RocksDbCanonicalSecondary {
         )
     }
 
-    /// Opens a secondary requiring at least the selected workload and blob coverage, and
-    /// adopts the network-upgrade schedule its canonical writer admitted.
-    ///
-    /// The reader brings no activation table of its own, so it needs no node:
-    /// the schedule it reads through is the one the writer persisted, and
-    /// each catch-up follows the writer's later revisions. A READY store whose
-    /// writer has not admitted a schedule yet is refused with
-    /// [`CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted`], which a
-    /// reader retries, because the writer admits its first revision when it
-    /// opens the store.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
-    )]
-    pub fn open_ready_adopting_writer_schedule(
-        primary_path: impl AsRef<Path>,
-        secondary_path: impl AsRef<Path>,
-        expected_network: Network,
-        expected_workload: CanonicalStoreWorkload,
-        expected_raw_blob_retention: RawBlobRetention,
-        expected_reorg_policy: super::CanonicalReorgPolicy,
-        resources: impl Into<RocksDbOpenResources>,
-    ) -> Result<Self, CanonicalStoreError> {
-        Self::open_ready_adopting_writer_schedule_requiring(
-            primary_path,
-            secondary_path,
-            expected_network,
-            CanonicalStoreRequirements::from_legacy(expected_workload, expected_raw_blob_retention),
-            expected_reorg_policy,
-            resources,
-        )
-    }
-
     /// Opens a secondary with explicit minimum retained data and history.
-    /// See [`Self::open_ready_adopting_writer_schedule`] for schedule admission.
+    ///
+    /// The reader adopts the canonical writer's admitted activation schedule
+    /// and follows later revisions on catch-up.
     #[allow(
         clippy::too_many_arguments,
         reason = "secondary admission keeps filesystem, schedule, and reorg policy explicit"
     )]
-    pub fn open_ready_adopting_writer_schedule_requiring(
+    pub fn open_ready_adopting_writer_schedule(
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
         expected_network: Network,

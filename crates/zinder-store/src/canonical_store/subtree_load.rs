@@ -17,8 +17,8 @@ use super::{
 
 const SUBTREE_ROOT_KEY_LEN: usize = 1 + 4;
 const SUBTREE_ROOT_VALUE_LEN: usize = 32 + 4 + 32;
-const SUBTREE_ROOT_SEQUENCE_DIGEST_VERSION: u16 = 2;
-const SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN: &[u8] = b"zinder.canonical.subtree-root-sequence.v2\0";
+pub(super) const SUBTREE_ROOT_SEQUENCE_DIGEST_VERSION: u16 = 1;
+const SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN: &[u8] = b"zinder.canonical.subtree-root-sequence.v1\0";
 type EncodedSubtreeRoot = ([u8; SUBTREE_ROOT_KEY_LEN], [u8; SUBTREE_ROOT_VALUE_LEN]);
 
 /// Caller-authenticated subtree-root fields before canonical block identity is attached.
@@ -1033,7 +1033,7 @@ mod tests {
             let store = validated.publish_baseline(publication)?;
             assert_eq!(store.stored_set().subtree_root_coverage(), Some(coverage));
             let open = |suffix, requirements| {
-                RocksDbCanonicalSecondary::open_ready_requiring(
+                RocksDbCanonicalSecondary::open_ready(
                     &path,
                     temporary.path().join(format!("{label}-{suffix}")),
                     &activations,

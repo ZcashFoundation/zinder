@@ -503,6 +503,10 @@ fn fixed_tip_build_matches_exact_version_one_wallet_contract()
     let temporary = TempDir::new()?;
     let fixture = wallet_baseline_fixture();
     let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    assert_eq!(
+        canonical_store.ready_evidence().schema_version,
+        zinder_wallet_projection::REQUIRED_CANONICAL_STORE_SCHEMA_VERSION
+    );
 
     let outcome = build_wallet_from_canonical(
         &canonical_store,
@@ -710,8 +714,9 @@ fn closed_canonical_primary_secondary_build_matches_primary_oracle()
         temporary.path().join("canonical"),
         temporary.path().join("canonical-secondary"),
         &inactive_upgrade_activations()?,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(
+            RawBlobRetention::Transactions,
+        ),
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1614,8 +1619,9 @@ fn open_incremental_secondary(
         temporary.path().join("canonical"),
         temporary.path().join(secondary_name),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(
+            RawBlobRetention::Transactions,
+        ),
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
@@ -1732,9 +1738,9 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
     assert_eq!(
         outcome.report.projection_digest.as_bytes(),
         [
-            0xb8, 0x72, 0x03, 0x7c, 0x82, 0x37, 0x80, 0x3e, 0xe3, 0x64, 0xfa, 0xb4, 0xa8, 0xa5,
-            0x39, 0xfd, 0x46, 0x5c, 0x3b, 0x3a, 0x31, 0x61, 0x6c, 0x80, 0x22, 0xa6, 0x72, 0x1f,
-            0x30, 0x62, 0xf1, 0x4d,
+            0xcf, 0xf7, 0xde, 0xc4, 0x25, 0x53, 0x6d, 0x6a, 0x7f, 0xc9, 0x74, 0xa6, 0x6b, 0x12,
+            0xcd, 0x3b, 0xed, 0xf6, 0x17, 0x59, 0x35, 0xc4, 0x05, 0xaa, 0x7f, 0x3b, 0x67, 0x87,
+            0x55, 0xab, 0xb9, 0xf4,
         ]
     );
     assert_eq!(outcome.report.scanned_block_count, 3);

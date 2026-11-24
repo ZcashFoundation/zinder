@@ -117,7 +117,7 @@ impl PublicationReader {
         admitted_stored_set: Option<CanonicalStoredSet>,
     ) -> io::Result<Self> {
         let scratch = reservation.generation()?;
-        let secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
+        let secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
             &config.primary_path,
             scratch.path(),
             config.network,

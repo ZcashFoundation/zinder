@@ -29,7 +29,7 @@ use zinder_source::{
 use crate::error::BenchError;
 
 /// Version stamped into every manifest this crate writes.
-pub const FIXTURE_FORMAT_VERSION: u32 = 3;
+pub const FIXTURE_FORMAT_VERSION: u32 = 1;
 /// Stable identity stamped into every canonical fixture manifest.
 pub const FIXTURE_CONTRACT_IDENTITY: &str = "canonical-fixture";
 

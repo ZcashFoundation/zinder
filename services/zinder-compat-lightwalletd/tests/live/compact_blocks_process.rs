@@ -217,7 +217,7 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
     }
     fs::create_dir_all(&evidence_root)?;
     let source_before = inventory(&canonical_path)?;
-    let source_manifest = canonical_path.join("canonical-construction-manifest.v4.json");
+    let source_manifest = canonical_path.join("canonical-construction-manifest.v1.json");
     let source_manifest_before = sha256_file(&source_manifest)?;
 
     let source = ZebraJsonRpcSource::with_options(
@@ -236,8 +236,7 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
         &canonical_path,
         &control_secondary,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        expected_raw_blob_policy,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(expected_raw_blob_policy),
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -810,10 +809,7 @@ fn build_reorg_process_primary(
         baseline_tip,
         UnixTimestampMillis::new(1_774_669_000_000),
     ))?;
-    let mut primary = validated.publish_baseline(publication)?;
-    // The writer admits its first schedule revision when it opens the store,
-    // and the compatibility reader opens only on an admitted schedule.
-    primary.admit_network_upgrade_schedule(activations)?;
+    let primary = validated.publish_baseline(publication)?;
     let live_block = canonical_build_blocks(chain, activations)?
         .pop()
         .ok_or_else(|| eyre!("reorg process fixture did not produce a live block"))?;

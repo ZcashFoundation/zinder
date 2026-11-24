@@ -168,8 +168,16 @@ impl ReadStore {
             &self.primary,
             self.secondary_root.join(name),
             &self.activations,
-            self.workload,
-            self.raw_blob_retention,
+            if self.workload == CanonicalStoreWorkload::Explorer {
+                zinder_store::CanonicalStoreRequirements::new(&[
+                    zinder_store::CanonicalStoredData::FinalNoteCommitmentRoots,
+                ])
+                .with_blob_retention(self.raw_blob_retention)
+            } else {
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    self.raw_blob_retention,
+                )
+            },
             self.reorg_policy,
             self.budget,
         )?;

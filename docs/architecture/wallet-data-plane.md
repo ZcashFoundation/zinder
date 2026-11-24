@@ -71,7 +71,7 @@ Ingest builds compact blocks when it commits a block. Query never fetches a bloc
 
 Canonical history never contains height 0. A complete store retains blocks from height 1.
 
-`zinder-client` validates the range stream. It fails with `IndexerError::MalformedResponse` when the server sends a block before the header, a second header, no header, a header for another network or another pinned epoch, a skipped, repeated, or extra height, a short stream, or a block above the header's visible tip. The client requires contract revision 8 or later and refuses an older server.
+`zinder-client` validates the range stream. It fails with `IndexerError::MalformedResponse` when the server sends a block before the header, a second header, no header, a header for another network or another pinned epoch, a skipped, repeated, or extra height, a short stream, or a block above the header's visible tip. The client requires contract revision 1 or later and refuses an older server.
 
 ## Full blocks
 

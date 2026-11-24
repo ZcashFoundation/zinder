@@ -34,19 +34,17 @@ pub use rows::{
 pub use serial_oracle::WalletProjectionSerialOracle;
 
 /// Physical wallet schema version under the clean `wallet` identity.
-///
-/// Version 2 holds accumulator version 2 and UTXO commitment scheme 2. A store
-/// or state bundle of version 1 is refused and must be rebuilt.
-pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 2;
+pub const WALLET_PROJECTION_SCHEMA_VERSION: u16 = 1;
 
 /// Wallet projection row-value encoding version with source-bound reorg undo.
-pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 2;
+pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 1;
 
 /// Version of the durable projection-build lease embedded in store control.
 pub const WALLET_PROJECTION_BUILD_LEASE_VERSION: u16 = 1;
 
 /// Canonical store schema admitted by this projection schema.
-pub const REQUIRED_CANONICAL_STORE_SCHEMA_VERSION: u16 = 6;
+pub const REQUIRED_CANONICAL_STORE_SCHEMA_VERSION: u16 =
+    zinder_store::CANONICAL_STORE_SCHEMA_VERSION;
 
 /// Canonical replay format admitted by this projection schema.
 pub const REQUIRED_CANONICAL_REPLAY_FORMAT_VERSION: u32 = 1;

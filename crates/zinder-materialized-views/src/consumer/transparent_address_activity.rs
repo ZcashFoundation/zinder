@@ -42,8 +42,7 @@ use zinder_core::{
 use zinder_proto::v1::explorer::{PrevoutResolutionStatus, TransparentAddressActivityRecord};
 
 use crate::consumer::address_value_event::{
-    AddressValueEventKind, address_value_events, decode_stored_transaction_id,
-    internal_transaction_ids_by_position,
+    AddressValueEventKind, address_value_events, internal_transaction_ids_by_position,
 };
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
@@ -125,7 +124,7 @@ impl TransparentAddressActivityConsumer {
     pub fn stored_transaction_id(
         record: &TransparentAddressActivityRecord,
     ) -> Result<TransactionId, WireDecodeError> {
-        decode_stored_transaction_id(&record.internal_transaction_id, &record.transaction_id)
+        zinder_core::wire::decode_internal_transaction_id(&record.transaction_id)
     }
 }
 
@@ -254,13 +253,12 @@ impl RowAccumulator {
             | PrevoutResolutionStatus::Unspecified => None,
         };
         TransparentAddressActivityRecord {
-            internal_transaction_id: self.internal_transaction_id,
+            transaction_id: self.internal_transaction_id,
             block_time_unix_seconds,
             net_value_zat,
             input_count: self.input_count,
             output_count: self.output_count,
             prevout_resolution_status: prevout_resolution_status as i32,
-            ..TransparentAddressActivityRecord::default()
         }
     }
 }
@@ -396,7 +394,7 @@ mod tests {
 
     use rust_rocksdb::WriteBatch;
     use tempfile::tempdir;
-    use zinder_core::wire::{encode_internal_transaction_id, encode_rpc_transaction_id_hex};
+    use zinder_core::wire::encode_internal_transaction_id;
     use zinder_core::{
         BlockHash, TransactionFactsArtifact, TransactionId, TransactionLocation,
         TransparentOutputFact,
@@ -466,24 +464,14 @@ mod tests {
             .ok_or("the received output must write an activity row")?;
         let record = TransparentAddressActivityRecord::decode(payload.as_slice())?;
         assert_eq!(
-            record.internal_transaction_id,
+            record.transaction_id,
             encode_internal_transaction_id(transaction_id)
         );
-        assert_eq!(record.transaction_id, "");
         assert_eq!(
             TransparentAddressActivityConsumer::stored_transaction_id(&record)?,
             transaction_id
         );
 
-        let legacy = TransparentAddressActivityRecord {
-            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-            internal_transaction_id: Vec::new(),
-            ..record
-        };
-        assert_eq!(
-            TransparentAddressActivityConsumer::stored_transaction_id(&legacy)?,
-            transaction_id
-        );
         Ok(())
     }
 }

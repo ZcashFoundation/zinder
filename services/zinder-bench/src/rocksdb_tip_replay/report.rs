@@ -14,7 +14,7 @@ use super::{
 /// Contract identity of a tip replay report.
 pub(super) const REPORT_CONTRACT_IDENTITY: &str = "rocksdb-tip-replay";
 /// Version of the tip replay report shape.
-pub(super) const REPORT_FORMAT_VERSION: u32 = 2;
+pub(super) const REPORT_FORMAT_VERSION: u32 = 1;
 
 /// Complete evidence from one tip replay run.
 #[derive(Debug, Serialize, Deserialize)]

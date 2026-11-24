@@ -879,11 +879,8 @@ fn secondary_admission_rejects_another_network_activation_table()
     Ok(())
 }
 
-/// A reader without a node adopts the writer's schedule: it waits for the
-/// writer's first admission, then reads through the admitted table and
-/// follows each later revision on catch-up.
 #[test]
-fn a_secondary_adopts_the_writer_admitted_schedule_once_one_exists()
+fn a_node_free_secondary_adopts_the_schedule_at_ready_publication()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let store_path = temporary.path().join("canonical");
@@ -895,18 +892,6 @@ fn a_secondary_adopts_the_writer_admitted_schedule_once_one_exists()
         BlockHeight::new(2),
     )?;
 
-    let error = open_adopting_secondary(&store_path, temporary.path().join("early"))?
-        .err()
-        .ok_or("a READY store without an admitted schedule must refuse a node-free reader")?;
-    assert!(
-        matches!(
-            error,
-            CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. }
-        ),
-        "unexpected pre-admission error: {error:?}"
-    );
-
-    store.admit_network_upgrade_schedule(&construction)?;
     let mut secondary = open_adopting_secondary(&store_path, temporary.path().join("reader"))??;
     assert_eq!(secondary.network(), Network::ZcashTestnet);
     assert_eq!(
@@ -948,8 +933,7 @@ fn a_secondary_adopting_the_writer_schedule_refuses_another_network()
         &store_path,
         temporary.path().join("secondary"),
         Network::ZcashMainnet,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -1036,7 +1020,7 @@ fn secondary_refuses_a_required_height_below_the_checkpointed_floor()
         Some(BlockHeight::new(1)),
     )?;
     let requested = BlockHeight::new(1);
-    let error = RocksDbCanonicalSecondary::open_ready_requiring(
+    let error = RocksDbCanonicalSecondary::open_ready(
         &path,
         temporary.path().join("secondary"),
         &activations,
@@ -1070,8 +1054,7 @@ fn open_secondary(
         store_path,
         secondary_path,
         activations,
-        CanonicalStoreWorkload::Wallet,
-        raw_blob_retention,
+        crate::CanonicalStoreRequirements::for_blob_retention(raw_blob_retention),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     ))
@@ -1088,8 +1071,7 @@ fn open_adopting_secondary(
             store_path,
             secondary_path,
             Network::ZcashTestnet,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
             CanonicalReorgPolicy::new(REORG_WINDOW)?,
             RocksDbResourceBudget::for_local_tests(),
         ),
@@ -1125,8 +1107,7 @@ fn open_secondary_on(
         store_path,
         secondary_path,
         activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbOpenResources::with_shared_block_cache(
             RocksDbResourceBudget::for_local_tests(),

@@ -150,8 +150,9 @@ impl ReplayStores {
             paths.canonical,
             paths.canonical_secondary,
             &settings.fixture_activations,
-            CanonicalStoreWorkload::Wallet,
-            settings.raw_blob_retention,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                settings.raw_blob_retention,
+            ),
             effective_reorg_policy,
             settings.canonical_secondary_budget,
         )?;

@@ -92,10 +92,6 @@ enum ConvergenceFailure {
     WriterAhead,
     #[error("writer fence diverged from the candidate secondary")]
     WriterFenceDiverged,
-    #[error(
-        "the canonical writer has not admitted a network-upgrade schedule for the candidate secondary to adopt"
-    )]
-    WriterScheduleNotAdmitted,
     #[error("candidate storage failed: {0}")]
     Storage(CompactBlockServingError),
 }
@@ -288,8 +284,7 @@ impl CompactBlockPublisher {
             ConvergenceFailure::Storage(error) => error,
             failure @ (ConvergenceFailure::WriterStatusTransport(_)
             | ConvergenceFailure::WriterAhead
-            | ConvergenceFailure::WriterFenceDiverged
-            | ConvergenceFailure::WriterScheduleNotAdmitted) => {
+            | ConvergenceFailure::WriterFenceDiverged) => {
                 CompactBlockServingError::Runtime(failure.to_string())
             }
         })?;
@@ -537,7 +532,7 @@ impl CompactBlockPublisher {
                 );
                 return;
             }
-            Err(ConvergenceFailure::Storage(_) | ConvergenceFailure::WriterScheduleNotAdmitted) => {
+            Err(ConvergenceFailure::Storage(_)) => {
                 self.record_failure(
                     ReadinessCause::StorageUnavailable,
                     active.event_fence().visible_tip().height.value(),
@@ -675,7 +670,7 @@ async fn open_generation(
                 "cannot create compact-block secondary: {error}"
             ))
         })?;
-        RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule_requiring(
+        RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
             primary,
             secondary,
             network,
@@ -794,53 +789,6 @@ fn candidate_unavailable() -> ConvergenceFailure {
     ))
 }
 
-/// Opens a candidate in `generation`, retrying until `convergence_timeout`
-/// passes while the canonical writer has not admitted its first
-/// network-upgrade schedule.
-///
-/// The writer admits that schedule when it first opens the store, which can
-/// take longer than the convergence attempts allow, so this wait is bounded
-/// by time alone.
-async fn open_generation_awaiting_schedule(
-    config: &CompactBlockServingConfig,
-    generation: CandidateGeneration<'_>,
-    retry_delay: Duration,
-    shutdown: &CancellationToken,
-) -> Result<Option<RocksDbCanonicalSecondary>, ConvergenceFailure> {
-    let deadline = tokio::time::Instant::now() + config.convergence_timeout;
-    let mut waiting_logged = false;
-    while !shutdown.is_cancelled() {
-        match open_generation(config, generation).await {
-            opened if shutdown.is_cancelled() => {
-                close_unpublished_generation(opened.ok()).await;
-                break;
-            }
-            Ok(candidate) => return Ok(Some(candidate)),
-            Err(CompactBlockServingError::Storage(
-                CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
-            )) if tokio::time::Instant::now() < deadline => {
-                if !waiting_logged {
-                    tracing::info!(
-                        target: "zinder::compat_lightwalletd",
-                        event = "canonical_schedule_admission_pending",
-                        "waiting for the canonical writer to admit a network-upgrade schedule"
-                    );
-                    waiting_logged = true;
-                }
-            }
-            Err(CompactBlockServingError::Storage(
-                CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
-            )) => return Err(ConvergenceFailure::WriterScheduleNotAdmitted),
-            Err(error) => return Err(ConvergenceFailure::Storage(error)),
-        }
-        tokio::select! {
-            () = shutdown.cancelled() => break,
-            () = tokio::time::sleep(retry_delay) => {}
-        }
-    }
-    Ok(None)
-}
-
 /// Opens a candidate in `generation`, converges it on the writer fence, and
 /// returns it with the writer status that attested it, or `None` on shutdown.
 async fn converge_candidate<'a>(
@@ -852,11 +800,15 @@ async fn converge_candidate<'a>(
 ) -> Result<Option<(RocksDbCanonicalSecondary, CanonicalWriterStatusResponse)>, ConvergenceFailure>
 {
     let retry_delay = config.catchup_interval.min(CONVERGENCE_RETRY_DELAY_CAP);
-    let Some(candidate) =
-        open_generation_awaiting_schedule(config, generation, retry_delay, shutdown).await?
-    else {
+    if shutdown.is_cancelled() {
         return Ok(None);
-    };
+    }
+    let opened = open_generation(config, generation).await;
+    if shutdown.is_cancelled() {
+        close_unpublished_generation(opened.ok()).await;
+        return Ok(None);
+    }
+    let candidate = opened.map_err(ConvergenceFailure::Storage)?;
     let mut probe = CandidateFenceProbe {
         writer_status,
         candidate: Some(candidate),
@@ -1203,20 +1155,6 @@ mod tests {
         (RocksDbCanonicalStore, Vec<zinder_testkit::FixtureBlock>),
         Box<dyn std::error::Error>,
     > {
-        let (mut store, blocks) = unadmitted_lifecycle_store(root, activations)?;
-        store.admit_network_upgrade_schedule(activations)?;
-        Ok((store, blocks))
-    }
-
-    /// Builds the READY lifecycle store before its writer's first schedule
-    /// admission.
-    fn unadmitted_lifecycle_store(
-        root: &std::path::Path,
-        activations: &zinder_core::NetworkUpgradeActivations,
-    ) -> Result<
-        (RocksDbCanonicalStore, Vec<zinder_testkit::FixtureBlock>),
-        Box<dyn std::error::Error>,
-    > {
         let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
         let mut blocks = chain.blocks().to_vec();
         let first = blocks
@@ -1406,18 +1344,13 @@ mod tests {
         Ok(())
     }
 
-    /// Compact serving brings no activation table of its own: bootstrap waits
-    /// for the writer's first schedule admission and serves that schedule.
-    ///
-    /// The wait is bounded by the convergence timeout, however many attempts
-    /// it takes.
     #[tokio::test]
-    async fn bootstrap_waits_for_the_writers_first_schedule_admission()
+    async fn bootstrap_adopts_the_schedule_from_ready_publication()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let activations = lifecycle_activations();
-        let (mut primary, _blocks) =
-            unadmitted_lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
         let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
@@ -1456,13 +1389,6 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !bootstrap.is_finished(),
-            "bootstrap must wait for the schedule"
-        );
-        primary.admit_network_upgrade_schedule(&activations)?;
-        control.set_writer_status(lifecycle_writer_status(&primary));
         let (_publisher, slot) = bootstrap.await??;
 
         let reader = slot.capture();
@@ -1481,64 +1407,6 @@ mod tests {
         drop(reader);
         let _ = shutdown_sender.send(());
         server.await??;
-        Ok(())
-    }
-
-    /// A writer that never admits a schedule fails bootstrap with a typed
-    /// error instead of a reader-supplied table.
-    #[tokio::test]
-    async fn bootstrap_reports_a_store_whose_writer_admitted_no_schedule()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = tempfile::tempdir()?;
-        let activations = lifecycle_activations();
-        let (primary, _blocks) =
-            unadmitted_lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
-        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("http://{}", listener.local_addr()?);
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            Server::builder()
-                .add_service(CanonicalControlServer::new(control))
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                    let _ = shutdown_receiver.await;
-                })
-                .await
-        });
-        let config = CompactBlockServingConfig {
-            canonical_primary_path: temporary.path().join("canonical-primary"),
-            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
-            network: Network::ZcashRegtest,
-            requirements: transaction_requirements(),
-            reorg_policy: CanonicalReorgPolicy::new(100)?,
-            resource_budget: RocksDbResourceBudget::for_local_tests(),
-            catchup_interval: Duration::from_millis(1),
-            convergence_timeout: Duration::from_millis(300),
-            convergence_attempts: 4,
-            staleness_ceiling: Duration::from_mins(1),
-            lag_threshold: 0,
-        };
-
-        let outcome = CompactBlockPublisher::bootstrap(
-            config,
-            CompactServingReadiness::new(Readiness::default()),
-            &endpoint,
-            None,
-        )
-        .await;
-
-        let bootstrap_error = outcome.err();
-        let _ = shutdown_sender.send(());
-        server.await??;
-        let Some(CompactBlockServingError::Runtime(message)) = bootstrap_error else {
-            return Err(
-                format!("expected a runtime bootstrap error, got {bootstrap_error:?}").into(),
-            );
-        };
-        assert!(
-            message.contains("has not admitted a network-upgrade schedule"),
-            "bootstrap failed for another reason: {message}"
-        );
         Ok(())
     }
 
