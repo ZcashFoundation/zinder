@@ -2,6 +2,7 @@
 //! and the terminal status of a streaming response.
 
 use std::{
+    cell::RefCell,
     pin::Pin,
     task::{Context, Poll},
     time::Instant,
@@ -461,6 +462,48 @@ struct ObservedBody {
     boundaries: MessageBoundaries,
 }
 
+tokio::task_local! {
+    static GATED_COMPLETION: RefCell<Option<RpcCompletion>>;
+}
+
+/// A terminal observation that the release gate may still be holding behind
+/// DATA. Dropping it before release records the observer's default cancellation.
+pub(super) struct RpcCompletion {
+    rpc: ObservedRpc,
+    outcome: Outcome,
+}
+
+impl RpcCompletion {
+    /// Captures a completion even when a transport adapter turns the native
+    /// trailers into DATA before the gate sees them.
+    pub(super) fn capture<T>(held: Option<Self>, poll: impl FnOnce() -> T) -> (T, Option<Self>) {
+        GATED_COMPLETION.sync_scope(RefCell::new(held), || {
+            let frame = poll();
+            (frame, GATED_COMPLETION.with(RefCell::take))
+        })
+    }
+
+    pub(super) fn replace_status(status: &Status) {
+        let _ = GATED_COMPLETION.try_with(|slot| {
+            if let Some(completion) = slot.borrow_mut().as_mut() {
+                completion.outcome = Outcome::from_status(status);
+            }
+        });
+    }
+
+    fn finish(self) {
+        let mut completion = Some(self);
+        let _ = GATED_COMPLETION.try_with(|slot| *slot.borrow_mut() = completion.take());
+        if let Some(completion) = completion {
+            completion.release();
+        }
+    }
+
+    pub(super) fn release(mut self) {
+        self.rpc.outcome = self.outcome;
+    }
+}
+
 impl http_body::Body for ObservedBody {
     type Data = Bytes;
     type Error = Status;
@@ -474,7 +517,7 @@ impl http_body::Body for ObservedBody {
         let Some(rpc) = &mut this.rpc else {
             return frame;
         };
-        match &frame {
+        let outcome = match &frame {
             Poll::Pending => return frame,
             Poll::Ready(Some(Ok(next))) => {
                 if let Some(chunk) = next.data_ref() {
@@ -483,15 +526,16 @@ impl http_body::Body for ObservedBody {
                     }
                     return frame;
                 }
-                rpc.outcome = next
-                    .trailers_ref()
+                next.trailers_ref()
                     .and_then(Outcome::from_headers)
-                    .unwrap_or_else(|| Outcome::plain(Code::Unknown));
+                    .unwrap_or_else(|| Outcome::plain(Code::Unknown))
             }
-            Poll::Ready(Some(Err(status))) => rpc.outcome = Outcome::from_status(status),
-            Poll::Ready(None) => rpc.outcome = Outcome::plain(Code::Unknown),
+            Poll::Ready(Some(Err(status))) => Outcome::from_status(status),
+            Poll::Ready(None) => Outcome::plain(Code::Unknown),
+        };
+        if let Some(rpc) = this.rpc.take() {
+            RpcCompletion { rpc, outcome }.finish();
         }
-        this.rpc.take();
         frame
     }
 

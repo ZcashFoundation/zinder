@@ -5,7 +5,7 @@ use http_body_util::{BodyExt as _, Full};
 use prost::Message as _;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
+use tokio_stream::StreamExt as _;
 use tonic::{Code, Status, body::Body, codegen::Bytes, transport::Channel};
 use tower::{Layer as _, ServiceExt as _};
 use zinder_core::{BlockId, Network, TransactionId, wire::encode_rpc_transaction_id_hex};
@@ -116,7 +116,7 @@ async fn with_fixture_client(
     let endpoint = format!("http://{}", listener.local_addr()?);
     let server = public_grpc_server(ClientAddressSource::Connection)
         .add_service(fixture.adapter.into_server())
-        .serve_with_incoming(TcpListenerStream::new(listener));
+        .serve_with_incoming(listener);
     let request = async {
         let client = CompactTxStreamerClient::connect(endpoint).await?;
         check(client).await

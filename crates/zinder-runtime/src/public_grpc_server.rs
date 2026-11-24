@@ -11,9 +11,23 @@
 //! - a connection closed once the client's protocol errors have made the
 //!   server reset [`HTTP2_MAX_LOCAL_ERROR_RESETS`] of its streams;
 //! - a server-wide bound on requests whose message is still arriving
-//!   ([`GrpcReceiveLimitLayer`]); and
-//! - an end to any response whose client stops reading it
-//!   ([`GrpcSendStallLayer`]).
+//!   ([`GrpcReceiveLimitLayer`]);
+//! - an end to any response whose client stops reading it: the transport
+//!   held the response's data for the send stall timeout, so the listener
+//!   resets the response's HTTP/2 stream while the connection and its other
+//!   streams stay open;
+//! - an HTTP/2 response's end sent only once the client's window covers the
+//!   data before it, so a finished response cannot keep data and a stream
+//!   slot that no reset can reach; and
+//! - a connection closed once it writes less than 16 KiB within the send
+//!   stall timeout after a write blocks, because its client has stopped
+//!   reading every stream on it.
+//!
+//! Zinder serves these listeners with its own connection loop
+//! ([`PublicGrpcRouter`]) instead of tonic's, because resetting one stream
+//! needs the task hyper sends that stream from, and tonic gives no way to
+//! reach it. [`GrpcSendStallLayer`] ends a call whose client stops reading
+//! when a listener cannot reset its transport, as tonic's own server cannot.
 //!
 //! tonic reads a whole request message into memory before the handler runs,
 //! and the per-connection stream limit does not bound how many messages the
@@ -37,9 +51,13 @@
 //! calls still open once the runtime's drain deadline passes.
 
 mod call_termination;
+mod grpc_timeout;
 mod message_boundaries;
 mod receive_slots;
+mod release_gate;
 mod send_stall;
+mod serving;
+mod stream_reset;
 mod wallet_rpc_metrics;
 
 use std::{
@@ -63,10 +81,7 @@ use tonic::{
     body::Body,
     server::NamedService,
     service::interceptor::InterceptedService,
-    transport::{
-        Server,
-        server::{Router, TcpConnectInfo, TlsConnectInfo},
-    },
+    transport::server::{TcpConnectInfo, TlsConnectInfo},
 };
 use tonic_reflection::server::{
     Builder as ReflectionBuilder,
@@ -80,13 +95,16 @@ use zinder_proto::compat::lightwalletd::compact_tx_streamer_server;
 
 pub(crate) use self::call_termination::OpenGrpcCalls;
 pub use self::call_termination::{GrpcCallTermination, GrpcCallTerminationLayer};
+pub use self::grpc_timeout::GrpcDeadline;
 use self::send_stall::ResponseCancellation;
 pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
+pub use self::serving::{PublicGrpcRouter, PublicGrpcServer};
 pub(crate) use self::wallet_rpc_metrics::{RANGE_BLOCKS, RANGE_DURATION, WalletRpcMethod};
 pub use self::wallet_rpc_metrics::{WalletRpcMetrics, WalletRpcMetricsLayer};
 use self::{
     message_boundaries::MessageBoundaries,
     receive_slots::{ReceiveSlot, ReceiveSlots},
+    stream_reset::TransportReset,
 };
 use crate::{Readiness, TrafficReadinessInterceptor, public_grpc_health::public_grpc_health};
 
@@ -153,12 +171,10 @@ const RECEIVE_SLOT_HOLD_DURATION_METRIC: &str =
 const PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC: &str =
     "zinder_grpc_proxy_client_address_fallbacks_total";
 const SEND_STALLS_METRIC: &str = "zinder_grpc_response_send_stalls_total";
+const RELEASE_PROBES_METRIC: &str = "zinder_grpc_response_release_probes_total";
 
 /// The layers every public Zinder listener applies to its requests.
-type PublicGrpcLayers = Stack<GrpcSendStallLayer, Stack<GrpcReceiveLimitLayer, Identity>>;
-
-/// The tonic server type that [`public_grpc_server`] returns.
-pub type PublicGrpcServer = Server<PublicGrpcLayers>;
+pub type PublicGrpcLayers = Stack<GrpcSendStallLayer, Stack<GrpcReceiveLimitLayer, Identity>>;
 
 /// The layers of a supervised public listener, outermost first: call
 /// termination, the receive limit, and the send stall bound.
@@ -171,9 +187,12 @@ pub(crate) type SupervisedGrpcLayers = Stack<
 /// default receive limits and send stall timeout, telling clients apart by
 /// `client_address`.
 ///
-/// Add services and serve as with [`tonic::transport::Server::builder`].
+/// Add services with [`PublicGrpcServer::add_service`] and serve the
+/// [`PublicGrpcRouter`] it returns.
 #[must_use]
-pub fn public_grpc_server(client_address: ClientAddressSource) -> PublicGrpcServer {
+pub fn public_grpc_server(
+    client_address: ClientAddressSource,
+) -> PublicGrpcServer<PublicGrpcLayers> {
     public_grpc_server_with(
         GrpcReceiveLimits::default(),
         DEFAULT_GRPC_SEND_STALL_TIMEOUT,
@@ -191,9 +210,9 @@ pub fn public_grpc_server_with(
     limits: GrpcReceiveLimits,
     send_stall_timeout: Duration,
     client_address: ClientAddressSource,
-) -> PublicGrpcServer {
+) -> PublicGrpcServer<PublicGrpcLayers> {
     describe_limit_metrics();
-    public_grpc_transport()
+    public_grpc_transport(send_stall_timeout)
         .layer(GrpcReceiveLimitLayer::new(limits, client_address))
         .layer(GrpcSendStallLayer::new(send_stall_timeout))
 }
@@ -218,28 +237,24 @@ pub(crate) fn supervised_grpc_layers(
         .into_inner()
 }
 
-/// The HTTP/2 transport policy every public listener shares.
-pub(crate) fn public_grpc_transport() -> Server {
-    Server::builder()
-        .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
-        .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
-        .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
-        .http2_max_local_error_reset_streams(Some(HTTP2_MAX_LOCAL_ERROR_RESETS))
+/// The transport every public listener shares, with no layers yet. A
+/// connection whose writes make no progress for `send_stall_timeout` closes.
+pub(crate) fn public_grpc_transport(send_stall_timeout: Duration) -> PublicGrpcServer {
+    PublicGrpcServer::new(send_stall_timeout)
 }
 
 /// Assembles a supervised listener that serves `application_service`
 /// behind the traffic gate, and reflection and health outside it.
 ///
 /// Open health `Watch` streams end once `drain` is cancelled.
-pub(crate) fn supervised_router<S, L, ResponseBody>(
-    mut server: Server<L>,
+pub(crate) fn supervised_router<S, L, T, ResponseBody>(
+    server: PublicGrpcServer<L, T>,
     application_service: S,
     descriptor_set: &'static [u8],
     readiness: &Readiness,
     drain: &CancellationToken,
-) -> Result<Router<L>, tonic_reflection::server::Error>
+) -> Result<PublicGrpcRouter<L, T>, tonic_reflection::server::Error>
 where
-    L: Clone,
     S: Service<http::Request<Body>, Response = http::Response<ResponseBody>, Error = Infallible>
         + NamedService
         + Clone
@@ -385,8 +400,15 @@ fn describe_limit_metrics() {
     metrics::describe_counter!(
         SEND_STALLS_METRIC,
         metrics::Unit::Count,
-        "gRPC responses ended with DEADLINE_EXCEEDED because their client stopped reading \
-         them for the send stall timeout."
+        "gRPC responses whose transport held their data for the send stall timeout. The \
+         listener abandons each one by resetting its HTTP/2 stream, or by closing its HTTP/1.1 \
+         connection."
+    );
+    metrics::describe_counter!(
+        RELEASE_PROBES_METRIC,
+        metrics::Unit::Count,
+        "One-byte chunks a public gRPC listener sent before ending or pausing an HTTP/2 \
+         response, to confirm the client's flow-control window covers the data before them."
     );
 }
 
@@ -524,12 +546,17 @@ where
         if let Some(cancellation) = &response_cancellation {
             request.extensions_mut().insert(cancellation.clone());
         }
+        // `call` runs inside the task that carries the request.
+        let transport_reset = (pool == ReceivePool::ClientStream)
+            .then(TransportReset::current)
+            .flatten();
         let request = request.map(|body| {
             Body::new(ReceiveBoundBody {
                 inner: body,
                 state: ReceiveState::Receiving(Box::new(Receiving::new(
                     admission.slot,
                     receive_timeout,
+                    transport_reset,
                 ))),
                 pool,
                 receive_timeout,
@@ -689,14 +716,24 @@ struct Receiving {
     _slot: ReceiveSlot,
     deadline: Pin<Box<Sleep>>,
     evicted: Pin<Box<WaitForCancellationFutureOwned>>,
+    /// Completes once the HTTP/2 stream or HTTP/1.1 connection that carries a
+    /// client stream is reset. A handler that keeps polling the request, such
+    /// as gRPC reflection, then sees it fail and drops it, which lets h2
+    /// finish the stream's reset.
+    transport_reset: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
     boundaries: MessageBoundaries,
 }
 
 impl Receiving {
-    fn new(slot: ReceiveSlot, receive_timeout: Duration) -> Self {
+    fn new(
+        slot: ReceiveSlot,
+        receive_timeout: Duration,
+        transport_reset: Option<TransportReset>,
+    ) -> Self {
         Self {
             deadline: Box::pin(tokio::time::sleep(receive_timeout)),
             evicted: Box::pin(slot.evicted()),
+            transport_reset: transport_reset.map(|reset| Box::pin(reset.wait_for_reset())),
             _slot: slot,
             boundaries: MessageBoundaries::default(),
         }
@@ -730,6 +767,14 @@ impl http_body::Body for ReceiveBoundBody {
         if receiving.evicted.as_mut().poll(cx).is_ready() {
             this.state = ReceiveState::Cancelled;
             return Poll::Ready(Some(Err(this.report(too_many_requests()))));
+        }
+        if let Some(reset) = &mut receiving.transport_reset
+            && reset.as_mut().poll(cx).is_ready()
+        {
+            this.state = ReceiveState::Cancelled;
+            return Poll::Ready(Some(Err(
+                this.report(Status::cancelled("the response's stream was reset"))
+            )));
         }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {

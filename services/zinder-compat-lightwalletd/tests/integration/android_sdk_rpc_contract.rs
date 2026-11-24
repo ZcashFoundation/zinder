@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::{net::TcpListener, sync::oneshot};
-use tokio_stream::wrappers::TcpListenerStream;
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
@@ -136,7 +135,7 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
     let server = tokio::spawn(async move {
         zinder_runtime::public_grpc_server(zinder_runtime::ClientAddressSource::Connection)
             .add_service(adapter.into_server())
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+            .serve_with_incoming_shutdown(listener, async move {
                 let _shutdown_result = shutdown_receiver.await;
             })
             .await

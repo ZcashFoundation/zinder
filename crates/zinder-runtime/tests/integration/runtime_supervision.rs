@@ -8,10 +8,7 @@ use tokio::{
     net::TcpListener,
     sync::mpsc,
 };
-use tokio_stream::{
-    StreamExt as _,
-    wrappers::{ReceiverStream, TcpListenerStream},
-};
+use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Code, Request, Status, transport::Endpoint};
 use tonic_health::pb::{
     HealthCheckRequest, health_check_response::ServingStatus, health_client::HealthClient,
@@ -58,7 +55,7 @@ fn serve_wallet_listener(
     runtime: &SupervisedRuntime,
     readiness: &Readiness,
     listener: TcpListener,
-) -> Result<impl Future<Output = Result<(), tonic::transport::Error>> + use<>> {
+) -> Result<impl Future<Output = Result<(), std::io::Error>> + use<>> {
     let stand_in_wallet_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
         .build_v1alpha()?;
@@ -68,10 +65,7 @@ fn serve_wallet_listener(
         ClientAddressSource::Connection,
         readiness,
     )?;
-    Ok(router.serve_with_incoming_shutdown(
-        TcpListenerStream::new(listener),
-        runtime.grpc_server_shutdown(),
-    ))
+    Ok(router.serve_with_incoming_shutdown(listener, runtime.grpc_server_shutdown()))
 }
 
 fn ready() -> Readiness {

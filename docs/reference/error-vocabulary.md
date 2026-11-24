@@ -25,6 +25,13 @@ Transport refusals, which happen before any handler runs, carry no
 `ErrorInfo`. [Configuration](configuration.md#public-grpc-listeners) lists
 them with their status codes.
 
+A response whose client stops reading it ends at the send-stall deadline with
+an HTTP/2 stream reset (`RST_STREAM` with `CANCEL`) instead of a status.
+Clients built on grpc-go, grpc-java, and tonic with its `server` feature
+report it as `CANCELLED` with no `ErrorInfo`. gRPC Swift on SwiftNIO reports `UNAVAILABLE`, and other
+clients, or a proxy in front of Zinder, may report it differently.
+`zinder-client` classifies it as `RetryPolicy::RetryWithBackoff`.
+
 A node that rejects a broadcast transaction is not an error. The response
 carries a `BroadcastRejectionReason` verdict instead, as
 [ADR-0018](../adrs/0018-transaction-facts-status-and-broadcast.md) describes.

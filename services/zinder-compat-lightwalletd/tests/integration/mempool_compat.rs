@@ -131,7 +131,7 @@ async fn lightwalletd_get_mempool_tx_filters_with_twenty_thousand_suffixes() -> 
     tokio::spawn(
         zinder_runtime::public_grpc_server(zinder_runtime::ClientAddressSource::Connection)
             .add_service(adapter.into_server())
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            .serve_with_incoming(listener),
     );
     let mut client =
         lightwalletd::compact_tx_streamer_client::CompactTxStreamerClient::connect(endpoint)

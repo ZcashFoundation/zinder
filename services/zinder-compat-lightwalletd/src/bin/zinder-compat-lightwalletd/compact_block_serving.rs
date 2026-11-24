@@ -5416,10 +5416,7 @@ mod tests {
         )?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let listener_address = listener.local_addr()?;
-        let server = router.serve_with_incoming_shutdown(
-            TcpListenerStream::new(listener),
-            runtime.grpc_server_shutdown(),
-        );
+        let server = router.serve_with_incoming_shutdown(listener, runtime.grpc_server_shutdown());
         let shutdown = runtime.shutdown_request();
         let supervised = tokio::spawn({
             let serving_readiness = serving_readiness.clone();
