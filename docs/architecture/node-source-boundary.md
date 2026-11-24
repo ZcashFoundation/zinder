@@ -38,8 +38,11 @@ the source. A call waits for a slot for at most its own timeout. A
 `node.broadcast_timeout_secs` or else `node.request_timeout_secs`, so a queued
 broadcast never runs longer than one timeout. Readiness probes use one slot of
 their own: the tip and `getblockchaininfo` reads, and in lightwalletd serving
-the node verification the probe runs first. Calls that hold every shared slot
-therefore never delay a readiness probe.
+the node verification the probe runs first. Every node verification a reader
+shares with its readiness probe also uses that slot: the light-wallet schedule
+check and each broadcast endpoint's verification, whether a request or the
+probe starts it. Calls that hold every shared slot therefore never delay a
+readiness probe.
 [Configuration](../reference/configuration.md#the-node-sections) gives the
 default and the sizing rule.
 

@@ -702,7 +702,11 @@ impl EndpointVerifications {
         if let Some(settled) = verification.settled(target) {
             return settled;
         }
-        let outcome = verify_node_endpoint(source, target).await;
+        // The attempt lock is shared with readiness probes, so the attempt
+        // calls through the endpoint's verification view, never behind
+        // forwarded calls that hold its shared call slots.
+        let view = source.verification_view();
+        let outcome = verify_node_endpoint(view.as_ref().unwrap_or(source), target).await;
         let admission = self.admission.lock();
         verification.record(outcome, target, admission.as_deref())
     }
@@ -1304,7 +1308,11 @@ impl LightWalletNodeVerification {
             return Err(shared);
         }
 
-        let outcome = match verify_node_schedule(source, target).await {
+        // The schedule lock is held across these calls and readiness probes
+        // wait on it, so they go through the node's verification view, never
+        // behind forwarded calls that hold its shared call slots.
+        let view = source.verification_view();
+        let outcome = match verify_node_schedule(view.as_ref().unwrap_or(source), target).await {
             Ok(evidence) => {
                 *schedule = LightWalletNodeVerificationSchedule::Verified(
                     target.basis,

@@ -247,3 +247,180 @@ async fn a_cancelled_tip_check_leaves_no_running_call_behind() -> Result<()> {
         .map_err(|error| eyre!("a later check failed: {error}"))?;
     Ok(())
 }
+
+/// A JSON-RPC node that serves `schedule`, holds `tip`, and holds every
+/// `getrawtransaction` call until `gate` opens, so a caller can take every
+/// shared call slot of a source.
+struct SaturableNode {
+    server: zinder_testkit::JsonRpcTestServer,
+    entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+    gate: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
+}
+
+impl SaturableNode {
+    fn start(schedule: &NetworkUpgradeActivations, tip: BlockId) -> Result<Self> {
+        use serde_json::json;
+        use zinder_core::wire::{encode_branch_id_hex, encode_rpc_block_hash_hex};
+        use zinder_testkit::{RpcReply, method};
+
+        let upgrades: serde_json::Map<_, _> = schedule
+            .activations()
+            .iter()
+            .map(|activation| {
+                (
+                    encode_branch_id_hex(activation.branch_id),
+                    json!({"name": activation.name, "status": "active",
+                        "activationheight": activation.activation_height.value()}),
+                )
+            })
+            .collect();
+        let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+        let held = Arc::clone(&gate);
+        let server = zinder_testkit::JsonRpcTestServer::start([
+            method("rpc.discover").reply_with(|_| {
+                RpcReply::result(json!({"methods": [{"name": "sendrawtransaction"}]}))
+            }),
+            method("getblockchaininfo")
+                .reply_with(move |_| RpcReply::result(json!({"upgrades": upgrades}))),
+            method("getblockhash")
+                .reply_with(move |_| RpcReply::result(json!(encode_rpc_block_hash_hex(tip.hash)))),
+            method("getrawtransaction").reply_with(move |_| {
+                let _ = entered_tx.send(());
+                let (released, opened) = &*held;
+                let mut released = released.lock();
+                opened.wait_while_for(
+                    &mut released,
+                    |released| !*released,
+                    std::time::Duration::from_secs(20),
+                );
+                RpcReply::error("released")
+            }),
+        ])?;
+        Ok(Self {
+            server,
+            entered,
+            gate,
+        })
+    }
+
+    /// A source with one shared call slot and a long request timeout.
+    fn one_slot_source(&self) -> Result<zinder_source::ZebraJsonRpcSource> {
+        Ok(zinder_source::ZebraJsonRpcSource::with_options(
+            Network::ZcashRegtest,
+            self.server.url(),
+            zinder_source::NodeAuth::None,
+            zinder_source::ZebraJsonRpcSourceOptions {
+                request_timeout: std::time::Duration::from_secs(15),
+                max_concurrent_requests: std::num::NonZeroU32::MIN,
+                ..zinder_source::ZebraJsonRpcSourceOptions::default()
+            },
+        )?)
+    }
+
+    /// Takes the source's only shared slot with a call the node holds.
+    async fn saturate(
+        &mut self,
+        source: &zinder_source::ZebraJsonRpcSource,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let holder = source.clone();
+        let call = tokio::spawn(async move {
+            let _ = holder
+                .fetch_mined_transaction_bytes(zinder_core::TransactionId::from_bytes([7; 32]))
+                .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.entered.recv())
+            .await?
+            .ok_or_else(|| eyre!("the saturating call never reached the node"))?;
+        Ok(call)
+    }
+
+    fn open(&self) {
+        let (released, opened) = &*self.gate;
+        *released.lock() = true;
+        opened.notify_all();
+    }
+}
+
+const PROMPTLY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The sample Regtest upgrades, one activating at each height from 1, which
+/// a node reports the same way it is stored.
+fn one_upgrade_per_height() -> Result<NetworkUpgradeActivations> {
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .zip(1..)
+            .map(
+                |(activation, height)| zinder_core::NetworkUpgradeActivation {
+                    activation_height: zinder_core::BlockHeight::new(height),
+                    ..activation.clone()
+                },
+            )
+            .collect(),
+    )?)
+}
+
+#[tokio::test]
+async fn light_wallet_schedule_verification_and_readiness_pass_while_shared_slots_are_full()
+-> Result<()> {
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let reader = Arc::new(RocksDbCanonicalReader::new(store.take_readers()?.0)?);
+    let tip = crate::CanonicalReader::event_fence(reader.as_ref()).visible_tip();
+    let mut node = SaturableNode::start(&schedule, tip)?;
+    let source = node.one_slot_source()?;
+    let captured = Arc::clone(&reader);
+    let query = crate::LightWalletNodeQuery::new(
+        move || Arc::clone(&captured),
+        source.clone(),
+        std::time::Duration::from_secs(1),
+        std::num::NonZeroU32::MIN,
+    );
+    let target = crate::VerifiedNodeTarget::of(&reader)?;
+    let held = node.saturate(&source).await?;
+
+    // A foreground request refreshes the schedule while it holds the
+    // verification lock, and the readiness probe then verifies behind it.
+    tokio::time::timeout(PROMPTLY, query.schedule_verified_node(&target))
+        .await
+        .map_err(|_| eyre!("a schedule refresh waited behind saturated shared slots"))??;
+    let probe = query.readiness_probe_node();
+    tokio::time::timeout(PROMPTLY, query.verify_current(&probe))
+        .await
+        .map_err(|_| eyre!("the readiness probe waited behind saturated shared slots"))??;
+
+    node.open();
+    held.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn broadcast_endpoint_reverification_passes_while_shared_slots_are_full() -> Result<()> {
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let (canonical, wallet) = store.take_readers()?;
+    let pair = Arc::new(crate::WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(crate::RocksDbWalletReader::new(wallet)),
+    )?);
+    let tip = pair.canonical_fence().visible_tip();
+    let slot = crate::WalletServingPairSlot::new(pair);
+    let mut node = SaturableNode::start(&schedule, tip)?;
+    let source = node.one_slot_source()?;
+    let nodes = crate::OrderedBroadcaster::new(source.clone(), []);
+    let held = node.saturate(&source).await?;
+
+    tokio::time::timeout(PROMPTLY, nodes.verify_endpoint(0, &slot))
+        .await
+        .map_err(|_| eyre!("endpoint verification waited behind saturated shared slots"))??;
+    assert!(nodes.verified_capabilities().is_some());
+
+    node.open();
+    held.await?;
+    Ok(())
+}

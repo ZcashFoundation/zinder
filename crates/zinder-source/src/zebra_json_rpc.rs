@@ -1955,6 +1955,12 @@ impl BroadcastNodeProbe for ZebraJsonRpcSource {
     async fn holds_block(&self, block: BlockId) -> Result<bool, SourceError> {
         Ok(self.fetch_block_hash(block.height).await? == block.hash)
     }
+
+    /// Verification calls through the readiness-probe view, whose calls use
+    /// the upstream-health slot instead of the shared call budget.
+    fn verification_view(&self) -> Option<Self> {
+        Some(self.for_readiness_probes())
+    }
 }
 
 #[async_trait]
