@@ -109,21 +109,58 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// intermediaries that don't surface the failure to userspace.
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
-/// HTTP/2 stream-level receive window advertised to the server.
+/// HTTP/2 stream-level receive window the client advertises to the server.
 ///
-/// The 65,535-byte default caps a single `CompactBlocksInRange` stream at
-/// roughly `65,535 B / RTT`, about 728 KB/s over a 90 ms WAN round trip. Four
-/// MiB lets one stream fill a WAN bandwidth-delay product.
+/// Raised above hyper's unconfigured 2 MiB client stream window so a single
+/// `CompactBlocksInRange` stream can fill a WAN bandwidth-delay product.
+/// Hyper's client, not the HTTP/2 spec, chooses that 2 MiB default; other
+/// stacks start from the 65,535-byte spec window.
 const HTTP2_INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 
-/// HTTP/2 connection-level receive window advertised to the server.
+/// HTTP/2 connection-level receive window the client advertises to the server.
 ///
-/// Sixteen MiB lets every concurrent stream share the connection window
-/// without a single stream's window bounding aggregate WAN throughput.
+/// Raised above hyper's unconfigured 5 MiB client connection window so every
+/// concurrent stream shares the connection window without one stream's window
+/// bounding aggregate WAN throughput.
 const HTTP2_INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// Maximum DATA frame size the client advertises in `SETTINGS_MAX_FRAME_SIZE`.
+///
+/// A server caps the frames it sends at the value its peer advertises, so
+/// raising this from hyper's 16 KiB default lets the server send 64 KiB frames
+/// and reduces per-frame overhead over a WAN round trip.
+const HTTP2_MAX_FRAME_SIZE: u32 = 64 * 1024;
 
 /// Oldest native wallet contract revision this client can safely consume.
 pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 8;
+
+/// Builds the tonic [`Endpoint`] for a native `WalletQuery` endpoint, with the
+/// WAN HTTP/2 flow-control and framing settings the remote index relies on.
+///
+/// The endpoint advertises fixed initial windows and frame size. It does not
+/// enable hyper's adaptive window, because in tonic 0.14.9 and hyper 1.12.0
+/// `adaptive_window(true)` resets both initial windows back to the 65,535-byte
+/// spec value, discarding these larger sizes.
+fn build_endpoint(uri: &str) -> Result<Endpoint, IndexerError> {
+    // URI scheme is the TLS signal: `https://` negotiates rustls with system roots.
+    let use_tls = uri.starts_with("https://");
+    let mut endpoint = Channel::from_shared(uri.to_owned())
+        .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
+    if use_tls {
+        endpoint = endpoint
+            .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())
+            .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
+    }
+    Ok(endpoint
+        .keep_alive_while_idle(true)
+        .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .tcp_keepalive(Some(TCP_KEEPALIVE))
+        .initial_stream_window_size(HTTP2_INITIAL_STREAM_WINDOW)
+        .initial_connection_window_size(HTTP2_INITIAL_CONNECTION_WINDOW)
+        .max_frame_size(HTTP2_MAX_FRAME_SIZE))
+}
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
@@ -132,30 +169,17 @@ impl RemoteChainIndex {
     /// established on the first gRPC call, not here. Only URI parsing can
     /// fail at this stage; transport errors surface at first use.
     pub fn connect(options: RemoteOpenOptions) -> Result<Self, IndexerError> {
-        // URI scheme is the TLS signal: `https://` negotiates rustls with system roots.
-        let use_tls = options.endpoint.starts_with("https://");
-        let mut endpoint = Channel::from_shared(options.endpoint)
-            .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
-        if use_tls {
-            endpoint = endpoint
-                .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())
-                .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
-        }
-        let endpoint = endpoint
-            .keep_alive_while_idle(true)
-            .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
-            .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_keepalive(Some(TCP_KEEPALIVE))
-            .http2_adaptive_window(true)
-            .initial_stream_window_size(HTTP2_INITIAL_STREAM_WINDOW)
-            .initial_connection_window_size(HTTP2_INITIAL_CONNECTION_WINDOW);
+        let RemoteOpenOptions {
+            endpoint: uri,
+            network,
+        } = options;
+        let endpoint = build_endpoint(&uri)?;
         let channel = endpoint.connect_lazy();
 
         Ok(Self {
             client: Arc::new(ArcSwap::new(Arc::new(WalletQueryClient::new(channel)))),
             endpoint,
-            network: options.network,
+            network,
         })
     }
 
@@ -1339,6 +1363,119 @@ mod server_info_conversion_tests {
             schema_version,
             ..wallet::WalletServerInfo::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod endpoint_transport_tests {
+    use std::{io, time::Duration};
+
+    use tokio::io::AsyncReadExt;
+
+    use super::*;
+
+    /// The 24-byte HTTP/2 connection preface every client sends before its
+    /// first frame.
+    const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    /// The header and payload of one HTTP/2 frame.
+    struct Http2Frame {
+        kind: u8,
+        stream_id: u32,
+        payload: Vec<u8>,
+    }
+
+    async fn read_frame(stream: &mut (impl AsyncReadExt + Unpin)) -> io::Result<Http2Frame> {
+        let mut header = [0u8; 9];
+        stream.read_exact(&mut header).await?;
+        let length = u32::from(header[0]) << 16 | u32::from(header[1]) << 8 | u32::from(header[2]);
+        let kind = header[3];
+        let stream_id =
+            u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+        let mut payload = vec![
+            0u8;
+            usize::try_from(length).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds usize")
+            })?
+        ];
+        stream.read_exact(&mut payload).await?;
+        Ok(Http2Frame {
+            kind,
+            stream_id,
+            payload,
+        })
+    }
+
+    /// The endpoint advertises fixed WAN windows and frame size, not the
+    /// 65,535-byte windows hyper's adaptive setting would substitute.
+    #[tokio::test]
+    async fn the_endpoint_advertises_fixed_wan_http2_windows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let endpoint = build_endpoint(&format!("http://{address}"))?;
+        // The handshake waits for the server's SETTINGS frame, which this test
+        // never sends, so drive it in a task the test aborts afterward.
+        let connect = tokio::spawn(async move { endpoint.connect().await });
+        let (mut stream, _) = listener.accept().await?;
+
+        let mut preface = [0u8; 24];
+        stream.read_exact(&mut preface).await?;
+        assert_eq!(&preface, CLIENT_PREFACE);
+
+        let mut initial_window_size = None;
+        let mut max_frame_size = None;
+        let mut connection_window_increment = 0u32;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, read_frame(&mut stream)).await??;
+            match frame.kind {
+                // SETTINGS.
+                0x4 => {
+                    for entry in frame.payload.as_chunks::<6>().0 {
+                        let id = u16::from_be_bytes([entry[0], entry[1]]);
+                        let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
+                        match id {
+                            // SETTINGS_INITIAL_WINDOW_SIZE.
+                            0x4 => initial_window_size = Some(value),
+                            // SETTINGS_MAX_FRAME_SIZE.
+                            0x5 => max_frame_size = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
+                // WINDOW_UPDATE on the connection, stream 0.
+                0x8 if frame.stream_id == 0 && frame.payload.len() == 4 => {
+                    let increment = u32::from_be_bytes([
+                        frame.payload[0],
+                        frame.payload[1],
+                        frame.payload[2],
+                        frame.payload[3],
+                    ]) & 0x7fff_ffff;
+                    connection_window_increment =
+                        connection_window_increment.wrapping_add(increment);
+                }
+                _ => {}
+            }
+            if initial_window_size.is_some()
+                && max_frame_size.is_some()
+                && connection_window_increment > 0
+            {
+                break;
+            }
+        }
+
+        assert_eq!(initial_window_size, Some(HTTP2_INITIAL_STREAM_WINDOW));
+        assert_eq!(max_frame_size, Some(HTTP2_MAX_FRAME_SIZE));
+        // The connection window starts at the spec's 65,535 bytes and the
+        // client raises it to its advertised size by WINDOW_UPDATE.
+        assert_eq!(
+            65_535u32 + connection_window_increment,
+            HTTP2_INITIAL_CONNECTION_WINDOW
+        );
+
+        connect.abort();
+        Ok(())
     }
 }
 

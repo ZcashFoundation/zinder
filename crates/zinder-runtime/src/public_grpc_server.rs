@@ -130,18 +130,16 @@ const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// resets without end.
 pub const HTTP2_MAX_LOCAL_ERROR_RESETS: usize = 1024;
 
-/// Maximum DATA frame size the server advertises and sends.
-///
-/// Raised from hyper's 16 KiB default so a large compact-block batch is not
-/// fragmented into 16 KiB frames, which caps throughput over WAN round trips.
-const HTTP2_MAX_FRAME_SIZE: u32 = 64 * 1024;
-
 /// Largest send buffer per HTTP/2 stream.
 ///
+/// This is h2's per-stream backpressure threshold, not a hard memory cap: once
+/// a stream's queued data reaches it, h2 stops polling the producer for more.
 /// Raised from hyper's ~400 KiB default so a single `GetBlockRange` stream can
-/// fill a 100-200 ms round-trip bandwidth-delay product. Worst-case memory is
-/// the concurrent stream bound times this buffer, because a stalled stream is
-/// reset at the send stall timeout ([`DEFAULT_GRPC_SEND_STALL_TIMEOUT`]).
+/// fill a 100-200 ms round-trip bandwidth-delay product. A stalled stream is
+/// still reset at the send stall timeout ([`DEFAULT_GRPC_SEND_STALL_TIMEOUT`]),
+/// and the write-stall bound closes a connection that cannot write out what it
+/// holds. The queued data and its backing buffers can exceed this per stream;
+/// see [Configuration](../../../docs/reference/configuration.md#public-grpc-listeners).
 const HTTP2_MAX_SEND_BUF_SIZE: usize = 1024 * 1024;
 
 /// Requests each receive pool admits at once across every connection.
@@ -870,7 +868,7 @@ mod tests {
 
     use super::{
         CLIENT_STREAMING_METHOD_PATHS, ClientAddressSource, ClientFairnessKey,
-        PROXY_CLIENT_ADDRESS_HEADER, client_address,
+        PROXY_CLIENT_ADDRESS_HEADER, ProxyHeaderFallback, client_address, proxy_named_client,
     };
 
     const PROXY_CONNECTION: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000);
@@ -952,6 +950,21 @@ mod tests {
                 client_address(&request, ClientAddressSource::ProxyHeader),
                 Some(ClientFairnessKey::Connection(PROXY_CONNECTION)),
                 "{fields:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn trailing_whitespace_and_bracketed_bare_ip_fall_back_as_invalid() -> Result<(), http::Error> {
+        // Strict parsing: a bare IP with trailing whitespace, or a bracketed
+        // bare IPv6 address without a port, is neither one `ip:port` address
+        // nor one bare IP address, so it falls back to the peer as `invalid`.
+        for header in ["203.0.113.7 ", "[2001:db8::7]"] {
+            let request = proxied_request(&[header])?;
+            assert_eq!(
+                proxy_named_client(request.headers()),
+                Err(ProxyHeaderFallback::Invalid)
             );
         }
         Ok(())

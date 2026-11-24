@@ -35,9 +35,8 @@ use tower::{
 };
 
 use super::{
-    GrpcDeadline, HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, HTTP2_MAX_FRAME_SIZE,
-    HTTP2_MAX_LOCAL_ERROR_RESETS, HTTP2_MAX_SEND_BUF_SIZE, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
-    grpc_timeout,
+    GrpcDeadline, HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, HTTP2_MAX_LOCAL_ERROR_RESETS,
+    HTTP2_MAX_SEND_BUF_SIZE, MAX_CONCURRENT_STREAMS_PER_CONNECTION, grpc_timeout,
     release_gate::{GateObserver, ReleaseGate},
     stream_reset::{ResettableStreams, resettable},
 };
@@ -408,7 +407,6 @@ fn connection_builder(
         .http2()
         .timer(TokioTimer::new())
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
-        .max_frame_size(HTTP2_MAX_FRAME_SIZE)
         .max_send_buf_size(HTTP2_MAX_SEND_BUF_SIZE)
         .keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
         .keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
