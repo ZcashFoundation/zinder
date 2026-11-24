@@ -216,7 +216,7 @@ exercises it.
 | `ci-pr` | Every pull request, pushes to `main`, and weekly | The `rust` job runs format, check, clippy, docs, and the `ci`, `ci-postgres`, `ci-parity`, and `ci-perf` profiles. `dependency hygiene` runs the changelog, runbook, alignment, and release-policy scripts, `cargo deny`, and `cargo machete`. Other jobs check the SDK packages and the vendored protocols. Coverage and mutation run only on the weekly schedule or a manual run. |
 | `protocol-contracts` | Pull requests and `main` pushes that touch the protocol | Checked-in generated code, `proto breaking` (pull requests only), and capability coverage |
 | `live-tests` | Node-facing pull requests, nightly Regtest, weekly Testnet, and manual Mainnet | The T3 suite, once against Zebra and once against Zakura on Regtest |
-| `parity-compat` | Node-facing pull requests and nightly | Live parity against a reference lightwalletd, on both nodes |
+| `parity-compat` | Node-facing pull requests and nightly | Live parity against a reference lightwalletd and a pinned CBB light client, on both nodes |
 | `binary-archives` | Pull requests that touch build inputs | Release binary archives for both platforms |
 | `build-images` | Pull requests that touch images or deployment files | Deployment admission and runtime image smoke builds |
 
@@ -761,6 +761,13 @@ ZINDER_TEST_LIVE=1 \
 
 CI excludes the mempool parity tests, because this fixed-height setup has no
 live mempool composition.
+
+The [parity workflow](../../.github/workflows/parity-compat.yml) builds a
+pinned version of [Compact Block Bench](https://github.com/dismad/cbb) and
+runs one client per listener. Each client requests the last three blocks and
+the tree state one block below the fixed tip. The smoke requires both calls
+to succeed, every client to connect, and the range probe to succeed. CI dumps
+the JSON reports on failure. Timing is recorded without a latency threshold.
 
 ## Specialized procedures
 

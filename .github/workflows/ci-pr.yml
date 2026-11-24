@@ -321,6 +321,9 @@ jobs:
               --profile rocksdb \
               config >/dev/null
 
+      - name: Test the CBB interoperability report contract
+        run: scripts/test-cbb-interop-report.sh
+
       - name: Test deployment Compose contract
         env:
           ZINDER_INGEST_IMAGE: zinder-ingest:ci-proof
