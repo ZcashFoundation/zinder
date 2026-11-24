@@ -17,9 +17,10 @@ use super::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, CanonicalStoreError, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore,
     block_load::{
-        BLOCK_HEADER_VALUE_LEN, StoredTreeStateRoots, decode_served_tree_state_checkpoint,
-        decode_stored_tree_state_roots, decode_tree_state_checkpoint, encode_block_position,
-        encode_transaction_position, encode_tree_state_checkpoint,
+        BLOCK_HEADER_VALUE_LEN, StoredTreeStateRoots, TRANSACTION_LOCATION_VALUE_LEN,
+        decode_served_tree_state_checkpoint, decode_stored_tree_state_roots,
+        decode_tree_state_checkpoint, encode_block_position, encode_transaction_position,
+        encode_tree_state_checkpoint,
     },
     block_replay::validate_incremental_replay_range_bound,
     pool_presence_mismatch,
@@ -38,7 +39,6 @@ use super::{
 };
 
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
-const TRANSACTION_LOCATION_VALUE_BYTES: usize = 40;
 const COMPACT_BLOCK_MULTI_GET_BATCH_SIZE: usize = 1_024;
 const BLOCK_BLOB_MULTI_GET_BATCH_SIZE: usize = 1_024;
 const TREE_STATE_ROOTS_MULTI_GET_BATCH_SIZE: usize = 1_024;
@@ -989,10 +989,19 @@ fn read_transaction_blob(
     store: &impl CanonicalServingRead,
     location: TransactionLocation,
 ) -> Result<Option<TransactionBlobArtifact>, CanonicalStoreError> {
-    if read_transaction_location(store, location.transaction_id)? != Some(location) {
+    let Some(stored) = read_transaction_location(store, location.transaction_id)? else {
+        return Ok(None);
+    };
+    if stored.block_height != location.block_height
+        || stored.block_hash != location.block_hash
+        || stored.tx_index_in_block != location.tx_index_in_block
+        || location
+            .serialized_bytes_sha256
+            .is_some_and(|digest| Some(digest) != stored.serialized_bytes_sha256)
+    {
         return Ok(None);
     }
-    read_located_transaction_blob(store, location)
+    read_located_transaction_blob(store, stored)
 }
 
 /// Reads the raw transaction at `location`, which the caller read from this
@@ -1506,17 +1515,18 @@ fn decode_transaction_location(
     transaction_id: TransactionId,
     encoded: &[u8],
 ) -> Result<TransactionLocation, CanonicalStoreError> {
-    if encoded.len() != TRANSACTION_LOCATION_VALUE_BYTES {
+    if encoded.len() != TRANSACTION_LOCATION_VALUE_LEN {
         return Err(CanonicalStoreError::publication(
             "transaction location is not the exact version-1 value",
         ));
     }
-    Ok(TransactionLocation::new(
+    Ok(TransactionLocation {
         transaction_id,
-        BlockHeight::new(read_u32_be(encoded, 0)?),
-        BlockHash::from_bytes(read_array(encoded, 4)?),
-        read_u32_be(encoded, 36)?,
-    ))
+        block_height: BlockHeight::new(read_u32_be(encoded, 0)?),
+        block_hash: BlockHash::from_bytes(read_array(encoded, 4)?),
+        tx_index_in_block: read_u32_be(encoded, 36)?,
+        serialized_bytes_sha256: Some(read_array(encoded, 40)?),
+    })
 }
 
 fn decode_height_key(encoded: &[u8]) -> Result<BlockHeight, CanonicalStoreError> {

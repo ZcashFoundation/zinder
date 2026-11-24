@@ -8,7 +8,7 @@ use std::{
 
 use metrics::Histogram;
 
-use rust_rocksdb::{DB, IngestExternalFileOptions, IteratorMode, Options};
+use rust_rocksdb::{DB, IngestExternalFileOptions, IteratorMode};
 use zinder_core::{
     BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, CanonicalBlockFacts,
     CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
@@ -24,11 +24,12 @@ use zinder_rocksdb_bulk_load::{
 use self::codec::{BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN};
 
 pub(super) use self::codec::{
-    BLOCK_HEADER_VALUE_LEN, StoredTreeStateRoots, decode_block_final_note_commitment_roots,
-    decode_served_tree_state_checkpoint, decode_stored_tree_state_roots,
-    decode_tree_state_checkpoint, encode_block_final_note_commitment_roots,
-    encode_block_hash_location, encode_block_header, encode_block_position,
-    encode_transaction_location, encode_transaction_position, encode_tree_state_checkpoint,
+    BLOCK_HEADER_VALUE_LEN, StoredTreeStateRoots, TRANSACTION_LOCATION_VALUE_LEN,
+    decode_block_final_note_commitment_roots, decode_served_tree_state_checkpoint,
+    decode_stored_tree_state_roots, decode_tree_state_checkpoint,
+    encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
+    encode_block_position, encode_transaction_location, encode_transaction_position,
+    encode_tree_state_checkpoint,
 };
 
 use super::{
@@ -42,8 +43,8 @@ use super::{
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        CanonicalColumnFamilyOptions, TRANSACTION_BLOB_COLUMN_FAMILY,
+        TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
     tree_state_replay::recorded_tree_sizes,
 };
@@ -206,7 +207,7 @@ pub(super) struct CanonicalStagedSstEvidence {
 #[derive(Clone, Copy)]
 pub(super) struct CanonicalBlockSstConfig<'options> {
     pub(super) staging_path: &'options Path,
-    pub(super) options: &'options Options,
+    pub(super) options: &'options CanonicalColumnFamilyOptions,
     pub(super) workload: CanonicalStoreWorkload,
     pub(super) build_plan: &'options CanonicalStoreBuildPlan,
     /// The activation table the build plan fingerprints, which decides the
@@ -300,7 +301,8 @@ impl<'options> CanonicalBlockSstStager<'options> {
         let transaction_location_capacity = fixed_record_capacity::<TRANSACTION_LOCATION_RECORD_LEN>(
             config.reverse_index_sort_memory_bytes,
         )?;
-        let mut tree_state_checkpoint_writer = config.ordered_writer("tree-state-checkpoint")?;
+        let mut tree_state_checkpoint_writer =
+            config.ordered_writer("tree-state-checkpoint", TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
         let predecessor = config.build_plan.history_predecessor();
         let predecessor_key = encode_block_position(predecessor.block_id.height);
         let predecessor_value =
@@ -310,14 +312,17 @@ impl<'options> CanonicalBlockSstStager<'options> {
             checked_row_bytes(predecessor_key.len(), predecessor_value.len())?;
         Ok(Self {
             stored_set: config.build_plan.stored_set(config.workload),
-            header_writer: config.ordered_writer("block-header")?,
-            replay_writer: config.ordered_writer("block-replay")?,
-            compact_writer: config.ordered_writer("compact-block")?,
-            transaction_blob_writer: config.ordered_writer("transaction-blob")?,
-            block_blob_writer: config.ordered_writer("block-blob")?,
+            header_writer: config.ordered_writer("block-header", BLOCK_HEADER_COLUMN_FAMILY)?,
+            replay_writer: config.ordered_writer("block-replay", BLOCK_REPLAY_COLUMN_FAMILY)?,
+            compact_writer: config.ordered_writer("compact-block", COMPACT_BLOCK_COLUMN_FAMILY)?,
+            transaction_blob_writer: config
+                .ordered_writer("transaction-blob", TRANSACTION_BLOB_COLUMN_FAMILY)?,
+            block_blob_writer: config.ordered_writer("block-blob", BLOCK_BLOB_COLUMN_FAMILY)?,
             tree_state_checkpoint_writer,
-            block_final_note_commitment_roots_writer: config
-                .ordered_writer("block-final-note-commitment-roots")?,
+            block_final_note_commitment_roots_writer: config.ordered_writer(
+                "block-final-note-commitment-roots",
+                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+            )?,
             block_hash_sorter: FixedRecordSorter::new(
                 config.staging_path,
                 "block-hash-index",
@@ -407,8 +412,10 @@ impl<'options> CanonicalBlockSstStager<'options> {
                 self.header_writer.finish()
             })?,
             block_hash: timed_finish_step("sort_merge", BLOCK_HASH_INDEX_COLUMN_FAMILY, || {
-                self.block_hash_sorter
-                    .finish::<32>(options, sst_target_logical_bytes)
+                self.block_hash_sorter.finish::<32>(
+                    options.for_family(BLOCK_HASH_INDEX_COLUMN_FAMILY),
+                    sst_target_logical_bytes,
+                )
             })?,
             replay: timed_finish_step("sst_finish", BLOCK_REPLAY_COLUMN_FAMILY, || {
                 self.replay_writer.finish()
@@ -420,8 +427,10 @@ impl<'options> CanonicalBlockSstStager<'options> {
                 "sort_merge",
                 TRANSACTION_LOCATION_COLUMN_FAMILY,
                 || {
-                    self.transaction_location_sorter
-                        .finish::<32>(options, sst_target_logical_bytes)
+                    self.transaction_location_sorter.finish::<32>(
+                        options.for_family(TRANSACTION_LOCATION_COLUMN_FAMILY),
+                        sst_target_logical_bytes,
+                    )
                 },
             )?,
             transaction_blob: timed_finish_step(
@@ -455,11 +464,12 @@ impl<'options> CanonicalBlockSstConfig<'options> {
     fn ordered_writer(
         self,
         artifact_label: &'static str,
+        family: &'static str,
     ) -> Result<OrderedSstWriter<'options>, CanonicalStoreError> {
         Ok(OrderedSstWriter::new(
             self.staging_path,
             artifact_label,
-            self.options,
+            self.options.for_family(family),
             self.sst_target_logical_bytes,
         )?)
     }
@@ -590,12 +600,15 @@ fn write_build_block(
                 height.value()
             ))
         })?;
-        let location_record = encode_transaction_location(TransactionLocation::new(
-            transaction.public_facts.transaction_id,
-            height,
-            facts.block_header.block_hash,
-            transaction_index,
-        ));
+        let location_record = encode_transaction_location(
+            TransactionLocation::new(
+                transaction.public_facts.transaction_id,
+                height,
+                facts.block_header.block_hash,
+                transaction_index,
+            ),
+            transaction.serialized_bytes_digest.as_bytes(),
+        );
         transaction_location_sorter.push(location_record)?;
     }
 
@@ -1418,8 +1431,11 @@ impl BlockSequenceRow {
             })?;
         let mut transaction_location_logical_bytes = 0;
         for _ in &block.facts.transactions {
-            transaction_location_logical_bytes =
-                checked_add_row_bytes(transaction_location_logical_bytes, 32, 40)?;
+            transaction_location_logical_bytes = checked_add_row_bytes(
+                transaction_location_logical_bytes,
+                32,
+                TRANSACTION_LOCATION_VALUE_LEN,
+            )?;
         }
         let mut transaction_blob_logical_bytes = 0;
         for transaction_blob in &block.transaction_blobs {

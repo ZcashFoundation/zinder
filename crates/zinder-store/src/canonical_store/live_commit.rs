@@ -786,12 +786,15 @@ fn append_transaction_rows(
                 height.value()
             ))
         })?;
-        let location_record = encode_transaction_location(TransactionLocation::new(
-            transaction.public_facts.transaction_id,
-            height,
-            facts.block_header.block_hash,
-            transaction_index,
-        ));
+        let location_record = encode_transaction_location(
+            TransactionLocation::new(
+                transaction.public_facts.transaction_id,
+                height,
+                facts.block_header.block_hash,
+                transaction_index,
+            ),
+            transaction.serialized_bytes_digest.as_bytes(),
+        );
         rows.push(PreparedLiveRow::new(
             TRANSACTION_LOCATION_COLUMN_FAMILY,
             location_record[..32].to_vec(),

@@ -46,7 +46,7 @@ use domain operations. Column family names and keys are private to
 | `block_replay` | Reversible `CanonicalBlockFacts` envelope per height, the source for every derived record |
 | `block_header` | Header by height |
 | `block_hash_index` | Height by block hash |
-| `transaction_location` | Block position by transaction ID |
+| `transaction_location` | Block position and serialized byte digest by transaction ID |
 | `compact_block` | Compact block per height |
 | `tree_state_checkpoint` | Commitment tree checkpoint at least every 100 blocks |
 | `subtree_root` | Completed shielded subtree roots |
@@ -57,6 +57,22 @@ use domain operations. Column family names and keys are private to
 | `mempool_event` | Retained mempool history |
 | `displaced_block_facts` | Blocks removed by a reorg |
 | `block_blob`, `transaction_blob` | Raw bytes, kept according to `storage.raw_blob_policy` |
+
+Canonical schema v1 uses a 72-byte value for each 32-byte transaction ID
+in `transaction_location`. The value contains a 4-byte big-endian block
+height, the 32-byte block hash, a 4-byte big-endian transaction index, and
+the 32-byte SHA-256 digest committed by canonical transaction facts. A
+location lookup returns the digest even when raw blob retention is disabled.
+The reader requires exactly 72 bytes. Rebuild any pre-release schema v1
+canonical store constructed with 40-byte transaction locations.
+
+RocksDB applies these codecs per data column family.
+
+| Canonical column families | Upper levels | Bottommost level and bulk SSTs |
+| --- | --- | --- |
+| `block_replay`, `compact_block`, `tree_state_checkpoint`, `transaction_blob`, `block_blob`, `displaced_block_facts` | LZ4 | Zstandard level 3 |
+| `block_hash_index`, `transaction_location` | None | None |
+| Other canonical data families | LZ4 | LZ4 |
 
 A control record ties the store to its network, workload (`wallet` or
 `explorer`), raw-blob retention, reorg window, network-upgrade activations,
@@ -106,7 +122,8 @@ see the same canonical transaction mapping, because no commit or catch-up can
 run while the read holds it. The location therefore needs no second check. A
 read of raw bytes at a location the caller supplies first compares it with the
 current location row, and returns no bytes when that row is missing or differs
-in any field. A location saved before later commits, such as an unrelated
+in block height, block hash, transaction index, or a digest supplied by the
+caller. A location saved before later commits, such as an unrelated
 append or a reorg strictly above its block, still matches and returns bytes.
 
 ## Wallet store
@@ -116,7 +133,8 @@ compact blocks and tree states, stays in the canonical store. The wallet store
 is versioned by `WALLET_ROCKSDB_SCHEMA_VERSION` for its layout and
 `WALLET_PROJECTION_VALUE_ENCODING_VERSION` for its row values. Its control
 record binds it to one canonical source identity and records the chain event it
-has reached and a digest of its rows.
+has reached and a digest of its rows. Wallet data column families use LZ4
+at every level and for bulk SSTs.
 
 | Column family | Key | Filter |
 | --- | --- | --- |

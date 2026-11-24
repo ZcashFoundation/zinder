@@ -2541,12 +2541,17 @@ fn transaction_location(
     block_hash: [u8; 32],
     transaction_tag: u8,
 ) -> TransactionLocation {
-    TransactionLocation::new(
-        TransactionId::from_bytes([transaction_tag; 32]),
-        height,
-        BlockHash::from_bytes(block_hash),
-        0,
-    )
+    TransactionLocation {
+        serialized_bytes_sha256: Some(
+            SerializedBytesDigest::from_serialized_bytes(&[transaction_tag]).as_bytes(),
+        ),
+        ..TransactionLocation::new(
+            TransactionId::from_bytes([transaction_tag; 32]),
+            height,
+            BlockHash::from_bytes(block_hash),
+            0,
+        )
+    }
 }
 
 fn add_checkpoint(block: &mut CanonicalBuildBlock) -> Result<(), Box<dyn std::error::Error>> {

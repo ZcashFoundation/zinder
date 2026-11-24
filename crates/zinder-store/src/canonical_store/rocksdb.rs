@@ -22,7 +22,7 @@ use super::{
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
     CanonicalSubtreeRootLoadCoverage,
     activation_schedule::CanonicalActivationSchedule,
-    block_replay::CanonicalReplayScan,
+    block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, CanonicalReplayScan},
     construction_manifest::{
         copy_construction_manifest, read_construction_manifest_binding,
         validate_ready_construction_manifest,
@@ -1044,11 +1044,10 @@ pub(super) fn canonical_column_family_descriptors(
     block_cache: &Cache,
     resource_budget: RocksDbResourceBudget,
 ) -> Vec<ColumnFamilyDescriptor> {
+    let options = CanonicalColumnFamilyOptions::new(block_cache, resource_budget);
     CANONICAL_DATA_COLUMN_FAMILIES
         .into_iter()
-        .map(|name| {
-            ColumnFamilyDescriptor::new(name, canonical_data_options(block_cache, resource_budget))
-        })
+        .map(|name| ColumnFamilyDescriptor::new(name, options.for_family(name).clone()))
         .collect()
 }
 
@@ -1062,10 +1061,11 @@ pub(super) fn canonical_verification_column_family_descriptors(
     block_cache: &Cache,
     resource_budget: RocksDbResourceBudget,
 ) -> Vec<ColumnFamilyDescriptor> {
+    let family_options = CanonicalColumnFamilyOptions::new(block_cache, resource_budget);
     CANONICAL_DATA_COLUMN_FAMILIES
         .into_iter()
         .map(|name| {
-            let mut options = canonical_data_options(block_cache, resource_budget);
+            let mut options = family_options.for_family(name).clone();
             if matches!(
                 name,
                 TREE_STATE_CHECKPOINT_COLUMN_FAMILY | BLOCK_HEADER_COLUMN_FAMILY
@@ -1077,12 +1077,47 @@ pub(super) fn canonical_verification_column_family_descriptors(
         .collect()
 }
 
-pub(super) fn canonical_data_options(
-    block_cache: &Cache,
-    resource_budget: RocksDbResourceBudget,
-) -> Options {
+pub(super) struct CanonicalColumnFamilyOptions {
+    hot: Options,
+    cold: Options,
+    uncompressed: Options,
+}
+
+impl CanonicalColumnFamilyOptions {
+    pub(super) fn new(block_cache: &Cache, resource_budget: RocksDbResourceBudget) -> Self {
+        let hot = canonical_data_options(block_cache, resource_budget);
+        let mut cold = hot.clone();
+        cold.set_bottommost_compression_type(DBCompressionType::Zstd);
+        cold.set_bottommost_compression_options(-14, 3, 0, 0, true);
+
+        let mut uncompressed = hot.clone();
+        uncompressed.set_compression_type(DBCompressionType::None);
+        Self {
+            hot,
+            cold,
+            uncompressed,
+        }
+    }
+
+    pub(super) fn for_family(&self, name: &str) -> &Options {
+        match name {
+            BLOCK_REPLAY_COLUMN_FAMILY
+            | COMPACT_BLOCK_COLUMN_FAMILY
+            | TREE_STATE_CHECKPOINT_COLUMN_FAMILY
+            | TRANSACTION_BLOB_COLUMN_FAMILY
+            | BLOCK_BLOB_COLUMN_FAMILY
+            | DISPLACED_BLOCK_FACTS_COLUMN_FAMILY => &self.cold,
+            BLOCK_HASH_INDEX_COLUMN_FAMILY | TRANSACTION_LOCATION_COLUMN_FAMILY => {
+                &self.uncompressed
+            }
+            _ => &self.hot,
+        }
+    }
+}
+
+fn canonical_data_options(block_cache: &Cache, resource_budget: RocksDbResourceBudget) -> Options {
     let mut options = Options::default();
-    options.set_compression_type(DBCompressionType::Snappy);
+    options.set_compression_type(DBCompressionType::Lz4);
     options.set_block_based_table_factory(&build_block_based_table_factory(block_cache));
     options.set_write_buffer_size(
         usize::try_from(resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
@@ -1453,6 +1488,86 @@ mod tests {
             RocksDbResourceBudget::for_local_tests(),
         );
         assert_eq!(options.get_uncache_aggressiveness(), 0);
+    }
+
+    #[test]
+    fn canonical_compression_profiles_apply_to_external_ssts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let options = CanonicalColumnFamilyOptions::new(
+            &Cache::new_lru_cache(1024 * 1024),
+            RocksDbResourceBudget::for_local_tests(),
+        );
+        let mut uncompressed_size = 0;
+        for (family, upper, bottom) in [
+            (
+                BLOCK_HASH_INDEX_COLUMN_FAMILY,
+                DBCompressionType::None,
+                None,
+            ),
+            (
+                TRANSACTION_LOCATION_COLUMN_FAMILY,
+                DBCompressionType::None,
+                None,
+            ),
+            (BLOCK_HEADER_COLUMN_FAMILY, DBCompressionType::Lz4, None),
+            (SUBTREE_ROOT_COLUMN_FAMILY, DBCompressionType::Lz4, None),
+            (
+                BLOCK_REPLAY_COLUMN_FAMILY,
+                DBCompressionType::Lz4,
+                Some(DBCompressionType::Zstd),
+            ),
+            (
+                COMPACT_BLOCK_COLUMN_FAMILY,
+                DBCompressionType::Lz4,
+                Some(DBCompressionType::Zstd),
+            ),
+            (
+                TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+                DBCompressionType::Lz4,
+                Some(DBCompressionType::Zstd),
+            ),
+            (
+                TRANSACTION_BLOB_COLUMN_FAMILY,
+                DBCompressionType::Lz4,
+                Some(DBCompressionType::Zstd),
+            ),
+            (
+                BLOCK_BLOB_COLUMN_FAMILY,
+                DBCompressionType::Lz4,
+                Some(DBCompressionType::Zstd),
+            ),
+            (
+                DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
+                DBCompressionType::Lz4,
+                Some(DBCompressionType::Zstd),
+            ),
+        ] {
+            let options = options.for_family(family);
+            assert_eq!(options.get_compression_type(), Some(upper), "{family}");
+            assert_eq!(
+                options.get_bottommost_compression_type(),
+                bottom,
+                "{family}"
+            );
+            let mut writer = zinder_rocksdb_bulk_load::OrderedSstWriter::new(
+                temporary.path(),
+                family,
+                options,
+                1024 * 1024,
+            )?;
+            for index in 0_u32..512 {
+                writer.put(&index.to_be_bytes(), &[0x7b; 72])?;
+            }
+            let files = writer.finish()?;
+            if upper == DBCompressionType::None {
+                assert!(files.file_bytes >= 512 * 72, "{family}");
+                uncompressed_size = files.file_bytes;
+            } else {
+                assert!(files.file_bytes < uncompressed_size / 2, "{family}");
+            }
+        }
+        Ok(())
     }
 
     #[test]
