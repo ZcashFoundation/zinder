@@ -1,0 +1,6 @@
+kind: fixed
+body: Lightwalletd block-range streams now release their admission slot as soon as the stream ends or returns a terminal error and finishes any in-flight chunk read, rather than waiting for the transport to drop the response body, eliminating spurious UNAVAILABLE refusals at the default concurrency limit. The bounded waiter queue for block-range stream slots is also raised from 1x to 3x compat.max_concurrent_block_range_streams (300 waiters by default, holding no chunk buffers while queued) while keeping the default 100 active stream slots.
+time: 2026-11-24T21:16:00.000000000Z
+custom:
+    Bump: patch
+    PR: "560"
