@@ -577,12 +577,50 @@ fn assert_no_publisher_key(bytes: &[u8], keys: &[[u8; 32]; 2]) {
 }
 
 #[test]
-fn marker_creation_failure_clears_the_reservation_for_retry() -> TestResult {
+fn marker_collision_preserves_unowned_entries() -> TestResult {
     let root = tempfile::tempdir()?;
     let path = root.path().join("workspace");
-    let workspace = Workspace::reserve(path.clone())?;
-    fs::create_dir(path.join(WORKSPACE_MARKER))?;
-    assert!(workspace.mark().is_err());
+    let marker = path.join(WORKSPACE_MARKER);
+    let payload = path.join("keep");
+    let result = Workspace::create_with_marker(path, |directory| {
+        fs::write(&marker, b"unowned marker")?;
+        fs::write(&payload, b"unowned payload")?;
+        create_workspace_marker(directory)
+    });
+    assert!(
+        matches!(result, Err(EdgeSnapshotError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists)
+    );
+    assert_eq!(fs::read(marker)?, b"unowned marker");
+    assert_eq!(fs::read(payload)?, b"unowned payload");
+    Ok(())
+}
+
+#[test]
+fn marker_error_preserves_a_populated_reservation() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("workspace");
+    let payload = path.join("keep");
+    let result = Workspace::create_with_marker(path, |_| {
+        fs::write(&payload, b"unowned payload")?;
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    });
+    assert!(
+        matches!(result, Err(EdgeSnapshotError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(fs::read(payload)?, b"unowned payload");
+    Ok(())
+}
+
+#[test]
+fn empty_reservation_failure_allows_immediate_retry() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("workspace");
+    let result = Workspace::create_with_marker(path.clone(), |_| {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    });
+    assert!(
+        matches!(result, Err(EdgeSnapshotError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied)
+    );
     assert!(!path.exists());
 
     let workspace = Workspace::create(path.clone())?;

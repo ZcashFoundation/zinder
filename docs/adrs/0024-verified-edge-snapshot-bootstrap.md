@@ -87,8 +87,11 @@ sealed-history destinations must be absent or empty, even when the bundle
 contains no sealed history. Their resolved paths must be separate from one
 another and from the private workspaces. Reservation checks device and inode
 identity as well as paths, including aliases through bind mounts. Each
-workspace holds a private marker. Cleanup and sidecar rollback traverse open
-directory descriptors and verify ownership before unlinking the directory. Bootstrap reserves workspaces before starting
+workspace holds a private marker. Recursive cleanup starts only after the
+workspace creates its marker exclusively. Before that, a reservation
+failure can remove only an empty directory with the reserved identity.
+Cleanup and sidecar rollback traverse open directory descriptors and verify
+ownership before unlinking the directory. Bootstrap reserves workspaces before starting
 an HTTP transfer. Before publication it clears inherited projection build
 leases and mempool events, generates a fresh `cursor_auth_key` using the OS
 CSPRNG, and runs normal READY admission on the resulting store. The receiver syncs files and

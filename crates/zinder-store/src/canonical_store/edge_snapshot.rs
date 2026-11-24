@@ -1359,16 +1359,21 @@ fn remove_empty_owned_directory(
             "snapshot cleanup path no longer identifies the owned directory",
         ));
     }
+    // POSIX has no inode-checked rmdir. Recursive cleanup is confined to the
+    // owned descriptor, and REMOVEDIR atomically refuses a populated replacement.
     Ok(unlinkat(parent_dir, name, AtFlags::REMOVEDIR)?)
 }
 
 impl Workspace {
     fn create(path: PathBuf) -> Result<Self, EdgeSnapshotError> {
-        Self::reserve(path)?.mark()
+        Self::create_with_marker(path, create_workspace_marker)
     }
 
-    fn reserve(path: PathBuf) -> Result<Self, EdgeSnapshotError> {
-        use rustix::fs::{AtFlags, Dir, Mode, mkdirat, statat};
+    fn create_with_marker(
+        path: PathBuf,
+        mark: impl FnOnce(&File) -> io::Result<()>,
+    ) -> Result<Self, EdgeSnapshotError> {
+        use rustix::fs::{AtFlags, Dir, Mode, fstat, mkdirat, statat};
 
         let parent_dir = open_directory(rustix::fs::CWD, parent(&path).as_os_str())?;
         let name = destination_name(&path)?.to_os_string();
@@ -1376,29 +1381,42 @@ impl Workspace {
         let reserved =
             statat(&parent_dir, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
         let identity = directory_stat_identity(&reserved)?;
-        let directory = match open_directory(&parent_dir, &name) {
-            Ok(directory) => directory,
-            Err(error) => {
-                if let Err(cleanup) = remove_empty_owned_directory(&parent_dir, &name, identity) {
-                    tracing::warn!(path = %path.display(), %cleanup, "failed to clear empty snapshot reservation");
-                }
-                return Err(error.into());
+
+        let clear_empty = |error: io::Error| {
+            if let Err(cleanup) = remove_empty_owned_directory(&parent_dir, &name, identity) {
+                tracing::warn!(path = %path.display(), %cleanup, "failed to clear empty snapshot reservation");
             }
+            EdgeSnapshotError::from(error)
         };
-        let named =
-            statat(&parent_dir, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
-        if directory_identity(&directory.metadata()?)? != identity
-            || directory_stat_identity(&named)? != identity
+        let directory = open_directory(&parent_dir, &name).map_err(clear_empty)?;
+        let opened = fstat(&directory)
+            .map_err(io::Error::from)
+            .map_err(clear_empty)?;
+        let named = statat(&parent_dir, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)
+            .map_err(clear_empty)?;
+        if directory_stat_identity(&opened).ok() != Some(identity)
+            || directory_stat_identity(&named).ok() != Some(identity)
         {
             return Err(refused("snapshot workspace changed during reservation"));
         }
-        for entry in Dir::read_from(&directory).map_err(io::Error::from)? {
-            let entry = entry.map_err(io::Error::from)?;
+        for entry in Dir::read_from(&directory)
+            .map_err(io::Error::from)
+            .map_err(clear_empty)?
+        {
+            let entry = entry.map_err(io::Error::from).map_err(clear_empty)?;
             if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
                 return Err(refused(
                     "snapshot workspace is no longer empty during reservation",
                 ));
             }
+        }
+        if let Err(error) = mark(&directory) {
+            return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                error.into()
+            } else {
+                clear_empty(error)
+            });
         }
         Ok(Self {
             path,
@@ -1408,19 +1426,19 @@ impl Workspace {
             directory,
         })
     }
+}
 
-    fn mark(self) -> Result<Self, EdgeSnapshotError> {
-        use rustix::fs::{Mode, OFlags, openat};
+fn create_workspace_marker(directory: &File) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags, openat};
 
-        openat(
-            &self.directory,
-            WORKSPACE_MARKER,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(io::Error::from)?;
-        Ok(self)
-    }
+    openat(
+        directory,
+        WORKSPACE_MARKER,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map(drop)
+    .map_err(io::Error::from)
 }
 
 impl Drop for Workspace {
