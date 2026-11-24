@@ -399,13 +399,27 @@ mod tests {
 
     #[test]
     fn a_bare_address_and_a_connection_are_distinct_clients() -> Result<(), &'static str> {
-        let slots = pool(2)?;
-        let _bare = admitted(slots.claim(Some(address(7))))?;
-        let _connection = admitted(slots.claim(Some(connection(7))))?;
+        // The same IP, once as a bare address and once as a `(ip, port)`
+        // connection, keys two distinct clients: the discriminant decides, not
+        // the address bytes.
+        let bare = address(7);
+        let connection = ClientFairnessKey::Connection(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            50_001,
+        ));
 
-        // Equal shares: neither may take the other's slot.
-        assert!(slots.claim(Some(address(7))).is_none());
-        assert!(slots.claim(Some(connection(7))).is_none());
+        let slots = pool(3)?;
+        let bare_oldest = admitted(slots.claim(Some(bare)))?;
+        let _bare_newest = admitted(slots.claim(Some(bare)))?;
+        let _connection = admitted(slots.claim(Some(connection)))?;
+
+        // The connection key holds one slot against the address key's two, so
+        // its next request evicts the address key's oldest slot rather than
+        // being refused as one merged client.
+        let connection_again = admitted(slots.claim(Some(connection)))?;
+        assert!(connection_again.evicted_another);
+        assert!(bare_oldest.slot.eviction.is_cancelled());
+        assert_eq!(slots.held(), 3);
         Ok(())
     }
 

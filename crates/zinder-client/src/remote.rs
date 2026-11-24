@@ -1414,56 +1414,63 @@ mod endpoint_transport_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let endpoint = build_endpoint(&format!("http://{address}"))?;
-        // The handshake waits for the server's SETTINGS frame, which this test
-        // never sends, so drive it in a task the test aborts afterward.
         let connect = tokio::spawn(async move { endpoint.connect().await });
-        let (mut stream, _) = listener.accept().await?;
 
-        let mut preface = [0u8; 24];
-        stream.read_exact(&mut preface).await?;
-        assert_eq!(&preface, CLIENT_PREFACE);
+        let (initial_window_size, max_frame_size, connection_window_increment) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut stream, _) = listener.accept().await?;
+                let mut preface = [0u8; 24];
+                stream.read_exact(&mut preface).await?;
+                assert_eq!(&preface, CLIENT_PREFACE);
 
-        let mut initial_window_size = None;
-        let mut max_frame_size = None;
-        let mut connection_window_increment = 0u32;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let frame = tokio::time::timeout_at(deadline, read_frame(&mut stream)).await??;
-            match frame.kind {
-                // SETTINGS.
-                0x4 => {
-                    for entry in frame.payload.as_chunks::<6>().0 {
-                        let id = u16::from_be_bytes([entry[0], entry[1]]);
-                        let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
-                        match id {
-                            // SETTINGS_INITIAL_WINDOW_SIZE.
-                            0x4 => initial_window_size = Some(value),
-                            // SETTINGS_MAX_FRAME_SIZE.
-                            0x5 => max_frame_size = Some(value),
-                            _ => {}
+                let mut initial_window_size = None;
+                let mut max_frame_size = None;
+                let mut connection_window_increment = 0u32;
+                loop {
+                    let frame = read_frame(&mut stream).await?;
+                    match frame.kind {
+                        // SETTINGS.
+                        0x4 => {
+                            for entry in frame.payload.as_chunks::<6>().0 {
+                                let id = u16::from_be_bytes([entry[0], entry[1]]);
+                                let value =
+                                    u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
+                                match id {
+                                    // SETTINGS_INITIAL_WINDOW_SIZE.
+                                    0x4 => initial_window_size = Some(value),
+                                    // SETTINGS_MAX_FRAME_SIZE.
+                                    0x5 => max_frame_size = Some(value),
+                                    _ => {}
+                                }
+                            }
                         }
+                        // WINDOW_UPDATE on the connection, stream 0.
+                        0x8 if frame.stream_id == 0 && frame.payload.len() == 4 => {
+                            let increment = u32::from_be_bytes([
+                                frame.payload[0],
+                                frame.payload[1],
+                                frame.payload[2],
+                                frame.payload[3],
+                            ]) & 0x7fff_ffff;
+                            connection_window_increment =
+                                connection_window_increment.wrapping_add(increment);
+                        }
+                        _ => {}
+                    }
+                    if initial_window_size.is_some()
+                        && max_frame_size.is_some()
+                        && connection_window_increment > 0
+                    {
+                        break;
                     }
                 }
-                // WINDOW_UPDATE on the connection, stream 0.
-                0x8 if frame.stream_id == 0 && frame.payload.len() == 4 => {
-                    let increment = u32::from_be_bytes([
-                        frame.payload[0],
-                        frame.payload[1],
-                        frame.payload[2],
-                        frame.payload[3],
-                    ]) & 0x7fff_ffff;
-                    connection_window_increment =
-                        connection_window_increment.wrapping_add(increment);
-                }
-                _ => {}
-            }
-            if initial_window_size.is_some()
-                && max_frame_size.is_some()
-                && connection_window_increment > 0
-            {
-                break;
-            }
-        }
+                Ok::<_, io::Error>((
+                    initial_window_size,
+                    max_frame_size,
+                    connection_window_increment,
+                ))
+            })
+            .await??;
 
         assert_eq!(initial_window_size, Some(HTTP2_INITIAL_STREAM_WINDOW));
         assert_eq!(max_frame_size, Some(HTTP2_MAX_FRAME_SIZE));

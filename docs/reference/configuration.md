@@ -412,9 +412,11 @@ With the setting off, the default, Zinder ignores the header.
 [Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit)
 lists the proxy settings this depends on.
 
-These limits count all clients together, and a client that opens many
-connections counts as many clients. Limit connections per client in the
-proxy.
+These limits count all clients together. A client that opens many connections
+counts as many clients when Zinder keys it by connection, as it does for a
+direct connection or an `ip:port` proxy header. When a proxy names only a bare
+IP address, every connection from that address counts as one client. Limit
+connections per client in the proxy.
 
 A response ends once one piece of it has waited 60 seconds to go out. A piece
 waits either for the client's flow-control window to cover everything queued
