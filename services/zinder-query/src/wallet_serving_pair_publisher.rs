@@ -9,9 +9,11 @@
 //! arrive: while every spare generation still holds such a pair, the
 //! publisher publishes nothing and then publishes the writer's latest fence,
 //! so blocks in a burst share one publication. A replaced pair that no
-//! request observed is released at once, so a burst that no workflow pins
-//! never waits. Each generation stays
-//! frozen until every in-flight request has dropped its captured pair `Arc`;
+//! request observed is released at once, so a burst of blocks that no request
+//! observes does not wait on the retention window. Requests still holding
+//! such a pair can delay reuse of its generation until they drop it. Each
+//! generation stays frozen until every in-flight request has dropped its
+//! captured pair `Arc`;
 //! the publisher then catches that same open generation up for a later
 //! publication, so a slot is opened cold only on its first use or after a
 //! failed catch-up. A request that holds an old pair for a long time pins
