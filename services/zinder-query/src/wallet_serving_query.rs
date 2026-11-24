@@ -739,6 +739,15 @@ where
         Some(self.serving_pair_slot.subscribe_publications())
     }
 
+    fn current_visible_tip_height(&self) -> Option<BlockHeight> {
+        Some(
+            self.serving_pair_slot
+                .capture_ephemeral()
+                .chain_epoch()
+                .visible_tip_height,
+        )
+    }
+
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
         &self.native_endpoint_capabilities
     }
@@ -2346,12 +2355,17 @@ mod tree_state_replay_limit_tests {
         let mut publications = query
             .subscribe_publications()
             .ok_or("a slot-backed query publishes replacements")?;
-        let seen = query.visible_tip_block(None).await?.height;
+        let seen = query
+            .current_visible_tip_height()
+            .ok_or("a slot-backed query reads its tip unpinned")?;
+        assert_eq!(seen, query.visible_tip_block(None).await?.height);
         assert!(!publications.has_changed()?);
 
         slot.publish_for_test(read_pair(&mut updated)?);
         tokio::time::timeout(Duration::from_secs(1), publications.changed()).await??;
-        let advanced = query.visible_tip_block(None).await?.height;
+        let advanced = query
+            .current_visible_tip_height()
+            .ok_or("a slot-backed query reads its tip unpinned")?;
         assert_eq!(advanced.value(), seen.value() + 1);
         Ok(())
     }

@@ -121,6 +121,17 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         None
     }
 
+    /// Returns the visible tip height of the serving data current now,
+    /// without keeping that data readable for epoch pins.
+    ///
+    /// A caller that only compares heights, such as one waiting for a newer
+    /// tip, reads it this way so its checks never retain a replaced
+    /// generation. `None` means the query has no such read, and the caller
+    /// reads the tip through [`Self::visible_tip_block`].
+    fn current_visible_tip_height(&self) -> Option<BlockHeight> {
+        None
+    }
+
     /// Returns the immutable structural capability set derived when this query
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;

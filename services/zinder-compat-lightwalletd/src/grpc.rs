@@ -519,6 +519,16 @@ where
         WalletQueryApi::subscribe_publications(self)
     }
 
+    async fn peek_visible_tip_height(&self) -> Result<zinder_core::BlockHeight, Status> {
+        match self.current_visible_tip_height() {
+            Some(height) => Ok(height),
+            None => self
+                .capture_view()
+                .await
+                .map(|view| view.visible_tip_height),
+        }
+    }
+
     async fn capture_view(&self) -> Result<ChainEpoch, Status> {
         self.visible_tip_block(None)
             .await

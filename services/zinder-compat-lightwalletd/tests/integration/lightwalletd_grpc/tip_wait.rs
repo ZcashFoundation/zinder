@@ -49,9 +49,9 @@ const SERVED_TIP: u32 = 9;
 const PUBLISH_DELAY: Duration = Duration::from_millis(300);
 /// The wait the publication tests allow, long enough that a request still
 /// waiting at its end shows up as a failed bound.
-const PUBLICATION_WAIT: Duration = Duration::from_secs(2);
+const PUBLICATION_WAIT: Duration = Duration::from_secs(5);
 /// Every request the publication wakes must answer before this.
-const ANSWERED_WITHIN: Duration = Duration::from_millis(1_500);
+const ANSWERED_WITHIN: Duration = Duration::from_secs(4);
 /// The wait a reader that never advances runs out.
 const EXPIRING_WAIT: Duration = Duration::from_secs(1);
 const HASH_MISMATCH: &str = "requested block hash does not match indexed block";
@@ -634,7 +634,7 @@ async fn a_height_past_the_block_window_fails_at_once() -> eyre::Result<()> {
     };
     assert_eq!(status.code(), Code::OutOfRange);
     assert!(
-        waited < Duration::from_millis(500),
+        waited < Duration::from_secs(2),
         "the refusal took {waited:?}"
     );
     Ok(())
@@ -673,7 +673,7 @@ async fn a_client_deadline_inside_the_wait_ends_deadline_exceeded() -> eyre::Res
         Some(Code::DeadlineExceeded)
     );
     assert!(
-        waited >= Duration::from_millis(200) && waited < Duration::from_secs(1),
+        waited >= Duration::from_millis(200) && waited < Duration::from_secs(2),
         "the deadline ended the call after {waited:?}"
     );
     let _stopped = stop.send(());

@@ -1285,7 +1285,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Milliseconds a height-selected lightwalletd block read waits for a height just past the visible tip before it runs unchanged. Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, the encoded block range methods, and `GetTreeState` by height, in every serving mode. The worst delay before a block-range response's headers is this wait plus the existing 10-second block-range admission wait. A value of 0 disables the wait. A nonzero value must be at least twice `storage.secondary_catchup_interval_ms`. There is no upper bound. Defaults to 3000, which is provisional pending cross-region skew measurement.",
+        description: "Milliseconds a height-selected lightwalletd block read waits for a height just past the visible tip before it runs unchanged. Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, the encoded block range methods, and, in wallet and light-wallet serving, `GetTreeState` by height. Applies to every serving mode. The worst delay before a block-range response's headers is this wait plus the existing 10-second block-range admission wait. A value of 0 disables the wait. A nonzero value must be at least twice `storage.secondary_catchup_interval_ms`. There is no upper bound. Defaults to 3000, which is provisional pending cross-region skew measurement.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS",

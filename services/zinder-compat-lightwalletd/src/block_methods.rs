@@ -147,6 +147,18 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
         None
     }
 
+    /// Reads the visible tip height current now, for a caller that compares
+    /// heights and reads nothing else.
+    ///
+    /// A mode that serves epoch-bound pairs reads it without keeping the pair
+    /// readable for pins. The default captures a view and drops it at once.
+    fn peek_visible_tip_height(&self) -> impl Future<Output = Result<BlockHeight, Status>> + Send {
+        async {
+            let view = self.capture_view().await?;
+            Ok(Self::view_chain_epoch(&view).visible_tip_height)
+        }
+    }
+
     /// Captures the chain view for one single-shot tip call, such as
     /// `GetLatestBlock` or `GetLightdInfo`, which expose no epoch and read
     /// nothing again by it.

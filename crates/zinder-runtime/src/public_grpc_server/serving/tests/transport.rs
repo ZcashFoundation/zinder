@@ -291,7 +291,10 @@ async fn a_request_deadline_includes_registered_middleware() -> Result<()> {
     let response = within_wait_limit(raw_request(address, 65_535, Some("50m"))).await??;
     server.abort();
     let status = Status::from_header_map(response.headers());
-    assert_eq!(status.map(|status| status.code()), Some(Code::Cancelled));
+    assert_eq!(
+        status.map(|status| status.code()),
+        Some(Code::DeadlineExceeded)
+    );
     assert!(calls.try_recv().is_err(), "the request reached the handler");
     Ok(())
 }

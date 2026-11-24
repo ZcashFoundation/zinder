@@ -204,13 +204,12 @@ impl TipWait {
     }
 }
 
-/// Reads the visible tip height and drops the view at once, so a wait never
-/// holds a serving generation.
+/// Reads the visible tip height without holding or retaining a view, so a
+/// wait never keeps a serving generation.
 async fn visible_tip_height<Reads: CompactBlockReads>(
     reads: &Reads,
 ) -> Result<BlockHeight, Status> {
-    let view = reads.capture_view().await?;
-    Ok(Reads::view_chain_epoch(&view).visible_tip_height)
+    reads.peek_visible_tip_height().await
 }
 
 /// How one wait ended.
