@@ -352,8 +352,10 @@ reflection, and unknown method paths are outside this denominator.
 
 Readiness refusals contribute to completed RPCs. A range refused before it
 opens contributes no stream-length or open-duration observation. Native range
-headers are excluded from the block count. To measure what arrived at a wallet,
-collect the client's outcome as well.
+headers are excluded from the block count. On HTTP/2, a response stays in
+flight until the listener releases its final status or the stream ends. A
+stream reset before that release records cancellation. To measure what arrived
+at a wallet, collect the client's outcome as well.
 
 ### Wallet requests
 

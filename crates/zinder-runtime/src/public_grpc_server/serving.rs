@@ -230,7 +230,12 @@ impl<L> PublicGrpcRouter<L> {
         ResponseBody: http_body::Body<Data = Bytes> + Send + 'static,
         ResponseBody::Error: Into<axum::BoxError>,
     {
-        let service = self.server.layers.service(self.routes.routes().prepare());
+        let router = self
+            .routes
+            .routes()
+            .into_axum_router()
+            .layer(axum::middleware::from_fn(grpc_timeout::enforce));
+        let service = self.server.layers.service(Routes::from(router).prepare());
         let connections = Connections {
             builder: connection_builder(self.server.accept_http1, self.server.send_stall_timeout),
             send_stall_timeout: self.server.send_stall_timeout,
@@ -383,10 +388,8 @@ fn connection_builder(
 
 /// Adapts `service` to one connection.
 ///
-/// Each request carries the connection's `connect_info`. Once the service is
-/// ready, the request's `grpc-timeout` bounds the time until its response
-/// starts, as in tonic's server. Each response is sent through a
-/// [`ReleaseGate`].
+/// Each request carries the connection's `connect_info`. Each response is
+/// sent through a [`ReleaseGate`].
 fn connection_service<S, ResponseBody>(
     service: S,
     connect_info: TcpConnectInfo,
@@ -417,8 +420,7 @@ where
         let mut service = service.clone();
         async move {
             service.ready().await.map_err(Into::into)?;
-            let deadline = grpc_timeout::client_deadline(request.headers());
-            let response = grpc_timeout::respond_within(deadline, service.call(request)).await?;
+            let response = grpc_timeout::transport_response(service.call(request).await)?;
             Ok(gate.apply(response))
         }
     })

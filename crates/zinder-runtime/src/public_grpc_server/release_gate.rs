@@ -55,7 +55,9 @@ use futures_util::task::AtomicWaker;
 use http_body::{Body as _, Frame, SizeHint};
 use tonic::{Status, body::Body};
 
-use super::{RELEASE_PROBES_METRIC, stream_reset::TransportReset};
+use super::{
+    RELEASE_PROBES_METRIC, stream_reset::TransportReset, wallet_rpc_metrics::RpcCompletion,
+};
 
 /// How a listener gates the responses it sends.
 #[derive(Clone, Debug)]
@@ -128,6 +130,7 @@ struct ReleaseGatedBody {
     transport: TransportReset,
     /// Reports when h2 has encoded the probe last handed out.
     departure: Option<Arc<Departure>>,
+    rpc_completion: Option<RpcCompletion>,
 }
 
 /// Whether h2 has let go of a probe.
@@ -204,6 +207,7 @@ impl ReleaseGatedBody {
             gate,
             transport,
             departure: None,
+            rpc_completion: None,
         }
     }
 
@@ -347,7 +351,19 @@ impl http_body::Body for ReleaseGatedBody {
         }
         this.transport.asked_for_next();
         if this.gate.probe_window {
-            this.poll_window_gated(cx)
+            let (frame, completion) = RpcCompletion::capture(|| this.poll_window_gated(cx));
+            if completion.is_some() {
+                this.rpc_completion = completion;
+            }
+            let ended = match &frame {
+                Poll::Pending => false,
+                Poll::Ready(Some(Ok(frame))) => frame.is_trailers(),
+                Poll::Ready(None | Some(Err(_))) => true,
+            };
+            if ended && let Some(completion) = this.rpc_completion.take() {
+                completion.release();
+            }
+            frame
         } else {
             this.poll_passed_through(cx)
         }

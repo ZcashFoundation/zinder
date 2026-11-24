@@ -20,13 +20,14 @@ use http::{HeaderValue, Request, header};
 use http_body::Frame;
 use http_body_util::{BodyExt as _, Full, StreamBody};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use prost::bytes::Bytes;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpSocket, TcpStream},
     sync::mpsc,
 };
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Status, body::Body, server::NamedService};
 use tower::Service;
 use zinder_runtime::{
@@ -103,6 +104,8 @@ impl Script {
 #[derive(Clone)]
 struct ScriptedStreamer {
     scripts: mpsc::UnboundedSender<Script>,
+    response_delay: Duration,
+    trailers_polled: Arc<AtomicUsize>,
     produced: Arc<AtomicUsize>,
     freed: Arc<AtomicUsize>,
 }
@@ -128,18 +131,31 @@ impl Service<Request<Body>> for ScriptedStreamer {
             produced: Arc::clone(&self.produced),
             freed: Arc::clone(&self.freed),
         });
-        let mut response =
-            http::Response::new(Body::new(StreamBody::new(ReceiverStream::new(receiver))));
+        let trailers_polled = Arc::clone(&self.trailers_polled);
+        let frames = ReceiverStream::new(receiver).map(move |frame| {
+            if frame.as_ref().is_ok_and(Frame::is_trailers) {
+                trailers_polled.fetch_add(1, Ordering::SeqCst);
+            }
+            frame
+        });
+        let mut response = http::Response::new(Body::new(StreamBody::new(frames)));
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/grpc"),
         );
-        Box::pin(std::future::ready(Ok(response)))
+        let delay = self.response_delay;
+        Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(response)
+        })
     }
 }
 
 struct TestServer {
     address: SocketAddr,
+    trailers_polled: Arc<AtomicUsize>,
     scripts: mpsc::UnboundedReceiver<Script>,
     produced: Arc<AtomicUsize>,
     freed: Arc<AtomicUsize>,
@@ -159,11 +175,18 @@ impl TestServer {
 }
 
 async fn serve() -> Result<TestServer> {
+    serve_with_response_delay(Duration::ZERO).await
+}
+
+async fn serve_with_response_delay(response_delay: Duration) -> Result<TestServer> {
     let (scripts_sender, scripts) = mpsc::unbounded_channel();
     let produced = Arc::new(AtomicUsize::new(0));
     let freed = Arc::new(AtomicUsize::new(0));
+    let trailers_polled = Arc::new(AtomicUsize::new(0));
     let streamer = ScriptedStreamer {
         scripts: scripts_sender,
+        response_delay,
+        trailers_polled: Arc::clone(&trailers_polled),
         produced: Arc::clone(&produced),
         freed: Arc::clone(&freed),
     };
@@ -182,6 +205,7 @@ async fn serve() -> Result<TestServer> {
     )?);
     Ok(TestServer {
         address,
+        trailers_polled,
         scripts,
         produced,
         freed,
@@ -270,7 +294,14 @@ async fn wait_until(what: &str, mut probe: impl FnMut() -> bool) -> Result<()> {
 
 /// Sends six messages with pauses, so the release gate probes the window,
 /// then `OK`, and checks the client decodes exactly those bytes and status.
+#[expect(
+    clippy::future_not_send,
+    reason = "The current-thread tests run the listener on the thread that owns the metrics recorder."
+)]
 async fn check_bytes_arrive_unchanged(encoding: &'static str, http2: bool) -> Result<()> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
     let mut server = serve().await?;
     let body = send(server.address, encoding, http2).await?;
     let mut script = server.next_script().await?;
@@ -293,6 +324,9 @@ async fn check_bytes_arrive_unchanged(encoding: &'static str, http2: bool) -> Re
     );
     let trailers = String::from_utf8_lossy(trailer_frame.get(5..).unwrap_or_default());
     ensure!(trailers.contains("grpc-status:0"), "trailers: {trailers}");
+    let finished = handle.render();
+    assert_range_gauges(&finished, 0);
+    assert_range_outcomes(&finished, Some(RANGE_OK));
     Ok(())
 }
 
@@ -372,18 +406,33 @@ async fn a_stalled_text_grpc_web_response_over_http1_closes_its_connection() -> 
 
 /// Sends a gRPC-Web response over HTTP/2 that ends while its data and its
 /// trailer frame wait for window, and checks the stream is reset.
+#[expect(
+    clippy::future_not_send,
+    reason = "The current-thread tests run the listener on the thread that owns the metrics recorder."
+)]
 async fn check_finished_http2_tail_is_reset(encoding: &'static str) -> Result<()> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
     let mut server = serve().await?;
     let body = send(server.address, encoding, true).await?;
     let mut script = server.next_script().await?;
     script.send_message(PAYLOAD).await?;
     script.finish().await?;
 
-    // tonic-web turns the trailers into one more DATA frame, which waits
-    // for window behind the message. The client reads nothing until well
-    // past the send stall timeout; the layer copies the message, so only
-    // the response's outcome shows whether the stream was reset.
-    tokio::time::sleep(STALL * 3).await;
+    wait_until("the gate to look ahead through the trailers", || {
+        server.trailers_polled.load(Ordering::SeqCst) == 1
+    })
+    .await?;
+    let active = handle.render();
+    assert_range_gauges(&active, 1);
+    assert_range_outcomes(&active, None);
+
+    // Keep withholding window until the send stall timer resets the stream.
+    wait_until("the cancelled response to be counted", || {
+        handle.render().contains(RANGE_CANCELLED)
+    })
+    .await?;
     match within_wait_limit(body.collect()).await? {
         Ok(_) => bail!("the response ended normally after stalling"),
         Err(error) => ensure!(
@@ -391,7 +440,32 @@ async fn check_finished_http2_tail_is_reset(encoding: &'static str) -> Result<()
             "the response ended with {error:?}, not a reset with CANCEL"
         ),
     }
+    let finished = handle.render();
+    assert_range_gauges(&finished, 0);
+    assert_range_outcomes(&finished, Some(RANGE_CANCELLED));
     Ok(())
+}
+
+const RANGE_OK: &str = r#"zinder_wallet_rpc_requests_total{surface="lightwalletd",method="GetBlockRange",grpc_code="ok",error_class="none"} 1"#;
+const RANGE_CANCELLED: &str = r#"zinder_wallet_rpc_requests_total{surface="lightwalletd",method="GetBlockRange",grpc_code="cancelled",error_class="none"} 1"#;
+
+fn assert_range_gauges(rendered: &str, count: u8) {
+    for gauge in [
+        "zinder_wallet_rpc_in_flight",
+        "zinder_wallet_rpc_open_streams",
+    ] {
+        let sample = format!(r#"{gauge}{{surface="lightwalletd",method="GetBlockRange"}} {count}"#);
+        assert!(rendered.lines().any(|line| line == sample), "{rendered}");
+    }
+}
+
+fn assert_range_outcomes(rendered: &str, expected: Option<&str>) {
+    let mut outcomes = rendered.lines().filter(|line| {
+        line.starts_with("zinder_wallet_rpc_requests_total{")
+            && line.contains(r#"method="GetBlockRange""#)
+    });
+    assert_eq!(outcomes.next(), expected, "{rendered}");
+    assert_eq!(outcomes.next(), None, "{rendered}");
 }
 
 /// Whether `error` comes from the server resetting the stream with `CANCEL`.
@@ -415,4 +489,57 @@ async fn a_finished_binary_grpc_web_response_waiting_for_window_is_reset() -> Re
 #[tokio::test]
 async fn a_finished_text_grpc_web_response_waiting_for_window_is_reset() -> Result<()> {
     check_finished_http2_tail_is_reset(TEXT).await
+}
+
+#[tokio::test]
+async fn a_finished_native_grpc_response_waiting_for_window_is_reset() -> Result<()> {
+    check_finished_http2_tail_is_reset("application/grpc").await
+}
+
+async fn check_browser_deadline(encoding: &'static str) -> Result<()> {
+    let mut server = serve_with_response_delay(WAIT_LIMIT * 2).await?;
+    let io = TokioIo::new(TcpStream::connect(server.address).await?);
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::spawn(connection);
+    let mut request = web_request(server.address, encoding)?;
+    request
+        .headers_mut()
+        .insert("grpc-timeout", HeaderValue::from_static("50m"));
+    let response = within_wait_limit(sender.send_request(request)).await??;
+    let script = server.next_script().await?;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some(&HeaderValue::from_static(ORIGIN))
+    );
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static(encoding))
+    );
+    assert_eq!(
+        Status::from_header_map(response.headers()).map(|status| status.code()),
+        Some(tonic::Code::Cancelled)
+    );
+    assert!(
+        within_wait_limit(response.into_body().collect())
+            .await??
+            .to_bytes()
+            .is_empty()
+    );
+    assert!(
+        script.frames.is_closed(),
+        "the deadline should drop the delayed handler"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_binary_grpc_web_deadline_preserves_encoding_and_cors() -> Result<()> {
+    check_browser_deadline(BINARY).await
+}
+
+#[tokio::test]
+async fn a_text_grpc_web_deadline_preserves_encoding_and_cors() -> Result<()> {
+    check_browser_deadline(TEXT).await
 }
