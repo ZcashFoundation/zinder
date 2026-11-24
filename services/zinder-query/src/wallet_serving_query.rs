@@ -2334,7 +2334,9 @@ mod tree_state_replay_limit_tests {
     }
 
     /// A subscription taken before a read wakes on the publication that
-    /// replaces the pair the read saw, and holds no pair while it waits.
+    /// replaces the pair the read saw. Neither the subscription nor the
+    /// unpinned tip read marks a pair observed, so publication releases the
+    /// replaced pair at once instead of retaining it for epoch pins.
     #[tokio::test]
     async fn a_publication_subscription_wakes_on_the_next_publication() -> Result<(), Box<dyn Error>>
     {
@@ -2350,7 +2352,10 @@ mod tree_state_replay_limit_tests {
                 Arc::new(RocksDbWalletReader::new(wallet)),
             )?))
         };
-        let slot = WalletServingPairSlot::new(read_pair(&mut original)?);
+        let first_pair = read_pair(&mut original)?;
+        let first_tip = first_pair.chain_epoch().visible_tip_height;
+        let replaced = Arc::downgrade(&first_pair);
+        let slot = WalletServingPairSlot::new(first_pair);
         let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
         let mut publications = query
             .subscribe_publications()
@@ -2358,15 +2363,21 @@ mod tree_state_replay_limit_tests {
         let seen = query
             .current_visible_tip_height()
             .ok_or("a slot-backed query reads its tip unpinned")?;
-        assert_eq!(seen, query.visible_tip_block(None).await?.height);
+        assert_eq!(seen, first_tip);
+        assert!(!slot.capture_ephemeral().is_observed_for_epoch_pin());
         assert!(!publications.has_changed()?);
 
         slot.publish_for_test(read_pair(&mut updated)?);
         tokio::time::timeout(Duration::from_secs(1), publications.changed()).await??;
+        assert!(
+            replaced.upgrade().is_none(),
+            "the replaced pair was retained for epoch pins"
+        );
         let advanced = query
             .current_visible_tip_height()
             .ok_or("a slot-backed query reads its tip unpinned")?;
         assert_eq!(advanced.value(), seen.value() + 1);
+        assert!(!slot.capture_ephemeral().is_observed_for_epoch_pin());
         Ok(())
     }
 
