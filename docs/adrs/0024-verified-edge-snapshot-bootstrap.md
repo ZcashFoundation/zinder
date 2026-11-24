@@ -84,10 +84,13 @@ Bootstrap prepares the store beneath `<target>.bootstrap.staging`, with the
 stage accessible only to the current operator. The canonical and optional
 sealed-history destinations must be absent or empty, even when the bundle
 contains no sealed history. Their resolved paths must be separate from one
-another and from the private workspaces. Bootstrap reserves the workspaces
-before starting an HTTP transfer. Before publication it clears inherited projection build leases and mempool
-events, generates a fresh `cursor_auth_key` using the OS CSPRNG, and runs
-normal READY admission on the resulting store. The receiver syncs files and
+another and from the private workspaces. Reservation checks device and inode
+identity as well as paths, including aliases through bind mounts. Each
+workspace holds a private marker. Cleanup verifies the reserved directory
+identity before removing it. Bootstrap reserves workspaces before starting
+an HTTP transfer. Before publication it clears inherited projection build
+leases and mempool events, generates a fresh `cursor_auth_key` using the OS
+CSPRNG, and runs normal READY admission on the resulting store. The receiver syncs files and
 directories, publishes the canonical directory by atomic no-replace rename,
 and syncs the destination parent directory. Normal ingest resumes ownership
 and follows from the snapshot tip.

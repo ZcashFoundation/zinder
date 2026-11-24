@@ -44,6 +44,7 @@ pub const DEFAULT_SPOT_CHECK_BLOCKS: NonZeroU32 = NonZeroU32::MIN.saturating_add
 
 const FORMAT: &str = "zinder-edge-snapshot.v1";
 const SIGNATURE_DOMAIN: &[u8] = b"zinder-edge-snapshot.v1\0";
+const WORKSPACE_MARKER: &str = ".zinder-snapshot-workspace";
 const MAX_SNAPSHOT_ENTRIES: usize = 65_536;
 const CANONICAL: &str = "canonical-rocksdb";
 const SEALED: &str = "sealed-history";
@@ -562,6 +563,7 @@ pub fn export_edge_snapshot(
 ) -> Result<(), EdgeSnapshotError> {
     let output = resolve_destination(output)?;
     let stage = sibling_path(&output, ".export.staging")?;
+    require_disjoint(&[&output, &stage])?;
     let signing_path = signing_key.canonicalize()?;
     let key_file = open_regular(&signing_path)?;
     let metadata = key_file.metadata()?;
@@ -574,7 +576,7 @@ pub fn export_edge_snapshot(
         .map_err(|_| refused("invalid Ed25519 PKCS#8 signing key"))?;
     let anchors = EdgeSnapshotAttestation::read(store)?.manifest_anchors(store)?;
     let work = Workspace::create(stage)?;
-    let working_copy = work.0.join("working-copy");
+    let working_copy = work.path.join("working-copy");
     store.create_owner_checkpoint_physical(&working_copy)?;
     let config = EdgeSnapshotStoreConfig {
         activations: store
@@ -592,7 +594,7 @@ pub fn export_edge_snapshot(
     if EdgeSnapshotAttestation::read(&copy)?.manifest_anchors(&copy)? != anchors {
         return Err(refused("checkpoint anchors changed during export"));
     }
-    let clean_bundle = work.0.join("bundle");
+    let clean_bundle = work.path.join("bundle");
     create_private_dir(&clean_bundle)?;
     copy.create_owner_checkpoint_physical(clean_bundle.join(CANONICAL))?;
     drop(copy);
@@ -752,7 +754,7 @@ impl EdgeSnapshotDestination {
     pub fn download_path(&self) -> Option<&Path> {
         self.download
             .as_ref()
-            .map(|workspace| workspace.0.as_path())
+            .map(|workspace| workspace.path.as_path())
     }
 }
 
@@ -788,7 +790,7 @@ where
     F: Future<Output = Result<(), E>>,
     E: From<EdgeSnapshotError>,
 {
-    let stage = &destination.stage.0;
+    let stage = &destination.stage.path;
     let canonical = stage.join(CANONICAL);
     let manifest = stage_files(&bootstrap, stage, &config)?;
     let staged_store = config.open(&canonical)?;
@@ -856,7 +858,7 @@ fn commit_bootstrap(
     canonical: &Path,
 ) -> Result<(), EdgeSnapshotError> {
     let target = &destination.target;
-    let sealed = destination.stage.0.join(SEALED);
+    let sealed = destination.stage.path.join(SEALED);
     let Some((output, sidecar)) = &destination.sealed else {
         return publish(canonical, target);
     };
@@ -864,7 +866,7 @@ fn commit_bootstrap(
     if !sealed.is_dir() {
         return publish(canonical, target);
     }
-    let files = sidecar.0.join(SEALED);
+    let files = sidecar.path.join(SEALED);
     create_private_dir(&files)?;
     for (relative, source) in inventory(&sealed)? {
         let target = files.join(relative);
@@ -1118,7 +1120,14 @@ fn publish(source: &Path, target: &Path) -> Result<(), EdgeSnapshotError> {
     Ok(())
 }
 
-struct Workspace(PathBuf);
+type DirectoryIdentity = (u64, u64);
+
+struct Workspace {
+    path: PathBuf,
+    identity: DirectoryIdentity,
+    // Keep the directory inode alive if the workspace is removed or replaced.
+    directory: File,
+}
 
 fn resolve_destination(path: &Path) -> Result<PathBuf, EdgeSnapshotError> {
     let name = path
@@ -1138,11 +1147,69 @@ fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf, EdgeSnapshotError>
     Ok(parent(path).join(name))
 }
 
+struct PathIdentity<'a> {
+    path: &'a Path,
+    deepest: DirectoryIdentity,
+    ancestors: Vec<DirectoryIdentity>,
+    tail: &'a Path,
+}
+
+impl<'a> PathIdentity<'a> {
+    fn read(path: &'a Path) -> Result<Self, EdgeSnapshotError> {
+        let mut parents = path.ancestors();
+        let (ancestor, deepest) = loop {
+            let ancestor = parents
+                .next()
+                .ok_or_else(|| refused("snapshot path has no existing directory ancestor"))?;
+            match fs::symlink_metadata(ancestor) {
+                Ok(metadata) => break (ancestor, directory_identity(&metadata)?),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let tail = path
+            .strip_prefix(ancestor)
+            .map_err(|_| refused("snapshot path has an invalid ancestor"))?;
+        let mut ancestors = vec![deepest];
+        for parent in parents {
+            ancestors.push(directory_identity(&fs::symlink_metadata(parent)?)?);
+        }
+        Ok(Self {
+            path,
+            deepest,
+            ancestors,
+            tail,
+        })
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        has_shared_path_prefix(self.path, other.path)
+            || (self.deepest == other.deepest && has_shared_path_prefix(self.tail, other.tail))
+            || (self.tail.as_os_str().is_empty() && other.ancestors.contains(&self.deepest))
+            || (other.tail.as_os_str().is_empty() && self.ancestors.contains(&other.deepest))
+    }
+}
+
+fn has_shared_path_prefix(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn directory_identity(metadata: &fs::Metadata) -> Result<DirectoryIdentity, EdgeSnapshotError> {
+    if !metadata.is_dir() {
+        return Err(refused("snapshot path has a non-directory ancestor"));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
 fn require_disjoint(paths: &[&Path]) -> Result<(), EdgeSnapshotError> {
-    for (index, path) in paths.iter().enumerate() {
-        if paths[index + 1..]
+    let identities = paths
+        .iter()
+        .map(|path| PathIdentity::read(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, path) in identities.iter().enumerate() {
+        if identities[index + 1..]
             .iter()
-            .any(|other| path.starts_with(other) || other.starts_with(path))
+            .any(|other| path.overlaps(other))
         {
             return Err(refused("snapshot paths must not overlap"));
         }
@@ -1152,15 +1219,44 @@ fn require_disjoint(paths: &[&Path]) -> Result<(), EdgeSnapshotError> {
 
 impl Workspace {
     fn create(path: PathBuf) -> Result<Self, EdgeSnapshotError> {
+        use rustix::fs::{Mode, OFlags, open, openat};
+
         create_private_dir(&path)?;
-        Ok(Self(path))
+        let directory: File = open(
+            &path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?
+        .into();
+        let identity = directory_identity(&directory.metadata()?)?;
+        let workspace = Self {
+            path,
+            identity,
+            directory,
+        };
+        openat(
+            &workspace.directory,
+            WORKSPACE_MARKER,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(io::Error::from)?;
+        Ok(workspace)
     }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.0) {
-            tracing::warn!(path = %self.0.display(), %error, "failed to remove snapshot staging directory");
+        let current = fs::symlink_metadata(&self.path)
+            .map_err(EdgeSnapshotError::from)
+            .and_then(|metadata| directory_identity(&metadata));
+        if !current.is_ok_and(|identity| identity == self.identity) {
+            tracing::warn!(path = %self.path.display(), "snapshot workspace no longer matches its reserved directory");
+            return;
+        }
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            tracing::warn!(path = %self.path.display(), %error, "failed to remove snapshot staging directory");
         }
     }
 }

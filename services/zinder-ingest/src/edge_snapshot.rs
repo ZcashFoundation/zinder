@@ -264,8 +264,10 @@ async fn prepare_source(
     let destination =
         EdgeSnapshotDestination::reserve(target, args.sealed_history_output.as_deref(), remote)?;
     let source = if let Some(directory) = destination.download_path() {
-        download_bundle(&args.source, directory, &args.public_key, config).await?;
-        directory.to_path_buf()
+        let bundle = directory.join("bundle");
+        fs::create_dir(&bundle)?;
+        download_bundle(&args.source, &bundle, &args.public_key, config).await?;
+        bundle
     } else {
         PathBuf::from(&args.source)
     };

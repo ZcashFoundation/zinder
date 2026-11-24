@@ -292,6 +292,17 @@ fn canonical_target_cannot_equal_the_sidecar_workspace() -> TestResult {
         matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("overlap"))
     );
     assert_eq!(fs::read_dir(root.path())?.count(), 0);
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(root.path(), &alias)?;
+    let failure = EdgeSnapshotDestination::reserve(
+        &alias.join("history.bootstrap.staging"),
+        Some(&history),
+        false,
+    );
+    assert!(
+        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("overlap"))
+    );
+    assert_eq!(fs::read_dir(root.path())?.count(), 1);
     Ok(())
 }
 
@@ -322,12 +333,237 @@ fn incompatible_local_manifest_refuses_before_any_payload_is_copied() -> TestRes
         trusted_keys: &keys,
         spot_check_blocks: DEFAULT_SPOT_CHECK_BLOCKS,
     };
-    let stage = &destination.stage.0;
+    let stage = &destination.stage.path;
     let failure = stage_files(&input, stage, &config);
     assert!(
         matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("store identity"))
     );
-    assert_eq!(fs::read_dir(stage)?.count(), 0);
+    let entries = fs::read_dir(stage)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<io::Result<Vec<_>>>()?;
+    assert_eq!(entries, [WORKSPACE_MARKER]);
     assert!(!target.exists());
     Ok(())
+}
+
+#[test]
+fn aliased_directory_identities_detect_destination_and_workspace_overlap() {
+    let shared = (7, 11);
+    let entry = |path, tail| PathIdentity {
+        path: Path::new(path),
+        deepest: shared,
+        ancestors: vec![shared, (7, 1)],
+        tail: Path::new(tail),
+    };
+    let target = entry("/first/canonical", "canonical");
+    assert!(target.overlaps(&entry("/second/canonical", "canonical")));
+    assert!(target.overlaps(&entry("/second/canonical/sidecar", "canonical/sidecar")));
+    let workspace = entry(
+        "/second/history.bootstrap.staging",
+        "history.bootstrap.staging",
+    );
+    assert!(
+        entry(
+            "/first/history.bootstrap.staging",
+            "history.bootstrap.staging"
+        )
+        .overlaps(&workspace)
+    );
+    assert!(!target.overlaps(&workspace));
+
+    let existing = entry("/first", "");
+    let descendant = PathIdentity {
+        path: Path::new("/second/child/sidecar"),
+        deepest: (7, 12),
+        ancestors: vec![(7, 12), shared, (7, 1)],
+        tail: Path::new("sidecar"),
+    };
+    assert!(existing.overlaps(&descendant));
+    assert!(descendant.overlaps(&existing));
+}
+
+#[test]
+fn workspace_cleanup_preserves_a_replacement_directory() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("workspace");
+    let work = Workspace::create(path.clone())?;
+    assert!(path.join(WORKSPACE_MARKER).is_file());
+    assert!(require_empty_or_absent(&path).is_err());
+    let moved = root.path().join("moved");
+    fs::rename(&path, &moved)?;
+    fs::create_dir(&path)?;
+    fs::write(path.join("keep"), b"replacement")?;
+    drop(work);
+    assert_eq!(fs::read(path.join("keep"))?, b"replacement");
+    assert!(moved.join(WORKSPACE_MARKER).is_file());
+    Ok(())
+}
+
+#[test]
+fn exported_checkpoint_removes_publisher_keys_leases_and_mempool() -> TestResult {
+    use crate::{CanonicalEventHistoryRequest, ProjectionBuildLease, ProjectionBuildLeaseId};
+
+    let root = tempfile::tempdir()?;
+    let (_source_directory, mut source) = admitted_source()?;
+    let publisher_keys = [[0x91; 32], [0xa7; 32]];
+    set_publisher_cursor_keys(&mut source, publisher_keys)?;
+    seed_mempool(&source)?;
+    let now = UnixTimestampMillis::new(10);
+    let anchor = source
+        .canonical_event_history(CanonicalEventHistoryRequest::new(None, NonZeroU32::MIN))?
+        .first()
+        .ok_or("missing baseline event")?
+        .projection_build_anchor();
+    let lease = source.acquire_projection_build_lease(
+        ProjectionBuildLease::new(
+            ProjectionBuildLeaseId::from_bytes([9; 16]),
+            anchor,
+            UnixTimestampMillis::new(20),
+        ),
+        now,
+    )?;
+    let history = MempoolEventHistoryRequest::with_default_limit(None);
+    let source_events = source.mempool_event_history(history)?;
+    let source_control = source.bounded_open.db.get(STORE_CONTROL_KEY)?;
+    let db = &source.bounded_open.db;
+    db.flush()?;
+    db.flush_cf(&column_family(db, MEMPOOL_EVENT_COLUMN_FAMILY)?)?;
+    let inherited = sensitive_tables(db)?;
+    let signing_key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| "key generation failed")?;
+    let signer =
+        Ed25519KeyPair::from_pkcs8(signing_key.as_ref()).map_err(|_| "key parsing failed")?;
+    let key_file = root.path().join("signer.der");
+    fs::write(&key_file, signing_key.as_ref())?;
+    let bundle = root.path().join("bundle");
+    export_edge_snapshot(&mut source, &bundle, &key_file, None)?;
+
+    let trusted = [signer.public_key().as_ref().try_into()?];
+    let manifest = EdgeSnapshotManifest::verify(
+        &fs::read(bundle.join(MANIFEST_FILE))?,
+        &fs::read(bundle.join(SIGNATURE_FILE))?,
+        &trusted,
+    )?;
+    validate_local_inventory(&bundle, &manifest)?;
+    for (path, bytes, digest) in manifest.files() {
+        assert_eq!(
+            transfer(&bundle.join(path), None, Some(bytes))?,
+            (bytes, digest)
+        );
+    }
+    inspect_exported_checkpoint(&bundle.join(CANONICAL), &inherited, &publisher_keys)?;
+    assert_eq!(source.cursor_auth_key, publisher_keys[1]);
+    assert_eq!(
+        source.bounded_open.db.get(STORE_CONTROL_KEY)?,
+        source_control
+    );
+    assert_eq!(source.mempool_event_history(history)?, source_events);
+    assert_eq!(
+        source.active_projection_build_lease(lease.id(), now)?,
+        Some(lease)
+    );
+    Ok(())
+}
+
+fn set_publisher_cursor_keys(
+    source: &mut RocksDbCanonicalStore,
+    publisher_keys: [[u8; 32]; 2],
+) -> TestResult {
+    let db = &source.bounded_open.db;
+    let original = db
+        .get(STORE_CONTROL_KEY)?
+        .ok_or("missing source store control")?;
+    let control = decode_store_control(db.path(), &original)?;
+    for key in publisher_keys {
+        db.put(
+            STORE_CONTROL_KEY,
+            encode_ready_store_control_with_revisions(
+                control.workload,
+                &control.build_plan,
+                key,
+                &source.ready_evidence(),
+                control.revisions(),
+            )?,
+        )?;
+        db.flush()?;
+        source.cursor_auth_key = key;
+    }
+    Ok(())
+}
+
+fn sensitive_tables(db: &rust_rocksdb::DB) -> TestResult<BTreeSet<String>> {
+    Ok(db
+        .live_files()?
+        .into_iter()
+        .filter(|sst| {
+            matches!(
+                sst.column_family_name.as_str(),
+                "default" | MEMPOOL_EVENT_COLUMN_FAMILY
+            )
+        })
+        .map(|sst| sst.name)
+        .collect())
+}
+
+fn inspect_exported_checkpoint(
+    path: &Path,
+    inherited: &BTreeSet<String>,
+    publisher_keys: &[[u8; 32]; 2],
+) -> TestResult {
+    use crate::canonical_store::event_lifecycle::PROJECTION_BUILD_LEASE_PREFIX;
+    use rust_rocksdb::{DB, Options};
+
+    let options = Options::default();
+    let families = DB::list_cf(&options, path)?;
+    let checkpoint = DB::open_cf_for_read_only(&options, path, &families, false)?;
+    let encoded = checkpoint
+        .get(STORE_CONTROL_KEY)?
+        .ok_or("missing exported store control")?;
+    let control = decode_store_control(path, &encoded)?;
+    assert!(!publisher_keys.contains(&control.cursor_auth_key));
+    assert!(checkpoint.get(MEMPOOL_EVENT_SEQUENCE_KEY)?.is_none());
+    assert!(checkpoint.get(MEMPOOL_EVENT_RETENTION_FLOOR_KEY)?.is_none());
+    assert!(sensitive_tables(&checkpoint)?.is_disjoint(inherited));
+    let live = checkpoint.live_files()?;
+    for family in families {
+        let cf = checkpoint
+            .cf_handle(&family)
+            .ok_or("missing exported column family")?;
+        let mut visible = 0_u64;
+        for row in checkpoint.iterator_cf(&cf, IteratorMode::Start) {
+            let (key, encoded) = row?;
+            assert!(!key.starts_with(PROJECTION_BUILD_LEASE_PREFIX) || family != "default");
+            assert_no_publisher_key(&key, publisher_keys);
+            assert_no_publisher_key(&encoded, publisher_keys);
+            visible += 1;
+        }
+        if family == MEMPOOL_EVENT_COLUMN_FAMILY {
+            assert_eq!(visible, 0);
+        }
+        if family == "default" {
+            // The decoded row scan accounts for compression. The table entry
+            // count also rules out hidden superseded rows in this family.
+            let entries: u64 = live
+                .iter()
+                .filter(|sst| sst.column_family_name == family)
+                .map(|sst| sst.num_entries)
+                .sum();
+            assert_eq!(entries, visible);
+        }
+    }
+    for entry in fs::read_dir(path)? {
+        let file = entry?.path();
+        match file.extension().and_then(std::ffi::OsStr::to_str) {
+            Some("sst") => assert_no_publisher_key(&fs::read(file)?, publisher_keys),
+            Some("log") => assert_eq!(fs::metadata(file)?.len(), 0),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn assert_no_publisher_key(bytes: &[u8], keys: &[[u8; 32]; 2]) {
+    for key in keys {
+        assert!(!bytes.windows(key.len()).any(|window| window == key));
+    }
 }

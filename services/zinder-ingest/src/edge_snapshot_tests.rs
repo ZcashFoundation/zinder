@@ -23,7 +23,7 @@ use zinder_core::{
 use zinder_ingest::{
     CommitmentTreeSizes, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
 };
-use zinder_source::{NodeCapabilities, SourceBlock, SourceSubtreeRoots};
+use zinder_source::{NodeCapabilities, SourceBlock, SourceSubtreeRoot, SourceSubtreeRoots};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend,
     CanonicalStoreBuildPlan, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbResourceBudget,
@@ -34,12 +34,18 @@ use super::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const SNAPSHOT: BlockHeight = BlockHeight::new(4096);
+const POOLS: [ShieldedProtocol; 3] = [
+    ShieldedProtocol::Sapling,
+    ShieldedProtocol::Orchard,
+    ShieldedProtocol::Ironwood,
+];
 
 struct Validator {
     blocks: BTreeMap<BlockHeight, SourceBlock>,
     checkpoint: CommitmentTreeCheckpoint,
     activations: NetworkUpgradeActivations,
     tip: BlockId,
+    subtrees: Vec<SubtreeRootArtifact>,
 }
 
 #[async_trait::async_trait]
@@ -82,7 +88,19 @@ impl NodeSource for Validator {
         start_index: SubtreeRootIndex,
         _: NonZeroU32,
     ) -> Result<SourceSubtreeRoots, SourceError> {
-        Ok(SourceSubtreeRoots::new(protocol, start_index, Vec::new()))
+        let roots = self
+            .subtrees
+            .iter()
+            .filter(|root| root.protocol == protocol)
+            .map(|root| {
+                SourceSubtreeRoot::new(
+                    root.subtree_index,
+                    root.root_hash,
+                    root.completing_block_height,
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(SourceSubtreeRoots::new(protocol, start_index, roots))
     }
 }
 
@@ -95,12 +113,14 @@ impl Validator {
             BlockHeight::new(0),
             genesis.zcash_serialize_to_vec()?,
         )?;
-        let floor = block_after(&genesis, BlockHeight::new(4095))?;
+        let early = block_after(&genesis, BlockHeight::new(4093))?;
+        let before_floor = block_after(&early, BlockHeight::new(4094))?;
+        let floor = block_after(&before_floor, BlockHeight::new(4095))?;
         let snapshot = block_after(&floor, SNAPSHOT)?;
         let next = block_after(&snapshot, BlockHeight::new(4097))?;
         let tip = block_id(&next);
         let checkpoint = checkpoint(&snapshot);
-        let blocks = [genesis, floor, snapshot, next]
+        let blocks = [genesis, early, before_floor, floor, snapshot, next]
             .into_iter()
             .map(|block| (block.height, block))
             .collect();
@@ -115,7 +135,48 @@ impl Validator {
             checkpoint,
             activations: NetworkUpgradeActivations::new(network, scheduled)?,
             tip,
+            subtrees: Vec::new(),
         })
+    }
+
+    fn with_completed_subtrees() -> TestResult<Self> {
+        let mut validator = Self::fixture()?;
+        let mut schedule = validator.activations.activations().to_vec();
+        for upgrade in &mut schedule {
+            upgrade.activation_height = BlockHeight::new(1);
+        }
+        validator.activations = NetworkUpgradeActivations::new(Network::ZcashRegtest, schedule)?;
+        let frontier = |pool| {
+            zinder_testkit::completed_subtree_frontier(pool).map_err(|error| error.to_string())
+        };
+        validator.checkpoint.frontiers = CommitmentTreeFrontiers::from_validated_parts(
+            Some(frontier(ShieldedProtocol::Sapling)?),
+            Some(frontier(ShieldedProtocol::Orchard)?),
+            Some(frontier(ShieldedProtocol::Ironwood)?),
+        )?;
+        validator.subtrees = POOLS
+            .into_iter()
+            .zip([(1, 4093), (2, 4094), (3, 4095)])
+            .map(|(pool, (seed, height))| {
+                let completion = block_id(validator.block(height)?);
+                Ok(SubtreeRootArtifact::new(
+                    pool,
+                    SubtreeRootIndex::new(0),
+                    SubtreeRootHash::from_bytes([seed; 32]),
+                    completion.height,
+                    completion.hash,
+                ))
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        Ok(validator)
+    }
+
+    fn checkpoint_at(&self, block: &SourceBlock) -> CommitmentTreeCheckpoint {
+        CommitmentTreeCheckpoint::new(
+            block_id(block),
+            block.block_time_seconds,
+            self.checkpoint.frontiers.clone(),
+        )
     }
 
     fn block(&self, height: u32) -> TestResult<&SourceBlock> {
@@ -138,13 +199,14 @@ impl Validator {
     fn build_block(&self, height: u32) -> TestResult<CanonicalBuildBlock> {
         let block = self.block(height)?;
         let prepared = prepare_canonical_block(block, &self.activations, RawBlobPolicy::None)?;
-        let positioned = position_canonical_block(prepared, &mut CommitmentTreeSizes::default())?;
+        let mut sizes = CommitmentTreeSizes::from_tip_metadata(self.checkpoint.tip_metadata());
+        let positioned = position_canonical_block(prepared, &mut sizes)?;
         Ok(CanonicalBuildBlock {
             facts: positioned.facts,
             replay_envelope: positioned.replay_envelope,
             compact_block: positioned.compact_block,
             tip_metadata: positioned.tip_metadata,
-            tree_state_checkpoint: Some(checkpoint(block)),
+            tree_state_checkpoint: Some(self.checkpoint_at(block)),
             block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
@@ -155,7 +217,7 @@ impl Validator {
         let config = self.config()?;
         let plan = CanonicalStoreBuildPlan::checkpointed(
             config.activations,
-            checkpoint(self.block(4095)?),
+            self.checkpoint_at(self.block(4095)?),
             self.checkpoint.block_id,
             config.raw_blob_retention,
             config.reorg_policy,
@@ -170,7 +232,11 @@ impl Validator {
             config.activations,
             [Ok::<_, io::Error>(self.build_block(4096)?)],
         )?;
-        builder.load_subtree_roots(std::iter::empty())?;
+        if self.subtrees.is_empty() {
+            builder.load_subtree_roots(std::iter::empty())?;
+        } else {
+            builder.load_complete_subtree_root_prefix(self.subtrees.iter().cloned())?;
+        }
         builder.confirm_source_tip_checkpoint(&self.checkpoint)?;
         let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -522,4 +588,84 @@ fn introduce_mismatch(
         _ => return Err(missing()),
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn terminal_subtree_attestation_checks_all_pools_before_publication() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let publisher = Validator::with_completed_subtrees()?;
+    let (bundle, keys) = signed_bundle(root.path(), &publisher)?;
+    let target = root.path().join("restored");
+    for pool in 0..POOLS.len() {
+        for mismatch in [
+            "index",
+            "root",
+            "completion height",
+            "completing block hash",
+        ] {
+            let mut validator = Validator::with_completed_subtrees()?;
+            let subtree = validator
+                .subtrees
+                .get_mut(pool)
+                .ok_or("missing terminal fixture root")?;
+            let expected = match mismatch {
+                "index" => {
+                    subtree.subtree_index = SubtreeRootIndex::new(1);
+                    "validator terminal subtree root differs"
+                }
+                "root" => {
+                    subtree.root_hash = SubtreeRootHash::from_bytes([7; 32]);
+                    "validator terminal subtree root differs"
+                }
+                "completion height" => {
+                    subtree.completing_block_height = SNAPSHOT;
+                    "validator terminal subtree root differs"
+                }
+                "completing block hash" => {
+                    validator
+                        .blocks
+                        .get_mut(&subtree.completing_block_height)
+                        .ok_or("missing completion block")?
+                        .hash = BlockHash::from_bytes([7; 32]);
+                    "validator best-chain block identity differs"
+                }
+                _ => return Err("unknown subtree mismatch".into()),
+            };
+            let failure =
+                bootstrap_terminal_fixture(&publisher, &validator, &bundle, &keys, &target).await;
+            assert!(
+                matches!(failure, Err(SnapshotCommandError::Refused(reason)) if reason == expected),
+                "{mismatch}: {failure:?}"
+            );
+            assert!(!target.exists());
+            assert!(!root.path().join("restored.bootstrap.staging").exists());
+        }
+    }
+    bootstrap_terminal_fixture(&publisher, &publisher, &bundle, &keys, &target).await?;
+    assert_append_restored(&publisher, &target)?;
+    Ok(())
+}
+
+async fn bootstrap_terminal_fixture(
+    publisher: &Validator,
+    validator: &Validator,
+    bundle: &Path,
+    keys: &[[u8; 32]],
+    target: &Path,
+) -> Result<(), SnapshotCommandError> {
+    let config = publisher
+        .config()
+        .map_err(|_| SnapshotCommandError::Refused("invalid terminal fixture"))?;
+    let policy = config.reorg_policy;
+    prepare_bootstrapped_store(
+        EdgeSnapshotDestination::reserve(target, None, false)?,
+        EdgeSnapshotBootstrap {
+            source: bundle,
+            trusted_keys: keys,
+            spot_check_blocks: NonZeroU32::MIN,
+        },
+        config,
+        |evidence| attest(validator, &publisher.activations, policy, evidence),
+    )
+    .await
 }
