@@ -777,6 +777,7 @@ fn reseal_body(
 }
 
 /// Corrupts one byte of the last row's shielded metadata digest.
+#[cfg(target_os = "linux")]
 fn tampered_digest(path: &Path) -> eyre::Result<SegmentIdentity> {
     let identity = publish(path, 1, 2)?;
     let bytes = fs::read(path)?;
@@ -786,6 +787,7 @@ fn tampered_digest(path: &Path) -> eyre::Result<SegmentIdentity> {
 }
 
 /// Corrupts one byte of the last row's shielded lengths prefix.
+#[cfg(target_os = "linux")]
 fn tampered_lengths(path: &Path) -> eyre::Result<SegmentIdentity> {
     let identity = publish(path, 1, 2)?;
     let bytes = fs::read(path)?;
