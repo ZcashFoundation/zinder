@@ -19,7 +19,7 @@ use crate::{
         RangeSource, view_reaches,
     },
     block_range::RangeBlock,
-    compact_block_messages::{CompactBlockShape, ironwood_active_at_or_below},
+    compact_block_messages::CompactBlockShape,
     sealed_history::{SealedBlock, SealedSlab},
 };
 
@@ -98,21 +98,10 @@ impl PublishedRangeRead {
         }
     }
 
-    /// The same read serving `shape`'s stored frames.
-    fn with_shape(&self, shape: CompactBlockShape) -> Self {
-        Self {
-            shape,
-            history: self.history.clone(),
-            tail: self.tail.clone(),
-            limits: self.limits.clone(),
-            is_descending: self.is_descending,
-        }
-    }
-
     /// Checks the whole offer. A descending offer that starts below the
     /// catalog can join it only from a live tail above the catalog.
     fn reads_published_files(&self, chunk: BlockHeightRange) -> bool {
-        self.shape.may_serve_published()
+        self.shape.is_published_shape()
             && self.history.as_ref().is_some_and(|catalog| {
                 let coverage = catalog.bounds();
                 (coverage.start..=coverage.end).contains(&chunk.start)
@@ -435,10 +424,6 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
             .collect()
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "view capture, pool-selection normalization, and the encoded-plan handoff share one chunk read's state"
-    )]
     async fn read<Output, Convert>(
         &self,
         reads: &Reads,
@@ -452,13 +437,13 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         if read.cancel.is_cancelled() {
             return cancelled_outcome(None);
         }
-        if !self.shape.may_serve_published() {
+        // Equivalence for a pool selection that omits only Ironwood was
+        // resolved when the stream was admitted; an unresolved selection
+        // reads canonical storage.
+        if !self.shape.is_published_shape() {
             return native_chunk(reads, read, convert).await;
         }
-        // A pool selection that omits only Ironwood encodes the same blocks as
-        // the default shapes below Ironwood activation, so it serves their
-        // stored frames once the chunk's highest height sits below it.
-        let routed = {
+        let (epoch, started, plan) = {
             let current;
             let view = match &read.view {
                 ChunkView::Captured(view) => view,
@@ -476,41 +461,18 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
             if !view_reaches(&epoch, read.chunk) {
                 return ChunkReadOutcome::unread(ChunkReadFailure::TipBelowChunk(epoch));
             }
-            let source = if self.shape.is_published_shape() {
-                self.clone()
-            } else {
-                let Some(equivalent) = self.shape.published_equivalent() else {
-                    return native_chunk(reads, read, convert).await;
-                };
-                match reads.view_activations(view).await {
-                    Ok(activations) => {
-                        if ironwood_active_at_or_below(&activations, read.chunk.end) {
-                            return native_chunk(reads, read, convert).await;
-                        }
-                    }
-                    Err(status) => {
-                        return ChunkReadOutcome::unread(ChunkReadFailure::Failed(status));
-                    }
-                }
-                self.with_shape(equivalent)
-            };
             let started = Instant::now();
             let fence = reads.range_fence(view);
-            let plan = source
+            let plan = self
                 .resolve_plan(
                     reads,
                     (view, epoch, fence, &read.cancel),
                     (&mut read.chunk, read.max_bytes),
                 )
                 .await;
-            Routing {
-                epoch,
-                started,
-                source,
-                plan,
-            }
+            (epoch, started, plan)
         };
-        let tail = match routed.plan {
+        let tail = match plan {
             AnchorPlan::UseEncoded(tail) => tail,
             AnchorPlan::FallbackNative => return native_chunk(reads, read, convert).await,
             AnchorPlan::Failed(status) => {
@@ -518,30 +480,20 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
                     return native_chunk(reads, read, convert).await;
                 }
                 return ChunkReadOutcome {
-                    read_duration: Some(routed.started.elapsed()),
+                    read_duration: Some(started.elapsed()),
                     converted: Err(ChunkReadFailure::Failed(status)),
                 };
             }
         };
         drop(read.view);
-        routed
-            .source
-            .finish_encoded_read(
-                (routed.epoch, routed.started),
-                (read.chunk, read.order, read.max_bytes, read.cancel),
-                tail,
-                convert,
-            )
-            .await
+        self.finish_encoded_read(
+            (epoch, started),
+            (read.chunk, read.order, read.max_bytes, read.cancel),
+            tail,
+            convert,
+        )
+        .await
     }
-}
-
-/// One encoded read's resolved shape and plan.
-struct Routing {
-    epoch: ChainEpoch,
-    started: Instant,
-    source: PublishedRangeRead,
-    plan: AnchorPlan,
 }
 
 /// The sealed slab that stores a published shape's frames.

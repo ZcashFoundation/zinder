@@ -357,6 +357,21 @@ fn finish_encoded_body(
     }
 }
 
+/// Moves `response`'s messages into `taken` for [`EncodedBlockBody`] and
+/// returns the response with an empty stream for tonic to frame, or returns it
+/// unchanged when no slot is waiting.
+fn hand_off_messages(
+    taken: Option<&mut Option<EncodedBlockRangeStream>>,
+    response: Response<EncodedBlockRangeStream>,
+) -> Response<EncodedBlockRangeStream> {
+    let Some(taken) = taken else {
+        return response;
+    };
+    let (metadata, messages, extensions) = response.into_parts();
+    *taken = Some(messages);
+    Response::from_parts(metadata, Box::pin(tokio_stream::empty()), extensions)
+}
+
 /// Opens the range for tonic and keeps its messages for [`EncodedBlockBody`].
 struct TakeMessages<'a> {
     service: &'a dyn EncodedBlockRange,
@@ -373,16 +388,8 @@ impl<'a> ServerStreamingService<BlockRange> for TakeMessages<'a> {
         let service = self.service;
         let taken = self.messages.take();
         Box::pin(async move {
-            let (metadata, messages, extensions) =
-                service.get_encoded_block_range(request).await?.into_parts();
-            let messages = match taken {
-                Some(taken) => {
-                    *taken = Some(messages);
-                    Box::pin(tokio_stream::empty())
-                }
-                None => messages,
-            };
-            Ok(Response::from_parts(metadata, messages, extensions))
+            let response = service.get_encoded_block_range(request).await?;
+            Ok(hand_off_messages(taken, response))
         })
     }
 }
@@ -403,18 +410,8 @@ impl<'a> ServerStreamingService<BlockRange> for TakeNullifierMessages<'a> {
         let service = self.service;
         let taken = self.messages.take();
         Box::pin(async move {
-            let (metadata, messages, extensions) = service
-                .get_encoded_block_range_nullifiers(request)
-                .await?
-                .into_parts();
-            let messages = match taken {
-                Some(taken) => {
-                    *taken = Some(messages);
-                    Box::pin(tokio_stream::empty())
-                }
-                None => messages,
-            };
-            Ok(Response::from_parts(metadata, messages, extensions))
+            let response = service.get_encoded_block_range_nullifiers(request).await?;
+            Ok(hand_off_messages(taken, response))
         })
     }
 }

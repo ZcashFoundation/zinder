@@ -51,6 +51,8 @@ const _: () = assert!(LENGTHS_LEN >= EncodedBlock::PREFIX_LEN);
 // One slab holds at most 4 GiB of frames, the reach of its u32 offset table.
 const MAX_SLAB_BYTES: u64 = u32::MAX as u64;
 const ROW_META_LEN: usize = 136;
+/// Read and write granularity for staged files.
+const STAGING_CHUNK: usize = 256 * 1024;
 const TRAILER_LEN: usize = 32;
 mod index;
 pub(crate) mod verity;
@@ -262,9 +264,11 @@ pub(crate) struct SegmentWriter {
     identity: SegmentIdentity,
     target: PathBuf,
     staged: Option<BufWriter<NamedTempFile>>,
-    /// Nullifier frames buffered until the shielded slab is complete; the
-    /// nullifier slab must follow the shielded slab contiguously on disk.
-    nullifier_frames: Vec<Vec<u8>>,
+    /// Nullifier frames staged beside the segment until the shielded slab is
+    /// complete, because the nullifier slab must follow the shielded slab
+    /// contiguously on disk. Staging keeps memory independent of the segment
+    /// length.
+    nullifiers: BufWriter<NamedTempFile>,
     rows: Vec<[u8; ROW_META_LEN]>,
     shielded_rel: Vec<u32>,
     nullifier_rel: Vec<u32>,
@@ -274,7 +278,7 @@ pub(crate) struct SegmentWriter {
 impl SegmentWriter {
     pub(crate) fn create(
         path: &Path,
-        staged: NamedTempFile,
+        (staged, nullifiers): (NamedTempFile, NamedTempFile),
         span: SegmentIdentity,
     ) -> io::Result<Self> {
         if span.start > span.end.height {
@@ -290,7 +294,7 @@ impl SegmentWriter {
             identity,
             target: path.to_owned(),
             staged: Some(staged),
-            nullifier_frames: Vec::new(),
+            nullifiers: BufWriter::new(nullifiers),
             rows: Vec::new(),
             shielded_rel: vec![0],
             nullifier_rel: vec![0],
@@ -331,10 +335,8 @@ impl SegmentWriter {
         staged.write_all(&shielded_frame)?;
         staged.write_all(&shielded_payload)?;
         self.push_slab_offset(SealedSlab::Shielded, LENGTHS_LEN + shielded_payload.len())?;
-        let mut frame = Vec::with_capacity(nullifier_frame.len() + nullifier_payload.len());
-        frame.extend_from_slice(&nullifier_frame);
-        frame.extend_from_slice(&nullifier_payload);
-        self.nullifier_frames.push(frame);
+        self.nullifiers.write_all(&nullifier_frame)?;
+        self.nullifiers.write_all(&nullifier_payload)?;
         self.push_slab_offset(SealedSlab::Nullifier, LENGTHS_LEN + nullifier_payload.len())?;
         self.rows.push(index::encode_row(
             id.hash,
@@ -366,6 +368,31 @@ impl SegmentWriter {
             u32::try_from(offset).map_err(|_| invalid("shielded segment slab offset overflow"))?,
         );
         Ok(())
+    }
+
+    /// Streams the staged nullifier slab behind the shielded slab, then
+    /// flushes the segment so the index follows it.
+    fn append_staged_nullifiers(
+        &mut self,
+        staged: &mut BufWriter<NamedTempFile>,
+        nullifier_len: u64,
+    ) -> io::Result<()> {
+        self.nullifiers.flush()?;
+        let spill = self.nullifiers.get_mut().as_file_mut();
+        spill.seek(io::SeekFrom::Start(0))?;
+        let copied = {
+            let mut input =
+                BufReader::with_capacity(STAGING_CHUNK, (&mut *spill).take(nullifier_len));
+            io::copy(&mut input, staged)?
+        };
+        if copied != nullifier_len {
+            return Err(invalid("staged nullifier slab is shorter than its index"));
+        }
+        // A surplus byte means the spill file and its offsets disagree.
+        if spill.read(&mut [0])? != 0 {
+            return Err(invalid("staged nullifier slab is longer than its index"));
+        }
+        staged.flush()
     }
 
     /// The segment's fixed header, from the writer's completed state.
@@ -407,10 +434,6 @@ impl SegmentWriter {
             .staged
             .take()
             .ok_or_else(|| invalid("failed shielded segment write"))?;
-        for frame in &self.nullifier_frames {
-            staged.write_all(frame)?;
-        }
-        staged.flush()?;
         let shielded_len = u64::from(
             *self
                 .shielded_rel
@@ -425,6 +448,7 @@ impl SegmentWriter {
         );
         let nullifier_slab_offset = HEADER_LEN as u64 + shielded_len;
         let index_offset = nullifier_slab_offset + nullifier_len;
+        self.append_staged_nullifiers(&mut staged, nullifier_len)?;
         write_index(
             &mut staged,
             (&self.shielded_rel, &self.nullifier_rel),
@@ -512,7 +536,7 @@ fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
 
 /// Hashes the finished body, then the whole staged file behind it, in one pass.
 fn hash_staged(file: &File, body_len: u64) -> io::Result<([u8; 32], Vec<u8>)> {
-    const CHUNK: usize = 256 * 1024;
+    const CHUNK: usize = STAGING_CHUNK;
     let mut digest = Sha256::new();
     let mut verity = fs_verity::new_dyn(fs_verity::InnerHashAlgorithm::Sha256);
     let mut input = BufReader::with_capacity(CHUNK, file);

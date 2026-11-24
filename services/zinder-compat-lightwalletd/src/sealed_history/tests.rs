@@ -31,23 +31,33 @@ fn block(height: u32) -> CompactBlockArtifact {
     )
 }
 
+fn staged_files(directory: &Path) -> eyre::Result<(NamedTempFile, NamedTempFile)> {
+    Ok((
+        NamedTempFile::new_in(directory)?,
+        NamedTempFile::new_in(directory)?,
+    ))
+}
+
 fn range(start: u32, end: u32) -> BlockHeightRange {
     BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end))
 }
 
 fn expected_message(slab: SealedSlab, height: u32) -> eyre::Result<Vec<u8>> {
+    expected_message_for(slab, &block(height))
+}
+
+fn expected_message_for(slab: SealedSlab, block: &CompactBlockArtifact) -> eyre::Result<Vec<u8>> {
     let shape = match slab {
         SealedSlab::Shielded => CompactBlockShape::DEFAULT_RANGE,
         SealedSlab::Nullifier => CompactBlockShape::DEFAULT_NULLIFIER_RANGE,
     };
-    Ok(shape.message(block(height))?.encode_to_vec())
+    Ok(shape.message(block.clone())?.encode_to_vec())
 }
 
 fn publish(path: &Path, start: u32, end: u32) -> eyre::Result<SegmentIdentity> {
-    let staged = NamedTempFile::new_in(parent_directory(path))?;
     let mut writer = SegmentWriter::create(
         path,
-        staged,
+        staged_files(parent_directory(path))?,
         SegmentIdentity::span(NETWORK, ARTIFACT_SCHEMA, id(start).height, id(end)),
     )?;
     for height in start..=end {
@@ -127,10 +137,9 @@ fn both_slabs_round_trip_each_projection_in_each_direction() -> eyre::Result<()>
 fn unfinished_or_competing_writers_never_replace_published_bytes() -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("shielded");
-    let staged = NamedTempFile::new_in(dir.path())?;
     let mut writer = SegmentWriter::create(
         &path,
-        staged,
+        staged_files(dir.path())?,
         SegmentIdentity::span(NETWORK, ARTIFACT_SCHEMA, id(1).height, id(2)),
     )?;
     writer.push(block(1), 300)?;
@@ -482,16 +491,120 @@ fn signed_index_and_header_must_describe_the_exact_frames_and_links() -> eyre::R
     ] {
         let mut changed = original.clone();
         changed[byte] ^= 1;
-        let expected = SegmentIdentity {
-            sha256: Sha256::digest(&changed).into(),
-            ..identity
-        };
-        fs::write(&path, &changed)?;
+        let expected = reseal_body(&path, identity, changed)?;
         assert!(
             SealedHistory::open(&path, expected).is_err(),
             "byte {byte} must fail admission"
         );
     }
+    Ok(())
+}
+
+/// Admits `bytes` as one portable and one kernel-protected segment.
+fn admission_errors(identity: SegmentIdentity, bytes: &[u8]) -> [Option<String>; 2] {
+    let mut errors = [None, None];
+    for (slot, protected) in errors.iter_mut().zip([false, true]) {
+        let mut input = io::Cursor::new(bytes);
+        *slot = index::admit(&mut input, identity, bytes.len() as u64, protected)
+            .err()
+            .map(|error| error.to_string());
+    }
+    errors
+}
+
+#[test]
+fn resealed_offset_tables_must_start_ascend_and_end_at_their_slabs() -> eyre::Result<()> {
+    const COUNT: usize = 3;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("segment");
+    let identity = publish(&path, 1, u32::try_from(COUNT)?)?;
+    let original = fs::read(&path)?;
+    let index = index_offset_of(&original)?;
+    let entry = |table: usize, at: usize| index + (table * (COUNT + 1) + at) * 4;
+    let read_entry = |bytes: &[u8], table, at| -> eyre::Result<u32> {
+        Ok(u32::from_be_bytes(
+            bytes[entry(table, at)..entry(table, at) + 4].try_into()?,
+        ))
+    };
+
+    // The unchanged file admits under both modes.
+    assert_eq!(admission_errors(identity, &original), [None, None]);
+
+    for (table, name) in [(0, "shielded"), (1, "nullifier")] {
+        let last = read_entry(&original, table, COUNT)?;
+        for (label, at, value, reason) in [
+            (
+                "nonzero origin",
+                0,
+                1,
+                "shielded segment offset table does not start at its slab",
+            ),
+            (
+                "descending pair",
+                1,
+                read_entry(&original, table, 2)? + 1,
+                "shielded segment offset table spans are not ascending",
+            ),
+            (
+                "repeated offset",
+                2,
+                read_entry(&original, table, 1)?,
+                "shielded segment offset table spans are not ascending",
+            ),
+            (
+                "terminal beyond the slab",
+                COUNT,
+                last + 1,
+                "shielded segment offset table ends away from its slab",
+            ),
+            (
+                "terminal short of the slab",
+                COUNT,
+                last - 1,
+                "shielded segment offset table ends away from its slab",
+            ),
+        ] {
+            let mut changed = original.clone();
+            changed[entry(table, at)..entry(table, at) + 4].copy_from_slice(&value.to_be_bytes());
+            let resealed = reseal_body(&path, identity, changed.clone())?;
+            // Resealing changes the trailer, so read back the pinned file.
+            let changed = fs::read(&path)?;
+            assert_eq!(
+                admission_errors(resealed, &changed),
+                [Some(reason.to_owned()), Some(reason.to_owned())],
+                "{name} table, {label}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_resealed_metadata_row_that_breaks_the_chain_fails_before_the_trailer() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("segment");
+    let identity = publish(&path, 1, 3)?;
+    let original = fs::read(&path)?;
+    let index = index_offset_of(&original)?;
+    let tables = 2 * (3 + 1) * 4;
+    // Row 1's parent hash no longer names row 0, and the trailer, pin, and
+    // fs-verity measurement are all re-derived over the changed body.
+    let resealed = reseal(
+        &path,
+        identity,
+        original,
+        index + tables + ROW_META_LEN + 32,
+    )?;
+    let changed = fs::read(&path)?;
+    let errors = admission_errors(resealed, &changed);
+    let [Some(portable), Some(protected)] = errors else {
+        eyre::bail!("a broken chain link was admitted");
+    };
+    assert_eq!(portable, protected);
+    assert!(
+        !portable.contains("SHA-256 mismatch"),
+        "the structural check must run, not the stale digest: {portable}"
+    );
     Ok(())
 }
 
@@ -633,6 +746,16 @@ fn reseal(
     at: usize,
 ) -> eyre::Result<SegmentIdentity> {
     bytes[at] ^= 1;
+    reseal_body(path, identity, bytes)
+}
+
+/// Re-derives the trailer over the changed body, writes the file, and returns
+/// the identity that pins it.
+fn reseal_body(
+    path: &Path,
+    identity: SegmentIdentity,
+    mut bytes: Vec<u8>,
+) -> eyre::Result<SegmentIdentity> {
     let trailer: [u8; 32] = Sha256::digest(&bytes[..bytes.len() - TRAILER_LEN]).into();
     let split = bytes.len() - TRAILER_LEN;
     bytes[split..].copy_from_slice(&trailer);
@@ -780,10 +903,9 @@ fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
     const TOTAL_BLOCKS: u32 = 100;
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("shielded-dense");
-    let staged = NamedTempFile::new_in(parent_directory(&path))?;
     let mut writer = SegmentWriter::create(
         &path,
-        staged,
+        staged_files(parent_directory(&path))?,
         SegmentIdentity::span(NETWORK, ARTIFACT_SCHEMA, id(1).height, id(TOTAL_BLOCKS)),
     )?;
     for height in 1..=TOTAL_BLOCKS {
@@ -831,6 +953,53 @@ fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
         "first slab must release independently of later slabs"
     );
     assert_eq!(later_slabs[0].id, id(u32::try_from(slab_one_count)? + 1));
+    Ok(())
+}
+
+#[test]
+fn the_nullifier_slab_stages_on_disk_and_streams_into_the_segment() -> eyre::Result<()> {
+    const TOTAL_BLOCKS: u32 = 100;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("shielded-staged");
+    let mut writer = SegmentWriter::create(
+        &path,
+        staged_files(dir.path())?,
+        SegmentIdentity::span(NETWORK, ARTIFACT_SCHEMA, id(1).height, id(TOTAL_BLOCKS)),
+    )?;
+    let spill = writer.nullifiers.get_ref().path().to_owned();
+    for height in 1..=TOTAL_BLOCKS {
+        let dense = dense_block(height)?;
+        let native_bytes = zinder_store::encode_compact_block_artifact(&dense).len();
+        writer.push(dense, native_bytes)?;
+    }
+    // The frames wait in the staging file, not in writer memory.
+    writer.nullifiers.flush()?;
+    assert_eq!(
+        fs::metadata(&spill)?.len(),
+        u64::from(
+            *writer
+                .nullifier_rel
+                .last()
+                .ok_or_else(|| invalid("missing nullifier offsets"))?
+        )
+    );
+    let identity = writer.finish()?;
+    assert!(!spill.exists(), "finish must release the staging file");
+
+    let history = SealedHistory::open(&path, identity)?;
+    let rows = history.read_chunk(
+        SealedSlab::Nullifier,
+        range(1, TOTAL_BLOCKS),
+        HeightOrder::Ascending,
+        usize::MAX,
+    )?;
+    assert_eq!(rows.len(), TOTAL_BLOCKS as usize);
+    for (row, height) in rows.iter().zip(1..) {
+        assert_eq!(
+            row.message.payload().to_vec(),
+            expected_message_for(SealedSlab::Nullifier, &dense_block(height)?)?
+        );
+    }
     Ok(())
 }
 

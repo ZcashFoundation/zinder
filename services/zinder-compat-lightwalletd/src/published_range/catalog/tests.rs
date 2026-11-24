@@ -340,7 +340,9 @@ fn publisher_recovers_its_staging_files_after_an_interrupted_write() -> Result<(
     let retained = fs::read(&installed)?;
     let partial = dir.join(".publisher-write.tmp");
     let staged_segment = dir.join(".publisher-segment.tmp");
+    let staged_nullifiers = dir.join(".publisher-nullifiers.tmp");
     fs::write(&partial, b"interrupted write")?;
+    fs::write(&staged_nullifiers, b"interrupted nullifier staging")?;
     fs::hard_link(&installed, &staged_segment)?;
     let operator_file = dir.join(".operator-backup");
     fs::write(&operator_file, b"private backup")?;
@@ -348,11 +350,13 @@ fn publisher_recovers_its_staging_files_after_an_interrupted_write() -> Result<(
     assert!(fixture.publisher().is_err());
     assert!(partial.exists());
     assert!(staged_segment.exists());
+    assert!(staged_nullifiers.exists());
     drop(first);
 
     let mut resumed = fixture.publisher()?;
     assert!(!partial.exists());
     assert!(!staged_segment.exists());
+    assert!(!staged_nullifiers.exists());
     assert_eq!(fs::read(operator_file)?, b"private backup");
     assert_eq!(fs::read(installed)?, retained);
     assert_eq!(fs::read(head)?, checkpoint);
@@ -1256,6 +1260,20 @@ struct RecordedSlot {
     slot: crate::CanonicalReaderSlot,
     rows: Arc<parking_lot::Mutex<Vec<BlockHeightRange>>>,
     native: Arc<parking_lot::Mutex<Vec<BlockHeightRange>>>,
+    /// Serves no writer-admitted activation schedule, as a standalone reader
+    /// can when its store carries none.
+    withhold_activation_schedule: bool,
+}
+
+impl RecordedSlot {
+    fn new(slot: crate::CanonicalReaderSlot) -> Self {
+        Self {
+            slot,
+            rows: Arc::default(),
+            native: Arc::default(),
+            withhold_activation_schedule: false,
+        }
+    }
 }
 
 impl crate::block_methods::CompactBlockReads for RecordedSlot {
@@ -1291,7 +1309,16 @@ impl crate::block_methods::CompactBlockReads for RecordedSlot {
     ) -> impl Future<
         Output = std::result::Result<zinder_core::NetworkUpgradeActivations, tonic::Status>,
     > + Send {
-        self.slot.view_activations(view)
+        let withheld = self.withhold_activation_schedule;
+        async move {
+            if withheld {
+                Err(tonic::Status::failed_precondition(
+                    "canonical reader carries no writer-admitted network-upgrade schedule",
+                ))
+            } else {
+                self.slot.view_activations(view).await
+            }
+        }
     }
 
     fn tip_block_time(
@@ -1383,11 +1410,7 @@ async fn blocks_only_reads_only_the_requested_rows_around_a_cached_frontier() ->
         reader.chain_epoch().visible_tip_height,
         BlockHeight::new(TIP)
     );
-    let reads = RecordedSlot {
-        slot: crate::CanonicalReaderSlot::new(Arc::new(reader)),
-        rows: Arc::default(),
-        native: Arc::default(),
-    };
+    let reads = RecordedSlot::new(crate::CanonicalReaderSlot::new(Arc::new(reader)));
     let span =
         |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
     let cold = super::super::ShieldedTailBuffer::default();
@@ -1469,11 +1492,7 @@ async fn ranges_that_cannot_use_signed_files_stream_while_every_published_read_p
     }
     let catalog = Arc::new(fixture.catalog(None)?);
     assert_eq!(catalog.bounds().end, BlockHeight::new(6));
-    let reads = RecordedSlot {
-        slot: crate::CanonicalReaderSlot::new(reader),
-        rows: Arc::default(),
-        native: Arc::default(),
-    };
+    let reads = RecordedSlot::new(crate::CanonicalReaderSlot::new(reader));
     let methods = crate::block_methods::BlockMethods::default();
     let span =
         |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
@@ -1797,11 +1816,7 @@ async fn nullifier_ranges_match_the_native_wire_bytes_without_native_reads() -> 
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
     let (_store, source) = reader(&chain)?;
     let source = Arc::new(source);
-    let reads = RecordedSlot {
-        slot: crate::CanonicalReaderSlot::new(source.clone()),
-        rows: Arc::default(),
-        native: Arc::default(),
-    };
+    let reads = RecordedSlot::new(crate::CanonicalReaderSlot::new(source.clone()));
     let fixture = Fixture::new()?;
     let mut publisher = fixture.publisher()?;
     for _ in 0..3 {
@@ -1849,11 +1864,7 @@ async fn an_ironwood_omitting_selection_serves_stored_frames_below_activation() 
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
     let (_store, source) = reader(&chain)?;
     let source = Arc::new(source);
-    let reads = RecordedSlot {
-        slot: crate::CanonicalReaderSlot::new(source.clone()),
-        rows: Arc::default(),
-        native: Arc::default(),
-    };
+    let reads = RecordedSlot::new(crate::CanonicalReaderSlot::new(source.clone()));
     let fixture = Fixture::new()?;
     let mut publisher = fixture.publisher()?;
     for _ in 0..3 {
@@ -1904,5 +1915,130 @@ async fn an_ironwood_omitting_selection_serves_stored_frames_below_activation() 
     .await?;
     assert_eq!(frames, native);
     assert!(!reads.native.lock().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unreadable_activation_schedule_serves_the_explicit_pools_natively() -> Result<()> {
+    use crate::compact_block_messages::CompactBlockShape;
+    use zinder_proto::compat::lightwalletd::PoolType;
+    const TIP: u32 = 2_100;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
+    let (_store, source) = reader(&chain)?;
+    let source = Arc::new(source);
+    let mut reads = RecordedSlot::new(crate::CanonicalReaderSlot::new(source.clone()));
+    reads.withhold_activation_schedule = true;
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    for _ in 0..3 {
+        assert!(publisher.publish_next(source.as_ref())?);
+    }
+    let catalog = Arc::new(fixture.catalog(None)?);
+    let methods = crate::block_methods::BlockMethods::default();
+    let sapling_orchard = vec![PoolType::Sapling as i32, PoolType::Orchard as i32];
+
+    // The covered range sits below Ironwood activation, so a proven
+    // equivalence would serve the sealed frames without a native read. With
+    // no schedule to prove it, the explicit selection answers instead.
+    let native = native_frames(
+        &methods,
+        &reads,
+        (1, 6, sapling_orchard.clone()),
+        CompactBlockShape::for_range,
+    )
+    .await?;
+    reads.native.lock().clear();
+    let frames = published_frames(
+        &methods,
+        &reads,
+        (Some(catalog.clone()), catalog.tail()),
+        (1, 6, sapling_orchard),
+        CompactBlockShape::for_range,
+    )
+    .await?;
+    assert_eq!(frames, native);
+    assert!(
+        !reads.native.lock().is_empty(),
+        "the explicit selection must read canonical storage"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_activation_sapling_orchard_ranges_bypass_the_signed_read_permits() -> Result<()> {
+    use std::time::Duration;
+    use zinder_proto::compat::lightwalletd::PoolType;
+    const TIP: u32 = 2_100;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
+    let (_store, source) = reader(&chain)?;
+    let source = Arc::new(source);
+    let reads = RecordedSlot::new(crate::CanonicalReaderSlot::new(source.clone()));
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    for _ in 0..3 {
+        assert!(publisher.publish_next(source.as_ref())?);
+    }
+    let catalog = Arc::new(fixture.catalog(None)?);
+    let methods = crate::block_methods::BlockMethods::default();
+    let sapling_orchard = vec![PoolType::Sapling as i32, PoolType::Orchard as i32];
+    let history = (Some(catalog.clone()), catalog.tail());
+
+    // Below activation the equivalent selection still counts as a signed
+    // read: with every permit held, the covered range waits for one.
+    let limit = methods.block_range_streams();
+    let held: Vec<_> = std::iter::from_fn(|| limit.try_published_read_permit()).collect();
+    assert_eq!(held.len(), 16);
+    let queued = Duration::from_millis(200);
+    assert!(
+        tokio::time::timeout(
+            queued,
+            published_frames(
+                &methods,
+                &reads,
+                history.clone(),
+                (1, 6, sapling_orchard.clone()),
+                crate::compact_block_messages::CompactBlockShape::for_range,
+            )
+        )
+        .await
+        .is_err()
+    );
+
+    // Above activation the same selection reads canonical storage: with every
+    // permit still held, neither a range above activation nor one that
+    // straddles it queues for a signed-file permit.
+    let prompt = Duration::from_secs(10);
+    let native_before = reads.native.lock().len();
+    let tail = tokio::time::timeout(
+        prompt,
+        published_frames(
+            &methods,
+            &reads,
+            history.clone(),
+            (2_085, 2_100, sapling_orchard.clone()),
+            crate::compact_block_messages::CompactBlockShape::for_range,
+        ),
+    )
+    .await??;
+    assert_eq!(tail.len(), 16);
+    let crossing = tokio::time::timeout(
+        prompt,
+        published_frames(
+            &methods,
+            &reads,
+            history.clone(),
+            (1_000, 2_100, sapling_orchard),
+            crate::compact_block_messages::CompactBlockShape::for_range,
+        ),
+    )
+    .await??;
+    assert_eq!(crossing.len(), 1_101);
+    drop(held);
+    let native_reads = reads.native.lock().clone();
+    assert!(
+        native_reads.len() > native_before,
+        "the explicit selection must read canonical storage"
+    );
+    assert!(native_reads.iter().all(|chunk| chunk.end.value() > 603));
     Ok(())
 }

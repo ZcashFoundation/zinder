@@ -40,7 +40,7 @@ use crate::block_range::{
     BlockRangeContinuity, BlockRangeResponse, BlockRangeSink, BlockRangeStage,
     BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, RangeBlock,
 };
-use crate::compact_block_messages::CompactBlockShape;
+use crate::compact_block_messages::{CompactBlockShape, ironwood_active_at_or_below};
 use crate::network_tip_estimate::estimated_network_height;
 use crate::node_tip_witness::NodeTipWitness;
 use crate::stale_tip::{StaleTipLimit, TipBlockTime, TipBlockTimeCache, unix_now_seconds};
@@ -393,8 +393,9 @@ impl BlockMethods {
         select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<lightwalletd::EncodedBlockRangeStream, Status> {
         let (range, is_descending) = block_range_from_request(request)?;
-        let slot = self.block_range_streams.open().await?;
         let shape = select(&request.pool_types)?;
+        let shape = resolve_published_shape(reads, shape, range.end).await?;
+        let slot = self.block_range_streams.open().await?;
         let source = crate::published_range::PublishedRangeRead::new(
             history,
             live_tail,
@@ -449,6 +450,41 @@ async fn published_read_permit(
         Some(limit) => limit.published_read_permit().await.map(Some),
         None => Ok(None),
     }
+}
+
+/// Resolves a pool selection that omits only Ironwood to the published shape
+/// it matches.
+///
+/// A request the stored frames cannot serve then never queues for a
+/// signed-file permit or inherits the reduced published byte budget.
+///
+/// Every chunk's highest height is at or below the request's highest height,
+/// so one captured view settles the whole request: an admitted activation
+/// schedule revision never changes activations at or below the tip it was
+/// admitted at. A schedule the reader cannot read, or a captured view it
+/// cannot take, leaves the selection alone, so the native path serves the
+/// request and reports its own canonical errors.
+async fn resolve_published_shape<Reads: CompactBlockReads>(
+    reads: &Reads,
+    shape: CompactBlockShape,
+    end: BlockHeight,
+) -> Result<CompactBlockShape, Status> {
+    if shape.is_published_shape() {
+        return Ok(shape);
+    }
+    let Some(equivalent) = shape.published_equivalent() else {
+        return Ok(shape);
+    };
+    let Ok(view) = reads.capture_view().await else {
+        return Ok(shape);
+    };
+    let Ok(activations) = reads.view_activations(&view).await else {
+        return Ok(shape);
+    };
+    if ironwood_active_at_or_below(&activations, end) {
+        return Ok(shape);
+    }
+    Ok(equivalent)
 }
 
 async fn first_chunk_view<Reads: CompactBlockReads>(

@@ -262,14 +262,6 @@ impl CompactBlockShape {
         self == Self::DEFAULT_RANGE || self == Self::DEFAULT_NULLIFIER_RANGE
     }
 
-    /// Returns whether a request for this shape may serve those stored
-    /// frames: it is a published shape, or it selects a published shape's
-    /// pools minus only Ironwood, whose omission changes no encoded block
-    /// across heights below Ironwood activation.
-    pub(crate) fn may_serve_published(self) -> bool {
-        self.is_published_shape() || self.published_equivalent().is_some()
-    }
-
     /// Returns the published shape whose stored frames carry exactly the
     /// bytes this shape encodes for every block below Ironwood activation,
     /// or `None` when this shape differs from one by more than that.
@@ -477,7 +469,6 @@ mod tests {
             ),
         ] {
             assert_eq!(shape.published_equivalent(), expected);
-            assert!(shape.may_serve_published());
         }
         for shape in [
             CompactBlockShape::for_range(&[lightwalletd::PoolType::Orchard as i32])?,
@@ -487,7 +478,6 @@ mod tests {
             CompactBlockShape::BLOCK_NULLIFIERS,
         ] {
             assert_eq!(shape.published_equivalent(), None);
-            assert!(!shape.may_serve_published());
         }
         Ok(())
     }

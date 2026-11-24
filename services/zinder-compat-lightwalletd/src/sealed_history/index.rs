@@ -71,6 +71,55 @@ impl StreamedSlab {
     }
 }
 
+/// Validates both slabs' relative offset tables against the header's
+/// offsets, before any span arithmetic or row decoding runs.
+///
+/// Each table must start at its slab base, every adjacent span must be
+/// ascending, and its last entry must be the slab's exact byte length.
+fn validate_tables(
+    header: &SegmentHeader,
+    (shielded_table, nullifier_table): (&[u32], &[u32]),
+    count: usize,
+) -> io::Result<()> {
+    let shielded_len = header
+        .nullifier_slab_offset
+        .checked_sub(HEADER_LEN as u64)
+        .ok_or_else(|| invalid("shielded segment index precedes its slabs"))?;
+    let nullifier_len = header
+        .index_offset
+        .checked_sub(header.nullifier_slab_offset)
+        .ok_or_else(|| invalid("shielded segment index precedes its slabs"))?;
+    validate_offset_table(shielded_table, count, shielded_len)?;
+    validate_offset_table(nullifier_table, count, nullifier_len)?;
+    Ok(())
+}
+
+/// Validates one slab's `[u32; count + 1]` relative offset table.
+fn validate_offset_table(table: &[u32], count: usize, slab_len: u64) -> io::Result<()> {
+    if table.len() != count + 1 {
+        return Err(invalid("shielded segment offset table is short"));
+    }
+    if u64::from(table[0]) != 0 {
+        return Err(invalid(
+            "shielded segment offset table does not start at its slab",
+        ));
+    }
+    if table
+        .windows(2)
+        .any(|pair| u64::from(pair[1]) <= u64::from(pair[0]))
+    {
+        return Err(invalid(
+            "shielded segment offset table spans are not ascending",
+        ));
+    }
+    if u64::from(table[count]) != slab_len {
+        return Err(invalid(
+            "shielded segment offset table ends away from its slab",
+        ));
+    }
+    Ok(())
+}
+
 /// The segment state admission hands to the serving history.
 pub(super) struct AdmittedSegment {
     pub(super) rows: Vec<SealedRow>,
@@ -100,14 +149,9 @@ fn admit_header(
             "shielded segment format, network, schema, or interval mismatch",
         ));
     }
-    let count = usize::try_from(block_count)
-        .map_err(|_| invalid("shielded segment height exceeds address space"))?;
     let index_len = offset_tables_len(block_count)
-        .checked_add(
-            u64::try_from(count * ROW_META_LEN)
-                .map_err(|_| invalid("shielded segment index exceeds address space"))?,
-        )
-        .ok_or_else(|| invalid("shielded segment exceeds address space"))?;
+        .checked_add(u64::from(block_count) * ROW_META_LEN as u64)
+        .ok_or_else(|| invalid("shielded segment index exceeds address space"))?;
     let body_len = header
         .index_offset
         .checked_add(index_len)
@@ -134,6 +178,7 @@ fn admit_protected(
     let shielded_table = read_offset_table(&mut *input, count)?;
     let nullifier_table = read_offset_table(&mut *input, count)?;
     let metadata = read_metadata(&mut *input, count)?;
+    validate_tables(header, (&shielded_table, &nullifier_table), count)?;
     Ok(admitted(
         header,
         decode_rows(
@@ -170,6 +215,7 @@ fn admit_portable(
     let shielded_table = hash_table(&mut input, count, &mut digest)?;
     let nullifier_table = hash_table(&mut input, count, &mut digest)?;
     let metadata = hash_metadata(&mut input, count, &mut digest)?;
+    validate_tables(header, (&shielded_table, &nullifier_table), count)?;
     let mut trailer = [0; TRAILER_LEN];
     input.read_exact(&mut trailer)?;
     // The trailer carries the body digest the catalog's identity pins.
@@ -326,13 +372,6 @@ fn decode_rows(
     streamed: Option<(&StreamedSlab, &StreamedSlab)>,
 ) -> io::Result<(Vec<SealedRow>, Vec<u32>, Vec<u32>)> {
     let count = metadata.len();
-    if header.nullifier_slab_offset != HEADER_LEN as u64 + u64::from(shielded_table[count])
-        || header.index_offset != header.nullifier_slab_offset + u64::from(nullifier_table[count])
-    {
-        return Err(invalid(
-            "shielded segment header offsets differ from its index",
-        ));
-    }
     let check = RowCheck {
         shielded_table: &shielded_table,
         nullifier_table: &nullifier_table,
@@ -447,7 +486,10 @@ fn wire_for(table: &[u32], i: usize) -> io::Result<usize> {
         .get(i + 1)
         .copied()
         .ok_or_else(|| invalid("shielded segment offset table is short"))?;
-    let frame = usize::try_from(u64::from(next) - u64::from(offset))
+    let span = u64::from(next)
+        .checked_sub(u64::from(offset))
+        .ok_or_else(|| invalid("shielded segment frame offsets are not ascending"))?;
+    let frame = usize::try_from(span)
         .map_err(|_| invalid("shielded segment frame offsets are not ascending"))?;
     if frame <= LENGTHS_LEN || frame > MAX_PAYLOAD_BYTES + LENGTHS_LEN {
         return Err(invalid("invalid shielded segment row lengths"));

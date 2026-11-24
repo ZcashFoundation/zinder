@@ -61,7 +61,7 @@ impl PublishedShieldedRange {
     fn build(
         reader: &RocksDbCanonicalReader,
         path: &Path,
-        staged: tempfile::NamedTempFile,
+        staged: (tempfile::NamedTempFile, tempfile::NamedTempFile),
         range: BlockHeightRange,
     ) -> io::Result<Self> {
         let view = reader.chain_epoch();
@@ -80,7 +80,7 @@ impl PublishedShieldedRange {
                 io::Error::new(io::ErrorKind::InvalidData, "missing terminal block header")
             })?;
         #[cfg(target_os = "linux")]
-        let fresh_file = crate::sealed_history::verity::reopen_staged(&staged)?;
+        let fresh_file = crate::sealed_history::verity::reopen_staged(&staged.0)?;
         let mut writer = SegmentWriter::create(
             path,
             staged,
