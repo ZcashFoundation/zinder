@@ -44,7 +44,7 @@ use zinder_store::{ArtifactFamily, MempoolEvent, RawBlobRetention};
 
 use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
-    CompactBlockReads, RequestedBlock, requested_block, view_reaches,
+    CompactBlockReads, RequestedBlock, TipCapture, requested_block, view_reaches,
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::mempool::{
@@ -518,6 +518,16 @@ where
 
     fn tail_source(&self, view: &Self::View) -> Option<zinder_query::CompactBlockFence> {
         self.compact_block_fence(*view)
+    }
+
+    async fn capture_tip(&self) -> Result<TipCapture<ChainEpoch>, Status> {
+        self.served_tip_snapshot()
+            .await
+            .map(|snapshot| TipCapture {
+                view: snapshot.chain_epoch,
+                block_time_unix_seconds: Some(snapshot.block_time_unix_seconds),
+            })
+            .map_err(|error| status_from_query_error(&error))
     }
 
     fn view_chain_epoch(view: &ChainEpoch) -> ChainEpoch {

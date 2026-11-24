@@ -136,6 +136,23 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
     /// Captures the chain view current now, without a storage read.
     fn capture_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send;
 
+    /// Captures the chain view for one single-shot tip call, such as
+    /// `GetLatestBlock` or `GetLightdInfo`, which expose no epoch and read
+    /// nothing again by it.
+    ///
+    /// A mode that serves epoch-bound pairs captures it without keeping the
+    /// pair readable for pins, and reads the tip's block time with it. The
+    /// default captures the current view and leaves the time to
+    /// [`Self::tip_block_time`].
+    fn capture_tip(&self) -> impl Future<Output = Result<TipCapture<Self::View>, Status>> + Send {
+        async {
+            Ok(TipCapture {
+                view: self.capture_view().await?,
+                block_time_unix_seconds: None,
+            })
+        }
+    }
+
     /// Returns the chain epoch `view` reads.
     fn view_chain_epoch(view: &Self::View) -> ChainEpoch;
 
@@ -260,6 +277,14 @@ impl Default for BlockMethods {
 
 /// The served tip a tip call answers with, the view it was read at, the times
 /// of its block, and when it was read.
+/// A view captured for one single-shot tip call.
+pub(crate) struct TipCapture<View> {
+    /// The captured view.
+    pub(crate) view: View,
+    /// The Unix time in the tip's header when the capture already read it.
+    pub(crate) block_time_unix_seconds: Option<i64>,
+}
+
 struct ServedTip<View> {
     view: View,
     chain_epoch: ChainEpoch,
@@ -412,12 +437,20 @@ impl BlockMethods {
         reads: &Reads,
         method: &'static str,
     ) -> Result<ServedTip<Reads::View>, Status> {
-        let view = reads.capture_view().await?;
+        let TipCapture {
+            view,
+            block_time_unix_seconds,
+        } = reads.capture_tip().await?;
         let chain_epoch = Reads::view_chain_epoch(&view);
         let tip_height = chain_epoch.visible_tip_height;
         let times = self
             .tip_block_times
-            .block_time(chain_epoch.id, tip_height, || reads.tip_block_time(&view))
+            .block_time(chain_epoch.id, tip_height, || async {
+                match block_time_unix_seconds {
+                    Some(block_time) => Ok(block_time),
+                    None => reads.tip_block_time(&view).await,
+                }
+            })
             .await?;
         // Sampled after the header read, which can wait for a blocking
         // thread, so the tip's age is the one it has when the call answers.

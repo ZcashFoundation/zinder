@@ -658,7 +658,7 @@ impl EndpointVerifications {
 
     /// Captures the evidence a verification checks against and tracks it.
     fn target(&self, pair_slot: &WalletServingPairSlot) -> Arc<VerificationTarget> {
-        let target = Arc::new(VerificationTarget::of(&pair_slot.capture()));
+        let target = Arc::new(VerificationTarget::of(&pair_slot.capture_ephemeral()));
         self.track(&target);
         target
     }

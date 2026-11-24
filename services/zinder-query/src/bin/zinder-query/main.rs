@@ -218,7 +218,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         )
         .await?;
     let visible_height = pair_slot
-        .capture()
+        .capture_ephemeral()
         .canonical_fence()
         .visible_tip()
         .height
