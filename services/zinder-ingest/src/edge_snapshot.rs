@@ -10,7 +10,10 @@ use clap::{Args, Subcommand};
 use reqwest::{Client, Url};
 use sha2::{Digest, Sha256};
 use zebra_chain::{block::Block, serialization::ZcashDeserializeInto};
-use zinder_core::{BlockHeight, BlockId, Network, NetworkUpgradeActivations, TransactionId};
+use zinder_core::{
+    BlockHeight, BlockId, Network, NetworkUpgradeActivations, SubtreeRootArtifact, TransactionId,
+};
+use zinder_ingest::configured_first_available_height;
 use zinder_source::{NodeSource, SourceError};
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreWorkload, RocksDbCanonicalStore,
@@ -106,11 +109,14 @@ pub(crate) async fn run(
     let policy = CanonicalReorgPolicy::new(runtime.reorg_window_blocks)
         .map_err(zinder_ingest::CanonicalWriterError::from)
         .map_err(IngestConfigError::from)?;
+    let required_first_available_height =
+        configured_first_available_height(runtime.run_overrides.checkpoint_height);
     let store_config = EdgeSnapshotStoreConfig {
         activations: &activations,
         workload: CanonicalStoreWorkload::Wallet,
         raw_blob_retention: runtime.raw_blob_policy.to_retention(),
         reorg_policy: policy,
+        required_first_available_height,
         resource_budget: runtime.canonical_rocksdb_budget,
     };
     match command {
@@ -131,17 +137,12 @@ pub(crate) async fn run(
             )?;
         }
         SnapshotCommand::BootstrapFromSnapshot(args) => {
-            let (destination, source) =
-                prepare_source(&args, &runtime.storage_path, &store_config).await?;
-            prepare_bootstrapped_store(
-                destination,
-                EdgeSnapshotBootstrap {
-                    source: &source,
-                    trusted_keys: &args.public_key,
-                    spot_check_blocks: args.spot_check_blocks,
-                },
+            bootstrap(
+                &args,
+                &runtime.storage_path,
                 store_config,
-                |evidence| attest(&validator, &activations, policy, evidence),
+                &validator,
+                policy,
             )
             .await?;
         }
@@ -149,12 +150,49 @@ pub(crate) async fn run(
     Ok(())
 }
 
+async fn bootstrap(
+    args: &BootstrapArgs,
+    target: &Path,
+    store_config: EdgeSnapshotStoreConfig<'_>,
+    validator: &impl NodeSource,
+    policy: CanonicalReorgPolicy,
+) -> Result<(), SnapshotCommandError> {
+    let activations = store_config.activations;
+    let required_first_available_height = store_config.required_first_available_height;
+    let (destination, source) = prepare_source(args, target, &store_config).await?;
+    prepare_bootstrapped_store(
+        destination,
+        EdgeSnapshotBootstrap {
+            source: &source,
+            trusted_keys: &args.public_key,
+            spot_check_blocks: args.spot_check_blocks,
+        },
+        store_config,
+        |evidence| {
+            attest(
+                validator,
+                activations,
+                policy,
+                required_first_available_height,
+                evidence,
+            )
+        },
+    )
+    .await
+}
+
 async fn attest(
     validator: &impl NodeSource,
     activations: &NetworkUpgradeActivations,
     policy: CanonicalReorgPolicy,
+    required_first_available_height: BlockHeight,
     evidence: EdgeSnapshotAttestation,
 ) -> Result<(), SnapshotCommandError> {
+    if evidence.history_floor.height > required_first_available_height {
+        return Err(SnapshotCommandError::Refused(
+            "snapshot history starts above the height the receiver requires",
+        ));
+    }
     let network = activations.network();
     let genesis = BlockId::new(BlockHeight::new(0), network.genesis_hash());
     require_block(validator, network, genesis).await?;
@@ -187,7 +225,35 @@ async fn attest(
             "validator tree state differs",
         ));
     }
-    for root in evidence.terminal_subtrees.into_iter().flatten() {
+    attest_terminal_subtrees(validator, network, evidence.terminal_subtrees).await?;
+    for block in evidence.blocks {
+        let observed = require_block(validator, network, block.block).await?;
+        let observed_ids = observed
+            .transactions
+            .iter()
+            .map(|tx| TransactionId::from_bytes(tx.hash().0));
+        if !observed_ids.eq(block.transaction_ids) {
+            return Err(SnapshotCommandError::Refused(
+                "validator spot-check transaction sequence differs",
+            ));
+        }
+    }
+    // The same best-chain fence must still cover all of the observations.
+    require_block(validator, network, tip).await?;
+    if validator.fetch_network_upgrade_activations().await? != *activations {
+        return Err(SnapshotCommandError::Refused(
+            "validator activation schedule changed",
+        ));
+    }
+    Ok(())
+}
+
+async fn attest_terminal_subtrees(
+    validator: &impl NodeSource,
+    network: Network,
+    subtrees: [Option<SubtreeRootArtifact>; 3],
+) -> Result<(), SnapshotCommandError> {
+    for root in subtrees.into_iter().flatten() {
         let index = root.subtree_index;
         let observed = validator
             .fetch_subtree_roots(root.protocol, index, NonZeroU32::MIN)
@@ -209,25 +275,6 @@ async fn attest(
             BlockId::new(root.completing_block_height, root.completing_block_hash),
         )
         .await?;
-    }
-    for block in evidence.blocks {
-        let observed = require_block(validator, network, block.block).await?;
-        let observed_ids = observed
-            .transactions
-            .iter()
-            .map(|tx| TransactionId::from_bytes(tx.hash().0));
-        if !observed_ids.eq(block.transaction_ids) {
-            return Err(SnapshotCommandError::Refused(
-                "validator spot-check transaction sequence differs",
-            ));
-        }
-    }
-    // The same best-chain fence must still cover all of the observations.
-    require_block(validator, network, tip).await?;
-    if validator.fetch_network_upgrade_activations().await? != *activations {
-        return Err(SnapshotCommandError::Refused(
-            "validator activation schedule changed",
-        ));
     }
     Ok(())
 }

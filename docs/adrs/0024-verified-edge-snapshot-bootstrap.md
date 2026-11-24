@@ -30,6 +30,12 @@ that boundary. The publisher keeps its own store and credentials.
   Inactive trees are null. Hashes and digests are arrays of 32 byte values,
   using the canonical store byte order for block hashes and the typed source
   byte order for tree roots.
+
+The receiver refuses a snapshot whose first retained block is above the first
+block its writer requires, which is block 1 without a checkpoint override and
+the block after the override otherwise. Manifest preflight enforces this before
+any payload is copied or downloaded, and attestation enforces it again, so
+normal writer startup never rejects a published bootstrap.
 - `manifest.v1.sig`, exactly 64 raw Ed25519 signature bytes. The publisher
   signs the ASCII format identifier followed by a NUL byte and the exact JSON
   bytes on disk. The receiver checks the signature against at least one

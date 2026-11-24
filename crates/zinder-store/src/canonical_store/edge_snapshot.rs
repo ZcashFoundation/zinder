@@ -204,6 +204,11 @@ impl EdgeSnapshotManifest {
                 "signed snapshot store identity differs from the receiver configuration",
             ));
         }
+        if anchors.history_floor.height > config.required_first_available_height.value() {
+            return Err(refused(
+                "signed snapshot history starts above the height the receiver requires",
+            ));
+        }
         Ok(())
     }
 
@@ -287,6 +292,8 @@ pub struct EdgeSnapshotStoreConfig<'a> {
     pub raw_blob_retention: RawBlobRetention,
     /// Exact configured canonical replacement depth.
     pub reorg_policy: CanonicalReorgPolicy,
+    /// Highest first retained block the receiving writer accepts at startup.
+    pub required_first_available_height: BlockHeight,
     /// Resource budget for cold admission.
     pub resource_budget: RocksDbResourceBudget,
 }
@@ -589,6 +596,7 @@ pub fn export_edge_snapshot(
         workload: store.workload(),
         raw_blob_retention: store.raw_blob_retention(),
         reorg_policy: store.reorg_policy(),
+        required_first_available_height: store.ready_evidence().first_retained_block.height,
         resource_budget: RocksDbResourceBudget::read_only_probe_defaults(),
     };
     let copy = config.open(&working_copy)?;

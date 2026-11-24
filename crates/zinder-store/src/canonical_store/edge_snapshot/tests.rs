@@ -37,6 +37,7 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
         workload: source.workload(),
         raw_blob_retention: source.raw_blob_retention(),
         reorg_policy: source.reorg_policy(),
+        required_first_available_height: BlockHeight::new(u32::MAX),
         resource_budget: RocksDbResourceBudget::for_local_tests(),
     };
     let target = root.path().join("target");
@@ -329,6 +330,7 @@ fn incompatible_local_manifest_refuses_before_any_payload_is_copied() -> TestRes
         workload: source.workload(),
         raw_blob_retention: source.raw_blob_retention(),
         reorg_policy: source.reorg_policy(),
+        required_first_available_height: BlockHeight::new(u32::MAX),
         resource_budget: RocksDbResourceBudget::for_local_tests(),
     };
     let input = EdgeSnapshotBootstrap {
@@ -736,6 +738,7 @@ async fn substituted_directories_are_refused_after_attestation() -> TestResult {
             workload: source.workload(),
             raw_blob_retention: source.raw_blob_retention(),
             reorg_policy: source.reorg_policy(),
+            required_first_available_height: BlockHeight::new(u32::MAX),
             resource_budget: RocksDbResourceBudget::for_local_tests(),
         };
         let failure = prepare_bootstrapped_store(

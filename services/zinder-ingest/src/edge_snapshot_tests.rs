@@ -11,6 +11,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
 };
+use tokio_util::sync::CancellationToken;
 use zebra_chain::{
     block::{Height, genesis::regtest_genesis_block, merkle::Root},
     serialization::ZcashSerialize,
@@ -21,8 +22,11 @@ use zinder_core::{
     SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, UnixTimestampMillis,
 };
 use zinder_ingest::{
-    CommitmentTreeSizes, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
+    CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalWriterConfig,
+    CanonicalWriterError, CommitmentTreeSizes, RawBlobPolicy, admit_canonical_store,
+    position_canonical_block, prepare_canonical_block,
 };
+use zinder_runtime::{ComposedReadiness, Readiness};
 use zinder_source::{NodeCapabilities, SourceBlock, SourceSubtreeRoot, SourceSubtreeRoots};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend,
@@ -34,12 +38,14 @@ use super::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const SNAPSHOT: BlockHeight = BlockHeight::new(4096);
+const HISTORY_FLOOR: BlockHeight = SNAPSHOT;
 const POOLS: [ShieldedProtocol; 3] = [
     ShieldedProtocol::Sapling,
     ShieldedProtocol::Orchard,
     ShieldedProtocol::Ironwood,
 ];
 
+#[derive(Clone)]
 struct Validator {
     blocks: BTreeMap<BlockHeight, SourceBlock>,
     checkpoint: CommitmentTreeCheckpoint,
@@ -192,6 +198,7 @@ impl Validator {
             workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(1)?,
+            required_first_available_height: HISTORY_FLOOR,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
         })
     }
@@ -309,6 +316,7 @@ async fn local_and_http_snapshot_bootstrap_can_append() -> TestResult {
             );
         }
         let policy = config.reorg_policy;
+        let required = config.required_first_available_height;
         prepare_bootstrapped_store(
             destination,
             EdgeSnapshotBootstrap {
@@ -317,7 +325,15 @@ async fn local_and_http_snapshot_bootstrap_can_append() -> TestResult {
                 spot_check_blocks: NonZeroU32::MIN,
             },
             config,
-            |evidence| attest(&validator, &validator.activations, policy, evidence),
+            |evidence| {
+                attest(
+                    &validator,
+                    &validator.activations,
+                    policy,
+                    required,
+                    evidence,
+                )
+            },
         )
         .await?;
         assert_append_restored(&validator, &target)?;
@@ -501,6 +517,7 @@ async fn validator_refuses_each_mismatched_anchor_before_publication() -> TestRe
         let validator = Validator::fixture()?;
         let config = publisher.config()?;
         let policy = config.reorg_policy;
+        let required = config.required_first_available_height;
         let activations = &publisher.activations;
         let failure = prepare_bootstrapped_store(
             EdgeSnapshotDestination::reserve(&target, None, false)?,
@@ -513,7 +530,7 @@ async fn validator_refuses_each_mismatched_anchor_before_publication() -> TestRe
             |mut evidence| async move {
                 let mut validator = validator;
                 introduce_mismatch(mismatch, &mut validator, &mut evidence)?;
-                attest(&validator, activations, policy, evidence).await
+                attest(&validator, activations, policy, required, evidence).await
             },
         )
         .await;
@@ -657,6 +674,7 @@ async fn bootstrap_terminal_fixture(
         .config()
         .map_err(|_| SnapshotCommandError::Refused("invalid terminal fixture"))?;
     let policy = config.reorg_policy;
+    let required = config.required_first_available_height;
     prepare_bootstrapped_store(
         EdgeSnapshotDestination::reserve(target, None, false)?,
         EdgeSnapshotBootstrap {
@@ -665,7 +683,176 @@ async fn bootstrap_terminal_fixture(
             spot_check_blocks: NonZeroU32::MIN,
         },
         config,
-        |evidence| attest(validator, &publisher.activations, policy, evidence),
+        |evidence| {
+            attest(
+                validator,
+                &publisher.activations,
+                policy,
+                required,
+                evidence,
+            )
+        },
     )
     .await
+}
+
+#[tokio::test]
+async fn snapshot_below_the_configured_history_floor_is_refused_before_payloads() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let validator = Validator::fixture()?;
+    let (bundle, keys) = signed_bundle(root.path(), &validator)?;
+    let (url, requests, server) = serve_bundle(bundle.clone()).await?;
+    let target = root.path().join("restored");
+    let uncovered = EdgeSnapshotStoreConfig {
+        required_first_available_height: configured_first_available_height(None),
+        ..validator.config()?
+    };
+    let args = bootstrap_args(url, keys);
+    let failure = prepare_source(&args, &target, &uncovered).await;
+    assert!(
+        matches!(failure, Err(SnapshotCommandError::Snapshot(EdgeSnapshotError::Refused(reason))) if reason.contains("history starts above")),
+        "unexpected HTTP preflight outcome"
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
+    assert!(!target.exists());
+    server.abort();
+
+    let args = bootstrap_args(bundle.to_string_lossy().into_owned(), keys);
+    let (destination, source) = prepare_source(&args, &target, &uncovered).await?;
+    let policy = uncovered.reorg_policy;
+    let required = uncovered.required_first_available_height;
+    let failure = prepare_bootstrapped_store(
+        destination,
+        EdgeSnapshotBootstrap {
+            source: &source,
+            trusted_keys: &keys,
+            spot_check_blocks: NonZeroU32::MIN,
+        },
+        uncovered,
+        |evidence| {
+            attest(
+                &validator,
+                &validator.activations,
+                policy,
+                required,
+                evidence,
+            )
+        },
+    )
+    .await;
+    assert!(
+        matches!(failure, Err(SnapshotCommandError::Snapshot(EdgeSnapshotError::Refused(reason))) if reason.contains("history starts above")),
+        "unexpected local preflight outcome"
+    );
+    assert!(!target.exists());
+
+    let args = bootstrap_args(bundle.to_string_lossy().into_owned(), keys);
+    let (destination, source) = prepare_source(&args, &target, &validator.config()?).await?;
+    let config = validator.config()?;
+    let policy = config.reorg_policy;
+    let below_floor = BlockHeight::new(HISTORY_FLOOR.value() - 1);
+    let failure = prepare_bootstrapped_store(
+        destination,
+        EdgeSnapshotBootstrap {
+            source: &source,
+            trusted_keys: &keys,
+            spot_check_blocks: NonZeroU32::MIN,
+        },
+        config,
+        |evidence| {
+            attest(
+                &validator,
+                &validator.activations,
+                policy,
+                below_floor,
+                evidence,
+            )
+        },
+    )
+    .await;
+    assert!(
+        matches!(failure, Err(SnapshotCommandError::Refused(reason)) if reason.contains("history starts above"))
+    );
+    assert!(!target.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn bootstrapped_store_passes_normal_writer_admission() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let validator = Validator::fixture()?;
+    let (bundle, keys) = signed_bundle(root.path(), &validator)?;
+    let target = root.path().join("restored");
+    let checkpoint_height = BlockHeight::new(HISTORY_FLOOR.value() - 1);
+    let config = EdgeSnapshotStoreConfig {
+        required_first_available_height: configured_first_available_height(Some(checkpoint_height)),
+        ..validator.config()?
+    };
+    let args = bootstrap_args(bundle.to_string_lossy().into_owned(), keys);
+    let (destination, source) = prepare_source(&args, &target, &config).await?;
+    let policy = config.reorg_policy;
+    let required = config.required_first_available_height;
+    prepare_bootstrapped_store(
+        destination,
+        EdgeSnapshotBootstrap {
+            source: &source,
+            trusted_keys: &keys,
+            spot_check_blocks: NonZeroU32::MIN,
+        },
+        config,
+        |evidence| {
+            attest(
+                &validator,
+                &validator.activations,
+                policy,
+                required,
+                evidence,
+            )
+        },
+    )
+    .await?;
+
+    let admit = |checkpoint_height| {
+        let validator = validator.clone();
+        let target = target.clone();
+        async move {
+            let writer = CanonicalWriterConfig {
+                storage_path: target,
+                resource_budget: RocksDbResourceBudget::for_local_tests(),
+                construction: CanonicalConstructionConfig::for_local_tests(
+                    Duration::from_secs(5),
+                    Arc::new(validator.activations.clone()),
+                ),
+                checkpoint_height,
+                raw_blob_retention: RawBlobRetention::None,
+                reorg_window_blocks: 1,
+                tree_state_checkpoint_selection: None,
+                follow: CanonicalFollowConfig {
+                    request_timeout: Duration::from_secs(5),
+                    poll_interval: Duration::from_millis(10),
+                    lag_threshold_blocks: 0,
+                    target_height: None,
+                    event_retention_window: None,
+                    event_retention_check_interval: Duration::from_secs(1),
+                    mempool_ready_gate: None,
+                    max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+                    node_failover: None,
+                },
+            };
+            admit_canonical_store(
+                &validator,
+                Arc::new(validator.activations.clone()),
+                &writer,
+                &ComposedReadiness::new(Readiness::default(), &[]),
+                &CancellationToken::new(),
+            )
+            .await
+        }
+    };
+    admit(Some(checkpoint_height)).await?;
+    assert!(matches!(
+        admit(None).await,
+        Err(CanonicalWriterError::InsufficientRetainedHistory { .. })
+    ));
+    Ok(())
 }
