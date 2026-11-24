@@ -186,6 +186,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
             request_timeout: validated.request_timeout,
             max_response_bytes: validated.pipeline_limits.max_response_bytes,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?;
     let network_upgrade_activations =

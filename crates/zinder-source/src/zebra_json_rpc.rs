@@ -21,6 +21,7 @@ use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
+use tokio::sync::SemaphorePermit;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, BlockValuePoolBalances, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
@@ -33,12 +34,12 @@ use zinder_core::{
 };
 
 use crate::{
-    BroadcastNodeProbe, CookieSource, CookieSourceError, JsonRpcMempoolSource,
-    JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceAdmissionLimits, MempoolSourceFactory,
-    NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSource, NodeStorageMode,
-    NodeTarget, ResilientClient, SourceBlock, SourceChainCursor, SourceChainSegment,
-    SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
-    SourceSubtreeRoot, SourceSubtreeRoots, SourceTransparentAddressBalance,
+    BroadcastNodeProbe, CookieSource, CookieSourceError, DEFAULT_NODE_MAX_CONCURRENT_REQUESTS,
+    JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceAdmissionLimits,
+    MempoolSourceFactory, NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSource,
+    NodeStorageMode, NodeTarget, ResilientClient, SourceBlock, SourceChainCursor,
+    SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
+    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, SourceTransparentAddressBalance,
     SourceTransparentUnspentOutput, SourceTransparentUtxoPage, TransactionBroadcaster,
     TransparentAddressLookup, TransparentAddressRowLimit,
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
@@ -46,6 +47,7 @@ use crate::{
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
     ZEBRA_REBUILD_THRESHOLD, ZebraIndexerMempoolSource, ZebraIndexerMempoolSourceOptions,
     ZebraIndexerSourceTarget, ZebraTransportError, decode_rpc_block_hash, encode_rpc_block_hash,
+    node_call_budget::{NodeCallBudget, NodeCallLane},
     source_block::wire_error_to_transaction_id_error,
     source_chain_update::SourceChainCursorPosition,
     source_transparent_address::{
@@ -159,7 +161,9 @@ pub struct ZebraJsonRpcSource {
     client: ResilientClient<ZebraSourceClient>,
     awaited_cookie: Option<Arc<AwaitedCookie>>,
     max_response_bytes: NonZeroU64,
+    request_timeout: Duration,
     broadcast_timeout: Option<Duration>,
+    call_budget: NodeCallBudget,
     cached_capabilities: Arc<Mutex<NodeCapabilities>>,
     health_floors: (f64, u32),
     ready_endpoint: Option<(String, ZebraReadyClient)>,
@@ -232,6 +236,12 @@ pub struct ZebraJsonRpcSourceOptions {
     /// fetches, which legitimately run long. `None` falls back to
     /// `request_timeout`.
     pub broadcast_timeout: Option<Duration>,
+    /// Most JSON-RPC calls the source and its clones have in flight at once.
+    ///
+    /// A call waits for a free slot for at most its own timeout, then fails
+    /// with [`SourceError::NodeUnavailable`] without contacting the node.
+    /// Upstream-health probes use a separate slot.
+    pub max_concurrent_requests: NonZeroU32,
 }
 
 impl Default for ZebraJsonRpcSourceOptions {
@@ -240,6 +250,7 @@ impl Default for ZebraJsonRpcSourceOptions {
             request_timeout: Duration::from_secs(30),
             max_response_bytes: DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
             broadcast_timeout: None,
+            max_concurrent_requests: DEFAULT_NODE_MAX_CONCURRENT_REQUESTS,
         }
     }
 }
@@ -505,7 +516,9 @@ impl ZebraJsonRpcSource {
             client,
             awaited_cookie,
             max_response_bytes,
+            request_timeout: options.request_timeout,
             broadcast_timeout,
+            call_budget: NodeCallBudget::new(options.max_concurrent_requests),
             cached_capabilities: Arc::new(Mutex::new(default_zebra_capabilities())),
             health_floors: NodeHealthConfig::default_floors(),
             ready_endpoint: None,
@@ -524,6 +537,7 @@ impl ZebraJsonRpcSource {
                 request_timeout: target.request_timeout,
                 max_response_bytes: target.max_response_bytes,
                 broadcast_timeout: target.broadcast_timeout,
+                max_concurrent_requests: target.max_concurrent_requests,
             },
         )
         .map(|source| {
@@ -531,6 +545,21 @@ impl ZebraJsonRpcSource {
                 .with_health_config(target.health.clone())
                 .with_indexer_target(ZebraIndexerSourceTarget::from_node_target(target))
         })
+    }
+
+    /// Returns a clone whose every JSON-RPC call uses the readiness-probe
+    /// slot instead of the `node.max_concurrent_requests` budget.
+    ///
+    /// A readiness probe that verifies the node before it observes it, such
+    /// as reading its methods, activation table, and tip block, runs through
+    /// this view so calls holding every shared slot cannot fail readiness.
+    /// The clone shares the client, capability cache, and both slot pools.
+    #[must_use]
+    pub fn for_readiness_probes(&self) -> Self {
+        Self {
+            call_budget: self.call_budget.readiness_view(),
+            ..self.clone()
+        }
     }
 
     /// Sets the indexer endpoint whose mempool stream
@@ -589,6 +618,18 @@ impl ZebraJsonRpcSource {
         Ok(self.client.snapshot())
     }
 
+    /// Waits for a JSON-RPC call slot on `lane`, for at most the request
+    /// timeout.
+    async fn admit(
+        &self,
+        lane: NodeCallLane,
+        operation: &'static str,
+    ) -> Result<SemaphorePermit<'_>, SourceError> {
+        self.call_budget
+            .admit(lane, operation, self.request_timeout)
+            .await
+    }
+
     async fn call_typed<Response>(
         &self,
         method: &'static str,
@@ -636,6 +677,22 @@ impl ZebraJsonRpcSource {
     }
 
     async fn call_decoding<WireResponse, Response>(
+        &self,
+        method: &'static str,
+        params: ArrayParams,
+        map_call_error: impl FnOnce(JsonRpcCallError) -> SourceError,
+        decode: impl FnOnce(WireResponse) -> Result<Response, SourceError>,
+    ) -> Result<Response, SourceError>
+    where
+        WireResponse: for<'de> Deserialize<'de>,
+    {
+        let _slot = self.admit(NodeCallLane::Shared, method).await?;
+        self.call_decoding_admitted(method, params, map_call_error, decode)
+            .await
+    }
+
+    /// Calls `method` on a call slot the caller holds.
+    async fn call_decoding_admitted<WireResponse, Response>(
         &self,
         method: &'static str,
         params: ArrayParams,
@@ -763,7 +820,9 @@ impl ZebraJsonRpcSource {
                 .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })?;
         }
 
+        let slot = self.admit(NodeCallLane::Shared, "batch_getblock").await?;
         let batch_result = self.request_client()?.batch_request::<Value>(batch).await;
+        drop(slot);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &batch_result,
             "batch_getblock",
@@ -914,11 +973,15 @@ impl ZebraJsonRpcSource {
             Value::from(1),
         ])?;
 
+        let slot = self
+            .admit(NodeCallLane::Shared, "getrawtransaction")
+            .await?;
         let started_at = Instant::now();
         let response = self
             .request_client()?
             .request::<Reply, _>("getrawtransaction", params)
             .await;
+        drop(slot);
         record_json_rpc_client_result("getrawtransaction", started_at, &response);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &response,
@@ -963,11 +1026,15 @@ impl ZebraJsonRpcSource {
             Value::from(0),
         ])?;
 
+        let slot = self
+            .admit(NodeCallLane::Shared, "getrawtransaction")
+            .await?;
         let started_at = Instant::now();
         let response = self
             .request_client()?
             .request::<String, _>("getrawtransaction", params)
             .await;
+        drop(slot);
         record_json_rpc_client_result("getrawtransaction", started_at, &response);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &response,
@@ -1564,17 +1631,11 @@ impl NodeSource for ZebraJsonRpcSource {
     }
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        let observed_tip: ZebraBestBlockHeightAndHash = self
-            .call_typed(
-                "getbestblockheightandhash",
-                ArrayParams::new(),
-                map_node_unavailable,
-            )
-            .await?;
-        Ok(BlockId::new(
-            BlockHeight::new(observed_tip.height),
-            BlockHash::from_bytes(observed_tip.hash),
-        ))
+        self.read_tip_id(NodeCallLane::Shared).await
+    }
+
+    async fn probe_tip_id(&self) -> Result<BlockId, SourceError> {
+        self.read_tip_id(NodeCallLane::Health).await
     }
 
     async fn fetch_subtree_roots(
@@ -1738,6 +1799,22 @@ impl NodeSource for ZebraJsonRpcSource {
 }
 
 impl ZebraJsonRpcSource {
+    async fn read_tip_id(&self, lane: NodeCallLane) -> Result<BlockId, SourceError> {
+        let _slot = self.admit(lane, "getbestblockheightandhash").await?;
+        let observed_tip: ZebraBestBlockHeightAndHash = self
+            .call_decoding_admitted(
+                "getbestblockheightandhash",
+                ArrayParams::new(),
+                map_node_unavailable,
+                Ok,
+            )
+            .await?;
+        Ok(BlockId::new(
+            BlockHeight::new(observed_tip.height),
+            BlockHash::from_bytes(observed_tip.hash),
+        ))
+    }
+
     /// Returns whether the node reports `pruned: false`.
     ///
     /// Fails closed: a failed call or a response without `pruned` counts as
@@ -1770,13 +1847,22 @@ impl ZebraJsonRpcSource {
     async fn poll_upstream_health_from_blockchain_info(
         &self,
     ) -> Result<UpstreamHealthSnapshot, SourceError> {
-        let snapshot_fields: ZebraGetBlockchainInfoHealth = self
-            .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
-                SourceError::NodeUnavailable {
-                    reason: error.message,
-                }
-            })
+        // The probe has its own slot, so calls saturating the shared budget
+        // cannot fail readiness.
+        let slot = self
+            .admit(NodeCallLane::Health, "getblockchaininfo")
             .await?;
+        let snapshot_fields: ZebraGetBlockchainInfoHealth = self
+            .call_decoding_admitted(
+                "getblockchaininfo",
+                ArrayParams::new(),
+                |error| SourceError::NodeUnavailable {
+                    reason: error.message,
+                },
+                Ok,
+            )
+            .await?;
+        drop(slot);
 
         let (progress_floor, gap_floor) = self.health_floors;
 
@@ -1881,23 +1967,29 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
         let params = positional_params([Value::from(raw_transaction_hex)])?;
 
         let started_at = Instant::now();
+        // Waiting for a slot counts against the broadcast deadline, so a
+        // saturated budget never stretches one broadcast past its timeout and
+        // still fails over to the next endpoint in time.
+        let call_timeout = self.broadcast_timeout.unwrap_or(self.request_timeout);
+        let slot = self
+            .call_budget
+            .admit(NodeCallLane::Shared, "sendrawtransaction", call_timeout)
+            .await?;
         let client_snapshot = self.request_client()?;
         let broadcast_fut = client_snapshot.request::<String, _>("sendrawtransaction", params);
 
-        let response = if let Some(timeout_duration) = self.broadcast_timeout {
-            match tokio::time::timeout(timeout_duration, broadcast_fut).await {
-                Ok(outcome) => outcome,
-                Err(_elapsed) => Err(ClientError::Transport(
-                    std::io::Error::other(format!(
-                        "sendrawtransaction timed out after {}ms",
-                        timeout_duration.as_millis()
-                    ))
-                    .into(),
-                )),
-            }
-        } else {
-            broadcast_fut.await
+        let remaining = call_timeout.saturating_sub(started_at.elapsed());
+        let response = match tokio::time::timeout(remaining, broadcast_fut).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(ClientError::Transport(
+                std::io::Error::other(format!(
+                    "sendrawtransaction timed out after {}ms",
+                    call_timeout.as_millis()
+                ))
+                .into(),
+            )),
         };
+        drop(slot);
         record_json_rpc_client_result("sendrawtransaction", started_at, &response);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &response,
@@ -2278,6 +2370,23 @@ fn record_json_rpc_source_outcome<Response>(
         "error_class" => source_error_class(rpc_outcome.as_ref().err())
     )
     .increment(1);
+    if matches!(rpc_outcome, Err(SourceError::NodeRateLimited { .. })) {
+        record_node_rate_limited(method);
+    }
+}
+
+/// Counts one call the node refused with HTTP 429.
+///
+/// Each call records its outcome through exactly one of
+/// [`record_json_rpc_source_outcome`] and [`record_json_rpc_client_result`],
+/// and each of those calls this once, so a refusal is counted once.
+fn record_node_rate_limited(method: &'static str) {
+    metrics::counter!(
+        "zinder_node_rate_limited_total",
+        "source" => "zebra_json_rpc",
+        "method" => method
+    )
+    .increment(1);
 }
 
 fn record_json_rpc_client_result<Response>(
@@ -2301,6 +2410,11 @@ fn record_json_rpc_client_result<Response>(
         "error_class" => client_error_class(rpc_outcome.as_ref().err())
     )
     .increment(1);
+    if let Err(error) = rpc_outcome
+        && client_error_is_rate_limited(error)
+    {
+        record_node_rate_limited(method);
+    }
 }
 
 const fn outcome_status<T, E>(outcome: &Result<T, E>) -> &'static str {
@@ -2311,6 +2425,7 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
     match error {
         None => "none",
         Some(SourceError::NodeUnavailable { .. }) => "node_unavailable",
+        Some(SourceError::NodeRateLimited { .. }) => "node_rate_limited",
         Some(SourceError::SourceResponseTooLarge { .. }) => "source_response_too_large",
         Some(SourceError::NodeResponseTooLarge { .. }) => "node_response_too_large",
         Some(SourceError::BlockUnavailable { .. }) => "block_unavailable",
@@ -2381,6 +2496,7 @@ fn client_error_class(error: Option<&ClientError>) -> &'static str {
         None => "none",
         Some(ClientError::Call(_)) => "json_rpc_call_error",
         Some(error) if client_error_is_response_too_large(error) => "response_too_large",
+        Some(error) if client_error_is_rate_limited(error) => "node_rate_limited",
         Some(_) => "transport_error",
     }
 }
@@ -2915,6 +3031,8 @@ fn map_transport_error(
                 "node refused the {operation} request credentials with HTTP 401; check node.auth"
             ),
         }
+    } else if client_error_is_rate_limited(error) {
+        SourceError::NodeRateLimited { operation }
     } else {
         SourceError::NodeUnavailable {
             reason: error.to_string(),
@@ -2936,6 +3054,21 @@ fn client_error_is_unauthorized(error: &ClientError) -> bool {
     matches!(
         source.downcast_ref::<jsonrpsee::http_client::transport::Error>(),
         Some(jsonrpsee::http_client::transport::Error::Rejected { status_code: 401 })
+    )
+}
+
+/// Returns whether the node refused the request with HTTP 429.
+///
+/// Zebra answers HTTP 429 (`Too many connections`) when its JSON-RPC server
+/// holds its connection limit. jsonrpsee rejects the status before it reads
+/// the body, so the refusal arrives as a transport error.
+fn client_error_is_rate_limited(error: &ClientError) -> bool {
+    let ClientError::Transport(source) = error else {
+        return false;
+    };
+    matches!(
+        source.downcast_ref::<jsonrpsee::http_client::transport::Error>(),
+        Some(jsonrpsee::http_client::transport::Error::Rejected { status_code: 429 })
     )
 }
 

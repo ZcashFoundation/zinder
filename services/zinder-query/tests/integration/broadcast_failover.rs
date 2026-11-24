@@ -338,6 +338,51 @@ async fn broadcast_fails_over_to_the_next_endpoint_when_the_first_is_unreachable
 }
 
 #[tokio::test]
+async fn broadcast_fails_over_to_the_next_endpoint_when_the_first_is_rate_limited()
+-> eyre::Result<()> {
+    let primary = regtest_node(MockTransactionBroadcaster::node_rate_limited());
+    let fallback = accepting_node(0x13);
+    let endpoints = Endpoints::verified(vec![primary.clone(), fallback.clone()]).await?;
+
+    let outcome = endpoints
+        .broadcast(RawTransactionBytes::new([0x01]))
+        .await?;
+
+    assert_eq!(
+        outcome,
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted {
+            transaction_id: TransactionId::from_bytes([0x13; 32]),
+        })
+    );
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(fallback.call_count(), 1);
+    Ok(())
+}
+
+/// A rate-limited endpoint may accept the transaction on a retry, so a
+/// consensus-branch rejection from another endpoint is not reported as the
+/// outcome.
+#[tokio::test]
+async fn rate_limited_endpoint_outweighs_a_consensus_branch_rejection() -> eyre::Result<()> {
+    let endpoints = Endpoints::verified(vec![
+        regtest_node(MockTransactionBroadcaster::node_rate_limited()),
+        node_answering(consensus_branch_rejection()),
+    ])
+    .await?;
+
+    let outcome = endpoints.broadcast(RawTransactionBytes::new([0x0d])).await;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(QueryError::Node(SourceError::NodeRateLimited { .. }))
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn broadcast_returns_a_node_answer_without_trying_the_next_endpoint() -> eyre::Result<()> {
     let answers = [
         TransactionBroadcastOutcome::Rejected(BroadcastRejected {

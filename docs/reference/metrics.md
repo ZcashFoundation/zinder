@@ -423,7 +423,7 @@ it as the writer commits.
 | --- | --- | --- | --- |
 | `zinder_wallet_broadcast_endpoint_attempts_total` | counter | `position`, `outcome` | Broadcasts sent to an endpoint, by result, such as `accepted`, `rejected`, or `node_unreachable`. |
 | `zinder_wallet_broadcast_endpoint_state` | gauge | `position`, `state` | 1 for the endpoint's state: `verified`, `unverified`, or `excluded`. |
-| `zinder_wallet_broadcast_endpoint_switches_total` | counter | `from_position`, `to_position`, `cause` | Changes of the preferred endpoint: `node_unreachable` or `bad_consensus_branch`. |
+| `zinder_wallet_broadcast_endpoint_switches_total` | counter | `from_position`, `to_position`, `cause` | Changes of the preferred endpoint: `node_unreachable`, `node_rate_limited`, or `bad_consensus_branch`. |
 
 ### Public gRPC listeners
 
@@ -477,7 +477,9 @@ Any runtime that calls a node exports these series. `source` is
 | --- | --- | --- | --- |
 | `zinder_node_request_total` | counter | `source`, `method`, `status`, `error_class` | Node requests. |
 | `zinder_node_request_duration_seconds` | histogram | `source`, `method`, `status`, `error_class` | Duration of node requests. |
-| `zinder_node_request_admission_wait_seconds` | histogram | `source`, `method` | Time an indexer block request waited for a request slot. |
+| `zinder_node_request_admission_wait_seconds` | histogram | `source`, `method` | Time a request waited for a request slot: an indexer block request, or a JSON-RPC call under `node.max_concurrent_requests`. |
+| `zinder_node_request_admission_timeouts_total` | counter | `source`, `method` | JSON-RPC calls that found no free slot under `node.max_concurrent_requests` within their timeout. They fail with `NodeUnavailable` without reaching the node. |
+| `zinder_node_rate_limited_total` | counter | `source`, `method` | JSON-RPC calls the node refused with HTTP 429. Each refusal also counts in `zinder_node_request_total` with `error_class="node_rate_limited"`. |
 | `zinder_node_active_requests` | gauge | `source`, `method` | Indexer requests in flight. |
 | `zinder_node_queued_requests` | gauge | `source`, `method` | Indexer requests waiting for a slot. |
 | `zinder_node_response_bytes_total` | counter | `source`, `method`, `encoding` | Bytes received from the indexer stream. |

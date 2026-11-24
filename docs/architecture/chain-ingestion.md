@@ -465,7 +465,9 @@ The follower switches after either:
 - 300 seconds of the active endpoint reporting not ready.
 
 Other failure classes, such as a malformed response, never switch, because
-switching would hide the problem behind whichever node answers. The follower
+switching would hide the problem behind whichever node answers. A node that
+refuses calls with HTTP 429 (`node_rate_limited`) is up, so the follower backs
+off and retries it instead. The follower
 tries standbys that hold ingest's tip first, in list order, then standbys on
 another branch above the settled tip, which it handles as a reorg. It logs
 `node_endpoint_switched`, restarts the mempool stream from the new endpoint,

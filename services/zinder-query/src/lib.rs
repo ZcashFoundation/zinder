@@ -1405,6 +1405,7 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::Node(source_error) if source_error.is_node_capability_missing() => {
                 ErrorReason::NodeCapabilityMissing
             }
+            Self::Node(SourceError::NodeRateLimited { .. }) => ErrorReason::NodeRateLimited,
             Self::Node(_) => ErrorReason::NodeUnavailable,
             Self::Store(_)
             | Self::WalletProjectionRead { .. }
@@ -1705,6 +1706,21 @@ mod error_reason_tests {
             reason: "probe".to_owned(),
         });
         assert_eq!(transient.error_reason(), ErrorReason::NodeUnavailable);
+    }
+
+    #[test]
+    fn node_rate_limited_maps_to_retryable_unavailable_with_its_own_reason() {
+        let error = QueryError::Node(SourceError::NodeRateLimited {
+            operation: "getrawtransaction",
+        });
+        assert_eq!(error.error_reason(), ErrorReason::NodeRateLimited);
+        let status = crate::status_from_query_error(&error);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("NODE_RATE_LIMITED".to_owned())
+        );
     }
 }
 

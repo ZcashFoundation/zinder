@@ -482,6 +482,7 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::UnsupportedTransactionStatus
         | ErrorReason::BlockingTaskFailed
         | ErrorReason::NodeUnavailable
+        | ErrorReason::NodeRateLimited
         | ErrorReason::StorageUnavailable
         | ErrorReason::UnsupportedWalletEncoding
         | ErrorReason::NoVisibleChainEpoch
@@ -723,6 +724,24 @@ mod tests {
         );
         assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
         assert!(matches!(error, IndexerError::RemoteFailure { .. }));
+    }
+
+    #[test]
+    fn node_rate_limited_refusal_is_retried_with_backoff() {
+        let status = tonic::Status::with_error_details(
+            Code::Unavailable,
+            "node rate-limited the call",
+            ErrorDetails::with_error_info(
+                ErrorReason::NodeRateLimited.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(error.reason(), Some(ErrorReason::NodeRateLimited));
+        assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
     }
 
     #[test]

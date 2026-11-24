@@ -386,6 +386,7 @@ fn json_rpc_source(
             request_timeout: validated.request_timeout,
             max_response_bytes: validated.pipeline_limits.max_response_bytes,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?)
 }

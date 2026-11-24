@@ -1356,4 +1356,18 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_rate_limited_node_is_unavailable_with_its_own_reason() {
+        let status = node_status(SourceError::NodeRateLimited {
+            operation: "getaddressutxos",
+        });
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("NODE_RATE_LIMITED".to_owned())
+        );
+    }
 }

@@ -269,15 +269,19 @@ fn next_fetch_retry_backoff(current_backoff: Duration) -> Duration {
 ///
 /// Per-call retry handles the failure classes where retrying the *same
 /// request* can plausibly succeed: transient transport
-/// ([`SourceFailureClass::NodeUnreachable`]) and short-lived subscription
-/// failures ([`SourceFailureClass::StreamDisconnected`]). View-stale
+/// ([`SourceFailureClass::NodeUnreachable`]), an HTTP 429 from a node at its
+/// connection limit ([`SourceFailureClass::NodeRateLimited`]), and
+/// short-lived subscription failures
+/// ([`SourceFailureClass::StreamDisconnected`]). View-stale
 /// failures ([`SourceFailureClass::UpstreamViewChanged`]) and structural
 /// failures are bubbled up to the loop, which re-observes the upstream
 /// before issuing dependent requests.
 fn per_call_retry_permitted(error: &SourceError) -> bool {
     matches!(
         error.upstream_classification(),
-        SourceFailureClass::NodeUnreachable | SourceFailureClass::StreamDisconnected,
+        SourceFailureClass::NodeUnreachable
+            | SourceFailureClass::NodeRateLimited
+            | SourceFailureClass::StreamDisconnected,
     )
 }
 

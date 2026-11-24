@@ -949,7 +949,10 @@ where
         {
             match probe_wallet_node_readiness(source).await {
                 Err(error)
-                    if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
+                    if matches!(
+                        error.upstream_classification(),
+                        SourceFailureClass::NodeUnreachable | SourceFailureClass::NodeRateLimited
+                    ) =>
                 {
                     unreachable = Some(error);
                 }
@@ -1067,9 +1070,12 @@ impl crate::LightWalletNodeQuery {
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut outage = None;
+            // Verification and observation use the readiness-probe slot, so
+            // forwarded calls holding every shared slot cannot fail readiness.
+            let probe_node = self.readiness_probe_node();
             loop {
                 let probe = async {
-                    let node = self.verified_current_node().await?;
+                    let node = self.verify_current(&probe_node).await?;
                     probe_wallet_node_readiness(node).await
                 };
                 let observation = tokio::select! {
@@ -1089,7 +1095,7 @@ impl crate::LightWalletNodeQuery {
 async fn probe_wallet_node_readiness(
     source: &impl NodeSource,
 ) -> Result<UpstreamHealthSnapshot, SourceError> {
-    source.tip_id().await?;
+    source.probe_tip_id().await?;
     source.poll_upstream_health().await
 }
 

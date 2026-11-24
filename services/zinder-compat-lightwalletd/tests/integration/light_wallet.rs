@@ -34,7 +34,7 @@ use zinder_query::{
     spawn_wallet_ingest_control_readiness_probe,
 };
 use zinder_runtime::{Readiness, ReadinessState};
-use zinder_source::{NodeAuth, ZebraJsonRpcSource};
+use zinder_source::{NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
     IngestControlFixture, JsonRpcStub, JsonRpcTestServer, RpcReply, WalletServingStoreFixture,
@@ -75,6 +75,32 @@ impl Fixture {
         replies: impl IntoIterator<Item = JsonRpcStub>,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::from_chain_with_options(
+            chain,
+            schedule,
+            replies,
+            ZebraJsonRpcSourceOptions {
+                request_timeout: timeout,
+                ..ZebraJsonRpcSourceOptions::default()
+            },
+        )
+    }
+
+    /// A one-block fixture whose node source uses `options`.
+    fn with_node_options(
+        replies: impl IntoIterator<Item = JsonRpcStub>,
+        options: ZebraJsonRpcSourceOptions,
+    ) -> Result<Self> {
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        Self::from_chain_with_options(&chain, &one_upgrade_per_height()?, replies, options)
+    }
+
+    fn from_chain_with_options(
+        chain: &ChainFixture,
+        schedule: &zinder_core::NetworkUpgradeActivations,
+        replies: impl IntoIterator<Item = JsonRpcStub>,
+        options: ZebraJsonRpcSourceOptions,
+    ) -> Result<Self> {
         let tip = chain
             .blocks()
             .last()
@@ -90,8 +116,12 @@ impl Fixture {
             tip.hash,
             std::iter::once(served_tip).chain(replies),
         )?;
-        let source =
-            ZebraJsonRpcSource::new(Network::ZcashRegtest, node.url(), NodeAuth::None, timeout)?;
+        let source = ZebraJsonRpcSource::with_options(
+            Network::ZcashRegtest,
+            node.url(),
+            NodeAuth::None,
+            options,
+        )?;
         let slot = CanonicalReaderSlot::new(Arc::new(RocksDbCanonicalReader::new(canonical)?));
         let adapter = LightwalletdGrpcAdapter::for_light_wallet(
             slot.clone(),

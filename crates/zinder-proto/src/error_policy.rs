@@ -122,6 +122,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::UnsupportedWalletEncoding
         | ErrorReason::BlockingTaskFailed
         | ErrorReason::NodeUnavailable
+        | ErrorReason::NodeRateLimited
         | ErrorReason::StorageUnavailable
         | ErrorReason::UpstreamUnreachable
         | ErrorReason::ServiceNotReady

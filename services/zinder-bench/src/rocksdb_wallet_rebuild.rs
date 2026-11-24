@@ -110,6 +110,7 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
                 || BenchError::invalid_argument("max response bytes must be non-zero"),
             )?,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?;
     let activations =

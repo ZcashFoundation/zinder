@@ -312,6 +312,7 @@ fn build_zebra_json_rpc_source(
             request_timeout: node.request_timeout,
             max_response_bytes: node.max_response_bytes,
             broadcast_timeout: node.broadcast_timeout,
+            max_concurrent_requests: node.max_concurrent_requests,
         },
     )?;
     Ok(source.with_health_config(node.health.clone()))

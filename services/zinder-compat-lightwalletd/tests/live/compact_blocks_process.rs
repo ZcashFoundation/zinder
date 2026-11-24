@@ -228,6 +228,7 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     let activations = source.fetch_network_upgrade_activations().await?;
@@ -580,6 +581,7 @@ async fn compact_blocks_process_refreshes_after_shallow_reorg() -> Result<()> {
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     let activations = source.fetch_network_upgrade_activations().await?;

@@ -171,6 +171,7 @@ data may be corrupt.
 | Reason | Meaning |
 | --- | --- |
 | `NODE_UNAVAILABLE` | The node is unreachable or failing. A broadcast also returns it, without sending, until one configured endpoint passes first-contact verification and whenever every verified endpoint is unreachable. The writer's mempool returns it while it hydrates from the node, and query forwards that for mempool calls. |
+| `NODE_RATE_LIMITED` | The node refused a forwarded call with HTTP 429 because it already holds its JSON-RPC connection limit, 100 by default on Zebra. The node is up. A broadcast tries the next verified endpoint first and returns this reason only when no endpoint accepted the transaction. |
 | `STORAGE_UNAVAILABLE` | Local storage cannot serve the request. Native query forwards this reason for mempool reads and stream establishment when the writer’s store owner stalls or stops. The writer reserves up to one second of the caller’s deadline to return the refusal. Reads without a deadline and owner writes retain the 60-second bound. |
 | `UPSTREAM_UNREACHABLE` | A configured federated endpoint, such as the explorer's wallet query endpoint or native query's ingest control, is temporarily unreachable. |
 | `SERVICE_NOT_READY` | The process is alive but not ready. Metadata: `readiness_cause`, a label from [Readiness](readiness.md#readiness-causes). With `canonical_store_damaged`, retrying does not succeed until an operator rebuilds the canonical store. |

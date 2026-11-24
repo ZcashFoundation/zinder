@@ -317,6 +317,25 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS` for each.",
     },
     EnvVarDoc {
+        name: "ZINDER_NODE__MAX_CONCURRENT_REQUESTS",
+        toml_path: "node.max_concurrent_requests",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Most JSON-RPC calls the process has in flight to this node at once, from 1 \
+                      to 1024. Defaults to 64, below Zebra's default limit of 100 JSON-RPC \
+                      connections, above which Zebra answers HTTP 429. A call beyond the limit \
+                      waits for a free slot for at most its own timeout. Readiness probes use \
+                      a separate slot. When several Zinder processes share one node, keep \
+                      their sum below the node's connection limit. Fallback endpoints do not \
+                      inherit it.",
+    },
+    EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__ADDR",
         toml_path: "node.health.addr",
         used_by: &[
@@ -553,6 +572,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Same as `ZINDER_NODE__BROADCAST_TIMEOUT_SECS`, for fallback endpoint \
                       `<N>`. It is not inherited from `[node]`: when unset, this endpoint's \
                       own `request_timeout_secs` applies. Recommended: 7.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE_FALLBACKS__<N>__MAX_CONCURRENT_REQUESTS",
+        toml_path: "node_fallbacks.<N>.max_concurrent_requests",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Same as `ZINDER_NODE__MAX_CONCURRENT_REQUESTS`, for fallback endpoint `<N>`. \
+                      It is not inherited from `[node]`: when unset, the default of 64 applies.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE_FALLBACKS__<N>__HEALTH__ADDR",

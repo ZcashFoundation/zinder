@@ -179,8 +179,8 @@ Each runtime uses `[node]` differently:
 `[node_fallbacks.N]` adds fallback endpoints. `[node]` is position 0, and the
 fallbacks count from 1 without a gap. Each fallback table takes the fields of
 `[node]`, and its environment names start with `ZINDER_NODE_FALLBACKS__<N>__`.
-A fallback does not inherit `broadcast_timeout_secs` from `[node]`, so set it
-on each endpoint. Positions are table keys, not a TOML array, so a file and the
+A fallback does not inherit `broadcast_timeout_secs` or
+`max_concurrent_requests` from `[node]`, so set them on each endpoint. Positions are table keys, not a TOML array, so a file and the
 environment merge field by field. A TOML array of tables
 (`[[node_fallbacks]]`) is refused:
 
@@ -199,6 +199,21 @@ path = "/var/run/auth-fallback/.cookie"
 
 [Node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover)
 describes how each runtime uses the list.
+
+`max_concurrent_requests` caps the JSON-RPC calls one process has in flight to
+one node endpoint. It defaults to 64 and accepts 1 to 1024. Zebra accepts 100
+JSON-RPC connections by default and refuses more with HTTP 429, which Zinder
+reports as `NODE_RATE_LIMITED`. A call beyond the cap waits for a free slot for
+at most its own timeout, then fails with `NODE_UNAVAILABLE` without reaching
+the node. Readiness probes use a slot of their own, so a busy node does not
+fail readiness. When ingest and readers share one node, keep the sum of their
+caps below the node's connection limit:
+
+```toml
+[node]
+json_rpc_addr = "http://zebra:8232"
+max_concurrent_requests = 32
+```
 
 ## Environment variables
 
@@ -228,6 +243,7 @@ not check descriptions or defaults.
 | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.request_timeout_secs` | Upstream-node JSON-RPC request timeout in seconds. Defaults to 30. |
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. Defaults to 67108864 (64 MiB). This is a ceiling on what Zinder accepts, not a request size: Zebra 7.1.0 and Zakura 1.8.6 refuse responses above 50 MiB by default, and ingest splits a source segment the node refuses. |
 | `ZINDER_NODE__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.broadcast_timeout_secs` | Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. With fallback endpoints, a broadcast moves to the next endpoint only after the endpoint's own timeout, so keep it well below wallet request deadlines. Fallback endpoints do not inherit it; set `ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS` for each. |
+| `ZINDER_NODE__MAX_CONCURRENT_REQUESTS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_concurrent_requests` | Most JSON-RPC calls the process has in flight to this node at once, from 1 to 1024. Defaults to 64, below Zebra's default limit of 100 JSON-RPC connections, above which Zebra answers HTTP 429. A call beyond the limit waits for a free slot for at most its own timeout. Readiness probes use a separate slot. When several Zinder processes share one node, keep their sum below the node's connection limit. Fallback endpoints do not inherit it. |
 | `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the wallet-serving readers, and `zinder-explorer` poll it as the primary upstream-sync signal; when unset, they fall back to `getblockchaininfo.verificationprogress`/`estimatedheight`. Compatibility with `compat.serving = "compact-blocks"` rejects every node setting. See [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md). |
 | `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. Query and wallet-serving compatibility use it to verify every broadcast endpoint, `[node]` and each fallback, on first contact and then refresh the node dependency their readiness reports; compact-blocks compatibility rejects it; `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
@@ -246,6 +262,7 @@ not check descriptions or defaults.
 | `ZINDER_NODE_FALLBACKS__<N>__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.request_timeout_secs` | Same as `ZINDER_NODE__REQUEST_TIMEOUT_SECS`, for fallback endpoint `<N>`. |
 | `ZINDER_NODE_FALLBACKS__<N>__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.max_response_bytes` | Same as `ZINDER_NODE__MAX_RESPONSE_BYTES`, for fallback endpoint `<N>`. |
 | `ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.broadcast_timeout_secs` | Same as `ZINDER_NODE__BROADCAST_TIMEOUT_SECS`, for fallback endpoint `<N>`. It is not inherited from `[node]`: when unset, this endpoint's own `request_timeout_secs` applies. Recommended: 7. |
+| `ZINDER_NODE_FALLBACKS__<N>__MAX_CONCURRENT_REQUESTS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.max_concurrent_requests` | Same as `ZINDER_NODE__MAX_CONCURRENT_REQUESTS`, for fallback endpoint `<N>`. It is not inherited from `[node]`: when unset, the default of 64 applies. |
 | `ZINDER_NODE_FALLBACKS__<N>__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.addr` | Same as `ZINDER_NODE__HEALTH__ADDR`, for fallback endpoint `<N>`. |
 | `ZINDER_NODE_FALLBACKS__<N>__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.poll_interval_ms` | Same as `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`, for fallback endpoint `<N>`, in ingest. Query and wallet-serving compatibility ignore it and verify and observe every endpoint on `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`. |
 | `ZINDER_NODE_FALLBACKS__<N>__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.verification_progress_floor` | Same as `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR`, for fallback endpoint `<N>`. |

@@ -522,9 +522,11 @@ where
 /// [`SourceFailureClass::NodeUnreachable`] (transport-level connect or
 /// dispatch failure on the JSON-RPC client) or
 /// [`SourceFailureClass::StreamDisconnected`] (gRPC stream torn down).
-/// Everything else (`UpstreamViewChanged`, `CapabilityMissing`,
-/// `ProtocolMismatch`, `Malformed`, `Configuration`) is application
-/// state and must not trigger reconnects.
+/// Everything else (`NodeRateLimited`, `UpstreamViewChanged`,
+/// `CapabilityMissing`, `ProtocolMismatch`, `Malformed`, `Configuration`)
+/// is application state and must not trigger reconnects. An HTTP 429 in
+/// particular proves the wire works: rebuilding the client would open new
+/// connections to a node that is refusing them for having too many.
 #[must_use]
 pub fn is_transport_failure(error: &SourceError) -> bool {
     matches!(
@@ -676,6 +678,32 @@ mod resilient_client_tests {
             }
         ));
         assert!(!is_transport_failure(&non_transport_failure()));
+        assert!(!is_transport_failure(&rate_limited()));
+    }
+
+    fn rate_limited() -> SourceError {
+        SourceError::NodeRateLimited {
+            operation: "getblock",
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_failures_never_rebuild() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let client = ResilientClient::new(
+            0_u32,
+            "test",
+            ZEBRA_REBUILD_THRESHOLD,
+            rebuilder_counting(Arc::clone(&invocations)),
+        );
+
+        for _ in 0..ZEBRA_REBUILD_THRESHOLD.get().saturating_mul(4) {
+            client.record_outcome::<()>(&Err(rate_limited()));
+        }
+        tokio::task::yield_now().await;
+
+        assert_eq!(invocations.load(Ordering::Relaxed), 0);
+        assert_eq!(*client.snapshot(), 0);
     }
 
     #[tokio::test]
