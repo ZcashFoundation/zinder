@@ -288,6 +288,15 @@ impl RocksDbCanonicalSecondary {
             .record_block_cache_entry_gauges(StoreRole::CanonicalSecondary);
     }
 
+    /// Publishes per-column-family integer properties and level file counts
+    /// for one serving generation under the `canonical_secondary` store role.
+    pub fn record_column_family_property_gauges(&self) {
+        self.bounded_open.record_column_family_property_gauges(
+            StoreRole::CanonicalSecondary,
+            &CANONICAL_DATA_COLUMN_FAMILIES,
+        );
+    }
+
     /// Returns this secondary's cumulative ticker, or zero with statistics off.
     #[must_use]
     pub fn rocksdb_ticker_count(&self, ticker: rust_rocksdb::statistics::Ticker) -> u64 {

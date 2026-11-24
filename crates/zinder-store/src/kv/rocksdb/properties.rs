@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::LazyLock};
 use parking_lot::Mutex;
 use rust_rocksdb::{AsColumnFamilyRef, DB, properties};
 
-use super::{RocksDbResourceGaugeInputs, StoreRole, u64_to_f64};
+use super::{StoreRole, u64_to_f64};
 
 pub(super) fn record_cache_entries(db: &DB, role: StoreRole) {
     let Ok(Some(property)) = db.property_value("rocksdb.block-cache-entry-stats") else {
@@ -79,14 +79,15 @@ static OCCUPIED_LEVELS: LazyLock<Mutex<HashSet<OccupiedLevel>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub(super) fn record_level_gauges(
-    inputs: &RocksDbResourceGaugeInputs<'_>,
+    db: &DB,
+    store_role: StoreRole,
     cf: &'static str,
     family: &impl AsColumnFamilyRef,
 ) {
-    let role = inputs.store_role.as_str();
+    let role = store_role.as_str();
     for level in 0..=6 {
         let files = properties::num_files_at_level(level);
-        let Ok(Some(count)) = inputs.db.property_int_value_cf(family, &files) else {
+        let Ok(Some(count)) = db.property_int_value_cf(family, &files) else {
             continue;
         };
         let key = (role, cf, level);

@@ -1,0 +1,6 @@
+kind: added
+body: Export `rocksdb.live-sst-files-size` per data column family through `zinder_store_rocksdb_property` on primary stores and on the single newest active serving generation of canonical and wallet secondary readers (`canonical_secondary` and `wallet_secondary`) on the 15-second sampling cadence.
+time: 2026-11-24T21:21:00.000000000Z
+custom:
+    Bump: minor
+    PR: "561"
