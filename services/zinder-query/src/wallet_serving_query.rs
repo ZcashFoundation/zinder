@@ -2333,10 +2333,11 @@ mod tree_state_replay_limit_tests {
         Ok(())
     }
 
-    /// A subscription taken before a read wakes on the publication that
-    /// replaces the pair the read saw. Neither the subscription nor the
-    /// unpinned tip read marks a pair observed, so publication releases the
-    /// replaced pair at once instead of retaining it for epoch pins.
+    /// A subscription wakes on the publication that replaces the pair it saw.
+    ///
+    /// Neither the subscription nor the unpinned tip read marks a pair
+    /// observed, so publication releases the replaced pair at once instead of
+    /// retaining it for epoch pins.
     #[tokio::test]
     async fn a_publication_subscription_wakes_on_the_next_publication() -> Result<(), Box<dyn Error>>
     {
