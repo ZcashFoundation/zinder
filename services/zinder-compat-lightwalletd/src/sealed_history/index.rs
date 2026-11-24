@@ -1,8 +1,23 @@
+//! Admission of one dual-slab segment against its signed identity.
+//!
+//! A portable segment is streamed once: both slabs' frames are hashed into
+//! the whole-body digest and each frame's payload digest is recorded, then
+//! the offset tables and per-row metadata are checked against exactly what
+//! was streamed. A kernel-verified segment skips the payload scan; fs-verity
+//! pins its bytes, so admission reads only the header, tables, and metadata.
+
+use std::io::{BufRead, BufReader};
+
 use super::{
-    BlockHash, BlockHeightRange, BlockId, BufRead, BufReader, Digest as _, HEADER_LEN, INDEX_LEN,
-    IndexedBlock, LENGTHS_LEN, MAX_PAYLOAD_BYTES, Read, Seek, SegmentIdentity, Sha256, decode_hash,
-    decode_lengths, encode_internal_block_hash, invalid, io,
+    BlockHash, BlockHeight, BlockId, Digest as _, HEADER_LEN, LENGTHS_LEN, MAX_PAYLOAD_BYTES,
+    ROW_META_LEN, Read, SealedRow, SegmentHeader, SegmentIdentity, Sha256, TRAILER_LEN,
+    decode_hash, decode_lengths, encode_internal_block_hash, encode_len, invalid, io,
 };
+
+/// Bytes of the two `[u32; block_count + 1]` relative offset tables.
+pub(super) fn offset_tables_len(block_count: u32) -> u64 {
+    2 * (u64::from(block_count) + 1) * 4
+}
 
 pub(super) fn pinned_verity(
     expected: Option<[u8; 32]>,
@@ -18,160 +33,424 @@ pub(super) fn pinned_verity(
     }
 }
 
-pub(super) fn encode(
-    offset: u64,
-    lengths: [u8; 8],
+/// Encodes one per-block metadata row: identity, native length, and the
+/// payload digests of both slabs.
+pub(super) fn encode_row(
     hash: BlockHash,
     parent: BlockHash,
-    sha256: [u8; 32],
-) -> [u8; INDEX_LEN] {
-    let mut row = [0; INDEX_LEN];
-    row[..8].copy_from_slice(&offset.to_be_bytes());
-    row[8..16].copy_from_slice(&lengths);
-    row[16..48].copy_from_slice(&encode_internal_block_hash(hash));
-    row[48..80].copy_from_slice(&encode_internal_block_hash(parent));
-    row[80..].copy_from_slice(&sha256);
-    row
+    native_bytes: usize,
+    shielded_sha256: [u8; 32],
+    nullifier_sha256: [u8; 32],
+) -> io::Result<[u8; ROW_META_LEN]> {
+    let mut row = [0; ROW_META_LEN];
+    row[..32].copy_from_slice(&encode_internal_block_hash(hash));
+    row[32..64].copy_from_slice(&encode_internal_block_hash(parent));
+    row[64..68].copy_from_slice(&encode_len(native_bytes)?);
+    row[72..104].copy_from_slice(&shielded_sha256);
+    row[104..].copy_from_slice(&nullifier_sha256);
+    Ok(row)
 }
 
-type Frame = ([u8; LENGTHS_LEN], [u8; 32]);
-
-fn hash_frames(
-    input: &mut impl BufRead,
-    count: u64,
-    trailer: u64,
-    digest: &mut Sha256,
-) -> io::Result<Vec<Frame>> {
-    let mut frames = Vec::new();
-    let mut end = HEADER_LEN as u64;
-    for _ in 0..count {
-        let mut lengths = [0; LENGTHS_LEN];
-        input.read_exact(&mut lengths)?;
-        let (_, mut len) = decode_lengths(lengths)?;
-        end += LENGTHS_LEN as u64 + len as u64;
-        if end > trailer {
-            return Err(invalid("shielded segment row exceeds file size"));
-        }
-        digest.update(lengths);
-        let mut payload = Sha256::new();
-        while len > 0 {
-            let available = input.fill_buf()?;
-            if available.is_empty() {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            let take = len.min(available.len());
-            payload.update(&available[..take]);
-            digest.update(&available[..take]);
-            input.consume(take);
-            len -= take;
-        }
-        frames.push((lengths, payload.finalize().into()));
-    }
-    if end != trailer {
-        return Err(invalid("shielded segment index offset mismatch"));
-    }
-    Ok(frames)
+/// What one streaming pass over a portable segment recorded for one slab.
+struct StreamedSlab {
+    /// Frame-start offsets relative to the slab base, plus its total length.
+    rel: Vec<u32>,
+    wire: Vec<usize>,
+    native: Vec<usize>,
+    digests: Vec<[u8; 32]>,
 }
 
-pub(super) fn admit(
-    input: &mut (impl Read + Seek),
+impl StreamedSlab {
+    fn new() -> Self {
+        Self {
+            rel: vec![0],
+            wire: Vec::new(),
+            native: Vec::new(),
+            digests: Vec::new(),
+        }
+    }
+}
+
+/// The segment state admission hands to the serving history.
+pub(super) struct AdmittedSegment {
+    pub(super) rows: Vec<SealedRow>,
+    /// Absolute file offset of the nullifier slab's base.
+    pub(super) nullifier_base: u64,
+    pub(super) shielded_rel: Vec<u32>,
+    pub(super) nullifier_rel: Vec<u32>,
+}
+
+/// The header, interval, and file-size checks every admission starts with.
+fn admit_header(
     expected: SegmentIdentity,
     file_len: u64,
-    protected: bool,
-) -> io::Result<Vec<IndexedBlock>> {
-    let mut header = [0; HEADER_LEN];
-    input.read_exact(&mut header)?;
-    if header != expected.header()? {
+    header_bytes: &[u8; HEADER_LEN],
+) -> io::Result<SegmentHeader> {
+    let header = SegmentHeader::decode(header_bytes)?;
+    let block_count = expected.block_count()?;
+    if header.network_tag != expected.network.id()
+        || header.artifact_schema_version != expected.artifact_schema
+        || header.segment_flags != super::SEGMENT_FLAGS_HAS_NULLIFIER_SLAB
+        || header.start_height != expected.start.value()
+        || header.block_count != block_count
+        || header.last_block_hash != encode_internal_block_hash(expected.end.hash)
+        || header.shielded_slab_offset != HEADER_LEN as u64
+    {
         return Err(invalid(
-            "shielded segment format, network, or interval mismatch",
+            "shielded segment format, network, schema, or interval mismatch",
         ));
     }
-    let count = u64::from(expected.end.height.value() - expected.start.value()) + 1;
-    let minimum = HEADER_LEN as u64 + count * (INDEX_LEN + LENGTHS_LEN + 68) as u64;
-    let maximum = HEADER_LEN as u64 + count * (INDEX_LEN + LENGTHS_LEN + MAX_PAYLOAD_BYTES) as u64;
-    if !(minimum..=maximum).contains(&file_len) {
+    let count = usize::try_from(block_count)
+        .map_err(|_| invalid("shielded segment height exceeds address space"))?;
+    let index_len = offset_tables_len(block_count)
+        .checked_add(
+            u64::try_from(count * ROW_META_LEN)
+                .map_err(|_| invalid("shielded segment index exceeds address space"))?,
+        )
+        .ok_or_else(|| invalid("shielded segment exceeds address space"))?;
+    let body_len = header
+        .index_offset
+        .checked_add(index_len)
+        .and_then(|end| end.checked_add(TRAILER_LEN as u64))
+        .ok_or_else(|| invalid("shielded segment exceeds address space"))?;
+    if file_len != body_len {
         return Err(invalid(
             "shielded segment file size does not fit its interval",
         ));
     }
-    let trailer = file_len - count * INDEX_LEN as u64;
-    if protected {
-        input.seek(io::SeekFrom::Start(trailer))?;
-        let count =
-            usize::try_from(count).map_err(|_| invalid("shielded index exceeds address space"))?;
-        let mut entries = Vec::new();
-        entries.try_reserve_exact(count).map_err(io::Error::other)?;
-        entries.resize(count, [0; INDEX_LEN]);
-        input.read_exact(entries.as_flattened_mut())?;
-        return decode_index(entries, expected, None, trailer);
-    }
-    let mut digest = Sha256::new_with_prefix(header);
-    let mut input = BufReader::new(input);
-    let frames = hash_frames(&mut input, count, trailer, &mut digest)?;
-    let mut entries = Vec::new();
-    for _ in 0..count {
-        let mut entry = [0; INDEX_LEN];
-        input.read_exact(&mut entry)?;
-        digest.update(entry);
-        entries.push(entry);
-    }
-    if !input.fill_buf()?.is_empty() || <[u8; 32]>::from(digest.finalize()) != expected.sha256 {
-        return Err(invalid("shielded segment length or SHA-256 mismatch"));
-    }
-    decode_index(entries, expected, Some(&frames), trailer)
+    Ok(header)
 }
 
-fn decode_index(
-    entries: Vec<[u8; INDEX_LEN]>,
+/// Admits a kernel-verified segment: fs-verity pins its bytes, so admission
+/// reads only the offset tables and metadata rows behind the header.
+fn admit_protected(
+    input: &mut (impl Read + std::io::Seek),
     expected: SegmentIdentity,
-    frames: Option<&[Frame]>,
-    trailer: u64,
-) -> io::Result<Vec<IndexedBlock>> {
-    let mut next = HEADER_LEN as u64;
-    let mut prior = None;
-    let mut rows = Vec::with_capacity(entries.len());
-    for ((i, entry), height) in entries
-        .into_iter()
-        .enumerate()
-        .zip(BlockHeightRange::inclusive(
-            expected.start,
-            expected.end.height,
-        ))
-    {
-        let offset = u64::from_be_bytes(field(&entry[..8])?);
-        let lengths = field(&entry[8..16])?;
-        let (native_bytes, len) = decode_lengths(lengths)?;
-        let sha256 = field(&entry[80..])?;
-        if offset != next + LENGTHS_LEN as u64
-            || frames.is_some_and(|rows| rows[i] != (lengths, sha256))
-        {
-            return Err(invalid(
-                "shielded segment payload or framing differs from its index",
-            ));
-        }
-        next = offset + len as u64;
-        let id = BlockId::new(height, decode_hash(&entry[16..48])?);
-        let parent = decode_hash(&entry[48..80])?;
-        expected.check_block(id, parent, prior)?;
-        prior = Some(id);
-        rows.push(IndexedBlock {
-            id,
-            parent,
-            native_bytes,
-            offset,
-            len,
-            sha256,
-            validation: std::sync::OnceLock::new(),
-        });
+    header: &SegmentHeader,
+) -> io::Result<AdmittedSegment> {
+    let count = usize::try_from(expected.block_count()?)
+        .map_err(|_| invalid("shielded segment height exceeds address space"))?;
+    input.seek(std::io::SeekFrom::Start(header.index_offset))?;
+    let shielded_table = read_offset_table(&mut *input, count)?;
+    let nullifier_table = read_offset_table(&mut *input, count)?;
+    let metadata = read_metadata(&mut *input, count)?;
+    Ok(admitted(
+        header,
+        decode_rows(
+            expected,
+            header,
+            (shielded_table, nullifier_table),
+            metadata,
+            None,
+        )?,
+    ))
+}
+
+/// Admits a portable segment by streaming it exactly once.
+fn admit_portable(
+    input: &mut (impl Read + std::io::Seek),
+    expected: SegmentIdentity,
+    header: &SegmentHeader,
+    header_bytes: &[u8],
+) -> io::Result<AdmittedSegment> {
+    let count = usize::try_from(expected.block_count()?)
+        .map_err(|_| invalid("shielded segment height exceeds address space"))?;
+    let mut digest = Sha256::new();
+    digest.update(header_bytes);
+    let mut input = BufReader::new(input);
+    let region = header
+        .index_offset
+        .checked_sub(HEADER_LEN as u64)
+        .ok_or_else(|| invalid("shielded segment index precedes its slabs"))?;
+    let shielded = hash_frames(&mut input, count, region, &mut digest)?;
+    let nullifiers = hash_frames(&mut input, count, region, &mut digest)?;
+    if u64::from(shielded.rel[count]) + u64::from(nullifiers.rel[count]) != region {
+        return Err(invalid("shielded segment slabs differ from their index"));
     }
-    if next != trailer {
-        return Err(invalid("shielded segment index offset mismatch"));
+    let shielded_table = hash_table(&mut input, count, &mut digest)?;
+    let nullifier_table = hash_table(&mut input, count, &mut digest)?;
+    let metadata = hash_metadata(&mut input, count, &mut digest)?;
+    let mut trailer = [0; TRAILER_LEN];
+    input.read_exact(&mut trailer)?;
+    // The trailer carries the body digest the catalog's identity pins.
+    let body_digest: [u8; 32] = digest
+        .finalize()
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid("invalid shielded segment digest length"))?;
+    if !input.fill_buf()?.is_empty() || body_digest != expected.sha256 || trailer != body_digest {
+        return Err(invalid("shielded segment length or SHA-256 mismatch"));
+    }
+    Ok(admitted(
+        header,
+        decode_rows(
+            expected,
+            header,
+            (shielded_table, nullifier_table),
+            metadata,
+            Some((&shielded, &nullifiers)),
+        )?,
+    ))
+}
+
+pub(super) fn admit(
+    input: &mut (impl Read + std::io::Seek),
+    expected: SegmentIdentity,
+    file_len: u64,
+    protected: bool,
+) -> io::Result<AdmittedSegment> {
+    let mut header_bytes = [0; HEADER_LEN];
+    input.read_exact(&mut header_bytes)?;
+    let header = admit_header(expected, file_len, &header_bytes)?;
+    if protected {
+        admit_protected(&mut *input, expected, &header)
+    } else {
+        admit_portable(&mut *input, expected, &header, &header_bytes)
+    }
+}
+
+/// Wraps decoded rows with their slab bases from the header.
+fn admitted(
+    header: &SegmentHeader,
+    (rows, shielded_rel, nullifier_rel): (Vec<SealedRow>, Vec<u32>, Vec<u32>),
+) -> AdmittedSegment {
+    AdmittedSegment {
+        nullifier_base: header.nullifier_slab_offset,
+        rows,
+        shielded_rel,
+        nullifier_rel,
+    }
+}
+
+/// Streams `count` frames of one slab, hashing each into `digest` and
+/// recording its framing for comparison against the offset table.
+fn hash_frames(
+    input: &mut impl BufRead,
+    count: usize,
+    region: u64,
+    digest: &mut Sha256,
+) -> io::Result<StreamedSlab> {
+    let mut slab = StreamedSlab::new();
+    let mut position = 0_u64;
+    for _ in 0..count {
+        let mut lengths = [0; LENGTHS_LEN];
+        input.read_exact(&mut lengths)?;
+        let (native, wire) = decode_lengths(lengths)?;
+        position += LENGTHS_LEN as u64 + wire as u64;
+        if position > region {
+            return Err(invalid("shielded segment row exceeds file size"));
+        }
+        digest.update(lengths);
+        let mut payload = Sha256::new();
+        let mut remaining = wire;
+        while remaining > 0 {
+            let available = input.fill_buf()?;
+            if available.is_empty() {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let take = remaining.min(available.len());
+            payload.update(&available[..take]);
+            digest.update(&available[..take]);
+            input.consume(take);
+            remaining -= take;
+        }
+        slab.rel.push(
+            u32::try_from(position)
+                .map_err(|_| invalid("shielded segment slab exceeds its offset range"))?,
+        );
+        slab.wire.push(wire);
+        slab.native.push(native);
+        slab.digests.push(payload.finalize().into());
+    }
+    Ok(slab)
+}
+
+/// Reads one `[u32; count + 1]` relative offset table, hashing it on the way.
+fn hash_table(input: &mut impl BufRead, count: usize, digest: &mut Sha256) -> io::Result<Vec<u32>> {
+    let mut table = Vec::with_capacity(count + 1);
+    for _ in 0..=count {
+        let mut raw = [0; 4];
+        input.read_exact(&mut raw)?;
+        digest.update(raw);
+        table.push(u32::from_be_bytes(raw));
+    }
+    Ok(table)
+}
+
+/// Reads the per-block metadata rows, hashing them on the way.
+fn hash_metadata(
+    input: &mut impl BufRead,
+    count: usize,
+    digest: &mut Sha256,
+) -> io::Result<Vec<[u8; ROW_META_LEN]>> {
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut row = [0; ROW_META_LEN];
+        input.read_exact(&mut row)?;
+        digest.update(row);
+        rows.push(row);
     }
     Ok(rows)
 }
 
-fn field<const N: usize>(bytes: &[u8]) -> io::Result<[u8; N]> {
-    bytes
-        .try_into()
-        .map_err(|_| invalid("invalid shielded segment index field"))
+/// Reads one `[u32; count + 1]` relative offset table from a protected file.
+fn read_offset_table(input: &mut impl Read, count: usize) -> io::Result<Vec<u32>> {
+    let mut table = Vec::with_capacity(count + 1);
+    for _ in 0..=count {
+        let mut raw = [0; 4];
+        input.read_exact(&mut raw)?;
+        table.push(u32::from_be_bytes(raw));
+    }
+    Ok(table)
+}
+
+/// Reads the per-block metadata rows from a protected file.
+fn read_metadata(input: &mut impl Read, count: usize) -> io::Result<Vec<[u8; ROW_META_LEN]>> {
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut row = [0; ROW_META_LEN];
+        input.read_exact(&mut row)?;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Validates the offset tables and metadata against the segment identity, and
+/// against the streamed frames of a portable admission, and decodes the
+/// serving rows.
+fn decode_rows(
+    expected: SegmentIdentity,
+    header: &SegmentHeader,
+    (shielded_table, nullifier_table): (Vec<u32>, Vec<u32>),
+    metadata: Vec<[u8; ROW_META_LEN]>,
+    streamed: Option<(&StreamedSlab, &StreamedSlab)>,
+) -> io::Result<(Vec<SealedRow>, Vec<u32>, Vec<u32>)> {
+    let count = metadata.len();
+    if header.nullifier_slab_offset != HEADER_LEN as u64 + u64::from(shielded_table[count])
+        || header.index_offset != header.nullifier_slab_offset + u64::from(nullifier_table[count])
+    {
+        return Err(invalid(
+            "shielded segment header offsets differ from its index",
+        ));
+    }
+    let check = RowCheck {
+        shielded_table: &shielded_table,
+        nullifier_table: &nullifier_table,
+        streamed,
+    };
+    let mut prior = None;
+    let mut rows = Vec::with_capacity(count);
+    for (i, entry) in metadata.into_iter().enumerate() {
+        let native = check.lengths(i, &entry)?;
+        let id = BlockId::new(
+            BlockHeight::new(
+                expected
+                    .start
+                    .value()
+                    .checked_add(
+                        u32::try_from(i).map_err(|_| {
+                            invalid("shielded segment height exceeds address space")
+                        })?,
+                    )
+                    .ok_or_else(|| invalid("shielded segment interval exceeds its height type"))?,
+            ),
+            decode_hash(&entry[..32])?,
+        );
+        let parent = decode_hash(&entry[32..64])?;
+        if i == 0 && parent.as_bytes() != header.first_prev_hash {
+            return Err(invalid(
+                "shielded segment does not start at its claimed parent",
+            ));
+        }
+        expected.check_block(id, parent, prior)?;
+        prior = Some(id);
+        rows.push(SealedRow {
+            id,
+            parent,
+            native_bytes: native,
+            shielded_sha256: digest_field(&entry, 72)?,
+            nullifier_sha256: digest_field(&entry, 104)?,
+            shielded_validation: std::sync::OnceLock::new(),
+            nullifier_validation: std::sync::OnceLock::new(),
+        });
+    }
+    let last_row = rows
+        .last()
+        .ok_or_else(|| invalid("empty shielded segment interval"))?;
+    if last_row.id != expected.end {
+        return Err(invalid(
+            "shielded segment ends away from its terminal block",
+        ));
+    }
+    Ok((rows, shielded_table, nullifier_table))
+}
+
+/// One metadata row's framing check against its offset tables and, for a
+/// portable admission, the frames that were streamed.
+struct RowCheck<'a> {
+    shielded_table: &'a [u32],
+    nullifier_table: &'a [u32],
+    streamed: Option<(&'a StreamedSlab, &'a StreamedSlab)>,
+}
+
+impl RowCheck<'_> {
+    /// Validates row `i`'s lengths and streamed framing, and returns its
+    /// native byte count, which budgets both slabs equally.
+    fn lengths(&self, i: usize, entry: &[u8; ROW_META_LEN]) -> io::Result<usize> {
+        if entry[68..72] != [0; 4] {
+            return Err(invalid("shielded segment metadata reserved bytes are set"));
+        }
+        let native = super::decode_len(&entry[64..68])?;
+        let shielded_wire = wire_for(self.shielded_table, i)?;
+        let nullifier_wire = wire_for(self.nullifier_table, i)?;
+        if super::validate_lengths(native, shielded_wire).is_err()
+            || super::validate_lengths(native, nullifier_wire).is_err()
+        {
+            return Err(invalid("invalid shielded segment row lengths"));
+        }
+        if let Some((shielded, nullifiers)) = self.streamed {
+            let shielded_digest = digest_field(entry, 72)?;
+            let nullifier_digest = digest_field(entry, 104)?;
+            if shielded.rel[i] != self.shielded_table[i]
+                || shielded.wire[i] != shielded_wire
+                || shielded.native[i] != native
+                || shielded.digests[i] != shielded_digest
+                || nullifiers.rel[i] != self.nullifier_table[i]
+                || nullifiers.wire[i] != nullifier_wire
+                || nullifiers.native[i] != native
+                || nullifiers.digests[i] != nullifier_digest
+            {
+                return Err(invalid(
+                    "shielded segment payload or framing differs from its index",
+                ));
+            }
+        }
+        Ok(native)
+    }
+}
+
+/// Reads one 32-byte payload digest field of a metadata row.
+fn digest_field(entry: &[u8; ROW_META_LEN], offset: usize) -> io::Result<[u8; 32]> {
+    entry
+        .get(offset..offset + 32)
+        .and_then(|field| field.try_into().ok())
+        .ok_or_else(|| invalid("invalid shielded segment metadata row"))
+}
+
+/// A row's payload length in one slab, from its offset table span.
+fn wire_for(table: &[u32], i: usize) -> io::Result<usize> {
+    let offset = table
+        .get(i)
+        .copied()
+        .ok_or_else(|| invalid("shielded segment offset table is short"))?;
+    let next = table
+        .get(i + 1)
+        .copied()
+        .ok_or_else(|| invalid("shielded segment offset table is short"))?;
+    let frame = usize::try_from(u64::from(next) - u64::from(offset))
+        .map_err(|_| invalid("shielded segment frame offsets are not ascending"))?;
+    if frame <= LENGTHS_LEN || frame > MAX_PAYLOAD_BYTES + LENGTHS_LEN {
+        return Err(invalid("invalid shielded segment row lengths"));
+    }
+    Ok(frame - LENGTHS_LEN)
 }

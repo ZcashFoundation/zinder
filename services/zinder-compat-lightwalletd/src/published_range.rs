@@ -84,9 +84,12 @@ impl PublishedShieldedRange {
         let mut writer = SegmentWriter::create(
             path,
             staged,
-            network,
-            range.start,
-            BlockId::new(range.end, end.block_hash),
+            SegmentIdentity::span(
+                network,
+                view.artifact_schema_version.value(),
+                range.start,
+                BlockId::new(range.end, end.block_hash),
+            ),
         )?;
         let mut first = range.start;
         loop {
@@ -141,6 +144,7 @@ impl PublishedShieldedRange {
             network: Network::from_id(identity.network_id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "unknown segment network")
             })?,
+            artifact_schema: identity.artifact_schema,
             start: BlockHeight::new(identity.first),
             end: BlockId::new(
                 BlockHeight::new(identity.last),

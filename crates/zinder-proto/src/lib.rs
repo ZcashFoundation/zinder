@@ -154,8 +154,8 @@ pub mod compat {
         )]
 
         pub use crate::encoded_block_range::{
-            BoundedChunkRetention, EncodedBlock, EncodedBlockRange, EncodedBlockRangeStream,
-            InvalidEncodedBlock,
+            BoundedChunkRetention, EncodedBlock, EncodedBlockRange, EncodedBlockRangeNullifiers,
+            EncodedBlockRangeStream, InvalidEncodedBlock,
         };
 
         /// Upstream `lightwallet-protocol` commit served by this compatibility pin.

@@ -373,7 +373,12 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
             |history| history.encoded_range(),
         );
         self.block_methods
-            .published_block_range(&self.slot, &request.into_inner(), range)
+            .published_block_range(
+                &self.slot,
+                &request.into_inner(),
+                range,
+                CompactBlockShape::for_range,
+            )
             .await
             .map(Response::new)
     }

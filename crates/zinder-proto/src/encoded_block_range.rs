@@ -51,6 +51,35 @@ impl<'a> ServerStreamingService<BlockRange> for &'a (dyn EncodedBlockRange + '_)
     }
 }
 
+/// Serves lightwalletd `GetBlockRangeNullifiers` from previously encoded
+/// protobuf messages.
+///
+/// Return `Some(self)` from [`CompactTxStreamer::encoded_block_range_nullifiers`]
+/// to use this implementation for nullifier range requests on the generated
+/// server.
+///
+/// [`CompactTxStreamer::encoded_block_range_nullifiers`]: crate::compat::lightwalletd::compact_tx_streamer_server::CompactTxStreamer::encoded_block_range_nullifiers
+#[tonic::async_trait]
+pub trait EncodedBlockRangeNullifiers: Send + Sync {
+    /// Opens a stream of encoded nullifier-only compact blocks for the
+    /// requested heights and pools.
+    async fn get_encoded_block_range_nullifiers(
+        &self,
+        request: Request<BlockRange>,
+    ) -> Result<Response<EncodedBlockRangeStream>, Status>;
+}
+
+impl<'a> ServerStreamingService<BlockRange> for &'a (dyn EncodedBlockRangeNullifiers + '_) {
+    type Response = EncodedBlock;
+    type ResponseStream = EncodedBlockRangeStream;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Response<Self::ResponseStream>, Status>> + Send + 'a>>;
+
+    fn call(&mut self, request: Request<BlockRange>) -> Self::Future {
+        (*self).get_encoded_block_range_nullifiers(request)
+    }
+}
+
 /// One lightwalletd `CompactBlock` protobuf message in gRPC's
 /// length-prefixed form: an uncompressed flag byte, the big-endian payload
 /// length, and the payload.
@@ -278,6 +307,45 @@ where
             request,
         )
         .await;
+    finish_encoded_body(response, messages, max_message_size)
+}
+
+/// Handles one `GetBlockRangeNullifiers` call for the generated server, as
+/// [`server_streaming`] handles `GetBlockRange`.
+pub(crate) async fn server_streaming_nullifiers<B>(
+    grpc: &mut Grpc<EncodedBlockCodec>,
+    service: &dyn EncodedBlockRangeNullifiers,
+    request: http::Request<B>,
+    send_compression: EnabledCompressionEncodings,
+    max_message_size: Option<usize>,
+) -> http::Response<Body>
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<StdError> + Send,
+{
+    if !send_compression.is_empty() {
+        return grpc.server_streaming(service, request).await;
+    }
+    let mut messages = None;
+    let response = grpc
+        .server_streaming(
+            TakeNullifierMessages {
+                service,
+                messages: Some(&mut messages),
+            },
+            request,
+        )
+        .await;
+    finish_encoded_body(response, messages, max_message_size)
+}
+
+/// Marks a response that keeps bounded allocations behind its data chunks and
+/// hands its messages to [`EncodedBlockBody`].
+fn finish_encoded_body(
+    response: http::Response<Body>,
+    messages: Option<EncodedBlockRangeStream>,
+    max_message_size: Option<usize>,
+) -> http::Response<Body> {
     match messages {
         Some(messages) => {
             let (mut parts, _) = response.into_parts();
@@ -307,6 +375,38 @@ impl<'a> ServerStreamingService<BlockRange> for TakeMessages<'a> {
         Box::pin(async move {
             let (metadata, messages, extensions) =
                 service.get_encoded_block_range(request).await?.into_parts();
+            let messages = match taken {
+                Some(taken) => {
+                    *taken = Some(messages);
+                    Box::pin(tokio_stream::empty())
+                }
+                None => messages,
+            };
+            Ok(Response::from_parts(metadata, messages, extensions))
+        })
+    }
+}
+
+/// Opens the nullifier range for tonic, as [`TakeMessages`] opens the range.
+struct TakeNullifierMessages<'a> {
+    service: &'a dyn EncodedBlockRangeNullifiers,
+    messages: Option<&'a mut Option<EncodedBlockRangeStream>>,
+}
+
+impl<'a> ServerStreamingService<BlockRange> for TakeNullifierMessages<'a> {
+    type Response = EncodedBlock;
+    type ResponseStream = EncodedBlockRangeStream;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Response<Self::ResponseStream>, Status>> + Send + 'a>>;
+
+    fn call(&mut self, request: Request<BlockRange>) -> Self::Future {
+        let service = self.service;
+        let taken = self.messages.take();
+        Box::pin(async move {
+            let (metadata, messages, extensions) = service
+                .get_encoded_block_range_nullifiers(request)
+                .await?
+                .into_parts();
             let messages = match taken {
                 Some(taken) => {
                     *taken = Some(messages);

@@ -1371,6 +1371,10 @@ pub mod compact_tx_streamer_server {
             tonic::Response<Self::GetBlockRangeStream>,
             tonic::Status,
         >;
+        /// Provides encoded protobuf responses for GetBlockRangeNullifiers when available.
+        fn encoded_block_range_nullifiers(&self) -> Option<&dyn super::EncodedBlockRangeNullifiers> {
+            None
+        }
         /// Server streaming response type for the GetBlockRangeNullifiers method.
         type GetBlockRangeNullifiersStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::CompactBlock, tonic::Status>,
@@ -1860,6 +1864,19 @@ pub mod compact_tx_streamer_server {
                     let max_encoding_message_size = self.max_encoding_message_size;
                     let inner = self.inner.clone();
                     let fut = async move {
+                        if let Some(encoded) = inner.encoded_block_range_nullifiers() {
+                            let codec = crate::encoded_block_range::EncodedBlockCodec;
+                            let mut grpc = tonic::server::Grpc::new(codec)
+                                .apply_compression_config(
+                                    accept_compression_encodings,
+                                    send_compression_encodings,
+                                )
+                                .apply_max_message_size_config(
+                                    max_decoding_message_size,
+                                    max_encoding_message_size,
+                                );
+                            return Ok(crate::encoded_block_range::server_streaming_nullifiers(&mut grpc, encoded, req, send_compression_encodings, max_encoding_message_size).await);
+                        }
                         let method = GetBlockRangeNullifiersSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)

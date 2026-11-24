@@ -235,8 +235,13 @@ fn read_catalog(
 }
 
 impl PublishedShieldedCatalog {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the slab, range, order, byte budget, and oversized-row exception describe one bounded catalog read"
+    )]
     pub(super) fn read_chunk(
         &self,
+        slab: crate::sealed_history::SealedSlab,
         range: BlockHeightRange,
         order: HeightOrder,
         max_bytes: usize,
@@ -264,7 +269,7 @@ impl PublishedShieldedCatalog {
         if let [part] = selected {
             return part
                 .segment
-                .bounded_rows(range, order, max_bytes, allow_oversized);
+                .bounded_rows(slab, range, order, max_bytes, allow_oversized);
         }
         let mut output = Vec::new();
         let mut remaining = max_bytes;
@@ -285,9 +290,9 @@ impl PublishedShieldedCatalog {
                 range.end.min(identity.end.height),
             );
             let allow_oversized = allow_oversized && output.is_empty();
-            let mut rows = part
-                .segment
-                .bounded_rows(span, order, remaining, allow_oversized)?;
+            let mut rows =
+                part.segment
+                    .bounded_rows(slab, span, order, remaining, allow_oversized)?;
             let whole_span = u64::try_from(rows.len()).ok()
                 == Some(u64::from(span.end.value() - span.start.value()) + 1);
             remaining = rows

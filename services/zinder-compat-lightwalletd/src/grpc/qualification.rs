@@ -911,7 +911,34 @@ impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<QualificationWa
             |history| history.encoded_range(),
         );
         self.block_methods
-            .published_block_range(&self.query_api.slot, &request.into_inner(), range)
+            .published_block_range(
+                &self.query_api.slot,
+                &request.into_inner(),
+                range,
+                CompactBlockShape::for_range,
+            )
+            .await
+            .map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
+impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<QualificationWallet> {
+    async fn get_encoded_block_range_nullifiers(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
+        self.block_methods
+            .published_block_range(
+                &self.query_api.slot,
+                &request.into_inner(),
+                range,
+                CompactBlockShape::for_nullifier_range,
+            )
             .await
             .map(Response::new)
     }
@@ -922,6 +949,12 @@ impl compact_tx_streamer_server::CompactTxStreamer
     for LightwalletdGrpcAdapter<QualificationWallet>
 {
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
+        Some(self)
+    }
+
+    fn encoded_block_range_nullifiers(
+        &self,
+    ) -> Option<&dyn lightwalletd::EncodedBlockRangeNullifiers> {
         Some(self)
     }
 

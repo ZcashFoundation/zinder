@@ -11,7 +11,7 @@ use eyre::OptionExt as _;
 use prost::bytes::Bytes;
 use zinder_proto::compat::lightwalletd::EncodedBlock;
 
-use super::{SealedBlock, ShieldedTailBuffer, build_source, fill, quarter_chunk_rows, span};
+use super::{ShieldedTailBuffer, TailRow, build_source, fill, quarter_chunk_rows, span};
 
 tokio::task_local! {
     static LIVE: Arc<LivePayloadBytes>;
@@ -42,23 +42,26 @@ impl Drop for TrackedPayload {
 }
 
 // Each allocation is counted once until the final Bytes clone releases its owner.
-pub(in crate::published_range::tail) fn track_chunk(
-    mut rows: Vec<SealedBlock>,
-) -> Vec<SealedBlock> {
+pub(in crate::published_range::tail) fn track_chunk(mut rows: Vec<TailRow>) -> Vec<TailRow> {
     let _ = LIVE.try_with(|live| {
         for row in &mut rows {
-            let payload_len = row.message.payload_len();
-            let tracked = EncodedBlock::from_length_prefixed(Bytes::from_owner(TrackedPayload {
-                bytes: row.message.as_length_prefixed().clone(),
-                payload_len,
-                live: Arc::clone(live),
-            }));
-            // An untracked row would fail the byte-count assertions.
-            if let Ok(tracked) = tracked {
-                row.message = tracked;
-                let held = live.current.fetch_add(payload_len, Relaxed) + payload_len;
-                live.peak.fetch_max(held, Relaxed);
-            }
+            let track = |frame: &mut EncodedBlock| {
+                let payload_len = frame.payload_len();
+                let tracked =
+                    EncodedBlock::from_length_prefixed(Bytes::from_owner(TrackedPayload {
+                        bytes: frame.as_length_prefixed().clone(),
+                        payload_len,
+                        live: Arc::clone(live),
+                    }));
+                // An untracked row would fail the byte-count assertions.
+                if let Ok(tracked) = tracked {
+                    *frame = tracked;
+                    let held = live.current.fetch_add(payload_len, Relaxed) + payload_len;
+                    live.peak.fetch_max(held, Relaxed);
+                }
+            };
+            track(&mut row.shielded);
+            track(&mut row.nullifiers);
         }
     });
     rows
@@ -105,10 +108,11 @@ async fn replacement_holds_two_full_tails_and_one_converted_chunk() -> eyre::Res
         assert_eq!(old.rows.len(), replacement.rows.len());
         for (old_row, new_row) in old.rows.iter().zip(&replacement.rows) {
             assert_eq!(old_row.id.height, new_row.id.height);
-            assert_ne!(old_row.message, new_row.message);
+            assert_ne!(old_row.shielded, new_row.shielded);
+            assert_ne!(old_row.nullifiers, new_row.nullifiers);
             assert_ne!(
-                old_row.message.as_length_prefixed().as_ptr(),
-                new_row.message.as_length_prefixed().as_ptr()
+                old_row.shielded.as_length_prefixed().as_ptr(),
+                new_row.shielded.as_length_prefixed().as_ptr()
             );
         }
 
@@ -116,7 +120,7 @@ async fn replacement_holds_two_full_tails_and_one_converted_chunk() -> eyre::Res
             .rows
             .front()
             .ok_or_eyre("missing old row")?
-            .message
+            .shielded
             .clone();
         drop(old);
         assert_eq!(live.current.load(Relaxed), budget + pinned.payload_len());

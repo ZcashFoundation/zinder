@@ -14,7 +14,11 @@ use zinder_testkit::{
 };
 
 use super::*;
+use crate::compact_block_messages::CompactBlockShape;
 use crate::published_range::manifest::{self, verification_key_from};
+
+/// The pool-selection function a published range request carries.
+type Select = fn(&[i32]) -> Result<CompactBlockShape, tonic::Status>;
 
 struct Fixture {
     directory: TempDir,
@@ -598,7 +602,13 @@ async fn encoded_tail_reads_each_generation_from_its_own_store() -> Result<()> {
         let span = tail.bounds().ok_or_else(|| eyre!("empty tail"))?;
         assert_eq!(span.start, BlockHeight::new(3));
         assert_eq!(span.end, source.chain_epoch().visible_tip_height);
-        let rows = tail.select(span, HeightOrder::Ascending, usize::MAX, true);
+        let rows = tail.select(
+            crate::sealed_history::SealedSlab::Shielded,
+            span,
+            HeightOrder::Ascending,
+            usize::MAX,
+            true,
+        );
         for row in &rows {
             let block = source
                 .compact_blocks_in_range(BlockHeightRange::inclusive(row.id.height, row.id.height))
@@ -621,8 +631,27 @@ async fn encoded_tail_reads_each_generation_from_its_own_store() -> Result<()> {
         }
         retained = Some(rows[0].message.as_length_prefixed().clone());
         for order in [HeightOrder::Ascending, HeightOrder::Descending] {
-            assert_eq!(tail.select(span, order, 0, true).len(), 1);
-            assert!(tail.select(span, order, 0, false).is_empty());
+            assert_eq!(
+                tail.select(
+                    crate::sealed_history::SealedSlab::Shielded,
+                    span,
+                    order,
+                    0,
+                    true
+                )
+                .len(),
+                1
+            );
+            assert!(
+                tail.select(
+                    crate::sealed_history::SealedSlab::Shielded,
+                    span,
+                    order,
+                    0,
+                    false
+                )
+                .is_empty()
+            );
         }
     }
     Ok(())
@@ -656,8 +685,20 @@ async fn a_signed_extension_prunes_covered_tail_rows_at_the_same_fence() -> Resu
         original.bounds().map(|span| span.start),
         Some(BlockHeight::new(3))
     );
-    let reused = retained.select(suffix, HeightOrder::Ascending, usize::MAX, true);
-    let previous = original.select(suffix, HeightOrder::Ascending, usize::MAX, true);
+    let reused = retained.select(
+        crate::sealed_history::SealedSlab::Shielded,
+        suffix,
+        HeightOrder::Ascending,
+        usize::MAX,
+        true,
+    );
+    let previous = original.select(
+        crate::sealed_history::SealedSlab::Shielded,
+        suffix,
+        HeightOrder::Ascending,
+        usize::MAX,
+        true,
+    );
     assert_eq!(reused.len(), 2);
     assert!(
         previous
@@ -706,6 +747,7 @@ async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_rea
     .await?;
     let row = tail
         .select(
+            crate::sealed_history::SealedSlab::Shielded,
             BlockHeightRange::inclusive(fifth, fifth),
             HeightOrder::Descending,
             0,
@@ -1317,7 +1359,12 @@ async fn stream_blocks_only(
         pool_types: Vec::new(),
     };
     let mut stream = crate::block_methods::BlockMethods::default()
-        .published_block_range(reads, &request, (None, tail.clone()))
+        .published_block_range(
+            reads,
+            &request,
+            (None, tail.clone()),
+            crate::compact_block_messages::CompactBlockShape::for_range,
+        )
         .await?;
     let mut frames = 0;
     while let Some(frame) = stream.next().await {
@@ -1377,7 +1424,7 @@ async fn stream_published(
     methods: &crate::block_methods::BlockMethods,
     reads: &RecordedSlot,
     catalog: &Arc<PublishedShieldedCatalog>,
-    (first, last, pool_types): (u64, u64, Vec<i32>),
+    (first, last, pool_types, select): (u64, u64, Vec<i32>, Select),
 ) -> Result<usize> {
     use tokio_stream::StreamExt as _;
     let block = |height| {
@@ -1392,7 +1439,12 @@ async fn stream_published(
         pool_types,
     };
     let mut stream = methods
-        .published_block_range(reads, &request, (Some(catalog.clone()), catalog.tail()))
+        .published_block_range(
+            reads,
+            &request,
+            (Some(catalog.clone()), catalog.tail()),
+            select,
+        )
         .await?;
     let mut frames = 0;
     while let Some(frame) = stream.next().await {
@@ -1425,7 +1477,14 @@ async fn ranges_that_cannot_use_signed_files_stream_while_every_published_read_p
     let methods = crate::block_methods::BlockMethods::default();
     let span =
         |first, last| BlockHeightRange::inclusive(BlockHeight::new(first), BlockHeight::new(last));
-    let default_shape = |first, last| (first, last, Vec::new());
+    let default_shape = |first, last| {
+        (
+            first,
+            last,
+            Vec::new(),
+            CompactBlockShape::for_range as Select,
+        )
+    };
 
     assert_eq!(
         stream_published(&methods, &reads, &catalog, default_shape(2_100, 1_000)).await?,
@@ -1450,7 +1509,17 @@ async fn ranges_that_cannot_use_signed_files_stream_while_every_published_read_p
         let transparent = vec![zinder_proto::compat::lightwalletd::PoolType::Transparent as i32];
         let frames = tokio::time::timeout(
             prompt,
-            stream_published(&methods, &reads, &catalog, (first, last, transparent)),
+            stream_published(
+                &methods,
+                &reads,
+                &catalog,
+                (
+                    first,
+                    last,
+                    transparent,
+                    CompactBlockShape::for_range as Select,
+                ),
+            ),
         )
         .await??;
         assert_eq!(frames as u64, last - first + 1);
@@ -1461,15 +1530,37 @@ async fn ranges_that_cannot_use_signed_files_stream_while_every_published_read_p
     );
     assert_eq!(*reads.native.lock(), vec![span(1, 6), span(1_000, 1_015)]);
     below_catalog_streams_without_permits(&methods, &reads, prompt).await?;
+    queued_ranges_wait_then_stream_after_the_permits_return(
+        &methods, &reads, &catalog, held, prompt,
+    )
+    .await
+}
 
-    let queued = Duration::from_millis(200);
+/// Holds every published-read permit, confirms queued default-shape ranges
+/// time out, then releases the permits and confirms each streams.
+async fn queued_ranges_wait_then_stream_after_the_permits_return(
+    methods: &crate::block_methods::BlockMethods,
+    reads: &RecordedSlot,
+    catalog: &Arc<PublishedShieldedCatalog>,
+    held: Vec<tokio::sync::OwnedSemaphorePermit>,
+    prompt: std::time::Duration,
+) -> Result<()> {
+    let default_shape = |first, last| {
+        (
+            first,
+            last,
+            Vec::new(),
+            CompactBlockShape::for_range as Select,
+        )
+    };
+    let queued = std::time::Duration::from_millis(200);
     for range in [
         default_shape(1, 6),
         default_shape(5, 20),
         default_shape(20, 5),
     ] {
         assert!(
-            tokio::time::timeout(queued, stream_published(&methods, &reads, &catalog, range))
+            tokio::time::timeout(queued, stream_published(methods, reads, catalog, range))
                 .await
                 .is_err()
         );
@@ -1480,14 +1571,12 @@ async fn ranges_that_cannot_use_signed_files_stream_while_every_published_read_p
         (default_shape(5, 20), 16),
         (default_shape(20, 5), 16),
     ] {
-        let frames =
-            tokio::time::timeout(prompt, stream_published(&methods, &reads, &catalog, range))
-                .await??;
+        let frames = tokio::time::timeout(prompt, stream_published(methods, reads, catalog, range))
+            .await??;
         assert_eq!(frames, expected);
     }
     Ok(())
 }
-
 async fn below_catalog_streams_without_permits(
     methods: &crate::block_methods::BlockMethods,
     reads: &RecordedSlot,
@@ -1506,7 +1595,17 @@ async fn below_catalog_streams_without_permits(
     for (start, end, count) in [(1, 16, 16), (16, 1, 16), (1_001, 999, 3)] {
         let frames = tokio::time::timeout(
             prompt,
-            stream_published(methods, reads, &catalog, (start, end, Vec::new())),
+            stream_published(
+                methods,
+                reads,
+                &catalog,
+                (
+                    start,
+                    end,
+                    Vec::new(),
+                    CompactBlockShape::for_range as Select,
+                ),
+            ),
         )
         .await??;
         assert_eq!(frames, count);
@@ -1525,7 +1624,6 @@ async fn a_chunk_holds_a_published_read_permit_exactly_when_its_plan_can_open_si
     use crate::{
         CanonicalReaderSlot,
         block_range::{BlockRangeChunks, BlockRangeStreamLimit},
-        compact_block_messages::CompactBlockShape,
         published_range::PublishedRangeRead,
     };
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2_010);
@@ -1627,4 +1725,184 @@ async fn assert_published_read_admission(
 
 fn test_span(start: u32, end: u32) -> BlockHeightRange {
     BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end))
+}
+
+/// Streams `first..=last` through `select`, over the published range, and
+/// returns each frame's payload bytes in wire order.
+async fn published_frames(
+    methods: &crate::block_methods::BlockMethods,
+    reads: &RecordedSlot,
+    (history, tail): (
+        Option<Arc<PublishedShieldedCatalog>>,
+        super::super::tail::ShieldedTailBuffer,
+    ),
+    (first, last, pool_types): (u64, u64, Vec<i32>),
+    select: fn(&[i32]) -> Result<crate::compact_block_messages::CompactBlockShape, tonic::Status>,
+) -> Result<Vec<Vec<u8>>> {
+    use tokio_stream::StreamExt as _;
+    let block = |height| {
+        Some(zinder_proto::compat::lightwalletd::BlockId {
+            height,
+            hash: Vec::new(),
+        })
+    };
+    let request = zinder_proto::compat::lightwalletd::BlockRange {
+        start: block(first),
+        end: block(last),
+        pool_types,
+    };
+    let mut stream = methods
+        .published_block_range(reads, &request, (history, tail), select)
+        .await?;
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next().await {
+        frames.push(frame?.payload().to_vec());
+    }
+    Ok(frames)
+}
+
+/// Streams `first..=last` through the native chunk path, as a server without
+/// published files answers it, and returns each block's encoded bytes.
+async fn native_frames(
+    methods: &crate::block_methods::BlockMethods,
+    reads: &RecordedSlot,
+    (first, last, pool_types): (u64, u64, Vec<i32>),
+    select: fn(&[i32]) -> Result<crate::compact_block_messages::CompactBlockShape, tonic::Status>,
+) -> Result<Vec<Vec<u8>>> {
+    use prost::Message as _;
+    use tokio_stream::StreamExt as _;
+    let block = |height| {
+        Some(zinder_proto::compat::lightwalletd::BlockId {
+            height,
+            hash: Vec::new(),
+        })
+    };
+    let request = zinder_proto::compat::lightwalletd::BlockRange {
+        start: block(first),
+        end: block(last),
+        pool_types,
+    };
+    let mut stream = methods.block_range(reads, &request, select).await?;
+    let mut frames = Vec::new();
+    while let Some(block) = stream.next().await {
+        frames.push(block?.encode_to_vec());
+    }
+    Ok(frames)
+}
+
+#[tokio::test]
+async fn nullifier_ranges_match_the_native_wire_bytes_without_native_reads() -> Result<()> {
+    use crate::compact_block_messages::CompactBlockShape;
+    const TIP: u32 = 2_100;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
+    let (_store, source) = reader(&chain)?;
+    let source = Arc::new(source);
+    let reads = RecordedSlot {
+        slot: crate::CanonicalReaderSlot::new(source.clone()),
+        rows: Arc::default(),
+        native: Arc::default(),
+    };
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    for _ in 0..3 {
+        assert!(publisher.publish_next(source.as_ref())?);
+    }
+    let catalog = Arc::new(fixture.catalog(None)?);
+    assert_eq!(catalog.bounds().end, BlockHeight::new(6));
+    let methods = crate::block_methods::BlockMethods::default();
+
+    for (first, last) in [(1_u64, 6_u64), (6, 1), (2_085, 2_100), (2_100, 2_085)] {
+        let native = native_frames(
+            &methods,
+            &reads,
+            (first, last, Vec::new()),
+            CompactBlockShape::for_nullifier_range,
+        )
+        .await?;
+        reads.native.lock().clear();
+        let frames = published_frames(
+            &methods,
+            &reads,
+            (Some(catalog.clone()), catalog.tail()),
+            (first, last, Vec::new()),
+            CompactBlockShape::for_nullifier_range,
+        )
+        .await?;
+        assert_eq!(frames, native, "nullifier range {first}..={last}");
+        // Both directions serve Slab 1 and the tail's nullifier frames; no
+        // chunk fell back to the native path.
+        assert!(
+            reads.native.lock().is_empty(),
+            "nullifier range {first}..={last} read canonical chunks natively"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_ironwood_omitting_selection_serves_stored_frames_below_activation() -> Result<()> {
+    use crate::compact_block_messages::CompactBlockShape;
+    use zinder_proto::compat::lightwalletd::PoolType;
+    const TIP: u32 = 2_100;
+    // The regtest fixture activates NU6.3 at 603, so the catalog's rows sit
+    // below Ironwood activation and the tail's rows sit above it.
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(TIP);
+    let (_store, source) = reader(&chain)?;
+    let source = Arc::new(source);
+    let reads = RecordedSlot {
+        slot: crate::CanonicalReaderSlot::new(source.clone()),
+        rows: Arc::default(),
+        native: Arc::default(),
+    };
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    for _ in 0..3 {
+        assert!(publisher.publish_next(source.as_ref())?);
+    }
+    let catalog = Arc::new(fixture.catalog(None)?);
+    let methods = crate::block_methods::BlockMethods::default();
+    let sapling_orchard = vec![PoolType::Sapling as i32, PoolType::Orchard as i32];
+
+    // Below activation the selection is byte-identical to the default, so it
+    // serves the sealed frames without a native read.
+    let default_frames = published_frames(
+        &methods,
+        &reads,
+        (Some(catalog.clone()), catalog.tail()),
+        (1, 6, Vec::new()),
+        CompactBlockShape::for_range,
+    )
+    .await?;
+    reads.native.lock().clear();
+    let omitting = published_frames(
+        &methods,
+        &reads,
+        (Some(catalog.clone()), catalog.tail()),
+        (1, 6, sapling_orchard.clone()),
+        CompactBlockShape::for_range,
+    )
+    .await?;
+    assert_eq!(omitting, default_frames);
+    assert!(reads.native.lock().is_empty());
+
+    // Above activation the selection is not equivalent, so it reads native.
+    let native = native_frames(
+        &methods,
+        &reads,
+        (2_085, 2_100, sapling_orchard.clone()),
+        CompactBlockShape::for_range,
+    )
+    .await?;
+    reads.native.lock().clear();
+    let frames = published_frames(
+        &methods,
+        &reads,
+        (Some(catalog.clone()), catalog.tail()),
+        (2_085, 2_100, sapling_orchard),
+        CompactBlockShape::for_range,
+    )
+    .await?;
+    assert_eq!(frames, native);
+    assert!(!reads.native.lock().is_empty());
+    Ok(())
 }

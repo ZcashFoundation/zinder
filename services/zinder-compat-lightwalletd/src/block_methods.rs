@@ -390,10 +390,11 @@ impl BlockMethods {
             Option<Arc<crate::published_range::PublishedShieldedCatalog>>,
             crate::published_range::ShieldedTailBuffer,
         ),
+        select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<lightwalletd::EncodedBlockRangeStream, Status> {
         let (range, is_descending) = block_range_from_request(request)?;
         let slot = self.block_range_streams.open().await?;
-        let shape = CompactBlockShape::for_range(&request.pool_types)?;
+        let shape = select(&request.pool_types)?;
         let source = crate::published_range::PublishedRangeRead::new(
             history,
             live_tail,

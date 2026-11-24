@@ -7,12 +7,14 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, CanonicalHistoryBounds, ChainEpoch,
     CompactBlockArtifact,
 };
+use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zinder_query::{CompactBlockFence, CompactBlockSource};
 use zinder_store::{CanonicalEventFence, HeightOrder};
 
 use crate::{
-    block_methods::CompactBlockReads, compact_block_messages::CompactBlockShape,
-    sealed_history::SealedBlock,
+    block_methods::CompactBlockReads,
+    compact_block_messages::CompactBlockShape,
+    sealed_history::{SealedBlock, SealedSlab},
 };
 
 const TAIL_BLOCKS: u32 = 5_096;
@@ -25,6 +27,36 @@ pub(super) struct TailReadLimits {
 }
 
 pub(super) type Fence = (CanonicalEventFence, CanonicalHistoryBounds);
+
+/// One cached tail block in both projections the tail serves.
+#[derive(Clone)]
+pub(super) struct TailRow {
+    id: BlockId,
+    parent: BlockHash,
+    native_bytes: usize,
+    shielded: EncodedBlock,
+    nullifiers: EncodedBlock,
+}
+
+impl TailRow {
+    /// Total payload bytes the row keeps alive.
+    fn payload_len(&self) -> usize {
+        self.shielded.payload_len() + self.nullifiers.payload_len()
+    }
+
+    fn sealed_block(&self, slab: SealedSlab) -> SealedBlock {
+        let message = match slab {
+            SealedSlab::Shielded => &self.shielded,
+            SealedSlab::Nullifier => &self.nullifiers,
+        };
+        SealedBlock {
+            id: self.id,
+            parent: self.parent,
+            native_bytes: self.native_bytes,
+            message: message.clone(),
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct ShieldedTailBuffer(Arc<ShieldedTailBufferInner>);
@@ -41,7 +73,7 @@ pub(super) struct EncodedTail {
     /// The admitted serving generation the rows were read from. Rows are
     /// reused only while requests read that same immutable generation.
     source: CompactBlockSource,
-    rows: VecDeque<SealedBlock>,
+    rows: VecDeque<TailRow>,
     bytes: usize,
     byte_capped: bool,
     held: HeldBytes,
@@ -170,8 +202,8 @@ fn check_cancel(source: &impl TailSource) -> Result<(), Status> {
     Ok(())
 }
 
-fn payload_bytes<'a>(rows: impl IntoIterator<Item = &'a SealedBlock>) -> usize {
-    rows.into_iter().map(|row| row.message.payload_len()).sum()
+fn payload_bytes<'a>(rows: impl IntoIterator<Item = &'a TailRow>) -> usize {
+    rows.into_iter().map(TailRow::payload_len).sum()
 }
 
 impl ShieldedTailBuffer {
@@ -383,7 +415,7 @@ impl EncodedTail {
                     .is_some_and(|bounds| bounds.start <= requested_floor))
     }
 
-    fn with_rows(&self, rows: VecDeque<SealedBlock>, byte_capped: bool, held: HeldBytes) -> Self {
+    fn with_rows(&self, rows: VecDeque<TailRow>, byte_capped: bool, held: HeldBytes) -> Self {
         Self {
             epoch: self.epoch,
             fence: self.fence,
@@ -395,8 +427,13 @@ impl EncodedTail {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the slab, span, order, byte budget, and oversized-row exception describe one bounded tail selection"
+    )]
     pub(super) fn select(
         &self,
+        slab: SealedSlab,
         span: BlockHeightRange,
         order: HeightOrder,
         budget: usize,
@@ -418,7 +455,7 @@ impl EncodedTail {
             if row.native_bytes > room && !(allow_first && selected.is_empty()) {
                 break;
             }
-            selected.push(row.clone());
+            selected.push(row.sealed_block(slab));
             room = room.saturating_sub(row.native_bytes);
         }
         if order == HeightOrder::Descending {
@@ -429,12 +466,12 @@ impl EncodedTail {
 
     /// Appends `row`, evicting the lowest rows past `max_tail_bytes`. The
     /// newest row stays even when it alone exceeds the budget.
-    fn push_with_limit(&mut self, row: SealedBlock, max_tail_bytes: usize) {
-        self.bytes += row.message.payload_len();
+    fn push_with_limit(&mut self, row: TailRow, max_tail_bytes: usize) {
+        self.bytes += row.payload_len();
         self.rows.push_back(row);
         while self.rows.len() > 1 && self.bytes > max_tail_bytes {
             if let Some(evicted) = self.rows.pop_front() {
-                self.bytes -= evicted.message.payload_len();
+                self.bytes -= evicted.payload_len();
                 self.byte_capped = true;
             }
         }
@@ -463,7 +500,7 @@ async fn build<Source: TailSource>(
         held: HeldBytes::default(),
     };
     let mut held = HeldBytes::default();
-    let mut keep = |chunk: Vec<SealedBlock>| {
+    let mut keep = |chunk: Vec<TailRow>| {
         held.observe(tail.bytes + payload_bytes(&chunk));
         for row in chunk {
             tail.push_with_limit(row, max_tail_bytes);
@@ -525,7 +562,7 @@ async fn prepend_missing<Source: TailSource>(
 
 /// The highest contiguous rows of one prepend batch that fit a byte budget.
 struct PrependWindow {
-    rows: VecDeque<SealedBlock>,
+    rows: VecDeque<TailRow>,
     bytes: usize,
     budget: usize,
     /// The last row read, which must link to the rows above the batch.
@@ -534,15 +571,15 @@ struct PrependWindow {
 }
 
 impl PrependWindow {
-    fn push(&mut self, row: SealedBlock) {
+    fn push(&mut self, row: TailRow) {
         self.top = Some((row.id, row.parent));
-        self.bytes += row.message.payload_len();
+        self.bytes += row.payload_len();
         self.rows.push_back(row);
         while self.bytes > self.budget {
             let Some(evicted) = self.rows.pop_front() else {
                 break;
             };
-            self.bytes -= evicted.message.payload_len();
+            self.bytes -= evicted.payload_len();
             self.dropped = true;
         }
     }
@@ -557,7 +594,7 @@ async fn read_prepend_batches<Source: TailSource>(
     let mut remaining_bytes = max_tail_bytes.saturating_sub(existing.bytes);
     let mut kept_bytes = 0;
     let mut held = existing.held;
-    let mut batches: Vec<VecDeque<SealedBlock>> = Vec::new();
+    let mut batches: Vec<VecDeque<TailRow>> = Vec::new();
     let mut expected_height = existing.rows.front().map_or(0, |row| row.id.height.value());
     let mut expected_parent = existing.rows.front().map(|row| row.parent);
     let mut byte_capped =
@@ -577,7 +614,7 @@ async fn read_prepend_batches<Source: TailSource>(
             dropped: false,
         };
         let retained = existing.bytes + kept_bytes;
-        let mut keep = |chunk: Vec<SealedBlock>| {
+        let mut keep = |chunk: Vec<TailRow>| {
             held.observe(retained + window.bytes + payload_bytes(&chunk));
             for row in chunk {
                 window.push(row);
@@ -640,7 +677,7 @@ async fn encode_span<Source: TailSource>(
     source: &Source,
     span: BlockHeightRange,
     mut prior: Option<BlockId>,
-    (keep, budget): (&mut impl FnMut(Vec<SealedBlock>), Option<usize>),
+    (keep, budget): (&mut impl FnMut(Vec<TailRow>), Option<usize>),
 ) -> Result<SpanEnd, Status> {
     let mut next = Some(span.start);
     while let Some(height) = next.filter(|height| *height <= span.end) {
@@ -675,7 +712,7 @@ async fn encode_range<Source: TailSource>(
     source: &Source,
     range: BlockHeightRange,
     max_bytes: usize,
-) -> Result<Option<Vec<SealedBlock>>, Status> {
+) -> Result<Option<Vec<TailRow>>, Status> {
     let Some(blocks) = source.read_rows(range, max_bytes).await? else {
         return Ok(None);
     };
@@ -688,15 +725,17 @@ async fn encode_range<Source: TailSource>(
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
-        let shape = CompactBlockShape::for_range(&[])?;
+        let shielded = CompactBlockShape::DEFAULT_RANGE;
+        let nullifiers = CompactBlockShape::DEFAULT_NULLIFIER_RANGE;
         blocks
             .into_iter()
             .map(|(block, native_bytes)| {
-                Ok(SealedBlock {
+                Ok(TailRow {
                     id: BlockId::new(block.height(), block.block_hash()),
                     parent: block.previous_block_hash(),
                     native_bytes,
-                    message: shape.encoded(block)?,
+                    shielded: shielded.encoded(block.clone())?,
+                    nullifiers: nullifiers.encoded(block)?,
                 })
             })
             .collect::<Result<Vec<_>, Status>>()
@@ -845,11 +884,15 @@ mod tests {
                 .collect()
         }
 
+        /// The largest payload bytes one cached row keeps: both of its frames.
         fn largest_payload(&self) -> eyre::Result<usize> {
-            let shape = CompactBlockShape::for_range(&[])?;
+            let shielded = CompactBlockShape::DEFAULT_RANGE;
+            let nullifiers = CompactBlockShape::DEFAULT_NULLIFIER_RANGE;
             let mut largest = 0;
             for block in &self.blocks {
-                largest = largest.max(shape.message(block.clone())?.encode_to_vec().len());
+                let row = shielded.message(block.clone())?.encode_to_vec().len()
+                    + nullifiers.message(block.clone())?.encode_to_vec().len();
+                largest = largest.max(row);
             }
             Ok(largest)
         }
@@ -951,11 +994,15 @@ mod tests {
         assert_eq!(expanded.bounds(), Some(span(5, 10)));
         assert_eq!(*source.reads.lock(), vec![span(8, 10), span(5, 7)]);
         assert_eq!(
-            expanded.rows[3].message.as_length_prefixed().as_ptr(),
-            first.rows[0].message.as_length_prefixed().as_ptr()
+            expanded.rows[3].shielded.as_length_prefixed().as_ptr(),
+            first.rows[0].shielded.as_length_prefixed().as_ptr()
+        );
+        assert_eq!(
+            expanded.rows[3].nullifiers.as_length_prefixed().as_ptr(),
+            first.rows[0].nullifiers.as_length_prefixed().as_ptr()
         );
 
-        let single_row_bytes = first.rows[0].message.payload_len();
+        let single_row_bytes = first.rows[0].payload_len();
         let capped = fill(
             &buffer,
             &source,
@@ -1001,8 +1048,10 @@ mod tests {
         assert_eq!(*advanced.reads.lock(), vec![span(402, 501)]);
         assert!(first.rows.iter().all(|old| {
             refilled.rows.iter().all(|new| {
-                old.message.as_length_prefixed().as_ptr()
-                    != new.message.as_length_prefixed().as_ptr()
+                old.shielded.as_length_prefixed().as_ptr()
+                    != new.shielded.as_length_prefixed().as_ptr()
+                    && old.nullifiers.as_length_prefixed().as_ptr()
+                        != new.nullifiers.as_length_prefixed().as_ptr()
             })
         }));
 
@@ -1024,13 +1073,25 @@ mod tests {
         let served = fill(&buffer, &original, span(3, 10), TAIL_BYTES).await?;
         let replacement = fill(&buffer, &other, span(3, 10), TAIL_BYTES).await?;
         assert_eq!(*other.reads.lock(), vec![span(3, 10)]);
-        let shape = CompactBlockShape::for_range(&[])?;
-        let expected = shape.message(other.blocks[6].clone())?.encode_to_vec();
+        let expected = CompactBlockShape::DEFAULT_RANGE
+            .message(other.blocks[6].clone())?
+            .encode_to_vec();
+        let expected_nullifiers = CompactBlockShape::DEFAULT_NULLIFIER_RANGE
+            .message(other.blocks[6].clone())?
+            .encode_to_vec();
         assert_eq!(
-            replacement.rows[3].message.payload().as_ref(),
+            replacement.rows[3].shielded.payload().as_ref(),
             expected.as_slice()
         );
-        assert_ne!(served.rows[3].message, replacement.rows[3].message);
+        assert_eq!(
+            replacement.rows[3].nullifiers.payload().as_ref(),
+            expected_nullifiers.as_slice()
+        );
+        assert_ne!(served.rows[3].shielded, replacement.rows[3].shielded);
+        // The nullifier projection drops chain metadata, and the mock block
+        // carries no shielded transactions, so both branches encode it the
+        // same way; only the shielded frame carries the branch difference.
+        assert_eq!(served.rows[3].nullifiers, replacement.rows[3].nullifiers);
         Ok(())
     }
 
@@ -1695,7 +1756,12 @@ mod tests {
             pool_types: Vec::new(),
         };
         let opened = BlockMethods::default()
-            .published_block_range(reads, &request, (None, ShieldedTailBuffer::default()))
+            .published_block_range(
+                reads,
+                &request,
+                (None, ShieldedTailBuffer::default()),
+                CompactBlockShape::for_range,
+            )
             .await;
         let mut stream = match opened {
             Ok(stream) => stream,
@@ -1752,6 +1818,7 @@ mod tests {
                     &without_tail,
                     &request,
                     (None, ShieldedTailBuffer::default()),
+                    CompactBlockShape::for_range,
                 )
                 .await,
         )
@@ -1763,7 +1830,12 @@ mod tests {
         }
         let primed = with_tail.source.rows_read.load(Ordering::SeqCst);
         let opened = methods
-            .published_block_range(&with_tail, &request, (None, buffer.clone()))
+            .published_block_range(
+                &with_tail,
+                &request,
+                (None, buffer.clone()),
+                CompactBlockShape::for_range,
+            )
             .await;
         let before_response = with_tail.source.rows_read.load(Ordering::SeqCst) - primed;
         assert_eq!(drain(opened).await, native);
