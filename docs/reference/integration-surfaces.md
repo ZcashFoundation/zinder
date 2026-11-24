@@ -46,7 +46,7 @@ The Zcash Foundation runs these public endpoints, which any client can use:
 
 Each address is a gRPC endpoint over TLS, not a website. Give it to a gRPC client, such as a wallet, `grpcurl`, or `zinder-client`. A browser that opens it gets an empty 404 response.
 
-On the Mainnet endpoints, wallets that share one public IP address share a bandwidth limit.
+On the Foundation's Mainnet endpoints, wallets behind one public IPv4 address share bandwidth. The lightwalletd gateway also limits how quickly it accepts new calls. If it rejects a read during a burst, it returns the gRPC status `UNAVAILABLE` (14). Honor the delay in `grpc-retry-pushback-ms` when the response includes it. Otherwise, retry the read with exponential backoff.
 
 ## What every client must handle
 
