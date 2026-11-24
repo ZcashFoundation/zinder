@@ -1,0 +1,6 @@
+kind: fixed
+body: A lean wallet lookup that misses the canonical store now verifies the forwarding node against the served tip before it consults the live mempool or reports the transaction absent, in lightwalletd GetTransaction and the native transaction lookup. An unreachable or skewed node returns UNAVAILABLE. Tip checks in block-range requests no longer keep a replaced serving generation alive, and transaction broadcast, fee, and shielded-history refresh release their serving pair before waiting on the node or a file.
+time: 2026-11-24T10:30:00.000000000Z
+custom:
+    Bump: patch
+    PR: "544"
