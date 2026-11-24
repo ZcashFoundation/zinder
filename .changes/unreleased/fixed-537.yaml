@@ -1,0 +1,6 @@
+kind: fixed
+body: A public gRPC listener that trusts the x-zinder-client-address header now accepts a bare IP address, such as the {client_ip_address} value a GCP Global External Application Load Balancer sends, and counts every connection from that address as one client in the receive limit. An ip:port header still keys each connection apart, so wallets behind a shared Tor exit stay separate. Block-range streams also send larger HTTP/2 frames and buffers, and the native client advertises a larger adaptive receive window, so a 90 ms WAN round trip is no longer capped near the 65,535-byte window default.
+time: 2026-11-24T06:48:05.096528303Z
+custom:
+    Bump: patch
+    PR: "537"
