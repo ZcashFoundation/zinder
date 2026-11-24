@@ -231,14 +231,23 @@ This guarantee depends on these settings:
 
 - Caddy sets `X-Zinder-Client-Address` to `{http.request.remote}` on every
   forwarded call, replacing any value the client sent. Zinder reads the
-  header only when a request carries it once, as one IP address and port,
-  such as `203.0.113.7:51234` or `[2001:db8::7]:51234`. It counts a request
-  against Caddy's own connection when the header is missing, appears more
-  than once, holds a comma-separated list, or holds anything else.
-  `zinder_grpc_proxy_client_address_fallbacks_total` counts these requests by
-  reason, and stays at zero behind this template. A local supervisor's
-  headerless `grpc.health.v1.Health/Check` uses its loopback connection for
-  the receive limit and leaves the counter unchanged.
+  header only when a request carries it once, as one `ip:port` address or one
+  bare IP address, such as `203.0.113.7:51234`, `[2001:db8::7]:51234`, or
+  `203.0.113.7`. It counts a request against Caddy's own connection when the
+  header is missing, appears more than once, holds a comma-separated list, or
+  holds anything that is neither. `zinder_grpc_proxy_client_address_fallbacks_total`
+  counts these requests by reason, and stays at zero behind this template. A
+  local supervisor's headerless `grpc.health.v1.Health/Check` uses its
+  loopback connection for the receive limit and leaves the counter unchanged.
+- A proxy that names the client as an `ip:port` keeps Zinder keying the
+  connection, so two wallets behind one address stay apart. A proxy that
+  names only a bare IP, as GCP Global External Application Load Balancer does
+  with `x-zinder-client-address: {client_ip_address}`, has no port to key, so
+  Zinder groups every connection from that IP as one client. Set the custom
+  header's replace semantics to `true` so the load balancer overwrites any
+  value the client sent; if it appends instead, Zinder refuses the value with
+  the `repeated` reason and counts the request against the proxy's own
+  connection.
 - Only Caddy can reach the gRPC listener, apart from peers you trust as much
   as Caddy. Zinder reads the header from every connection once the setting is
   on. A peer that reaches the listener without going through Caddy can name
@@ -278,6 +287,8 @@ This guarantee depends on these settings:
   behind Tor share exit addresses. A client that opens many connections still
   counts as many clients, so keep the per-client connection limit described
   in [Add access control and rate limits](#add-access-control-and-rate-limits).
+  The bare-IP proxy header is the one exception: when a proxy names only an
+  IP address, every connection from it counts as one client.
 
 Leave the setting off when wallets connect to Zinder without a proxy. With it
 off, Zinder ignores the header.

@@ -398,20 +398,25 @@ a few pooled connections, so behind one every client looks like the same few.
 Set `query.trust_proxy_client_address`, `compat.trust_proxy_client_address`,
 or `explorer.trust_proxy_client_address` to `true` when the listener is
 reachable only through a proxy that sets the `x-zinder-client-address`
-request header to the client connection's IP address and port. Zinder then
-counts each request against that connection. A request that carries the
-header more than once, as a comma-separated list, or as anything but one IP
-address and port, or that carries none, counts against the proxy's own
-connection instead, and `zinder_grpc_proxy_client_address_fallbacks_total`
-counts it. A loopback `grpc.health.v1.Health/Check` with no header uses its
-own connection for the receive limit and leaves the fallback counter unchanged.
+request header to the client connection's IP address and port, or to a bare
+IP address. Zinder then counts each request against that connection, or
+against that whole address when the header names only a bare IP, as a load
+balancer's `{client_ip_address}` does. A request that carries the header
+more than once, as a comma-separated list, or as anything that is neither one
+`ip:port` address nor one bare IP address, or that carries none, counts
+against the proxy's own connection instead, and
+`zinder_grpc_proxy_client_address_fallbacks_total` counts it. A loopback
+`grpc.health.v1.Health/Check` with no header uses its own connection for the
+receive limit and leaves the fallback counter unchanged.
 With the setting off, the default, Zinder ignores the header.
 [Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit)
 lists the proxy settings this depends on.
 
-These limits count all clients together, and a client that opens many
-connections counts as many clients. Limit connections per client in the
-proxy.
+These limits count all clients together. A client that opens many connections
+counts as many clients when Zinder keys it by connection, as it does for a
+direct connection or an `ip:port` proxy header. When a proxy names only a bare
+IP address, every connection from that address counts as one client. Limit
+connections per client in the proxy.
 
 A response ends once one piece of it has waited 60 seconds to go out. A piece
 waits either for the client's flow-control window to cover everything queued
@@ -448,12 +453,12 @@ byte. If that takes 60 seconds, because the client's socket takes data slowly
 or other busy streams on the connection share it, the stream is reset with
 `CANCEL` and counted in `zinder_grpc_response_send_stalls_total`, even while
 the connection writes enough to meet the 16 KiB rule below. As an
-illustration, assume a stream has its 400 KiB send buffer and one 64 KiB
-piece queued ahead of that byte, about 464 KiB (485 KiB for gRPC-Web text),
-and that HTTP/2 shares the socket evenly among busy streams. Then a socket
-that takes less than about 7.7 KiB/s over 60 seconds resets a stream that is
-alone on its connection, and with n busy streams the socket must take about
-n times that.
+illustration, assume a stream has its 1 MiB send buffer and one 64 KiB
+piece queued ahead of that byte, about 1,088 KiB (about 1,109 KiB for
+gRPC-Web text), and that HTTP/2 shares the socket evenly among busy streams.
+Then a socket that takes less than about 18.1 KiB/s over 60 seconds resets a
+stream that is alone on its connection, and with n busy streams the socket
+must take about n times that.
 
 A client that reads again receives the data that reached it before the
 reset, then the reset. grpc-go, grpc-java, and tonic built with its `server`
@@ -461,19 +466,19 @@ feature report the reset as `CANCELLED`. gRPC Swift on SwiftNIO reports
 `UNAVAILABLE`, and other clients, or a proxy in front of Zinder, may report it
 differently.
 
-While a response is open, the transport holds less than about 592 KiB of
-its payload, or 656 KiB and 8 bytes for a gRPC-Web text response: the
-400 KiB HTTP/2 send buffer, the piece queued past it, the piece waiting for
+While a response is open, the transport holds less than about 1,216 KiB of
+its payload, or 1,280 KiB and 8 bytes for a gRPC-Web text response: the
+1 MiB HTTP/2 send buffer, the piece queued past it, the piece waiting for
 window, and the next piece. These are estimates of transport payload. The
 listener also keeps the response chunk it is splitting into pieces until it
 hands out that chunk's last piece; for `GetBlockRange` that chunk is one
 encoded block, or a batch of smaller ones. A gRPC-Web response's trailers
 add a frame of their own. One connection holds at most 200 responses, about
-116 MiB of transport payload, or 128 MiB in gRPC-Web text mode. A
+237.5 MiB of transport payload, or 250 MiB in gRPC-Web text mode. A
 `GetBlockRange` response on the lightwalletd listener hands HTTP/2 slices of
 its stored blocks instead of copies, so a stalled range stream can keep up to
-about 2,208 KiB of block allocations alive, and one connection about
-431.25 MiB ([lightwalletd compatibility](lightwalletd-compatibility.md)).
+about 3,456 KiB of block allocations alive, and one connection about
+675 MiB ([lightwalletd compatibility](lightwalletd-compatibility.md)).
 That data is held only until the stream's reset.
 
 The server ends a response, or waits for its producer, only once HTTP/2 has
