@@ -111,6 +111,27 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         None
     }
 
+    /// Subscribes to replacements of the serving data this query reads, so a
+    /// caller can wait for a newer visible tip without polling.
+    ///
+    /// The receiver reports a change for every replacement made after this
+    /// call. `None` means the query publishes no replacements, and a caller
+    /// must not wait for one.
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        None
+    }
+
+    /// Returns the visible tip height of the serving data current now,
+    /// without keeping that data readable for epoch pins.
+    ///
+    /// A caller that only compares heights, such as one waiting for a newer
+    /// tip, reads it this way so its checks never retain a replaced
+    /// generation. `None` means the query has no such read, and the caller
+    /// reads the tip through [`Self::visible_tip_block`].
+    fn current_visible_tip_height(&self) -> Option<BlockHeight> {
+        None
+    }
+
     /// Returns the immutable structural capability set derived when this query
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;

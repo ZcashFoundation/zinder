@@ -331,3 +331,15 @@ the wallet store, because a secondary's metadata directory belongs to one
 process. Each also needs its own listen and
 ops addresses. The shipped deployments run one of each. Every reader process
 runs on the host that holds the stores.
+
+Readers publish a new block at slightly different times. Behind a load
+balancer, a wallet can learn the new tip from one reader and ask another for
+that block before it has published it. `zinder-compat-lightwalletd` waits
+briefly for a height just past its tip, so this short skew does not fail the
+request. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#waiting-for-a-height-just-past-the-tip)
+has the details and settings.
+
+The wait covers only short skew. It does not make reads consistent across
+readers. `GetLatestBlock` can still go backwards when two requests reach
+different readers, and `GetTransaction` can still miss a transaction that was
+just mined when the request reaches a reader that has not published its block.

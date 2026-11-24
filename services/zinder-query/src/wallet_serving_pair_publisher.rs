@@ -313,6 +313,17 @@ impl WalletServingPairSlot {
         Arc::clone(&self.published.load().current)
     }
 
+    /// Subscribes to the slot's publications.
+    ///
+    /// The receiver reports a change for every pair published after this
+    /// call, so a caller that subscribes before it reads the current pair
+    /// cannot miss the publication that replaces it. Holding the receiver
+    /// holds no pair.
+    #[must_use]
+    pub fn subscribe_publications(&self) -> watch::Receiver<()> {
+        self.signals.publication.subscribe()
+    }
+
     /// Reports whether `candidate` still names the currently published pair.
     #[must_use]
     pub(crate) fn is_current_weak(&self, candidate: &Weak<WalletServingReadPair>) -> bool {

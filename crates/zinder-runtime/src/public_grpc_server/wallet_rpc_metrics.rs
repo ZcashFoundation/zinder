@@ -22,6 +22,7 @@ use zinder_proto::{
 };
 
 use super::MessageBoundaries;
+use super::grpc_timeout::DeadlineExpiry;
 
 const REQUESTS: &str = "zinder_wallet_rpc_requests_total";
 const READINESS_REFUSALS: &str = "zinder_wallet_rpc_readiness_refusals_total";
@@ -217,6 +218,7 @@ where
         };
         request.extensions_mut().insert(method);
         let mut rpc = ObservedRpc::start(method, shape);
+        rpc.deadline = request.extensions().get::<DeadlineExpiry>().cloned();
         let request = if shape == RpcShape::Upload {
             request.map(|body| {
                 Body::new(ObservedUpload {
@@ -328,6 +330,10 @@ struct ObservedRpc {
     stream_opened: Option<Instant>,
     range_messages: f64,
     outcome: Outcome,
+    /// Set when the client's `grpc-timeout` bounds the call, so a call the
+    /// deadline abandoned records `DEADLINE_EXCEEDED`, the status the client
+    /// receives, instead of the default cancellation.
+    deadline: Option<DeadlineExpiry>,
 }
 
 impl ObservedRpc {
@@ -341,6 +347,7 @@ impl ObservedRpc {
             stream_opened: None,
             range_messages: 0.0,
             outcome: Outcome::plain(Code::Cancelled),
+            deadline: None,
         }
     }
 
@@ -377,6 +384,11 @@ impl ObservedRpc {
 
 impl Drop for ObservedRpc {
     fn drop(&mut self) {
+        if self.outcome.code == Code::Cancelled
+            && self.deadline.as_ref().is_some_and(DeadlineExpiry::expired)
+        {
+            self.outcome = Outcome::plain(Code::DeadlineExceeded);
+        }
         let labels = [
             ("surface", self.method.surface),
             ("method", self.method.name),

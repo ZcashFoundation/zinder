@@ -854,6 +854,10 @@ impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<NodeBackedLight
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.query_api.slot, "get_encoded_block_range", &request)
+            .await?;
         let range = self.published_history.as_ref().map_or_else(
             || (None, self.live_tail.clone()),
             |history| history.encoded_range(),
@@ -861,7 +865,7 @@ impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<NodeBackedLight
         self.block_methods
             .published_block_range(
                 &self.query_api.slot,
-                &request.into_inner(),
+                &request,
                 range,
                 CompactBlockShape::for_range,
             )
@@ -876,6 +880,14 @@ impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<NodeB
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(
+                &self.query_api.slot,
+                "get_encoded_block_range_nullifiers",
+                &request,
+            )
+            .await?;
         let range = self.published_history.as_ref().map_or_else(
             || (None, self.live_tail.clone()),
             |history| history.encoded_range(),
@@ -883,7 +895,7 @@ impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<NodeB
         self.block_methods
             .published_block_range(
                 &self.query_api.slot,
-                &request.into_inner(),
+                &request,
                 range,
                 CompactBlockShape::for_nullifier_range,
             )
@@ -920,9 +932,13 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
+        let block_id = request.into_inner();
+        self.block_methods
+            .await_block_tip(&self.query_api.slot, "get_block", &block_id)
+            .await?;
         block_methods::compact_block(
             &self.query_api.slot,
-            &request.into_inner(),
+            &block_id,
             CompactBlockShape::FULL_BLOCK,
         )
         .await
@@ -933,9 +949,13 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
+        let block_id = request.into_inner();
+        self.block_methods
+            .await_block_tip(&self.query_api.slot, "get_block_nullifiers", &block_id)
+            .await?;
         block_methods::compact_block(
             &self.query_api.slot,
-            &request.into_inner(),
+            &block_id,
             CompactBlockShape::BLOCK_NULLIFIERS,
         )
         .await
@@ -950,6 +970,9 @@ impl compact_tx_streamer_server::CompactTxStreamer
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let request = request.into_inner();
         self.block_methods
+            .await_range_tip(&self.query_api.slot, "get_block_range", &request)
+            .await?;
+        self.block_methods
             .block_range(&self.query_api.slot, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
@@ -962,6 +985,9 @@ impl compact_tx_streamer_server::CompactTxStreamer
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
         let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.query_api.slot, "get_block_range_nullifiers", &request)
+            .await?;
         self.block_methods
             .block_range(
                 &self.query_api.slot,
@@ -1063,8 +1089,13 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
-        let reader = self.query_api.slot.capture();
         let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
+        if let RequestedBlock::Height(height) = block {
+            self.block_methods
+                .await_tip(&self.query_api.slot, "get_tree_state", height)
+                .await?;
+        }
+        let reader = self.query_api.slot.capture();
         reject_genesis_tree_state(block, reader.network())?;
         let height = match block {
             RequestedBlock::Height(height) => height,

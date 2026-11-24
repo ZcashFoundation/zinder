@@ -13,8 +13,9 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 use url::Url;
 use zinder_compat_lightwalletd::{
-    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, DEFAULT_STALE_TIP_LIMIT,
-    LightwalletdAdmissionError, StaleTipLimit,
+    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, DEFAULT_STALE_TIP_LIMIT, DEFAULT_TIP_WAIT,
+    DEFAULT_TIP_WAIT_MAX_BLOCKS, DEFAULT_TIP_WAIT_MAX_WAITERS, LightwalletdAdmissionError,
+    StaleTipLimit,
 };
 use zinder_core::Network;
 use zinder_query::{
@@ -95,6 +96,14 @@ pub(crate) struct LightwalletdConfig {
     /// How old the served tip may be before `GetLatestBlock` and
     /// `GetLightdInfo` fail with `UNAVAILABLE`.
     pub(crate) stale_tip_limit: StaleTipLimit,
+    /// Longest a height-selected block read waits for a height just past the
+    /// visible tip. Zero disables the wait.
+    pub(crate) tip_wait: Duration,
+    /// Furthest past the visible tip, in blocks, a read may name and still
+    /// wait.
+    pub(crate) tip_wait_max_blocks: NonZeroU32,
+    /// Most reads that wait for the tip at once.
+    pub(crate) tip_wait_max_waiters: NonZeroU32,
     /// Whether `Ping` answers, as `lightwalletd --ping-very-insecure` does.
     pub(crate) ping_very_insecure: bool,
     pub(crate) broadcaster: Option<NodeTarget>,
@@ -345,6 +354,9 @@ struct CompatSection {
     tree_state_replay_wait_ms: Option<u64>,
     tree_state_replay_waiters_per_slot: Option<u32>,
     stale_tip_limit_ms: Option<u64>,
+    tip_wait_ms: Option<u64>,
+    tip_wait_max_blocks: Option<u32>,
+    tip_wait_max_waiters: Option<u32>,
     ping_very_insecure: Option<bool>,
     serving: Option<CompatServing>,
     trust_proxy_client_address: Option<bool>,
@@ -487,6 +499,8 @@ fn resolve_lightwalletd_config(
         resolve_wallet_storage(serving, wallet.unwrap_or_default(), &storage)?;
     let (tree_state_replay_wait, tree_state_replay_waiters_per_slot) =
         resolve_tree_state_replay(serving, &config.compat)?;
+    let (tip_wait, tip_wait_max_blocks, tip_wait_max_waiters) =
+        resolve_tip_wait(&config.compat, storage.secondary_catchup_interval)?;
     let ResolvedIngestControlReader {
         addr: ingest_control_addr,
         bearer_token_path: ingest_control_bearer_token_path,
@@ -540,6 +554,9 @@ fn resolve_lightwalletd_config(
         tree_state_replay_wait,
         tree_state_replay_waiters_per_slot,
         stale_tip_limit,
+        tip_wait,
+        tip_wait_max_blocks,
+        tip_wait_max_waiters,
         ping_very_insecure: config.compat.ping_very_insecure.unwrap_or(false),
         broadcaster,
         node_fallbacks,
@@ -708,6 +725,9 @@ impl LightwalletdConfigToml {
                 stale_tip_limit_ms: config.stale_tip_limit.limit().map_or(0, |limit| {
                     u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
                 }),
+                tip_wait_ms: u64::try_from(config.tip_wait.as_millis()).unwrap_or(u64::MAX),
+                tip_wait_max_blocks: config.tip_wait_max_blocks.get(),
+                tip_wait_max_waiters: config.tip_wait_max_waiters.get(),
                 ping_very_insecure: config.ping_very_insecure,
                 serving: config.profile.is_none().then_some(config.serving),
                 trust_proxy_client_address: config
@@ -734,6 +754,9 @@ struct CompatToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     tree_state_replay_waiters_per_slot: Option<u32>,
     stale_tip_limit_ms: u64,
+    tip_wait_ms: u64,
+    tip_wait_max_blocks: u32,
+    tip_wait_max_waiters: u32,
     ping_very_insecure: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     serving: Option<CompatServing>,
@@ -869,6 +892,37 @@ fn resolve_stale_tip_limit(configured_ms: Option<u64>) -> Result<StaleTipLimit, 
             Ok(StaleTipLimit::after(limit))
         }
     }
+}
+
+/// Resolves the tip wait, its block distance, and its waiter cap.
+///
+/// Every serving mode shares them. A nonzero wait must span two catch-up
+/// intervals, because a shorter one cannot reliably see the next publication.
+fn resolve_tip_wait(
+    compat: &CompatSection,
+    catchup_interval: Duration,
+) -> Result<(Duration, NonZeroU32, NonZeroU32), ConfigError> {
+    let tip_wait = compat
+        .tip_wait_ms
+        .map_or(DEFAULT_TIP_WAIT, Duration::from_millis);
+    if !tip_wait.is_zero() && tip_wait < catchup_interval.saturating_mul(2) {
+        return Err(ConfigError::invalid(format!(
+            "compat.tip_wait_ms must be 0 or at least twice storage.secondary_catchup_interval_ms ({}), because a shorter wait cannot reliably see the next publication",
+            catchup_interval.saturating_mul(2).as_millis()
+        )));
+    }
+    let max_blocks = match compat.tip_wait_max_blocks {
+        None => DEFAULT_TIP_WAIT_MAX_BLOCKS,
+        Some(configured) => NonZeroU32::new(configured)
+            .ok_or_else(|| ConfigError::invalid("compat.tip_wait_max_blocks must be at least 1"))?,
+    };
+    let max_waiters = match compat.tip_wait_max_waiters {
+        None => DEFAULT_TIP_WAIT_MAX_WAITERS,
+        Some(configured) => NonZeroU32::new(configured).ok_or_else(|| {
+            ConfigError::invalid("compat.tip_wait_max_waiters must be at least 1")
+        })?,
+    };
+    Ok((tip_wait, max_blocks, max_waiters))
 }
 
 fn require_distinct_storage_paths(

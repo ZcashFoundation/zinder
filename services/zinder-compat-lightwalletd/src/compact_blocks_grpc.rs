@@ -5,6 +5,7 @@
 use std::{num::NonZeroU32, sync::Arc, time::Duration, time::Instant};
 
 use arc_swap::ArcSwap;
+use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 use zinder_core::{ChainEpoch, CompactBlockArtifact, NetworkUpgradeActivations};
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
@@ -25,6 +26,7 @@ use crate::node_tip_witness::NodeTipWitness;
 use crate::ping::LightwalletdPing;
 use crate::request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
 use crate::stale_tip::StaleTipLimit;
+use crate::tip_wait::TipWait;
 
 /// The canonical reader compact-blocks serving answers from, which its owner
 /// replaces with the reader of each newer generation.
@@ -38,6 +40,8 @@ use crate::stale_tip::StaleTipLimit;
 #[derive(Clone)]
 pub struct CanonicalReaderSlot {
     current: Arc<ArcSwap<RocksDbCanonicalReader>>,
+    /// Changes on every publication, so a read can wait for a newer reader.
+    publication: Arc<watch::Sender<()>>,
 }
 
 impl CanonicalReaderSlot {
@@ -46,6 +50,7 @@ impl CanonicalReaderSlot {
     pub fn new(reader: Arc<RocksDbCanonicalReader>) -> Self {
         Self {
             current: Arc::new(ArcSwap::from(reader)),
+            publication: Arc::new(watch::Sender::new(())),
         }
     }
 
@@ -59,7 +64,9 @@ impl CanonicalReaderSlot {
     /// requests that captured it may still hold.
     #[must_use]
     pub fn publish(&self, reader: Arc<RocksDbCanonicalReader>) -> Arc<RocksDbCanonicalReader> {
-        self.current.swap(reader)
+        let replaced = self.current.swap(reader);
+        self.publication.send_replace(());
+        replaced
     }
 }
 
@@ -72,6 +79,10 @@ impl CompactBlockReads for CanonicalReaderSlot {
         &self,
     ) -> impl Future<Output = Result<Arc<RocksDbCanonicalReader>, Status>> + Send {
         std::future::ready(Ok(self.capture()))
+    }
+
+    fn subscribe_publications(&self) -> Option<watch::Receiver<()>> {
+        Some(self.publication.subscribe())
     }
 
     fn range_fence(
@@ -333,6 +344,20 @@ impl CompactBlocksGrpcAdapter {
         self
     }
 
+    /// Lets a block read that names a height just past the visible tip wait
+    /// briefly for that height instead of failing at once.
+    ///
+    /// Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`,
+    /// `GetBlockRangeNullifiers`, the encoded range methods, and, where this
+    /// adapter serves it, `GetTreeState`, when they select by height. The
+    /// adapter defaults to [`TipWait::disabled`]; the
+    /// `zinder-compat-lightwalletd` binary sets the configured wait.
+    #[must_use]
+    pub fn with_tip_wait(mut self, tip_wait: TipWait) -> Self {
+        self.block_methods = self.block_methods.with_tip_wait(tip_wait);
+        self
+    }
+
     /// Sets how this adapter answers `Ping`. The default refuses it with
     /// `FAILED_PRECONDITION`, as lightwalletd does without
     /// `--ping-very-insecure`.
@@ -368,17 +393,16 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.slot, "get_encoded_block_range", &request)
+            .await?;
         let range = self.published_history.as_ref().map_or_else(
             || (None, self.live_tail.clone()),
             |history| history.encoded_range(),
         );
         self.block_methods
-            .published_block_range(
-                &self.slot,
-                &request.into_inner(),
-                range,
-                CompactBlockShape::for_range,
-            )
+            .published_block_range(&self.slot, &request, range, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }
@@ -423,13 +447,13 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter 
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        block_methods::compact_block(
-            &self.slot,
-            &request.into_inner(),
-            CompactBlockShape::FULL_BLOCK,
-        )
-        .await
-        .map(Response::new)
+        let block_id = request.into_inner();
+        self.block_methods
+            .await_block_tip(&self.slot, "get_block", &block_id)
+            .await?;
+        block_methods::compact_block(&self.slot, &block_id, CompactBlockShape::FULL_BLOCK)
+            .await
+            .map(Response::new)
     }
 
     async fn get_block_range(
@@ -437,6 +461,9 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlocksGrpcAdapter 
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.slot, "get_block_range", &request)
+            .await?;
         self.block_methods
             .block_range(&self.slot, &request, CompactBlockShape::for_range)
             .await

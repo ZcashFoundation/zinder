@@ -755,6 +755,190 @@ fn stale_tip_limit_defaults_to_25_minutes_and_is_bounded() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Prints the effective configuration with the given environment settings.
+fn print_config_with_env(
+    config_path: &Path,
+    settings: &[(&str, &str)],
+) -> eyre::Result<std::process::Output> {
+    let mut command = zinder_compat_command();
+    command.args(["--print-config", "--config", path_str(config_path)?]);
+    command.envs(settings.iter().copied());
+    Ok(command.output()?)
+}
+
+/// The tip wait defaults to 3000 ms, 2 blocks, and 256 waiters, and 0 turns
+/// the wait off.
+#[test]
+fn tip_wait_defaults_to_three_seconds_two_blocks_and_256_waiters() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-tip-wait-store"),
+            &tempdir.path().join("compat-tip-wait-secondary"),
+            &tempdir.path().join("compat-tip-wait-wallet"),
+        )?,
+    )?;
+
+    let defaults = print_config_with_env(&config_path, &[])?;
+    assert!(defaults.status.success(), "{defaults:?}");
+    let stdout = String::from_utf8(defaults.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 3000"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_blocks = 2"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_waiters = 256"), "{stdout}");
+
+    let disabled = print_config_with_env(&config_path, &[("ZINDER_COMPAT__TIP_WAIT_MS", "0")])?;
+    assert!(disabled.status.success(), "{disabled:?}");
+    let stdout = String::from_utf8(disabled.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 0"), "{stdout}");
+
+    let raised = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "60000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS", "1000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS", "4096"),
+        ],
+    )?;
+    assert!(raised.status.success(), "{raised:?}");
+    let stdout = String::from_utf8(raised.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 60000"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_blocks = 1000"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_waiters = 4096"), "{stdout}");
+    Ok(())
+}
+
+/// A nonzero tip wait must span two catch-up intervals, because a shorter
+/// wait cannot reliably see the next publication.
+#[test]
+fn tip_wait_shorter_than_two_catchup_intervals_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-tip-wait-short-store"),
+            &tempdir.path().join("compat-tip-wait-short-secondary"),
+            &tempdir.path().join("compat-tip-wait-short-wallet"),
+        )?,
+    )?;
+
+    let too_short = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS", "1000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "1999"),
+        ],
+    )?;
+    assert!(!too_short.status.success(), "{too_short:?}");
+    let stderr = String::from_utf8(too_short.stderr)?;
+    assert!(
+        stderr.contains("compat.tip_wait_ms must be 0 or at least twice")
+            && stderr.contains("storage.secondary_catchup_interval_ms (2000)"),
+        "{stderr}"
+    );
+
+    let boundary = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS", "1000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "2000"),
+        ],
+    )?;
+    assert!(boundary.status.success(), "{boundary:?}");
+
+    let slow_catchup = print_config_with_env(
+        &config_path,
+        &[("ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS", "2000")],
+    )?;
+    assert!(!slow_catchup.status.success(), "{slow_catchup:?}");
+    let stderr = String::from_utf8(slow_catchup.stderr)?;
+    assert!(
+        stderr.contains("storage.secondary_catchup_interval_ms (4000)"),
+        "{stderr}"
+    );
+
+    let disabled_with_slow_catchup = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS", "2000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "0"),
+        ],
+    )?;
+    assert!(
+        disabled_with_slow_catchup.status.success(),
+        "{disabled_with_slow_catchup:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tip_wait_blocks_and_waiters_of_zero_are_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-tip-wait-zero-store"),
+            &tempdir.path().join("compat-tip-wait-zero-secondary"),
+            &tempdir.path().join("compat-tip-wait-zero-wallet"),
+        )?,
+    )?;
+
+    for (variable, message) in [
+        (
+            "ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS",
+            "compat.tip_wait_max_blocks must be at least 1",
+        ),
+        (
+            "ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS",
+            "compat.tip_wait_max_waiters must be at least 1",
+        ),
+    ] {
+        let output = print_config_with_env(&config_path, &[(variable, "0")])?;
+        assert!(!output.status.success(), "{variable}: {output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains(message), "{variable}: {stderr}");
+    }
+    Ok(())
+}
+
+/// Every serving mode answers height-selected block reads, so compact-block
+/// serving accepts and renders the tip wait settings.
+#[test]
+fn compact_blocks_accepts_the_tip_wait() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let config_path = temporary.path().join("compact-blocks.toml");
+    fs::write(
+        &config_path,
+        compact_blocks_config_toml(
+            &temporary.path().join("compact-blocks-tip-wait-store"),
+            &temporary.path().join("compact-blocks-tip-wait-secondary"),
+        )?,
+    )?;
+
+    let defaults = print_config_with_env(&config_path, &[])?;
+    assert!(defaults.status.success(), "{defaults:?}");
+    let stdout = String::from_utf8(defaults.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 3000"), "{stdout}");
+
+    let configured = print_config_with_env(
+        &config_path,
+        &[
+            ("ZINDER_COMPAT__TIP_WAIT_MS", "5000"),
+            ("ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS", "3"),
+            ("ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS", "8"),
+        ],
+    )?;
+    assert!(configured.status.success(), "{configured:?}");
+    let stdout = String::from_utf8(configured.stdout)?;
+    assert!(stdout.contains("tip_wait_ms = 5000"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_blocks = 3"), "{stdout}");
+    assert!(stdout.contains("tip_wait_max_waiters = 8"), "{stdout}");
+    Ok(())
+}
+
 #[test]
 fn block_range_stream_limit_outside_its_range_is_rejected() -> eyre::Result<()> {
     for configured_streams in ["0", "65537"] {

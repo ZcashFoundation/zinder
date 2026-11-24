@@ -5,6 +5,7 @@
 
 mod browser_streams;
 mod published_range;
+mod tip_wait;
 
 use async_trait::async_trait;
 use eyre::eyre;

@@ -735,6 +735,19 @@ where
         })
     }
 
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        Some(self.serving_pair_slot.subscribe_publications())
+    }
+
+    fn current_visible_tip_height(&self) -> Option<BlockHeight> {
+        Some(
+            self.serving_pair_slot
+                .capture_ephemeral()
+                .chain_epoch()
+                .visible_tip_height,
+        )
+    }
+
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
         &self.native_endpoint_capabilities
     }
@@ -2317,6 +2330,55 @@ mod tree_state_replay_limit_tests {
         drop(held_slot);
 
         assert_eq!(waiting.await??.height, reconstructed);
+        Ok(())
+    }
+
+    /// A subscription wakes on the publication that replaces the pair it saw.
+    ///
+    /// Neither the subscription nor the unpinned tip read marks a pair
+    /// observed, so publication releases the replaced pair at once instead of
+    /// retaining it for epoch pins.
+    #[tokio::test]
+    async fn a_publication_subscription_wakes_on_the_next_publication() -> Result<(), Box<dyn Error>>
+    {
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let activations = sample_regtest_upgrade_activations();
+        let mut original = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let mut updated =
+            WalletServingStoreFixture::from_chain(&chain.extend_blocks(1), &activations)?;
+        let read_pair = |store: &mut WalletServingStoreFixture| -> Result<_, Box<dyn Error>> {
+            let (canonical, wallet) = store.take_readers()?;
+            Ok(Arc::new(WalletServingReadPair::new(
+                Arc::new(RocksDbCanonicalReader::new(canonical)?),
+                Arc::new(RocksDbWalletReader::new(wallet)),
+            )?))
+        };
+        let first_pair = read_pair(&mut original)?;
+        let first_tip = first_pair.chain_epoch().visible_tip_height;
+        let replaced = Arc::downgrade(&first_pair);
+        let slot = WalletServingPairSlot::new(first_pair);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        let mut publications = query
+            .subscribe_publications()
+            .ok_or("a slot-backed query publishes replacements")?;
+        let seen = query
+            .current_visible_tip_height()
+            .ok_or("a slot-backed query reads its tip unpinned")?;
+        assert_eq!(seen, first_tip);
+        assert!(!slot.capture_ephemeral().is_observed_for_epoch_pin());
+        assert!(!publications.has_changed()?);
+
+        slot.publish_for_test(read_pair(&mut updated)?);
+        tokio::time::timeout(Duration::from_secs(1), publications.changed()).await??;
+        assert!(
+            replaced.upgrade().is_none(),
+            "the replaced pair was retained for epoch pins"
+        );
+        let advanced = query
+            .current_visible_tip_height()
+            .ok_or("a slot-backed query reads its tip unpinned")?;
+        assert_eq!(advanced.value(), seen.value() + 1);
+        assert!(!slot.capture_ephemeral().is_observed_for_epoch_pin());
         Ok(())
     }
 
