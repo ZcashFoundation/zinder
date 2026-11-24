@@ -1,9 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use ring::{
-    rand::SystemRandom,
-    signature::{Ed25519KeyPair, KeyPair},
-};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -249,13 +246,16 @@ async fn local_and_http_snapshot_bootstrap_can_append() -> TestResult {
 
 fn signed_bundle(root: &Path, validator: &Validator) -> TestResult<(PathBuf, [[u8; 32]; 1])> {
     let mut canonical = validator.publish(&root.join("publisher"))?;
-    let signing_key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-        .map_err(|_| "key generation failed")?;
-    let signer =
-        Ed25519KeyPair::from_pkcs8(signing_key.as_ref()).map_err(|_| "key parsing failed")?;
+    // PKCS#8 v1 seed-only DER, as exported by OpenSSL.
+    let mut signing_key = vec![
+        0x30, 0x2e, 0x02, 0x01, 0, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+    ];
+    signing_key.extend([42; 32]);
+    let signer = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&signing_key)
+        .map_err(|_| "key parsing failed")?;
     let keys = [signer.public_key().as_ref().try_into()?];
     let bundle = root.join("bundle");
-    export_edge_snapshot(&mut canonical, &bundle, signing_key.as_ref(), None)?;
+    export_edge_snapshot(&mut canonical, &bundle, &signing_key, None)?;
     Ok((bundle, keys))
 }
 

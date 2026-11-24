@@ -510,7 +510,9 @@ pub fn export_edge_snapshot(
     signing_key: &[u8],
     sealed_history: Option<&Path>,
 ) -> Result<(), EdgeSnapshotError> {
-    let key = Ed25519KeyPair::from_pkcs8(signing_key)
+    // PKCS#8 v1 carries only the seed. Ring derives its public key and
+    // checks the embedded public key when the publisher supplies v2.
+    let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(signing_key)
         .map_err(|_| refused("invalid Ed25519 PKCS#8 signing key"))?;
     let anchors = EdgeSnapshotAttestation::read(store)?.manifest_anchors(store)?;
     let work = Workspace::new(output, ".export.staging")?;
