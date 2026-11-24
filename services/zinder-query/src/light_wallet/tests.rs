@@ -7,7 +7,7 @@ use zinder_core::{BlockHeight, Network};
 use zinder_source::{NodeAuth, ZebraJsonRpcSource};
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
-use super::{QualificationWalletQuery, TreeStateReplayLimit};
+use super::{LightWalletNodeQuery, TreeStateReplayLimit};
 use crate::{CanonicalReader as _, QueryError, RocksDbCanonicalReader};
 
 fn reader(
@@ -20,9 +20,9 @@ fn reader(
     Ok((store, reader))
 }
 
-fn query(slot: &Arc<ArcSwap<RocksDbCanonicalReader>>) -> Result<QualificationWalletQuery> {
+fn query(slot: &Arc<ArcSwap<RocksDbCanonicalReader>>) -> Result<LightWalletNodeQuery> {
     let capture = Arc::clone(slot);
-    Ok(QualificationWalletQuery::new(
+    Ok(LightWalletNodeQuery::new(
         move || capture.load_full(),
         ZebraJsonRpcSource::new(
             Network::ZcashRegtest,
@@ -255,8 +255,8 @@ async fn node_admission_checks_the_reader_the_request_captured() -> Result<()> {
     };
     let (_captured_store, captured) = open(&chain)?;
     let (_sibling_store, published) = open(&sibling)?;
-    let request_target = super::QualificationNodeTarget::of(&captured)?;
-    let published_target = super::QualificationNodeTarget::of(&published)?;
+    let request_target = super::VerifiedNodeTarget::of(&captured)?;
+    let published_target = super::VerifiedNodeTarget::of(&published)?;
     // The reader the request captured is replaced by a sibling, and the node
     // follows the sibling.
     let slot = Arc::new(ArcSwap::from(Arc::clone(&published)));
@@ -267,7 +267,7 @@ async fn node_admission_checks_the_reader_the_request_captured() -> Result<()> {
         .hash;
     let node = node_holding(&schedule, tip)?;
     let capture = Arc::clone(&slot);
-    let query = QualificationWalletQuery::new(
+    let query = LightWalletNodeQuery::new(
         move || capture.load_full(),
         ZebraJsonRpcSource::new(
             Network::ZcashRegtest,

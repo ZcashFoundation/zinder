@@ -230,6 +230,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         ingest_control.clone(),
     )
     .with_node_broadcast(node_broadcast.clone())
+    .with_verified_cold_transactions()
     .with_tree_state_replay_wait(query_config.tree_state_replay_wait)
     .with_tree_state_replay_waiters_per_slot(query_config.tree_state_replay_waiters_per_slot);
     let endpoint_metadata = WalletEndpointMetadata {

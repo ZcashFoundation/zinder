@@ -1011,7 +1011,7 @@ fn node_observation_cause(
     }
 }
 
-impl crate::QualificationWalletQuery {
+impl crate::LightWalletNodeQuery {
     /// Probes this endpoint's forwarding admission and health for the node-source dependency.
     #[must_use]
     pub fn spawn_node_readiness_probe(

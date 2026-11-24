@@ -86,7 +86,7 @@ pub const WALLET_READ_TRANSACTION_BY_ID_V2: &str = "wallet.read.transaction_by_i
 ///
 /// A composition may advertise this only together with
 /// [`WALLET_READ_TRANSACTION_BY_ID_V2`] and when its admitted store retains
-/// transaction blobs (ingest `raw_blob_policy` in `{transactions, all}`).
+/// transaction blobs or the query has a verified node byte source.
 /// When absent the field is `None`; clients branch on presence rather than
 /// empty-vs-populated bytes.
 pub const WALLET_READ_TRANSACTION_BYTES_V1: &str = "wallet.read.transaction_bytes_v1";

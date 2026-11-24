@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use zinder_core::CanonicalHistoryBounds;
 use zinder_store::{
-    CanonicalStoreRequirements, CanonicalStoreWorkload, CanonicalStoredSet, RawBlobRetention,
+    CanonicalStoreRequirements, CanonicalStoreWorkload, CanonicalStoredData, CanonicalStoredSet,
+    RawBlobRetention,
 };
 
 /// Selects a coordinated deployment configuration across runtimes.
@@ -13,31 +14,94 @@ use zinder_store::{
 pub enum DeploymentProfile {
     /// Canonical wallet history with node-backed reads and no wallet projection.
     LightWallet,
+    /// Native and compatibility wallet serving over a local wallet projection
+    /// without raw transaction blobs; mined transaction bytes are fetched from
+    /// a verified upstream node on demand.
+    Wallet,
+    /// Native and compatibility wallet serving over a local wallet projection
+    /// with retained raw transaction blobs.
+    WalletArchive,
+    /// Full Explorer stack with block and transaction blobs and Explorer views.
+    Explorer,
 }
 
 impl DeploymentProfile {
-    /// Returns the retained data policy the canonical writer builds under this profile.
+    /// Returns the persisted configuration spelling of this profile.
     #[must_use]
-    pub const fn canonical_stored_set(self) -> CanonicalStoredSet {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::LightWallet => CanonicalStoredSet::for_history(
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::None,
-                CanonicalHistoryBounds::complete(),
-            ),
+            Self::LightWallet => "light-wallet",
+            Self::Wallet => "wallet",
+            Self::WalletArchive => "wallet-archive",
+            Self::Explorer => "explorer",
         }
     }
 
-    /// Returns the minimum canonical data a serving reader requires under this profile.
+    /// Returns the retained data policy the canonical writer builds under this profile.
+    #[must_use]
+    pub const fn canonical_stored_set(self) -> CanonicalStoredSet {
+        CanonicalStoredSet::for_history(
+            self.workload(),
+            self.raw_blob_retention(),
+            CanonicalHistoryBounds::complete(),
+        )
+    }
+
+    /// Returns the canonical workload the writer builds under this profile.
+    #[must_use]
+    pub const fn workload(self) -> CanonicalStoreWorkload {
+        match self {
+            Self::LightWallet | Self::Wallet | Self::WalletArchive => {
+                CanonicalStoreWorkload::Wallet
+            }
+            Self::Explorer => CanonicalStoreWorkload::Explorer,
+        }
+    }
+
+    /// Returns the raw-blob retention the writer stores under this profile.
+    #[must_use]
+    pub const fn raw_blob_retention(self) -> RawBlobRetention {
+        match self {
+            Self::LightWallet | Self::Wallet => RawBlobRetention::None,
+            Self::WalletArchive | Self::Explorer => RawBlobRetention::All,
+        }
+    }
+
+    /// Resolves retention and checks an explicitly configured value for agreement.
     ///
-    /// Light-wallet serving checks forwarded reads against canonical history from height
-    /// one and serves completed subtree roots from index zero.
+    /// # Errors
+    ///
+    /// Returns a configuration error when the requested retention conflicts.
+    pub fn resolve_raw_blob_retention(
+        self,
+        configured: Option<RawBlobRetention>,
+    ) -> Result<RawBlobRetention, crate::ConfigError> {
+        let retention = self.raw_blob_retention();
+        if configured.is_some_and(|policy| policy != retention) {
+            return Err(crate::ConfigError::invalid(format!(
+                "deployment.profile = \"{}\" requires storage.raw_blob_policy = \"{}\"",
+                self.as_str(),
+                retention.as_kebab_case(),
+            )));
+        }
+        Ok(retention)
+    }
+
+    /// Returns the minimum canonical coverage for this profile's stored set.
     #[must_use]
     pub fn canonical_requirement(self) -> CanonicalStoreRequirements {
-        match self {
-            Self::LightWallet => CanonicalStoreRequirements::default()
-                .from_height(CanonicalHistoryBounds::complete().first_available_height())
-                .with_complete_subtree_root_prefix(),
+        let required_data = if self == Self::Explorer {
+            &[CanonicalStoredData::FinalNoteCommitmentRoots][..]
+        } else {
+            &[]
+        };
+        let requirements = CanonicalStoreRequirements::new(required_data)
+            .from_height(CanonicalHistoryBounds::complete().first_available_height())
+            .with_blob_retention(self.raw_blob_retention());
+        if self == Self::LightWallet {
+            requirements.with_complete_subtree_root_prefix()
+        } else {
+            requirements
         }
     }
 }
@@ -84,10 +148,52 @@ mod tests {
     use super::{DeploymentProfile, DeploymentSection};
 
     #[test]
-    fn deployment_section_deserializes_light_wallet() -> Result<()> {
-        let section: DeploymentSection = toml::from_str("profile = \"light-wallet\"")?;
-        assert_eq!(section.profile, Some(DeploymentProfile::LightWallet));
+    fn deployment_section_deserializes_every_profile() -> Result<()> {
+        for (encoded, expected) in [
+            ("light-wallet", DeploymentProfile::LightWallet),
+            ("wallet", DeploymentProfile::Wallet),
+            ("wallet-archive", DeploymentProfile::WalletArchive),
+            ("explorer", DeploymentProfile::Explorer),
+        ] {
+            let section: DeploymentSection = toml::from_str(&format!("profile = \"{encoded}\""))?;
+            assert_eq!(section.profile, Some(expected));
+        }
         Ok(())
+    }
+
+    #[test]
+    fn every_profile_fixes_the_writer_workload_and_retention() {
+        use zinder_store::{CanonicalStoreWorkload, RawBlobRetention};
+        for (profile, workload, retention) in [
+            (
+                DeploymentProfile::LightWallet,
+                CanonicalStoreWorkload::Wallet,
+                RawBlobRetention::None,
+            ),
+            (
+                DeploymentProfile::Wallet,
+                CanonicalStoreWorkload::Wallet,
+                RawBlobRetention::None,
+            ),
+            (
+                DeploymentProfile::WalletArchive,
+                CanonicalStoreWorkload::Wallet,
+                RawBlobRetention::All,
+            ),
+            (
+                DeploymentProfile::Explorer,
+                CanonicalStoreWorkload::Explorer,
+                RawBlobRetention::All,
+            ),
+        ] {
+            assert_eq!(profile.workload(), workload);
+            assert_eq!(profile.raw_blob_retention(), retention);
+            let stored_set = profile.canonical_stored_set();
+            assert_eq!(
+                stored_set.raw_blob_retention(),
+                profile.raw_blob_retention()
+            );
+        }
     }
 
     #[test]

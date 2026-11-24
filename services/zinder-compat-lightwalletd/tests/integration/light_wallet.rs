@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Status, transport::Channel};
 use tonic_types::StatusExt as _;
 use zinder_compat_lightwalletd::{
-    CanonicalReaderSlot, LightwalletdGrpcAdapter, QualificationWallet,
+    CanonicalReaderSlot, LightwalletdGrpcAdapter, NodeBackedLightWallet,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, Network, TransactionId, wire::encode_rpc_block_hash_hex,
@@ -49,7 +49,7 @@ mod utxo_transport;
 const ADDRESS: &str = "tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx";
 
 struct Fixture {
-    adapter: LightwalletdGrpcAdapter<QualificationWallet>,
+    adapter: LightwalletdGrpcAdapter<NodeBackedLightWallet>,
     node: JsonRpcTestServer,
     slot: CanonicalReaderSlot,
     _store: WalletServingStoreFixture,
@@ -93,7 +93,7 @@ impl Fixture {
         let source =
             ZebraJsonRpcSource::new(Network::ZcashRegtest, node.url(), NodeAuth::None, timeout)?;
         let slot = CanonicalReaderSlot::new(Arc::new(RocksDbCanonicalReader::new(canonical)?));
-        let adapter = LightwalletdGrpcAdapter::for_light_wallet_qualification(
+        let adapter = LightwalletdGrpcAdapter::for_light_wallet(
             slot.clone(),
             source,
             DEFAULT_TREE_STATE_REPLAY_WAIT,
@@ -882,10 +882,7 @@ async fn every_light_wallet_selection_refuses_the_same_checkpointed_history() ->
     for (label, selection) in [
         ("profile", "[deployment]\nprofile = \"light-wallet\""),
         ("serving", "[compat]\nserving = \"light-wallet\""),
-        (
-            "legacy",
-            "[compat]\nserving = \"light-wallet-qualification\"",
-        ),
+        ("legacy", "[compat]\nserving = \"light-wallet\""),
     ] {
         let config_path = files.path().join(format!("{label}.toml"));
         std::fs::write(&config_path, selection)?;
@@ -1140,7 +1137,7 @@ async fn spawn_binary_ingest_control(
 }
 
 async fn assert_degraded_node_readiness(
-    adapter: &LightwalletdGrpcAdapter<QualificationWallet>,
+    adapter: &LightwalletdGrpcAdapter<NodeBackedLightWallet>,
 ) -> Result<()> {
     let readiness = Readiness::default();
     let composed = WalletServingReadiness::with_node_and_ingest_control(readiness.clone());

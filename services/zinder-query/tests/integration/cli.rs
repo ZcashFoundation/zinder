@@ -74,7 +74,8 @@ fn print_config_uses_native_ports_and_dedicated_secondary_roots() -> eyre::Resul
 #[test]
 fn print_config_accepts_a_query_without_a_node() -> eyre::Result<()> {
     let temporary = TempDir::new()?;
-    let output = Command::new(zinder_testkit::bin_exe!("zinder-query"))
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-query"));
+    command
         .args(["--print-config", "--network", "zcash-regtest"])
         .arg("--canonical-primary-path")
         .arg(temporary.path().join("canonical-primary"))
@@ -84,8 +85,8 @@ fn print_config_accepts_a_query_without_a_node() -> eyre::Result<()> {
         .arg(temporary.path().join("wallet-primary"))
         .arg("--wallet-secondary-root")
         .arg(temporary.path().join("wallet-secondary"))
-        .args(["--ingest-control-addr", "http://127.0.0.1:9100"])
-        .output()?;
+        .args(["--ingest-control-addr", "http://127.0.0.1:9100"]);
+    let output = command.output()?;
     assert!(
         output.status.success(),
         "print-config failed: {}",
@@ -94,6 +95,11 @@ fn print_config_accepts_a_query_without_a_node() -> eyre::Result<()> {
     let stdout = String::from_utf8(output.stdout)?;
     assert!(!stdout.contains("[node]"), "{stdout}");
     assert!(!stdout.contains("json_rpc_addr"), "{stdout}");
+    let lean = command
+        .env("ZINDER_DEPLOYMENT__PROFILE", "wallet")
+        .output()?;
+    assert!(!lean.status.success(), "{lean:?}");
+    assert!(String::from_utf8(lean.stderr)?.contains("requires [node]"));
     Ok(())
 }
 
@@ -279,6 +285,31 @@ fn tree_state_replay_waiters_per_slot_default_to_64_and_are_bounded() -> eyre::R
             stderr.contains("query.tree_state_replay_waiters_per_slot must be in 1..=256"),
             "{stderr}"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn wallet_profiles_render_without_injected_retention() -> eyre::Result<()> {
+    let temporary = TempDir::new()?;
+    let secondary = temporary.path().join("canonical-secondary");
+    for profile in ["wallet", "wallet-archive", "explorer"] {
+        let output = query_command(&temporary, &secondary)
+            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains(&format!("profile = \"{profile}\"")),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
+        let conflict = query_command(&temporary, &secondary)
+            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+            .output()?;
+        assert!(!conflict.status.success(), "{conflict:?}");
+        assert!(String::from_utf8(conflict.stderr)?.contains("storage.raw_blob_policy"));
     }
     Ok(())
 }

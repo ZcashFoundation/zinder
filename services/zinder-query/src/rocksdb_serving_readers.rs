@@ -216,6 +216,63 @@ pub struct MinedTransactionDigest {
     pub serialized_bytes_digest: zinder_core::SerializedBytesDigest,
 }
 
+impl MinedTransactionDigest {
+    /// Reads the exact byte commitment from the indexed transaction location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an artifact corruption error when the location has no digest.
+    pub fn from_location(
+        location: zinder_core::TransactionLocation,
+    ) -> Result<Self, crate::QueryError> {
+        let serialized_bytes_digest = location
+            .serialized_bytes_sha256
+            .map(zinder_core::SerializedBytesDigest::from_bytes)
+            .ok_or_else(|| crate::QueryError::ArtifactCorrupt {
+                family: ArtifactFamily::TransactionLocation,
+                reason: "canonical transaction location has no serialized byte digest".to_owned(),
+            })?;
+        Ok(Self {
+            location,
+            serialized_bytes_digest,
+        })
+    }
+
+    /// Checks the node's containing block and the exact serialized bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a node availability error for a different block and an artifact
+    /// corruption error for a byte digest mismatch.
+    pub fn verify_node_bytes(
+        self,
+        block: zinder_core::BlockId,
+        bytes: &[u8],
+    ) -> Result<(), crate::QueryError> {
+        if block != zinder_core::BlockId::new(self.location.block_height, self.location.block_hash)
+        {
+            return Err(crate::QueryError::Node(
+                zinder_source::SourceError::NodeUnavailable {
+                    reason:
+                        "node does not mine the transaction in the served block; retry with backoff"
+                            .to_owned(),
+                },
+            ));
+        }
+        if zinder_core::SerializedBytesDigest::from_serialized_bytes(bytes)
+            != self.serialized_bytes_digest
+        {
+            return Err(crate::QueryError::ArtifactCorrupt {
+                family: ArtifactFamily::TransactionLocation,
+                reason:
+                    "node transaction bytes differ from the bytes committed to the served chain"
+                        .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl CanonicalReader for RocksDbCanonicalReader {
     fn network(&self) -> Network {

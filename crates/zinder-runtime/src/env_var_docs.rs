@@ -103,10 +103,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_DEPLOYMENT__PROFILE",
         toml_path: "deployment.profile",
-        used_by: &["zinder-ingest", "zinder-compat-lightwalletd"],
+        used_by: &[
+            "zinder-ingest",
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Selects `light-wallet` for both ingest and lightwalletd compatibility. See [Light-wallet profile](#light-wallet-profile).",
+        description: "Coordinates the [deployment profile](#deployment-profiles).",
     },
     EnvVarDoc {
         name: "ZINDER_NETWORK__NAME",
@@ -135,13 +140,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-explorer",
         ],
         requirement: Requirement::ConditionalOn(
-            "running ingest or light-wallet serving, broadcasting, or reading wallet fees",
+            "running ingest, light-wallet serving, or lean wallet serving, or using broadcast or fee reads",
         ),
         sensitive: false,
         description: "Upstream node JSON-RPC URL. Light-wallet serving forwards transparent \
                       address reads, omitted transaction bodies, broadcasts, and fee reads to \
                       this node. Query and wallet-mode compatibility use a configured node for \
-                      broadcasts, and wallet-mode compatibility also reads the fee. \
+                      broadcasts and verified mined transaction bytes in lean wallet mode. Wallet-mode compatibility also reads the fee. \
                       Compact-blocks serving rejects node settings. Explorer uses the address \
                       for upstream tip observation. See [The node sections](#the-node-sections).",
     },
@@ -1419,7 +1424,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "The raw-blob policy accepts `none`, `transactions`, or `all`. The ingest writer defaults to `none` for \
                       explicit coverage and `transactions` for wallet-serving coverage. Wallet-serving ingest accepts \
-                      `none` with the light-wallet profile. Projector, query, and compatibility readers use the value as \
+                      `none` with `light-wallet` or `wallet`. Projector, query, and compatibility readers use the value as \
                       a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an \
                       existing canonical store requires a rebuild.",
     },

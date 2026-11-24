@@ -468,15 +468,26 @@ fn compatibility_serving_rejects_unapproved_aliases() -> eyre::Result<()> {
     let storage_path = temporary.path().join("compat-alias-store");
     let secondary_path = temporary.path().join("compat-alias-secondary");
     let config_path = temporary.path().join("compat-alias.toml");
-    let config = compact_blocks_config_toml(&storage_path, &secondary_path)?
-        .replace("serving = \"compact-blocks\"", "serving = \"canonical\"");
-    fs::write(&config_path, config)?;
-
-    let output = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
+    let config = compact_blocks_config_toml(&storage_path, &secondary_path)?;
+    for alias in ["canonical", "light-wallet-qualification"] {
+        fs::write(
+            &config_path,
+            config.replace(
+                "serving = \"compact-blocks\"",
+                &format!("serving = \"{alias}\""),
+            ),
+        )?;
+        let output = zinder_compat_command()
+            .args(["--print-config", "--config", path_str(&config_path)?])
+            .output()?;
+        assert!(!output.status.success(), "{output:?}");
+        assert!(String::from_utf8(output.stderr)?.contains("serving"));
+    }
+    let cli_alias = zinder_compat_command()
+        .args(["--print-config", "--serving", "light-wallet-qualification"])
         .output()?;
-    assert!(!output.status.success(), "{output:?}");
-    assert!(String::from_utf8(output.stderr)?.contains("serving"));
+    assert!(!cli_alias.status.success(), "{cli_alias:?}");
+    assert!(String::from_utf8(cli_alias.stderr)?.contains("invalid value"));
     Ok(())
 }
 

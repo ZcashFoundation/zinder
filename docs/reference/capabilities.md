@@ -172,7 +172,7 @@ persisted retention.
 | `wallet.read.subtree_roots_in_range_v1` | `SubtreeRoots` | Always |
 | `wallet.read.subtree_roots_ironwood_v1` | Ironwood protocol on `SubtreeRoots` | Always |
 | `wallet.read.transaction_by_id_v2` | `Transaction` | Ingest control serves mempool transaction lookups |
-| `wallet.read.transaction_bytes_v1` | `raw_transaction_bytes` on `Transaction` | As above, and the admitted canonical store retains transaction bodies |
+| `wallet.read.transaction_bytes_v1` | `raw_transaction_bytes` on `Transaction` | As above, and the admitted query retains transaction bodies or has a verified node byte source |
 | `wallet.read.server_info_v2` | `ServerInfo` | Always |
 | `wallet.read.network_upgrade_activations_v1` | `NetworkUpgradeActivations` | Always |
 | `wallet.broadcast.transaction_v1` | `BroadcastTransaction` | A `[node]` endpoint is configured |

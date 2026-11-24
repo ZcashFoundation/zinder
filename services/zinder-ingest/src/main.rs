@@ -51,8 +51,8 @@ use zinder_source::{
     validate_zebra_indexer_endpoint,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, MempoolEventRetentionConfig,
-    RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    CanonicalReorgPolicy, MempoolEventRetentionConfig, RocksDbCanonicalSecondary,
+    RocksDbResourceBudget,
 };
 
 use crate::config::{
@@ -226,7 +226,7 @@ async fn run_probe(
     let store = zinder_store::RocksDbCanonicalStore::open_ready(
         &runtime_config.storage_path,
         &activations,
-        zinder_store::CanonicalStoreWorkload::Wallet,
+        runtime_config.workload,
         runtime_config.raw_blob_policy.to_retention(),
         zinder_store::CanonicalReorgPolicy::new(runtime_config.reorg_window_blocks)
             .map_err(zinder_ingest::CanonicalWriterError::from)?,
@@ -867,7 +867,7 @@ fn tree_state_densification_context(
             TREE_STATE_DENSIFICATION_SECONDARY_PATH_SUFFIX,
         ),
         network_upgrade_activations,
-        workload: CanonicalStoreWorkload::Wallet,
+        workload: command_config.runtime_config.workload,
         raw_blob_retention: runtime_config.raw_blob_policy.to_retention(),
         reorg_policy,
         resource_budget: tree_state_pass_secondary_budget(runtime_config.canonical_rocksdb_budget),
@@ -892,7 +892,7 @@ fn tree_state_verification_context(
             TREE_STATE_VERIFICATION_SECONDARY_PATH_SUFFIX,
         ),
         network_upgrade_activations,
-        workload: CanonicalStoreWorkload::Wallet,
+        workload: command_config.runtime_config.workload,
         raw_blob_retention: runtime_config.raw_blob_policy.to_retention(),
         reorg_policy,
         resource_budget: tree_state_pass_secondary_budget(runtime_config.canonical_rocksdb_budget),
@@ -1249,6 +1249,7 @@ fn canonical_writer_config(
             .run_overrides
             .checkpoint_height,
         raw_blob_retention: command_config.runtime_config.raw_blob_policy.to_retention(),
+        workload: command_config.runtime_config.workload,
         reorg_window_blocks: command_config.runtime_config.reorg_window_blocks,
         tree_state_checkpoint_selection: command_config
             .tree_state_densification
@@ -1290,7 +1291,7 @@ fn log_canonical_writer_start(
             .len()
             .saturating_add(1),
         active_node_position,
-        workload = "wallet",
+        workload = command_config.runtime_config.workload.as_str(),
         schema_version = zinder_store::CANONICAL_STORE_SCHEMA_VERSION,
         raw_blob_retention = %writer_config.raw_blob_retention,
         reorg_window_blocks = writer_config.reorg_window_blocks,

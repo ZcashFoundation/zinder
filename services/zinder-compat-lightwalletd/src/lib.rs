@@ -29,7 +29,7 @@ pub use block_range::{
     DEFAULT_BLOCK_RANGE_ADMISSION_WAIT, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 pub use compact_blocks_grpc::{CanonicalReaderSlot, CompactBlocksGrpcAdapter};
-pub use grpc::qualification::QualificationWallet;
+pub use grpc::light_wallet::NodeBackedLightWallet;
 pub use grpc::{
     DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS, DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,
     LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,

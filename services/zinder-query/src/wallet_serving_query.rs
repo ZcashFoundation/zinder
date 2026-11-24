@@ -410,6 +410,7 @@ pub struct WalletServingQuery<Broadcaster, NativeIngest = ()> {
     broadcast_bytes: BroadcastByteBudget,
     native_endpoint_capabilities: NativeWalletEndpointCapabilities,
     node_verifications: Option<EndpointVerifications>,
+    cold_transactions: Option<Arc<crate::cold_transaction::ColdTransactionSource>>,
 }
 
 impl<Broadcaster, NativeIngest> std::fmt::Debug for WalletServingQuery<Broadcaster, NativeIngest> {
@@ -455,6 +456,7 @@ impl WalletServingQuery<()> {
             compact_block_stream_sub_read_bytes: COMPACT_BLOCK_STREAM_SUB_READ_BYTES,
             broadcast_bytes: BroadcastByteBudget::process(),
             node_verifications: None,
+            cold_transactions: None,
         }
     }
 }
@@ -491,6 +493,7 @@ impl WalletServingQuery<(), AdmittedIngestControl> {
             compact_block_stream_sub_read_bytes: COMPACT_BLOCK_STREAM_SUB_READ_BYTES,
             broadcast_bytes: BroadcastByteBudget::process(),
             node_verifications: None,
+            cold_transactions: None,
         }
     }
 }
@@ -526,6 +529,7 @@ impl<NativeIngest> WalletServingQuery<(), NativeIngest> {
             serving_pair_slot: self.serving_pair_slot,
             node_verifications: nodes.as_ref().map(OrderedBroadcaster::verifications),
             broadcaster: nodes,
+            cold_transactions: self.cold_transactions,
             native_ingest: self.native_ingest,
             tree_state_replays: self.tree_state_replays,
             compact_block_stream_sub_read_bytes: self.compact_block_stream_sub_read_bytes,
@@ -535,7 +539,39 @@ impl<NativeIngest> WalletServingQuery<(), NativeIngest> {
     }
 }
 
+impl<NativeIngest>
+    WalletServingQuery<Option<OrderedBroadcaster<zinder_source::ZebraJsonRpcSource>>, NativeIngest>
+{
+    /// Enables verified mined transaction byte reads from the configured primary node
+    /// when the admitted canonical store has no transaction blobs.
+    #[must_use]
+    pub fn with_verified_cold_transactions(mut self) -> Self {
+        if !self
+            .admitted_raw_blob_retention()
+            .retains_transaction_blobs()
+            && let Some(source) = self
+                .broadcaster
+                .as_ref()
+                .and_then(OrderedBroadcaster::primary_source)
+        {
+            self.cold_transactions = Some(Arc::new(
+                crate::cold_transaction::ColdTransactionSource::new(source.clone()),
+            ));
+            self.native_endpoint_capabilities = self
+                .native_endpoint_capabilities
+                .with_cold_transaction_bytes();
+        }
+        self
+    }
+}
+
 impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
+    /// Returns whether this query can verify mined bytes fetched from its configured node.
+    #[must_use]
+    pub const fn has_verified_cold_tx_source(&self) -> bool {
+        self.cold_transactions.is_some()
+    }
+
     /// Lets a tree-state reconstruction that finds every replay slot taken
     /// wait up to `wait` for one before it is refused.
     ///
@@ -1063,9 +1099,14 @@ where
                 let header = transaction
                     .block_header
                     .ok_or(QueryError::BlockNotInBestChain)?;
-                let raw_transaction_bytes = transaction
-                    .transaction_blob
-                    .map(|blob| blob.raw_transaction_bytes);
+                let raw_transaction_bytes =
+                    match (transaction.transaction_blob, &self.cold_transactions) {
+                        (Some(blob), _) => Some(blob.raw_transaction_bytes),
+                        (None, Some(source)) => {
+                            Some(source.fetch(pair.canonical(), location).await?)
+                        }
+                        (None, None) => None,
+                    };
                 let chain_context = MinedTransactionChainContext::from_response_epoch(
                     &chain_epoch,
                     location.block_height,

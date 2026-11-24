@@ -1,4 +1,4 @@
-//! gRPC routes for canonical and node-backed light-wallet qualification.
+//! gRPC routes for canonical and node-backed light-wallet serving.
 
 use std::{
     collections::HashSet,
@@ -22,18 +22,18 @@ use tonic::{Request, Response, Status, body::Body, server::NamedService, service
 use tower::{Service, util::MapResponseLayer};
 use zebra_chain::transparent::Address;
 use zinder_core::{
-    BlockHeight, BlockId, ChainEpoch, Network, RawTransactionBytes, SerializedBytesDigest,
-    SubtreeRootRange, TransactionId, TransactionLocation,
+    BlockHeight, BlockId, ChainEpoch, Network, RawTransactionBytes, SubtreeRootRange,
+    TransactionId,
     wire::{
         decode_internal_transaction_id, decode_rpc_block_hash_bytes, encode_internal_transaction_id,
     },
 };
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
 use zinder_query::{
-    ArtifactKey, BlockTransactionDigests, CanonicalReader,
-    MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, MinedTransactionDigest, QualificationNodeTarget,
-    QualificationWalletQuery, QueryError, RocksDbCanonicalReader, StorageReadError, SubtreeRoots,
-    parse_receivable_transparent_address, read_on_blocking_thread, status_from_query_error,
+    ArtifactKey, CanonicalReader, LightWalletNodeQuery, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+    MinedTransactionDigest, QueryError, RocksDbCanonicalReader, StorageReadError, SubtreeRoots,
+    VerifiedNodeTarget, parse_receivable_transparent_address, read_on_blocking_thread,
+    status_from_query_error,
 };
 use zinder_source::{
     SourceError, SourceTransparentUnspentOutput, SourceTransparentUtxoPage,
@@ -62,77 +62,38 @@ const FORWARDED_UTXO_RESPONSE_SLOTS: usize = 2;
 
 /// The canonical reader and node-backed methods for light-wallet serving.
 #[derive(Clone)]
-pub struct QualificationWallet {
+pub struct NodeBackedLightWallet {
     slot: CanonicalReaderSlot,
-    query: QualificationWalletQuery,
+    query: LightWalletNodeQuery,
     utxo_slots: Arc<Semaphore>,
     utxo_response_slots: Arc<Semaphore>,
     history_slots: Arc<Semaphore>,
     transaction_slots: Arc<Semaphore>,
-    block_digests: BlockDigestCache,
 }
 
-/// The recorded digests of the block the latest forwarded lookup read.
-///
-/// Lookups of several transactions in one block, such as a wallet enhancing
-/// them one call at a time, decode that block's facts once. A block's height
-/// and hash fix its contents, so an entry stays valid across reader
-/// generations.
-#[derive(Clone, Default)]
-struct BlockDigestCache(Arc<parking_lot::Mutex<Option<Arc<BlockTransactionDigests>>>>);
-
-impl BlockDigestCache {
-    async fn digest_of(
-        &self,
-        reader: &RocksDbCanonicalReader,
-        location: TransactionLocation,
-    ) -> Result<MinedTransactionDigest, Status> {
-        let block = BlockId::new(location.block_height, location.block_hash);
-        let cached = self
-            .0
-            .lock()
-            .clone()
-            .filter(|digests| digests.block() == block);
-        let digests = if let Some(digests) = cached {
-            digests
-        } else {
-            let digests = Arc::new(
-                reader
-                    .block_transaction_digests(block)
-                    .await
-                    .map_err(storage_status)?,
-            );
-            *self.0.lock() = Some(Arc::clone(&digests));
-            digests
-        };
-        digests.digest_of(location).map_err(storage_status)
-    }
-}
-
-impl LightwalletdGrpcAdapter<QualificationWallet> {
+impl LightwalletdGrpcAdapter<NodeBackedLightWallet> {
     /// Serves local block data, retained transactions, and node-backed wallet lookups without a projector.
     #[must_use]
-    pub fn for_light_wallet_qualification(
+    pub fn for_light_wallet(
         slot: CanonicalReaderSlot,
         node: ZebraJsonRpcSource,
         replay_wait: Duration,
         replay_waiters_per_slot: NonZeroU32,
     ) -> Self {
         let readers = slot.clone();
-        let query = QualificationWalletQuery::new(
+        let query = LightWalletNodeQuery::new(
             move || readers.capture(),
             node,
             replay_wait,
             replay_waiters_per_slot,
         );
-        Self::new(QualificationWallet {
+        Self::new(NodeBackedLightWallet {
             slot,
             query,
             utxo_slots: Arc::new(Semaphore::new(1)),
             utxo_response_slots: Arc::new(Semaphore::new(FORWARDED_UTXO_RESPONSE_SLOTS)),
             history_slots: Arc::new(Semaphore::new(FORWARDED_HISTORY_SLOTS)),
             transaction_slots: Arc::new(Semaphore::new(FORWARDED_TRANSACTION_SLOTS)),
-            block_digests: BlockDigestCache::default(),
         })
     }
 
@@ -169,7 +130,7 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
             .spawn_node_readiness_probe(readiness, interval, cancel)
     }
 
-    async fn qualification_transaction(
+    async fn light_wallet_transaction(
         &self,
         filter: lightwalletd::TxFilter,
     ) -> Result<lightwalletd::RawTransaction, Status> {
@@ -222,14 +183,12 @@ impl LightwalletdGrpcAdapter<QualificationWallet> {
                 )
             })?;
         let view = served_view(&reader)?;
-        let digests = self.query_api.block_digests.clone();
         let span = tracing::Span::current();
         // The storage read owns admission even if the caller drops the
         // request. Only the caller can proceed from evidence to the node.
         let (evidence, _permit) = tokio::task::spawn_blocking(move || {
-            let evidence = span.in_scope(|| {
-                read_on_blocking_thread(forwarded_transaction_evidence(&reader, &digests, id))
-            });
+            let evidence = span
+                .in_scope(|| read_on_blocking_thread(forwarded_transaction_evidence(&reader, id)));
             (evidence, permit)
         })
         .await
@@ -265,12 +224,12 @@ enum ForwardedTransactionEvidence {
 
 async fn forwarded_transaction_evidence(
     reader: &RocksDbCanonicalReader,
-    digests: &BlockDigestCache,
     id: TransactionId,
 ) -> Result<ForwardedTransactionEvidence, Status> {
     let miss = match reader.mined_transaction_location(id).await {
         Ok(Some(location)) => {
-            let digest = digests.digest_of(reader, location).await?;
+            let digest = MinedTransactionDigest::from_location(location)
+                .map_err(|error| status_from_query_error(&error))?;
             return Ok(ForwardedTransactionEvidence::Mined(digest));
         }
         Ok(None) => CanonicalTransactionMiss::NotInChain {
@@ -284,7 +243,7 @@ async fn forwarded_transaction_evidence(
     Ok(ForwardedTransactionEvidence::Missing(miss))
 }
 
-impl QualificationWallet {
+impl NodeBackedLightWallet {
     async fn node(&self, view: &ServedView) -> Result<&ZebraJsonRpcSource, Status> {
         self.query
             .verified_node(&view.target)
@@ -431,7 +390,6 @@ impl QualificationWallet {
                 page: IntoIter::default(),
                 page_range: (range.start_height, range.end_height),
                 last_position: None,
-                block_digests: self.block_digests.clone(),
             };
             history.read_page().await?;
             Ok::<_, Status>(history)
@@ -450,7 +408,7 @@ impl QualificationWallet {
 struct ServedView {
     network: Network,
     tip: BlockId,
-    target: QualificationNodeTarget,
+    target: VerifiedNodeTarget,
 }
 
 fn served_view(reader: &RocksDbCanonicalReader) -> Result<ServedView, Status> {
@@ -458,7 +416,7 @@ fn served_view(reader: &RocksDbCanonicalReader) -> Result<ServedView, Status> {
     Ok(ServedView {
         network: epoch.network,
         tip: BlockId::new(epoch.visible_tip_height, epoch.visible_tip_hash),
-        target: QualificationNodeTarget::of(reader)
+        target: VerifiedNodeTarget::of(reader)
             .map_err(|error| status_from_query_error(&QueryError::Node(error)))?,
     })
 }
@@ -470,16 +428,9 @@ fn served_transaction(
     (reported, bytes): (BlockId, Vec<u8>),
 ) -> Result<lightwalletd::RawTransaction, Status> {
     let location = mined.location;
-    if reported != BlockId::new(location.block_height, location.block_hash) {
-        return Err(outside_served_view(
-            "node does not mine the transaction in the served block",
-        ));
-    }
-    if SerializedBytesDigest::from_serialized_bytes(&bytes) != mined.serialized_bytes_digest {
-        return Err(Status::data_loss(
-            "node transaction bytes differ from the bytes committed to the served chain",
-        ));
-    }
+    mined
+        .verify_node_bytes(reported, &bytes)
+        .map_err(|error| status_from_query_error(&error))?;
     Ok(lightwalletd::RawTransaction {
         data: bytes,
         height: u64::from(location.block_height.value()),
@@ -640,7 +591,6 @@ struct NodeAddressHistory {
     page: IntoIter<TransactionId>,
     page_range: (BlockHeight, BlockHeight),
     last_position: Option<(BlockHeight, u32)>,
-    block_digests: BlockDigestCache,
 }
 
 #[derive(Clone)]
@@ -763,12 +713,11 @@ impl NodeAddressHistory {
         let permit = admission.reserve_evidence()?;
         let reader = self.slot.capture();
         let served = self.served;
-        let digests = self.block_digests.clone();
         let span = tracing::Span::current();
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             span.in_scope(|| {
-                read_on_blocking_thread(history_transaction_evidence(&reader, &digests, served, id))
+                read_on_blocking_thread(history_transaction_evidence(&reader, served, id))
             })
         });
         tracing::trace!(
@@ -823,7 +772,6 @@ impl NodeAddressHistory {
 
 async fn history_transaction_evidence(
     reader: &RocksDbCanonicalReader,
-    digests: &BlockDigestCache,
     served: BlockId,
     id: TransactionId,
 ) -> Result<MinedTransactionDigest, Status> {
@@ -842,7 +790,7 @@ async fn history_transaction_evidence(
         .await
         .map_err(storage_status)?
         .ok_or_else(history_changed)?;
-    digests.digest_of(reader, location).await
+    MinedTransactionDigest::from_location(location).map_err(|error| status_from_query_error(&error))
 }
 
 fn history_deadline_exceeded() -> Status {
@@ -890,7 +838,7 @@ fn storage_status(error: StorageReadError) -> Status {
     status_from_query_error(&QueryError::canonical_read(error))
 }
 
-impl SubtreeRootReads for QualificationWallet {
+impl SubtreeRootReads for NodeBackedLightWallet {
     async fn read_subtree_roots(
         &self,
         range: SubtreeRootRange,
@@ -901,7 +849,7 @@ impl SubtreeRootReads for QualificationWallet {
 }
 
 #[tonic::async_trait]
-impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<QualificationWallet> {
+impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<NodeBackedLightWallet> {
     async fn get_encoded_block_range(
         &self,
         request: Request<lightwalletd::BlockRange>,
@@ -923,7 +871,7 @@ impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<QualificationWa
 }
 
 #[tonic::async_trait]
-impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<QualificationWallet> {
+impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<NodeBackedLightWallet> {
     async fn get_encoded_block_range_nullifiers(
         &self,
         request: Request<lightwalletd::BlockRange>,
@@ -946,7 +894,7 @@ impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<Quali
 
 #[tonic::async_trait]
 impl compact_tx_streamer_server::CompactTxStreamer
-    for LightwalletdGrpcAdapter<QualificationWallet>
+    for LightwalletdGrpcAdapter<NodeBackedLightWallet>
 {
     fn encoded_block_range(&self) -> Option<&dyn lightwalletd::EncodedBlockRange> {
         Some(self)
@@ -1028,7 +976,7 @@ impl compact_tx_streamer_server::CompactTxStreamer
         &self,
         request: Request<lightwalletd::TxFilter>,
     ) -> Result<Response<lightwalletd::RawTransaction>, Status> {
-        self.qualification_transaction(request.into_inner())
+        self.light_wallet_transaction(request.into_inner())
             .await
             .map(Response::new)
     }
@@ -1362,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn qualification_utxo_limit_applies_to_the_requested_response() {
+    fn light_wallet_utxo_limit_applies_to_the_requested_response() {
         let limit = NonZeroU32::MIN.saturating_add(9);
         for (available, requested, expected) in [(20, 4, 4), (20, 10, 10), (10, 0, 10), (7, 11, 7)]
         {

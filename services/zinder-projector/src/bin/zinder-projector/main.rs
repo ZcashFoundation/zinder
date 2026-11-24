@@ -1829,8 +1829,13 @@ fn open_canonical_secondary(
         &config.canonical_path,
         &config.canonical_secondary_path,
         config.network,
-        zinder_store::CanonicalStoreRequirements::for_blob_retention(
-            config.expected_canonical_raw_blob_retention,
+        config.profile.map_or_else(
+            || {
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    config.expected_canonical_raw_blob_retention,
+                )
+            },
+            zinder_runtime::DeploymentProfile::canonical_requirement,
         ),
         reorg_policy,
         config.canonical_rocksdb_budget,

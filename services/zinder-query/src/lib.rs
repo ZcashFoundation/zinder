@@ -31,15 +31,16 @@ use zinder_store::{
 };
 
 mod broadcast_byte_budget;
+mod cold_transaction;
 mod compact_block_fence;
 mod grpc;
 mod ingest_control;
+mod light_wallet;
 mod native_wallet_endpoint_capabilities;
 mod node_broadcast;
 #[cfg(test)]
 mod observed_canonical_reader;
-mod qualification;
-pub use qualification::{QualificationNodeTarget, QualificationWalletQuery};
+pub use light_wallet::{LightWalletNodeQuery, VerifiedNodeTarget};
 mod rocksdb_serving_readers;
 mod serving_read;
 mod serving_readers;

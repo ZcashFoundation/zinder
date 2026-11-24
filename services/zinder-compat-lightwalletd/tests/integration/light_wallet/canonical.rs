@@ -1,4 +1,4 @@
-//! Qualification reads at the canonical and forwarding boundaries.
+//! Light-wallet reads at the canonical and forwarding boundaries.
 
 use std::{future::Future, sync::Arc, time::Duration};
 
@@ -640,7 +640,7 @@ async fn check_publication_during_tip_lookup(
         super::NodeAuth::None,
         Duration::from_secs(2),
     )?;
-    let adapter = super::LightwalletdGrpcAdapter::for_light_wallet_qualification(
+    let adapter = super::LightwalletdGrpcAdapter::for_light_wallet(
         slot,
         source,
         super::DEFAULT_TREE_STATE_REPLAY_WAIT,
@@ -942,7 +942,7 @@ fn saturated_replays_return_unavailable_while_latest_checkpoint_is_readable() ->
             [],
             Duration::from_secs(2),
         )?;
-        let adapter = LightwalletdGrpcAdapter::for_light_wallet_qualification(
+        let adapter = LightwalletdGrpcAdapter::for_light_wallet(
             fixture.slot,
             ZebraJsonRpcSource::new(
                 Network::ZcashRegtest,
@@ -987,7 +987,7 @@ fn saturated_replays_return_unavailable_while_latest_checkpoint_is_readable() ->
 }
 
 #[tokio::test]
-async fn transactions_of_one_block_share_its_recorded_digests() -> Result<()> {
+async fn transactions_of_one_block_use_their_indexed_digests() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let block = chain
         .blocks()
@@ -1036,5 +1036,90 @@ async fn transactions_of_one_block_share_its_recorded_digests() -> Result<()> {
         .err()
         .ok_or_else(|| eyre!("accepted bytes the block's digests do not record"))?;
     assert_eq!(status.code(), Code::DataLoss);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lean_wallet_verifies_and_caches_mined_bytes_without_forwarding_address_lookups()
+-> Result<()> {
+    use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
+    use zinder_query::{
+        OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot,
+        WalletServingQuery, WalletServingReadPair,
+    };
+    use zinder_source::{NodeAuth, ZebraJsonRpcSource};
+    use zinder_testkit::WalletServingStoreFixture;
+
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(1);
+    let block = super::served_tip(1)?;
+    let id = TransactionId::from_bytes([0x55; 32]);
+    let chain = chain.with_transaction_rows(FixtureTransactionRows::coinbase(
+        id,
+        block.height,
+        block.hash,
+        vec![0x55],
+    ));
+    let schedule = super::one_upgrade_per_height()?;
+    let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let (canonical, wallet) = store.take_readers()?;
+    let pair = WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?;
+    let node = super::verifiable_node(
+        &schedule,
+        block.hash,
+        [
+            method("getrawtransaction").reply(mined_reply(id, block, "56")),
+            method("getrawtransaction").reply(mined_reply(id, block, "55")),
+        ],
+    )?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        node.url(),
+        NodeAuth::None,
+        Duration::from_secs(2),
+    )?;
+    let query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)))
+            .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
+            .with_verified_cold_transactions();
+    assert!(query.has_verified_cold_tx_source());
+    let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?;
+
+    assert_eq!(
+        adapter
+            .get_taddress_balance(super::balance_request())
+            .await?
+            .into_inner()
+            .value_zat,
+        0
+    );
+    assert!(node.requests_for("getaddressbalance")?.is_empty());
+    assert!(node.requests_for("getaddressutxos")?.is_empty());
+    assert!(node.requests_for("getrawtransaction")?.is_empty());
+
+    let corrupt = adapter
+        .get_transaction(transaction(id))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted bytes that disagree with the canonical digest"))?;
+    assert_eq!(corrupt.code(), Code::DataLoss);
+    for _ in 0..2 {
+        let mined = adapter.get_transaction(transaction(id)).await?.into_inner();
+        assert_eq!((mined.height, mined.data), (1, vec![0x55]));
+    }
+    assert_eq!(node.requests_for("getrawtransaction")?.len(), 2);
+    drop(node);
+    assert_eq!(
+        adapter
+            .get_transaction(transaction(id))
+            .await?
+            .into_inner()
+            .data,
+        vec![0x55]
+    );
     Ok(())
 }

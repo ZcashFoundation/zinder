@@ -748,6 +748,7 @@ fn park_config(
     projector_control_addr: SocketAddr,
 ) -> TestResult<ProjectorConfig> {
     Ok(ProjectorConfig {
+        profile: None,
         network: Network::ZcashRegtest,
         canonical_path: root.join("canonical"),
         canonical_secondary_path: root.join("canonical-secondary"),

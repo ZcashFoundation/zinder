@@ -304,7 +304,7 @@ struct IngestSection {
     source: Option<String>,
     /// Whether the complete bundled Explorer materialized-view workload is
     /// requested. Omitted values remain false for every coverage.
-    explorer_views: bool,
+    explorer_views: Option<bool>,
     /// Available bytes on the store volume below which Explorer view replay
     /// pauses. Zero disables the guard.
     explorer_views_min_free_bytes: Option<u64>,
@@ -486,7 +486,7 @@ fn resolve_ingest_config(
         node_response_byte_range(&node_target, &node_fallbacks);
     let coverage = config.ingest.run_overrides.coverage.unwrap_or_default();
     let explorer_views = resolve_explorer_views(
-        config.ingest.explorer_views,
+        config.ingest.explorer_views.unwrap_or(false),
         config.ingest.run_overrides.checkpoint_height,
     )?;
     let mut densification = config.ingest.tree_state_densification;
@@ -693,6 +693,12 @@ fn resolve_ingest_config(
         canonical_rocksdb_budget,
         materialized_view_rocksdb_budget,
         raw_blob_policy,
+        workload: config
+            .deployment
+            .profile
+            .map_or(zinder_store::CanonicalStoreWorkload::Wallet, |profile| {
+                profile.workload()
+            }),
         reorg_window_blocks,
         phase_classification: PhaseClassificationConfig {
             catchup_threshold_blocks,
@@ -825,24 +831,36 @@ fn apply_deployment_profile(config: &mut IngestConfig) -> Result<(), ConfigError
     let Some(profile) = config.deployment.profile else {
         return Ok(());
     };
-    let raw_blob_policy = RawBlobPolicy::from(profile.canonical_stored_set().raw_blob_retention());
-    if config.ingest.explorer_views
-        || config
-            .ingest
-            .run_overrides
-            .coverage
-            .is_some_and(|coverage| coverage != IngestCoverage::WalletServing)
-        || config
-            .storage
-            .raw_blob_policy
-            .is_some_and(|policy| policy != raw_blob_policy)
-    {
-        return Err(ConfigError::invalid(
-            "deployment.profile = \"light-wallet\" requires wallet-serving coverage, raw_blob_policy = \"none\", and Explorer views disabled. To select this profile, remove conflicting overrides",
-        ));
+    let raw_blob_policy = RawBlobPolicy::from(profile.raw_blob_retention());
+    let explorer_views = matches!(profile, DeploymentProfile::Explorer);
+    let conflicting_explorer_views = config
+        .ingest
+        .explorer_views
+        .is_some_and(|configured| configured != explorer_views);
+    let conflicting_coverage = config
+        .ingest
+        .run_overrides
+        .coverage
+        .is_some_and(|coverage| coverage != IngestCoverage::WalletServing);
+    let conflicting_retention = config
+        .storage
+        .raw_blob_policy
+        .is_some_and(|policy| policy != raw_blob_policy);
+    if conflicting_explorer_views || conflicting_coverage || conflicting_retention {
+        return Err(ConfigError::invalid(format!(
+            "deployment.profile = \"{}\" requires wallet-serving coverage, raw_blob_policy = \"{}\", and Explorer views {}. To select this profile, remove conflicting overrides",
+            profile.as_str(),
+            raw_blob_policy.as_kebab_case(),
+            if explorer_views {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        )));
     }
     config.ingest.run_overrides.coverage = Some(IngestCoverage::WalletServing);
     config.storage.raw_blob_policy = Some(raw_blob_policy);
+    config.ingest.explorer_views = Some(explorer_views);
     Ok(())
 }
 
@@ -854,7 +872,10 @@ fn resolve_raw_blob_policy(
     match (coverage, configured_policy) {
         (IngestCoverage::WalletServing, None) => Ok(RawBlobPolicy::Transactions),
         (IngestCoverage::WalletServing, Some(RawBlobPolicy::None))
-            if profile != Some(DeploymentProfile::LightWallet) =>
+            if !matches!(
+                profile,
+                Some(DeploymentProfile::LightWallet | DeploymentProfile::Wallet)
+            ) =>
         {
             Err(ConfigError::invalid(
                 "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",

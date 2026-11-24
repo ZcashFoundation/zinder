@@ -919,8 +919,7 @@ fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn light_wallet_profile_selects_wallet_history_without_transaction_blobs()
--> Result<(), Box<dyn Error>> {
+fn deployment_profiles_render_and_reject_conflicting_retention() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("wallet-serving-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
@@ -928,26 +927,31 @@ fn light_wallet_profile_selects_wallet_history_without_transaction_blobs()
         .replace("coverage = \"wallet-serving\"\n", "");
     fs::write(&config_path, config)?;
 
-    let output = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_DEPLOYMENT__PROFILE", "light-wallet")
-        .output()?;
+    for profile in ["light-wallet", "wallet", "wallet-archive", "explorer"] {
+        let output = zinder_ingest_command()
+            .args(["--print-config", "--config", path_str(&config_path)?])
+            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+            .output()?;
 
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("[deployment]"), "{stdout}");
-    assert!(stdout.contains("profile = \"light-wallet\""), "{stdout}");
-    assert!(!stdout.contains("coverage ="), "{stdout}");
-    assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
-    assert!(!stdout.contains("explorer_views ="), "{stdout}");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(stdout.contains("[deployment]"), "{stdout}");
+        assert!(
+            stdout.contains(&format!("profile = \"{profile}\"")),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("coverage ="), "{stdout}");
+        assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
+        assert!(!stdout.contains("explorer_views ="), "{stdout}");
 
-    let conflict = zinder_ingest_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_DEPLOYMENT__PROFILE", "light-wallet")
-        .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
-        .output()?;
-    assert!(!conflict.status.success(), "{conflict:?}");
-    assert!(String::from_utf8(conflict.stderr)?.contains("remove conflicting overrides"));
+        let conflict = zinder_ingest_command()
+            .args(["--print-config", "--config", path_str(&config_path)?])
+            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+            .output()?;
+        assert!(!conflict.status.success(), "{conflict:?}");
+        assert!(String::from_utf8(conflict.stderr)?.contains("remove conflicting overrides"));
+    }
 
     let legacy_key = zinder_ingest_command()
         .args(["--print-config", "--config", path_str(&config_path)?])

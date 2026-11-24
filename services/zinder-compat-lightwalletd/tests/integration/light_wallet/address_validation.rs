@@ -127,7 +127,7 @@ async fn invalid_balance_addresses_match_wallet_status_details_over_grpc() -> Re
     };
     tokio::select! {
         result = wallet_server => Err(eyre!("wallet RPC server stopped: {result:?}")),
-        result = qual_server => Err(eyre!("qualification RPC server stopped: {result:?}")),
+        result = qual_server => Err(eyre!("light-wallet RPC server stopped: {result:?}")),
         result = tokio::time::timeout(std::time::Duration::from_secs(20), compare) => result?,
     }
 }
