@@ -13,7 +13,7 @@
 //! admitted a request, and how long each request held its slot.
 
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant},
@@ -50,12 +50,28 @@ struct HeldSlot {
     claimed_at: Instant,
 }
 
+/// How one client is identified when the pool counts its slots.
+///
+/// A direct connection, or the `ip:port` a trusted proxy names, is keyed by
+/// its full address, so distinct connections from one host stay separate
+/// clients. A bare IP a trusted proxy names, such as GCP GXLB's
+/// `{client_ip_address}`, has no port and so keys the whole address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClientFairnessKey {
+    /// A full connection address, from a direct socket or an `ip:port`
+    /// proxy header. Preserved per ADR-0007 Decision 10, which keeps clients
+    /// behind a shared Tor exit address isolated by `(ip, port)`.
+    Connection(SocketAddr),
+    /// A bare IP address from a proxy header, which carries no port.
+    Address(IpAddr),
+}
+
 /// Whose slots count together when the pool picks one to evict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Holder {
     /// A client, identified by its connection's remote address or by the
     /// client connection a trusted proxy names.
-    Client(SocketAddr),
+    Client(ClientFairnessKey),
     /// A request whose transport reported no remote address. It counts as a
     /// client of its own.
     Unidentified { slot_id: u64 },
@@ -90,7 +106,7 @@ impl ReceiveSlots {
     /// Claims a slot for a request from `client`, evicting another client's
     /// oldest slot when the pool is full and the fairness rule allows it.
     /// Returns `None` when the request is refused.
-    pub(super) fn claim(self: &Arc<Self>, client: Option<SocketAddr>) -> Option<Admission> {
+    pub(super) fn claim(self: &Arc<Self>, client: Option<ClientFairnessKey>) -> Option<Admission> {
         let mut table = self.table.lock();
         let id = table.next_slot_id;
         let holder = client.map_or(Holder::Unidentified { slot_id: id }, Holder::Client);
@@ -214,7 +230,7 @@ impl Drop for ReceiveSlot {
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroUsize,
         sync::Arc,
     };
@@ -227,11 +243,16 @@ mod tests {
 
     use super::{
         super::{RECEIVE_SLOTS_HELD_METRIC, ReceivePool},
-        Admission, ReceiveSlots,
+        Admission, ClientFairnessKey, ReceiveSlots,
     };
 
-    fn connection(port: u16) -> SocketAddr {
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    fn connection(port: u16) -> ClientFairnessKey {
+        ClientFairnessKey::Connection(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    }
+
+    /// A bare IPv4 address, as a proxy that emits `{client_ip_address}` names.
+    fn address(octet: u8) -> ClientFairnessKey {
+        ClientFairnessKey::Address(IpAddr::V4(Ipv4Addr::new(203, 0, 113, octet)))
     }
 
     /// The value the occupancy gauge holds now, and the lowest and highest it
@@ -344,6 +365,47 @@ mod tests {
 
         assert!(slots.claim(Some(connection(2))).is_none());
         assert!(slots.claim(Some(connection(1))).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_ports_of_one_address_stay_distinct_clients() -> Result<(), &'static str> {
+        // ADR-0007 Decision 10: clients that share an address, such as wallets
+        // behind one Tor exit, are keyed by `(ip, port)` and never collapsed.
+        let slots = pool(2)?;
+        let oldest = admitted(slots.claim(Some(connection(1))))?;
+        let _second = admitted(slots.claim(Some(connection(2))))?;
+
+        // The two ports are distinct clients holding one slot each, so a
+        // third distinct port evicts the oldest rather than being refused.
+        let third = admitted(slots.claim(Some(connection(3))))?;
+        assert!(third.evicted_another);
+        assert!(oldest.slot.eviction.is_cancelled());
+        assert_eq!(slots.held(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_address_is_one_client_across_many_connections() -> Result<(), &'static str> {
+        let slots = pool(2)?;
+        // A proxy naming only the bare IP groups every connection behind it.
+        let _first = admitted(slots.claim(Some(address(7))))?;
+        let _second = admitted(slots.claim(Some(address(7))))?;
+
+        // The bare address already holds the most slots, so it is refused.
+        assert!(slots.claim(Some(address(7))).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_bare_address_and_a_connection_are_distinct_clients() -> Result<(), &'static str> {
+        let slots = pool(2)?;
+        let _bare = admitted(slots.claim(Some(address(7))))?;
+        let _connection = admitted(slots.claim(Some(connection(7))))?;
+
+        // Equal shares: neither may take the other's slot.
+        assert!(slots.claim(Some(address(7))).is_none());
+        assert!(slots.claim(Some(connection(7))).is_none());
         Ok(())
     }
 

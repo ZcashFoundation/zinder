@@ -109,6 +109,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// intermediaries that don't surface the failure to userspace.
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
+/// HTTP/2 stream-level receive window advertised to the server.
+///
+/// The 65,535-byte default caps a single `CompactBlocksInRange` stream at
+/// roughly `65,535 B / RTT`, about 728 KB/s over a 90 ms WAN round trip. Four
+/// MiB lets one stream fill a WAN bandwidth-delay product.
+const HTTP2_INITIAL_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+
+/// HTTP/2 connection-level receive window advertised to the server.
+///
+/// Sixteen MiB lets every concurrent stream share the connection window
+/// without a single stream's window bounding aggregate WAN throughput.
+const HTTP2_INITIAL_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+
 /// Oldest native wallet contract revision this client can safely consume.
 pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 8;
 
@@ -133,7 +146,10 @@ impl RemoteChainIndex {
             .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
             .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_keepalive(Some(TCP_KEEPALIVE));
+            .tcp_keepalive(Some(TCP_KEEPALIVE))
+            .http2_adaptive_window(true)
+            .initial_stream_window_size(HTTP2_INITIAL_STREAM_WINDOW)
+            .initial_connection_window_size(HTTP2_INITIAL_CONNECTION_WINDOW);
         let channel = endpoint.connect_lazy();
 
         Ok(Self {

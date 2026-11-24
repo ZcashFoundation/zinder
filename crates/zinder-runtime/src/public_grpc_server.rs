@@ -63,7 +63,7 @@ mod wallet_rpc_metrics;
 use std::{
     convert::Infallible,
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
@@ -103,7 +103,7 @@ pub(crate) use self::wallet_rpc_metrics::{RANGE_BLOCKS, RANGE_DURATION, WalletRp
 pub use self::wallet_rpc_metrics::{WalletRpcMetrics, WalletRpcMetricsLayer};
 use self::{
     message_boundaries::MessageBoundaries,
-    receive_slots::{ReceiveSlot, ReceiveSlots},
+    receive_slots::{ClientFairnessKey, ReceiveSlot, ReceiveSlots},
     stream_reset::TransportReset,
 };
 use crate::{Readiness, TrafficReadinessInterceptor, public_grpc_health::public_grpc_health};
@@ -130,6 +130,20 @@ const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// resets without end.
 pub const HTTP2_MAX_LOCAL_ERROR_RESETS: usize = 1024;
 
+/// Maximum DATA frame size the server advertises and sends.
+///
+/// Raised from hyper's 16 KiB default so a large compact-block batch is not
+/// fragmented into 16 KiB frames, which caps throughput over WAN round trips.
+const HTTP2_MAX_FRAME_SIZE: u32 = 64 * 1024;
+
+/// Largest send buffer per HTTP/2 stream.
+///
+/// Raised from hyper's ~400 KiB default so a single `GetBlockRange` stream can
+/// fill a 100-200 ms round-trip bandwidth-delay product. Worst-case memory is
+/// the concurrent stream bound times this buffer, because a stalled stream is
+/// reset at the send stall timeout ([`DEFAULT_GRPC_SEND_STALL_TIMEOUT`]).
+const HTTP2_MAX_SEND_BUF_SIZE: usize = 1024 * 1024;
+
 /// Requests each receive pool admits at once across every connection.
 ///
 /// With the 2 MiB [`crate::MAX_DECODING_MESSAGE_BYTES`], each pool holds
@@ -155,7 +169,8 @@ const CLIENT_STREAMING_METHOD_PATHS: &[&str] = &[
 ];
 
 /// Request header in which a trusted reverse proxy names the client
-/// connection a request arrived on, as one `ip:port` address.
+/// connection a request arrived on, as one `ip:port` address or one bare IP
+/// address.
 ///
 /// Read only when the listener uses [`ClientAddressSource::ProxyHeader`].
 pub const PROXY_CLIENT_ADDRESS_HEADER: &str = "x-zinder-client-address";
@@ -303,8 +318,8 @@ pub enum ClientAddressSource {
     /// The [`PROXY_CLIENT_ADDRESS_HEADER`] that a reverse proxy sets on every
     /// request it forwards. A request counts against the connection's remote
     /// address instead when it carries no such header, carries it more than
-    /// once or as a comma-separated list, or carries a value that is not one
-    /// `ip:port` address.
+    /// once or as a comma-separated list, or carries a value that is neither
+    /// one `ip:port` address nor one bare IP address.
     ///
     /// Any client that reaches the listener can set the header, so use this
     /// only when the listener is reachable solely through a proxy that
@@ -571,17 +586,23 @@ where
 fn client_address<B>(
     request: &http::Request<B>,
     source: ClientAddressSource,
-) -> Option<SocketAddr> {
+) -> Option<ClientFairnessKey> {
     match source {
-        ClientAddressSource::Connection => remote_address(request),
+        ClientAddressSource::Connection => {
+            remote_address(request).map(ClientFairnessKey::Connection)
+        }
         ClientAddressSource::ProxyHeader => match proxy_named_client(request.headers()) {
             Ok(client) => Some(client),
             Err(fallback) => {
-                let peer = remote_address(request);
+                let peer = remote_address(request).map(ClientFairnessKey::Connection);
                 let direct_health_check = fallback == ProxyHeaderFallback::Missing
                     && request.method() == http::Method::POST
                     && request.uri().path() == "/grpc.health.v1.Health/Check"
-                    && peer.is_some_and(|addr| addr.ip().to_canonical().is_loopback());
+                    && matches!(
+                        peer,
+                        Some(ClientFairnessKey::Connection(addr))
+                            if addr.ip().to_canonical().is_loopback()
+                    );
                 if !direct_health_check {
                     metrics::counter!(
                         PROXY_CLIENT_ADDRESS_FALLBACKS_METRIC,
@@ -606,7 +627,7 @@ enum ProxyHeaderFallback {
     /// proxy that appends to the header rather than replacing it forwards
     /// the client's own value first.
     Repeated,
-    /// The header is not one `ip:port` address.
+    /// The header is neither one `ip:port` address nor one bare IP address.
     Invalid,
 }
 
@@ -620,9 +641,9 @@ impl ProxyHeaderFallback {
     }
 }
 
-/// The client connection that the single [`PROXY_CLIENT_ADDRESS_HEADER`] in
-/// `headers` names.
-fn proxy_named_client(headers: &http::HeaderMap) -> Result<SocketAddr, ProxyHeaderFallback> {
+/// The client that the single [`PROXY_CLIENT_ADDRESS_HEADER`] in `headers`
+/// names: an `ip:port` connection, or a bare IP address.
+fn proxy_named_client(headers: &http::HeaderMap) -> Result<ClientFairnessKey, ProxyHeaderFallback> {
     let mut fields = headers.get_all(PROXY_CLIENT_ADDRESS_HEADER).iter();
     let field = fields.next().ok_or(ProxyHeaderFallback::Missing)?;
     if fields.next().is_some() {
@@ -632,7 +653,13 @@ fn proxy_named_client(headers: &http::HeaderMap) -> Result<SocketAddr, ProxyHead
     if address.contains(',') {
         return Err(ProxyHeaderFallback::Repeated);
     }
-    address.parse().map_err(|_| ProxyHeaderFallback::Invalid)
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        return Ok(ClientFairnessKey::Connection(socket));
+    }
+    address
+        .parse::<IpAddr>()
+        .map(ClientFairnessKey::Address)
+        .map_err(|_| ProxyHeaderFallback::Invalid)
 }
 
 /// The remote address of the connection a request arrived on, which tonic
@@ -842,8 +869,8 @@ mod tests {
     use tonic::transport::server::TcpConnectInfo;
 
     use super::{
-        CLIENT_STREAMING_METHOD_PATHS, ClientAddressSource, PROXY_CLIENT_ADDRESS_HEADER,
-        client_address,
+        CLIENT_STREAMING_METHOD_PATHS, ClientAddressSource, ClientFairnessKey,
+        PROXY_CLIENT_ADDRESS_HEADER, client_address,
     };
 
     const PROXY_CONNECTION: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000);
@@ -865,14 +892,30 @@ mod tests {
 
     #[test]
     fn a_trusted_proxy_header_names_the_client() -> Result<(), Box<dyn std::error::Error>> {
-        for (header, client) in [
-            ("203.0.113.7:51234", "203.0.113.7:51234"),
-            ("[2001:db8::7]:443", "[2001:db8::7]:443"),
+        for (header, expected) in [
+            // `ip:port` headers key the connection, bracketed or not.
+            (
+                "203.0.113.7:51234",
+                ClientFairnessKey::Connection("203.0.113.7:51234".parse()?),
+            ),
+            (
+                "[2001:db8::7]:443",
+                ClientFairnessKey::Connection("[2001:db8::7]:443".parse()?),
+            ),
+            // Bare IP headers key the whole address, as GCP GXLB emits.
+            (
+                "203.0.113.7",
+                ClientFairnessKey::Address("203.0.113.7".parse()?),
+            ),
+            (
+                "2001:db8::1",
+                ClientFairnessKey::Address("2001:db8::1".parse()?),
+            ),
         ] {
             let request = proxied_request(&[header])?;
             assert_eq!(
                 client_address(&request, ClientAddressSource::ProxyHeader),
-                Some(client.parse()?)
+                Some(expected)
             );
         }
         Ok(())
@@ -883,7 +926,7 @@ mod tests {
         let request = proxied_request(&["203.0.113.7:51234"])?;
         assert_eq!(
             client_address(&request, ClientAddressSource::Connection),
-            Some(PROXY_CONNECTION)
+            Some(ClientFairnessKey::Connection(PROXY_CONNECTION))
         );
         Ok(())
     }
@@ -892,7 +935,7 @@ mod tests {
     fn a_proxy_header_that_is_not_one_address_counts_the_connection() -> Result<(), http::Error> {
         let not_one_address: [&[&str]; 9] = [
             &[],
-            &["203.0.113.7"],
+            &["203.0.113.7:"],
             &["client-1"],
             &[""],
             &[" 203.0.113.7:51234"],
@@ -907,7 +950,7 @@ mod tests {
             let request = proxied_request(fields)?;
             assert_eq!(
                 client_address(&request, ClientAddressSource::ProxyHeader),
-                Some(PROXY_CONNECTION),
+                Some(ClientFairnessKey::Connection(PROXY_CONNECTION)),
                 "{fields:?}"
             );
         }
@@ -923,6 +966,8 @@ mod tests {
             proxied_request(&[])?,
             proxied_request(&["198.51.100.4:443", "203.0.113.7:51234"])?,
             proxied_request(&["203.0.113.7:51234, 198.51.100.4:443"])?,
+            proxied_request(&["203.0.113.7:"])?,
+            // A bare IP is a valid client, not a fallback.
             proxied_request(&["203.0.113.7"])?,
             proxied_request(&["203.0.113.7:51234"])?,
         ];
@@ -999,9 +1044,9 @@ mod tests {
             let expected = if let [address] = headers
                 && reason.is_none()
             {
-                Some(address.parse()?)
+                Some(ClientFairnessKey::Connection(address.parse()?))
             } else {
-                peer
+                peer.map(ClientFairnessKey::Connection)
             };
             assert_eq!(client, expected);
             let scrape = recorder.handle().render();
