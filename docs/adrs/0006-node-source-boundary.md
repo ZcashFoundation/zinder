@@ -26,6 +26,8 @@ Fresh construction also needs more than one block per call. A round trip per blo
 
 Continuous following uses one block update at a time rather than treating a historical segment as a live stream ([ADR-0009](0009-ingest-lifecycle-and-construction.md)). [Node source boundary](../architecture/node-source-boundary.md) describes the adapters, the capability model, and node authentication.
 
+Verified snapshot bootstrap uses the configured `NodeSource` to attest the chain identity, activation schedule, final trees, subtree roots, and sampled block commitments before publication. [ADR-0024](0024-verified-edge-snapshot-bootstrap.md).
+
 ## Evidence
 
 - Decision 5, the light-wallet composition's node-backed reads: judgment on measured cost. [ADR-0023](0023-deployment-profiles.md) decision 4 records the measurements, and [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7 records the verification of each answer.

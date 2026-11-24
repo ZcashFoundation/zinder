@@ -28,6 +28,7 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `CanonicalEventFence` | Proof of one writer position: chain epoch, event sequence, visible tip, and sequence digest. A reader compares fences to prove it sees exactly what the writer committed. | `zinder-store` |
 | `CanonicalWriterFence` | The wire form of the writer's fence, returned by `CanonicalControl.WriterStatus`. Writer and readers both encode it with `zinder_proto::wire::canonical_writer_fence_message`. | `zinder.v1.ingest` |
 | `CanonicalActivationSchedule` | The network-upgrade activation table the writer admitted, with its revision and admission tip. | `zinder-store` |
+| `EdgeSnapshotManifest` | Signed checkpoint inventory and consensus commitments for initializing a canonical writer. [ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md) defines the artifact. | `zinder-store` |
 | `CanonicalBlockFacts` | Everything about one block that replay and materialized views need. | `zinder-core` |
 | `ChainEvent` | A durable canonical append or replacement. | `zinder-store`, `zinder-client` |
 | `MempoolEvent` | A live-pool change: added, invalidated, or mined. | `zinder-store`, `zinder-client` |
