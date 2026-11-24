@@ -118,6 +118,179 @@ impl TransactionCache {
 mod tests {
     use super::*;
 
+    use std::{pin::pin, task::Poll, time::Duration};
+
+    use eyre::{Result, eyre};
+    use parking_lot::Condvar;
+    use serde_json::json;
+    use tokio::{sync::mpsc, task::JoinSet, time::timeout};
+    use zinder_core::{
+        BlockHeight, BlockId, Network, NetworkUpgradeActivations,
+        wire::{encode_branch_id_hex, encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex},
+    };
+    use zinder_source::NodeAuth;
+    use zinder_testkit::{
+        ChainFixture, JsonRpcStub, JsonRpcTestServer, RpcReply, WalletServingStoreFixture, method,
+        sample_regtest_upgrade_activations,
+    };
+
+    #[tokio::test]
+    async fn cold_fetch_refuses_a_thirty_third_miss_and_releases_a_cancelled_slot() -> Result<()> {
+        let (_store, reader, schedule) = cold_fetch_fixture()?;
+        let tip = reader.event_fence().visible_tip();
+        let location = |byte| TransactionLocation {
+            serialized_bytes_sha256: Some(
+                SerializedBytesDigest::from_serialized_bytes(&[0x55]).as_bytes(),
+            ),
+            ..TransactionLocation::new(
+                TransactionId::from_bytes([byte; 32]),
+                tip.height,
+                tip.hash,
+                0,
+            )
+        };
+        let replacement = location(33);
+        let replacement_txid = encode_rpc_transaction_id_hex(replacement.transaction_id);
+        let (entered, mut calls) = mpsc::unbounded_channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let stub =
+            blocked_transaction_stub(tip, replacement_txid.clone(), entered, Arc::clone(&gate));
+        let node = cold_fetch_node(&schedule, tip, stub)?;
+        let source = Arc::new(ColdTransactionSource::new(ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            node.url(),
+            NodeAuth::None,
+            Duration::from_secs(20),
+        )?));
+        let mut misses = JoinSet::new();
+        let mut spawn_miss = |byte| {
+            let (source, reader, location) = (source.clone(), reader.clone(), location(byte));
+            misses.spawn(async move { source.fetch(reader.as_ref(), location).await })
+        };
+        let first = spawn_miss(0);
+        for byte in 1..32 {
+            spawn_miss(byte);
+        }
+        timeout(Duration::from_secs(10), async {
+            for _ in 0..32 {
+                calls
+                    .recv()
+                    .await
+                    .ok_or_else(|| eyre!("node never received the cold request"))?;
+            }
+            Ok::<_, eyre::Report>(())
+        })
+        .await??;
+
+        let mut excess = pin!(source.fetch(reader.as_ref(), location(32)));
+        assert!(matches!(futures_util::poll!(&mut excess),
+            Poll::Ready(Err(QueryError::Node(SourceError::NodeUnavailable { reason })))
+                if reason.contains("cold transaction fetch slots are full")
+        ));
+        assert_eq!(calls.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        first.abort();
+        assert!(matches!(misses.join_next().await, Some(Err(error)) if error.is_cancelled()));
+        assert_eq!(
+            timeout(
+                Duration::from_secs(5),
+                source.fetch(reader.as_ref(), replacement)
+            )
+            .await??,
+            [0x55]
+        );
+        assert_eq!(calls.try_recv()?, replacement_txid);
+        assert_eq!(calls.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
+        let (released, ready) = &*gate;
+        *released.lock() = true;
+        ready.notify_all();
+        while let Some(reply) = misses.join_next().await {
+            assert_eq!(reply??, [0x55]);
+        }
+        Ok(())
+    }
+
+    fn cold_fetch_fixture() -> Result<(
+        WalletServingStoreFixture,
+        Arc<crate::RocksDbCanonicalReader>,
+        NetworkUpgradeActivations,
+    )> {
+        let schedule = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            sample_regtest_upgrade_activations()
+                .activations()
+                .iter()
+                .zip(1..)
+                .map(
+                    |(activation, height)| zinder_core::NetworkUpgradeActivation {
+                        activation_height: BlockHeight::new(height),
+                        ..activation.clone()
+                    },
+                )
+                .collect(),
+        )?;
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+        let reader = Arc::new(crate::RocksDbCanonicalReader::new(store.take_readers()?.0)?);
+        Ok((store, reader, schedule))
+    }
+
+    fn blocked_transaction_stub(
+        tip: BlockId,
+        replacement_txid: String,
+        entered: mpsc::UnboundedSender<String>,
+        node_gate: Arc<(Mutex<bool>, Condvar)>,
+    ) -> JsonRpcStub {
+        method("getrawtransaction").reply_with(move |params| {
+            // The stub server records the request only after the reply handler returns.
+            let _ = entered.send(params[0].as_str().unwrap_or_default().to_owned());
+            if params[0] != replacement_txid {
+                let (released, ready) = &*node_gate;
+                let mut released = released.lock();
+                ready.wait_while_for(
+                    &mut released,
+                    |released| !*released,
+                    Duration::from_secs(20),
+                );
+                if !*released {
+                    return RpcReply::error("cold fetch fixture timed out");
+                }
+            }
+            RpcReply::result(json!({
+                "txid": params[0], "hex": "55", "height": tip.height.value(),
+                "blockhash": encode_rpc_block_hash_hex(tip.hash),
+            }))
+        })
+    }
+
+    fn cold_fetch_node(
+        schedule: &NetworkUpgradeActivations,
+        tip: BlockId,
+        fetch: JsonRpcStub,
+    ) -> Result<JsonRpcTestServer> {
+        let upgrades: serde_json::Map<_, _> = schedule
+            .activations()
+            .iter()
+            .map(|activation| {
+                (
+                    encode_branch_id_hex(activation.branch_id),
+                    json!({"name": activation.name, "status": "active",
+                    "activationheight": activation.activation_height.value()}),
+                )
+            })
+            .collect();
+        JsonRpcTestServer::start([
+            method("rpc.discover").reply_with(|_| {
+                RpcReply::result(json!({"methods": [{"name": "sendrawtransaction"}]}))
+            }),
+            method("getblockchaininfo")
+                .reply_with(move |_| RpcReply::result(json!({"upgrades": upgrades}))),
+            method("getblockhash")
+                .reply_with(move |_| RpcReply::result(json!(encode_rpc_block_hash_hex(tip.hash)))),
+            fetch,
+        ])
+    }
+
     #[test]
     fn cache_evicts_by_bytes_and_recency_and_separates_digests() {
         let mut cache = TransactionCache::default();

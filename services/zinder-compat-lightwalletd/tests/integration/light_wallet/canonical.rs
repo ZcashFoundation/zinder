@@ -9,7 +9,7 @@ use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Status};
 use tonic_types::StatusExt as _;
-use zinder_compat_lightwalletd::IngestControlMempoolSurface;
+use zinder_compat_lightwalletd::{IngestControlMempoolSurface, LightwalletdGrpcAdapter};
 use zinder_core::{
     BlockHeight, CompactTransactionData, MempoolEntry, MempoolObservation, Network,
     RawTransactionBytes, ShieldedProtocol, TransactionId,
@@ -20,12 +20,17 @@ use zinder_core::{
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_server::CompactTxStreamer as _,
 };
-use zinder_query::{CanonicalReader as _, WalletServingReadiness};
+use zinder_query::{
+    CanonicalReader as _, OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair, WalletServingReadiness,
+};
 use zinder_runtime::{Readiness, ReadinessCause, ReadinessInput, ReadinessState};
+use zinder_source::{NodeAuth, ZebraJsonRpcSource};
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, IngestControlFixture, RpcReply,
-    commitment_tree_checkpoints, method, sample_regtest_upgrade_activations, with_note_commitments,
+    ChainFixture, FixtureTransactionRows, IngestControlFixture, JsonRpcTestServer, RpcReply,
+    WalletServingStoreFixture, commitment_tree_checkpoints, method,
+    sample_regtest_upgrade_activations, with_note_commitments,
 };
 
 use super::Fixture;
@@ -1042,14 +1047,6 @@ async fn transactions_of_one_block_use_their_indexed_digests() -> Result<()> {
 #[tokio::test]
 async fn lean_wallet_verifies_and_caches_mined_bytes_without_forwarding_address_lookups()
 -> Result<()> {
-    use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
-    use zinder_query::{
-        OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot,
-        WalletServingQuery, WalletServingReadPair,
-    };
-    use zinder_source::{NodeAuth, ZebraJsonRpcSource};
-    use zinder_testkit::WalletServingStoreFixture;
-
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(1);
@@ -1063,11 +1060,6 @@ async fn lean_wallet_verifies_and_caches_mined_bytes_without_forwarding_address_
     ));
     let schedule = super::one_upgrade_per_height()?;
     let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
-    let (canonical, wallet) = store.take_readers()?;
-    let pair = WalletServingReadPair::new(
-        Arc::new(RocksDbCanonicalReader::new(canonical)?),
-        Arc::new(RocksDbWalletReader::new(wallet)),
-    )?;
     let node = super::verifiable_node(
         &schedule,
         block.hash,
@@ -1076,16 +1068,7 @@ async fn lean_wallet_verifies_and_caches_mined_bytes_without_forwarding_address_
             method("getrawtransaction").reply(mined_reply(id, block, "55")),
         ],
     )?;
-    let source = ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        node.url(),
-        NodeAuth::None,
-        Duration::from_secs(2),
-    )?;
-    let query =
-        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)))
-            .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
-            .with_verified_cold_transactions();
+    let query = lean_wallet_query(&mut store, &node)?.with_verified_cold_transactions();
     assert!(query.has_verified_cold_tx_source());
     let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?;
 
@@ -1122,4 +1105,149 @@ async fn lean_wallet_verifies_and_caches_mined_bytes_without_forwarding_address_
         vec![0x55]
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn lean_wallet_history_selects_local_rows_and_verifies_cold_bodies() -> Result<()> {
+    use zinder_core::wire::encode_rpc_transaction_id_hex;
+
+    let block = super::served_tip(1)?;
+    let first = TransactionId::from_bytes([0x55; 32]);
+    let second = TransactionId::from_bytes([0x56; 32]);
+    let unrelated = TransactionId::from_bytes([0x57; 32]);
+    let chain = lean_history_chain(
+        block,
+        [
+            (first, 0x55, true),
+            (second, 0x56, true),
+            (unrelated, 0x57, false),
+        ],
+    )?;
+    let schedule = super::one_upgrade_per_height()?;
+    let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let node = super::verifiable_node(
+        &schedule,
+        block.hash,
+        [
+            method("getaddresstxids").reply(RpcReply::result(json!([
+                encode_rpc_transaction_id_hex(unrelated)
+            ]))),
+            method("getrawtransaction").reply(mined_reply(first, block, "99")),
+            method("getrawtransaction").reply_with(move |params| {
+                if params[0] == encode_rpc_transaction_id_hex(first) {
+                    mined_reply(first, block, "55")
+                } else if params[0] == encode_rpc_transaction_id_hex(second) {
+                    mined_reply(second, block, "56")
+                } else {
+                    RpcReply::error("transaction is outside the selected address history")
+                }
+            }),
+        ],
+    )?;
+    let query = lean_wallet_query(&mut store, &node)?;
+    let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(
+        query.clone().with_verified_cold_transactions(),
+    )?;
+    let mut corrupt = adapter
+        .get_taddress_txids(super::history_request(1, 1))
+        .await?
+        .into_inner();
+    let refusal = corrupt
+        .next()
+        .await
+        .transpose()
+        .err()
+        .ok_or_else(|| eyre!("history accepted bytes that disagree with the indexed digest"))?;
+    assert_eq!(refusal.code(), Code::DataLoss);
+    drop(corrupt);
+
+    let ids = adapter
+        .get_taddress_txids(super::history_request(1, 1))
+        .await?
+        .into_inner();
+    let current_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(
+        query.with_verified_cold_transactions(),
+    )?;
+    let transactions = current_adapter
+        .get_taddress_transactions(super::history_request(1, 1))
+        .await?
+        .into_inner();
+    for mut stream in [ids, transactions] {
+        for expected in [0x55, 0x56] {
+            let row = stream
+                .next()
+                .await
+                .transpose()?
+                .ok_or_else(|| eyre!("missing history row"))?;
+            assert_eq!((row.height, row.data), (1, vec![expected]));
+        }
+        assert!(
+            stream.next().await.is_none(),
+            "history included an unrelated transaction"
+        );
+    }
+    assert_eq!(node.requests_for("getrawtransaction")?.len(), 5);
+    assert!(node.requests_for("getaddresstxids")?.is_empty());
+    Ok(())
+}
+
+fn lean_wallet_query(
+    store: &mut WalletServingStoreFixture,
+    node: &JsonRpcTestServer,
+) -> Result<WalletServingQuery<Option<OrderedBroadcaster<ZebraJsonRpcSource>>>> {
+    let (canonical, wallet) = store.take_readers()?;
+    let pair = WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        node.url(),
+        NodeAuth::None,
+        Duration::from_secs(2),
+    )?;
+    Ok(
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)))
+            .with_node_broadcast(Some(OrderedBroadcaster::new(source, []))),
+    )
+}
+
+fn lean_history_chain(
+    block: zinder_core::BlockId,
+    transactions: [(TransactionId, u8, bool); 3],
+) -> Result<ChainFixture> {
+    use zinder_core::{
+        TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
+    };
+    use zinder_source::parse_transparent_address;
+
+    let script = parse_transparent_address(super::ADDRESS)?
+        .script()
+        .as_raw_bytes()
+        .to_vec();
+    let hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+    let mut chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(1);
+    for ((id, byte, matches_address), index) in transactions.into_iter().zip(0..) {
+        chain = chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            id,
+            block.height,
+            block.hash,
+            index,
+            vec![byte],
+        ));
+        if matches_address {
+            chain = chain.with_address_output_index(TransparentUnspentOutput::new(
+                hash,
+                script.clone(),
+                TransparentOutPoint::new(id, 0),
+                1,
+                block.height,
+                block.hash,
+            ));
+        }
+    }
+
+    Ok(chain)
 }
