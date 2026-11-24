@@ -547,6 +547,21 @@ impl ZebraJsonRpcSource {
         })
     }
 
+    /// Returns a clone whose every JSON-RPC call uses the readiness-probe
+    /// slot instead of the `node.max_concurrent_requests` budget.
+    ///
+    /// A readiness probe that verifies the node before it observes it, such
+    /// as reading its methods, activation table, and tip block, runs through
+    /// this view so calls holding every shared slot cannot fail readiness.
+    /// The clone shares the client, capability cache, and both slot pools.
+    #[must_use]
+    pub fn for_readiness_probes(&self) -> Self {
+        Self {
+            call_budget: self.call_budget.readiness_view(),
+            ..self.clone()
+        }
+    }
+
     /// Sets the indexer endpoint whose mempool stream
     /// [`MempoolSourceFactory::mempool_source`] follows. `None` selects
     /// JSON-RPC mempool polling.
@@ -1952,33 +1967,27 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
         let params = positional_params([Value::from(raw_transaction_hex)])?;
 
         let started_at = Instant::now();
-        // Waiting for a slot counts against the broadcast timeout, so a
-        // saturated budget still fails over to the next endpoint in time.
+        // Waiting for a slot counts against the broadcast deadline, so a
+        // saturated budget never stretches one broadcast past its timeout and
+        // still fails over to the next endpoint in time.
+        let call_timeout = self.broadcast_timeout.unwrap_or(self.request_timeout);
         let slot = self
             .call_budget
-            .admit(
-                NodeCallLane::Shared,
-                "sendrawtransaction",
-                self.broadcast_timeout.unwrap_or(self.request_timeout),
-            )
+            .admit(NodeCallLane::Shared, "sendrawtransaction", call_timeout)
             .await?;
         let client_snapshot = self.request_client()?;
         let broadcast_fut = client_snapshot.request::<String, _>("sendrawtransaction", params);
 
-        let response = if let Some(timeout_duration) = self.broadcast_timeout {
-            let remaining = timeout_duration.saturating_sub(started_at.elapsed());
-            match tokio::time::timeout(remaining, broadcast_fut).await {
-                Ok(outcome) => outcome,
-                Err(_elapsed) => Err(ClientError::Transport(
-                    std::io::Error::other(format!(
-                        "sendrawtransaction timed out after {}ms",
-                        timeout_duration.as_millis()
-                    ))
-                    .into(),
-                )),
-            }
-        } else {
-            broadcast_fut.await
+        let remaining = call_timeout.saturating_sub(started_at.elapsed());
+        let response = match tokio::time::timeout(remaining, broadcast_fut).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(ClientError::Transport(
+                std::io::Error::other(format!(
+                    "sendrawtransaction timed out after {}ms",
+                    call_timeout.as_millis()
+                ))
+                .into(),
+            )),
         };
         drop(slot);
         record_json_rpc_client_result("sendrawtransaction", started_at, &response);

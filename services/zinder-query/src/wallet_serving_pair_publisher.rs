@@ -1070,9 +1070,12 @@ impl crate::LightWalletNodeQuery {
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut outage = None;
+            // Verification and observation use the readiness-probe slot, so
+            // forwarded calls holding every shared slot cannot fail readiness.
+            let probe_node = self.readiness_probe_node();
             loop {
                 let probe = async {
-                    let node = self.verified_current_node().await?;
+                    let node = self.verify_current(&probe_node).await?;
                     probe_wallet_node_readiness(node).await
                 };
                 let observation = tokio::select! {

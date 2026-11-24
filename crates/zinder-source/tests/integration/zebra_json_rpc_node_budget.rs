@@ -272,3 +272,59 @@ async fn health_probes_answer_while_every_shared_slot_is_held() -> eyre::Result<
     slow_call.await??;
     Ok(())
 }
+
+/// Without `broadcast_timeout`, a broadcast that queued for a call slot still
+/// ends within one `request_timeout`, counted from when it started waiting.
+#[tokio::test]
+async fn queued_broadcast_without_its_own_timeout_ends_within_the_request_timeout()
+-> eyre::Result<()> {
+    const REQUEST_TIMEOUT: Duration = Duration::from_millis(1_000);
+    let server = JsonRpcTestServer::start([
+        method("getrawtransaction").reply_with(|_params| {
+            RpcReply::delayed(Duration::from_millis(600), RpcReply::result(json!("00")))
+        }),
+        method("sendrawtransaction").reply_with(|_params| {
+            RpcReply::delayed(
+                Duration::from_millis(900),
+                RpcReply::result(json!("ab".repeat(32))),
+            )
+        }),
+    ])?;
+    let source = ZebraJsonRpcSource::with_options(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::None,
+        ZebraJsonRpcSourceOptions {
+            request_timeout: REQUEST_TIMEOUT,
+            broadcast_timeout: None,
+            max_concurrent_requests: NonZeroU32::MIN,
+            ..ZebraJsonRpcSourceOptions::default()
+        },
+    )?;
+    let holder = source.clone();
+    let held_slot = tokio::spawn(async move {
+        holder
+            .fetch_raw_transaction_bytes(TransactionId::from_bytes([0x24; 32]))
+            .await
+    });
+    while server.requests_for("getrawtransaction")?.is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let started_at = std::time::Instant::now();
+    let outcome = source
+        .broadcast_transaction(RawTransactionBytes::new([0x04]))
+        .await;
+    let elapsed = started_at.elapsed();
+
+    assert!(
+        matches!(&outcome, Err(SourceError::NodeUnavailable { reason }) if reason.contains("timed out after 1000ms")),
+        "a queued broadcast must time out at the request timeout, got {outcome:?}"
+    );
+    assert!(
+        elapsed < REQUEST_TIMEOUT + Duration::from_millis(300),
+        "the queued broadcast took {elapsed:?}, longer than one request timeout"
+    );
+    held_slot.await??;
+    Ok(())
+}

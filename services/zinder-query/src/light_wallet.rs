@@ -78,8 +78,24 @@ impl LightWalletNodeQuery {
     /// Verifies the configured node against the currently served reader, and
     /// refuses when that reader changes during verification.
     pub(crate) async fn verified_current_node(&self) -> Result<&ZebraJsonRpcSource, SourceError> {
+        self.verify_current(&self.source).await
+    }
+
+    /// Returns the readiness-probe view of the configured node, whose calls
+    /// never wait behind forwarded calls.
+    pub(crate) fn readiness_probe_node(&self) -> ZebraJsonRpcSource {
+        self.source.for_readiness_probes()
+    }
+
+    /// Verifies `node`, the configured node or a view of it, against the
+    /// currently served reader, and refuses when that reader changes during
+    /// verification. Every view shares one verification state.
+    pub(crate) async fn verify_current<'node>(
+        &self,
+        node: &'node ZebraJsonRpcSource,
+    ) -> Result<&'node ZebraJsonRpcSource, SourceError> {
         let target = VerifiedNodeTarget::of((self.capture)().as_ref())?;
-        let node = self.verified_node(&target).await?;
+        self.verification.verify(node, &target.0).await?;
         if !target.0.still_served_by((self.capture)().as_ref()) {
             return Err(SourceError::NodeUnavailable {
                 reason:

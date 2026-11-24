@@ -585,6 +585,10 @@ fn chain_value_pools_response(
 fn status_from_source_error(error: &SourceError) -> Status {
     match error {
         SourceError::NodeUnavailable { reason } => Status::unavailable(reason.clone()),
+        SourceError::NodeRateLimited { .. } => zinder_proto::status_for_reason(
+            zinder_proto::v1::ops::ErrorReason::NodeRateLimited,
+            error.to_string(),
+        ),
         SourceError::NodeCapabilityMissing { capability } => {
             Status::failed_precondition(format!("upstream node is missing {capability}"))
         }
@@ -1080,6 +1084,7 @@ mod tests {
                 BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32])),
                 vec![ChainValuePool::new("transparent", true, Some(1_000))],
             ),
+            rate_limited: false,
         };
         let adapter = CanonicalIngestControlGrpcAdapter::new(
             zinder_core::Network::ZcashTestnet,
@@ -1118,6 +1123,46 @@ mod tests {
             Some(expected_epoch.id.value())
         );
 
+        fixture.shutdown().await
+    }
+
+    /// A node that refuses the value-pool read with HTTP 429 reaches the
+    /// client as retryable `UNAVAILABLE` with `NODE_RATE_LIMITED`, not as
+    /// `INTERNAL`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limited_value_pool_read_is_unavailable_with_its_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let source = StaticValuePoolSource {
+            capabilities: NodeCapabilities::new([NodeCapability::ChainValuePools])?,
+            value_pools: ChainValuePools::new(
+                BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x42; 32])),
+                Vec::new(),
+            ),
+            rate_limited: true,
+        };
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            Arc::new(source),
+            ComposedReadiness::new(Readiness::default(), &[]),
+        );
+
+        let status = IngestControl::chain_value_pools_at_tip(
+            &adapter,
+            Request::new(zinder_proto::v1::wallet::ChainValuePoolsAtTipRequest {}),
+        )
+        .await
+        .err()
+        .ok_or("a rate-limited node must fail the value-pool read")?;
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("NODE_RATE_LIMITED".to_owned())
+        );
         fixture.shutdown().await
     }
 
@@ -1720,6 +1765,7 @@ mod tests {
     struct StaticValuePoolSource {
         capabilities: NodeCapabilities,
         value_pools: ChainValuePools,
+        rate_limited: bool,
     }
 
     #[async_trait]
@@ -1754,6 +1800,11 @@ mod tests {
         }
 
         async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
+            if self.rate_limited {
+                return Err(SourceError::NodeRateLimited {
+                    operation: "getblockchaininfo",
+                });
+            }
             Ok(self.value_pools.clone())
         }
     }

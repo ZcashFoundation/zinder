@@ -33,10 +33,13 @@ how ingest follows the mempool.
 The JSON-RPC library exposes no connection-pool limit, so every concurrent call
 can open another HTTP connection. `ZebraJsonRpcSource` therefore admits its
 calls through `node.max_concurrent_requests` slots, shared by every clone of
-the source. A call waits for a slot for at most its own timeout, which for
-`sendrawtransaction` is `node.broadcast_timeout_secs` and includes the wait.
-`tip_id` probes and the `getblockchaininfo` health fallback use one slot of
-their own, so calls that hold every shared slot never delay a readiness probe.
+the source. A call waits for a slot for at most its own timeout. A
+`sendrawtransaction` call counts that wait against its timeout,
+`node.broadcast_timeout_secs` or else `node.request_timeout_secs`, so a queued
+broadcast never runs longer than one timeout. Readiness probes use one slot of
+their own: the tip and `getblockchaininfo` reads, and in lightwalletd serving
+the node verification the probe runs first. Calls that hold every shared slot
+therefore never delay a readiness probe.
 [Configuration](../reference/configuration.md#the-node-sections) gives the
 default and the sizing rule.
 

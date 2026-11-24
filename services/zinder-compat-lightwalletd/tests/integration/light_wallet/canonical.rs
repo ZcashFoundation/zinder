@@ -761,6 +761,61 @@ async fn dependency_probe_reports_a_missing_broadcast_capability_and_a_divergent
     Ok(())
 }
 
+/// The dependency probe verifies and observes the node through its own call
+/// slot, so a forwarded broadcast holding every shared slot does not delay it.
+#[tokio::test]
+async fn dependency_probe_runs_while_forwarded_calls_hold_every_shared_slot() -> Result<()> {
+    const SLOW_BROADCAST: Duration = Duration::from_secs(4);
+    let fixture = Fixture::with_node_options(
+        [method("sendrawtransaction").reply_with(|_| {
+            RpcReply::delayed(SLOW_BROADCAST, RpcReply::result(json!("01".repeat(32))))
+        })],
+        zinder_source::ZebraJsonRpcSourceOptions {
+            request_timeout: Duration::from_secs(5),
+            max_concurrent_requests: std::num::NonZeroU32::MIN,
+            ..zinder_source::ZebraJsonRpcSourceOptions::default()
+        },
+    )?;
+    let broadcasting = fixture.adapter.clone();
+    let broadcast = tokio::spawn(async move { broadcasting.send_transaction(send()).await });
+    while fixture.node.requests_for("sendrawtransaction")?.is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let runtime = Readiness::default();
+    let inputs = WalletServingReadiness::with_node_and_ingest_control(runtime);
+    inputs
+        .canonical_admission()
+        .publish_admission(ReadinessState::ready(Some(1)));
+    let cancel = CancellationToken::new();
+    let probe = fixture.adapter.spawn_node_readiness_probe(
+        inputs,
+        Duration::from_millis(40),
+        cancel.clone(),
+    );
+    tokio::time::timeout(Duration::from_millis(1_500), async {
+        while fixture
+            .node
+            .requests_for("getbestblockheightandhash")?
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok::<(), eyre::Report>(())
+    })
+    .await
+    .map_err(|_| eyre!("the probe waited behind the forwarded broadcast"))??;
+
+    assert!(
+        !broadcast.is_finished(),
+        "the forwarded broadcast must still hold the shared slot"
+    );
+    cancel.cancel();
+    probe.await?;
+    broadcast.await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn checkpointed_tree_state_rejects_genesis_but_preserves_height_lookups() -> Result<()> {
     use super::super::lightwalletd_grpc::{

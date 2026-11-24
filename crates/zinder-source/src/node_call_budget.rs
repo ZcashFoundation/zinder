@@ -31,6 +31,9 @@ pub(crate) struct NodeCallBudget {
     shared: Arc<Semaphore>,
     health: Arc<Semaphore>,
     max_concurrent_requests: NonZeroU32,
+    /// Admits every call through the health slot, for a readiness probe
+    /// that must not queue behind the shared budget.
+    readiness_only: bool,
 }
 
 impl NodeCallBudget {
@@ -42,6 +45,16 @@ impl NodeCallBudget {
             shared: Arc::new(Semaphore::new(shared_slots)),
             health: Arc::new(Semaphore::new(1)),
             max_concurrent_requests,
+            readiness_only: false,
+        }
+    }
+
+    /// Returns a budget sharing these slots that admits every call through
+    /// the health slot.
+    pub(crate) fn readiness_view(&self) -> Self {
+        Self {
+            readiness_only: true,
+            ..self.clone()
         }
     }
 
@@ -56,9 +69,11 @@ impl NodeCallBudget {
         operation: &'static str,
         wait_limit: Duration,
     ) -> Result<SemaphorePermit<'_>, SourceError> {
-        let slots = match lane {
-            NodeCallLane::Shared => &self.shared,
-            NodeCallLane::Health => &self.health,
+        let health_slot = self.readiness_only || lane == NodeCallLane::Health;
+        let slots = if health_slot {
+            &self.health
+        } else {
+            &self.shared
         };
         let wait_started_at = Instant::now();
         match tokio::time::timeout(wait_limit, slots.acquire()).await {
@@ -81,14 +96,20 @@ impl NodeCallBudget {
                     "method" => operation
                 )
                 .increment(1);
-                Err(SourceError::NodeUnavailable {
-                    reason: format!(
+                let reason = if health_slot {
+                    format!(
+                        "{operation} waited {}ms for the readiness-probe JSON-RPC call slot",
+                        wait_limit.as_millis(),
+                    )
+                } else {
+                    format!(
                         "{operation} waited {}ms for one of node.max_concurrent_requests={} \
                          JSON-RPC call slots",
                         wait_limit.as_millis(),
                         self.max_concurrent_requests,
-                    ),
-                })
+                    )
+                };
+                Err(SourceError::NodeUnavailable { reason })
             }
         }
     }
@@ -137,6 +158,39 @@ mod tests {
                 Duration::from_millis(10),
             )
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_view_admits_shared_calls_through_the_health_slot() -> Result<(), SourceError>
+    {
+        let budget = NodeCallBudget::new(limit(1)?);
+        let _held = budget
+            .admit(NodeCallLane::Shared, "getblock", Duration::from_secs(1))
+            .await?;
+        let readiness = budget.readiness_view();
+
+        let probe = readiness
+            .admit(
+                NodeCallLane::Shared,
+                "rpc.discover",
+                Duration::from_millis(10),
+            )
+            .await?;
+        let second_probe = readiness
+            .admit(
+                NodeCallLane::Shared,
+                "getblockhash",
+                Duration::from_millis(10),
+            )
+            .await
+            .err();
+        drop(probe);
+
+        assert!(
+            matches!(&second_probe, Some(SourceError::NodeUnavailable { reason }) if reason.contains("readiness-probe")),
+            "{second_probe:?}"
+        );
         Ok(())
     }
 
