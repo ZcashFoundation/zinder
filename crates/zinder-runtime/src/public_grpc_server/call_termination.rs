@@ -46,7 +46,9 @@ use slab::Slab;
 use tonic::{Status, body::Body};
 use tower::{Layer, Service};
 
-use super::CLIENT_STREAMING_METHOD_PATHS;
+use super::{
+    CLIENT_STREAMING_METHOD_PATHS, release_gate::looking_ahead, wallet_rpc_metrics::RpcCompletion,
+};
 use crate::{ReadinessCause, not_ready_status};
 
 /// How many shards a listener's calls register in.
@@ -261,6 +263,8 @@ enum CallState<F> {
     },
     /// The handler is producing its response body.
     Streaming { body: Body, waker: Option<Waker> },
+    /// The handler is gone, but the gate is still sending preceding DATA.
+    HeldTrailers(Frame<Bytes>),
     /// The runtime ended the call; its status has not been reported yet.
     Terminated,
     /// The call has ended, and its handler is gone.
@@ -295,6 +299,7 @@ impl<F> OpenCall<F> {
             }
             CallState::Responding { .. }
             | CallState::Streaming { .. }
+            | CallState::HeldTrailers(_)
             | CallState::Terminated
             | CallState::Finished => false,
         }
@@ -317,7 +322,7 @@ impl<F: Send> TerminateCall for OpenCall<F> {
     fn terminate(&self) -> bool {
         let mut state = self.state.lock();
         let (was_running, response_waker) = match &mut *state {
-            CallState::Admitted => {
+            CallState::Admitted | CallState::HeldTrailers(_) => {
                 *state = CallState::Terminated;
                 (false, None)
             }
@@ -471,7 +476,10 @@ where
                 this.responded = true;
                 Poll::Ready(Ok(server_stopped().into_http()))
             }
-            CallState::Admitted | CallState::Streaming { .. } | CallState::Finished => {
+            CallState::Admitted
+            | CallState::Streaming { .. }
+            | CallState::HeldTrailers(_)
+            | CallState::Finished => {
                 this.responded = true;
                 Poll::Ready(Ok(server_stopped().into_http()))
             }
@@ -516,6 +524,10 @@ impl<F: Send> CallBody for OpenCall<F> {
                 }
                 Poll::Ready(Some(Ok(frame))) => {
                     if frame.is_trailers() {
+                        if looking_ahead() {
+                            *state = CallState::HeldTrailers(frame);
+                            return Poll::Pending;
+                        }
                         *state = CallState::Finished;
                     }
                     Poll::Ready(Some(Ok(frame)))
@@ -525,9 +537,17 @@ impl<F: Send> CallBody for OpenCall<F> {
                     ended
                 }
             },
+            CallState::HeldTrailers(_) | CallState::Terminated if looking_ahead() => Poll::Pending,
+            CallState::HeldTrailers(trailers) => {
+                let trailers = mem::replace(trailers, Frame::trailers(http::HeaderMap::new()));
+                *state = CallState::Finished;
+                Poll::Ready(Some(Ok(trailers)))
+            }
             CallState::Terminated => {
                 *state = CallState::Finished;
-                Poll::Ready(Some(trailers_reporting(&server_stopped())))
+                let status = server_stopped();
+                RpcCompletion::replace_status(&status);
+                Poll::Ready(Some(trailers_reporting(&status)))
             }
             CallState::Admitted | CallState::Responding { .. } | CallState::Finished => {
                 Poll::Ready(None)
@@ -539,7 +559,7 @@ impl<F: Send> CallBody for OpenCall<F> {
         match &*self.state.lock() {
             CallState::Streaming { body, .. } => body.is_end_stream(),
             CallState::Admitted | CallState::Responding { .. } | CallState::Finished => true,
-            CallState::Terminated => false,
+            CallState::HeldTrailers(_) | CallState::Terminated => false,
         }
     }
 
@@ -548,6 +568,7 @@ impl<F: Send> CallBody for OpenCall<F> {
             CallState::Streaming { body, .. } => body.size_hint(),
             CallState::Admitted
             | CallState::Responding { .. }
+            | CallState::HeldTrailers(_)
             | CallState::Terminated
             | CallState::Finished => SizeHint::default(),
         }
@@ -555,7 +576,10 @@ impl<F: Send> CallBody for OpenCall<F> {
 
     fn release(&self) {
         let mut state = self.state.lock();
-        if matches!(*state, CallState::Streaming { .. }) {
+        if matches!(
+            *state,
+            CallState::Streaming { .. } | CallState::HeldTrailers(_)
+        ) {
             *state = CallState::Finished;
         }
     }

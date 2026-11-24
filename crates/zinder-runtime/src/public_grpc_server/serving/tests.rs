@@ -31,7 +31,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
-use tokio_util::sync::PollSemaphore;
+use tokio_util::sync::{CancellationToken, PollSemaphore};
 use tonic::{
     Code, Request, Status,
     body::Body,
@@ -42,13 +42,17 @@ use tonic_prost::ProstCodec;
 use tower::Service;
 
 use super::PublicGrpcServer;
-use crate::public_grpc_server::release_gate::GateObserver;
+use crate::public_grpc_server::{
+    call_termination::{GrpcCallTerminationLayer, OpenGrpcCalls},
+    release_gate::GateObserver,
+    wallet_rpc_metrics::WalletRpcMetricsLayer,
+};
 
 const STALL: Duration = Duration::from_millis(500);
 /// A bound that a test never reaches, so the other bound alone acts.
 const NEVER: Duration = Duration::from_hours(1);
 const WAIT_LIMIT: Duration = Duration::from_secs(10);
-const STREAM_PATH: &str = "/zinder.test.v1.Scripted/Stream";
+const STREAM_PATH: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange";
 /// Bytes of each scripted message's payload.
 const PAYLOAD: usize = 64 * 1024;
 
@@ -132,7 +136,7 @@ struct Scripted {
 }
 
 impl NamedService for Scripted {
-    const NAME: &'static str = "zinder.test.v1.Scripted";
+    const NAME: &'static str = "cash.z.wallet.sdk.rpc.CompactTxStreamer";
 }
 
 impl Service<http::Request<Body>> for Scripted {
@@ -242,6 +246,7 @@ struct Bounds {
     /// growing it, so a client that stops reading blocks the server's
     /// writes after a few KiB.
     send_buffer: Option<u32>,
+    shutdown: Option<(Arc<OpenGrpcCalls>, CancellationToken)>,
 }
 
 impl Default for Bounds {
@@ -252,6 +257,7 @@ impl Default for Bounds {
             accept_http1: false,
             admission: None,
             send_buffer: None,
+            shutdown: None,
         }
     }
 }
@@ -278,14 +284,23 @@ fn serve(bounds: Bounds) -> Result<TestServer> {
         .with_write_stall_timeout(bounds.write_stall)
         .with_gate_observer(gate_observer)
         .accept_http1(bounds.accept_http1);
-    let server = match bounds.admission {
-        Some(admission) => tokio::spawn(
+    let server = match (bounds.admission, bounds.shutdown) {
+        (Some(admission), None) => tokio::spawn(
             server
                 .layer(AdmissionLayer(admission))
                 .add_service(service)
                 .serve_with_incoming(listener),
         ),
-        None => tokio::spawn(server.add_service(service).serve_with_incoming(listener)),
+        (None, Some((calls, shutdown))) => tokio::spawn(
+            server
+                .transport_layer(tonic_web::GrpcWebLayer::new())
+                .layer(GrpcCallTerminationLayer::new(calls))
+                .layer(WalletRpcMetricsLayer::Lightwalletd)
+                .add_service(service)
+                .serve_with_incoming_shutdown(listener, shutdown.cancelled_owned()),
+        ),
+        (None, None) => tokio::spawn(server.add_service(service).serve_with_incoming(listener)),
+        (Some(_), Some(_)) => bail!("the test listener can only configure one layer"),
     };
     Ok(TestServer {
         address,

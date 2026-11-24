@@ -59,6 +59,16 @@ use super::{
     RELEASE_PROBES_METRIC, stream_reset::TransportReset, wallet_rpc_metrics::RpcCompletion,
 };
 
+tokio::task_local! {
+    static LOOKING_AHEAD: ();
+}
+
+/// Terminal trailers must stay in the tracked call until preceding DATA
+/// departs. This also keeps them replaceable before gRPC-Web encodes them.
+pub(super) fn looking_ahead() -> bool {
+    LOOKING_AHEAD.try_with(|()| ()).is_ok()
+}
+
 /// How a listener gates the responses it sends.
 #[derive(Clone, Debug)]
 pub(super) struct ReleaseGate {
@@ -275,7 +285,7 @@ impl ReleaseGatedBody {
             },
         };
         // Look at what follows `current` before handing it out.
-        match self.poll_inner(cx) {
+        match LOOKING_AHEAD.sync_scope((), || self.poll_inner(cx)) {
             Poll::Ready(Polled::Data(next)) => {
                 self.ahead = Some(next);
                 return self.hand_out(current);
@@ -351,10 +361,9 @@ impl http_body::Body for ReleaseGatedBody {
         }
         this.transport.asked_for_next();
         if this.gate.probe_window {
-            let (frame, completion) = RpcCompletion::capture(|| this.poll_window_gated(cx));
-            if completion.is_some() {
-                this.rpc_completion = completion;
-            }
+            let held = this.rpc_completion.take();
+            let (frame, completion) = RpcCompletion::capture(held, || this.poll_window_gated(cx));
+            this.rpc_completion = completion;
             let ended = match &frame {
                 Poll::Pending => false,
                 Poll::Ready(Some(Ok(frame))) => frame.is_trailers(),

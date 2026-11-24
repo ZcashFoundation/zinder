@@ -2,6 +2,7 @@
 //! an h2 client that controls exactly when it grants window and when it
 //! changes its settings.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use h2::client::{Connection, SendRequest};
 use tokio::{net::TcpStream, sync::watch};
 
@@ -35,13 +36,23 @@ impl H2Client {
     /// Opens a call to the scripted method and returns its response body once
     /// its headers have arrived.
     async fn open_stream(&self) -> Result<h2::RecvStream> {
+        self.open_stream_as("application/grpc", Bytes::from_static(&[0; 5]))
+            .await
+    }
+
+    async fn open_stream_as(
+        &self,
+        content_type: &'static str,
+        request_frame: Bytes,
+    ) -> Result<h2::RecvStream> {
         let mut requests = within_wait_limit(self.requests.clone().ready()).await??;
         let request = http::Request::post(format!("http://localhost{STREAM_PATH}"))
-            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header(http::header::CONTENT_TYPE, content_type)
+            .header(http::header::ACCEPT, content_type)
             .header(http::header::TE, "trailers")
             .body(())?;
         let (response, mut request_body) = requests.send_request(request, false)?;
-        request_body.send_data(Bytes::from_static(&[0; 5]), true)?;
+        request_body.send_data(request_frame, true)?;
         Ok(within_wait_limit(response).await??.into_body())
     }
 
@@ -245,6 +256,163 @@ async fn take_window_back(withheld: &WithheldEnd) -> Result<()> {
         withheld.client.set_stream_window(0)
     })
     .await
+}
+
+#[tokio::test]
+async fn shutdown_replaces_a_status_held_behind_flow_control() -> Result<()> {
+    shutdown_while_sending("application/grpc", false).await
+}
+
+#[tokio::test]
+async fn shutdown_replaces_a_status_before_grpc_web_encodes_it() -> Result<()> {
+    shutdown_while_sending("application/grpc-web+proto", false).await?;
+    shutdown_while_sending("application/grpc-web-text+proto", true).await
+}
+
+#[expect(
+    clippy::future_not_send,
+    reason = "the recorder guard stays on the current-thread test runtime"
+)]
+async fn shutdown_while_sending(content_type: &'static str, text: bool) -> Result<()> {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let calls = Arc::new(OpenGrpcCalls::default());
+    let shutdown = CancellationToken::new();
+    let mut server = serve(Bounds {
+        send_stall: NEVER,
+        shutdown: Some((Arc::clone(&calls), shutdown.clone())),
+        ..Bounds::default()
+    })?;
+    let message = message_frame(PAYLOAD, 0);
+    let (message, request_frame) = if text {
+        (
+            STANDARD.encode(message).into_bytes(),
+            Bytes::from(STANDARD.encode([0; 5])),
+        )
+    } else {
+        (message, Bytes::from_static(&[0; 5]))
+    };
+    let window = u32::try_from(message.len() - 1)?;
+    let client = H2Client::connect(server.address, window).await?;
+    let mut body = client.open_stream_as(content_type, request_frame).await?;
+    let mut script = server.next_script().await?;
+    let producer = script.frames.clone();
+    script.send_message(PAYLOAD).await?;
+    script.finish().await?;
+    within_wait_limit(producer.closed()).await?;
+
+    // Consume the entire window without returning any credit for the probe.
+    let mut received = Vec::new();
+    while received.len() < usize::try_from(window)? {
+        let chunk = within_wait_limit(body.data())
+            .await?
+            .ok_or_else(|| eyre!("the response ended before using its window"))??;
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, message[..message.len() - 1]);
+    assert!(!body.is_end_stream());
+
+    shutdown.cancel();
+    wait_until_async("the listener stops accepting connections", || async {
+        Ok(TcpStream::connect(server.address).await.is_err())
+    })
+    .await?;
+    calls.terminate();
+    assert!(client.set_stream_window(window + 1024).await?);
+
+    while let Some(chunk) = within_wait_limit(body.data()).await? {
+        received.extend_from_slice(&chunk?);
+    }
+    let terminal = received
+        .strip_prefix(message.as_slice())
+        .ok_or_else(|| eyre!("the message changed"))?;
+    let trailers = within_wait_limit(body.trailers()).await??;
+    if content_type == "application/grpc" {
+        assert_eq!(terminal, b"");
+        assert_shutdown_status(
+            &trailers.ok_or_else(|| eyre!("the response ended without trailers"))?,
+        )?;
+    } else {
+        assert!(trailers.is_none());
+        assert_shutdown_status(&decode_web_trailers(terminal, text)?)?;
+    }
+
+    assert_shutdown_completion(&metrics.render())?;
+    within_wait_limit(server.server).await???;
+    Ok(())
+}
+
+fn assert_shutdown_completion(rendered: &str) -> Result<()> {
+    let mut completions = rendered.lines().filter(|line| {
+        line.starts_with("zinder_wallet_rpc_requests_total{")
+            && line.contains("method=\"GetBlockRange\"")
+    });
+    let completion = completions
+        .next()
+        .ok_or_else(|| eyre!("missing completion metric"))?;
+    assert!(
+        completion.contains("grpc_code=\"unavailable\""),
+        "{completion}"
+    );
+    assert!(
+        completion.contains("error_class=\"SERVICE_NOT_READY\""),
+        "{completion}"
+    );
+    assert!(completion.ends_with(" 1"), "{completion}");
+    assert_eq!(completions.next(), None);
+    Ok(())
+}
+
+fn assert_shutdown_status(trailers: &http::HeaderMap) -> Result<()> {
+    use tonic_types::StatusExt as _;
+
+    assert_eq!(
+        trailers
+            .get(Status::GRPC_STATUS)
+            .and_then(|code| code.to_str().ok()),
+        Some("14")
+    );
+    let status =
+        Status::from_header_map(trailers).ok_or_else(|| eyre!("missing shutdown status"))?;
+    let details = status
+        .get_details_error_info()
+        .ok_or_else(|| eyre!("missing shutdown details"))?;
+    assert_eq!(details.reason, "SERVICE_NOT_READY");
+    assert_eq!(
+        details.metadata.get("readiness_cause").map(String::as_str),
+        Some("shutting_down")
+    );
+    Ok(())
+}
+
+fn decode_web_trailers(bytes: &[u8], text: bool) -> Result<http::HeaderMap> {
+    let decoded;
+    let bytes = if text {
+        decoded = STANDARD.decode(bytes)?;
+        decoded.as_slice()
+    } else {
+        bytes
+    };
+    let (header, payload) = bytes
+        .split_at_checked(5)
+        .ok_or_else(|| eyre!("short trailer frame"))?;
+    let [0x80, size @ ..] = header else {
+        bail!("missing gRPC-Web trailer frame");
+    };
+    let size = u32::from_be_bytes(size.try_into()?);
+    assert_eq!(usize::try_from(size)?, payload.len());
+    let mut trailers = http::HeaderMap::new();
+    for line in std::str::from_utf8(payload)?.lines() {
+        let (name, field) = line
+            .split_once(':')
+            .ok_or_else(|| eyre!("malformed trailer"))?;
+        trailers.append(
+            http::HeaderName::from_bytes(name.as_bytes())?,
+            http::HeaderValue::from_str(field)?,
+        );
+    }
+    Ok(trailers)
 }
 
 /// A window taken back before the end leaves the stall timer to reset it.

@@ -58,6 +58,7 @@ raw-cpuid.workspace = true
 x86_64.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 axum = { workspace = true, features = ["ws"] }
 eyre.workspace = true
 h2.workspace = true
@@ -71,6 +72,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-stream.workspace = true
 tonic-prost.workspace = true
+tonic-web.workspace = true
 zinder-testkit.workspace = true
 
 [lints]

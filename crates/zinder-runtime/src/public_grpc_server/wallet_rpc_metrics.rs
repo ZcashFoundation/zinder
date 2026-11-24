@@ -476,11 +476,19 @@ pub(super) struct RpcCompletion {
 impl RpcCompletion {
     /// Captures a completion even when a transport adapter turns the native
     /// trailers into DATA before the gate sees them.
-    pub(super) fn capture<T>(poll: impl FnOnce() -> T) -> (T, Option<Self>) {
-        GATED_COMPLETION.sync_scope(RefCell::new(None), || {
+    pub(super) fn capture<T>(held: Option<Self>, poll: impl FnOnce() -> T) -> (T, Option<Self>) {
+        GATED_COMPLETION.sync_scope(RefCell::new(held), || {
             let frame = poll();
             (frame, GATED_COMPLETION.with(RefCell::take))
         })
+    }
+
+    pub(super) fn replace_status(status: &Status) {
+        let _ = GATED_COMPLETION.try_with(|slot| {
+            if let Some(completion) = slot.borrow_mut().as_mut() {
+                completion.outcome = Outcome::from_status(status);
+            }
+        });
     }
 
     fn finish(self) {

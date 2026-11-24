@@ -6551,6 +6551,7 @@ name = "zinder-runtime"
 version = "0.24.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "config",
@@ -6591,6 +6592,7 @@ dependencies = [
  "tonic-prost",
  "tonic-reflection",
  "tonic-types",
+ "tonic-web",
  "tower",
  "tracing",
  "tracing-subscriber",
