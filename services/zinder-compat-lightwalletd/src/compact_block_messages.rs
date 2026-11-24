@@ -2,7 +2,8 @@
 
 use tonic::Status;
 use zinder_core::{
-    CompactBlockArtifact, CompactShieldedAction, CompactTransaction, CompactTransactionData,
+    BlockHeight, CompactBlockArtifact, CompactShieldedAction, CompactTransaction,
+    CompactTransactionData, NetworkUpgradeActivations, ShieldedProtocol,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
@@ -59,6 +60,14 @@ impl CompactBlockShape {
         transparent: false,
         payload: Payload::SelectedPools,
         ..Self::FULL_BLOCK
+    };
+
+    /// The nullifier-only projection stored by the signed history's second
+    /// slab and the live tail: every stored shielded transaction reduced to
+    /// its nullifiers with an empty chain metadata envelope.
+    pub(crate) const DEFAULT_NULLIFIER_RANGE: Self = Self {
+        payload: Payload::Nullifiers,
+        ..Self::DEFAULT_RANGE
     };
 
     /// `GetBlockNullifiers` retains every stored transaction in nullifier-only
@@ -246,6 +255,45 @@ impl CompactBlockShape {
                 && (!scan.transparent_outputs.is_empty()
                     || (self.payload != Payload::Mempool && !scan.transparent_inputs.is_empty())))
     }
+
+    /// Returns whether this shape is one of the two default projections the
+    /// signed history stores as pre-encoded frames and the live tail caches.
+    pub(crate) fn is_published_shape(self) -> bool {
+        self == Self::DEFAULT_RANGE || self == Self::DEFAULT_NULLIFIER_RANGE
+    }
+
+    /// Returns the published shape whose stored frames carry exactly the
+    /// bytes this shape encodes for every block below Ironwood activation,
+    /// or `None` when this shape differs from one by more than that.
+    ///
+    /// A pool selection that skips only Ironwood still keeps every
+    /// transaction the default keeps and emits the same chain metadata, so
+    /// below activation the two encodings are byte-identical.
+    pub(crate) fn published_equivalent(self) -> Option<Self> {
+        let without_ironwood_choice = Self {
+            ironwood: true,
+            ..self
+        };
+        if without_ironwood_choice == Self::DEFAULT_RANGE {
+            Some(Self::DEFAULT_RANGE)
+        } else if without_ironwood_choice == Self::DEFAULT_NULLIFIER_RANGE {
+            Some(Self::DEFAULT_NULLIFIER_RANGE)
+        } else {
+            None
+        }
+    }
+}
+
+/// Returns whether Ironwood actions can appear in any block at or below
+/// `end`, which is the case exactly when the network's Ironwood upgrade has
+/// activated at or below that height.
+pub(crate) fn ironwood_active_at_or_below(
+    activations: &NetworkUpgradeActivations,
+    end: BlockHeight,
+) -> bool {
+    activations
+        .activation_height_by_name(ShieldedProtocol::Ironwood.activation_upgrade_name())
+        .is_some_and(|activation| activation <= end)
 }
 
 fn encode_actions(
@@ -377,6 +425,152 @@ mod tests {
         assert_eq!(block_nullifiers.vtx[3], nullifiers.vtx[1]);
         assert_eq!(shielded, shielded_expected);
         assert_eq!(transparent, transparent_expected);
+        Ok(())
+    }
+
+    #[test]
+    fn default_nullifier_range_is_what_an_unspecified_request_selects() -> eyre::Result<()> {
+        assert_eq!(
+            CompactBlockShape::for_nullifier_range(&[])?,
+            CompactBlockShape::DEFAULT_NULLIFIER_RANGE
+        );
+        assert!(CompactBlockShape::DEFAULT_NULLIFIER_RANGE.is_published_shape());
+        assert!(CompactBlockShape::DEFAULT_RANGE.is_published_shape());
+        assert!(!CompactBlockShape::BLOCK_NULLIFIERS.is_published_shape());
+        assert!(
+            !CompactBlockShape::for_range(&[lightwalletd::PoolType::Orchard as i32])?
+                .is_published_shape()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_ironwood_omitting_selection_has_a_published_equivalent() -> eyre::Result<()> {
+        let sapling_orchard = &[
+            lightwalletd::PoolType::Sapling as i32,
+            lightwalletd::PoolType::Orchard as i32,
+        ];
+        for (shape, expected) in [
+            (
+                CompactBlockShape::for_range(sapling_orchard)?,
+                Some(CompactBlockShape::DEFAULT_RANGE),
+            ),
+            (
+                CompactBlockShape::for_nullifier_range(sapling_orchard)?,
+                Some(CompactBlockShape::DEFAULT_NULLIFIER_RANGE),
+            ),
+            (
+                CompactBlockShape::DEFAULT_RANGE,
+                Some(CompactBlockShape::DEFAULT_RANGE),
+            ),
+            (
+                CompactBlockShape::DEFAULT_NULLIFIER_RANGE,
+                Some(CompactBlockShape::DEFAULT_NULLIFIER_RANGE),
+            ),
+        ] {
+            assert_eq!(shape.published_equivalent(), expected);
+        }
+        for shape in [
+            CompactBlockShape::for_range(&[lightwalletd::PoolType::Orchard as i32])?,
+            CompactBlockShape::for_range(&[lightwalletd::PoolType::Ironwood as i32])?,
+            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Sapling as i32])?,
+            CompactBlockShape::FULL_BLOCK,
+            CompactBlockShape::BLOCK_NULLIFIERS,
+        ] {
+            assert_eq!(shape.published_equivalent(), None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ironwood_omission_encodes_identically_below_activation() -> eyre::Result<()> {
+        let block = mixed_block()?;
+        let scan = CompactTransactionData {
+            ironwood_actions: vec![CompactShieldedAction {
+                nullifier: [0x41; 32],
+                commitment: [0x42; 32],
+                ephemeral_key: [0x43; 32],
+                ciphertext: [0x44; 52],
+            }],
+            ..CompactTransactionData::default()
+        };
+        let with_ironwood = CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(9), BlockHash::from_bytes([9; 32])),
+            BlockHash::from_bytes([8; 32]),
+            9,
+            vec![CompactTransaction {
+                index: 0,
+                transaction_id: TransactionId::from_bytes([1; 32]),
+                data: scan,
+            }],
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 1,
+                orchard_commitment_tree_size: 2,
+                ironwood_commitment_tree_size: 3,
+            },
+        )?;
+        let without_ironwood = CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(10), BlockHash::from_bytes([10; 32])),
+            BlockHash::from_bytes([9; 32]),
+            10,
+            Vec::new(),
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 1,
+                orchard_commitment_tree_size: 2,
+                ironwood_commitment_tree_size: 3,
+            },
+        )?;
+        let sapling_orchard = &[
+            lightwalletd::PoolType::Sapling as i32,
+            lightwalletd::PoolType::Orchard as i32,
+        ];
+        for (omitting, default) in [
+            (
+                CompactBlockShape::for_range(sapling_orchard)?,
+                CompactBlockShape::DEFAULT_RANGE,
+            ),
+            (
+                CompactBlockShape::for_nullifier_range(sapling_orchard)?,
+                CompactBlockShape::DEFAULT_NULLIFIER_RANGE,
+            ),
+        ] {
+            // A block without Ironwood actions encodes identically either way.
+            assert_eq!(
+                omitting.message(block.clone())?,
+                default.message(block.clone())?
+            );
+            assert_eq!(
+                omitting.message(without_ironwood.clone())?,
+                default.message(without_ironwood.clone())?
+            );
+            // A block carrying Ironwood actions differs, so the equivalence
+            // only holds below activation.
+            assert_ne!(
+                omitting.message(with_ironwood.clone())?,
+                default.message(with_ironwood.clone())?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ironwood_activation_judgement_follows_the_admitted_schedule() -> eyre::Result<()> {
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let activation = activations
+            .activation_height_by_name(ShieldedProtocol::Ironwood.activation_upgrade_name())
+            .ok_or_else(|| eyre::eyre!("fixture schedule lacks Ironwood activation"))?;
+        assert!(!ironwood_active_at_or_below(
+            &activations,
+            BlockHeight::new(activation.value() - 1)
+        ));
+        assert!(ironwood_active_at_or_below(
+            &activations,
+            BlockHeight::new(activation.value())
+        ));
+        assert!(ironwood_active_at_or_below(
+            &activations,
+            BlockHeight::new(activation.value() + 1)
+        ));
         Ok(())
     }
 

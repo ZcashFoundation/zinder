@@ -1,8 +1,29 @@
-//! Signed catalog segment for the default shielded `GetBlockRange`.
+//! Signed catalog segment for the default shielded and nullifier ranges.
+//!
+//! A segment file carries one settled height interval in two slabs of
+//! pre-encoded lightwalletd `CompactBlock` frames, so `GetBlockRange` and
+//! `GetBlockRangeNullifiers` both serve zero-copy byte spans:
+//!
+//! ```text
+//! [Header 128 B]
+//! [Slab 0: shielded frames]     [native_len u32][wire_len u32][payload] per block
+//! [Slab 1: nullifier frames]    same framing, one frame per block
+//! [Index]
+//!   shielded_rel_offsets:  [u32; block_count + 1]   relative to the slab base
+//!   nullifier_rel_offsets: [u32; block_count + 1]
+//!   rows: [hash 32][parent 32][native_len u32][reserved u32]
+//!         [shielded_sha256 32][nullifier_sha256 32] per block
+//! [Trailer: SHA-256 of every byte before it]
+//! ```
+//!
+//! The trailer digest is pinned by the signed catalog and, where the
+//! filesystem provides it, by fs-verity over the whole file. Each row keeps
+//! its own payload digests and chain identity, so a portable file that
+//! changes after admission still fails closed when its bytes are read.
 
 use std::{
     fs::File,
-    io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -20,41 +41,138 @@ use zinder_store::HeightOrder;
 
 use crate::compact_block_messages::CompactBlockShape;
 
-// The magic binds version 2 to the default shielded range projection. All integers are big-endian.
-const MAGIC: &[u8; 8] = b"ZSHRNG02";
-const HEADER_LEN: usize = 52;
+// The magic binds the unified dual-slab segment format. All integers are big-endian.
+const MAGIC: &[u8; 8] = b"ZSHRNG01";
+pub(crate) const HEADER_LEN: usize = 128;
 const LENGTHS_LEN: usize = 8;
 // A row's length field ends with its big-endian payload length, so its last
 // bytes can carry the gRPC message prefix.
 const _: () = assert!(LENGTHS_LEN >= EncodedBlock::PREFIX_LEN);
-const INDEX_LEN: usize = 112;
+// One slab holds at most 4 GiB of frames, the reach of its u32 offset table.
+const MAX_SLAB_BYTES: u64 = u32::MAX as u64;
+const ROW_META_LEN: usize = 136;
+/// Read and write granularity for staged files.
+const STAGING_CHUNK: usize = 256 * 1024;
+const TRAILER_LEN: usize = 32;
 mod index;
 pub(crate) mod verity;
 // Bound the encoded bytes allocated for one authenticated row.
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const SLAB_TARGET_BYTES: usize = 64 * 1024;
+// Bit 0 marks the nullifier slab present, which every segment must carry.
+const SEGMENT_FLAGS_HAS_NULLIFIER_SLAB: u16 = 0x0001;
+
+/// Which slab of a segment a range read serves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SealedSlab {
+    /// Pre-encoded `CompactBlockShape::DEFAULT_RANGE` frames.
+    Shielded,
+    /// Pre-encoded `CompactBlockShape::DEFAULT_NULLIFIER_RANGE` frames.
+    Nullifier,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentIdentity {
     pub(crate) network: Network,
+    pub(crate) artifact_schema: u16,
     pub(crate) start: BlockHeight,
     pub(crate) end: BlockId,
     pub(crate) sha256: [u8; 32],
     pub(crate) verity: Option<[u8; 32]>,
 }
 
-impl SegmentIdentity {
-    fn header(self) -> io::Result<[u8; HEADER_LEN]> {
-        if self.start > self.end.height {
-            return Err(invalid("reversed shielded segment interval"));
-        }
+/// The fixed header of one segment, in file order.
+pub(crate) struct SegmentHeader {
+    network_tag: u32,
+    artifact_schema_version: u16,
+    segment_flags: u16,
+    start_height: u32,
+    block_count: u32,
+    first_prev_hash: [u8; 32],
+    last_block_hash: [u8; 32],
+    shielded_slab_offset: u64,
+    nullifier_slab_offset: u64,
+    index_offset: u64,
+}
+
+/// Reads `N` bytes at `offset` of a fixed-width header field.
+fn field<const N: usize>(bytes: &[u8], offset: usize) -> io::Result<[u8; N]> {
+    bytes
+        .get(offset..offset + N)
+        .and_then(|raw| raw.try_into().ok())
+        .ok_or_else(|| invalid("short shielded segment header"))
+}
+
+impl SegmentHeader {
+    fn encode(self) -> [u8; HEADER_LEN] {
         let mut header = [0; HEADER_LEN];
         header[..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&self.network.id().to_be_bytes());
-        header[12..16].copy_from_slice(&self.start.value().to_be_bytes());
-        header[16..20].copy_from_slice(&self.end.height.value().to_be_bytes());
-        header[20..].copy_from_slice(&encode_internal_block_hash(self.end.hash));
-        Ok(header)
+        header[8..12].copy_from_slice(&self.network_tag.to_be_bytes());
+        header[12..14].copy_from_slice(&self.artifact_schema_version.to_be_bytes());
+        header[14..16].copy_from_slice(&self.segment_flags.to_be_bytes());
+        header[16..20].copy_from_slice(&self.start_height.to_be_bytes());
+        header[20..24].copy_from_slice(&self.block_count.to_be_bytes());
+        header[24..56].copy_from_slice(&self.first_prev_hash);
+        header[56..88].copy_from_slice(&self.last_block_hash);
+        header[88..96].copy_from_slice(&self.shielded_slab_offset.to_be_bytes());
+        header[96..104].copy_from_slice(&self.nullifier_slab_offset.to_be_bytes());
+        header[104..112].copy_from_slice(&self.index_offset.to_be_bytes());
+        header
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if &field::<8>(bytes, 0)? != MAGIC {
+            return Err(invalid("shielded segment magic mismatch"));
+        }
+        if !field::<16>(bytes, 112)?.iter().all(|byte| *byte == 0) {
+            return Err(invalid("shielded segment header reserved bytes are set"));
+        }
+        let u32_at = |offset: usize| field::<4>(bytes, offset).map(u32::from_be_bytes);
+        let u16_at = |offset: usize| field::<2>(bytes, offset).map(u16::from_be_bytes);
+        let u64_at = |offset: usize| field::<8>(bytes, offset).map(u64::from_be_bytes);
+        let hash_at = |offset: usize| field::<32>(bytes, offset);
+        Ok(Self {
+            network_tag: u32_at(8)?,
+            artifact_schema_version: u16_at(12)?,
+            segment_flags: u16_at(14)?,
+            start_height: u32_at(16)?,
+            block_count: u32_at(20)?,
+            first_prev_hash: hash_at(24)?,
+            last_block_hash: hash_at(56)?,
+            shielded_slab_offset: u64_at(88)?,
+            nullifier_slab_offset: u64_at(96)?,
+            index_offset: u64_at(104)?,
+        })
+    }
+}
+
+impl SegmentIdentity {
+    fn block_count(self) -> io::Result<u32> {
+        let span = self
+            .end
+            .height
+            .value()
+            .checked_sub(self.start.value())
+            .ok_or_else(|| invalid("reversed shielded segment interval"))?;
+        span.checked_add(1)
+            .ok_or_else(|| invalid("shielded segment interval exceeds its height type"))
+    }
+
+    /// The interval identity of a segment a writer is about to stage.
+    pub(crate) fn span(
+        network: Network,
+        artifact_schema: u16,
+        start: BlockHeight,
+        end: BlockId,
+    ) -> Self {
+        Self {
+            network,
+            artifact_schema,
+            start,
+            end,
+            sha256: [0; 32],
+            verity: None,
+        }
     }
 
     fn check_block(self, id: BlockId, parent: BlockHash, prior: Option<BlockId>) -> io::Result<()> {
@@ -72,45 +190,114 @@ impl SegmentIdentity {
     }
 }
 
+/// One block's segment-wide authentication data, shared by both slabs.
+pub(crate) struct SealedRow {
+    id: BlockId,
+    parent: BlockHash,
+    /// Stored compact-block bytes the row budgets, before pool filtering.
+    native_bytes: usize,
+    shielded_sha256: [u8; 32],
+    nullifier_sha256: [u8; 32],
+    shielded_validation: OnceLock<Result<(), PayloadError>>,
+    nullifier_validation: OnceLock<Result<(), PayloadError>>,
+}
+
+impl SealedRow {
+    fn sha256(&self, slab: SealedSlab) -> &[u8; 32] {
+        match slab {
+            SealedSlab::Shielded => &self.shielded_sha256,
+            SealedSlab::Nullifier => &self.nullifier_sha256,
+        }
+    }
+
+    fn validation(&self, slab: SealedSlab) -> &OnceLock<Result<(), PayloadError>> {
+        match slab {
+            SealedSlab::Shielded => &self.shielded_validation,
+            SealedSlab::Nullifier => &self.nullifier_validation,
+        }
+    }
+
+    fn check_digest(&self, slab: SealedSlab, payload: &[u8]) -> Result<(), PayloadError> {
+        if <[u8; 32]>::from(Sha256::digest(payload)) != *self.sha256(slab) {
+            return Err(PayloadError::Digest);
+        }
+        Ok(())
+    }
+
+    fn verify_payload(
+        &self,
+        slab: SealedSlab,
+        payload: &Bytes,
+        kernel_verified: bool,
+    ) -> Result<(), PayloadError> {
+        // Portable files can change between reads. Only authenticated bytes share a verdict.
+        if !kernel_verified {
+            self.check_digest(slab, payload)?;
+        }
+        *self.validation(slab).get_or_init(|| {
+            if kernel_verified {
+                self.check_digest(slab, payload)?;
+            }
+            let block = lightwalletd::CompactBlock::decode(payload.clone())
+                .map_err(|_| PayloadError::Protobuf)?;
+            if block.height != u64::from(self.id.height.value())
+                || block.hash != encode_internal_block_hash(self.id.hash)
+                || block.prev_hash != encode_internal_block_hash(self.parent)
+            {
+                return Err(PayloadError::Identity);
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+enum PayloadError {
+    #[error("shielded segment payload SHA-256 mismatch")]
+    Digest,
+    #[error("malformed shielded segment CompactBlock protobuf")]
+    Protobuf,
+    #[error("shielded segment payload height, hash, or parent differs from its index")]
+    Identity,
+}
 pub(crate) struct SegmentWriter {
     identity: SegmentIdentity,
     target: PathBuf,
     staged: Option<BufWriter<NamedTempFile>>,
-    digest: Sha256,
-    verity: Box<dyn fs_verity::DynFsVerityDigest + 'static>,
-    index: Vec<[u8; INDEX_LEN]>,
-    offset: u64,
+    /// Nullifier frames staged beside the segment until the shielded slab is
+    /// complete, because the nullifier slab must follow the shielded slab
+    /// contiguously on disk. Staging keeps memory independent of the segment
+    /// length.
+    nullifiers: BufWriter<NamedTempFile>,
+    rows: Vec<[u8; ROW_META_LEN]>,
+    shielded_rel: Vec<u32>,
+    nullifier_rel: Vec<u32>,
     prior: Option<BlockId>,
 }
 
 impl SegmentWriter {
     pub(crate) fn create(
         path: &Path,
-        staged: NamedTempFile,
-        network: Network,
-        start: BlockHeight,
-        end: BlockId,
+        (staged, nullifiers): (NamedTempFile, NamedTempFile),
+        span: SegmentIdentity,
     ) -> io::Result<Self> {
-        let identity = SegmentIdentity {
-            network,
-            start,
-            end,
-            sha256: [0; 32],
-            verity: None,
-        };
-        let header = identity.header()?;
-        let mut verity = fs_verity::new_dyn(fs_verity::InnerHashAlgorithm::Sha256);
-        verity.write_all(&header)?;
+        if span.start > span.end.height {
+            return Err(invalid("reversed shielded segment interval"));
+        }
+        let identity = span;
+        identity.block_count()?;
+        // The header is rewritten with its final anchors and offsets once the
+        // frames and index are in place, so a partial write publishes nothing.
         let mut staged = BufWriter::new(staged);
-        staged.write_all(&header)?;
+        staged.write_all(&[0; HEADER_LEN])?;
         Ok(Self {
             identity,
             target: path.to_owned(),
             staged: Some(staged),
-            digest: Sha256::new_with_prefix(header),
-            verity,
-            index: Vec::new(),
-            offset: HEADER_LEN as u64,
+            nullifiers: BufWriter::new(nullifiers),
+            rows: Vec::new(),
+            shielded_rel: vec![0],
+            nullifier_rel: vec![0],
             prior: None,
         })
     }
@@ -124,63 +311,170 @@ impl SegmentWriter {
         self.identity
             .check_block(id, block.previous_block_hash(), self.prior)?;
         let parent = block.previous_block_hash();
-        let message = CompactBlockShape::for_range(&[])
-            .and_then(|shape| shape.message(block))
+        let shielded = CompactBlockShape::DEFAULT_RANGE
+            .message(block.clone())
             .map_err(|status| io::Error::new(io::ErrorKind::InvalidData, status))?;
-        let payload_len = message.encoded_len();
-        validate_lengths(native_bytes, payload_len)?;
-        let mut lengths = [0; LENGTHS_LEN];
-        lengths[..4].copy_from_slice(&encode_len(native_bytes)?);
-        lengths[4..].copy_from_slice(&encode_len(payload_len)?);
-        let payload = message.encode_to_vec();
+        let nullifiers = CompactBlockShape::DEFAULT_NULLIFIER_RANGE
+            .message(block)
+            .map_err(|status| io::Error::new(io::ErrorKind::InvalidData, status))?;
+        let shielded_payload = shielded.encode_to_vec();
+        let nullifier_payload = nullifiers.encode_to_vec();
+        validate_lengths(native_bytes, shielded_payload.len())?;
+        validate_lengths(native_bytes, nullifier_payload.len())?;
+        let mut shielded_frame = [0; LENGTHS_LEN];
+        shielded_frame[..4].copy_from_slice(&encode_len(native_bytes)?);
+        shielded_frame[4..].copy_from_slice(&encode_len(shielded_payload.len())?);
+        let mut nullifier_frame = [0; LENGTHS_LEN];
+        nullifier_frame[..4].copy_from_slice(&encode_len(native_bytes)?);
+        nullifier_frame[4..].copy_from_slice(&encode_len(nullifier_payload.len())?);
         // A partial write poisons the staged file so a later finish cannot publish it.
         let mut staged = self
             .staged
             .take()
             .ok_or_else(|| invalid("failed shielded segment write"))?;
-        staged.write_all(&lengths)?;
-        staged.write_all(&payload)?;
-        self.verity.write_all(&lengths)?;
-        self.verity.write_all(&payload)?;
-        self.digest.update(lengths);
-        self.digest.update(&payload);
-        let offset = self.offset + LENGTHS_LEN as u64;
-        self.index.push(index::encode(
-            offset,
-            lengths,
+        staged.write_all(&shielded_frame)?;
+        staged.write_all(&shielded_payload)?;
+        self.push_slab_offset(SealedSlab::Shielded, LENGTHS_LEN + shielded_payload.len())?;
+        self.nullifiers.write_all(&nullifier_frame)?;
+        self.nullifiers.write_all(&nullifier_payload)?;
+        self.push_slab_offset(SealedSlab::Nullifier, LENGTHS_LEN + nullifier_payload.len())?;
+        self.rows.push(index::encode_row(
             id.hash,
             parent,
-            Sha256::digest(&payload).into(),
-        ));
-        self.offset = offset + payload.len() as u64;
+            native_bytes,
+            Sha256::digest(&shielded_payload).into(),
+            Sha256::digest(&nullifier_payload).into(),
+        )?);
         self.staged = Some(staged);
         self.prior = Some(id);
         Ok(())
+    }
+
+    fn push_slab_offset(&mut self, slab: SealedSlab, frame_len: usize) -> io::Result<()> {
+        let rel = match slab {
+            SealedSlab::Shielded => &mut self.shielded_rel,
+            SealedSlab::Nullifier => &mut self.nullifier_rel,
+        };
+        let prior = *rel
+            .last()
+            .ok_or_else(|| invalid("failed shielded segment write"))?;
+        let offset = u64::from(prior)
+            .checked_add(frame_len as u64)
+            .ok_or_else(|| invalid("shielded segment slab exceeds its offset range"))?;
+        if offset > MAX_SLAB_BYTES {
+            return Err(invalid("shielded segment slab exceeds its offset range"));
+        }
+        rel.push(
+            u32::try_from(offset).map_err(|_| invalid("shielded segment slab offset overflow"))?,
+        );
+        Ok(())
+    }
+
+    /// Streams the staged nullifier slab behind the shielded slab, then
+    /// flushes the segment so the index follows it.
+    fn append_staged_nullifiers(
+        &mut self,
+        staged: &mut BufWriter<NamedTempFile>,
+        nullifier_len: u64,
+    ) -> io::Result<()> {
+        self.nullifiers.flush()?;
+        let spill = self.nullifiers.get_mut().as_file_mut();
+        spill.seek(io::SeekFrom::Start(0))?;
+        let copied = {
+            let mut input =
+                BufReader::with_capacity(STAGING_CHUNK, (&mut *spill).take(nullifier_len));
+            io::copy(&mut input, staged)?
+        };
+        if copied != nullifier_len {
+            return Err(invalid("staged nullifier slab is shorter than its index"));
+        }
+        // A surplus byte means the spill file and its offsets disagree.
+        if spill.read(&mut [0])? != 0 {
+            return Err(invalid("staged nullifier slab is longer than its index"));
+        }
+        staged.flush()
+    }
+
+    /// The segment's fixed header, from the writer's completed state.
+    fn finished_header(
+        &self,
+        block_count: u32,
+        nullifier_slab_offset: u64,
+        index_offset: u64,
+    ) -> io::Result<SegmentHeader> {
+        let first_prev_hash: [u8; 32] = self
+            .rows
+            .first()
+            .ok_or_else(|| invalid("incomplete shielded segment"))?[32..64]
+            .try_into()
+            .map_err(|_| invalid("incomplete shielded segment"))?;
+        Ok(SegmentHeader {
+            network_tag: self.identity.network.id(),
+            artifact_schema_version: self.identity.artifact_schema,
+            segment_flags: SEGMENT_FLAGS_HAS_NULLIFIER_SLAB,
+            start_height: self.identity.start.value(),
+            block_count,
+            first_prev_hash,
+            last_block_hash: encode_internal_block_hash(self.identity.end.hash),
+            shielded_slab_offset: HEADER_LEN as u64,
+            nullifier_slab_offset,
+            index_offset,
+        })
     }
 
     pub(crate) fn finish(mut self) -> io::Result<SegmentIdentity> {
         if self.prior != Some(self.identity.end) {
             return Err(invalid("incomplete shielded segment"));
         }
+        let block_count = self.identity.block_count()?;
+        if u32::try_from(self.rows.len()).ok() != Some(block_count) {
+            return Err(invalid("incomplete shielded segment"));
+        }
         let mut staged = self
             .staged
             .take()
             .ok_or_else(|| invalid("failed shielded segment write"))?;
-        for entry in self.index {
-            staged.write_all(&entry)?;
-            self.digest.update(entry);
-            self.verity.write_all(&entry)?;
-        }
+        let shielded_len = u64::from(
+            *self
+                .shielded_rel
+                .last()
+                .ok_or_else(|| invalid("incomplete shielded segment"))?,
+        );
+        let nullifier_len = u64::from(
+            *self
+                .nullifier_rel
+                .last()
+                .ok_or_else(|| invalid("incomplete shielded segment"))?,
+        );
+        let nullifier_slab_offset = HEADER_LEN as u64 + shielded_len;
+        let index_offset = nullifier_slab_offset + nullifier_len;
+        self.append_staged_nullifiers(&mut staged, nullifier_len)?;
+        write_index(
+            &mut staged,
+            (&self.shielded_rel, &self.nullifier_rel),
+            &self.rows,
+        )?;
+        let header = self.finished_header(block_count, nullifier_slab_offset, index_offset)?;
         let staged = staged
             .into_inner()
             .map_err(io::IntoInnerError::into_error)?;
+        // The staged file is a private temporary file, so this in-place header
+        // patch cannot race a reader.
+        write_all_at(staged.as_file(), &header.encode(), 0)?;
+        let index_len = index::offset_tables_len(block_count)
+            + u64::try_from(self.rows.len() * ROW_META_LEN)
+                .map_err(|_| invalid("shielded segment index exceeds address space"))?;
+        let body_len = index_offset
+            .checked_add(index_len)
+            .ok_or_else(|| invalid("shielded segment exceeds address space"))?;
+        let (trailer, verity) = hash_staged(staged.as_file(), body_len)?;
+        write_all_at(staged.as_file(), &trailer, body_len)?;
         staged.as_file().sync_all()?;
         let identity = SegmentIdentity {
-            sha256: self.digest.finalize().into(),
+            sha256: trailer,
             verity: Some(
-                self.verity
-                    .finalize()
-                    .as_ref()
+                verity
+                    .as_slice()
                     .try_into()
                     .map_err(|_| invalid("invalid fs-verity digest length"))?,
             ),
@@ -199,6 +493,73 @@ impl SegmentWriter {
     }
 }
 
+/// Writes the offset tables and per-block metadata rows of one staged index.
+fn write_index(
+    staged: &mut BufWriter<NamedTempFile>,
+    (shielded_rel, nullifier_rel): (&[u32], &[u32]),
+    rows: &[[u8; ROW_META_LEN]],
+) -> io::Result<()> {
+    for offset in shielded_rel {
+        staged.write_all(&offset.to_be_bytes())?;
+    }
+    for offset in nullifier_rel {
+        staged.write_all(&offset.to_be_bytes())?;
+    }
+    for entry in rows {
+        staged.write_all(entry)?;
+    }
+    Ok(())
+}
+
+fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt as _;
+        file.write_all_at(bytes, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::fs::FileExt as _;
+        let mut written = 0;
+        let mut offset = offset;
+        while written < bytes.len() {
+            let count = file.seek_write(&bytes[written..], offset)?;
+            if count == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            written += count;
+            offset += count as u64;
+        }
+        Ok(())
+    }
+}
+
+/// Hashes the finished body, then the whole staged file behind it, in one pass.
+fn hash_staged(file: &File, body_len: u64) -> io::Result<([u8; 32], Vec<u8>)> {
+    const CHUNK: usize = STAGING_CHUNK;
+    let mut digest = Sha256::new();
+    let mut verity = fs_verity::new_dyn(fs_verity::InnerHashAlgorithm::Sha256);
+    let mut input = BufReader::with_capacity(CHUNK, file);
+    input.seek(io::SeekFrom::Start(0))?;
+    let mut chunk = vec![0; CHUNK];
+    let mut remaining = body_len;
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(chunk.len() as u64))
+            .map_err(|_| invalid("shielded segment exceeds address space"))?;
+        input.read_exact(&mut chunk[..wanted])?;
+        digest.update(&chunk[..wanted]);
+        verity.write_all(&chunk[..wanted])?;
+        remaining -= wanted as u64;
+    }
+    let trailer: [u8; 32] = digest
+        .finalize()
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid("invalid shielded segment digest length"))?;
+    verity.write_all(&trailer)?;
+    Ok((trailer, verity.finalize().as_ref().to_vec()))
+}
+
 fn parent_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -209,57 +570,12 @@ pub(crate) struct SealedHistory {
     pub(crate) kernel_verified: bool,
     identity: SegmentIdentity,
     file: File,
-    rows: Vec<IndexedBlock>,
-}
-
-struct IndexedBlock {
-    id: BlockId,
-    parent: BlockHash,
-    native_bytes: usize,
-    offset: u64,
-    len: usize,
-    sha256: [u8; 32],
-    validation: OnceLock<Result<(), PayloadError>>,
-}
-
-#[derive(Clone, Copy, Debug, thiserror::Error)]
-enum PayloadError {
-    #[error("shielded segment payload SHA-256 mismatch")]
-    Digest,
-    #[error("malformed shielded segment CompactBlock protobuf")]
-    Protobuf,
-    #[error("shielded segment payload height, hash, or parent differs from its index")]
-    Identity,
-}
-
-impl IndexedBlock {
-    fn check_digest(&self, payload: &[u8]) -> Result<(), PayloadError> {
-        if <[u8; 32]>::from(Sha256::digest(payload)) != self.sha256 {
-            return Err(PayloadError::Digest);
-        }
-        Ok(())
-    }
-
-    fn verify_payload(&self, payload: &Bytes, kernel_verified: bool) -> Result<(), PayloadError> {
-        // Portable files can change between reads. Only authenticated bytes share a verdict.
-        if !kernel_verified {
-            self.check_digest(payload)?;
-        }
-        *self.validation.get_or_init(|| {
-            if kernel_verified {
-                self.check_digest(payload)?;
-            }
-            let block = lightwalletd::CompactBlock::decode(payload.clone())
-                .map_err(|_| PayloadError::Protobuf)?;
-            if block.height != u64::from(self.id.height.value())
-                || block.hash != encode_internal_block_hash(self.id.hash)
-                || block.prev_hash != encode_internal_block_hash(self.parent)
-            {
-                return Err(PayloadError::Identity);
-            }
-            Ok(())
-        })
-    }
+    rows: Vec<SealedRow>,
+    nullifier_base: u64,
+    /// Frame-start offsets of the shielded slab, relative to its base, plus
+    /// the slab's total length.
+    shielded_rel: Vec<u32>,
+    nullifier_rel: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -293,12 +609,21 @@ impl SealedHistory {
         let file = open_regular_file(path)?;
         let file_len = file.metadata()?.len();
         let protected = index::pinned_verity(expected.verity, || verity::measure(&file))?;
-        let rows = index::admit(&mut &file, expected, file_len, protected)?;
+        let index::AdmittedSegment {
+            rows,
+            nullifier_base,
+            shielded_rel,
+            nullifier_rel,
+        } = index::admit(&mut &file, expected, file_len, protected)?;
         Ok(Self {
             kernel_verified: protected,
             identity: expected,
             file,
             rows,
+            // The shielded slab always starts right after the fixed header.
+            nullifier_base,
+            shielded_rel,
+            nullifier_rel,
         })
     }
 
@@ -313,15 +638,21 @@ impl SealedHistory {
     #[cfg(test)]
     pub(crate) fn read_chunk(
         &self,
+        slab: SealedSlab,
         range: BlockHeightRange,
         order: HeightOrder,
         max_bytes: usize,
     ) -> io::Result<Vec<SealedBlock>> {
-        self.bounded_rows(range, order, max_bytes, true)
+        self.bounded_rows(slab, range, order, max_bytes, true)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the slab, range, order, byte budget, and oversized-row exception describe one bounded read"
+    )]
     pub(crate) fn bounded_rows(
         &self,
+        slab: SealedSlab,
         range: BlockHeightRange,
         order: HeightOrder,
         max_bytes: usize,
@@ -340,10 +671,11 @@ impl SealedHistory {
             usize::try_from(height.value() - self.identity.start.value())
                 .map_err(|_| invalid("shielded segment height exceeds address space"))
         };
-        let candidates = &self.rows[index(range.start)?..=index(range.end)?];
+        let first = index(range.start)?;
+        let last = index(range.end)?;
         let mut remaining = max_bytes;
         let mut count = 0;
-        let mut iter = candidates.iter();
+        let mut iter = self.rows[first..=last].iter();
         while let Some(row) = match order {
             HeightOrder::Ascending => iter.next(),
             HeightOrder::Descending => iter.next_back(),
@@ -355,42 +687,56 @@ impl SealedHistory {
             remaining = remaining.saturating_sub(row.native_bytes);
         }
         let selected = match order {
-            HeightOrder::Ascending => &candidates[..count],
-            HeightOrder::Descending => &candidates[candidates.len() - count..],
+            HeightOrder::Ascending => first..first + count,
+            HeightOrder::Descending => last + 1 - count..last + 1,
         };
         if selected.is_empty() {
             return Ok(Vec::new());
         }
-        self.read_payloads(selected)
+        self.read_payloads(slab, selected)
     }
 
-    fn read_payloads(&self, selected: &[IndexedBlock]) -> io::Result<Vec<SealedBlock>> {
-        let first = selected
-            .first()
-            .ok_or_else(|| invalid("empty shielded chunk"))?;
-        let last = selected
-            .last()
-            .ok_or_else(|| invalid("empty shielded chunk"))?;
-        let first_frame = first.offset - LENGTHS_LEN as u64;
-        let len = relative_frame_offset(last, first_frame)?
-            .checked_add(last.len)
-            .ok_or_else(|| invalid("shielded chunk exceeds address space"))?;
+    fn slab_rel(&self, slab: SealedSlab) -> &[u32] {
+        match slab {
+            SealedSlab::Shielded => &self.shielded_rel,
+            SealedSlab::Nullifier => &self.nullifier_rel,
+        }
+    }
+
+    fn slab_base(&self, slab: SealedSlab) -> u64 {
+        match slab {
+            SealedSlab::Shielded => HEADER_LEN as u64,
+            SealedSlab::Nullifier => self.nullifier_base,
+        }
+    }
+
+    fn read_payloads(
+        &self,
+        slab: SealedSlab,
+        selected: std::ops::Range<usize>,
+    ) -> io::Result<Vec<SealedBlock>> {
+        let rel = self.slab_rel(slab);
+        let first = selected.start;
+        let last = selected.end - 1;
+        let first_frame = self.slab_base(slab) + u64::from(rel[first]);
+        let len = usize::try_from(u64::from(rel[last + 1]) - u64::from(rel[first]))
+            .map_err(|_| invalid("shielded chunk exceeds address space"))?;
         let mut plan = Vec::new();
         if selected.len() == 1 || len <= SLAB_TARGET_BYTES {
-            plan.push((selected, len));
+            plan.push((selected.clone(), len));
         } else {
-            let mut start = 0;
+            let mut start = first;
             let mut bytes = 0;
-            for (index, row) in selected.iter().enumerate() {
-                let frame_len = LENGTHS_LEN + row.len;
+            for index in selected.clone() {
+                let frame_len = frame_len(rel, index)?;
                 if bytes != 0 && bytes + frame_len > SLAB_TARGET_BYTES {
-                    plan.push((&selected[start..index], bytes));
+                    plan.push((start..index, bytes));
                     start = index;
                     bytes = 0;
                 }
                 bytes += frame_len;
             }
-            plan.push((&selected[start..], bytes));
+            plan.push((start..selected.end, bytes));
         }
         let mut offset = first_frame;
         let mut slabs = Vec::with_capacity(plan.len());
@@ -399,74 +745,88 @@ impl SealedHistory {
             offset += len as u64;
         }
         let mut out = Vec::with_capacity(selected.len());
-        for (rows, slab) in slabs {
-            self.append_slab(&mut out, rows, slab)?;
+        for (rows, slab_bytes) in slabs {
+            self.append_slab(slab, &mut out, rows, slab_bytes)?;
         }
         Ok(out)
     }
 
     fn append_slab(
         &self,
+        slab: SealedSlab,
         out: &mut Vec<SealedBlock>,
-        rows: &[IndexedBlock],
-        mut slab: Vec<u8>,
+        rows: std::ops::Range<usize>,
+        mut slab_bytes: Vec<u8>,
     ) -> io::Result<()> {
-        let first_frame = rows[0].offset - LENGTHS_LEN as u64;
+        let rel = self.slab_rel(slab);
+        let first_rel = rel[rows.start];
         let mut starts = Vec::with_capacity(rows.len());
-        for row in rows {
-            let start = verified_row_start(row, &slab, first_frame)?;
+        for index in rows.clone() {
+            let frame_start = usize::try_from(u64::from(rel[index]) - u64::from(first_rel))
+                .map_err(|_| invalid("shielded chunk exceeds address space"))?;
+            self.verified_row_start(slab, index, &slab_bytes, frame_start)?;
             // The checked length field becomes the gRPC message prefix, so the
             // generated server's response body returns the row as a slice of
             // the slab instead of copying it into an encode buffer.
-            slab[start - EncodedBlock::PREFIX_LEN] = 0;
-            starts.push(start);
+            slab_bytes[frame_start + LENGTHS_LEN - EncodedBlock::PREFIX_LEN] = 0;
+            starts.push(frame_start + LENGTHS_LEN);
         }
-        let slab_allocation = slab.capacity();
-        let packed = Bytes::from(slab);
-        for (row, start) in rows.iter().zip(starts) {
+        let slab_allocation = slab_bytes.capacity();
+        let packed = Bytes::from(slab_bytes);
+        for (index, payload_start) in rows.zip(starts) {
+            let payload_len = frame_len(rel, index)? - LENGTHS_LEN;
             // Every row of the slab keeps the whole slab alive.
             let message = EncodedBlock::from_length_prefixed_in(
-                packed.slice(start - EncodedBlock::PREFIX_LEN..start + row.len),
+                packed.slice(payload_start - EncodedBlock::PREFIX_LEN..payload_start + payload_len),
                 slab_allocation,
             )
             .map_err(|_| invalid("shielded segment frame is not a gRPC message"))?;
-            out.push(verify_and_build_block(row, message, self.kernel_verified)?);
+            let row = &self.rows[index];
+            row.verify_payload(slab, &message.payload(), self.kernel_verified)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            out.push(SealedBlock {
+                id: row.id,
+                parent: row.parent,
+                native_bytes: row.native_bytes,
+                message,
+            });
+        }
+        Ok(())
+    }
+
+    fn verified_row_start(
+        &self,
+        slab: SealedSlab,
+        index: usize,
+        raw: &[u8],
+        frame_start: usize,
+    ) -> io::Result<()> {
+        let lengths: [u8; LENGTHS_LEN] = raw
+            .get(frame_start..frame_start + LENGTHS_LEN)
+            .and_then(|field| field.try_into().ok())
+            .ok_or_else(|| invalid("missing shielded segment frame lengths"))?;
+        let row = &self.rows[index];
+        let frame_len = frame_len(self.slab_rel(slab), index)?;
+        let (native, wire) = decode_lengths(lengths)?;
+        if native != row.native_bytes || wire != frame_len - LENGTHS_LEN {
+            return Err(invalid(
+                "shielded segment frame lengths differ from its index",
+            ));
         }
         Ok(())
     }
 }
 
-fn relative_frame_offset(row: &IndexedBlock, first_frame: u64) -> io::Result<usize> {
-    usize::try_from(row.offset - first_frame)
-        .map_err(|_| invalid("shielded chunk exceeds address space"))
-}
-
-fn verified_row_start(row: &IndexedBlock, raw: &[u8], first_frame: u64) -> io::Result<usize> {
-    let start = relative_frame_offset(row, first_frame)?;
-    let lengths = raw[..start]
-        .last_chunk()
-        .ok_or_else(|| invalid("missing shielded segment frame lengths"))?;
-    if decode_lengths(*lengths)? != (row.native_bytes, row.len) {
-        return Err(invalid(
-            "shielded segment frame lengths differ from its index",
-        ));
-    }
-    Ok(start)
-}
-
-fn verify_and_build_block(
-    row: &IndexedBlock,
-    message: EncodedBlock,
-    kernel_verified: bool,
-) -> io::Result<SealedBlock> {
-    row.verify_payload(&message.payload(), kernel_verified)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(SealedBlock {
-        id: row.id,
-        parent: row.parent,
-        native_bytes: row.native_bytes,
-        message,
-    })
+/// A row's whole frame length: its lengths field plus its payload.
+fn frame_len(rel: &[u32], index: usize) -> io::Result<usize> {
+    let next = rel
+        .get(index + 1)
+        .ok_or_else(|| invalid("shielded segment offset table is short"))?;
+    let offset = rel
+        .get(index)
+        .ok_or_else(|| invalid("shielded segment offset table is short"))?;
+    usize::try_from(u64::from(*next) - u64::from(*offset))
+        .map_err(|_| invalid("shielded segment frame offsets are not ascending"))
 }
 
 /// Reads `len` bytes at `offset` into a new slab.

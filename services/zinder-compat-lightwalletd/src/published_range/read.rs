@@ -20,7 +20,7 @@ use crate::{
     },
     block_range::RangeBlock,
     compact_block_messages::CompactBlockShape,
-    sealed_history::SealedBlock,
+    sealed_history::{SealedBlock, SealedSlab},
 };
 
 #[derive(Clone)]
@@ -101,7 +101,7 @@ impl PublishedRangeRead {
     /// Checks the whole offer. A descending offer that starts below the
     /// catalog can join it only from a live tail above the catalog.
     fn reads_published_files(&self, chunk: BlockHeightRange) -> bool {
-        self.shape == CompactBlockShape::DEFAULT_RANGE
+        self.shape.is_published_shape()
             && self.history.as_ref().is_some_and(|catalog| {
                 let coverage = catalog.bounds();
                 (coverage.start..=coverage.end).contains(&chunk.start)
@@ -156,6 +156,7 @@ impl PublishedRangeRead {
         max_bytes: usize,
         (tail, cancel): (Option<&EncodedTail>, &CancellationToken),
     ) -> std::io::Result<Vec<SealedBlock>> {
+        let slab = sealed_slab(self.shape);
         if cancel.is_cancelled() {
             return Err(std::io::Error::new(
                 ErrorKind::Interrupted,
@@ -164,24 +165,24 @@ impl PublishedRangeRead {
         }
         let Some(history) = &self.history else {
             let live = tail.ok_or_else(|| std::io::Error::other("missing encoded tail"))?;
-            return Ok(live.select(span, order, max_bytes, true));
+            return Ok(live.select(slab, span, order, max_bytes, true));
         };
         let end = history.bounds().end;
         if span.end <= end {
-            return history.read_chunk(span, order, max_bytes, (true, cancel));
+            return history.read_chunk(slab, span, order, max_bytes, (true, cancel));
         }
         let live = tail.ok_or_else(|| std::io::Error::other("missing encoded tail"))?;
         if span.start > end {
-            return Ok(live.select(span, order, max_bytes, true));
+            return Ok(live.select(slab, span, order, max_bytes, true));
         }
         let prefix = BlockHeightRange::inclusive(span.start, end);
         let suffix = BlockHeightRange::inclusive(BlockHeight::new(end.value() + 1), span.end);
         let (mut first, first_span) = match order {
             HeightOrder::Ascending => (
-                history.read_chunk(prefix, order, max_bytes, (true, cancel))?,
+                history.read_chunk(slab, prefix, order, max_bytes, (true, cancel))?,
                 prefix,
             ),
-            HeightOrder::Descending => (live.select(suffix, order, max_bytes, true), suffix),
+            HeightOrder::Descending => (live.select(slab, suffix, order, max_bytes, true), suffix),
         };
         let room = first.iter().fold(max_bytes, |budget, row| {
             budget.saturating_sub(row.native_bytes)
@@ -193,9 +194,9 @@ impl PublishedRangeRead {
             return Ok(first);
         }
         match order {
-            HeightOrder::Ascending => first.extend(live.select(suffix, order, room, false)),
+            HeightOrder::Ascending => first.extend(live.select(slab, suffix, order, room, false)),
             HeightOrder::Descending => {
-                let mut earlier = history.read_chunk(prefix, order, room, (false, cancel))?;
+                let mut earlier = history.read_chunk(slab, prefix, order, room, (false, cancel))?;
                 earlier.append(&mut first);
                 first = earlier;
             }
@@ -210,7 +211,7 @@ impl PublishedRangeRead {
         let coverage = history.bounds();
         coverage.start <= chunk.start
             && chunk.end <= coverage.end
-            && self.shape == CompactBlockShape::DEFAULT_RANGE
+            && self.shape.is_published_shape()
     }
 
     async fn resolve_plan<Reads: CompactBlockReads>(
@@ -436,7 +437,10 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         if read.cancel.is_cancelled() {
             return cancelled_outcome(None);
         }
-        if self.shape != CompactBlockShape::DEFAULT_RANGE {
+        // Equivalence for a pool selection that omits only Ironwood was
+        // resolved when the stream was admitted; an unresolved selection
+        // reads canonical storage.
+        if !self.shape.is_published_shape() {
             return native_chunk(reads, read, convert).await;
         }
         let (epoch, started, plan) = {
@@ -492,6 +496,15 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     }
 }
 
+/// The sealed slab that stores a published shape's frames.
+fn sealed_slab(shape: CompactBlockShape) -> SealedSlab {
+    if shape == CompactBlockShape::DEFAULT_NULLIFIER_RANGE {
+        SealedSlab::Nullifier
+    } else {
+        SealedSlab::Shielded
+    }
+}
+
 impl PublishedRangeRead {
     async fn finish_encoded_read<Output, Convert>(
         &self,
@@ -514,7 +527,7 @@ impl PublishedRangeRead {
         }
         let touches_disk = self.reads_published_files(chunk);
         if !touches_disk && let Some(live) = tail.as_deref() {
-            let rows = live.select(chunk, order, max_bytes, true);
+            let rows = live.select(sealed_slab(self.shape), chunk, order, max_bytes, true);
             return finish_encoded_rows(epoch, Some(started.elapsed()), Ok(rows), &cancel, convert);
         }
         let source = self.clone();

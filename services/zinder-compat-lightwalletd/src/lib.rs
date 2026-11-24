@@ -48,3 +48,6 @@ pub use node_tip_witness::{
 pub use ping::LightwalletdPing;
 pub use request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
 pub use stale_tip::{DEFAULT_STALE_TIP_LIMIT, StaleTipLimit};
+
+/// The fixed header length, in bytes, of a `ZSHRNG01` sealed segment file.
+pub const SEALED_HEADER_LEN: usize = sealed_history::HEADER_LEN;

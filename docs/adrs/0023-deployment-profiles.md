@@ -21,7 +21,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
 2. **A profile is not a capability, a readiness input, or a store identity.** Capabilities derive from the composition and its admitted evidence ([ADR-0015](0015-wallet-runtime-composition.md) decision 1). Readiness follows each runtime's admission rules ([ADR-0016](0016-wallet-serving-readiness.md)). A store records what it holds, not a profile name, and a reader admits any store that meets its requirements.
 3. **The light-wallet profile serves lightwalletd clients without transaction bodies or a wallet projection.** Operators run standalone `zinder-ingest` and `zinder-compat-lightwalletd`, and run no projector and no native query. Ingest builds complete wallet-serving history from height 1, with no raw blobs and no Explorer views. Compatibility serves the light-wallet composition:
    - It requires complete block history and a complete subtree-root prefix, and it also admits a store that retains blobs.
-   - Canonical storage certifies the coverage of compact blocks, nullifiers, tree states, subtree roots, and the tip. The adapter's signed settled-history projection can supply compact-range payloads ([ADR-0014](0014-consumer-neutral-wallet-data-plane.md) decision 8).
+   - Canonical storage certifies the coverage of compact blocks, nullifiers, tree states, subtree roots, and the tip. The adapter's signed settled-history projection can supply compact-range and nullifier-range payloads ([ADR-0014](0014-consumer-neutral-wallet-data-plane.md) decision 8).
    - Mempool methods go through ingest control.
    - The reads in decision 4 go to one node that keeps transparent address indexes.
 4. **Only the light-wallet composition forwards indexed reads to the node.** This holds whether the profile or the explicit compatibility serving setting, including its alias, selects the composition. Its node-backed reads follow [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7:
@@ -68,6 +68,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
 
 ## Revision history
 
+- 2026-11-24. Decision 3 notes the signed settled-history projection also supplies nullifier-range payloads, which the light-wallet profile's `GetBlockRangeNullifiers` stream reads zero-copy.
 - 2026-11-23. Decision 1 distinguishes listener and ingest config output from the publisher's effective settings.
 - 2026-11-23. Decision 4 distinguishes the wallet deployment's node calls from the Explorer's tip observation.
 - 2026-11-23. The consequences describe bounded forwarded history concurrency and request time.

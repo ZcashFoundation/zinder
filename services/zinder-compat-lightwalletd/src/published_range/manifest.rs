@@ -21,10 +21,18 @@ struct SignedManifest {
 
 const STAGED_WRITE: &str = ".publisher-write.tmp";
 const STAGED_SEGMENT: &str = ".publisher-segment.tmp";
+const STAGED_NULLIFIERS: &str = ".publisher-nullifiers.tmp";
 
 fn staged_write(directory: &Path) -> io::Result<NamedTempFile> {
     Builder::new()
         .prefix(STAGED_WRITE)
+        .rand_bytes(0)
+        .tempfile_in(directory)
+}
+
+fn staged_nullifiers(directory: &Path) -> io::Result<NamedTempFile> {
+    Builder::new()
+        .prefix(STAGED_NULLIFIERS)
         .rand_bytes(0)
         .tempfile_in(directory)
 }
@@ -52,7 +60,7 @@ pub(super) fn lock_directory(directory: &Path) -> io::Result<File> {
         .open(directory.join(".publisher.lock"))?;
     file.try_lock()?;
     // A killed publisher can leave either name before the next atomic installation.
-    for name in [STAGED_WRITE, STAGED_SEGMENT] {
+    for name in [STAGED_WRITE, STAGED_SEGMENT, STAGED_NULLIFIERS] {
         if let Err(error) = fs::remove_file(directory.join(name))
             && error.kind() != io::ErrorKind::NotFound
         {
@@ -68,7 +76,8 @@ pub(super) fn publish_segment(
     range: BlockHeightRange,
 ) -> io::Result<PublishedShieldedRange> {
     let segment = TempPath::try_from_path(directory.join(STAGED_SEGMENT))?;
-    let history = PublishedShieldedRange::build(reader, &segment, staged_write(directory)?, range)?;
+    let staged = (staged_write(directory)?, staged_nullifiers(directory)?);
+    let history = PublishedShieldedRange::build(reader, &segment, staged, range)?;
     let destination = segment_path(directory, history.identity.sha256);
     let published = match fs::hard_link(&segment, &destination) {
         Ok(()) => history,

@@ -40,7 +40,7 @@ use crate::block_range::{
     BlockRangeContinuity, BlockRangeResponse, BlockRangeSink, BlockRangeStage,
     BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, RangeBlock,
 };
-use crate::compact_block_messages::CompactBlockShape;
+use crate::compact_block_messages::{CompactBlockShape, ironwood_active_at_or_below};
 use crate::network_tip_estimate::estimated_network_height;
 use crate::node_tip_witness::NodeTipWitness;
 use crate::stale_tip::{StaleTipLimit, TipBlockTime, TipBlockTimeCache, unix_now_seconds};
@@ -390,10 +390,12 @@ impl BlockMethods {
             Option<Arc<crate::published_range::PublishedShieldedCatalog>>,
             crate::published_range::ShieldedTailBuffer,
         ),
+        select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<lightwalletd::EncodedBlockRangeStream, Status> {
         let (range, is_descending) = block_range_from_request(request)?;
+        let shape = select(&request.pool_types)?;
         let slot = self.block_range_streams.open().await?;
-        let shape = CompactBlockShape::for_range(&request.pool_types)?;
+        let shape = resolve_published_shape(reads, shape, range.end).await;
         let source = crate::published_range::PublishedRangeRead::new(
             history,
             live_tail,
@@ -448,6 +450,49 @@ async fn published_read_permit(
         Some(limit) => limit.published_read_permit().await.map(Some),
         None => Ok(None),
     }
+}
+
+/// Resolves a pool selection that omits only Ironwood to the published shape
+/// it matches.
+///
+/// A request the stored frames cannot serve then never queues for a
+/// signed-file permit or inherits the reduced published byte budget. The
+/// caller holds its ordinary stream slot first, so a saturated listener
+/// refuses a request before this reads anything.
+///
+/// Every chunk's highest height is at or below the request's highest height,
+/// so one captured view settles the whole request, but only when that view
+/// reaches the request's highest height: an admitted activation schedule
+/// revision never changes activations at or below the tip it was admitted at,
+/// while a view below the end can still lack an activation the writer admits
+/// before a later chunk's view sees the end. A captured view that falls short
+/// of the end, a schedule the reader cannot read, or a view it cannot take
+/// leaves the selection alone, so the native path serves the request and
+/// reports its own canonical errors.
+async fn resolve_published_shape<Reads: CompactBlockReads>(
+    reads: &Reads,
+    shape: CompactBlockShape,
+    end: BlockHeight,
+) -> CompactBlockShape {
+    if shape.is_published_shape() {
+        return shape;
+    }
+    let Some(equivalent) = shape.published_equivalent() else {
+        return shape;
+    };
+    let Ok(view) = reads.capture_view().await else {
+        return shape;
+    };
+    if Reads::view_chain_epoch(&view).visible_tip_height < end {
+        return shape;
+    }
+    let Ok(activations) = reads.view_activations(&view).await else {
+        return shape;
+    };
+    if ironwood_active_at_or_below(&activations, end) {
+        return shape;
+    }
+    equivalent
 }
 
 async fn first_chunk_view<Reads: CompactBlockReads>(
@@ -1015,9 +1060,11 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
+        num::NonZeroU32,
         sync::{
             Arc,
-            atomic::{AtomicI64, Ordering},
+            atomic::{AtomicI64, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -1028,12 +1075,13 @@ mod tests {
         CompactBlockArtifact, Network, NetworkUpgradeActivations, UnixTimestampMillis,
         wire::encode_branch_id_hex,
     };
+    use zinder_proto::compat::lightwalletd;
 
     use super::{
         BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, CompactBlockReads,
-        RequestedBlock, lightd_info,
+        RequestedBlock, lightd_info, resolve_published_shape,
     };
-    use crate::stale_tip::StaleTipLimit;
+    use crate::{compact_block_messages::CompactBlockShape, stale_tip::StaleTipLimit};
 
     /// The block time in the header of the served tip in the slow-header
     /// test.
@@ -1156,6 +1204,201 @@ mod tests {
             Some(Code::Unavailable),
             "GetLightdInfo must see the tip 30 minutes old when its header read ends"
         );
+    }
+
+    /// One scripted chain view: its epoch and the activation schedule the
+    /// writer had admitted with it.
+    struct ScriptedView {
+        epoch: ChainEpoch,
+        activations: NetworkUpgradeActivations,
+    }
+
+    /// Reads that hand out `views` in order, repeating the last one, and
+    /// count the views captured.
+    #[derive(Clone)]
+    struct ScriptedViews {
+        views: Arc<parking_lot::Mutex<std::collections::VecDeque<Arc<ScriptedView>>>>,
+        captures: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedViews {
+        fn new(views: impl IntoIterator<Item = (u32, NetworkUpgradeActivations)>) -> Self {
+            let views = views
+                .into_iter()
+                .map(|(tip, activations)| {
+                    Arc::new(ScriptedView {
+                        epoch: ChainEpoch {
+                            id: ChainEpochId::new(u64::from(tip)),
+                            network: Network::ZcashRegtest,
+                            visible_tip_height: BlockHeight::new(tip),
+                            visible_tip_hash: BlockHash::from_bytes([1; 32]),
+                            settled_tip_height: BlockHeight::new(tip),
+                            settled_tip_hash: BlockHash::from_bytes([1; 32]),
+                            artifact_schema_version: ArtifactSchemaVersion::new(1),
+                            tip_metadata: ChainTipMetadata::new(0, 0, 0),
+                            created_at: UnixTimestampMillis::new(0),
+                        },
+                        activations,
+                    })
+                })
+                .collect();
+            Self {
+                views: Arc::new(parking_lot::Mutex::new(views)),
+                captures: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn captures(&self) -> usize {
+            self.captures.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CompactBlockReads for ScriptedViews {
+        type View = Arc<ScriptedView>;
+
+        fn capture_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send {
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            let mut views = self.views.lock();
+            let view = if views.len() > 1 {
+                views.pop_front()
+            } else {
+                views.front().cloned()
+            };
+            std::future::ready(view.ok_or_else(|| Status::unavailable("no scripted view")))
+        }
+
+        fn view_chain_epoch(view: &Self::View) -> ChainEpoch {
+            view.epoch
+        }
+
+        fn view_activations(
+            &self,
+            view: &Self::View,
+        ) -> impl Future<Output = Result<NetworkUpgradeActivations, Status>> + Send {
+            std::future::ready(Ok(view.activations.clone()))
+        }
+
+        fn tip_block_time(
+            &self,
+            _view: &Self::View,
+        ) -> impl Future<Output = Result<i64, Status>> + Send {
+            std::future::ready(Err(Status::unimplemented("the test serves no tip time")))
+        }
+
+        fn read_compact_block(
+            &self,
+            _view: &Self::View,
+            _block: RequestedBlock,
+        ) -> impl Future<Output = Result<CompactBlockArtifact, Status>> + Send {
+            std::future::ready(Err(Status::unimplemented("the test serves no block")))
+        }
+
+        fn read_compact_block_chunk<Output, Convert>(
+            &self,
+            _read: ChunkRead<Self::View>,
+            _convert: Convert,
+        ) -> impl Future<Output = ChunkReadOutcome<Output>> + Send
+        where
+            Output: Send + 'static,
+            Convert: FnOnce(ChainEpoch, Vec<CompactBlockArtifact>) -> Output + Send + 'static,
+        {
+            std::future::ready(ChunkReadOutcome::unread(ChunkReadFailure::Failed(
+                Status::unimplemented("the test serves no block range"),
+            )))
+        }
+    }
+
+    fn sapling_orchard() -> Result<CompactBlockShape, Status> {
+        CompactBlockShape::for_range(&[
+            lightwalletd::PoolType::Sapling as i32,
+            lightwalletd::PoolType::Orchard as i32,
+        ])
+    }
+
+    /// Equivalence needs a view that reaches the request's end and an
+    /// Ironwood activation above it.
+    #[tokio::test]
+    async fn two_pool_equivalence_needs_a_view_that_reaches_the_request_end() -> Result<(), Status>
+    {
+        let explicit = sapling_orchard()?;
+        let published = explicit
+            .published_equivalent()
+            .ok_or_else(|| Status::internal("the selection omits only Ironwood"))?;
+        let scheduled = zinder_testkit::sample_regtest_upgrade_activations();
+        let unscheduled = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let end = BlockHeight::new(700);
+
+        // A view that reaches the end and carries no activation at or below
+        // it proves equivalence.
+        let covering = ScriptedViews::new([(700, unscheduled.clone())]);
+        assert_eq!(
+            resolve_published_shape(&covering, explicit, end).await,
+            published
+        );
+        // An activation at or below the end disproves it.
+        let activated = ScriptedViews::new([(700, scheduled.clone())]);
+        assert_eq!(
+            resolve_published_shape(&activated, explicit, end).await,
+            explicit
+        );
+        let below_activation = ScriptedViews::new([(700, scheduled.clone())]);
+        assert_eq!(
+            resolve_published_shape(&below_activation, explicit, BlockHeight::new(602)).await,
+            published
+        );
+
+        // The first view stops short of the end and has no activation yet; the
+        // writer admits one before the next view, which sees the end. The
+        // short view proves nothing, so the explicit pools stay.
+        let successive = ScriptedViews::new([(100, unscheduled), (700, scheduled)]);
+        assert_eq!(
+            resolve_published_shape(&successive, explicit, end).await,
+            explicit
+        );
+        assert_eq!(successive.captures(), 1);
+        Ok(())
+    }
+
+    /// A listener at its stream limit refuses a two-pool request before it
+    /// captures a view or reads an activation schedule.
+    #[tokio::test]
+    async fn a_saturated_listener_refuses_a_two_pool_request_before_any_view_read()
+    -> Result<(), Status> {
+        let one_stream = NonZeroU32::new(1).ok_or_else(|| Status::internal("zero streams"))?;
+        let methods = BlockMethods::default()
+            .with_max_concurrent_block_range_streams(one_stream)
+            .with_block_range_admission_wait(Duration::ZERO);
+        let reads =
+            ScriptedViews::new([(700, NetworkUpgradeActivations::empty(Network::ZcashRegtest))]);
+        let _held = methods.block_range_streams().open().await?;
+        let request = lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: 700,
+                hash: Vec::new(),
+            }),
+            pool_types: vec![
+                lightwalletd::PoolType::Sapling as i32,
+                lightwalletd::PoolType::Orchard as i32,
+            ],
+        };
+        let refused = methods
+            .published_block_range(
+                &reads,
+                &request,
+                (None, crate::published_range::ShieldedTailBuffer::default()),
+                CompactBlockShape::for_range,
+            )
+            .await;
+        assert_eq!(
+            refused.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        assert_eq!(reads.captures(), 0);
+        Ok(())
     }
 
     #[test]

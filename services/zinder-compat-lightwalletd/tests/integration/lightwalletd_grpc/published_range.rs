@@ -214,7 +214,7 @@ async fn generated_wallet_clients_cross_the_published_boundary_in_both_direction
         [] as [BlockHeightRange; 0]
     );
 
-    check_other_wallet_calls(&mut wallet, &mut stock, &mut blocks_only).await
+    check_other_wallet_calls(&mut wallet, &mut stock, &mut blocks_only, &recorder).await
 }
 
 #[allow(
@@ -225,6 +225,7 @@ async fn check_other_wallet_calls(
     wallet: &mut Endpoint,
     stock: &mut Endpoint,
     blocks_only: &mut Endpoint,
+    recorder: &EpochPinRecorder<WalletServingQuery<()>>,
 ) -> eyre::Result<()> {
     let mut explicit = block_range_request(2, 2);
     explicit.pool_types = vec![lightwalletd::PoolType::Transparent as i32];
@@ -236,25 +237,34 @@ async fn check_other_wallet_calls(
         wallet.blocks(explicit.clone()).await?,
         stock.blocks(explicit).await?
     );
-    let request = block_range_request(1, 6);
-    let expected = drain_slowly(
-        stock
-            .client
-            .get_block_range_nullifiers(request.clone())
-            .await?
-            .into_inner(),
-    )
-    .await;
-    let actual = drain_slowly(
-        wallet
-            .client
-            .get_block_range_nullifiers(request)
-            .await?
-            .into_inner(),
-    )
-    .await;
-    assert!(actual.ending.is_none() && expected.ending.is_none());
-    assert_eq!(actual.blocks, expected.blocks);
+    // The covered nullifier ranges served the sealed nullifier slab; none of
+    // their chunks was offered to the native compact-block path.
+    let offered_before_nullifiers = recorder.offered_compact_block_ranges().len();
+    for (first, last) in [(1, 6), (6, 1)] {
+        let request = block_range_request(first, last);
+        let expected = drain_slowly(
+            stock
+                .client
+                .get_block_range_nullifiers(request.clone())
+                .await?
+                .into_inner(),
+        )
+        .await;
+        let actual = drain_slowly(
+            wallet
+                .client
+                .get_block_range_nullifiers(request)
+                .await?
+                .into_inner(),
+        )
+        .await;
+        assert!(actual.ending.is_none() && expected.ending.is_none());
+        assert_eq!(actual.blocks, expected.blocks);
+    }
+    assert_eq!(
+        recorder.offered_compact_block_ranges().len(),
+        offered_before_nullifiers
+    );
     let tx = lightwalletd::TxFilter {
         hash: vec![17; 32],
         ..Default::default()
@@ -971,7 +981,11 @@ async fn damaged_admitted_segment_ends_covered_rpc_with_data_loss_in_both_orders
         .find(|path| path.extension().is_some_and(|ext| ext == "bin"))
         .ok_or_else(|| eyre!("missing segment"))?;
     let mut file = std::fs::OpenOptions::new().write(true).open(segment)?;
-    file.seek(SeekFrom::Start(60))?;
+    // The first shielded payload byte: the 128-byte header plus its lengths.
+    file.seek(SeekFrom::Start(
+        u64::try_from(zinder_compat_lightwalletd::SEALED_HEADER_LEN + 8)
+            .map_err(|_| eyre!("segment offset overflows"))?,
+    ))?;
     file.write_all(&[0xff])?;
     let mut wallet = Endpoint::start(
         Server::builder().add_service(
@@ -1050,9 +1064,9 @@ async fn catalog_keeps_the_original_native_budget_when_protobuf_has_unknown_fiel
         let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "bin") {
             let mut segment = std::fs::read(&path)?;
-            if segment[12..16] == middle.value().to_be_bytes() {
+            if segment[16..20] == middle.value().to_be_bytes() {
                 let byte = segment
-                    .get_mut(60)
+                    .get_mut(zinder_compat_lightwalletd::SEALED_HEADER_LEN + 8)
                     .ok_or_else(|| eyre!("missing middle block"))?;
                 *byte ^= 1;
                 std::fs::write(path, &segment)?;
