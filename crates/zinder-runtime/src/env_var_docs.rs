@@ -1172,6 +1172,47 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       default 2-second wait.",
     },
     EnvVarDoc {
+        name: "ZINDER_QUERY__FORWARDED_READ_MAX_CONCURRENT",
+        toml_path: "query.forwarded_read_max_concurrent",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Node calls that reads of mined transaction bodies forwarded to `[node]` run at once, per \
+                      process, when the store omits the bodies. Transaction lookups reserve 3/8 \
+                      of the slots and hold at most 3/4. Must be in 1..=256; defaults to 32, \
+                      below Zebra's default limit of 100 JSON-RPC connections.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_QUERY__FORWARDED_READ_WAIT_MS",
+        toml_path: "query.forwarded_read_wait_ms",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Milliseconds a forwarded transaction read waits for a node-call slot before it is \
+                      refused with `FORWARDED_READ_LIMIT_REACHED`. Must be in 0..=30000; 0 \
+                      refuses at once when every slot is taken; defaults to 10000.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_QUERY__FORWARDED_READ_WAITERS_PER_SLOT",
+        toml_path: "query.forwarded_read_waiters_per_slot",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Forwarded reads that may wait for each node-call slot of their kind's cap; a read \
+                      that finds every waiting place taken is refused at once with \
+                      `FORWARDED_READ_LIMIT_REACHED`. Must be in 1..=64; defaults to 16.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_QUERY__FORWARDED_TRANSACTION_CACHE_BYTES",
+        toml_path: "query.forwarded_transaction_cache_bytes",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Bytes of verified mined transaction bodies kept after they are read from the node, \
+                      evicted least recently used first. Must be in 0..=1073741824; 0 disables \
+                      the cache; defaults to 67108864 (64 MiB).",
+    },
+    EnvVarDoc {
         name: "ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS",
         toml_path: "query.trust_proxy_client_address",
         used_by: &["zinder-query"],
@@ -1298,6 +1339,52 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       slot. A rebuild that finds every waiting place taken fails at once with \
                       `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks \
                       serving rejects it. Accepts 1 to 256 and defaults to 64.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__FORWARDED_READ_MAX_CONCURRENT",
+        toml_path: "compat.forwarded_read_max_concurrent",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Node calls that wallet reads forwarded to `[node]` run at once, per process: mined \
+                      transaction bodies the store omits and, in light-wallet serving, address \
+                      UTXO and history lookups. Each kind reserves a share and the rest is \
+                      shared. Applies to wallet and light-wallet serving. Compact-blocks serving \
+                      rejects it. Accepts 1 to 256 and defaults to 32.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__FORWARDED_READ_WAIT_MS",
+        toml_path: "compat.forwarded_read_wait_ms",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Milliseconds a forwarded read waits for a slot before it fails with `UNAVAILABLE`. \
+                      Applies to wallet and light-wallet serving. Compact-blocks serving rejects \
+                      it. Accepts 0 to 30000 and defaults to 10000. A value of 0 refuses at once \
+                      when every slot is taken.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__FORWARDED_READ_WAITERS_PER_SLOT",
+        toml_path: "compat.forwarded_read_waiters_per_slot",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Forwarded reads that may wait for each node-call slot of their kind's cap. A read \
+                      that finds every waiting place taken fails at once with `UNAVAILABLE`. \
+                      Applies to wallet and light-wallet serving. Compact-blocks serving rejects \
+                      it. Accepts 1 to 64 and defaults to 16.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__FORWARDED_TRANSACTION_CACHE_BYTES",
+        toml_path: "compat.forwarded_transaction_cache_bytes",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Bytes of verified mined transaction bodies kept after they are read from the node, \
+                      shared by `GetTransaction` and address history. Applies to wallet and \
+                      light-wallet serving. Compact-blocks serving rejects it. Accepts 0 to \
+                      1073741824 and defaults to 67108864 (64 MiB). A value of 0 disables the \
+                      cache.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__STALE_TIP_LIMIT_MS",
@@ -2217,6 +2304,10 @@ mod tests {
                 "ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS",
                 "ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS",
                 "ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
+                "ZINDER_QUERY__FORWARDED_READ_MAX_CONCURRENT",
+                "ZINDER_QUERY__FORWARDED_READ_WAIT_MS",
+                "ZINDER_QUERY__FORWARDED_READ_WAITERS_PER_SLOT",
+                "ZINDER_QUERY__FORWARDED_TRANSACTION_CACHE_BYTES",
                 "ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS",
             ]
         );
@@ -2240,6 +2331,10 @@ mod tests {
                 "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS",
                 "ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS",
                 "ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
+                "ZINDER_COMPAT__FORWARDED_READ_MAX_CONCURRENT",
+                "ZINDER_COMPAT__FORWARDED_READ_WAIT_MS",
+                "ZINDER_COMPAT__FORWARDED_READ_WAITERS_PER_SLOT",
+                "ZINDER_COMPAT__FORWARDED_TRANSACTION_CACHE_BYTES",
                 "ZINDER_COMPAT__STALE_TIP_LIMIT_MS",
                 "ZINDER_COMPAT__TIP_WAIT_MS",
                 "ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS",

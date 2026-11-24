@@ -33,9 +33,9 @@ use config::{CompatServing, LightwalletdConfigError, LightwalletdConfigOverrides
 use supervision::{CompactBlocksServingTasks, WalletServingTasks};
 use zinder_query::{
     AdmittedIngestControl, CanonicalReader as _, DEFAULT_TREE_STATE_REPLAY_WAIT,
-    DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, OrderedBroadcaster, WalletServingPairConfig,
-    WalletServingPairPublisher, WalletServingQuery, WalletServingReadiness,
-    spawn_wallet_ingest_control_readiness_probe,
+    DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, ForwardedReadLimit, OrderedBroadcaster,
+    WalletServingPairConfig, WalletServingPairPublisher, WalletServingQuery,
+    WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
 };
 
 #[global_allocator]
@@ -301,9 +301,11 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
     let tree_state_replay_waiters_per_slot = lightwalletd_config
         .tree_state_replay_waiters_per_slot
         .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT);
+    let forwarded_reads =
+        ForwardedReadLimit::new(lightwalletd_config.forwarded_reads.unwrap_or_default());
     let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot)
         .with_node_broadcast(node_broadcast)
-        .with_verified_cold_transactions()
+        .with_verified_cold_transactions(forwarded_reads)
         .with_tree_state_replay_wait(tree_state_replay_wait)
         .with_tree_state_replay_waiters_per_slot(tree_state_replay_waiters_per_slot);
     let grpc_adapter =
@@ -580,6 +582,7 @@ async fn run_canonical(
                 lightwalletd_config
                     .tree_state_replay_waiters_per_slot
                     .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT),
+                ForwardedReadLimit::new(lightwalletd_config.forwarded_reads.unwrap_or_default()),
             )
             .with_max_concurrent_block_range_streams(
                 lightwalletd_config.max_concurrent_block_range_streams,

@@ -289,6 +289,70 @@ fn tree_state_replay_waiters_per_slot_default_to_64_and_are_bounded() -> eyre::R
     Ok(())
 }
 
+/// Forwarded-read admission and cache settings render their defaults,
+/// follow their environment variables, and are refused outside their ranges.
+#[test]
+fn forwarded_read_settings_default_and_are_bounded() -> eyre::Result<()> {
+    const SETTINGS: [(&str, &str, &str, &str, &str); 4] = [
+        (
+            "FORWARDED_READ_MAX_CONCURRENT",
+            "forwarded_read_max_concurrent",
+            "32",
+            "256",
+            "257",
+        ),
+        (
+            "FORWARDED_READ_WAIT_MS",
+            "forwarded_read_wait_ms",
+            "10000",
+            "0",
+            "30001",
+        ),
+        (
+            "FORWARDED_READ_WAITERS_PER_SLOT",
+            "forwarded_read_waiters_per_slot",
+            "16",
+            "64",
+            "0",
+        ),
+        (
+            "FORWARDED_TRANSACTION_CACHE_BYTES",
+            "forwarded_transaction_cache_bytes",
+            "67108864",
+            "0",
+            "1073741825",
+        ),
+    ];
+    let temporary = TempDir::new()?;
+    let secondary = temporary.path().join("canonical-secondary");
+    let rendered = |variable: &str, value: Option<&str>| -> eyre::Result<std::process::Output> {
+        let mut command = query_command(&temporary, &secondary);
+        for (suffix, ..) in SETTINGS {
+            command.env_remove(format!("ZINDER_QUERY__{suffix}"));
+        }
+        if let Some(value) = value {
+            command.env(format!("ZINDER_QUERY__{variable}"), value);
+        }
+        Ok(command.output()?)
+    };
+    for (variable, key, default, accepted, refused) in SETTINGS {
+        for (value, expected) in [(None, default), (Some(accepted), accepted)] {
+            let output = rendered(variable, value)?;
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout)?;
+            assert!(stdout.contains(&format!("{key} = {expected}")), "{stdout}");
+        }
+        let output = rendered(variable, Some(refused))?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains(&format!("query.{key} must be in")),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn wallet_profiles_render_without_injected_retention() -> eyre::Result<()> {
     let temporary = TempDir::new()?;

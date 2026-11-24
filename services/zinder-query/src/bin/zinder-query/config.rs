@@ -12,7 +12,7 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_query::{
     DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
-    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    ForwardedReadConfig, MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
@@ -54,6 +54,8 @@ pub(super) struct QueryConfig {
     pub(super) tree_state_replay_wait: Duration,
     /// Most tree-state rebuilds that wait for each rebuild slot.
     pub(super) tree_state_replay_waiters_per_slot: NonZeroU32,
+    /// Admission and cache settings for transaction bytes read from the node.
+    pub(super) forwarded_reads: ForwardedReadConfig,
     /// First node endpoint transaction broadcast tries, or `None` for a
     /// storage-only query.
     pub(super) node: Option<NodeTarget>,
@@ -186,6 +188,10 @@ struct QuerySection {
     pair_convergence_attempts: Option<u8>,
     tree_state_replay_wait_ms: Option<u64>,
     tree_state_replay_waiters_per_slot: Option<u32>,
+    forwarded_read_max_concurrent: Option<u32>,
+    forwarded_read_wait_ms: Option<u64>,
+    forwarded_read_waiters_per_slot: Option<u32>,
+    forwarded_transaction_cache_bytes: Option<u64>,
     trust_proxy_client_address: Option<bool>,
 }
 
@@ -256,6 +262,13 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
     let tree_state_replay_waiters_per_slot = require_tree_state_replay_waiters_per_slot(
         config.query.tree_state_replay_waiters_per_slot,
     )?;
+    let forwarded_reads = ForwardedReadConfig::resolve(
+        config.query.forwarded_read_max_concurrent,
+        config.query.forwarded_read_wait_ms,
+        config.query.forwarded_read_waiters_per_slot,
+        config.query.forwarded_transaction_cache_bytes,
+    )
+    .map_err(|error| ConfigError::invalid(format!("query.{error}")))?;
     let node = config
         .node
         .map(|section| NodeTarget::resolve(network, section))
@@ -286,6 +299,7 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         pair_convergence_attempts,
         tree_state_replay_wait,
         tree_state_replay_waiters_per_slot,
+        forwarded_reads,
         node,
         node_fallbacks,
     })
@@ -438,6 +452,11 @@ impl QueryConfigToml {
                 tree_state_replay_wait_ms: u64::try_from(config.tree_state_replay_wait.as_millis())
                     .unwrap_or(u64::MAX),
                 tree_state_replay_waiters_per_slot: config.tree_state_replay_waiters_per_slot.get(),
+                forwarded_read_max_concurrent: config.forwarded_reads.max_concurrent().get(),
+                forwarded_read_wait_ms: u64::try_from(config.forwarded_reads.wait().as_millis())
+                    .unwrap_or(u64::MAX),
+                forwarded_read_waiters_per_slot: config.forwarded_reads.waiters_per_slot().get(),
+                forwarded_transaction_cache_bytes: config.forwarded_reads.transaction_cache_bytes(),
                 trust_proxy_client_address: config
                     .client_address_source
                     .trust_proxy_client_address(),
@@ -455,6 +474,10 @@ struct QueryToml {
     pair_convergence_attempts: u8,
     tree_state_replay_wait_ms: u64,
     tree_state_replay_waiters_per_slot: u32,
+    forwarded_read_max_concurrent: u32,
+    forwarded_read_wait_ms: u64,
+    forwarded_read_waiters_per_slot: u32,
+    forwarded_transaction_cache_bytes: u64,
     trust_proxy_client_address: bool,
 }
 

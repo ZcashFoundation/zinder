@@ -647,6 +647,120 @@ fn tree_state_replay_waiters_per_slot_default_to_64_and_are_bounded() -> eyre::R
     Ok(())
 }
 
+const FORWARDED_READ_SETTINGS: [(&str, &str, &str, &str, &str); 4] = [
+    (
+        "FORWARDED_READ_MAX_CONCURRENT",
+        "forwarded_read_max_concurrent",
+        "32",
+        "256",
+        "0",
+    ),
+    (
+        "FORWARDED_READ_WAIT_MS",
+        "forwarded_read_wait_ms",
+        "10000",
+        "0",
+        "30001",
+    ),
+    (
+        "FORWARDED_READ_WAITERS_PER_SLOT",
+        "forwarded_read_waiters_per_slot",
+        "16",
+        "1",
+        "65",
+    ),
+    (
+        "FORWARDED_TRANSACTION_CACHE_BYTES",
+        "forwarded_transaction_cache_bytes",
+        "67108864",
+        "0",
+        "1073741825",
+    ),
+];
+
+/// Wallet serving's forwarded-read admission and cache settings render their
+/// defaults, follow their environment variables, and are refused outside
+/// their ranges.
+#[test]
+fn forwarded_read_settings_default_and_are_bounded() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-forwarded-store"),
+            &tempdir.path().join("compat-forwarded-secondary"),
+            &tempdir.path().join("compat-forwarded-wallet"),
+        )?,
+    )?;
+    let rendered = |variable: &str, value: Option<&str>| -> eyre::Result<std::process::Output> {
+        let mut command = zinder_compat_command();
+        command.args(["--print-config", "--config", path_str(&config_path)?]);
+        for (suffix, ..) in FORWARDED_READ_SETTINGS {
+            command.env_remove(format!("ZINDER_COMPAT__{suffix}"));
+        }
+        if let Some(value) = value {
+            command.env(format!("ZINDER_COMPAT__{variable}"), value);
+        }
+        Ok(command.output()?)
+    };
+    for (variable, key, default, accepted, refused) in FORWARDED_READ_SETTINGS {
+        for (value, expected) in [(None, default), (Some(accepted), accepted)] {
+            let output = rendered(variable, value)?;
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout)?;
+            assert!(stdout.contains(&format!("{key} = {expected}")), "{stdout}");
+        }
+        let output = rendered(variable, Some(refused))?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains(&format!("compat.{key} must be in")),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// Compact-block serving forwards no wallet read, so it refuses every
+/// forwarded-read setting and renders none.
+#[test]
+fn compact_blocks_rejects_the_forwarded_read_settings() -> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let config_path = temporary.path().join("compact-blocks.toml");
+    fs::write(
+        &config_path,
+        compact_blocks_config_toml(
+            &temporary.path().join("compact-blocks-store"),
+            &temporary.path().join("compact-blocks-secondary"),
+        )?,
+    )?;
+    let command = || -> eyre::Result<std::process::Command> {
+        let mut command = zinder_compat_command();
+        command.args(["--print-config", "--config", path_str(&config_path)?]);
+        for (suffix, ..) in FORWARDED_READ_SETTINGS {
+            command.env_remove(format!("ZINDER_COMPAT__{suffix}"));
+        }
+        Ok(command)
+    };
+    for (variable, key, default, ..) in FORWARDED_READ_SETTINGS {
+        let output = command()?
+            .env(format!("ZINDER_COMPAT__{variable}"), default)
+            .output()?;
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains(&format!("does not accept compat.{key}")),
+            "{stderr}"
+        );
+    }
+    let output = command()?.output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains("forwarded_"), "{stdout}");
+    Ok(())
+}
+
 /// Compact-block serving answers no tree-state request, so it refuses the
 /// tree-state rebuild wait and waiters like any other wallet setting.
 #[test]

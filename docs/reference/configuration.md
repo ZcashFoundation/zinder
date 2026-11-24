@@ -77,6 +77,19 @@ query and compatibility processes a primary `[node]` that can supply mined
 transaction bytes. Readers check the stored data requirements when opening
 the canonical store. A writer changing retention must build a new store.
 
+`light-wallet` and `wallet` depend on the node for every mined transaction
+body a wallet asks for, through `GetTransaction` and address history. Each
+process admits these reads through a bounded node-call budget, a wait queue,
+and a verified byte cache, configured with the `forwarded_read_*` and
+`forwarded_transaction_cache_bytes` settings of `[query]` or `[compat]`; see
+[Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads).
+Retain transaction bodies locally instead when the node is remote, pruning,
+or shared with other heavy work, or when a public deployment serves many
+wallets at once. Use `wallet-archive`, or build the store with
+`storage.raw_blob_policy = "transactions"` and set `compat.serving =
+"light-wallet"` or `"wallet"` explicitly. Transaction bodies take about 251
+GiB on Mainnet.
+
 ## Light-wallet profile
 
 Set `deployment.profile = "light-wallet"` in both the ingest and
@@ -105,10 +118,10 @@ Without the profile, both use the reader's configured
 `storage.raw_blob_policy`, which defaults to `transactions`.
 Set it to `none` explicitly to admit a store without transaction bodies. See
 [Lightwalletd compatibility](lightwalletd-compatibility.md#runtime-serving-selection)
-for method behavior. Light-wallet serving uses fixed per-listener limits for
-[forwarded transactions](lightwalletd-compatibility.md#gettransaction),
-[address history](lightwalletd-compatibility.md#gettaddresstxids-and-gettaddresstransactions),
-and [unspent-output lookups](lightwalletd-compatibility.md#getaddressutxos-and-getaddressutxosstream).
+for method behavior. Light-wallet serving bounds its forwarded transaction,
+address history, and unspent-output reads as
+[Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads)
+describes, with the settings in the table below.
 
 ## How configuration is loaded
 
@@ -308,6 +321,10 @@ not check descriptions or defaults.
 | `ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS` | zinder-query | Optional | `query.pair_convergence_attempts` | Maximum bounded attempts to converge and admit native query's canonical and wallet secondary pair. Must be in 1..=64; defaults to 12. |
 | `ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS` | zinder-query | Optional | `query.tree_state_replay_wait_ms` | Milliseconds a tree-state rebuild waits for a rebuild slot before it is refused with `TREE_STATE_REPLAY_LIMIT_REACHED`. Must be in 0..=5000; 0 refuses at once; defaults to 2000. |
 | `ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-query | Optional | `query.tree_state_replay_waiters_per_slot` | Tree-state rebuilds that may wait for each rebuild slot; a rebuild that finds every waiting place taken is refused at once with `TREE_STATE_REPLAY_LIMIT_REACHED`. Must be in 1..=256; defaults to 64, enough for one slot to serve its waiters at a 30 ms rebuild within the default 2-second wait. |
+| `ZINDER_QUERY__FORWARDED_READ_MAX_CONCURRENT` | zinder-query | Optional | `query.forwarded_read_max_concurrent` | Node calls that reads of mined transaction bodies forwarded to `[node]` run at once, per process, when the store omits the bodies. Transaction lookups reserve 3/8 of the slots and hold at most 3/4. Must be in 1..=256; defaults to 32, below Zebra's default limit of 100 JSON-RPC connections. |
+| `ZINDER_QUERY__FORWARDED_READ_WAIT_MS` | zinder-query | Optional | `query.forwarded_read_wait_ms` | Milliseconds a forwarded transaction read waits for a node-call slot before it is refused with `FORWARDED_READ_LIMIT_REACHED`. Must be in 0..=30000; 0 refuses at once when every slot is taken; defaults to 10000. |
+| `ZINDER_QUERY__FORWARDED_READ_WAITERS_PER_SLOT` | zinder-query | Optional | `query.forwarded_read_waiters_per_slot` | Forwarded reads that may wait for each node-call slot of their kind's cap; a read that finds every waiting place taken is refused at once with `FORWARDED_READ_LIMIT_REACHED`. Must be in 1..=64; defaults to 16. |
+| `ZINDER_QUERY__FORWARDED_TRANSACTION_CACHE_BYTES` | zinder-query | Optional | `query.forwarded_transaction_cache_bytes` | Bytes of verified mined transaction bodies kept after they are read from the node, evicted least recently used first. Must be in 0..=1073741824; 0 disables the cache; defaults to 67108864 (64 MiB). |
 | `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS` | zinder-query | Optional | `query.trust_proxy_client_address` | Counts each WalletQuery request against the client connection that a reverse proxy names in the `x-zinder-client-address` header, instead of the proxy's own connection, when the receive limit picks which client to refuse. Set it only when clients reach the listener solely through a proxy that replaces the header. Defaults to false. |
 | `ZINDER_COMPAT__LISTEN_ADDR` | zinder-compat-lightwalletd | Optional | `compat.listen_addr` | Listen address for the lightwalletd-compatible gRPC endpoint. Defaults to `127.0.0.1:9067`. |
 | `ZINDER_COMPAT__BROWSER_ORIGINS` | zinder-compat-lightwalletd | Optional | `compat.browser_origins` | Enables gRPC-Web for the listed browser origins. Use comma-separated HTTP or HTTPS origins in the environment, or an array in TOML. An empty list disables browser access (the default). Use `*` alone to allow every origin. |
@@ -321,6 +338,10 @@ not check descriptions or defaults.
 | `ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` | zinder-compat-lightwalletd | Optional | `compat.max_concurrent_block_range_streams` | Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` streams the compatibility server serves. A valid request past the limit waits in a bounded queue of up to three times this limit (300 waiters by default, holding no chunk buffers) for up to 10 seconds for a slot, then fails with `UNAVAILABLE`. Raise this setting (for example to 200) on higher-concurrency public endpoints when memory allows and slot wait or refusal metrics rise. Must be in 1..=65536; defaults to 100. |
 | `ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_wait_ms` | Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot before it is refused with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 0 to 5000 and defaults to 2000. A value of 0 refuses at once. |
 | `ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT` | zinder-compat-lightwalletd | Optional | `compat.tree_state_replay_waiters_per_slot` | Number of lightwalletd `GetTreeState` rebuilds that may wait for each rebuild slot. A rebuild that finds every waiting place taken fails at once with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 1 to 256 and defaults to 64. |
+| `ZINDER_COMPAT__FORWARDED_READ_MAX_CONCURRENT` | zinder-compat-lightwalletd | Optional | `compat.forwarded_read_max_concurrent` | Node calls that wallet reads forwarded to `[node]` run at once, per process: mined transaction bodies the store omits and, in light-wallet serving, address UTXO and history lookups. Each kind reserves a share and the rest is shared. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 1 to 256 and defaults to 32. |
+| `ZINDER_COMPAT__FORWARDED_READ_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.forwarded_read_wait_ms` | Milliseconds a forwarded read waits for a slot before it fails with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 0 to 30000 and defaults to 10000. A value of 0 refuses at once when every slot is taken. |
+| `ZINDER_COMPAT__FORWARDED_READ_WAITERS_PER_SLOT` | zinder-compat-lightwalletd | Optional | `compat.forwarded_read_waiters_per_slot` | Forwarded reads that may wait for each node-call slot of their kind's cap. A read that finds every waiting place taken fails at once with `UNAVAILABLE`. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 1 to 64 and defaults to 16. |
+| `ZINDER_COMPAT__FORWARDED_TRANSACTION_CACHE_BYTES` | zinder-compat-lightwalletd | Optional | `compat.forwarded_transaction_cache_bytes` | Bytes of verified mined transaction bodies kept after they are read from the node, shared by `GetTransaction` and address history. Applies to wallet and light-wallet serving. Compact-blocks serving rejects it. Accepts 0 to 1073741824 and defaults to 67108864 (64 MiB). A value of 0 disables the cache. |
 | `ZINDER_COMPAT__STALE_TIP_LIMIT_MS` | zinder-compat-lightwalletd | Optional | `compat.stale_tip_limit_ms` | Milliseconds the served tip may age, counted from its block time or from when the process first served it, whichever is earlier, while the writer cannot vouch for it because its node is unreachable, behind the network, or ahead of the writer, before lightwalletd `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, so wallets stop building transactions on a stale tip. A tip the node still reports is never refused. 0 disables it; otherwise at least 300000. Defaults to 1500000 (25 minutes). |
 | `ZINDER_COMPAT__TIP_WAIT_MS` | zinder-compat-lightwalletd | Optional | `compat.tip_wait_ms` | Milliseconds a height-selected lightwalletd block read waits for a height just past the visible tip before it runs unchanged. Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, the encoded block range methods, and, in wallet and light-wallet serving, `GetTreeState` by height. Applies to every serving mode. The worst delay before a block-range response's headers is this wait plus the existing 10-second block-range admission wait. A value of 0 disables the wait. A nonzero value must be at least twice `storage.secondary_catchup_interval_ms`. There is no upper bound. Defaults to 3000, which is provisional pending cross-region skew measurement. |
 | `ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS` | zinder-compat-lightwalletd | Optional | `compat.tip_wait_max_blocks` | Furthest past the visible tip, in blocks, that a read may name and still wait for the tip. A read naming a height further ahead runs at once. Applies to every serving mode. Must be at least 1, with no upper bound. Defaults to 2. |
@@ -591,6 +612,8 @@ has a bound.
 | Transaction bytes being broadcast at once, per process | 16 MiB | `BROADCAST_BUDGET_EXHAUSTED` |
 | Open `WalletQuery.CompactBlocksInRange` streams, per process | 100 | `COMPACT_BLOCK_STREAM_LIMIT_REACHED` |
 | Tree states rebuilt at once for heights without a stored checkpoint | One per CPU; a rebuild waits for a slot up to 2 s by default (`query.tree_state_replay_wait_ms` in `zinder-query`, `compat.tree_state_replay_wait_ms` in wallet-serving `zinder-compat-lightwalletd`), with at most 64 waiting per slot by default (`query.tree_state_replay_waiters_per_slot` and `compat.tree_state_replay_waiters_per_slot`, 1 to 256) and any further rebuild refused at once | `TREE_STATE_REPLAY_LIMIT_REACHED` natively; `UNAVAILABLE` with no reason in lightwalletd `GetTreeState` |
+| Node calls that forwarded wallet reads run at once, per process | 32 by default (`query.forwarded_read_max_concurrent`, `compat.forwarded_read_max_concurrent`, 1 to 256), split into a reserved floor and cap per kind; a read waits up to 10 s by default (`forwarded_read_wait_ms`) with 16 waiting per slot of its kind's cap by default (`forwarded_read_waiters_per_slot`) | `FORWARDED_READ_LIMIT_REACHED` natively; `UNAVAILABLE` with no reason in lightwalletd |
+| Forwarded unspent-output responses and address-history streams open at once, per process | 16 and 32, each with 128 waiting places and the same wait | `UNAVAILABLE` |
 
 The broadcast budget covers native `BroadcastTransaction` and lightwalletd
 `SendTransaction`. A broadcast holds its transaction's bytes until the node

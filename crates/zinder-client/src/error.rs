@@ -491,6 +491,7 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::TransactionNotFound
         | ErrorReason::TreeStateReplayLimitReached
         | ErrorReason::CompactBlockStreamLimitReached
+        | ErrorReason::ForwardedReadLimitReached
         | ErrorReason::BroadcastBudgetExhausted => RetryPolicy::RetryWithBackoff,
         ErrorReason::Unknown(_) => retry_policy_for_status(code),
     }
@@ -741,6 +742,24 @@ mod tests {
         let error = IndexerError::from_status(status);
 
         assert_eq!(error.reason(), Some(ErrorReason::NodeRateLimited));
+        assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
+    }
+
+    #[test]
+    fn forwarded_read_limit_refusal_is_retried_with_backoff() {
+        let status = tonic::Status::with_error_details(
+            Code::ResourceExhausted,
+            "forwarded transaction reads are at their limit",
+            ErrorDetails::with_error_info(
+                ErrorReason::ForwardedReadLimitReached.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(error.reason(), Some(ErrorReason::ForwardedReadLimitReached));
         assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
     }
 

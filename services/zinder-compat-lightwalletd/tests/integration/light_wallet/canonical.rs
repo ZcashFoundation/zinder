@@ -133,100 +133,214 @@ fn mined_reply(id: TransactionId, block: zinder_core::BlockId, hex: &str) -> Rpc
     }))
 }
 
-#[test]
-fn forwarded_transactions_refuse_extra_calls_until_a_slot_returns() -> Result<()> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .max_blocking_threads(1)
-        .build()?
-        .block_on(forwarded_transaction_admission())
+/// The node calls a [`gated_transactions`] node has entered, and the gate
+/// that holds their answers.
+struct NodeGate {
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
 }
 
-async fn forwarded_transaction_admission() -> Result<()> {
-    use parking_lot::{Condvar, Mutex};
-
-    let id = TransactionId::from_bytes([0x55; 32]);
-    let timeout = Duration::from_mins(2);
-    let (entered, mut calls) = tokio::sync::mpsc::unbounded_channel();
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let node_gate = Arc::clone(&gate);
-    let (fixture, _) = mined_without_retention(id, timeout, |served| {
-        [method("getrawtransaction").reply_with(move |_| {
-            let _ = entered.send(());
-            let released_in_time = {
-                let (released, ready) = &*node_gate;
-                let mut released = released.lock();
-                ready.wait_while_for(&mut released, |released| !*released, timeout);
-                *released
-            };
-            if released_in_time {
-                mined_reply(id, served, "55")
-            } else {
-                RpcReply::error("test node gate did not release")
-            }
-        })]
-    })?;
-
-    let (occupied, entered_blocking_pool) = tokio::sync::oneshot::channel();
-    let (release, blocked) = tokio::sync::oneshot::channel();
-    let blocking_slot = tokio::task::spawn_blocking(move || {
-        let _ = occupied.send(());
-        let _ = blocked.blocking_recv();
-    });
-    entered_blocking_pool.await?;
-    let mut replay_requests: Vec<_> = (0..8)
-        .map(|_| Box::pin(fixture.adapter.get_transaction(transaction(id))))
-        .collect();
-    for request in &mut replay_requests {
-        assert!(futures_util::poll!(request).is_pending());
+impl NodeGate {
+    fn entered(&self) -> usize {
+        self.entered.load(std::sync::atomic::Ordering::Acquire)
     }
-    assert_transaction_refused(fixture.adapter.get_transaction(transaction(id)).await)?;
-    drop(replay_requests);
-    assert_transaction_refused(fixture.adapter.get_transaction(transaction(id)).await)?;
-    release
-        .send(())
-        .map_err(|()| eyre!("blocking pool gate closed early"))?;
-    blocking_slot.await?;
-    // The single blocking worker runs all admitted evidence before this marker.
-    tokio::task::spawn_blocking(|| ()).await?;
-    assert!(
-        fixture.node.requests()?.is_empty(),
-        "cancelled evidence forwarded to the node"
+
+    async fn wait_for_entered(&self, calls: usize) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.entered() < calls {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| eyre!("the node received {} of {calls} calls", self.entered()))
+    }
+
+    fn open(&self) {
+        let (released, ready) = &*self.gate;
+        *released.lock() = true;
+        ready.notify_all();
+    }
+}
+
+/// Serves block 1 mining one transaction per byte in `bytes`, without bodies.
+///
+/// Each transaction has that byte as its ID and its one-byte body, and the
+/// node reports each in block 1 once its gate opens.
+fn gated_transactions(
+    bytes: std::ops::RangeInclusive<u8>,
+    reads: zinder_query::ForwardedReadLimit,
+) -> Result<(Fixture, NodeGate)> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let block = chain
+        .blocks()
+        .first()
+        .ok_or_else(|| eyre!("missing block"))?;
+    let served = zinder_core::BlockId::new(block.height, block.hash);
+    let chain = bytes.fold(chain, |chain, byte| {
+        chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            TransactionId::from_bytes([byte; 32]),
+            served.height,
+            served.hash,
+            u32::from(byte),
+            vec![byte],
+        ))
+    });
+    let gate = NodeGate {
+        entered: Arc::default(),
+        gate: Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new())),
+    };
+    let (node_gate, entered) = (Arc::clone(&gate.gate), Arc::clone(&gate.entered));
+    let fixture = Fixture::with_reads(
+        &chain,
+        &super::one_upgrade_per_height()?,
+        [method("getrawtransaction").reply_with(move |params| {
+            entered.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let (released, opened) = &*node_gate;
+            let mut released = released.lock();
+            opened.wait_while_for(
+                &mut released,
+                |released| !*released,
+                Duration::from_secs(20),
+            );
+            let txid = params[0].as_str().unwrap_or_default();
+            RpcReply::result(json!({
+                "hex": txid.get(..2).unwrap_or_default(),
+                "txid": txid,
+                "height": served.height.value(),
+                "blockhash": encode_rpc_block_hash_hex(served.hash),
+            }))
+        })],
+        Duration::from_secs(30),
+        reads,
+    )?;
+    Ok((fixture, gate))
+}
+
+#[tokio::test]
+async fn forwarded_transactions_queue_coalesce_and_refuse_only_past_their_waiting_places()
+-> Result<()> {
+    // Four node-call slots give transaction lookups a cap of two and, at one
+    // waiter per slot, two waiting places.
+    let reads = zinder_query::ForwardedReadLimit::new(zinder_query::ForwardedReadConfig::resolve(
+        Some(4),
+        Some(10_000),
+        Some(1),
+        None,
+    )?);
+    let (fixture, gate) = gated_transactions(0x51..=0x55, reads)?;
+    let mut lookups = tokio::task::JoinSet::new();
+    let mut lookup = |byte: u8| {
+        let adapter = fixture.adapter.clone();
+        lookups.spawn(async move {
+            adapter
+                .get_transaction(transaction(TransactionId::from_bytes([byte; 32])))
+                .await
+                .map(|reply| (byte, reply.into_inner().data))
+        });
+    };
+    for byte in [0x51, 0x52] {
+        lookup(byte);
+    }
+    gate.wait_for_entered(2).await?;
+    // Two more wait for a slot, and a repeat of a running lookup joins it.
+    for byte in [0x53, 0x54, 0x51] {
+        lookup(byte);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        gate.entered(),
+        2,
+        "a lookup beyond the share reached the node"
     );
 
-    let mut pending = tokio::task::JoinSet::new();
-    for _ in 0..8 {
-        let adapter = fixture.adapter.clone();
-        pending.spawn(async move { adapter.get_transaction(transaction(id)).await });
-    }
-    for _ in 0..8 {
-        tokio::time::timeout(timeout, calls.recv())
-            .await?
-            .ok_or_else(|| eyre!("forwarded lookup did not reach the node"))?;
-    }
-    let extra = fixture.adapter.get_transaction(transaction(id)).await;
-    let (released, ready) = &*gate;
-    *released.lock() = true;
-    ready.notify_all();
+    let refused = fixture
+        .adapter
+        .get_transaction(transaction(TransactionId::from_bytes([0x55; 32])))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a lookup past every waiting place was admitted"))?;
+    assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+    assert!(refused.message().contains("retry with backoff"));
 
-    assert_transaction_refused(extra)?;
-    while let Some(reply) = pending.join_next().await {
-        assert_eq!(reply??.into_inner().data, [0x55]);
+    gate.open();
+    let mut served = Vec::new();
+    while let Some(reply) = lookups.join_next().await {
+        let (byte, data) = reply??;
+        assert_eq!(data, [byte]);
+        served.push(byte);
     }
-    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 8);
-    let reply = fixture.adapter.get_transaction(transaction(id)).await?;
-    assert_eq!(reply.into_inner().data, [0x55]);
+    served.sort_unstable();
+    assert_eq!(served, [0x51, 0x51, 0x52, 0x53, 0x54]);
+    assert_eq!(
+        gate.entered(),
+        4,
+        "the repeated lookup made its own node call"
+    );
+    let cached = fixture
+        .adapter
+        .get_transaction(transaction(TransactionId::from_bytes([0x52; 32])))
+        .await?;
+    assert_eq!(cached.into_inner().data, [0x52]);
+    assert_eq!(gate.entered(), 4, "a cached lookup reached the node");
     Ok(())
 }
 
-fn assert_transaction_refused(
-    response: Result<tonic::Response<lightwalletd::RawTransaction>, Status>,
-) -> Result<()> {
-    let status = response
+#[tokio::test]
+async fn ninety_six_concurrent_forwarded_transactions_all_complete_within_the_wait() -> Result<()> {
+    let (fixture, gate) =
+        gated_transactions(0x01..=0x60, zinder_query::ForwardedReadLimit::default())?;
+    gate.open();
+    let lookups = (0x01..=0x60_u8).map(|byte| {
+        let adapter = fixture.adapter.clone();
+        async move {
+            adapter
+                .get_transaction(transaction(TransactionId::from_bytes([byte; 32])))
+                .await
+                .map(|reply| (byte, reply.into_inner().data))
+        }
+    });
+    let replies = tokio::time::timeout(
+        Duration::from_secs(30),
+        futures_util::future::try_join_all(lookups),
+    )
+    .await??;
+    for (byte, data) in replies {
+        assert_eq!(data, [byte]);
+    }
+    assert_eq!(gate.entered(), 96);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_forwarded_transaction_that_waits_past_the_wait_is_unavailable() -> Result<()> {
+    let reads = zinder_query::ForwardedReadLimit::new(zinder_query::ForwardedReadConfig::resolve(
+        Some(4),
+        Some(200),
+        Some(1),
+        None,
+    )?);
+    let (fixture, gate) = gated_transactions(0x51..=0x53, reads)?;
+    let mut held = tokio::task::JoinSet::new();
+    for byte in [0x51, 0x52] {
+        let adapter = fixture.adapter.clone();
+        held.spawn(async move {
+            adapter
+                .get_transaction(transaction(TransactionId::from_bytes([byte; 32])))
+                .await
+        });
+    }
+    gate.wait_for_entered(2).await?;
+    let expired = fixture
+        .adapter
+        .get_transaction(transaction(TransactionId::from_bytes([0x53; 32])))
+        .await
         .err()
-        .ok_or_else(|| eyre!("ninth lookup was admitted"))?;
-    assert_eq!(status.code(), Code::ResourceExhausted);
-    assert!(status.message().contains("retry with backoff"));
+        .ok_or_else(|| eyre!("a lookup was admitted past its wait"))?;
+    assert_eq!(expired.code(), Code::Unavailable, "{expired:?}");
+    gate.open();
+    while let Some(reply) = held.join_next().await {
+        reply??;
+    }
     Ok(())
 }
 
@@ -240,10 +354,10 @@ async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_
     );
     let (fixture, _) = mined_without_retention(mined, Duration::from_secs(2), |served| {
         [
-            method("getrawtransaction").reply(mined_reply(mined, served, "55")),
             method("getrawtransaction").reply(mined_reply(mined, other, "55")),
             // The served block and ID, with bytes ingest did not commit there.
             method("getrawtransaction").reply(mined_reply(mined, served, "56")),
+            method("getrawtransaction").reply(mined_reply(mined, served, "55")),
         ]
     })?;
     let epoch = fixture.slot.capture().chain_epoch();
@@ -266,13 +380,6 @@ async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_
             .with_mempool_surface(Arc::new(IngestControlMempoolSurface::new(
                 control.endpoint().to_owned(),
             )));
-    for (id, height, bytes) in [
-        (mined, 1, vec![0x55]),
-        (pending.transaction_id(), 0, vec![0x22]),
-    ] {
-        let reply = adapter.get_transaction(transaction(id)).await?.into_inner();
-        assert_eq!((reply.height, reply.data), (height, bytes));
-    }
     let refusal =
         |result: Result<_, Status>| result.err().ok_or_else(|| eyre!("expected an RPC refusal"));
     node_unavailable(&refusal(adapter.get_transaction(transaction(mined)).await)?);
@@ -280,6 +387,16 @@ async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_
         refusal(adapter.get_transaction(transaction(mined)).await)?.code(),
         Code::DataLoss
     );
+    // Neither refusal was cached; the verified bytes are, so the last lookup
+    // reads no node.
+    for (id, height, bytes) in [
+        (mined, 1, vec![0x55]),
+        (pending.transaction_id(), 0, vec![0x22]),
+        (mined, 1, vec![0x55]),
+    ] {
+        let reply = adapter.get_transaction(transaction(id)).await?.into_inner();
+        assert_eq!((reply.height, reply.data), (height, bytes));
+    }
     let missing = TransactionId::from_bytes([3; 32]);
     assert_eq!(
         refusal(fixture.adapter.get_transaction(transaction(missing)).await)?.code(),
@@ -406,12 +523,13 @@ async fn forwarding_rechecks_the_captured_tip_and_recovers_after_a_fork() -> Res
             .collect::<Vec<_>>(),
         [json!([12]), json!([13]), json!([13]), json!([13])],
     );
-    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 3);
+    // Failed tip checks leave the schedule verification in force.
+    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 1);
     Ok(())
 }
 
 #[tokio::test]
-async fn concurrent_forwarding_shares_discovery_and_schedule_but_checks_each_tip() -> Result<()> {
+async fn concurrent_forwarding_shares_discovery_schedule_and_one_tip_check() -> Result<()> {
     let broadcasts = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let advertised = Arc::clone(&broadcasts);
     let fixture = Fixture::new([
@@ -432,12 +550,14 @@ async fn concurrent_forwarding_shares_discovery_and_schedule_but_checks_each_tip
     )?;
     assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 1);
     assert_eq!(fixture.node.requests_for("getblockchaininfo")?.len(), 2);
-    assert_eq!(fixture.node.requests_for("getblockhash")?.len(), 2);
+    // Concurrent checks of the same tip share one call, and its answer is
+    // not reused once it returns.
+    assert_eq!(fixture.node.requests_for("getblockhash")?.len(), 1);
     assert_eq!(fixture.node.requests_for("sendrawtransaction")?.len(), 2);
     fixture.adapter.send_transaction(send()).await?;
     assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 1);
     assert_eq!(fixture.node.requests_for("getblockchaininfo")?.len(), 2);
-    assert_eq!(fixture.node.requests_for("getblockhash")?.len(), 3);
+    assert_eq!(fixture.node.requests_for("getblockhash")?.len(), 2);
 
     broadcasts.store(false, std::sync::atomic::Ordering::Relaxed);
     tokio::time::pause();
@@ -464,7 +584,8 @@ async fn concurrent_forwarding_shares_discovery_and_schedule_but_checks_each_tip
 }
 
 #[tokio::test]
-async fn concurrent_forwarding_shares_a_failed_tip_verification_and_can_retry() -> Result<()> {
+async fn concurrent_forwarding_shares_a_failed_tip_check_and_retries_without_rediscovery()
+-> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let tip = chain.tip_hash().ok_or_else(|| eyre!("missing tip"))?;
     let fixture = Fixture::from_chain(
@@ -496,7 +617,10 @@ async fn concurrent_forwarding_shares_a_failed_tip_verification_and_can_retry() 
     assert!(fixture.node.requests_for("sendrawtransaction")?.is_empty());
 
     fixture.adapter.send_transaction(send()).await?;
-    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 2);
+    // A failed tip check leaves the schedule verification in force, so the
+    // retry checks only the tip.
+    assert_eq!(fixture.node.requests_for("rpc.discover")?.len(), 1);
+    assert_eq!(fixture.node.requests_for("getblockhash")?.len(), 2);
     assert_eq!(fixture.node.requests_for("sendrawtransaction")?.len(), 1);
     Ok(())
 }
@@ -650,6 +774,7 @@ async fn check_publication_during_tip_lookup(
         source,
         super::DEFAULT_TREE_STATE_REPLAY_WAIT,
         super::DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+        zinder_query::ForwardedReadLimit::default(),
     );
     node_unavailable(
         &adapter
@@ -1012,6 +1137,7 @@ fn saturated_replays_return_unavailable_while_latest_checkpoint_is_readable() ->
             )?,
             Duration::ZERO,
             NonZeroU32::MIN,
+            zinder_query::ForwardedReadLimit::default(),
         );
         let mut calls = heights
             .into_iter()
@@ -1076,26 +1202,31 @@ async fn transactions_of_one_block_use_their_indexed_digests() -> Result<()> {
         &super::one_upgrade_per_height()?,
         [
             method("getrawtransaction").reply(mined_reply(coinbase, served, "55")),
-            method("getrawtransaction").reply(mined_reply(spend, served, "56")),
             method("getrawtransaction").reply(mined_reply(spend, served, "57")),
+            method("getrawtransaction").reply(mined_reply(spend, served, "56")),
         ],
         Duration::from_secs(2),
     )?;
-    for (id, body) in [(coinbase, 0x55), (spend, 0x56)] {
-        let reply = fixture
+    let mined_body = async |id| {
+        fixture
             .adapter
             .get_transaction(transaction(id))
-            .await?
-            .into_inner();
-        assert_eq!((reply.height, reply.data), (1, vec![body]));
-    }
-    let status = fixture
-        .adapter
-        .get_transaction(transaction(spend))
+            .await
+            .map(|reply| {
+                let reply = reply.into_inner();
+                (reply.height, reply.data)
+            })
+    };
+    assert_eq!(mined_body(coinbase).await?, (1, vec![0x55]));
+    let status = mined_body(spend)
         .await
         .err()
         .ok_or_else(|| eyre!("accepted bytes the block's digests do not record"))?;
     assert_eq!(status.code(), Code::DataLoss);
+    for _ in 0..2 {
+        assert_eq!(mined_body(spend).await?, (1, vec![0x56]));
+    }
+    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 3);
     Ok(())
 }
 
@@ -1123,7 +1254,8 @@ async fn lean_wallet_verifies_and_caches_mined_bytes_without_forwarding_address_
             method("getrawtransaction").reply(mined_reply(id, block, "55")),
         ],
     )?;
-    let query = lean_wallet_query(&mut store, &node)?.with_verified_cold_transactions();
+    let query = lean_wallet_query(&mut store, &node)?
+        .with_verified_cold_transactions(zinder_query::ForwardedReadLimit::default());
     assert!(query.has_verified_cold_tx_source());
     let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?;
 
@@ -1190,7 +1322,8 @@ async fn assert_miss_behavior(
         .extend_blocks(1);
     let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
     let node = super::verifiable_node(&schedule, tip.hash, [])?;
-    let query = lean_wallet_query(&mut store, &node)?.with_verified_cold_transactions();
+    let query = lean_wallet_query(&mut store, &node)?
+        .with_verified_cold_transactions(zinder_query::ForwardedReadLimit::default());
     let lean = retention == RawBlobRetention::None;
     assert_eq!(query.has_verified_cold_tx_source(), lean);
     let epoch = zinder_query::WalletQueryApi::visible_tip_block(&query, None)
@@ -1277,7 +1410,7 @@ async fn skewed_pending_lookup(
         .map_err(|error| Status::internal(error.to_string()))?;
     let query = lean_wallet_query(&mut store, &skewed)
         .map_err(internal)?
-        .with_verified_cold_transactions();
+        .with_verified_cold_transactions(zinder_query::ForwardedReadLimit::default());
     LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)
         .map_err(|error| Status::internal(error.to_string()))?
         .with_mempool_surface(Arc::new(IngestControlMempoolSurface::new(
@@ -1327,7 +1460,9 @@ async fn lean_wallet_history_selects_local_rows_and_verifies_cold_bodies() -> Re
     )?;
     let query = lean_wallet_query(&mut store, &node)?;
     let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(
-        query.clone().with_verified_cold_transactions(),
+        query
+            .clone()
+            .with_verified_cold_transactions(zinder_query::ForwardedReadLimit::default()),
     )?;
     let mut corrupt = adapter
         .get_taddress_txids(super::history_request(1, 1))
@@ -1347,7 +1482,7 @@ async fn lean_wallet_history_selects_local_rows_and_verifies_cold_bodies() -> Re
         .await?
         .into_inner();
     let current_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(
-        query.with_verified_cold_transactions(),
+        query.with_verified_cold_transactions(zinder_query::ForwardedReadLimit::default()),
     )?;
     let transactions = current_adapter
         .get_taddress_transactions(super::history_request(1, 1))

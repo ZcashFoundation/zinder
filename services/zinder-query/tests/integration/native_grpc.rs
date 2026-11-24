@@ -734,7 +734,7 @@ async fn lean_wallet_transaction_miss_verifies_the_forwarding_node_before_the_me
         admitted,
     )
     .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
-    .with_verified_cold_transactions();
+    .with_verified_cold_transactions(zinder_query::ForwardedReadLimit::default());
     assert!(query.has_verified_cold_tx_source());
     let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
     let missing = TransactionId::from_bytes([0x49; 32]);
@@ -812,7 +812,7 @@ async fn lean_wallet_history_floor_miss_verifies_the_forwarding_node_first() -> 
         admitted,
     )
     .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
-    .with_verified_cold_transactions();
+    .with_verified_cold_transactions(zinder_query::ForwardedReadLimit::default());
     let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
     let unknown = TransactionId::from_bytes([0x4a; 32]);
 
