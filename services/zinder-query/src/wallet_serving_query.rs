@@ -40,8 +40,8 @@ use crate::{
     DEFAULT_MAX_FULL_BLOCK_RANGE, FULL_BLOCK_STREAM_CHANNEL_CAPACITY,
     FULL_BLOCK_STREAM_SUB_READ_BLOCKS, FullBlock, FullBlockStream,
     NativeWalletEndpointCapabilities, OrderedBroadcaster, QueryError, RawTransaction,
-    SettledTipBlock, SpendStatusReadEnd, SubtreeRoots, Transaction, TransactionStatus,
-    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    ServedTipSnapshot, SettledTipBlock, SpendStatusReadEnd, SubtreeRoots, Transaction,
+    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
     TransparentOutpointSpendStatuses, TreeState, TreeStateFrontiers, UpstreamNodeCapabilities,
     VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
@@ -438,7 +438,10 @@ impl WalletServingQuery<()> {
     /// [`WalletServingQuery::with_node_broadcast`] installs a node endpoint.
     #[must_use]
     pub fn from_serving_pair_slot(serving_pair_slot: WalletServingPairSlot) -> Self {
-        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
+        let raw_blob_retention = serving_pair_slot
+            .capture_ephemeral()
+            .canonical()
+            .raw_blob_retention();
         Self {
             native_endpoint_capabilities: NativeWalletEndpointCapabilities::for_wallet_serving_pair(
                 raw_blob_retention,
@@ -469,7 +472,10 @@ impl WalletServingQuery<(), AdmittedIngestControl> {
         serving_pair_slot: WalletServingPairSlot,
         ingest_control: AdmittedIngestControl,
     ) -> Self {
-        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
+        let raw_blob_retention = serving_pair_slot
+            .capture_ephemeral()
+            .canonical()
+            .raw_blob_retention();
         Self {
             native_endpoint_capabilities:
                 NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
@@ -566,8 +572,9 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
         }
     }
 
+    /// Captures the current pair for a read that exposes no chain epoch.
     fn capture_pair(&self) -> Arc<WalletServingReadPair> {
-        self.serving_pair_slot.capture()
+        self.serving_pair_slot.capture_ephemeral()
     }
 
     /// Selects the pair a read pinned to `at_epoch_id` captures, or the
@@ -704,6 +711,20 @@ where
                 block_hash: chain_epoch.visible_tip_hash,
                 chain_epoch,
             })
+        })
+        .await
+    }
+
+    async fn served_tip_snapshot(&self) -> Result<ServedTipSnapshot, QueryError> {
+        serving_read::record("visible_tip_block", None, async {
+            let pair = self.serving_pair_slot.capture_ephemeral();
+            serving_read::read_ephemeral_pair(&self.serving_pair_slot, pair, |pair| async move {
+                Ok(ServedTipSnapshot {
+                    chain_epoch: pair.chain_epoch(),
+                    block_time_unix_seconds: pair.visible_tip_block_time().await?,
+                })
+            })
+            .await
         })
         .await
     }

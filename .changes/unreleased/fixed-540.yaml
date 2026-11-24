@@ -1,0 +1,6 @@
+kind: fixed
+body: A burst of blocks no longer freezes the wallet-serving tip for 30 to 60 seconds. The reader released a replaced serving pair only after its 60-second retention window, so four back-to-back blocks filled every secondary generation even when no client held an epoch to pin. It now keeps a replaced pair for the window only when a response exposed its chain epoch, and releases any other pair at once. `GetLatestBlock` and `GetLightdInfo` expose no epoch, so polling them no longer delays new blocks, and an epoch a response exposed stays readable for the full minute.
+time: 2026-11-24T09:00:00.000000000Z
+custom:
+    Bump: patch
+    PR: "540"

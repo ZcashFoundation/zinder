@@ -22,13 +22,13 @@ The settled tip is the height at or below which ingest never replaces a block. T
 
 ### How long an epoch stays readable
 
-A replaced epoch stays readable for one minute after a newer one replaces it, however many blocks arrive in that minute. A workflow that finishes within that minute completes across new blocks. After it, a pinned read fails with `FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE`. The client takes a new snapshot and restarts the whole workflow, not only the failed read. `zinder-client` reports this as `IndexerError::ChainEpochPinUnavailable` with `RetryPolicy::RefreshChainEpoch`.
+A replaced epoch that a response exposed stays readable for one minute after a newer one replaces it, however many blocks arrive in that minute. An epoch that no response exposed has nothing to pin, so the server releases it as soon as a newer one replaces it. `GetLatestBlock` and `GetLightdInfo` on the compatibility listener expose no epoch, so polling them never extends retention. A workflow that finishes within that minute completes across new blocks. After it, a pinned read fails with `FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE`. The client takes a new snapshot and restarts the whole workflow, not only the failed read. `zinder-client` reports this as `IndexerError::ChainEpochPinUnavailable` with `RetryPolicy::RefreshChainEpoch`.
 
 A retained epoch still answers after a reorg replaces its blocks, because a pin promises that epoch's view, not the current best chain.
 
 `TransparentAddressUnspentOutputs`, `CompactBlocksInRange`, and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
 
-A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. Together they delay a new block by at most about 90 seconds.
+A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. Together they delay a new block by at most about 90 seconds. A burst of blocks that no workflow reads by epoch does not wait on retention.
 
 ## Methods
 

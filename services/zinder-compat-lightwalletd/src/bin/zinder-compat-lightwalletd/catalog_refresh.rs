@@ -26,21 +26,25 @@ impl CatalogSource {
         config: &ShieldedHistorySection,
     ) -> Result<PublishedShieldedHistory, tonic::Status> {
         match self {
-            Self::Wallet(slot) => config.open(slot.capture().canonical()).await,
+            Self::Wallet(slot) => config.open(slot.capture_ephemeral().canonical()).await,
             Self::Compact(slot) => config.open(slot.capture().as_ref()).await,
         }
     }
 
     async fn verify_source(&self, history: &PublishedShieldedHistory) -> Result<(), tonic::Status> {
         match self {
-            Self::Wallet(slot) => history.verify_source(slot.capture().canonical()).await,
+            Self::Wallet(slot) => {
+                history
+                    .verify_source(slot.capture_ephemeral().canonical())
+                    .await
+            }
             Self::Compact(slot) => history.verify_source(slot.capture().as_ref()).await,
         }
     }
 
     async fn refresh(&self, history: &PublishedShieldedHistory) -> Result<bool, tonic::Status> {
         match self {
-            Self::Wallet(slot) => history.refresh(slot.capture().canonical()).await,
+            Self::Wallet(slot) => history.refresh(slot.capture_ephemeral().canonical()).await,
             Self::Compact(slot) => history.refresh(slot.capture().as_ref()).await,
         }
     }

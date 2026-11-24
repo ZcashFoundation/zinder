@@ -138,6 +138,24 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<VisibleTipBlock, QueryError>;
 
+    /// Reads the visible tip and its block time for one single-shot answer,
+    /// such as a latest-block or server-info response.
+    ///
+    /// The caller must not read again by the returned epoch. A query that
+    /// serves from a pair slot answers from one pair without keeping that
+    /// pair readable for pins, so frequent tip calls never hold a serving
+    /// generation. The default composes the pinned reads.
+    async fn served_tip_snapshot(&self) -> Result<ServedTipSnapshot, QueryError> {
+        let tip = self.visible_tip_block(None).await?;
+        let header = self
+            .block_header_by_selector(BlockSelector::Height(tip.height), Some(tip.chain_epoch.id))
+            .await?;
+        Ok(ServedTipSnapshot {
+            chain_epoch: tip.chain_epoch,
+            block_time_unix_seconds: header.block_header.block_time,
+        })
+    }
+
     /// Reads the block at the chain epoch's settled finality watermark.
     /// Mirrors `visible_tip_block` but resolves to
     /// `chain_epoch.settled_tip_height` rather than `chain_epoch.visible_tip_height`.
@@ -658,6 +676,19 @@ pub struct VisibleTipBlock {
     pub height: BlockHeight,
     /// Visible-tip block hash.
     pub block_hash: zinder_core::BlockHash,
+}
+
+/// The visible tip and the Unix time in its header, read from one pair for a
+/// single-shot answer.
+///
+/// Its epoch identifies the tip for caching. Reads by that epoch are not
+/// guaranteed to be served.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServedTipSnapshot {
+    /// Chain epoch of the pair that answered.
+    pub chain_epoch: ChainEpoch,
+    /// Unix time in the visible-tip block header.
+    pub block_time_unix_seconds: i64,
 }
 
 /// Settled-tip block metadata bound to one chain epoch. The block sits at

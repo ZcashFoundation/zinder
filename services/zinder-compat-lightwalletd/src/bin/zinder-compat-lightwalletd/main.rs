@@ -289,7 +289,7 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
     };
     let visible_height = Some(
         serving_pair_slot
-            .capture()
+            .capture_ephemeral()
             .canonical_fence()
             .visible_tip()
             .height

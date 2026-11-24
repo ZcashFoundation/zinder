@@ -9,6 +9,7 @@ use std::{
 };
 
 use thiserror::Error;
+use tokio::sync::OnceCell;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use zinder_core::{BlockId, ChainEpoch, Network, NetworkUpgradeActivations};
 use zinder_store::{CanonicalActivationSchedule, CanonicalEventFence};
@@ -102,6 +103,8 @@ pub struct WalletServingReadPair {
     chain_epoch: ChainEpoch,
     reads_revoked: CancellationToken,
     table_file_missing: AtomicBool,
+    observed_for_epoch_pin: AtomicBool,
+    tip_block_time: OnceCell<i64>,
 }
 
 impl WalletServingReadPair {
@@ -135,6 +138,8 @@ impl WalletServingReadPair {
             wallet,
             reads_revoked: CancellationToken::new(),
             table_file_missing: AtomicBool::new(false),
+            observed_for_epoch_pin: AtomicBool::new(false),
+            tip_block_time: OnceCell::new(),
         })
     }
 
@@ -266,6 +271,42 @@ impl WalletServingReadPair {
     /// Reports whether a read found one of this pair's table files deleted.
     pub(crate) fn has_missing_table_file(&self) -> bool {
         self.table_file_missing.load(Ordering::Acquire)
+    }
+
+    /// Marks this pair as one whose chain epoch a request may have exposed,
+    /// so the slot keeps it readable for pins once it is replaced.
+    ///
+    /// Only the slot calls this, while it holds its transition lock.
+    pub(crate) fn mark_observed_for_epoch_pin(&self) {
+        self.observed_for_epoch_pin.store(true, Ordering::Release);
+    }
+
+    /// Reports whether a request may have exposed this pair's chain epoch.
+    pub(crate) fn is_observed_for_epoch_pin(&self) -> bool {
+        self.observed_for_epoch_pin.load(Ordering::Acquire)
+    }
+
+    /// Clears the observation mark, so a test can replay the first
+    /// observation of a pair.
+    #[cfg(test)]
+    pub(crate) fn clear_observation_for_test(&self) {
+        self.observed_for_epoch_pin.store(false, Ordering::Release);
+    }
+
+    /// Reads the block time of this pair's visible tip once and keeps it, so
+    /// the frequent single-shot tip calls read a header once per pair.
+    pub(crate) async fn visible_tip_block_time(&self) -> Result<i64, QueryError> {
+        self.tip_block_time
+            .get_or_try_init(|| async {
+                self.canonical
+                    .block_header_at(self.chain_epoch.visible_tip_height)
+                    .await
+                    .map_err(QueryError::canonical_read)?
+                    .ok_or(QueryError::BlockNotInBestChain)
+                    .map(|stored| stored.into_header().block_time)
+            })
+            .await
+            .copied()
     }
 
     /// Returns the failure a revoked read ends with: its epoch is no longer
