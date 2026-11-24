@@ -389,13 +389,21 @@ fn workspace_cleanup_preserves_a_replacement_directory() -> TestResult {
     let work = Workspace::create(path.clone())?;
     assert!(path.join(WORKSPACE_MARKER).is_file());
     assert!(require_empty_or_absent(&path).is_err());
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside)?;
+    fs::write(outside.join("keep"), b"outside")?;
+    let subtree = path.join("nested");
+    fs::create_dir(&subtree)?;
+    fs::write(subtree.join("payload"), b"owned")?;
+    std::os::unix::fs::symlink(&outside, subtree.join("link"))?;
     let moved = root.path().join("moved");
     fs::rename(&path, &moved)?;
     fs::create_dir(&path)?;
     fs::write(path.join("keep"), b"replacement")?;
     drop(work);
     assert_eq!(fs::read(path.join("keep"))?, b"replacement");
-    assert!(moved.join(WORKSPACE_MARKER).is_file());
+    assert_eq!(fs::read(outside.join("keep"))?, b"outside");
+    assert_eq!(fs::read_dir(&moved)?.count(), 0);
     Ok(())
 }
 
@@ -566,4 +574,70 @@ fn assert_no_publisher_key(bytes: &[u8], keys: &[[u8; 32]; 2]) {
     for key in keys {
         assert!(!bytes.windows(key.len()).any(|window| window == key));
     }
+}
+
+#[test]
+fn marker_creation_failure_clears_the_reservation_for_retry() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("workspace");
+    let workspace = Workspace::reserve(path.clone())?;
+    fs::create_dir(path.join(WORKSPACE_MARKER))?;
+    assert!(workspace.mark().is_err());
+    assert!(!path.exists());
+
+    let workspace = Workspace::create(path.clone())?;
+    assert!(path.join(WORKSPACE_MARKER).is_file());
+    drop(workspace);
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
+fn export_overlap_checks_subdirectories_exposed_through_an_alias() {
+    let history = PathIdentity {
+        path: Path::new("/history"),
+        deepest: (7, 10),
+        ancestors: vec![(7, 10), (7, 1)],
+        tail: Path::new(""),
+    };
+    let child = (7, 11);
+    let destination = |path, tail| PathIdentity {
+        path: Path::new(path),
+        deepest: child,
+        ancestors: vec![child, (7, 20), (7, 1)],
+        tail: Path::new(tail),
+    };
+    let output = destination("/mnt/alias/snapshot", "snapshot");
+    let stage = destination(
+        "/mnt/alias/snapshot.export.staging",
+        "snapshot.export.staging",
+    );
+    let directories = BTreeSet::from([history.deepest, child]);
+    for alias in [output, stage] {
+        assert!(!history.overlaps(&alias));
+        assert!(reject_history_ancestor_overlap(&directories, &[alias]).is_err());
+    }
+}
+
+#[test]
+fn failed_canonical_commit_rolls_back_the_published_sidecar() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let target = root.path().join("canonical");
+    let output = root.path().join("history");
+    let destination = EdgeSnapshotDestination::reserve(&target, Some(&output), false)?;
+    let sealed = destination.stage.path.join(SEALED);
+    fs::create_dir(&sealed)?;
+    fs::write(sealed.join("segment"), b"staged history")?;
+    let canonical = destination.stage.path.join(CANONICAL);
+    fs::create_dir(&canonical)?;
+    fs::create_dir(&target)?;
+    fs::write(target.join("keep"), b"existing primary")?;
+
+    let failure = commit_bootstrap(&destination, &canonical);
+    assert!(
+        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("occupied"))
+    );
+    assert!(!output.exists());
+    assert_eq!(fs::read(target.join("keep"))?, b"existing primary");
+    Ok(())
 }

@@ -41,7 +41,8 @@ that boundary. The publisher keeps its own store and credentials.
 - Optional opaque files beneath `sealed-history/`. The signature attests
   their paths, lengths, and digests. The compatibility runtime retains
   responsibility for admitting their format and chain linkage. Export refuses
-  a history source that overlaps the bundle or its staging directory. It also
+  a history source that overlaps the bundle or its staging directory, including
+  through an alias of a history subdirectory. It also
   refuses the signing key itself and hard links to that key.
 
 Each file record gives a slash-separated relative path, byte length, and
@@ -86,8 +87,8 @@ sealed-history destinations must be absent or empty, even when the bundle
 contains no sealed history. Their resolved paths must be separate from one
 another and from the private workspaces. Reservation checks device and inode
 identity as well as paths, including aliases through bind mounts. Each
-workspace holds a private marker. Cleanup verifies the reserved directory
-identity before removing it. Bootstrap reserves workspaces before starting
+workspace holds a private marker. Cleanup and sidecar rollback traverse open
+directory descriptors and verify ownership before unlinking the directory. Bootstrap reserves workspaces before starting
 an HTTP transfer. Before publication it clears inherited projection build
 leases and mempool events, generates a fresh `cursor_auth_key` using the OS
 CSPRNG, and runs normal READY admission on the resulting store. The receiver syncs files and

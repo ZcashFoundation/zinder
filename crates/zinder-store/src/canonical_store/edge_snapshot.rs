@@ -2,11 +2,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs::{self, File},
     future::Future,
     io::{self, Read, Write},
     num::NonZeroU32,
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -652,7 +656,18 @@ impl<'a> ExportHistory<'a> {
         }
         let root = root.canonicalize()?;
         require_disjoint(&[&root, output, stage])?;
-        let paths = inventory(&root)?.into_keys().collect();
+        let mut paths = Vec::new();
+        let mut directories = BTreeSet::from([directory_identity(&fs::symlink_metadata(&root)?)?]);
+        walk_inventory(&root, |relative, path, is_directory| {
+            if is_directory {
+                directories.insert(directory_identity(&fs::symlink_metadata(path)?)?);
+            } else {
+                paths.push(relative.to_owned());
+            }
+            Ok(())
+        })?;
+        let destinations = [PathIdentity::read(output)?, PathIdentity::read(stage)?];
+        reject_history_ancestor_overlap(&directories, &destinations)?;
         let sealed = Self {
             root,
             paths,
@@ -874,14 +889,27 @@ fn commit_bootstrap(
         transfer(&source, Some(&target), None)?;
     }
     sync_tree(&files)?;
-    rename_no_replace(&files, output)?;
-    let commit = File::open(parent(output))
-        .and_then(|directory| directory.sync_all())
+    let files_dir = open_directory(&sidecar.directory, OsStr::new(SEALED))?;
+    let files_identity = directory_identity(&files_dir.metadata()?)?;
+    let output_parent = &sidecar.parent_dir;
+    let output_name = destination_name(output)?;
+    rename_no_replace_at(
+        &sidecar.directory,
+        OsStr::new(SEALED),
+        output_parent,
+        output_name,
+    )?;
+    let commit = output_parent
+        .sync_all()
         .map_err(EdgeSnapshotError::from)
         .and_then(|()| rename_no_replace(canonical, target));
     if let Err(error) = commit {
-        fs::remove_dir_all(output)?;
-        File::open(parent(output))?.sync_all()?;
+        let rollback =
+            remove_owned_directory(output_parent, output_name, &files_dir, files_identity);
+        let sync = output_parent.sync_all();
+        if let Err(error) = rollback.and(sync) {
+            tracing::warn!(path = %output.display(), %error, "failed to roll back snapshot sidecar");
+        }
         return Err(error);
     }
     File::open(parent(target))?.sync_all()?;
@@ -1103,15 +1131,40 @@ fn require_empty_or_absent(path: &Path) -> Result<(), EdgeSnapshotError> {
 }
 
 fn rename_no_replace(source: &Path, target: &Path) -> Result<(), EdgeSnapshotError> {
-    use rustix::fs::{CWD, RenameFlags, renameat_with};
     require_empty_or_absent(target)?;
-    match fs::remove_dir(target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    let source_parent = open_directory(rustix::fs::CWD, parent(source).as_os_str())?;
+    let target_parent = open_directory(rustix::fs::CWD, parent(target).as_os_str())?;
+    Ok(rename_no_replace_at(
+        &source_parent,
+        destination_name(source)?,
+        &target_parent,
+        destination_name(target)?,
+    )?)
+}
+
+fn rename_no_replace_at(
+    source_parent: &File,
+    source_name: &OsStr,
+    target_parent: &File,
+    target_name: &OsStr,
+) -> io::Result<()> {
+    use rustix::{
+        fs::{AtFlags, RenameFlags, renameat_with, unlinkat},
+        io::Errno,
+    };
+
+    match unlinkat(target_parent, target_name, AtFlags::REMOVEDIR) {
+        Ok(()) | Err(Errno::NOENT) => {}
         Err(error) => return Err(error.into()),
     }
-    renameat_with(CWD, source, CWD, target, RenameFlags::NOREPLACE).map_err(io::Error::from)?;
-    Ok(())
+    renameat_with(
+        source_parent,
+        source_name,
+        target_parent,
+        target_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)
 }
 
 fn publish(source: &Path, target: &Path) -> Result<(), EdgeSnapshotError> {
@@ -1125,24 +1178,26 @@ type DirectoryIdentity = (u64, u64);
 struct Workspace {
     path: PathBuf,
     identity: DirectoryIdentity,
+    parent_dir: File,
+    name: OsString,
     // Keep the directory inode alive if the workspace is removed or replaced.
     directory: File,
 }
 
 fn resolve_destination(path: &Path) -> Result<PathBuf, EdgeSnapshotError> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| refused("missing destination filename"))?;
+    let name = destination_name(path)?;
     let resolved = parent(path).canonicalize()?.join(name);
     require_empty_or_absent(&resolved)?;
     Ok(resolved)
 }
 
+fn destination_name(path: &Path) -> Result<&OsStr, EdgeSnapshotError> {
+    path.file_name()
+        .ok_or_else(|| refused("missing destination filename"))
+}
+
 fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf, EdgeSnapshotError> {
-    let mut name = path
-        .file_name()
-        .ok_or_else(|| refused("missing destination filename"))?
-        .to_os_string();
+    let mut name = destination_name(path)?.to_os_string();
     name.push(suffix);
     Ok(parent(path).join(name))
 }
@@ -1217,45 +1272,162 @@ fn require_disjoint(paths: &[&Path]) -> Result<(), EdgeSnapshotError> {
     Ok(())
 }
 
+fn reject_history_ancestor_overlap(
+    history: &BTreeSet<DirectoryIdentity>,
+    destinations: &[PathIdentity<'_>],
+) -> Result<(), EdgeSnapshotError> {
+    if destinations.iter().any(|path| {
+        path.ancestors
+            .iter()
+            .any(|ancestor| history.contains(ancestor))
+    }) {
+        return Err(refused(
+            "snapshot export overlaps a sealed-history directory",
+        ));
+    }
+    Ok(())
+}
+
+fn open_directory(parent_dir: impl rustix::fd::AsFd, name: &OsStr) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    openat(
+        parent_dir,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(io::Error::from)
+}
+
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "the types of stat device and inode fields vary across Unix targets"
+)]
+fn directory_stat_identity(stat: &rustix::fs::Stat) -> io::Result<DirectoryIdentity> {
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+        return Err(io::Error::other("snapshot entry is no longer a directory"));
+    }
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
+}
+
+fn remove_owned_directory(
+    parent_dir: &File,
+    name: &OsStr,
+    dir_fd: &File,
+    expected_identity: DirectoryIdentity,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Dir, FileType, fstat, statat, unlinkat};
+
+    if directory_stat_identity(&fstat(dir_fd)?)? != expected_identity {
+        return Err(io::Error::other(
+            "snapshot cleanup descriptor identity differs",
+        ));
+    }
+    for entry in Dir::read_from(dir_fd)? {
+        let entry = entry?;
+        let bytes = entry.file_name().to_bytes();
+        if matches!(bytes, b"." | b"..") {
+            continue;
+        }
+        let name = OsStr::from_bytes(bytes);
+        let stat = statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if stat.st_ino != entry.ino() {
+            return Err(io::Error::other("snapshot cleanup child identity differs"));
+        }
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            let child = open_directory(dir_fd, name)?;
+            remove_owned_directory(dir_fd, name, &child, directory_stat_identity(&stat)?)?;
+        } else {
+            unlinkat(dir_fd, name, AtFlags::empty())?;
+        }
+    }
+    remove_empty_owned_directory(parent_dir, name, expected_identity)
+}
+
+fn remove_empty_owned_directory(
+    parent_dir: &File,
+    name: &OsStr,
+    expected_identity: DirectoryIdentity,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, statat, unlinkat};
+
+    let current = statat(parent_dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if directory_stat_identity(&current)? != expected_identity {
+        return Err(io::Error::other(
+            "snapshot cleanup path no longer identifies the owned directory",
+        ));
+    }
+    Ok(unlinkat(parent_dir, name, AtFlags::REMOVEDIR)?)
+}
+
 impl Workspace {
     fn create(path: PathBuf) -> Result<Self, EdgeSnapshotError> {
-        use rustix::fs::{Mode, OFlags, open, openat};
+        Self::reserve(path)?.mark()
+    }
 
-        create_private_dir(&path)?;
-        let directory: File = open(
-            &path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?
-        .into();
-        let identity = directory_identity(&directory.metadata()?)?;
-        let workspace = Self {
+    fn reserve(path: PathBuf) -> Result<Self, EdgeSnapshotError> {
+        use rustix::fs::{AtFlags, Dir, Mode, mkdirat, statat};
+
+        let parent_dir = open_directory(rustix::fs::CWD, parent(&path).as_os_str())?;
+        let name = destination_name(&path)?.to_os_string();
+        mkdirat(&parent_dir, &name, Mode::RWXU).map_err(io::Error::from)?;
+        let reserved =
+            statat(&parent_dir, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+        let identity = directory_stat_identity(&reserved)?;
+        let directory = match open_directory(&parent_dir, &name) {
+            Ok(directory) => directory,
+            Err(error) => {
+                if let Err(cleanup) = remove_empty_owned_directory(&parent_dir, &name, identity) {
+                    tracing::warn!(path = %path.display(), %cleanup, "failed to clear empty snapshot reservation");
+                }
+                return Err(error.into());
+            }
+        };
+        let named =
+            statat(&parent_dir, &name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+        if directory_identity(&directory.metadata()?)? != identity
+            || directory_stat_identity(&named)? != identity
+        {
+            return Err(refused("snapshot workspace changed during reservation"));
+        }
+        for entry in Dir::read_from(&directory).map_err(io::Error::from)? {
+            let entry = entry.map_err(io::Error::from)?;
+            if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                return Err(refused(
+                    "snapshot workspace is no longer empty during reservation",
+                ));
+            }
+        }
+        Ok(Self {
             path,
             identity,
+            parent_dir,
+            name,
             directory,
-        };
+        })
+    }
+
+    fn mark(self) -> Result<Self, EdgeSnapshotError> {
+        use rustix::fs::{Mode, OFlags, openat};
+
         openat(
-            &workspace.directory,
+            &self.directory,
             WORKSPACE_MARKER,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         )
         .map_err(io::Error::from)?;
-        Ok(workspace)
+        Ok(self)
     }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        let current = fs::symlink_metadata(&self.path)
-            .map_err(EdgeSnapshotError::from)
-            .and_then(|metadata| directory_identity(&metadata));
-        if !current.is_ok_and(|identity| identity == self.identity) {
-            tracing::warn!(path = %self.path.display(), "snapshot workspace no longer matches its reserved directory");
-            return;
-        }
-        if let Err(error) = fs::remove_dir_all(&self.path) {
+        if let Err(error) =
+            remove_owned_directory(&self.parent_dir, &self.name, &self.directory, self.identity)
+        {
             tracing::warn!(path = %self.path.display(), %error, "failed to remove snapshot staging directory");
         }
     }
