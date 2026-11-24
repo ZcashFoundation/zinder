@@ -13,31 +13,75 @@ use zinder_store::{
 pub enum DeploymentProfile {
     /// Canonical wallet history with node-backed reads and no wallet projection.
     LightWallet,
+    /// Native and compatibility wallet serving over a local wallet projection
+    /// without raw transaction blobs; mined transaction bytes are fetched from
+    /// a verified upstream node on demand.
+    Wallet,
+    /// Native and compatibility wallet serving over a local wallet projection
+    /// with retained raw transaction blobs.
+    WalletArchive,
 }
 
 impl DeploymentProfile {
-    /// Returns the retained data policy the canonical writer builds under this profile.
+    /// Returns the persisted configuration spelling of this profile.
     #[must_use]
-    pub const fn canonical_stored_set(self) -> CanonicalStoredSet {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::LightWallet => CanonicalStoredSet::for_history(
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::None,
-                CanonicalHistoryBounds::complete(),
-            ),
+            Self::LightWallet => "light-wallet",
+            Self::Wallet => "wallet",
+            Self::WalletArchive => "wallet-archive",
         }
     }
 
-    /// Returns the minimum canonical data a serving reader requires under this profile.
+    /// Returns the retained data policy the canonical writer builds under this profile.
+    #[must_use]
+    pub const fn canonical_stored_set(self) -> CanonicalStoredSet {
+        CanonicalStoredSet::for_history(
+            CanonicalStoreWorkload::Wallet,
+            self.raw_blob_retention(),
+            CanonicalHistoryBounds::complete(),
+        )
+    }
+
+    /// Returns the raw-blob retention the writer stores under this profile.
+    #[must_use]
+    pub const fn raw_blob_retention(self) -> RawBlobRetention {
+        match self {
+            Self::LightWallet | Self::Wallet => RawBlobRetention::None,
+            Self::WalletArchive => RawBlobRetention::All,
+        }
+    }
+
+    /// Resolves retention and checks an explicitly configured value for agreement.
     ///
-    /// Light-wallet serving checks forwarded reads against canonical history from height
-    /// one and serves completed subtree roots from index zero.
+    /// # Errors
+    ///
+    /// Returns a configuration error when the requested retention conflicts.
+    pub fn resolve_raw_blob_retention(
+        self,
+        configured: Option<RawBlobRetention>,
+    ) -> Result<RawBlobRetention, crate::ConfigError> {
+        let retention = self.raw_blob_retention();
+        if configured.is_some_and(|policy| policy != retention) {
+            return Err(crate::ConfigError::invalid(format!(
+                "deployment.profile = \"{}\" requires storage.raw_blob_policy = \"{}\"",
+                self.as_str(),
+                retention.as_kebab_case(),
+            )));
+        }
+        Ok(retention)
+    }
+
+    /// Returns the minimum canonical coverage for this profile's stored set.
     #[must_use]
     pub fn canonical_requirement(self) -> CanonicalStoreRequirements {
-        match self {
-            Self::LightWallet => CanonicalStoreRequirements::default()
-                .from_height(CanonicalHistoryBounds::complete().first_available_height())
-                .with_complete_subtree_root_prefix(),
+        let requirements = CanonicalStoreRequirements::default()
+            .from_height(CanonicalHistoryBounds::complete().first_available_height())
+            .with_blob_retention(self.raw_blob_retention());
+        if self == Self::LightWallet {
+            requirements.with_complete_subtree_root_prefix()
+        } else {
+            requirements
         }
     }
 }
@@ -84,10 +128,36 @@ mod tests {
     use super::{DeploymentProfile, DeploymentSection};
 
     #[test]
-    fn deployment_section_deserializes_light_wallet() -> Result<()> {
-        let section: DeploymentSection = toml::from_str("profile = \"light-wallet\"")?;
-        assert_eq!(section.profile, Some(DeploymentProfile::LightWallet));
+    fn deployment_section_deserializes_every_profile() -> Result<()> {
+        for (encoded, expected) in [
+            ("light-wallet", DeploymentProfile::LightWallet),
+            ("wallet", DeploymentProfile::Wallet),
+            ("wallet-archive", DeploymentProfile::WalletArchive),
+        ] {
+            let section: DeploymentSection = toml::from_str(&format!("profile = \"{encoded}\""))?;
+            assert_eq!(section.profile, Some(expected));
+        }
+        assert!(toml::from_str::<DeploymentSection>(r#"profile = "explorer""#).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn every_profile_fixes_the_writer_retention_and_complete_history() {
+        use zinder_store::RawBlobRetention;
+        for (profile, retention) in [
+            (DeploymentProfile::LightWallet, RawBlobRetention::None),
+            (DeploymentProfile::Wallet, RawBlobRetention::None),
+            (DeploymentProfile::WalletArchive, RawBlobRetention::All),
+        ] {
+            assert_eq!(profile.raw_blob_retention(), retention);
+            let stored_set = profile.canonical_stored_set();
+            assert_eq!(stored_set.raw_blob_retention(), retention);
+            assert_eq!(
+                stored_set.first_height(CanonicalStoredData::BlockHistory),
+                Some(BlockHeight::new(1))
+            );
+            assert!(!stored_set.contains(CanonicalStoredData::FinalNoteCommitmentRoots));
+        }
     }
 
     #[test]

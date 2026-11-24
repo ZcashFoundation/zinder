@@ -17,7 +17,7 @@ if [[ ! "$rpc_url" =~ ^http://127\.0\.0\.1:[0-9]+/?$ || ! "$wallet_url" =~ ^http
   exit 2
 fi
 if [[ ${ZINDER_NETWORK:-zcash-regtest} != zcash-regtest ]]; then
-  echo "the qualification harness requires zcash-regtest" >&2
+  echo "the light-wallet harness requires zcash-regtest" >&2
   exit 2
 fi
 # Binaries read network.name from --network. The bare key belongs to testkit.
@@ -126,11 +126,11 @@ start_candidate() {
 
 run_tests() {
   local policy=$1 port=$2 stopped=$3
-  local reference=${4:-$wallet_url} filter=${5:-'test(/^live::light_wallet_qualification::/) or test(tree_state_by_hash_matches_reference) or test(unknown_tree_state_queries_match_reference_status)'}
+  local reference=${4:-$wallet_url} filter=${5:-'test(/^live::light_wallet::/) or test(tree_state_by_hash_matches_reference) or test(unknown_tree_state_queries_match_reference_status)'}
   echo "Checking raw_blob_policy=$policy, node_stopped=$stopped, tip=$tip"
   ZINDER_TEST_LIVE=1 ZINDER_NETWORK=zcash-regtest \
-    ZINDER_TEST_QUALIFICATION_RAW_BLOB_POLICY="$policy" \
-    ZINDER_TEST_QUALIFICATION_NODE_STOPPED="$stopped" \
+    ZINDER_TEST_LIGHT_WALLET_RAW_BLOB_POLICY="$policy" \
+    ZINDER_TEST_LIGHT_WALLET_NODE_STOPPED="$stopped" \
     ZINDER_TEST_PARITY_ZINDER_ADDR="http://127.0.0.1:$((port + 2))" \
     ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR="$reference" \
     cargo nextest run --locked -p zinder-compat-lightwalletd --test acceptance \
@@ -147,7 +147,7 @@ done
 
 # All three wallet endpoints observe the same signed spend before the node is stopped.
 broadcast='test(accepted_send_transaction_surfaces_in_non_empty_mempool_methods)'
-ZINDER_TEST_QUALIFICATION_RETAINED_ADDR="http://127.0.0.1:$((ports[transactions] + 2))" \
+ZINDER_TEST_LIGHT_WALLET_RETAINED_ADDR="http://127.0.0.1:$((ports[transactions] + 2))" \
   run_tests none "${ports[none]}" false "$wallet_url" "$broadcast"
 
 restart_node=true

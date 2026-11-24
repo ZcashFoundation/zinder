@@ -35,8 +35,8 @@ const EXCLUSION_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest an endpoint stays excluded before it is verified again.
 const EXCLUSION_MAX_BACKOFF: Duration = Duration::from_mins(5);
 
-/// Longest an endpoint stays verified against an earlier basis. Qualification
-/// uses the same bound for capability and schedule evidence at a fixed URL.
+/// Longest an endpoint stays verified against an earlier basis. Light-wallet node
+/// verification uses the same bound for capability and schedule evidence at a fixed URL.
 ///
 /// It counts from when the serving pair was first seen on a new basis, or
 /// from the start of an inconclusive repeat against the same basis, and
@@ -227,6 +227,10 @@ impl<Source> OrderedBroadcaster<Source> {
 }
 
 impl OrderedBroadcaster<ZebraJsonRpcSource> {
+    pub(crate) fn primary_source(&self) -> Option<&ZebraJsonRpcSource> {
+        self.inner.nodes.endpoint(0)
+    }
+
     /// Builds the JSON-RPC source of `primary`, position 0, and of every
     /// fallback target after it, without contacting any node.
     ///
@@ -1196,20 +1200,20 @@ async fn verify_served_tip(
 }
 
 #[derive(Default)]
-pub(crate) struct QualificationNodeVerification {
-    schedule: Mutex<QualificationSchedule>,
+pub(crate) struct LightWalletNodeVerification {
+    schedule: Mutex<LightWalletNodeVerificationSchedule>,
     failed_attempts: AtomicU64,
 }
 
 #[derive(Default)]
-enum QualificationSchedule {
+enum LightWalletNodeVerificationSchedule {
     #[default]
     Unverified,
     Refused(VerificationBasis, VerificationRefusal),
     Verified(VerificationBasis, NetworkUpgradeActivations, Instant),
 }
 
-impl QualificationNodeVerification {
+impl LightWalletNodeVerification {
     pub(crate) async fn verify(
         &self,
         source: &impl BroadcastNodeProbe,
@@ -1221,7 +1225,7 @@ impl QualificationNodeVerification {
         let mut schedule = self.schedule.lock().await;
         let verified = matches!(
             &*schedule,
-            QualificationSchedule::Verified(basis, activations, checked)
+            LightWalletNodeVerificationSchedule::Verified(basis, activations, checked)
                 if *basis == target.basis
                     && checked.elapsed() < STALE_VERIFICATION_GRACE
                     && target.agrees_with(activations)
@@ -1230,39 +1234,45 @@ impl QualificationNodeVerification {
             drop(schedule);
             let tip_check = verify_served_tip(source, target).await;
             if tip_check.is_err() {
-                *self.schedule.lock().await = QualificationSchedule::Unverified;
+                *self.schedule.lock().await = LightWalletNodeVerificationSchedule::Unverified;
             }
             return tip_check;
         }
 
         if self.failed_attempts.load(Ordering::Relaxed) != observed_failures {
             return Err(match *schedule {
-                QualificationSchedule::Refused(basis, refusal) if basis == target.basis => {
+                LightWalletNodeVerificationSchedule::Refused(basis, refusal)
+                    if basis == target.basis =>
+                {
                     refusal.error()
                 }
-                QualificationSchedule::Unverified
-                | QualificationSchedule::Refused(..)
-                | QualificationSchedule::Verified(..) => SourceError::NodeUnavailable {
-                    reason: "concurrent verification did not confirm the served schedule and tip"
-                        .to_owned(),
-                },
+                LightWalletNodeVerificationSchedule::Unverified
+                | LightWalletNodeVerificationSchedule::Refused(..)
+                | LightWalletNodeVerificationSchedule::Verified(..) => {
+                    SourceError::NodeUnavailable {
+                        reason:
+                            "concurrent verification did not confirm the served schedule and tip"
+                                .to_owned(),
+                    }
+                }
             });
         }
 
-        *schedule = QualificationSchedule::Unverified;
+        *schedule = LightWalletNodeVerificationSchedule::Unverified;
         let evidence = verify_node_endpoint(source, target)
             .await
             .map_err(|failure| {
                 self.failed_attempts.fetch_add(1, Ordering::Release);
                 match failure {
                     VerificationFailure::Refused(refusal) => {
-                        *schedule = QualificationSchedule::Refused(target.basis, refusal);
+                        *schedule =
+                            LightWalletNodeVerificationSchedule::Refused(target.basis, refusal);
                         refusal.error()
                     }
                     VerificationFailure::Inconclusive(error) => error,
                 }
             })?;
-        *schedule = QualificationSchedule::Verified(
+        *schedule = LightWalletNodeVerificationSchedule::Verified(
             target.basis,
             evidence.node_activations,
             Instant::now(),

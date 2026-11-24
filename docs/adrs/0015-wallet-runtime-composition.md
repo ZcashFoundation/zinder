@@ -16,7 +16,7 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 
 ## Decision
 
-1. **One composition, one capability set.** The native wallet runtime has one production composition. After composition and admission it derives an immutable capability set from concrete evidence: the pair's persisted raw-blob retention, the methods the query implements, the configured node endpoints, and the admitted ingest-control methods. A deployment profile, or a serving setting, selects which composition a process runs ([ADR-0023](0023-deployment-profiles.md)), but neither is capability evidence. There are no capability profiles, setters, or support flags. The protocol's capability registry defines identifiers and versions, not which subset a process supports. `WalletQuery.ServerInfo` and the ops endpoint publish the same value. Each protocol adapter derives its own set, because a shared domain method is not a claim that a given adapter supports it.
+1. **One composition, one capability set.** The native wallet runtime has one production composition. After composition and admission it derives an immutable capability set from concrete evidence: the pair's persisted raw-blob retention, an installed verified mined-transaction byte source, the methods the query implements, the configured node endpoints, and the admitted ingest-control methods. A deployment profile, or a serving setting, selects which composition a process runs ([ADR-0023](0023-deployment-profiles.md)), but neither is capability evidence. There are no capability profiles, setters, or support flags. The protocol's capability registry defines identifiers and versions, not which subset a process supports. `WalletQuery.ServerInfo` and the ops endpoint publish the same value. Each protocol adapter derives its own set, because a shared domain method is not a claim that a given adapter supports it.
 2. **Adapters enforce what they advertise.** Every native RPC except `ServerInfo` checks its capability before it touches storage or a dependency. An advertised range method still has enforced limits.
 3. **Support is fixed for the process lifetime.** A supported operation stays advertised while a dependency is down. Only requests that call the dependency fail ([ADR-0016](0016-wallet-serving-readiness.md)). Discovery is not a health check.
 4. **The ingest-control identity is admitted once.** Native query, wallet-mode compatibility, and light-wallet compatibility admit `IngestControl` before opening storage or binding traffic. Admission requires the `zinder-ingest` identity, the same network and contract revision, and the required methods. Native query shares the admitted channel across components. Compatibility uses separate channels for mempool reads and the tip watcher.
@@ -68,6 +68,8 @@ A lightwalletd `GetBlockRange` stream has no width limit, and the client sets it
 - **Compatibility aliases for removed names.** Zinder's native consumers move with it, and aliases keep obsolete names available for new code.
 
 ## Revision history
+
+- 2026-11-24. Decision 1 adds the verified mined-transaction byte source as capability evidence.
 
 - 2026-11-21. Added the trust and ownership boundary for pre-encoded settled lightwalletd history.
 - 2026-11-21. Bound the compact segment index and the optional kernel measurement to the signed catalog.

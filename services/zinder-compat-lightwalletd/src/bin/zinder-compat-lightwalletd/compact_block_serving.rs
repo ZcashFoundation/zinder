@@ -111,7 +111,7 @@ impl CompactServingReadiness {
         }
     }
 
-    pub(crate) fn for_qualification(runtime: Readiness) -> Self {
+    pub(crate) fn for_light_wallet(runtime: Readiness) -> Self {
         Self {
             inputs: zinder_query::WalletServingReadiness::with_node_and_ingest_control(runtime),
             requires_writer_schedule: true,
@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_blocks_admit_a_matching_fence_without_qualification_schedule_attestation()
+    async fn compact_blocks_admit_a_matching_fence_without_light_wallet_schedule_attestation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let config =
@@ -1248,7 +1248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn qualification_bootstrap_requires_writer_schedule_attestation()
+    async fn light_wallet_bootstrap_requires_writer_schedule_attestation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let config =
@@ -1263,7 +1263,7 @@ mod tests {
             .revision += 1;
         let control = MutableCanonicalControl::new(status);
         let (endpoint, shutdown, server) = serve_control(&control).await?;
-        let readiness = CompactServingReadiness::for_qualification(Readiness::default());
+        let readiness = CompactServingReadiness::for_light_wallet(Readiness::default());
         let first =
             CompactBlockPublisher::bootstrap(config.clone(), readiness.clone(), &endpoint, None)
                 .await;
@@ -2907,13 +2907,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn qualification_probe_halt_requires_a_confirmed_writer_at_the_served_fence()
+    async fn light_wallet_probe_halt_requires_a_confirmed_writer_at_the_served_fence()
     -> Result<(), Box<dyn std::error::Error>> {
         use zinder_query::{AdmittedIngestControl, spawn_wallet_ingest_control_readiness_probe};
         let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
             .with_raw_blob_retention(RawBlobRetention::Transactions)
             .extend_blocks(2);
-        let readiness = CompactServingReadiness::for_qualification(Readiness::default());
+        let readiness = CompactServingReadiness::for_light_wallet(Readiness::default());
         let mut harness = LongRangeHarness::start_with_readiness(
             &zinder_testkit::CanonicalBaseline::new(&chain),
             readiness.clone(),
@@ -3055,14 +3055,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn qualification_replaces_the_reader_after_a_fixed_fence_schedule_change()
+    async fn light_wallet_replaces_the_reader_after_a_fixed_fence_schedule_change()
     -> Result<(), Box<dyn std::error::Error>> {
         let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
             .with_raw_blob_retention(RawBlobRetention::Transactions)
             .extend_blocks(3);
         let mut harness = LongRangeHarness::start_with_readiness(
             &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(2)),
-            CompactServingReadiness::for_qualification(Readiness::default()),
+            CompactServingReadiness::for_light_wallet(Readiness::default()),
         )
         .await?;
         let leased = harness.slot.capture();

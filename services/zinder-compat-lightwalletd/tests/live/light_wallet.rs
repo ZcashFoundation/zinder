@@ -23,14 +23,14 @@ async fn methods_match_wallet_serving_at_the_same_fence() -> Result<()> {
     if require_live_for(&[Network::ZcashRegtest])?.is_none() {
         return Ok(());
     }
-    let Some(policy) = optional_env("ZINDER_TEST_QUALIFICATION_RAW_BLOB_POLICY")? else {
+    let Some(policy) = optional_env("ZINDER_TEST_LIGHT_WALLET_RAW_BLOB_POLICY")? else {
         return Ok(());
     };
     assert!(matches!(policy.as_str(), "none" | "transactions"));
-    let node_stopped = std::env::var("ZINDER_TEST_QUALIFICATION_NODE_STOPPED")?.parse::<bool>()?;
-    let (mut candidate, mut wallet) = open_parity_clients().await?.ok_or_else(|| {
-        eyre!("both qualification and wallet-serving gRPC endpoints are required")
-    })?;
+    let node_stopped = std::env::var("ZINDER_TEST_LIGHT_WALLET_NODE_STOPPED")?.parse::<bool>()?;
+    let (mut candidate, mut wallet) = open_parity_clients()
+        .await?
+        .ok_or_else(|| eyre!("both light-wallet and wallet-serving gRPC endpoints are required"))?;
     let tip = compare_tip(&mut candidate, &mut wallet).await?;
     compare_canonical_reads(&mut candidate, &mut wallet).await?;
     let address = parity_transparent_address()?;

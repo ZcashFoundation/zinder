@@ -59,6 +59,24 @@ listener on `[::]` or a public address is refused. Arguments after the image
 name replace `--config /etc/zinder/config.toml`, so repeat it when you pass
 your own.
 
+## Deployment profiles
+
+Set `deployment.profile` on each participating standalone runtime. Matching
+explicit settings are accepted. Conflicting settings fail configuration
+resolution. `--print-config` shows the profile and omits the settings it
+supplies.
+
+| Profile | Canonical workload | Raw blobs | Serving |
+| --- | --- | --- | --- |
+| `light-wallet` | Wallet | None | Ingest and node-backed lightwalletd compatibility |
+| `wallet` | Wallet | None | Ingest, projector, native query, and wallet compatibility |
+| `wallet-archive` | Wallet | All | Ingest, projector, native query, and wallet compatibility |
+
+All profiles build complete canonical history. For `wallet`, give the native
+query and compatibility processes a primary `[node]` that can supply mined
+transaction bytes. Readers check the stored data requirements when opening
+the canonical store. A writer changing retention must build a new store.
+
 ## Light-wallet profile
 
 Set `deployment.profile = "light-wallet"` in both the ingest and
@@ -81,8 +99,8 @@ additional retained blobs. The ingest writer must match the store's original
 retention policy. For ingest and the compatibility listener, `--print-config`
 writes the resolved profile and omits the settings it supplies.
 
-The explicit `compat.serving = "light-wallet"` setting and its
-`light-wallet-qualification` alias apply the same history and subtree requirements.
+The explicit `compat.serving = "light-wallet"` setting applies the same history
+and subtree requirements.
 Without the profile, both use the reader's configured
 `storage.raw_blob_policy`, which defaults to `transactions`.
 Set it to `none` explicitly to admit a store without transaction bodies. See
@@ -194,9 +212,9 @@ not check descriptions or defaults.
 <!-- env-var-table:public-interfaces:start -->
 | Variable | Used by | Requirement | TOML field | Description |
 | -------- | ------- | ----------- | ---------- | ----------- |
-| `ZINDER_DEPLOYMENT__PROFILE` | zinder-ingest, zinder-compat-lightwalletd | Optional | `deployment.profile` | Selects `light-wallet` for both ingest and lightwalletd compatibility. See [Light-wallet profile](#light-wallet-profile). |
+| `ZINDER_DEPLOYMENT__PROFILE` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `deployment.profile` | Coordinates the [deployment profile](#deployment-profiles). |
 | `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
-| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running ingest or light-wallet serving, broadcasting, or reading wallet fees` | `node.json_rpc_addr` | Upstream node JSON-RPC URL. Light-wallet serving forwards transparent address reads, omitted transaction bodies, broadcasts, and fee reads to this node. Query and wallet-mode compatibility use a configured node for broadcasts, and wallet-mode compatibility also reads the fee. Compact-blocks serving rejects node settings. Explorer uses the address for upstream tip observation. See [The node sections](#the-node-sections). |
+| `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `running ingest, light-wallet serving, or lean wallet serving, or using broadcast or fee reads` | `node.json_rpc_addr` | Upstream node JSON-RPC URL. Light-wallet serving forwards transparent address reads, omitted transaction bodies, broadcasts, and fee reads to this node. Query and wallet-mode compatibility use a configured node for broadcasts and verified mined transaction bytes in lean wallet mode. Wallet-mode compatibility also reads the fee. Compact-blocks serving rejects node settings. Explorer uses the address for upstream tip observation. See [The node sections](#the-node-sections). |
 | `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. Falls back to JSON-RPC mempool polling when unset or empty. An `https://` URL negotiates TLS, configured by the `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified against the system roots. |
 | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node.indexer_tls.ca_cert_path` | PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Read at startup and whenever an indexer stream reconnects. |
 | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH is set` | `node.indexer_tls.client_cert_path` | PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`. |
@@ -300,7 +318,7 @@ not check descriptions or defaults.
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0006](../adrs/0006-node-source-boundary.md). |
 | `ZINDER_INGEST__EXPLORER_VIEWS` | zinder-ingest | Optional | `ingest.explorer_views` | Requests the bundled Explorer materialized views. Defaults to `false`. `true` requires genesis-complete canonical history or the authenticated `checkpoint_height = 0`. Without a profile, `--print-config` shows the request. The light-wallet profile disables the views and omits this field. Admission evidence appears after the Explorer store opens successfully. |
 | `ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES` | zinder-ingest | Optional | `ingest.explorer_views_min_free_bytes` | Available bytes on the volume holding `storage.path` below which Explorer view replay, the transparent-address ranking build, and historical view backfills pause, so the views cannot fill the volume canonical ingest and wallet serving need. Replay resumes once at least a tenth more than this is available. Defaults to 10737418240 (10 GiB); `0` disables the guard. |
-| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `storage.raw_blob_policy` | The raw-blob policy accepts `none`, `transactions`, or `all`. The ingest writer defaults to `none` for explicit coverage and `transactions` for wallet-serving coverage. Wallet-serving ingest accepts `none` with the light-wallet profile. Projector, query, and compatibility readers use the value as a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an existing canonical store requires a rebuild. |
+| `ZINDER_STORAGE__RAW_BLOB_POLICY` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd | Optional | `storage.raw_blob_policy` | The raw-blob policy accepts `none`, `transactions`, or `all`. The ingest writer defaults to `none` for explicit coverage and `transactions` for wallet-serving coverage. Wallet-serving ingest accepts `none` with `light-wallet` or `wallet`. Projector, query, and compatibility readers use the value as a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an existing canonical store requires a rebuild. |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | zinder-ingest | Optional | `ingest.reorg_window_blocks` | Chain-truth invariant: how deep the live reorg window extends. Bounds settlement, classifier default, and replacement traversal. Must be greater than zero. Defaults to 1000, Zebra's maximum finalization depth. A larger value raises an existing store's window in place; a smaller one is refused. |
 | `ZINDER_INGEST__MEMPOOL__MAX_TRANSACTION_COUNT` | zinder-ingest | Optional | `ingest.mempool.max_transaction_count` | Maximum number of transactions admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 8000. |
 | `ZINDER_INGEST__MEMPOOL__MAX_TOTAL_RAW_TRANSACTION_BYTES` | zinder-ingest | Optional | `ingest.mempool.max_total_raw_transaction_bytes` | Maximum cumulative raw transaction bytes admitted into one coherent live mempool. Exceeding the bound withdraws the serving generation and retries source hydration. Must be greater than zero. Defaults to 80000000. |

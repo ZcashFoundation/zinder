@@ -74,7 +74,8 @@ fn print_config_uses_native_ports_and_dedicated_secondary_roots() -> eyre::Resul
 #[test]
 fn print_config_accepts_a_query_without_a_node() -> eyre::Result<()> {
     let temporary = TempDir::new()?;
-    let output = Command::new(zinder_testkit::bin_exe!("zinder-query"))
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-query"));
+    command
         .args(["--print-config", "--network", "zcash-regtest"])
         .arg("--canonical-primary-path")
         .arg(temporary.path().join("canonical-primary"))
@@ -84,8 +85,8 @@ fn print_config_accepts_a_query_without_a_node() -> eyre::Result<()> {
         .arg(temporary.path().join("wallet-primary"))
         .arg("--wallet-secondary-root")
         .arg(temporary.path().join("wallet-secondary"))
-        .args(["--ingest-control-addr", "http://127.0.0.1:9100"])
-        .output()?;
+        .args(["--ingest-control-addr", "http://127.0.0.1:9100"]);
+    let output = command.output()?;
     assert!(
         output.status.success(),
         "print-config failed: {}",
@@ -94,6 +95,11 @@ fn print_config_accepts_a_query_without_a_node() -> eyre::Result<()> {
     let stdout = String::from_utf8(output.stdout)?;
     assert!(!stdout.contains("[node]"), "{stdout}");
     assert!(!stdout.contains("json_rpc_addr"), "{stdout}");
+    let lean = command
+        .env("ZINDER_DEPLOYMENT__PROFILE", "wallet")
+        .output()?;
+    assert!(!lean.status.success(), "{lean:?}");
+    assert!(String::from_utf8(lean.stderr)?.contains("requires [node]"));
     Ok(())
 }
 
@@ -280,5 +286,95 @@ fn tree_state_replay_waiters_per_slot_default_to_64_and_are_bounded() -> eyre::R
             "{stderr}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn wallet_profiles_render_without_injected_retention() -> eyre::Result<()> {
+    let temporary = TempDir::new()?;
+    let secondary = temporary.path().join("canonical-secondary");
+    for profile in ["wallet", "wallet-archive"] {
+        let output = query_command(&temporary, &secondary)
+            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains(&format!("profile = \"{profile}\"")),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
+        let conflict = query_command(&temporary, &secondary)
+            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+            .output()?;
+        assert!(!conflict.status.success(), "{conflict:?}");
+        assert!(String::from_utf8(conflict.stderr)?.contains("storage.raw_blob_policy"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wallet_profiles_refuse_checkpointed_canonical_history() -> eyre::Result<()> {
+    use std::time::Duration;
+
+    use zinder_core::{BlockHeight, Network};
+    use zinder_store::RawBlobRetention;
+    use zinder_testkit::{
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, IngestControlFixture,
+        sample_regtest_upgrade_activations,
+    };
+
+    let network = Network::ZcashRegtest;
+    let control = IngestControlFixture::spawn(network).await?;
+    let activations = sample_regtest_upgrade_activations();
+    for (profile, retention) in [
+        ("wallet", RawBlobRetention::None),
+        ("wallet-archive", RawBlobRetention::All),
+    ] {
+        let chain = ChainFixture::new(network)
+            .with_raw_blob_retention(retention)
+            .extend_blocks(2);
+        let baseline = CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(1));
+        let writer = CanonicalWriterFixture::publish(&baseline, &activations)?;
+        let reorg_window = writer
+            .canonical_primary()?
+            .reorg_policy()
+            .reorg_window_blocks();
+        let directory = tempfile::tempdir()?;
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-query"))
+                .env_clear()
+                .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+                .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+                .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+                .env(
+                    "ZINDER_STORAGE__SECONDARY_PATH",
+                    directory.path().join("canonical-secondary"),
+                )
+                .env("ZINDER_WALLET__PATH", directory.path().join("wallet"))
+                .env(
+                    "ZINDER_WALLET__SECONDARY_PATH",
+                    directory.path().join("wallet-secondary"),
+                )
+                .env("ZINDER_INGEST_CONTROL__ADDR", control.endpoint())
+                .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:1")
+                .env(
+                    "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
+                    reorg_window.to_string(),
+                )
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await??;
+        assert!(!output.status.success(), "{profile} unexpectedly started");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("lacks required BlockHistory coverage"),
+            "{profile} failed for a different reason: {stderr}",
+        );
+    }
+    control.shutdown().await?;
     Ok(())
 }

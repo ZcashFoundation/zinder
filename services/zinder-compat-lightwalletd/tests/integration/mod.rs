@@ -4,7 +4,7 @@ mod cli;
 mod env_var_contract;
 mod health;
 mod ingest_control_tip_change;
-mod light_wallet_qualification;
+mod light_wallet;
 mod lightwalletd_grpc;
 mod lightwalletd_scan_contract;
 mod mempool_compat;

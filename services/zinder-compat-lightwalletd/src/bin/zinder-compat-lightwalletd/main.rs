@@ -35,7 +35,7 @@ use zinder_query::{
     AdmittedIngestControl, CanonicalReader as _, DEFAULT_TREE_STATE_REPLAY_WAIT,
     DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, OrderedBroadcaster, WalletServingPairConfig,
     WalletServingPairPublisher, WalletServingQuery, WalletServingReadiness,
-    spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
+    spawn_wallet_ingest_control_readiness_probe,
 };
 
 #[global_allocator]
@@ -261,9 +261,7 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
                 wallet_primary_path,
                 wallet_secondary_root,
                 network: lightwalletd_config.network,
-                expected_raw_blob_retention: lightwalletd_config
-                    .storage
-                    .expected_raw_blob_retention,
+                canonical_requirements: lightwalletd_config.canonical_requirements(),
                 canonical_reorg_policy: lightwalletd_config.canonical_reorg_policy,
                 canonical_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
                 wallet_resource_budget: wallet_rocksdb_budget,
@@ -296,7 +294,6 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
             .value(),
     );
     open_storage_phase.complete();
-    let (incoming, listen_addr) = browser_transport::bind(lightwalletd_config.listen_addr)?;
 
     let tree_state_replay_wait = lightwalletd_config
         .tree_state_replay_wait
@@ -304,15 +301,19 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
     let tree_state_replay_waiters_per_slot = lightwalletd_config
         .tree_state_replay_waiters_per_slot
         .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT);
-    let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot.clone())
-        .with_node_broadcast(node_broadcast.clone())
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot)
+        .with_node_broadcast(node_broadcast)
+        .with_verified_cold_transactions()
         .with_tree_state_replay_wait(tree_state_replay_wait)
         .with_tree_state_replay_waiters_per_slot(tree_state_replay_waiters_per_slot);
+    let grpc_adapter =
+        LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query.clone())?;
+    let (incoming, listen_addr) = browser_transport::bind(lightwalletd_config.listen_addr)?;
     let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
     let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
         spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
-    let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
+    let grpc_adapter = grpc_adapter
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
         )
@@ -333,9 +334,7 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
     )
     .await?;
     let _signal_handle = runtime.request_shutdown_on_terminating_signal();
-    let node_readiness_handle = spawn_wallet_node_readiness_probe(
-        node_broadcast,
-        serving_pair_slot,
+    let node_readiness_handle = wallet_query.spawn_node_readiness_probe(
         serving_readiness.clone(),
         lightwalletd_config
             .broadcaster
@@ -347,6 +346,7 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
             ),
         cancel.clone(),
     );
+    drop(wallet_query);
     // Health and serving-pair refresh observe the same ingest control plane, so
     // they intentionally share one configured freshness cadence.
     let ingest_control_readiness_handle = spawn_wallet_ingest_control_readiness_probe(
@@ -446,7 +446,7 @@ fn with_ingest_mempool<Query>(
 
 enum CanonicalComposition {
     CompactBlocks,
-    Qualification {
+    LightWallet {
         source: Box<ZebraJsonRpcSource>,
         ingest: AdmittedIngestControl,
         poll_interval: std::time::Duration,
@@ -472,7 +472,7 @@ impl CanonicalComposition {
                     || std::time::Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS),
                     |health| health.poll_interval,
                 );
-                Ok(Self::Qualification {
+                Ok(Self::LightWallet {
                     source: Box::new(source),
                     ingest,
                     poll_interval,
@@ -501,8 +501,8 @@ async fn run_canonical(
     let readiness = Readiness::default();
     let composition = CanonicalComposition::admit(&lightwalletd_config).await?;
     let serving_readiness = match &composition {
-        CanonicalComposition::Qualification { .. } => {
-            compact_block_serving::CompactServingReadiness::for_qualification(readiness.clone())
+        CanonicalComposition::LightWallet { .. } => {
+            compact_block_serving::CompactServingReadiness::for_light_wallet(readiness.clone())
         }
         CanonicalComposition::CompactBlocks => {
             compact_block_serving::CompactServingReadiness::new(readiness.clone())
@@ -562,12 +562,12 @@ async fn run_canonical(
     }
     .supervised();
     let (server, tasks) = match composition {
-        CanonicalComposition::Qualification {
+        CanonicalComposition::LightWallet {
             source,
             ingest,
             poll_interval,
         } => {
-            let adapter = LightwalletdGrpcAdapter::for_light_wallet_qualification(
+            let adapter = LightwalletdGrpcAdapter::for_light_wallet(
                 slot,
                 *source,
                 lightwalletd_config
@@ -609,8 +609,8 @@ async fn run_canonical(
                     &readiness,
                 )?,
                 tasks
-                    .with("qualification node probe", node_probe)
-                    .with("qualification ingest probe", ingest_probe)
+                    .with("light-wallet node probe", node_probe)
+                    .with("light-wallet ingest probe", ingest_probe)
                     .with("tip-change publisher", tip_publisher),
             )
         }

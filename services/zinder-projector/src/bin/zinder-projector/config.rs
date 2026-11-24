@@ -11,12 +11,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    BearerToken, ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection,
-    NetworkSection, NetworkToml, OpsSection, OpsServerError, OpsToml, ProjectorControlSection,
-    ProjectorControlToml, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, SecuritySection,
-    SecurityToml, StorageRoleSection, guard_optional_serving_bind, require_field,
-    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
-    resolve_ingest_control_reader, resolve_ops_listen_addr, resolve_projector_control,
+    BearerToken, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection, DeploymentToml,
+    IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml, OpsSection,
+    OpsServerError, OpsToml, ProjectorControlSection, ProjectorControlToml,
+    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, SecuritySection, SecurityToml,
+    StorageRoleSection, guard_optional_serving_bind, require_field, resolve_allow_public_bind,
+    resolve_canonical_reader_rocksdb_budget, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_projector_control,
     resolve_wallet_projection_writer_rocksdb_budget, section_defaults::DEFAULT_CANONICAL_PATH,
 };
 use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
@@ -53,6 +54,7 @@ const MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES: u64 =
 /// Resolved release configuration.
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectorConfig {
+    pub(crate) profile: Option<DeploymentProfile>,
     pub(crate) network: Network,
     pub(crate) canonical_path: PathBuf,
     pub(crate) canonical_secondary_path: PathBuf,
@@ -367,10 +369,6 @@ fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {
             "storage.canonical_secondary_path",
             DEFAULT_CANONICAL_SECONDARY_PATH,
         )?
-        .with_default(
-            "storage.raw_blob_policy",
-            DEFAULT_RAW_BLOB_RETENTION.as_kebab_case(),
-        )?
         .with_default("wallet.path", DEFAULT_WALLET_PATH)?
         .with_default("projector.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
@@ -416,6 +414,7 @@ pub(crate) fn projector_config_toml(config: &ProjectorConfig) -> Result<String, 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ProjectorRawConfig {
+    deployment: DeploymentSection,
     network: NetworkSection,
     storage: ProjectorStorageSection,
     wallet: ProjectorWalletSection,
@@ -471,6 +470,7 @@ struct ProjectorFollowSection {
 }
 
 fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, ProjectorError> {
+    let profile = raw.deployment.profile;
     let network = raw.network.resolve()?;
     let canonical_path = require_field(raw.storage.canonical_path, "storage.canonical_path")?;
     let canonical_secondary_path = require_field(
@@ -478,7 +478,7 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
         "storage.canonical_secondary_path",
     )?;
     let expected_canonical_raw_blob_retention =
-        require_field(raw.storage.raw_blob_policy, "storage.raw_blob_policy")?;
+        resolve_expected_raw_blob_retention(profile, raw.storage.raw_blob_policy)?;
     let wallet_path = require_field(raw.wallet.path, "wallet.path")?;
     require_distinct_paths(&canonical_path, &canonical_secondary_path, &wallet_path)?;
     let canonical_rocksdb_budget =
@@ -510,6 +510,7 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
 
     Ok(ProjectorConfig {
+        profile,
         network,
         canonical_path,
         canonical_secondary_path,
@@ -530,6 +531,21 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
         ops_listen_addr,
         allow_public_bind,
     })
+}
+
+fn resolve_expected_raw_blob_retention(
+    profile: Option<DeploymentProfile>,
+    configured: Option<RawBlobRetention>,
+) -> Result<RawBlobRetention, ConfigError> {
+    let Some(profile) = profile else {
+        return Ok(configured.unwrap_or(DEFAULT_RAW_BLOB_RETENTION));
+    };
+    if matches!(profile, DeploymentProfile::LightWallet) {
+        return Err(ConfigError::invalid(
+            "deployment.profile = \"light-wallet\" runs no wallet projector; the light-wallet deployment serves node-backed reads without a wallet projection",
+        ));
+    }
+    profile.resolve_raw_blob_retention(configured)
 }
 
 fn resolve_build_config(raw: &ProjectorBuildSection) -> Result<ProjectorBuildConfig, ConfigError> {
@@ -706,6 +722,8 @@ fn require_minimum_u64(
 
 #[derive(Serialize)]
 struct ProjectorConfigToml {
+    #[serde(skip_serializing_if = "DeploymentToml::is_empty")]
+    deployment: DeploymentToml,
     network: NetworkToml,
     storage: ProjectorStorageToml,
     wallet: ProjectorWalletToml,
@@ -718,14 +736,19 @@ struct ProjectorConfigToml {
 
 impl ProjectorConfigToml {
     fn from_config(config: &ProjectorConfig) -> Self {
+        let storage = ProjectorStorageToml {
+            canonical_path: config.canonical_path.clone(),
+            canonical_secondary_path: config.canonical_secondary_path.clone(),
+            raw_blob_policy: config
+                .profile
+                .is_none()
+                .then_some(config.expected_canonical_raw_blob_retention),
+            canonical: ProjectorStorageRoleToml::from_budget(config.canonical_rocksdb_budget),
+        };
         Self {
+            deployment: DeploymentToml::from_resolved(config.profile),
             network: NetworkToml::from_network(config.network),
-            storage: ProjectorStorageToml {
-                canonical_path: config.canonical_path.clone(),
-                canonical_secondary_path: config.canonical_secondary_path.clone(),
-                raw_blob_policy: config.expected_canonical_raw_blob_retention,
-                canonical: ProjectorStorageRoleToml::from_budget(config.canonical_rocksdb_budget),
-            },
+            storage,
             wallet: ProjectorWalletToml {
                 path: config.wallet_path.clone(),
                 rocksdb: RocksDbResourceBudgetToml::from_resolved(config.wallet_rocksdb_budget),
@@ -757,7 +780,8 @@ impl ProjectorConfigToml {
 struct ProjectorStorageToml {
     canonical_path: PathBuf,
     canonical_secondary_path: PathBuf,
-    raw_blob_policy: RawBlobRetention,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_blob_policy: Option<RawBlobRetention>,
     canonical: ProjectorStorageRoleToml,
 }
 

@@ -57,6 +57,14 @@ impl NativeWalletEndpointCapabilities {
         })
     }
 
+    pub(crate) fn with_cold_transaction_bytes(&self) -> Self {
+        Self::from_predicate(|capability| {
+            self.contains(capability)
+                || (capability == capabilities::WALLET_READ_TRANSACTION_BYTES_V1
+                    && self.contains(capabilities::WALLET_READ_TRANSACTION_BY_ID_V2))
+        })
+    }
+
     /// Derives the native endpoint contract after its ingest control is admitted.
     ///
     /// The shared exact-pair query does not require this native-only dependency.

@@ -1,4 +1,4 @@
-//! Canonical reads and node access for the light-wallet qualification build.
+//! Canonical reads and node access for the node-backed light-wallet serving composition.
 
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
@@ -24,9 +24,9 @@ use crate::{
 ///
 /// A request captures it once, so node admission checks the chain view the
 /// request answers for even after the served reader changes.
-pub struct QualificationNodeTarget(crate::node_broadcast::VerificationTarget);
+pub struct VerifiedNodeTarget(crate::node_broadcast::VerificationTarget);
 
-impl QualificationNodeTarget {
+impl VerifiedNodeTarget {
     /// Captures the tip and schedule `reader` serves.
     ///
     /// # Errors
@@ -38,16 +38,16 @@ impl QualificationNodeTarget {
     }
 }
 
-/// Reads for a qualification-only lightwalletd server with one canonical store and one node.
+/// Reads for a node-backed lightwalletd server with one canonical store and one node.
 #[derive(Clone)]
-pub struct QualificationWalletQuery {
+pub struct LightWalletNodeQuery {
     source: ZebraJsonRpcSource,
     capture: Arc<dyn Fn() -> Arc<RocksDbCanonicalReader> + Send + Sync>,
     replays: TreeStateReplayLimit,
-    verification: Arc<crate::node_broadcast::QualificationNodeVerification>,
+    verification: Arc<crate::node_broadcast::LightWalletNodeVerification>,
 }
 
-impl QualificationWalletQuery {
+impl LightWalletNodeQuery {
     /// Uses the primary node for forwarding and the wallet replay bounds for canonical reads.
     #[must_use]
     pub fn new(
@@ -69,7 +69,7 @@ impl QualificationWalletQuery {
     /// the reader generation a forwarded read answers for.
     pub async fn verified_node(
         &self,
-        target: &QualificationNodeTarget,
+        target: &VerifiedNodeTarget,
     ) -> Result<&ZebraJsonRpcSource, SourceError> {
         self.verification.verify(&self.source, &target.0).await?;
         Ok(&self.source)
@@ -78,7 +78,7 @@ impl QualificationWalletQuery {
     /// Verifies the configured node against the currently served reader, and
     /// refuses when that reader changes during verification.
     pub(crate) async fn verified_current_node(&self) -> Result<&ZebraJsonRpcSource, SourceError> {
-        let target = QualificationNodeTarget::of((self.capture)().as_ref())?;
+        let target = VerifiedNodeTarget::of((self.capture)().as_ref())?;
         let node = self.verified_node(&target).await?;
         if !target.0.still_served_by((self.capture)().as_ref()) {
             return Err(SourceError::NodeUnavailable {

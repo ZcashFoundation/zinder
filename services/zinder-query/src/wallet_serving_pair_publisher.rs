@@ -82,7 +82,7 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError,
-    CanonicalStoreRequirements, CanonicalStoredSet, RawBlobRetention, ResourceGaugeThrottle,
+    CanonicalStoreRequirements, CanonicalStoredSet, ResourceGaugeThrottle,
     RocksDbCanonicalSecondary, RocksDbInstanceMemory, RocksDbOpenResources, RocksDbResourceBudget,
     SharedSecondaryResources, StoreRole, record_instance_memory_gauges,
 };
@@ -140,8 +140,8 @@ pub struct WalletServingPairConfig {
     /// generation adopts the network-upgrade schedule the canonical writer
     /// admitted for this network.
     pub network: Network,
-    /// Persisted raw-blob retention every published canonical pair must attest.
-    pub expected_raw_blob_retention: RawBlobRetention,
+    /// Minimum persisted data and historical coverage for each canonical secondary.
+    pub canonical_requirements: CanonicalStoreRequirements,
     /// Canonical replacement-depth identity expected from the writer.
     pub canonical_reorg_policy: CanonicalReorgPolicy,
     /// `RocksDB` budget for each canonical secondary generation. Its
@@ -798,7 +798,20 @@ pub fn spawn_wallet_node_readiness_probe<Source>(
 where
     Source: NodeSource + BroadcastNodeProbe,
 {
-    let Some(nodes) = nodes else {
+    let probe =
+        nodes.map(|nodes| WalletNodeProbe::new(nodes, serving_pair_slot, poll_interval, false));
+    spawn_wallet_node_probe(probe, readiness, cancel)
+}
+
+pub(crate) fn spawn_wallet_node_probe<Source>(
+    probe: Option<WalletNodeProbe<Source>>,
+    readiness: WalletServingReadiness,
+    cancel: CancellationToken,
+) -> JoinHandle<()>
+where
+    Source: NodeSource + BroadcastNodeProbe,
+{
+    let Some(probe) = probe else {
         readiness.publish_node_source_cause(ReadinessCause::Ready);
         return tokio::spawn(async move {
             cancel.cancelled().await;
@@ -806,12 +819,6 @@ where
     };
 
     tokio::spawn(async move {
-        let probe = WalletNodeProbe {
-            outcomes: watch::Sender::new(vec![None; nodes.endpoint_count()]),
-            nodes,
-            serving_pair_slot,
-            poll_interval,
-        };
         let verification = futures_util::future::join_all(
             (0..probe.nodes.endpoint_count()).map(|position| probe.keep_verified(position)),
         );
@@ -823,7 +830,8 @@ where
 }
 
 /// The node endpoints one readiness probe verifies and observes.
-struct WalletNodeProbe<Source> {
+pub(crate) struct WalletNodeProbe<Source> {
+    primary_required: bool,
     nodes: OrderedBroadcaster<Source>,
     serving_pair_slot: WalletServingPairSlot,
     poll_interval: Duration,
@@ -836,6 +844,21 @@ impl<Source> WalletNodeProbe<Source>
 where
     Source: NodeSource + BroadcastNodeProbe,
 {
+    pub(crate) fn new(
+        nodes: OrderedBroadcaster<Source>,
+        serving_pair_slot: WalletServingPairSlot,
+        poll_interval: Duration,
+        primary_required: bool,
+    ) -> Self {
+        Self {
+            outcomes: watch::Sender::new(vec![None; nodes.endpoint_count()]),
+            nodes,
+            serving_pair_slot,
+            poll_interval,
+            primary_required,
+        }
+    }
+
     /// Verifies the endpoint at `position` whenever its verification is
     /// due, without waiting on any other endpoint.
     async fn keep_verified(&self, position: usize) {
@@ -901,13 +924,18 @@ where
     }
 
     /// Observes the liveness of the first verified endpoint in broadcast
-    /// preference order that is reachable, or reports why none is verified.
+    /// preference order that is reachable. A query that also needs the
+    /// primary for cold transaction reads observes that endpoint directly.
     ///
     /// Returns `None` while no endpoint is verified and no verification has
     /// ended yet.
     async fn observe(&self) -> Option<Result<UpstreamHealthSnapshot, NodeFailure>> {
         let mut unreachable = None;
-        for (position, source) in self.nodes.verified_endpoints() {
+        for (position, source) in self
+            .nodes
+            .verified_endpoints()
+            .filter(|(position, _)| !self.primary_required || *position == 0)
+        {
             match probe_wallet_node_readiness(source).await {
                 Err(error)
                     if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
@@ -933,12 +961,18 @@ where
     /// verification ends.
     fn verification_failure(&self) -> Option<NodeFailure> {
         let outcomes = self.outcomes.borrow();
-        if outcomes.iter().all(Option::is_none) {
+        let observed = if self.primary_required {
+            outcomes.first()?.is_some()
+        } else {
+            outcomes.iter().any(Option::is_some)
+        };
+        if !observed {
             return None;
         }
         let failure = self
             .nodes
             .preference_order()
+            .filter(|position| !self.primary_required || *position == 0)
             .find_map(|position| outcomes.get(position)?.as_ref()?.as_ref().err().cloned());
         drop(outcomes);
         Some(failure.unwrap_or_else(|| {
@@ -1011,7 +1045,7 @@ fn node_observation_cause(
     }
 }
 
-impl crate::QualificationWalletQuery {
+impl crate::LightWalletNodeQuery {
     /// Probes this endpoint's forwarding admission and health for the node-source dependency.
     #[must_use]
     pub fn spawn_node_readiness_probe(
@@ -1809,8 +1843,7 @@ impl WalletServingPairPublisher {
         let wallet_generation_path = secondary_generation.wallet_generation_path.clone();
         let wallet_secondary_path = secondary_generation.wallet_secondary_path.clone();
         let canonical_reorg_policy = self.config.canonical_reorg_policy;
-        let requirements =
-            CanonicalStoreRequirements::for_blob_retention(self.config.expected_raw_blob_retention);
+        let requirements = self.config.canonical_requirements.clone();
         let canonical_resources = RocksDbOpenResources::from(&self.store_resources.canonical);
         let wallet_resources = RocksDbOpenResources::from(&self.store_resources.wallet);
         let network = self.config.network;
@@ -2810,10 +2843,10 @@ mod tests {
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
-        EventStreamStartPosition, RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalBuilder,
-        RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
-        StreamCursorTokenV1, event_stream_start_message,
+        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreRequirements,
+        CanonicalStoreWorkload, EventStreamStartPosition, RawBlobRetention, ResourceGaugeThrottle,
+        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+        RocksDbResourceBudget, StreamCursorTokenV1, event_stream_start_message,
     };
     use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionSourcePosition};
     use zinder_wallet_rocksdb::{
@@ -3051,6 +3084,50 @@ mod tests {
 
     /// A query without a configured node serves storage only, so its node
     /// dependency reports ready and never degrades.
+    #[tokio::test]
+    async fn primary_outage_degrades_cold_reads_while_the_fallback_broadcasts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary = MutableHealthSource::new()?;
+        let fallback = MutableHealthSource::new()?;
+        let (slot, _store) = regtest_serving_pair_slot()?;
+        let nodes = crate::OrderedBroadcaster::new(primary.clone(), [fallback.clone()]);
+        nodes.verify(&slot).await?;
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let probe = super::WalletNodeProbe::new(nodes, slot, Duration::from_millis(5), true);
+        let handle = super::spawn_wallet_node_probe(Some(probe), readiness, cancel.clone());
+
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        primary.available.store(false, Ordering::SeqCst);
+        query
+            .broadcast_transaction(zinder_core::RawTransactionBytes::new(vec![0x05; 32]))
+            .await?;
+        assert_eq!(fallback.broadcast_attempts.load(Ordering::SeqCst), 1);
+        wait_for_report(&runtime, |report| {
+            matches!(
+                report.degraded.as_slice(),
+                [zinder_runtime::ReadinessDependency {
+                    input: zinder_runtime::ReadinessInput::NodeSource,
+                    cause: zinder_runtime::ReadinessCause::NodeUnavailable(_),
+                }]
+            )
+        })
+        .await?;
+        let mut gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
+        assert!(gate.call(Request::new(())).is_ok());
+
+        primary.available.store(true, Ordering::SeqCst);
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn wallet_node_probe_reports_ready_without_a_configured_node()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4841,7 +4918,9 @@ mod tests {
             }
         });
         let config = WalletServingPairConfig {
-            expected_raw_blob_retention: writer.canonical_primary()?.raw_blob_retention(),
+            canonical_requirements: CanonicalStoreRequirements::for_blob_retention(
+                writer.canonical_primary()?.raw_blob_retention(),
+            ),
             ..wallet_serving_pair_config(
                 writer.canonical_primary_path().to_path_buf(),
                 temporary.path().join("canonical-secondaries"),
@@ -8648,7 +8727,9 @@ mod tests {
             wallet_primary_path,
             wallet_secondary_root,
             network: Network::ZcashRegtest,
-            expected_raw_blob_retention: RawBlobRetention::Transactions,
+            canonical_requirements: CanonicalStoreRequirements::for_blob_retention(
+                RawBlobRetention::Transactions,
+            ),
             canonical_reorg_policy: CanonicalReorgPolicy::new(100)?,
             canonical_resource_budget: RocksDbResourceBudget::for_local_tests(),
             wallet_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -9218,7 +9299,9 @@ mod tests {
         {
             let config = WalletServingPairConfig {
                 catchup_interval,
-                expected_raw_blob_retention: self.writer.canonical_primary()?.raw_blob_retention(),
+                canonical_requirements: CanonicalStoreRequirements::for_blob_retention(
+                    self.writer.canonical_primary()?.raw_blob_retention(),
+                ),
                 ..wallet_serving_pair_config(
                     self.writer.canonical_primary_path().to_path_buf(),
                     self.temporary.path().join("canonical-secondaries"),

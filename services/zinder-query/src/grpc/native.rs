@@ -994,6 +994,15 @@ mod server_info_tests {
             assert!(!transactions.contains(structurally_absent));
         }
 
+        let lean = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::None,
+            &admitted_ingest_control,
+        );
+        assert!(!lean.contains(WALLET_READ_TRANSACTION_BYTES_V1));
+        let with_verified_node = lean.with_cold_transaction_bytes();
+        assert!(with_verified_node.contains(WALLET_READ_TRANSACTION_BYTES_V1));
+        assert!(!with_verified_node.contains(WALLET_READ_FULL_BLOCK_AT_V1));
+
         let all = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
             RawBlobRetention::All,
             &admitted_ingest_control,

@@ -49,8 +49,6 @@ pub(crate) enum CompatServing {
     /// Canonical compact-block serving without wallet storage.
     CompactBlocks,
     /// Canonical wallet reads with node-backed transparent methods.
-    #[serde(alias = "light-wallet-qualification")]
-    #[value(alias = "light-wallet-qualification")]
     LightWallet,
 }
 
@@ -186,11 +184,13 @@ pub(crate) enum LightwalletdConfigError {
 
 impl LightwalletdConfig {
     pub(crate) fn canonical_requirements(&self) -> CanonicalStoreRequirements {
-        let requirements = if self.serving == CompatServing::LightWallet {
-            DeploymentProfile::LightWallet.canonical_requirement()
-        } else {
-            CanonicalStoreRequirements::default()
-        };
+        let profile = self.profile.or_else(|| {
+            (self.serving == CompatServing::LightWallet).then_some(DeploymentProfile::LightWallet)
+        });
+        let requirements = profile.map_or_else(
+            CanonicalStoreRequirements::default,
+            DeploymentProfile::canonical_requirement,
+        );
         requirements.with_blob_retention(self.storage.expected_raw_blob_retention)
     }
 }
@@ -508,6 +508,13 @@ fn resolve_lightwalletd_config(
     let (broadcaster, node_fallbacks) =
         resolve_node_list(serving, network, config.node, config.node_fallbacks)?;
 
+    if config.deployment.profile == Some(DeploymentProfile::Wallet) && broadcaster.is_none() {
+        return Err(ConfigError::invalid(
+            "the wallet profile requires [node] for verified mined transaction bytes",
+        )
+        .into());
+    }
+
     Ok(LightwalletdConfig {
         profile: config.deployment.profile,
         network,
@@ -552,22 +559,25 @@ fn resolve_serving(config: &mut LightwalletdRawConfig) -> Result<CompatServing, 
     let Some(profile) = config.deployment.profile else {
         return Ok(config.compat.serving.unwrap_or_default());
     };
-    let raw_blob_retention = profile.canonical_stored_set().raw_blob_retention();
+    let serving = if profile == DeploymentProfile::LightWallet {
+        CompatServing::LightWallet
+    } else {
+        CompatServing::Wallet
+    };
     if config
         .compat
         .serving
-        .is_some_and(|serving| serving != CompatServing::LightWallet)
-        || config
-            .storage
-            .raw_blob_policy
-            .is_some_and(|policy| policy != raw_blob_retention)
+        .is_some_and(|configured| configured != serving)
     {
-        return Err(ConfigError::invalid(
-            "deployment.profile = \"light-wallet\" requires compat.serving = \"light-wallet\" and raw_blob_policy = \"none\". To select this profile, remove conflicting overrides",
-        ));
+        return Err(ConfigError::invalid(format!(
+            "deployment.profile = \"{}\" requires compat.serving = \"{}\". To select this profile, remove conflicting overrides",
+            profile.as_str(),
+            serving.as_str(),
+        )));
     }
-    config.storage.raw_blob_policy = Some(raw_blob_retention);
-    Ok(CompatServing::LightWallet)
+    config.storage.raw_blob_policy =
+        Some(profile.resolve_raw_blob_retention(config.storage.raw_blob_policy)?);
+    Ok(serving)
 }
 
 /// The wallet primary path, secondary root, and `RocksDB` budget that wallet

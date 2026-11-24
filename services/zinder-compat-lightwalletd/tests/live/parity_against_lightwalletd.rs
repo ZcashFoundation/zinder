@@ -511,18 +511,18 @@ async fn accepted_send_transaction_surfaces_in_non_empty_mempool_methods() -> Re
         observed, expected,
         "transparent mempool CompactTx diverged after accepted send"
     );
-    if let Some(addr) = optional_env("ZINDER_TEST_QUALIFICATION_RETAINED_ADDR")? {
+    if let Some(addr) = optional_env("ZINDER_TEST_LIGHT_WALLET_RETAINED_ADDR")? {
         let mut retained = CompactTxStreamerClient::new(Endpoint::new(addr)?.connect().await?);
         let observed = accepted_mempool_transaction(
             &mut retained,
             broadcast_txid,
             &raw_transaction,
-            "retained qualification",
+            "retained light-wallet",
         )
         .await?;
         assert_eq!(
             observed, expected,
-            "retained qualification mempool CompactTx diverged"
+            "retained light-wallet mempool CompactTx diverged"
         );
     }
     Ok(())

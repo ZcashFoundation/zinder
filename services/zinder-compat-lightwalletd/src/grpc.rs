@@ -1,6 +1,6 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
-pub(crate) mod qualification;
+pub(crate) mod light_wallet;
 
 use std::sync::Arc;
 use std::{
@@ -131,9 +131,9 @@ impl Default for LightwalletdResponseLimits {
 /// Structural failure while composing the compatibility transparent-address claim.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum LightwalletdAdmissionError {
-    /// The admitted canonical store does not retain transaction bytes.
+    /// The admitted query has neither retained transaction bytes nor a verified node byte source.
     #[error(
-        "lightwalletd transparent compatibility requires transaction retention, but the admitted canonical store retains {retention}"
+        "lightwalletd wallet compatibility requires retained transaction bytes or a verified node byte source; admitted retention is {retention}"
     )]
     TransactionRetentionUnavailable {
         /// Retention authenticated by the admitted canonical serving pair.
@@ -325,7 +325,7 @@ where
     Broadcaster: zinder_source::TransactionBroadcaster + Clone,
 {
     /// Creates a compatibility adapter from an admitted canonical and wallet
-    /// serving pair with retained transaction bytes.
+    /// serving pair with retained transaction bytes or a verified node byte source.
     ///
     /// The resulting `taddrSupport` claim is fixed for this process. Later
     /// serving-pair lag or node outage is represented by the runtime readiness
@@ -334,7 +334,9 @@ where
         query_api: WalletServingQuery<Broadcaster>,
     ) -> Result<Self, LightwalletdAdmissionError> {
         let raw_blob_retention = query_api.admitted_raw_blob_retention();
-        if !raw_blob_retention.retains_transaction_blobs() {
+        if !raw_blob_retention.retains_transaction_blobs()
+            && !query_api.has_verified_cold_tx_source()
+        {
             return Err(
                 LightwalletdAdmissionError::TransactionRetentionUnavailable {
                     retention: raw_blob_retention,

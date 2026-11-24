@@ -65,6 +65,15 @@ matched substrings of node messages broke whenever the wording changed.
    transaction index stores the SHA-256 commitment to the exact serialized
    transaction bytes alongside the block position. This lets a reader obtain
    the commitment in one index lookup under every raw-blob retention policy.
+   Lean wallet serving uses this commitment to validate mined transaction bytes
+   fetched from the primary node against the captured canonical epoch. The
+   node verifies against the captured schedule and tip on a cache miss and
+   must report the indexed block. The reader admits at most 32 concurrent
+   fetches and caches up to 64 MiB of verified bytes by transaction ID and
+   digest. Missing commitments and mismatched bytes fail with `DATA_LOSS`.
+   A node outage can prevent a cold byte read while local address lookups
+   and verified cache hits can continue.
+
    [Storage backend](../architecture/storage-backend.md#canonical-store)
    defines the 72-byte row value.
 
@@ -105,5 +114,7 @@ with their retry rules are in
   the reason to learn the transaction is still in flight.
 
 ## Revision history
+
+- 2026-11-24. Mined byte reads can use the verified primary node and a bounded cache.
 
 - 2026-11-24. Added the canonical transaction location byte commitment.

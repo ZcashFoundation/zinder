@@ -16,20 +16,25 @@ use zinder_query::{
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
-    ClientAddressSource, ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection,
-    NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsToml,
-    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
-    RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
-    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
-    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
-    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
+    ClientAddressSource, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection,
+    DeploymentToml, IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml,
+    NodeFallbacksToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
+    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
+    RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
+    parse_socket_addr, require_field, resolve_allow_public_bind,
+    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
+    resolve_wallet_projection_reader_rocksdb_budget,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
-use zinder_store::{CanonicalReorgPolicy, CanonicalStoreBuildPlanError, RocksDbResourceBudget};
+use zinder_store::{
+    CanonicalReorgPolicy, CanonicalStoreBuildPlanError, CanonicalStoreRequirements,
+    RocksDbResourceBudget,
+};
 
 /// Resolved native wallet-query runtime configuration.
 #[derive(Clone, Debug)]
 pub(super) struct QueryConfig {
+    profile: Option<DeploymentProfile>,
     pub(super) network: Network,
     pub(super) storage: ResolvedCanonicalSecondaryStorage,
     pub(super) wallet_primary_path: PathBuf,
@@ -54,6 +59,19 @@ pub(super) struct QueryConfig {
     pub(super) node: Option<NodeTarget>,
     /// Endpoints broadcast tries after `node`, in position order.
     pub(super) node_fallbacks: Vec<NodeTarget>,
+}
+
+impl QueryConfig {
+    pub(super) fn canonical_requirements(&self) -> CanonicalStoreRequirements {
+        self.profile.map_or_else(
+            || {
+                CanonicalStoreRequirements::for_blob_retention(
+                    self.storage.expected_raw_blob_retention,
+                )
+            },
+            DeploymentProfile::canonical_requirement,
+        )
+    }
 }
 
 /// Command-line overrides for the native wallet-query command.
@@ -148,6 +166,7 @@ pub(super) fn query_config_toml(config: &QueryConfig) -> Result<String, QueryCon
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct QueryRawConfig {
+    deployment: DeploymentSection,
     network: NetworkSection,
     ops: OpsSection,
     storage: CanonicalSecondaryStorageSection,
@@ -178,7 +197,28 @@ struct WalletSection {
     rocksdb: RocksDbResourceBudgetSection,
 }
 
-fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
+fn apply_deployment_profile(config: &mut QueryRawConfig) -> Result<(), ConfigError> {
+    let profile = config.deployment.profile;
+    if let Some(profile) = profile {
+        if profile == DeploymentProfile::LightWallet {
+            return Err(ConfigError::invalid(
+                "the light-wallet profile has no native wallet query",
+            ));
+        }
+        config.storage.raw_blob_policy =
+            Some(profile.resolve_raw_blob_retention(config.storage.raw_blob_policy)?);
+        if profile == DeploymentProfile::Wallet && config.node.is_none() {
+            return Err(ConfigError::invalid(
+                "the wallet profile requires [node] for verified mined transaction bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
+    apply_deployment_profile(&mut config)?;
+    let profile = config.deployment.profile;
     let network = config.network.resolve()?;
     let storage = resolve_canonical_secondary_storage(config.storage)?;
     let wallet_primary_path = require_field(config.wallet.path, "wallet.path")?;
@@ -227,6 +267,7 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         .map_err(ConfigError::from)?;
 
     Ok(QueryConfig {
+        profile,
         network,
         storage,
         wallet_primary_path,
@@ -354,6 +395,8 @@ fn normalized_storage_path_identity(path: &Path) -> Result<PathBuf, ConfigError>
 
 #[derive(Serialize)]
 struct QueryConfigToml {
+    #[serde(skip_serializing_if = "DeploymentToml::is_empty")]
+    deployment: DeploymentToml,
     network: NetworkToml,
     ops: OpsToml,
     security: SecurityToml,
@@ -369,11 +412,16 @@ struct QueryConfigToml {
 
 impl QueryConfigToml {
     fn from_query_config(config: &QueryConfig) -> Self {
+        let mut storage = CanonicalSecondaryStorageToml::from_resolved(&config.storage);
+        if config.profile.is_some() {
+            storage.raw_blob_policy = None;
+        }
         Self {
             network: NetworkToml::from_network(config.network),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
-            storage: CanonicalSecondaryStorageToml::from_resolved(&config.storage),
+            deployment: DeploymentToml::from_resolved(config.profile),
+            storage,
             wallet: WalletToml {
                 path: config.wallet_primary_path.clone(),
                 secondary_path: config.wallet_secondary_root.clone(),
