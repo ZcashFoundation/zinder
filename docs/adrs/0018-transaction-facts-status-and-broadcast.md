@@ -61,6 +61,13 @@ matched substrings of node messages broke whenever the wording changed.
    runtime forwards the node's error code and message for every rejection and
    reports queued as code `-25`. It invents no Zinder-specific codes.
 
+8. **Mined locations carry the byte commitment.** The schema v1 canonical
+   transaction index stores the SHA-256 commitment to the exact serialized
+   transaction bytes alongside the block position. This lets a reader obtain
+   the commitment in one index lookup under every raw-blob retention policy.
+   [Storage backend](../architecture/storage-backend.md#canonical-store)
+   defines the 72-byte row value.
+
 Method behavior is in
 [Wallet data plane](../architecture/wallet-data-plane.md), and error reasons
 with their retry rules are in
@@ -96,3 +103,7 @@ with their retry rules are in
   older client's behavior unchanged.
 - **Treat queued as a rejection reason.** Every caller would have to inspect
   the reason to learn the transaction is still in flight.
+
+## Revision history
+
+- 2026-11-24. Added the canonical transaction location byte commitment.

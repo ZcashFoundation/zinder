@@ -23,6 +23,8 @@ The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB th
 3. RocksDB stays inside the storage crates. Runtimes and public APIs see chain epochs, typed artifacts, and typed errors, never RocksDB handles, options, or errors.
 4. Store checkpoints use RocksDB's own checkpoint primitive. A wallet-serving backup binds a canonical and a wallet checkpoint together ([ADR-0004](0004-storage-and-deployment-topologies.md)). [Private backups](../runbooks/private-backups.md) describes capture and restore of the pair.
 
+5. Canonical schema v1 keeps the serialized transaction digest in the transaction location index so readers can retrieve it with a point lookup. RocksDB uses fast compression for frequently accessed data, denser compression for cold history, and uncompressed hash indexes.
+
 [Storage backend](../architecture/storage-backend.md) describes the stores, their column families, and their layout.
 
 ## Consequences
@@ -39,6 +41,8 @@ The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB th
 - **LMDB through `heed`.** It excels at memory-mapped, read-heavy access from several processes. Zinder does not need several processes to open one database as primary, and LMDB fits append-heavy, frequently replaced data less well.
 
 ## Revision history
+
+- 2026-11-24. Added canonical transaction digests and per-family SST compression to decision 5.
 
 - 2026-11-24. Decision 2 binds the initial activation schedule to READY in canonical schema v1.
 

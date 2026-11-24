@@ -80,7 +80,7 @@ fn overwrite_location_row(
         .db
         .cf_handle(TRANSACTION_LOCATION_COLUMN_FAMILY)
         .ok_or("transaction location family absent")?;
-    let record = encode_transaction_location(location);
+    let record = encode_transaction_location(location, [0; 32]);
     let (key, location_value) = record.split_at(32);
     store.bounded_open.db.put_cf(&family, key, location_value)?;
     Ok(())
@@ -105,16 +105,31 @@ fn a_mined_transaction_comes_back_with_its_location_and_bytes() -> TestResult {
         assert_by_id_matches_two_reads(&store, mined_at(3))?.ok_or("transaction 103 is mined")?;
     assert_eq!(
         location,
-        TransactionLocation::new(
-            mined_at(3),
-            BlockHeight::new(3),
-            BlockHash::from_bytes([3; 32]),
-            0
-        )
+        TransactionLocation {
+            serialized_bytes_sha256: Some(
+                zinder_core::SerializedBytesDigest::from_serialized_bytes(&[103]).as_bytes()
+            ),
+            ..TransactionLocation::new(
+                mined_at(3),
+                BlockHeight::new(3),
+                BlockHash::from_bytes([3; 32]),
+                0
+            )
+        }
     );
     let blob = blob.ok_or("transaction bytes are retained")?;
     assert_eq!(blob.location, location);
     assert_eq!(blob.raw_transaction_bytes, vec![103]);
+    let position_only = TransactionLocation {
+        serialized_bytes_sha256: None,
+        ..location
+    };
+    assert_eq!(store.transaction_blob(position_only)?, Some(blob));
+    let wrong_digest = TransactionLocation {
+        serialized_bytes_sha256: Some([0; 32]),
+        ..location
+    };
+    assert_eq!(store.transaction_blob(wrong_digest)?, None);
     Ok(())
 }
 
@@ -172,6 +187,37 @@ fn a_transaction_whose_bytes_are_not_retained_keeps_its_location() -> TestResult
         assert_by_id_matches_two_reads(&store, mined_at(3))?.ok_or("transaction 103 is mined")?;
     assert_eq!(location.block_height, BlockHeight::new(3));
     assert_eq!(blob, None);
+    assert_eq!(
+        location.serialized_bytes_sha256,
+        Some(zinder_core::SerializedBytesDigest::from_serialized_bytes(&[103]).as_bytes())
+    );
+    Ok(())
+}
+
+#[test]
+fn transaction_location_rejects_legacy_and_other_non_exact_value_lengths() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = store_at(&temporary.path().join("canonical"), RawBlobRetention::None)?;
+    let transaction_id = mined_at(3);
+    let family = store
+        .bounded_open
+        .db
+        .cf_handle(TRANSACTION_LOCATION_COLUMN_FAMILY)
+        .ok_or("transaction location family absent")?;
+    let key = zinder_core::wire::encode_internal_transaction_id(transaction_id);
+    let stored = store
+        .bounded_open
+        .db
+        .get_cf(&family, key)?
+        .ok_or("location absent")?;
+    assert_eq!(stored.len(), 72);
+    for length in [40, 71, 73] {
+        let mut malformed = stored.clone();
+        malformed.resize(length, 0);
+        store.bounded_open.db.put_cf(&family, key, malformed)?;
+        assert!(store.transaction_location(transaction_id).is_err());
+        assert!(store.transaction_locations(&[transaction_id]).is_err());
+    }
     Ok(())
 }
 
@@ -235,7 +281,13 @@ fn a_location_row_that_disagrees_with_the_blob_rows_answers_as_the_two_reads_do(
     assert_eq!(store.transaction_blob(written)?, None);
     let (location, blob) =
         assert_by_id_matches_two_reads(&store, mined_at(3))?.ok_or("the damaged row is read")?;
-    assert_eq!(location, other_position);
+    assert_eq!(
+        location,
+        TransactionLocation {
+            serialized_bytes_sha256: Some([0; 32]),
+            ..other_position
+        }
+    );
     assert_eq!(blob.map(|blob| blob.raw_transaction_bytes), Some(vec![102]));
 
     // A damaged row that names a position with no stored bytes.
@@ -248,7 +300,13 @@ fn a_location_row_that_disagrees_with_the_blob_rows_answers_as_the_two_reads_do(
     overwrite_location_row(&store, empty_position)?;
     assert_eq!(
         assert_by_id_matches_two_reads(&store, mined_at(3))?,
-        Some((empty_position, None))
+        Some((
+            TransactionLocation {
+                serialized_bytes_sha256: Some([0; 32]),
+                ..empty_position
+            },
+            None
+        ))
     );
     Ok(())
 }

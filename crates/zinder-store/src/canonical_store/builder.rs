@@ -18,7 +18,7 @@ use super::{
         ingest_canonical_block_ssts, validate_source_tip_checkpoint, write_canonical_block_ssts,
     },
     rocksdb::{
-        canonical_column_family_descriptors, canonical_data_options, canonical_store_path,
+        CanonicalColumnFamilyOptions, canonical_column_family_descriptors, canonical_store_path,
         create_fresh_directory, initialize_store_identity, validate_resource_budget,
     },
     subtree_load::{
@@ -249,7 +249,7 @@ impl RocksDbCanonicalBuilder {
         let staging_path = canonical_block_staging_path(&self.store_path);
         let staging = FreshCanonicalBlockStaging::create(staging_path)?;
         let sst_options =
-            canonical_data_options(&self.bounded_open.block_cache, self.resource_budget);
+            CanonicalColumnFamilyOptions::new(&self.bounded_open.block_cache, self.resource_budget);
         let prepared = match write_canonical_block_ssts(
             CanonicalBlockSstConfig {
                 staging_path: staging.path(),
@@ -3503,7 +3503,7 @@ mod tests {
             evidence.compact_block_logical_bytes,
             expected_compact_block_logical_bytes
         );
-        assert_eq!(evidence.transaction_location_logical_bytes, 32 + 40);
+        assert_eq!(evidence.transaction_location_logical_bytes, 32 + 72);
         assert_eq!(evidence.transaction_blob_logical_bytes, 8 + 5);
         assert_eq!(evidence.block_blob_logical_bytes, 4 + 3);
         assert!(evidence.tree_state_checkpoint_logical_bytes > 0);
@@ -3714,7 +3714,7 @@ mod tests {
         assert_eq!(evidence.transaction_location_count, 1);
         assert_eq!(evidence.transaction_blob_count, 0);
         assert_eq!(evidence.block_blob_count, 0);
-        assert_eq!(evidence.transaction_location_logical_bytes, 32 + 40);
+        assert_eq!(evidence.transaction_location_logical_bytes, 32 + 72);
         assert_eq!(evidence.transaction_blob_logical_bytes, 0);
         assert_eq!(evidence.block_blob_logical_bytes, 0);
         Ok(())
@@ -3755,7 +3755,7 @@ mod tests {
         }
 
         let evidence =
-            store.bulk_load_blocks_with_limits(&testnet_activations()?, blocks, 1, 72)?;
+            store.bulk_load_blocks_with_limits(&testnet_activations()?, blocks, 1, 104)?;
 
         assert_eq!(evidence.block_hash_index_count, 3);
         assert!(evidence.sst_file_count > 7);

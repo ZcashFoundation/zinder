@@ -1702,7 +1702,7 @@ fn wallet_data_options(
     resource_budget: RocksDbResourceBudget,
 ) -> Options {
     let mut options = Options::default();
-    options.set_compression_type(DBCompressionType::Snappy);
+    options.set_compression_type(DBCompressionType::Lz4);
     options.set_block_based_table_factory(table_options);
     options.set_write_buffer_size(
         usize::try_from(resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
@@ -3448,6 +3448,36 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn wallet_data_families_use_lz4_in_store_and_bulk_build_options()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let family_options = WalletColumnFamilyOptions::new(
+            &Cache::new_lru_cache(1024 * 1024),
+            RocksDbResourceBudget::for_local_tests(),
+        );
+        for (name, family) in WALLET_DATA_COLUMN_FAMILIES {
+            let options = family_options.for_family(family);
+            assert_eq!(
+                options.get_compression_type(),
+                Some(DBCompressionType::Lz4),
+                "{name}"
+            );
+            assert_eq!(options.get_bottommost_compression_type(), None, "{name}");
+            let mut writer = zinder_rocksdb_bulk_load::OrderedSstWriter::new(
+                temporary.path(),
+                name,
+                options,
+                1024 * 1024,
+            )?;
+            for index in 0_u32..512 {
+                writer.put(&index.to_be_bytes(), &[0x7b; 72])?;
+            }
+            assert!(writer.finish()?.file_bytes < 512 * 72 / 2, "{name}");
+        }
+        Ok(())
     }
 
     const fn validation_config() -> WalletColdValidationConfig {

@@ -268,10 +268,12 @@ pub struct TransactionLocation {
     pub block_hash: BlockHash,
     /// Block-local transaction index.
     pub tx_index_in_block: u32,
+    /// SHA-256 of the exact serialized transaction bytes, when supplied by the source.
+    pub serialized_bytes_sha256: Option<[u8; 32]>,
 }
 
 impl TransactionLocation {
-    /// Creates a mined transaction location.
+    /// Creates a mined transaction location with position information only.
     #[must_use]
     pub const fn new(
         transaction_id: TransactionId,
@@ -284,6 +286,7 @@ impl TransactionLocation {
             block_height,
             block_hash,
             tx_index_in_block,
+            serialized_bytes_sha256: None,
         }
     }
 }

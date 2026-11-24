@@ -14,7 +14,8 @@ use crate::canonical_store::served_tree_state::{
 
 pub(in crate::canonical_store) const BLOCK_HEADER_VALUE_LEN: usize = 184;
 pub(super) const BLOCK_HASH_INDEX_RECORD_LEN: usize = 36;
-pub(super) const TRANSACTION_LOCATION_RECORD_LEN: usize = 72;
+pub(super) const TRANSACTION_LOCATION_RECORD_LEN: usize = 32 + TRANSACTION_LOCATION_VALUE_LEN;
+pub(in crate::canonical_store) const TRANSACTION_LOCATION_VALUE_LEN: usize = 72;
 
 const SAPLING_PRESENCE_BIT: u8 = 1 << 0;
 const ORCHARD_PRESENCE_BIT: u8 = 1 << 1;
@@ -144,12 +145,14 @@ pub(in crate::canonical_store) fn encode_block_hash_location(
 
 pub(in crate::canonical_store) fn encode_transaction_location(
     location: TransactionLocation,
-) -> [u8; 72] {
+    serialized_bytes_sha256: [u8; 32],
+) -> [u8; TRANSACTION_LOCATION_RECORD_LEN] {
     let mut row = [0_u8; TRANSACTION_LOCATION_RECORD_LEN];
     row[..32].copy_from_slice(&location.transaction_id.as_bytes());
     row[32..36].copy_from_slice(&encode_block_position(location.block_height));
     row[36..68].copy_from_slice(&location.block_hash.as_bytes());
-    row[68..].copy_from_slice(&location.tx_index_in_block.to_be_bytes());
+    row[68..72].copy_from_slice(&location.tx_index_in_block.to_be_bytes());
+    row[72..].copy_from_slice(&serialized_bytes_sha256);
     row
 }
 
@@ -572,11 +575,12 @@ mod tests {
         let block_hash_location = encode_block_hash_location(block_hash, height);
         assert_eq!(&block_hash_location[..32], &[7; 32]);
         assert_eq!(&block_hash_location[32..], &[1, 2, 3, 4]);
-        let encoded_location = encode_transaction_location(location);
+        let encoded_location = encode_transaction_location(location, [9; 32]);
         assert_eq!(&encoded_location[..32], &[8; 32]);
         assert_eq!(&encoded_location[32..36], &[1, 2, 3, 4]);
         assert_eq!(&encoded_location[36..68], &[7; 32]);
-        assert_eq!(&encoded_location[68..], &[0x11, 0x12, 0x13, 0x14]);
+        assert_eq!(&encoded_location[68..72], &[0x11, 0x12, 0x13, 0x14]);
+        assert_eq!(&encoded_location[72..], &[9; 32]);
     }
 
     #[test]
