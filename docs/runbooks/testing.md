@@ -113,7 +113,7 @@ kills a mutant in the crate that owns the mutated file.
 Append `--list` to the mutation command to inspect the selected functions and
 mutations. CI splits them across four shards with a 90-minute timeout per
 shard. A GitHub-hosted run took 56 minutes for 130 mutants with `--jobs 3`,
-and the selection lists 565 mutants, about 141 per shard. If a shard
+and the selection lists 567 mutants, about 142 per shard. If a shard
 approaches the timeout, increase the workflow matrix and the `--shard`
 denominator together. Use `--shard 0/4` to run one shard locally.
 
@@ -143,12 +143,14 @@ cargo mutants --workspace --all-features --cap-lints true \
   --file crates/zinder-wallet-rocksdb/src/store.rs \
   --file crates/zinder-core/src/utxo_set_commitment.rs \
   --file crates/zinder-wallet-projection/src/digest.rs \
+  --file crates/zinder-core/src/lthash16.rs \
   --re 'sealed_history/index\.rs:.*\b(hash_frames|admit|decode_index)\b' \
   --re 'variable_value_sort\.rs:.*\b(next_record|RunReader|SortedRunSource|remove_runs|merge_group|merge_run_group|read_run_head)\b' \
   --re 'accumulator_hashing\.rs:.*\b(append_row|insert_unspent_output|settle|make_room|submit|spawn|drain|combine|push_row|push_unspent_output|hash_partial|HashingWorkers::start)\b' \
   --re 'zinder-wallet-rocksdb/src/store\.rs:.*\b(outpoint_key_ranges|OutpointKeyRange|primary_output_scan_range_count|read_back_primary_output_rows|scan_primary_output_range|PrimaryOutputTotals|PrimaryScanRange|SharedExpectedReorgUndoSuffix|spawn_validation_scan)\b' \
   --re '(utxo_set_commitment|zinder-wallet-projection/src/digest)\.rs:.*\b(combine|fold_lanes)\b' \
   --re '(artifact_builder|source_transaction)\.rs:.*\b(parse_source_block|bytes_consumed|validate_transaction_byte_layout|transaction_identifiers|witnessed_transaction_identifiers)\b' \
+  --re 'lthash16\.rs:.*\bexpand_lthash16_element\b' \
   --re 'SegmentIdentity::check_block|validate_lengths|verify_payload|canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer|read_stored_final_note_commitment_roots_in_range|decode_stored_tree_state_roots|decode_checked_stored_roots|resolve_stored_roots_headers|framed_tree_size|skip_framed_node|read_tree_state_checkpoint_at|lookup_tree_state|find_tree_state|replay_tree_state|refuse_unadmitted_activations|reconstruct|required_seed_height|replay_compact_blocks|append_compact_block_commitments|requires_checkpoint|after_seed|scan_tree_state_strides|stride_ending_at_satisfied|next_tree_state_stride|first_seed_at_or_above|stride_satisfies|stored_heights_through_end|stored_tree_sizes|densify_tree_state_stride|replay_stride|append_stored_block|commitment_count|recorded_tree_sizes|commit_tree_state_stride|StoredStrideRows::read|StoredStrideRows::at|ReplayedTrees::append_block|ReplayedTrees::canonical_block_time|ReplayedTrees::checkpoint'
 ```
 

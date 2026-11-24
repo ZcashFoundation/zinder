@@ -30,6 +30,7 @@ commitment-tree-codec = [
 [dependencies]
 base16ct.workspace = true
 blake2b_simd.workspace = true
+chacha20.workspace = true
 hex.workspace = true
 incrementalmerkletree = { workspace = true, features = ["legacy-api"], optional = true }
 orchard = { workspace = true, default-features = false, optional = true }

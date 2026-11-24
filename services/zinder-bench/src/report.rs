@@ -23,7 +23,7 @@ pub const REPORT_FORMAT_VERSION: u32 = 4;
 /// Machine-readable report schema version for `rocksdb-canonical-fixture-replay` reports.
 pub const ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION: u32 = 5;
 /// Machine-readable report schema version for `rocksdb-storage-lifecycle` reports.
-pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = 5;
+pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = 6;
 /// Stable identity stamped into every benchmark report.
 pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
 /// CPU envelope used to derive canonical fixture replay defaults.
@@ -1784,10 +1784,10 @@ impl RocksDbStorageLifecycleReport {
             || self.contracts.wallet_store_identity != "wallet"
             || self.contracts.wallet_store_schema_version
                 != zinder_wallet_rocksdb::WALLET_ROCKSDB_SCHEMA_VERSION
-            || self.contracts.wallet_store_schema_version != 1
+            || self.contracts.wallet_store_schema_version != 2
             || self.contracts.wallet_projection_schema_version
                 != zinder_wallet_projection::WALLET_PROJECTION_SCHEMA_VERSION
-            || self.contracts.wallet_projection_schema_version != 1
+            || self.contracts.wallet_projection_schema_version != 2
             || self.contracts.wallet_value_encoding_version
                 != zinder_wallet_projection::WALLET_PROJECTION_VALUE_ENCODING_VERSION
             || self.contracts.wallet_value_encoding_version != 2
@@ -1851,7 +1851,7 @@ impl RocksDbStorageLifecycleReport {
             || wallet.historical_prevout_read_count != 0
             || wallet.construction.cold_validation_random_read_count != 0
             || wallet.utxo_summary.utxo_count != wallet.row_counts.transparent_unspent_output_count
-            || wallet.utxo_summary.commitment_scheme != "lthash16"
+            || wallet.utxo_summary.commitment_scheme != "lthash16-chacha12"
             || !wallet.cold_reopen_evidence_match
             || !wallet.canonical_fence_match
         {
@@ -2708,7 +2708,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         dense.validate()?;
         let encoded = serde_json::to_value(&dense)?;
-        assert_eq!(encoded["report_format_version"], 5);
+        assert_eq!(encoded["report_format_version"], 6);
         assert_eq!(
             encoded["resource_limits"]["tree_state_checkpoint_coverage"],
             "every-block"
@@ -2725,7 +2725,7 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         sparse.validate()?;
         let encoded = serde_json::to_value(&sparse)?;
-        assert_eq!(encoded["report_format_version"], 5);
+        assert_eq!(encoded["report_format_version"], 6);
         assert_eq!(
             encoded["resource_limits"]["tree_state_checkpoint_coverage"],
             "cadence-and-tip"
@@ -2742,11 +2742,15 @@ zinder_ingest_source_segment_disjoint_prefetch_discarded_completed_response_byte
             ));
         assert!(mismatched.validate().is_err());
 
-        let mut wrong_version = dense;
-        if let super::BenchmarkReport::RocksDbStorageLifecycle(inner) = &mut wrong_version {
-            inner.report_format_version = 4;
+        // The producer emits only the current format; archived formats 4 and 5
+        // carry the wallet schema 1 contract and are checked by the shell validator.
+        for archived_version in [4, 5] {
+            let mut wrong_version = dense.clone();
+            if let super::BenchmarkReport::RocksDbStorageLifecycle(inner) = &mut wrong_version {
+                inner.report_format_version = archived_version;
+            }
+            assert!(wrong_version.validate().is_err());
         }
-        assert!(wrong_version.validate().is_err());
         Ok(())
     }
 
@@ -3378,7 +3382,7 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                 utxo_summary: super::WalletStorageUtxoSummary {
                     utxo_count: 0,
                     total_value_zat: 0,
-                    commitment_scheme: "lthash16",
+                    commitment_scheme: "lthash16-chacha12",
                     commitment_accumulator_hex: "00".repeat(2048),
                     commitment_display_digest_hex: "66".repeat(32),
                 },

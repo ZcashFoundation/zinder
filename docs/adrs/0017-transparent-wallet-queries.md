@@ -57,14 +57,25 @@ different sets can share both.
    materialized-view rows. The spend view is rebuilt from canonical history
    that is complete from height 1.
 6. **The wallet projection commits to its unspent set with `LtHash16`.** Each
-   unspent output is hashed through BLAKE2X into 1,024 16-bit lanes that are
-   summed. The sum does not depend on order, and an output is removed by
-   subtraction, so each wallet transition updates the commitment in the same
-   write as its rows. Cold validation recomputes it and refuses admission on
-   a mismatch. The commitment covers every unspent output, including
-   unspendable scripts. A different encoding or membership rule is a new
-   scheme value, never a reinterpretation. The commitment is admission
-   evidence and is not served on the wire.
+   unspent output's commitment element is expanded into 1,024 16-bit lanes
+   that are summed modulo 2^16. The sum does not depend on order, and an
+   output is removed by subtraction, so each wallet transition updates the
+   commitment in the same write as its rows. Cold validation recomputes it
+   and refuses admission on a mismatch. The commitment covers every unspent
+   output, including unspendable scripts. It is admission evidence and is not
+   served on the wire.
+
+   The expansion is scheme 2. The root is an unkeyed 44-byte BLAKE2b hash of
+   the element with the personalization `ZinderUtxoRoot_2`. Its first 32
+   bytes are the key and its last 12 bytes the nonce of ChaCha12 in the
+   RFC 8439 state layout. The 32 keystream blocks at counters 0 through 31
+   are the lanes. The wallet row digest uses the same expansion with its own
+   personalization and row encoding, as
+   [Storage backend](../architecture/storage-backend.md#wallet-store)
+   describes. The two accumulators stay independent: each hashes its own
+   encoding, and cold validation recomputes each from the stored rows. A
+   different encoding, expansion, or membership rule is a new scheme value,
+   never a reinterpretation.
 
 Method responses and pinning rules are in
 [Wallet data plane](../architecture/wallet-data-plane.md).
@@ -87,8 +98,33 @@ Method responses and pinning rules are in
   privacy.
 - A checkpoint-bootstrapped store cannot prove an outpoint absent and cannot
   host the Explorer spend view.
-- Every wallet transition pays one BLAKE2X expansion per changed output, and
-  cold validation pays one per unspent output.
+- Every wallet transition pays one expansion per changed row and one per
+  changed output, and cold validation pays one per stored row and one per
+  unspent output.
+- The security of both accumulators rests on a heuristic. Zinder treats
+  ChaCha12 keyed by a public BLAKE2b root as a random function of the
+  element. The project's security review argues that if both the BLAKE2b
+  root and the ChaCha permutation were ideal, this hash-then-expand
+  construction would behave like a random oracle up to the root's birthday
+  bound. That is an informal argument, not a published result, and nothing
+  proves a 128-bit guarantee for the concrete BLAKE2b and 12-round ChaCha.
+- LtHash16 is weaker than first estimated. Lewi, Kim, Maykov, and Weis
+  estimated at least 200 bits of collision security for 1,024 16-bit lanes
+  ([ePrint 2019/227](https://eprint.iacr.org/2019/227)). Ding, Gong, Jiang,
+  and Tang give a collision attack on unrestricted sets with these
+  parameters that needs about 2^81 element hashes
+  ([ePrint 2026/2083](https://eprint.iacr.org/2026/2083)). Its colliding sets
+  hold at least 550^8, about 2^72.8, distinct elements.
+- Zinder's stores rule out that attack's witness. Row and UTXO counts are
+  checked 64-bit values, so two READY states hold fewer than 2^68 rows
+  together, and keys are unique, so no element repeats. Smaller witnesses
+  are not ruled out, and no published analysis gives a work factor for sets
+  of this size.
+- The hashes Zinder compares have idealized birthday ceilings, not proven
+  security levels: 2^128 for the 32-byte display digests and manifest
+  hashes, and 2^176 for two elements with equal 44-byte roots.
+- Changing the lane count or width changes the problem and needs its own
+  analysis.
 - The commitment is not comparable with zcashd's `gettxoutsetinfo`, which
   excludes unspendable outputs and hashes the set in a fixed order.
 
@@ -107,6 +143,27 @@ Method responses and pinning rules are in
   vanishes and crafted collisions are easy.
 - **An ordered digest like `hash_serialized`.** It requires a defined
   iteration order that Zinder's storage does not provide.
+- **BLAKE2X expansion, scheme 1.** A short element costs 33 BLAKE2b
+  compressions, one for the root and 32 for the output blocks. It costs
+  several times as much as the ChaCha12 expansion on every CPU family
+  measured, including CPUs without AVX-512 and Arm.
+- **BLAKE3 output expansion.** Its output is fast only with AVX-512. On a
+  Neoverse V2 Arm CPU it took 2,765 ns per element against 5,229 ns for
+  BLAKE2X and 1,190 ns for ChaCha12, and on AVX2-only CPUs it gained little
+  or lost.
+- **ChaCha8 or ChaCha20.** ChaCha8 leaves half a round of margin over the
+  published 7.5-round attacks on the cipher, in a setting where the key is
+  public. Eight rounds are already reached by inside-out distinguishers on
+  the ChaCha permutation (Neves and Araújo, Information Processing Letters
+  149, 2019) and by a related-key attack on ChaCha8
+  ([ePrint 2025/2334](https://eprint.iacr.org/2025/2334)). ChaCha20 costs
+  about 45% more per element than ChaCha12, and more rounds do not raise the
+  LtHash16 bound above.
+- **One expansion per unspent output for both accumulators, or a commitment
+  taken from the row digest.** The durable row and the commitment element
+  encode different fields. Sharing one expansion either hides row-only
+  fields from the row digest or makes the commitment depend on the row
+  layout, and a bad shared contribution would pass both checks.
 
 ## Revision history
 
@@ -114,3 +171,4 @@ Method responses and pinning rules are in
   light-wallet serving.
 - 2026-11-23. Evidence records what decision 2 rests on for light-wallet
   serving.
+- 2026-11-23. Decision 6 expands elements with a BLAKE2b root and ChaCha12 as scheme 2, replacing BLAKE2X, and records the LtHash16 security limits.

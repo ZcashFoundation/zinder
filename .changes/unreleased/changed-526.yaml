@@ -1,0 +1,6 @@
+kind: changed
+body: 'Fresh wallet builds and wallet transitions hash rows more than twice as fast: the wallet row digest and the UTXO set commitment now expand each element with ChaCha12 keyed by a BLAKE2b hash instead of BLAKE2X (UTXO commitment scheme 2, wallet store schema 2). The projector refuses wallet stores, private backups, and state bundles written by earlier releases, so rebuild the wallet store from the canonical store side by side before serving with this release. Canonical stores are unaffected. `zinder-core` replaces `UtxoSetCommitmentScheme::LtHash16` with `LtHash16ChaCha12` and adds `expand_lthash16_element`. On x86-64, release builds enable the ChaCha AVX-512 backend, which runs only on CPUs with AVX-512F and AVX-512VL and produces the same bytes as the AVX2 path. `zinder-bench` storage-lifecycle reports move to format 6 to record the new wallet contract; the report validator still accepts archived format 4 and 5 reports under their original wallet schema 1 contract.'
+time: 2026-11-23T21:43:08.702842686Z
+custom:
+    Bump: major
+    PR: "526"

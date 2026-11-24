@@ -21,6 +21,7 @@ mod commitment_tree_codec;
 mod displaced_block;
 pub mod explorer_reasons;
 pub mod explorer_search;
+mod lthash16;
 mod mempool;
 mod network_upgrade_activations;
 mod subtree_root;
@@ -34,6 +35,7 @@ mod utxo_set_commitment;
 mod wallet_scan;
 pub mod wire;
 
+pub use lthash16::{LTHASH16_EXPANSION_LEN, expand_lthash16_element};
 pub use utxo_set_commitment::{
     TransparentUtxoSetCommitment, UTXO_SET_COMMITMENT_DIGEST_LEN, UTXO_SET_COMMITMENT_LEN,
     UtxoSetCommitmentScheme, UtxoSetCommitmentSchemeMismatch,

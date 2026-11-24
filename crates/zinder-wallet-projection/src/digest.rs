@@ -1,7 +1,7 @@
 //! Order-independent, deletion-capable wallet projection row accumulator.
 
 use blake2b_simd::Params;
-use blake2b_simd::many::{HashManyJob, hash_many};
+use zinder_core::{LTHASH16_EXPANSION_LEN, expand_lthash16_element};
 
 use crate::contract_error::encoded_len;
 use crate::{
@@ -10,34 +10,23 @@ use crate::{
 };
 
 /// Version of the full wallet-row accumulator durable encoding.
-pub const WALLET_PROJECTION_ACCUMULATOR_VERSION: u16 = 1;
+///
+/// Version 2 expands rows with a `BLAKE2b` root and `ChaCha12`. Version 1
+/// expanded them with BLAKE2X and is no longer read.
+pub const WALLET_PROJECTION_ACCUMULATOR_VERSION: u16 = 2;
 
-/// Number of `u16` lanes in the wallet-row `LtHash16` accumulator.
-const ACCUMULATOR_LANE_COUNT: usize = 1024;
-
-/// Length in bytes of the full wallet-row accumulator.
-pub const WALLET_PROJECTION_ACCUMULATOR_LEN: usize = ACCUMULATOR_LANE_COUNT * 2;
+/// Length in bytes of the full wallet-row accumulator: 1,024 `u16` lanes.
+pub const WALLET_PROJECTION_ACCUMULATOR_LEN: usize = LTHASH16_EXPANSION_LEN;
 
 /// Length in bytes of the derived display digest.
 const DISPLAY_DIGEST_LEN: usize = 32;
 
-/// Fixed BLAKE2X personalization for wallet projection rows.
-const PROJECTION_ACCUMULATOR_PERSONAL: [u8; 16] = *b"ZinderWalletProj";
+/// `BLAKE2b` root personalization for wallet projection rows. Its trailing
+/// `2` matches [`WALLET_PROJECTION_ACCUMULATOR_VERSION`].
+const PROJECTION_ROW_ROOT_PERSONAL: [u8; 16] = *b"ZinderWProjRoot2";
 
 /// Domain-separated preimage prefix for one durable wallet row.
 const PROJECTION_ROW_DOMAIN: &[u8] = b"zinder:wallet-projection:row:v2\0";
-
-/// A `BLAKE2b` output block is 64 bytes.
-const BLAKE2B_OUTPUT_LEN: usize = 64;
-
-/// A `BLAKE2b` output block is 64 bytes in the XOF parameter encoding.
-const BLAKE2B_OUTPUT_LEN_U32: u32 = 64;
-
-/// Full accumulator length in the BLAKE2X parameter encoding.
-const WALLET_PROJECTION_ACCUMULATOR_LEN_U32: u32 = 2048;
-
-/// Number of 64-byte BLAKE2X blocks in one row expansion.
-const EXPANSION_BLOCK_COUNT: usize = WALLET_PROJECTION_ACCUMULATOR_LEN / BLAKE2B_OUTPUT_LEN;
 
 /// Durable row families committed by the wallet projection accumulator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,8 +54,9 @@ impl WalletProjectionRowFamily {
 
 /// Full, order-independent `LtHash16` accumulator over every durable row.
 ///
-/// Each row expands through `BLAKE2X` into 1024 little-endian `u16` lanes. The
-/// accumulator adds or subtracts those lanes modulo `2^16`, so an insert and
+/// Each row expands into 1,024 little-endian `u16` lanes through
+/// [`expand_lthash16_element`]. The accumulator adds or subtracts those lanes
+/// modulo `2^16`, so an insert and
 /// exact delete are inverse operations without rescanning historic rows. The
 /// full 2048-byte state is durable; [`Self::display_digest`] derives the
 /// compact 32-byte value exposed by readiness evidence.
@@ -180,7 +170,7 @@ impl WalletProjectionDigestBuilder {
             .checked_add(1)
             .ok_or(WalletProjectionContractError::ProjectionDigestRowCountOverflow)?;
         self.accumulator
-            .fold_lanes(&blake2x_expand(&preimage), u16::wrapping_add);
+            .fold_lanes(&expand_row(&preimage), u16::wrapping_add);
         *self.row_count_mut(family) = next_count;
         Ok(())
     }
@@ -200,7 +190,7 @@ impl WalletProjectionDigestBuilder {
             .checked_sub(1)
             .ok_or(WalletProjectionContractError::ProjectionDigestRowCountUnderflow)?;
         self.accumulator
-            .fold_lanes(&blake2x_expand(&preimage), u16::wrapping_sub);
+            .fold_lanes(&expand_row(&preimage), u16::wrapping_sub);
         *self.row_count_mut(family) = next_count;
         Ok(())
     }
@@ -341,43 +331,8 @@ fn row_preimage(
     Ok(preimage)
 }
 
-fn blake2x_expand(message: &[u8]) -> [u8; WALLET_PROJECTION_ACCUMULATOR_LEN] {
-    let xof_length = WALLET_PROJECTION_ACCUMULATOR_LEN_U32;
-    let root = Params::new()
-        .hash_length(BLAKE2B_OUTPUT_LEN)
-        .node_offset(u64::from(xof_length) << 32)
-        .personal(&PROJECTION_ACCUMULATOR_PERSONAL)
-        .hash(message);
-
-    // Each expansion block hashes the same root under its own node offset, so
-    // the blocks are independent and hash together as one SIMD batch.
-    let mut blocks: [HashManyJob<'_>; EXPANSION_BLOCK_COUNT] =
-        core::array::from_fn(|block_index| {
-            let block_index = u64::try_from(block_index).unwrap_or(u64::MAX);
-            HashManyJob::new(
-                Params::new()
-                    .hash_length(BLAKE2B_OUTPUT_LEN)
-                    .fanout(0)
-                    .max_depth(0)
-                    .max_leaf_length(BLAKE2B_OUTPUT_LEN_U32)
-                    .node_offset(block_index | (u64::from(xof_length) << 32))
-                    .inner_hash_length(BLAKE2B_OUTPUT_LEN)
-                    .personal(&PROJECTION_ACCUMULATOR_PERSONAL),
-                root.as_bytes(),
-            )
-        });
-    hash_many(blocks.iter_mut());
-
-    let mut output = [0; WALLET_PROJECTION_ACCUMULATOR_LEN];
-    for (output_block, block) in output
-        .as_chunks_mut::<BLAKE2B_OUTPUT_LEN>()
-        .0
-        .iter_mut()
-        .zip(&blocks)
-    {
-        output_block.copy_from_slice(block.to_hash().as_bytes());
-    }
-    output
+fn expand_row(preimage: &[u8]) -> [u8; WALLET_PROJECTION_ACCUMULATOR_LEN] {
+    expand_lthash16_element(&PROJECTION_ROW_ROOT_PERSONAL, preimage)
 }
 
 #[cfg(test)]
@@ -716,37 +671,6 @@ mod tests {
         assert_eq!(underflow.row_counts(), underflow_counts);
     }
 
-    /// Serial BLAKE2X expansion that every faster path must reproduce byte
-    /// for byte: one `Params::hash` call per 64-byte block, in block order.
-    fn serial_reference_expand(message: &[u8]) -> [u8; WALLET_PROJECTION_ACCUMULATOR_LEN] {
-        let mut output = [0; WALLET_PROJECTION_ACCUMULATOR_LEN];
-        let xof_length = WALLET_PROJECTION_ACCUMULATOR_LEN_U32;
-        let root = Params::new()
-            .hash_length(BLAKE2B_OUTPUT_LEN)
-            .node_offset(u64::from(xof_length) << 32)
-            .personal(&PROJECTION_ACCUMULATOR_PERSONAL)
-            .hash(message);
-
-        let mut produced = 0usize;
-        let mut block_index = 0u32;
-        while produced < output.len() {
-            let block_length = (output.len() - produced).min(BLAKE2B_OUTPUT_LEN);
-            let block = Params::new()
-                .hash_length(block_length)
-                .fanout(0)
-                .max_depth(0)
-                .max_leaf_length(BLAKE2B_OUTPUT_LEN_U32)
-                .node_offset(u64::from(block_index) | (u64::from(xof_length) << 32))
-                .inner_hash_length(BLAKE2B_OUTPUT_LEN)
-                .personal(&PROJECTION_ACCUMULATOR_PERSONAL)
-                .hash(root.as_bytes());
-            output[produced..produced + block_length].copy_from_slice(block.as_bytes());
-            produced += block_length;
-            block_index = block_index.wrapping_add(1);
-        }
-        output
-    }
-
     /// Deterministic bytes of `len`, distinct for each `seed`.
     fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {
         (0..=u8::MAX)
@@ -822,6 +746,11 @@ mod tests {
         Ok(builder)
     }
 
+    /// Checks lanes and a digest from an independent implementation.
+    ///
+    /// `reference_expansion.py` in the accumulator scheme evidence builds the
+    /// row preimages and the expansion with Python's standard `hashlib.blake2b` and
+    /// its own `ChaCha12`.
     #[test]
     fn multi_family_sequence_keeps_its_pinned_accumulator()
     -> Result<(), WalletProjectionContractError> {
@@ -840,75 +769,46 @@ mod tests {
         let lanes = builder.accumulator().as_bytes();
         assert_eq!(
             hex::encode(&lanes[..16]),
-            "745de52265dda526441abcc6f84841c3"
+            "e3088f27c34a44476bde42abc55cb18e"
         );
         assert_eq!(
             hex::encode(&lanes[1024..1040]),
-            "6c4855879a2042465d65e374bd12b90d"
+            "619fa7e15a61cb83ee9acc57d3cf857a"
         );
         assert_eq!(
             hex::encode(&lanes[2032..]),
-            "a37252d1b2f379e9c0b1bfdad6e582ac"
+            "fad1210b44455ec968fdf660b272aae5"
         );
         assert_eq!(
             hex::encode(builder.finish().as_bytes()),
-            "14fb5a39e6323a2d5805d6ea38c35b1f05b85773ffd0fd9833003e621ad1f788"
+            "d4e07ecae473b8591e1496ea943965e8c2044f9fc3ddf3815844811b014cfa4c"
         );
         Ok(())
     }
 
+    /// Fingerprints from the same independent reference as above.
     #[test]
     fn row_expansions_keep_their_pinned_bytes() {
         for (message, expected) in [
             (
                 Vec::new(),
-                "1b4f11d7c46d8024164a76418031ff38e46567e2d44cb9ed774f02992ba0c7e9",
+                "01917c84c6c5c55f4216756ffd6bd38c52622f1f735a2f6e63fbb6f39b64295a",
             ),
             (
                 patterned_bytes(64, 0x00),
-                "41339bca56f01af9e60b2013f7c3b324f91fd7bae8d196264dbaecc7d9a2a3ff",
+                "556fc968e30ef2356ce84cd2e03632dffbfee21336829c8ea0f68d833630d6b7",
             ),
             (
                 patterned_bytes(300, 0x5a),
-                "2c829dab647cf52acd7e841d2ec033cf9e18e90a8dd837c4798dfc217f51d916",
+                "40a73d90c92643987ba854a485afcd7259894ea8aa2b6d7b7262784d51ea81b4",
             ),
         ] {
             assert_eq!(
-                expansion_fingerprint(&blake2x_expand(&message)),
+                expansion_fingerprint(&expand_row(&message)),
                 expected,
                 "{}-byte preimage",
                 message.len()
             );
-        }
-    }
-
-    #[test]
-    fn row_expansion_matches_the_serial_reference_in_every_block() {
-        let messages = [
-            Vec::new(),
-            patterned_bytes(1, 0x01),
-            patterned_bytes(64, 0x02),
-            patterned_bytes(128, 0x03),
-            patterned_bytes(190, 0x04),
-            patterned_bytes(300, 0x05),
-        ];
-        for message in &messages {
-            let expanded = blake2x_expand(message);
-            let reference = serial_reference_expand(message);
-            for (block_index, (block, reference_block)) in expanded
-                .as_chunks::<BLAKE2B_OUTPUT_LEN>()
-                .0
-                .iter()
-                .zip(reference.as_chunks::<BLAKE2B_OUTPUT_LEN>().0.iter())
-                .enumerate()
-            {
-                assert_eq!(
-                    block,
-                    reference_block,
-                    "block {block_index} of a {}-byte preimage",
-                    message.len()
-                );
-            }
         }
     }
 }

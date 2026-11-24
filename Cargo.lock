@@ -6321,6 +6321,7 @@ version = "0.24.0"
 dependencies = [
  "base16ct",
  "blake2b_simd",
+ "chacha20",
  "eyre",
  "hex",
  "incrementalmerkletree",

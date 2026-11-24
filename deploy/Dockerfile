@@ -84,7 +84,10 @@ ARG SOURCE_DATE_EPOCH=0
 # x86-64-v3 also reaches the vendored RocksDB C++ (hardware CRC32c, AVX2);
 # scoping to the target triple keeps build scripts and non-x86 images on the
 # baseline ISA. Runtime hosts are verified at startup before storage opens.
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq --remap-path-prefix=/workspace=/usr/src/zinder --remap-path-prefix=/usr/local/cargo=/cargo"
+# `chacha20_avx512` compiles the wallet accumulators' AVX-512 ChaCha backend,
+# which runs only where AVX-512F and AVX-512VL are detected at run time and
+# produces the same bytes as the AVX2 path (scripts/test-lthash16-backends.sh).
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq --cfg chacha20_avx512 --remap-path-prefix=/workspace=/usr/src/zinder --remap-path-prefix=/usr/local/cargo=/cargo"
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--remap-path-prefix=/workspace=/usr/src/zinder --remap-path-prefix=/usr/local/cargo=/cargo"
 # jemalloc fixes its page size at build time and aborts on a kernel with larger
 # pages. 64 KiB pages run on AArch64 kernels with 4, 16, or 64 KiB pages; the
@@ -171,7 +174,7 @@ ARG RUST_VERSION
 ARG TARGETARCH
 ARG TARGETVARIANT
 
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq --cfg chacha20_avx512"
 
 COPY . .
 
