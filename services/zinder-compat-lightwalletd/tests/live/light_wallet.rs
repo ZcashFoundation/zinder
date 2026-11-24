@@ -60,25 +60,8 @@ async fn methods_match_wallet_serving_at_the_same_fence() -> Result<()> {
         node_stopped,
     )
     .await?;
-    let query = rpc::TxFilter {
-        hash: mined.txid,
-        ..Default::default()
-    };
-    let expected = wallet.get_transaction(query.clone()).await?.into_inner();
-    assert_eq!(expected.height, mined.height);
-    assert!(
-        !expected.data.is_empty(),
-        "the wallet must return the mined transaction bytes"
-    );
-    compare_node_read(
-        "GetTransaction",
-        candidate
-            .get_transaction(query)
-            .await
-            .map(Response::into_inner),
-        &expected,
-        node_stopped && policy == "none",
-    )?;
+    let expected =
+        compare_transactions(&mut candidate, &mut wallet, mined, &policy, node_stopped).await?;
 
     let fee = candidate.get_standard_fee(Empty {}).await;
     if node_stopped {
@@ -94,6 +77,70 @@ async fn methods_match_wallet_serving_at_the_same_fence() -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn compare_transactions(
+    candidate: &mut Client,
+    wallet: &mut Client,
+    mined: rpc::GetAddressUtxosReply,
+    policy: &str,
+    node_stopped: bool,
+) -> Result<rpc::RawTransaction> {
+    let query = rpc::TxFilter {
+        hash: mined.txid,
+        ..Default::default()
+    };
+    let expected = wallet.get_transaction(query.clone()).await?.into_inner();
+    assert_eq!(expected.height, mined.height);
+    assert!(
+        !expected.data.is_empty(),
+        "the wallet must return the mined transaction bytes"
+    );
+    // Warmed during the online pass when `policy == "none"`, so cached
+    // verified bytes keep serving after the node stops.
+    compare_node_read(
+        "GetTransaction",
+        candidate
+            .get_transaction(query)
+            .await
+            .map(Response::into_inner),
+        &expected,
+        false,
+    )?;
+    if node_stopped {
+        let cold_hash = wallet
+            .get_block(block_id(10))
+            .await?
+            .into_inner()
+            .vtx
+            .into_iter()
+            .next()
+            .ok_or_else(|| eyre!("regtest block 10 must carry a coinbase transaction"))?
+            .txid;
+        let cold_query = rpc::TxFilter {
+            hash: cold_hash,
+            ..Default::default()
+        };
+        let cold_expected = wallet
+            .get_transaction(cold_query.clone())
+            .await?
+            .into_inner();
+        assert_eq!(cold_expected.height, 10);
+        assert!(
+            !cold_expected.data.is_empty(),
+            "the wallet must return the mined transaction bytes"
+        );
+        compare_node_read(
+            "GetTransaction (uncached)",
+            candidate
+                .get_transaction(cold_query)
+                .await
+                .map(Response::into_inner),
+            &cold_expected,
+            policy == "none",
+        )?;
+    }
+    Ok(expected)
 }
 
 async fn compare_tip(candidate: &mut Client, wallet: &mut Client) -> Result<BlockId> {
