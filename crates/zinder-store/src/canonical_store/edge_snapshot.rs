@@ -9,7 +9,7 @@ use std::{
     num::NonZeroU32,
     os::unix::{
         ffi::OsStrExt,
-        fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, MetadataExt},
     },
     path::{Path, PathBuf},
 };
@@ -817,11 +817,17 @@ where
     reset_local_state(&staged_store)?;
     drop(staged_store);
     drop(config.open(&canonical)?);
+    let has_sealed = manifest
+        .files()
+        .any(|(path, _, _)| path.starts_with("sealed-history/"));
+    let staged = PinnedBootstrap::open(&destination, has_sealed)?;
     attest(evidence).await?;
-    fs::set_permissions(&canonical, fs::Permissions::from_mode(0o700))
+    staged.verify(&destination)?;
+    rustix::fs::fchmod(&staged.canonical.directory, rustix::fs::Mode::RWXU)
+        .map_err(io::Error::from)
         .map_err(EdgeSnapshotError::from)?;
-    sync_tree(&canonical)?;
-    commit_bootstrap(&destination, &canonical)?;
+    sync_tree_at(&staged.canonical.directory)?;
+    commit_bootstrap(&destination, &staged, &manifest.files)?;
     Ok(())
 }
 
@@ -868,31 +874,112 @@ fn stage_files(
     Ok(verified)
 }
 
+struct PinnedDirectory {
+    directory: File,
+    identity: DirectoryIdentity,
+}
+
+impl PinnedDirectory {
+    fn open(parent: &File, name: &str) -> Result<Self, EdgeSnapshotError> {
+        let directory = open_directory(parent, OsStr::new(name))?;
+        let identity = directory_identity(&directory.metadata()?)?;
+        Ok(Self {
+            directory,
+            identity,
+        })
+    }
+
+    fn matches(&self, parent: &File, name: &str) -> bool {
+        named_directory_matches(parent, OsStr::new(name), self.identity)
+    }
+}
+
+struct PinnedBootstrap {
+    canonical: PinnedDirectory,
+    sealed: Option<PinnedDirectory>,
+}
+
+impl PinnedBootstrap {
+    fn open(
+        destination: &EdgeSnapshotDestination,
+        has_sealed: bool,
+    ) -> Result<Self, EdgeSnapshotError> {
+        let stage = &destination.stage.directory;
+        let staged = Self {
+            canonical: PinnedDirectory::open(stage, CANONICAL)?,
+            sealed: has_sealed
+                .then(|| PinnedDirectory::open(stage, SEALED))
+                .transpose()?,
+        };
+        staged.verify(destination)?;
+        Ok(staged)
+    }
+
+    fn verify(&self, destination: &EdgeSnapshotDestination) -> Result<(), EdgeSnapshotError> {
+        let stage = &destination.stage;
+        if !stage.matches_entry()
+            || !self.canonical.matches(&stage.directory, CANONICAL)
+            || !self
+                .sealed
+                .as_ref()
+                .is_none_or(|sealed| sealed.matches(&stage.directory, SEALED))
+            || !destination
+                .sealed
+                .as_ref()
+                .is_none_or(|(_, workspace)| workspace.matches_entry())
+        {
+            return Err(refused(
+                "snapshot workspace was substituted during attestation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn rename_canonical(
+    destination: &EdgeSnapshotDestination,
+    staged: &PinnedBootstrap,
+) -> Result<(), EdgeSnapshotError> {
+    let stage = &destination.stage;
+    let name = destination_name(&destination.target)?;
+    require_empty_or_absent_at(&stage.parent_dir, name)?;
+    staged.verify(destination)?;
+    rename_no_replace_at(
+        &stage.directory,
+        OsStr::new(CANONICAL),
+        &stage.parent_dir,
+        name,
+    )?;
+    Ok(())
+}
+
 fn commit_bootstrap(
     destination: &EdgeSnapshotDestination,
-    canonical: &Path,
+    staged: &PinnedBootstrap,
+    inventory: &[SnapshotFile],
 ) -> Result<(), EdgeSnapshotError> {
-    let target = &destination.target;
-    let sealed = destination.stage.path.join(SEALED);
-    let Some((output, sidecar)) = &destination.sealed else {
-        return publish(canonical, target);
+    let canonical_parent = &destination.stage.parent_dir;
+    let sidecar = destination
+        .sealed
+        .as_ref()
+        .map(|(output, sidecar)| {
+            let name = destination_name(output)?;
+            require_empty_or_absent_at(&sidecar.parent_dir, name)?;
+            Ok::<_, EdgeSnapshotError>((sidecar, name))
+        })
+        .transpose()?;
+    let Some(((sidecar, output_name), sealed)) = sidecar.zip(staged.sealed.as_ref()) else {
+        rename_canonical(destination, staged)?;
+        canonical_parent.sync_all()?;
+        return Ok(());
     };
-    require_empty_or_absent(output)?;
-    if !sealed.is_dir() {
-        return publish(canonical, target);
+
+    let files = copy_sealed_history(sealed, sidecar, inventory)?;
+    staged.verify(destination)?;
+    if !files.matches(&sidecar.directory, SEALED) {
+        return Err(refused("snapshot sidecar workspace was substituted"));
     }
-    let files = sidecar.path.join(SEALED);
-    create_private_dir(&files)?;
-    for (relative, source) in inventory(&sealed)? {
-        let target = files.join(relative);
-        fs::create_dir_all(parent(&target))?;
-        transfer(&source, Some(&target), None)?;
-    }
-    sync_tree(&files)?;
-    let files_dir = open_directory(&sidecar.directory, OsStr::new(SEALED))?;
-    let files_identity = directory_identity(&files_dir.metadata()?)?;
     let output_parent = &sidecar.parent_dir;
-    let output_name = destination_name(output)?;
     rename_no_replace_at(
         &sidecar.directory,
         OsStr::new(SEALED),
@@ -902,18 +989,44 @@ fn commit_bootstrap(
     let commit = output_parent
         .sync_all()
         .map_err(EdgeSnapshotError::from)
-        .and_then(|()| rename_no_replace(canonical, target));
+        .and_then(|()| rename_canonical(destination, staged));
     if let Err(error) = commit {
         let rollback =
-            remove_owned_directory(output_parent, output_name, &files_dir, files_identity);
+            remove_owned_directory(output_parent, output_name, &files.directory, files.identity);
         let sync = output_parent.sync_all();
         if let Err(error) = rollback.and(sync) {
-            tracing::warn!(path = %output.display(), %error, "failed to roll back snapshot sidecar");
+            tracing::warn!(output = ?output_name, %error, "failed to roll back snapshot sidecar");
         }
         return Err(error);
     }
-    File::open(parent(target))?.sync_all()?;
+    canonical_parent.sync_all()?;
     Ok(())
+}
+
+fn copy_sealed_history(
+    sealed: &PinnedDirectory,
+    sidecar: &Workspace,
+    inventory: &[SnapshotFile],
+) -> Result<PinnedDirectory, EdgeSnapshotError> {
+    use rustix::fs::{Mode, mkdirat};
+
+    mkdirat(&sidecar.directory, SEALED, Mode::RWXU).map_err(io::Error::from)?;
+    let files = PinnedDirectory::open(&sidecar.directory, SEALED)?;
+    for file in inventory {
+        let Some(relative) = file.path.strip_prefix("sealed-history/") else {
+            continue;
+        };
+        let input = open_snapshot_file_at(&sealed.directory, relative)?;
+        let output = create_snapshot_file_at(&files.directory, relative)?;
+        if transfer_open_files(input, Some(output), Some(file.bytes))? != (file.bytes, file.sha256)
+        {
+            return Err(refused(
+                "staged sealed-history file differs from the signed inventory",
+            ));
+        }
+    }
+    sync_tree_at(&files.directory)?;
+    Ok(files)
 }
 
 fn read_bounded(input: impl Read, limit: u64) -> Result<Vec<u8>, EdgeSnapshotError> {
@@ -926,15 +1039,21 @@ fn read_bounded(input: impl Read, limit: u64) -> Result<Vec<u8>, EdgeSnapshotErr
 }
 
 fn open_regular(path: &Path) -> Result<File, EdgeSnapshotError> {
-    use rustix::fs::{Mode, OFlags, open};
+    open_regular_at(rustix::fs::CWD, path.as_os_str())
+}
 
-    let file: File = open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .map_err(io::Error::from)?
-    .into();
+fn open_regular_at(parent: impl rustix::fd::AsFd, name: &OsStr) -> Result<File, EdgeSnapshotError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let file = File::from(
+        openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?,
+    );
     if !file.metadata()?.is_file() {
         return Err(refused("snapshot input is not a regular file"));
     }
@@ -944,30 +1063,48 @@ fn open_regular(path: &Path) -> Result<File, EdgeSnapshotError> {
 // Resolve each component through a directory descriptor. Inventory checks
 // alone cannot protect a later read if an input directory is replaced.
 fn open_snapshot_file(root: &Path, relative: &str) -> Result<File, EdgeSnapshotError> {
-    use rustix::fs::{Mode, OFlags, open, openat};
+    let directory = open_directory(rustix::fs::CWD, root.as_os_str())?;
+    open_snapshot_file_at(&directory, relative)
+}
 
-    let directories = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
-    let mut directory = open(root, directories, Mode::empty()).map_err(io::Error::from)?;
+fn open_snapshot_file_at(root: &File, relative: &str) -> Result<File, EdgeSnapshotError> {
+    let mut directory = root.try_clone()?;
     let mut components = relative.split('/').peekable();
     while let Some(name) = components.next() {
         if components.peek().is_none() {
-            let file: File = openat(
-                &directory,
-                name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-                Mode::empty(),
-            )
-            .map_err(io::Error::from)?
-            .into();
-            if !file.metadata()?.is_file() {
-                return Err(refused("snapshot input is not a regular file"));
-            }
-            return Ok(file);
+            return open_regular_at(&directory, OsStr::new(name));
         }
-        directory =
-            openat(&directory, name, directories, Mode::empty()).map_err(io::Error::from)?;
+        directory = open_directory(&directory, OsStr::new(name))?;
     }
     Err(refused("empty snapshot path"))
+}
+
+fn create_snapshot_file_at(root: &File, relative: &str) -> io::Result<File> {
+    use rustix::{
+        fs::{Mode, OFlags, mkdirat, openat},
+        io::Errno,
+    };
+
+    let mut directory = root.try_clone()?;
+    let mut components = relative.split('/').peekable();
+    while let Some(name) = components.next() {
+        if components.peek().is_none() {
+            return openat(
+                &directory,
+                name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map(File::from)
+            .map_err(io::Error::from);
+        }
+        match mkdirat(&directory, name, Mode::RWXU) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(error) => return Err(error.into()),
+        }
+        directory = open_directory(&directory, OsStr::new(name))?;
+    }
+    Err(io::Error::other("empty snapshot path"))
 }
 
 fn transfer(
@@ -979,11 +1116,18 @@ fn transfer(
 }
 
 fn transfer_from(
-    mut input: File,
+    input: File,
     target: Option<&Path>,
     limit: Option<u64>,
 ) -> Result<(u64, [u8; 32]), EdgeSnapshotError> {
-    let mut output = target.map(File::create_new).transpose()?;
+    transfer_open_files(input, target.map(File::create_new).transpose()?, limit)
+}
+
+fn transfer_open_files(
+    mut input: File,
+    mut output: Option<File>,
+    limit: Option<u64>,
+) -> Result<(u64, [u8; 32]), EdgeSnapshotError> {
     let mut buffer = vec![0; 128 * 1024];
     let mut hash = Sha256::new();
     let mut bytes = 0;
@@ -1095,15 +1239,57 @@ fn walk_inventory(
 }
 
 fn sync_tree(root: &Path) -> Result<(), EdgeSnapshotError> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            sync_tree(&entry.path())?;
+    let directory = open_directory(rustix::fs::CWD, root.as_os_str())?;
+    sync_tree_at(&directory)
+}
+
+fn sync_tree_at(directory: &File) -> Result<(), EdgeSnapshotError> {
+    use rustix::fs::{AtFlags, Dir, FileType, statat};
+
+    for entry in Dir::read_from(directory).map_err(io::Error::from)? {
+        let entry = entry.map_err(io::Error::from)?;
+        let bytes = entry.file_name().to_bytes();
+        if matches!(bytes, b"." | b"..") {
+            continue;
+        }
+        let name = OsStr::from_bytes(bytes);
+        let stat = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            let child = open_directory(directory, name)?;
+            sync_tree_at(&child)?;
         } else {
-            open_regular(&entry.path())?.sync_all()?;
+            open_regular_at(directory, name)?.sync_all()?;
         }
     }
-    File::open(root)?.sync_all()?;
+    directory.sync_all()?;
+    Ok(())
+}
+
+fn require_empty_or_absent_at(parent_dir: &File, name: &OsStr) -> Result<(), EdgeSnapshotError> {
+    use rustix::{fs::Dir, io::Errno};
+
+    let occupied = || {
+        refused(format!(
+            "snapshot destination is occupied: {}",
+            name.to_string_lossy()
+        ))
+    };
+    match open_directory(parent_dir, name) {
+        Ok(directory) => {
+            for entry in Dir::read_from(&directory).map_err(io::Error::from)? {
+                let entry = entry.map_err(io::Error::from)?;
+                if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                    return Err(occupied());
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if matches!(error.raw_os_error(), Some(code) if code == Errno::NOTDIR.raw_os_error() || code == Errno::LOOP.raw_os_error()) =>
+        {
+            return Err(occupied());
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -1312,6 +1498,15 @@ fn directory_stat_identity(stat: &rustix::fs::Stat) -> io::Result<DirectoryIdent
     Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
+fn named_directory_matches(parent: &File, name: &OsStr, identity: DirectoryIdentity) -> bool {
+    use rustix::fs::{AtFlags, statat};
+
+    statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .ok()
+        .and_then(|stat| directory_stat_identity(&stat).ok())
+        == Some(identity)
+}
+
 fn remove_owned_directory(
     parent_dir: &File,
     name: &OsStr,
@@ -1365,6 +1560,10 @@ fn remove_empty_owned_directory(
 }
 
 impl Workspace {
+    fn matches_entry(&self) -> bool {
+        named_directory_matches(&self.parent_dir, &self.name, self.identity)
+    }
+
     fn create(path: PathBuf) -> Result<Self, EdgeSnapshotError> {
         Self::create_with_marker(path, create_workspace_marker)
     }

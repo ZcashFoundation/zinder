@@ -94,7 +94,10 @@ Cleanup and sidecar rollback traverse open directory descriptors and verify
 ownership before unlinking the directory. Bootstrap reserves workspaces before starting
 an HTTP transfer. Before publication it clears inherited projection build
 leases and mempool events, generates a fresh `cursor_auth_key` using the OS
-CSPRNG, and runs normal READY admission on the resulting store. The receiver syncs files and
+CSPRNG, and runs normal READY admission on the resulting store. Bootstrap pins the admitted
+canonical and optional sealed-history directories before attestation. It
+rechecks workspace and staged directory identities before descriptor-relative
+publication. The receiver syncs files and
 directories, publishes the canonical directory by atomic no-replace rename,
 and syncs the destination parent directory. Normal ingest resumes ownership
 and follows from the snapshot tip.

@@ -20,8 +20,8 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
     let keys = [publisher.public_key().as_ref().try_into()?];
     let bundle = root.path().join("bundle");
     let sealed = root.path().join("opaque");
-    fs::create_dir(&sealed)?;
-    fs::write(sealed.join("segment"), b"opaque history")?;
+    fs::create_dir_all(sealed.join("part"))?;
+    fs::write(sealed.join("part/segment"), b"opaque history")?;
     let key_file = root.path().join("signer.der");
     fs::write(&key_file, signing_key.as_ref())?;
     export_edge_snapshot(&mut source, &bundle, &key_file, Some(&sealed))?;
@@ -82,7 +82,10 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
     assert_ne!(restored.cursor_auth_key, old_key);
     assert_eq!(restored.mempool_event_history(history)?, []);
     assert_eq!(restored.ready_evidence(), source.ready_evidence());
-    assert_eq!(fs::read(sealed_output.join("segment"))?, b"opaque history");
+    assert_eq!(
+        fs::read(sealed_output.join("part/segment"))?,
+        b"opaque history"
+    );
     assert!(reserve().is_err());
     assert!(!root.path().join("sealed.bootstrap.staging").exists());
     Ok(())
@@ -671,11 +674,95 @@ fn failed_canonical_commit_rolls_back_the_published_sidecar() -> TestResult {
     fs::create_dir(&target)?;
     fs::write(target.join("keep"), b"existing primary")?;
 
-    let failure = commit_bootstrap(&destination, &canonical);
+    let staged = PinnedBootstrap::open(&destination, true)?;
+    let inventory = [SnapshotFile {
+        path: format!("{SEALED}/segment"),
+        bytes: 14,
+        sha256: Sha256::digest(b"staged history").into(),
+    }];
+    let failure = commit_bootstrap(&destination, &staged, &inventory);
     assert!(
         matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("occupied"))
     );
     assert!(!output.exists());
     assert_eq!(fs::read(target.join("keep"))?, b"existing primary");
+    Ok(())
+}
+
+#[tokio::test]
+async fn substituted_directories_are_refused_after_attestation() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let (_source_directory, mut source) = admitted_source()?;
+    let signing = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| "key generation failed")?;
+    let publisher =
+        Ed25519KeyPair::from_pkcs8(signing.as_ref()).map_err(|_| "key parsing failed")?;
+    let keys = [publisher.public_key().as_ref().try_into()?];
+    let key_file = root.path().join("signer.der");
+    fs::write(&key_file, signing.as_ref())?;
+    let bundle = root.path().join("bundle");
+    let history = root.path().join("input-history");
+    fs::create_dir(&history)?;
+    fs::write(history.join("segment"), b"history")?;
+    export_edge_snapshot(&mut source, &bundle, &key_file, Some(&history))?;
+    let activations = source
+        .network_upgrade_activations()
+        .ok_or("missing schedule")?;
+    for label in ["stage", CANONICAL, SEALED, "sidecar"] {
+        let target = root.path().join(format!("{label}-target"));
+        let output = root.path().join(format!("{label}-history"));
+        let destination = EdgeSnapshotDestination::reserve(&target, Some(&output), false)?;
+        let stage = destination.stage.path.clone();
+        let replaced = match label {
+            "stage" => stage.clone(),
+            "sidecar" => destination
+                .sealed
+                .as_ref()
+                .ok_or("missing sidecar")?
+                .1
+                .path
+                .clone(),
+            child => stage.join(child),
+        };
+        let moved = root.path().join(format!("{label}-moved"));
+        let replacement = if label == "stage" {
+            replaced.join(CANONICAL)
+        } else {
+            replaced.clone()
+        };
+        let unadmitted = replacement.join("unadmitted");
+        let config = EdgeSnapshotStoreConfig {
+            activations,
+            workload: source.workload(),
+            raw_blob_retention: source.raw_blob_retention(),
+            reorg_policy: source.reorg_policy(),
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+        };
+        let failure = prepare_bootstrapped_store(
+            destination,
+            EdgeSnapshotBootstrap {
+                source: &bundle,
+                trusted_keys: &keys,
+                spot_check_blocks: DEFAULT_SPOT_CHECK_BLOCKS,
+            },
+            config,
+            |_| async {
+                tokio::task::yield_now().await;
+                fs::rename(&replaced, &moved)?;
+                fs::create_dir_all(&replacement)?;
+                fs::write(&unadmitted, b"unadmitted")?;
+                Ok::<_, EdgeSnapshotError>(())
+            },
+        )
+        .await;
+        assert!(
+            matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason == "snapshot workspace was substituted during attestation")
+        );
+        assert!(!target.exists());
+        assert!(!output.exists());
+        if matches!(label, "stage" | "sidecar") {
+            assert_eq!(fs::read(&unadmitted)?, b"unadmitted");
+        }
+    }
     Ok(())
 }
