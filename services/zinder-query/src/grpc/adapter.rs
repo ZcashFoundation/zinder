@@ -404,6 +404,10 @@ where
             Err(error @ QueryError::CanonicalHistoryUnavailable { .. })
                 if at_epoch_id.is_none() =>
             {
+                self.query_api
+                    .verify_forwarding_node(None)
+                    .await
+                    .map_err(|error| status_from_query_error(&error))?;
                 let client = self
                     .ingest_control_client(INGEST_CONTROL_NOT_COMPOSED)
                     .await?;
@@ -424,6 +428,10 @@ where
                 .into_status(TRANSACTION_NOT_FOUND_IN_CHAIN));
         }
 
+        self.query_api
+            .verify_forwarding_node(Some(chain_epoch.id))
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
         let client = self
             .ingest_control_client(INGEST_CONTROL_NOT_COMPOSED)
             .await?;

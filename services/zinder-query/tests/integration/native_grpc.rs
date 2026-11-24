@@ -687,6 +687,141 @@ async fn history_floor_miss_still_reports_a_pending_transaction() -> eyre::Resul
     Ok(())
 }
 
+/// A store without transaction bodies verifies its node before the mempool.
+///
+/// A node that is down never yields an absence, and an epoch-pinned lookup
+/// stays a canonical read that never calls the node.
+#[tokio::test]
+async fn lean_wallet_transaction_miss_verifies_the_forwarding_node_before_the_mempool()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(1);
+    let tip = chain
+        .blocks()
+        .last()
+        .ok_or_else(|| eyre!("missing fixture tip"))?;
+    let schedule = one_upgrade_per_height()?;
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let node = verifiable_node(&schedule, tip.hash)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?);
+    let chain_epoch = pair.chain_epoch();
+    let ingest_control = StaticIngestControl::new();
+    ingest_control.set_mempool_transaction_miss(
+        TransactionAbsence::at_epoch(chain_epoch, true).into_status("not in the test mempool"),
+    );
+    let mempool = ingest_control.clone();
+    let (ingest_control_addr, cancel, server_task) =
+        spawn_ingest_control_server(ingest_control).await?;
+    let admitted = AdmittedIngestControl::connect(
+        &format!("http://{ingest_control_addr}"),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let source = zinder_source::ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        node.url(),
+        zinder_source::NodeAuth::None,
+        Duration::from_secs(2),
+    )?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(pair),
+        admitted,
+    )
+    .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
+    .with_verified_cold_transactions();
+    assert!(query.has_verified_cold_tx_source());
+    let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
+    let missing = TransactionId::from_bytes([0x49; 32]);
+
+    // A verified node lets the mempool complete the absence.
+    let absent = transaction_status(&adapter, missing, None).await?;
+    assert_eq!(
+        TransactionAbsence::from_status(&absent)?,
+        Some(TransactionAbsence::at_epoch(chain_epoch, true))
+    );
+    assert_eq!(mempool.mempool_transaction_call_count(), 1);
+
+    // A pinned lookup consults neither the mempool nor the node.
+    drop(node);
+    let pinned = transaction_status(&adapter, missing, Some(chain_epoch.id)).await?;
+    assert_eq!(
+        TransactionAbsence::from_status(&pinned)?,
+        Some(TransactionAbsence::at_epoch(chain_epoch, false))
+    );
+    assert_eq!(mempool.mempool_transaction_call_count(), 1);
+
+    // An unreachable node is `UNAVAILABLE`, and the mempool is not consulted.
+    let unverified = transaction_status(&adapter, missing, None).await?;
+    assert_eq!(unverified.code(), Code::Unavailable, "{unverified:?}");
+    assert_eq!(TransactionAbsence::from_status(&unverified)?, None);
+    assert_eq!(mempool.mempool_transaction_call_count(), 1);
+
+    cancel.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+fn one_upgrade_per_height() -> eyre::Result<zinder_core::NetworkUpgradeActivations> {
+    Ok(zinder_core::NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .zip(1..)
+            .map(
+                |(activation, height)| zinder_core::NetworkUpgradeActivation {
+                    activation_height: BlockHeight::new(height),
+                    ..activation.clone()
+                },
+            )
+            .collect(),
+    )?)
+}
+
+/// A node double that passes served-tip verification for a pair serving
+/// `schedule` with `tip_hash` at its tip.
+fn verifiable_node(
+    schedule: &zinder_core::NetworkUpgradeActivations,
+    tip_hash: zinder_core::BlockHash,
+) -> eyre::Result<zinder_testkit::JsonRpcTestServer> {
+    use zinder_core::wire::encode_branch_id_hex;
+    use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
+
+    let upgrades: serde_json::Map<String, serde_json::Value> = schedule
+        .activations()
+        .iter()
+        .map(|activation| {
+            (
+                encode_branch_id_hex(activation.branch_id),
+                serde_json::json!({
+                    "name": activation.name,
+                    "activationheight": activation.activation_height.value(),
+                    "status": "active",
+                }),
+            )
+        })
+        .collect();
+    JsonRpcTestServer::start([
+        method("rpc.discover").reply_with(|_| {
+            RpcReply::result(serde_json::json!({
+                "openrpc": "1.3.2",
+                "methods": [{"name": "rpc.discover"}, {"name": "sendrawtransaction"}],
+            }))
+        }),
+        method("getblockchaininfo")
+            .reply_with(move |_| RpcReply::result(serde_json::json!({ "upgrades": upgrades }))),
+        method("getblockhash").reply_with(move |_| {
+            RpcReply::result(serde_json::json!(encode_rpc_block_hash_hex(tip_hash)))
+        }),
+    ])
+}
+
 fn assert_history_floor(status: &Status, first_available_height: BlockHeight) -> eyre::Result<()> {
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(

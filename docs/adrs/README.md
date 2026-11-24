@@ -64,7 +64,7 @@ stop the debate from being repeated.
 | [0011](0011-ingest-control-transport-security.md) | Ingest control transport security | Ingest control authenticates with a bearer token, and the operator provides TLS. |
 | [0012](0012-mempool-topology-and-retention.md) | Mempool topology and retention | Ingest owns the one live mempool, and readers proxy it. |
 | [0013](0013-chain-event-streams.md) | Chain event streams | Event streams start at an explicit position and resume across reorgs. |
-| [0014](0014-consumer-neutral-wallet-data-plane.md) | Consumer-neutral wallet data plane | Native wallets read one consumer-neutral data plane from stored artifacts. Only the light-wallet lightwalletd composition forwards indexed reads to the node. |
+| [0014](0014-consumer-neutral-wallet-data-plane.md) | Consumer-neutral wallet data plane | Native wallets read one consumer-neutral data plane from stored artifacts. Only the light-wallet composition and the lean `wallet` profile read from the node, which supplies bytes at the served tip. |
 | [0015](0015-wallet-runtime-composition.md) | Wallet runtime composition | Wallet runtimes advertise only the capabilities their composition proves. |
 | [0016](0016-wallet-serving-readiness.md) | Wallet-serving readiness | Wallet-serving readiness follows the canonical and wallet serving pair, compact-blocks and light-wallet serving follow the canonical generation, and dependencies degrade instead of refusing traffic. |
 | [0017](0017-transparent-wallet-queries.md) | Transparent wallet queries | Only consumer-owned transparent methods are served, and wallet spend status comes from the wallet projection. |
@@ -73,7 +73,7 @@ stop the debate from being repeated.
 | [0020](0020-materialized-views.md) | Materialized views | Explorer views are rebuildable projections with exact per-view schema admission and explicit coverage. |
 | [0021](0021-shared-configuration-sections.md) | Shared configuration sections | Shared configuration sections live in `zinder-runtime`, and each runtime composes only what it uses. |
 | [0022](0022-release-artifacts.md) | Release artifacts | Releases ship reproducible GNU/Linux binaries with signatures, provenance, and SBOMs. |
-| [0023](0023-deployment-profiles.md) | Deployment profiles | A profile coordinates what a deployment's writer stores and what its readers serve and require. Light wallet is the only named profile, and only the light-wallet composition forwards indexed reads to the node. |
+| [0023](0023-deployment-profiles.md) | Deployment profiles | A profile coordinates what a deployment's writer stores and what its readers serve and require. `wallet` serves verified bytes from the node, `wallet-archive` retains bodies, and only the light-wallet composition forwards indexed reads. |
 | [0024](0024-verified-edge-snapshot-bootstrap.md) | Verified edge snapshot bootstrap | Publisher signatures and validator attestation admit a private canonical checkpoint before it becomes a writer. |
 
 ## Earlier numbering

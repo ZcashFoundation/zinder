@@ -529,6 +529,13 @@ where
         }
     }
 
+    async fn capture_ephemeral_view(&self) -> Result<ChainEpoch, Status> {
+        match self.current_chain_epoch() {
+            Some(chain_epoch) => Ok(chain_epoch),
+            None => self.capture_view().await,
+        }
+    }
+
     async fn capture_view(&self) -> Result<ChainEpoch, Status> {
         self.visible_tip_block(None)
             .await
@@ -637,7 +644,7 @@ where
         let at_epoch_id = match read.view {
             ChunkView::Captured(view) => Some(view.id),
             ChunkView::Current => {
-                let view = match self.capture_view().await {
+                let view = match self.capture_ephemeral_view().await {
                     Ok(view) => view,
                     Err(status) => {
                         return ChunkReadOutcome::unread(ChunkReadFailure::Failed(status));
@@ -1109,6 +1116,13 @@ where
             Err(error) => return Err(status_from_query_error(&error)),
         };
 
+        // A store without transaction bodies verifies its forwarding node
+        // against the captured tip before the mempool answers or an absence
+        // is reported.
+        self.query_api
+            .verify_forwarding_node(Some(at_epoch_id))
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
         self.pending_transaction(transaction_id, canonical_miss)
             .await
             .map(Response::new)

@@ -63,6 +63,20 @@ length and digest while streaming it to disk. An HTTP transfer retrieves
 complete files and needs space for both the download and the private staged
 copy.
 
+The receiver refuses a snapshot whose first retained block is above the first
+block its writer requires, which is block 1 without a checkpoint override and
+the block after the override otherwise. Manifest preflight enforces this before
+any payload is copied or downloaded, and attestation enforces it again. A
+writer started with the same `checkpoint_height` applies the same rule, so
+normal writer startup never rejects a published bootstrap.
+
+Bundled sealed history must cover no block above the snapshot boundary, because
+the compatibility runtime admits it against the canonical chain the bundle
+carries. A bundle copies files without their fs-verity protection, so a
+reader that sets `require_fs_verity = true` needs `fsverity enable --hash-alg
+sha256 --block-size 4096 FILE` run on each destination segment before it
+admits the catalog.
+
 After cold admission, the receiver compares the signed anchors with evidence
 read back from the store. The configured `NodeSource` must also attest:
 

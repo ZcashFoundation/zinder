@@ -137,6 +137,18 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
     /// Captures the chain view current now, without a storage read.
     fn capture_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send;
 
+    /// Captures the chain view current now for a probe that exposes no epoch
+    /// and reads nothing again by it, such as a tip check or a staleness
+    /// check.
+    ///
+    /// A mode that serves epoch-bound pairs captures it without keeping the
+    /// pair readable for pins, so a probe never retains a replaced
+    /// generation. A caller must not read by the returned view. The default
+    /// captures the current view.
+    fn capture_ephemeral_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send {
+        self.capture_view()
+    }
+
     /// Subscribes to publications of newer views, so a request can wait for
     /// the visible tip to advance without polling.
     ///
@@ -595,7 +607,7 @@ async fn resolve_published_shape<Reads: CompactBlockReads>(
     let Some(equivalent) = shape.published_equivalent() else {
         return shape;
     };
-    let Ok(view) = reads.capture_view().await else {
+    let Ok(view) = reads.capture_ephemeral_view().await else {
         return shape;
     };
     if Reads::view_chain_epoch(&view).visible_tip_height < end {
@@ -615,23 +627,29 @@ async fn first_chunk_view<Reads: CompactBlockReads>(
     end: BlockHeight,
     published_limit: Option<&BlockRangeStreamLimit>,
 ) -> Result<(Reads::View, Option<OwnedSemaphorePermit>), Status> {
-    let checked_view = async || {
-        let view = reads.capture_view().await?;
-        reject_future_block_height(end, Reads::view_chain_epoch(&view).visible_tip_height)?;
-        Ok::<_, Status>(view)
-    };
-    let view = checked_view().await?;
     let Some(limit) = published_limit else {
-        return Ok((view, None));
+        return Ok((checked_first_view(reads, end).await?, None));
     };
-    if let Some(permit) = limit.try_published_read_permit() {
-        return Ok((view, Some(permit)));
-    }
+    // A request that waits for a permit holds no view, so an unadmitted
+    // request never keeps a generation readable for pins. Its tip check is
+    // ephemeral, and the observed capture happens once the permit is held.
+    let tip_view = reads.capture_ephemeral_view().await?;
+    reject_future_block_height(end, Reads::view_chain_epoch(&tip_view).visible_tip_height)?;
+    drop(tip_view);
+    let permit = match limit.try_published_read_permit() {
+        Some(permit) => permit,
+        None => limit.published_read_permit().await?,
+    };
+    Ok((checked_first_view(reads, end).await?, Some(permit)))
+}
 
-    // A queued read must not pin a generation. Recheck the tip after admission.
-    drop(view);
-    let permit = limit.published_read_permit().await?;
-    Ok((checked_view().await?, Some(permit)))
+async fn checked_first_view<Reads: CompactBlockReads>(
+    reads: &Reads,
+    end: BlockHeight,
+) -> Result<Reads::View, Status> {
+    let view = reads.capture_view().await?;
+    reject_future_block_height(end, Reads::view_chain_epoch(&view).visible_tip_height)?;
+    Ok(view)
 }
 
 async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
@@ -1334,6 +1352,7 @@ mod tests {
     struct ScriptedViews {
         views: Arc<parking_lot::Mutex<std::collections::VecDeque<Arc<ScriptedView>>>>,
         captures: Arc<AtomicUsize>,
+        ephemeral_captures: Arc<AtomicUsize>,
     }
 
     impl ScriptedViews {
@@ -1360,11 +1379,28 @@ mod tests {
             Self {
                 views: Arc::new(parking_lot::Mutex::new(views)),
                 captures: Arc::new(AtomicUsize::new(0)),
+                ephemeral_captures: Arc::new(AtomicUsize::new(0)),
             }
         }
 
+        /// The views captured as observed, which a serving pair retains.
         fn captures(&self) -> usize {
             self.captures.load(Ordering::SeqCst)
+        }
+
+        /// The views captured by probes, which retain nothing.
+        fn ephemeral_captures(&self) -> usize {
+            self.ephemeral_captures.load(Ordering::SeqCst)
+        }
+
+        fn next_view(&self) -> Result<Arc<ScriptedView>, Status> {
+            let mut views = self.views.lock();
+            let view = if views.len() > 1 {
+                views.pop_front()
+            } else {
+                views.front().cloned()
+            };
+            view.ok_or_else(|| Status::unavailable("no scripted view"))
         }
     }
 
@@ -1373,13 +1409,14 @@ mod tests {
 
         fn capture_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send {
             self.captures.fetch_add(1, Ordering::SeqCst);
-            let mut views = self.views.lock();
-            let view = if views.len() > 1 {
-                views.pop_front()
-            } else {
-                views.front().cloned()
-            };
-            std::future::ready(view.ok_or_else(|| Status::unavailable("no scripted view")))
+            std::future::ready(self.next_view())
+        }
+
+        fn capture_ephemeral_view(
+            &self,
+        ) -> impl Future<Output = Result<Self::View, Status>> + Send {
+            self.ephemeral_captures.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(self.next_view())
         }
 
         fn view_chain_epoch(view: &Self::View) -> ChainEpoch {
@@ -1470,7 +1507,37 @@ mod tests {
             resolve_published_shape(&successive, explicit, end).await,
             explicit
         );
-        assert_eq!(successive.captures(), 1);
+        assert_eq!(successive.ephemeral_captures(), 1);
+        assert_eq!(successive.captures(), 0, "the probe observed a view");
+        Ok(())
+    }
+
+    /// A request that waits for a published-read permit holds no observed
+    /// view while it waits, and captures one only once it is admitted.
+    #[tokio::test]
+    async fn a_queued_first_chunk_captures_an_observed_view_only_once_admitted()
+    -> Result<(), Status> {
+        let one_stream = NonZeroU32::new(1).ok_or_else(|| Status::internal("zero streams"))?;
+        let limit = crate::block_range::BlockRangeStreamLimit::new(one_stream);
+        let mut held: Vec<_> = std::iter::from_fn(|| limit.try_published_read_permit()).collect();
+        let reads =
+            ScriptedViews::new([(700, NetworkUpgradeActivations::empty(Network::ZcashRegtest))]);
+        let waiting = tokio::spawn({
+            let (reads, limit) = (reads.clone(), limit.clone());
+            async move { super::first_chunk_view(&reads, BlockHeight::new(10), Some(&limit)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "the request did not queue");
+        assert_eq!(reads.ephemeral_captures(), 1);
+        assert_eq!(reads.captures(), 0, "a queued request observed a view");
+
+        drop(held.pop());
+        let (_view, permit) = waiting
+            .await
+            .map_err(|error| Status::internal(error.to_string()))??;
+        assert!(permit.is_some());
+        assert_eq!(reads.captures(), 1);
+        drop(held);
         Ok(())
     }
 

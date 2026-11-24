@@ -165,10 +165,13 @@ impl<Reads: CompactBlockReads> TailSource for ReadsTailSource<'_, Reads> {
     }
 
     async fn is_current(&self) -> bool {
-        self.reads.capture_view().await.is_ok_and(|current| {
-            Reads::view_chain_epoch(&current) == Reads::view_chain_epoch(self.view)
-                && self.reads_same_source(&current)
-        })
+        self.reads
+            .capture_ephemeral_view()
+            .await
+            .is_ok_and(|current| {
+                Reads::view_chain_epoch(&current) == Reads::view_chain_epoch(self.view)
+                    && self.reads_same_source(&current)
+            })
     }
 
     async fn read_rows(

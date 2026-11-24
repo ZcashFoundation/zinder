@@ -35,6 +35,33 @@ impl ColdTransactionSource {
         }
     }
 
+    /// Verifies the node against the served tip of `reader`, so a caller
+    /// that consults live state after a canonical miss knows the node follows
+    /// the served chain.
+    pub(crate) async fn verify_served_tip(
+        &self,
+        reader: &dyn CanonicalReader,
+    ) -> Result<(), QueryError> {
+        let _slot = self.acquire_slot()?;
+        self.verify_target(reader).await
+    }
+
+    fn acquire_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, QueryError> {
+        self.slots.try_acquire().map_err(|_| {
+            QueryError::Node(SourceError::NodeUnavailable {
+                reason: "cold transaction fetch slots are full; retry with backoff".to_owned(),
+            })
+        })
+    }
+
+    async fn verify_target(&self, reader: &dyn CanonicalReader) -> Result<(), QueryError> {
+        let target = VerificationTarget::from_canonical(reader).map_err(QueryError::Node)?;
+        self.verification
+            .verify(&self.node, &target)
+            .await
+            .map_err(QueryError::Node)
+    }
+
     pub(crate) async fn fetch(
         &self,
         reader: &dyn CanonicalReader,
@@ -47,16 +74,8 @@ impl ColdTransactionSource {
             return Ok(bytes.to_vec());
         }
 
-        let _slot = self.slots.try_acquire().map_err(|_| {
-            QueryError::Node(SourceError::NodeUnavailable {
-                reason: "cold transaction fetch slots are full; retry with backoff".to_owned(),
-            })
-        })?;
-        let target = VerificationTarget::from_canonical(reader).map_err(QueryError::Node)?;
-        self.verification
-            .verify(&self.node, &target)
-            .await
-            .map_err(QueryError::Node)?;
+        let _slot = self.acquire_slot()?;
+        self.verify_target(reader).await?;
         let (block, bytes) = self
             .node
             .fetch_mined_transaction_bytes(location.transaction_id)
