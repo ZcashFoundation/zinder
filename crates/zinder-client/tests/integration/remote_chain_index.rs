@@ -716,7 +716,7 @@ async fn reorg_revision_probe_is_lazy_and_failures_end_the_stream() -> eyre::Res
     assert!(stream.next().await.is_none());
 
     let mut modern = chain_events_at_revision(
-        WalletRevision::Reported(10),
+        WalletRevision::Reported(zinder_proto::CONTRACT_REVISION),
         EventStreamStart::EarliestRetained,
         vec![reorg_event(2, 1, 4)?, reorg_event(3, 2, 3)?],
     )

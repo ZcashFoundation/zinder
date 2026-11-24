@@ -110,7 +110,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Oldest native wallet contract revision this client can safely consume.
-pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 1;
+pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 8;
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
@@ -3075,13 +3075,16 @@ mod tests {
     }
 
     #[test]
-    fn contract_revision_one_is_the_minimum() {
-        assert!(matches!(
-            ensure_supported_contract_revision(0),
-            Err(IndexerError::FailedPrecondition { .. })
-        ));
-        assert!(ensure_supported_contract_revision(1).is_ok());
-        assert!(ensure_supported_contract_revision(2).is_ok());
+    fn contract_revision_eight_is_the_minimum() {
+        for revision in 0..8 {
+            assert!(matches!(
+                ensure_supported_contract_revision(revision),
+                Err(IndexerError::FailedPrecondition { .. })
+            ));
+        }
+        for revision in [8, 9, zinder_proto::CONTRACT_REVISION] {
+            assert!(ensure_supported_contract_revision(revision).is_ok());
+        }
     }
 
     #[test]

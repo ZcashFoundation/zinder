@@ -6725,7 +6725,6 @@ dependencies = [
  "hex",
  "thiserror 2.0.21",
  "zinder-core",
- "zinder-store",
 ]
 
 [[package]]

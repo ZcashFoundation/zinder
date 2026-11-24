@@ -15,7 +15,6 @@ publish.workspace = true
 blake2b_simd.workspace = true
 thiserror.workspace = true
 zinder-core.workspace = true
-zinder-store.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

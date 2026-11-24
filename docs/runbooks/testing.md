@@ -768,11 +768,14 @@ live mempool composition.
 
 Run the canonical-store tests after changing construction, admission, or
 persisted rows. The control-record tests check exact schema v1 bytes for
-every workload and retention policy. The publication crash tests check
-that the initial schedule and READY control survive together.
+every workload and retention policy. The store-open tests check that admission
+refuses unsupported schema markers without rewriting store control. The
+publication crash tests check that the initial schedule and READY control
+survive together. The wallet adapter integration tests check that the wallet
+projection requires the schema the canonical store publishes.
 
 ```bash
-cargo nextest run --profile=ci -p zinder-store
+cargo nextest run --profile=ci -p zinder-store -p zinder-wallet-rocksdb
 ```
 
 ### Reorg sweep

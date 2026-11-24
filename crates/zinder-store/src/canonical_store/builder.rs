@@ -1691,7 +1691,7 @@ mod tests {
         let manifest_path = store_path.join("canonical-construction-manifest.v1.json");
         std::fs::remove_file(&manifest_path)?;
         std::fs::write(
-            store_path.join("canonical-construction-manifest.v1.json"),
+            store_path.join("canonical-construction-manifest.v4.json"),
             b"{}",
         )?;
         let activations =

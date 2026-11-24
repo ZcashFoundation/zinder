@@ -43,8 +43,7 @@ pub const WALLET_PROJECTION_VALUE_ENCODING_VERSION: u16 = 1;
 pub const WALLET_PROJECTION_BUILD_LEASE_VERSION: u16 = 1;
 
 /// Canonical store schema admitted by this projection schema.
-pub const REQUIRED_CANONICAL_STORE_SCHEMA_VERSION: u16 =
-    zinder_store::CANONICAL_STORE_SCHEMA_VERSION;
+pub const REQUIRED_CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
 
 /// Canonical replay format admitted by this projection schema.
 pub const REQUIRED_CANONICAL_REPLAY_FORMAT_VERSION: u32 = 1;
