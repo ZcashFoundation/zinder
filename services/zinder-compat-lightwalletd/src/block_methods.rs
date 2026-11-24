@@ -484,8 +484,8 @@ impl BlockMethods {
     /// [`BlockRangeContinuity`].
     ///
     /// The stream holds a slot of the block-range limit from admission until
-    /// the response is dropped and no chunk read of the stream runs, even
-    /// when the client cancels the call.
+    /// the stream ends, fails, or the response is dropped, and no chunk read
+    /// of the stream runs, even when the client cancels the call.
     pub(crate) async fn block_range<Reads: CompactBlockReads>(
         &self,
         reads: &Reads,
