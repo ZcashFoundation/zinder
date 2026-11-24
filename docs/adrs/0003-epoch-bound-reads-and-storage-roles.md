@@ -59,6 +59,7 @@ A separate canonical writer can initialize from a publisher checkpoint after pri
 ## Revision history
 
 - 2026-11-24. Decision 7 binds lean wallet byte retrieval to indexed transaction evidence.
+- 2026-11-24. Linked ADR-0024 for initializing an independent writer from a verified snapshot.
 
 - 2026-11-24. Decision 4 makes secondary storage requirements explicit.
 

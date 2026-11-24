@@ -85,6 +85,8 @@ Regional RocksDB instances can initialize independent single-host writers from v
 
 ## Revision history
 
+- 2026-11-24. Linked ADR-0024 for bootstrapping an independent single-host RocksDB deployment.
+
 - 2026-11-20. Specified private, same-schema restore into an inactive RocksDB deployment and the identity retained by its cursors.
 
 - 2026-11-20. Decision 6 assigns optional gRPC-Web translation to the compatibility reader across storage topologies. TLS, client limits, and balancing remain at the deployment edge.

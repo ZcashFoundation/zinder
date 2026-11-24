@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Write},
     num::NonZeroU32,
     path::{Path, PathBuf},
     time::Duration,
@@ -16,8 +16,9 @@ use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreWorkload, RocksDbCanonicalStore,
     edge_snapshot::{
         DEFAULT_SPOT_CHECK_BLOCKS, EdgeSnapshotAttestation, EdgeSnapshotBootstrap,
-        EdgeSnapshotError, EdgeSnapshotManifest, EdgeSnapshotStoreConfig, MANIFEST_FILE,
-        MAX_MANIFEST_BYTES, SIGNATURE_FILE, export_edge_snapshot, prepare_bootstrapped_store,
+        EdgeSnapshotDestination, EdgeSnapshotError, EdgeSnapshotManifest, EdgeSnapshotStoreConfig,
+        MANIFEST_FILE, MAX_MANIFEST_BYTES, SIGNATURE_FILE, export_edge_snapshot,
+        prepare_bootstrapped_store,
     },
 };
 
@@ -122,40 +123,22 @@ pub(crate) async fn run(
                 policy,
                 store_config.resource_budget,
             )?;
-            let mut key = Vec::new();
-            File::open(args.signing_key)?
-                .take(1025)
-                .read_to_end(&mut key)?;
-            if key.len() > 1024 {
-                return Err(SnapshotCommandError::Refused(
-                    "signing key exceeds the size limit",
-                ));
-            }
             export_edge_snapshot(
                 &mut store,
                 &args.output_dir,
-                &key,
+                &args.signing_key,
                 args.include_sealed_history.as_deref(),
             )?;
         }
         SnapshotCommand::BootstrapFromSnapshot(args) => {
-            let download = if args.source.starts_with("http://")
-                || args.source.starts_with("https://")
-            {
-                Some(download_bundle(&args.source, &runtime.storage_path, &args.public_key).await?)
-            } else {
-                None
-            };
-            let source = download
-                .as_ref()
-                .map_or_else(|| Path::new(&args.source), |download| &download.0);
+            let (destination, source) =
+                prepare_source(&args, &runtime.storage_path, &store_config).await?;
             prepare_bootstrapped_store(
+                destination,
                 EdgeSnapshotBootstrap {
-                    source,
-                    target: &runtime.storage_path,
+                    source: &source,
                     trusted_keys: &args.public_key,
                     spot_check_blocks: args.spot_check_blocks,
-                    sealed_history_output: args.sealed_history_output.as_deref(),
                 },
                 store_config,
                 |evidence| attest(&validator, &activations, policy, evidence),
@@ -272,22 +255,29 @@ async fn require_block(
     Ok(decoded)
 }
 
-struct Download(PathBuf);
-
-impl Drop for Download {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_dir_all(&self.0) {
-            tracing::warn!(%error, "failed to remove snapshot download directory");
-        }
-    }
+async fn prepare_source(
+    args: &BootstrapArgs,
+    target: &Path,
+    config: &EdgeSnapshotStoreConfig<'_>,
+) -> Result<(EdgeSnapshotDestination, PathBuf), SnapshotCommandError> {
+    let remote = args.source.starts_with("http://") || args.source.starts_with("https://");
+    let destination =
+        EdgeSnapshotDestination::reserve(target, args.sealed_history_output.as_deref(), remote)?;
+    let source = if let Some(directory) = destination.download_path() {
+        download_bundle(&args.source, directory, &args.public_key, config).await?;
+        directory.to_path_buf()
+    } else {
+        PathBuf::from(&args.source)
+    };
+    Ok((destination, source))
 }
 
 async fn download_bundle(
     source: &str,
-    target: &Path,
+    directory: &Path,
     keys: &[[u8; 32]],
-) -> Result<Download, SnapshotCommandError> {
-    use std::os::unix::fs::DirBuilderExt;
+    config: &EdgeSnapshotStoreConfig<'_>,
+) -> Result<(), SnapshotCommandError> {
     let mut base = Url::parse(source)
         .map_err(|_| SnapshotCommandError::Refused("invalid snapshot base URL"))?;
     if !base.username().is_empty()
@@ -304,32 +294,28 @@ async fn download_bundle(
             .map_err(|()| SnapshotCommandError::Refused("invalid snapshot base URL"))?
             .push("");
     }
-    let mut name = target.as_os_str().to_os_string();
-    name.push(".bootstrap.download");
-    let directory = PathBuf::from(name);
-    fs::DirBuilder::new().mode(0o700).create(&directory)?;
-    let download = Download(directory);
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .read_timeout(Duration::from_secs(60))
         .connect_timeout(Duration::from_secs(20))
         .build()?;
     for (path, limit) in [(MANIFEST_FILE, MAX_MANIFEST_BYTES), (SIGNATURE_FILE, 64)] {
-        download_file(&client, &base, &download.0, path, limit).await?;
+        download_file(&client, &base, directory, path, limit).await?;
     }
     let manifest = EdgeSnapshotManifest::verify(
-        &fs::read(download.0.join(MANIFEST_FILE))?,
-        &fs::read(download.0.join(SIGNATURE_FILE))?,
+        &fs::read(directory.join(MANIFEST_FILE))?,
+        &fs::read(directory.join(SIGNATURE_FILE))?,
         keys,
     )?;
+    manifest.validate_store_config(config)?;
     for (path, bytes, digest) in manifest.files() {
-        if download_file(&client, &base, &download.0, path, bytes).await? != (bytes, digest) {
+        if download_file(&client, &base, directory, path, bytes).await? != (bytes, digest) {
             return Err(SnapshotCommandError::Refused(
                 "HTTP snapshot file differs from the signed inventory",
             ));
         }
     }
-    Ok(download)
+    Ok(())
 }
 
 async fn download_file(

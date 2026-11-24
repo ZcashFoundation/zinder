@@ -22,7 +22,7 @@ that boundary. The publisher keeps its own store and credentials.
 
 - `manifest.v1.json`, a UTF-8 JSON object with `format`, `anchors`, and `files`.
   Anchors carry the canonical schema version, network ID, genesis hash,
-  v1 activation-table fingerprint,
+  v1 activation-table fingerprint, canonical workload, raw blob retention,
   reorg window, first retained block and snapshot block identities, and three
   tree entries in Sapling, Orchard, and Ironwood order. Each active tree entry
   records its size, final root, and terminal completed subtree, if any. A
@@ -40,15 +40,21 @@ that boundary. The publisher keeps its own store and credentials.
   and compacts the affected families before checkpointing the export.
 - Optional opaque files beneath `sealed-history/`. The signature attests
   their paths, lengths, and digests. The compatibility runtime retains
-  responsibility for admitting their format and chain linkage.
+  responsibility for admitting their format and chain linkage. Export refuses
+  a history source that overlaps the bundle or its staging directory. It also
+  refuses the signing key itself and hard links to that key.
 
 Each file record gives a slash-separated relative path, byte length, and
 SHA-256 digest. The receiver refuses unknown fields, duplicate or conflicting
 paths, traversal, symlinks, unexpected checkpoint names, and missing or
-unlisted local files. HTTP(S) retrieves only the signed inventory. The
-receiver verifies every listed file while streaming its bytes to disk. An
-HTTP transfer needs space for the download and the private staged copy. Each
-request retrieves one complete file. HTTP transport can use HTTPS for confidentiality and endpoint authentication.
+unlisted local entries. It authenticates the manifest before walking local
+entries and accepts at most 65,536 files and directories per bundle, including
+the manifest and signature. An HTTP(S) source receives requests for the
+manifest and signature first. The receiver checks the signed store
+configuration before requesting any payload files and verifies each file's
+length and digest while streaming it to disk. An HTTP transfer retrieves
+complete files and needs space for both the download and the private staged
+copy.
 
 After cold admission, the receiver compares the signed anchors with evidence
 read back from the store. The configured `NodeSource` must also attest:
@@ -75,8 +81,11 @@ for the accuracy of historical rows outside those checks.
 ## Publication and recovery
 
 Bootstrap prepares the store beneath `<target>.bootstrap.staging`, with the
-stage accessible only to the current operator. It refuses an occupied target.
-Before publication it clears inherited projection build leases and mempool
+stage accessible only to the current operator. The canonical and optional
+sealed-history destinations must be absent or empty, even when the bundle
+contains no sealed history. Their resolved paths must be separate from one
+another and from the private workspaces. Bootstrap reserves the workspaces
+before starting an HTTP transfer. Before publication it clears inherited projection build leases and mempool
 events, generates a fresh `cursor_auth_key` using the OS CSPRNG, and runs
 normal READY admission on the resulting store. The receiver syncs files and
 directories, publishes the canonical directory by atomic no-replace rename,

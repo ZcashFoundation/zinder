@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use tokio::{
@@ -220,27 +226,38 @@ async fn local_and_http_snapshot_bootstrap_can_append() -> TestResult {
     let root = tempfile::tempdir()?;
     let validator = Validator::fixture()?;
     let (bundle, keys) = signed_bundle(root.path(), &validator)?;
-    let (url, server) = serve_bundle(bundle.clone()).await?;
-    let http = download_bundle(&url, &root.path().join("http"), &keys).await?;
-    server.abort();
-    for (name, source) in [("local", &bundle), ("http", &http.0)] {
-        let target = root.path().join(name);
+    let (url, _, server) = serve_bundle(bundle.clone()).await?;
+    for (name, source) in [
+        ("local", bundle.to_string_lossy().into_owned()),
+        ("http", url),
+    ] {
+        let target = root.path().join(name).join("");
+        assert!(target.as_os_str().as_encoded_bytes().ends_with(b"/"));
         let config = validator.config()?;
+        let args = bootstrap_args(source, keys);
+        let (destination, source) = prepare_source(&args, &target, &config).await?;
+        if name == "http" {
+            assert_eq!(
+                destination.download_path(),
+                Some(root.path().join("http.bootstrap.download").as_path())
+            );
+        }
         let policy = config.reorg_policy;
         prepare_bootstrapped_store(
+            destination,
             EdgeSnapshotBootstrap {
-                source,
-                target: &target,
+                source: &source,
                 trusted_keys: &keys,
                 spot_check_blocks: NonZeroU32::MIN,
-                sealed_history_output: None,
             },
             config,
             |evidence| attest(&validator, &validator.activations, policy, evidence),
         )
         .await?;
         assert_append_restored(&validator, &target)?;
+        assert!(!root.path().join("http.bootstrap.download").exists());
     }
+    server.abort();
     Ok(())
 }
 
@@ -255,7 +272,9 @@ fn signed_bundle(root: &Path, validator: &Validator) -> TestResult<(PathBuf, [[u
         .map_err(|_| "key parsing failed")?;
     let keys = [signer.public_key().as_ref().try_into()?];
     let bundle = root.join("bundle");
-    export_edge_snapshot(&mut canonical, &bundle, &signing_key, None)?;
+    let key_file = root.join("signing-key.der");
+    fs::write(&key_file, signing_key)?;
+    export_edge_snapshot(&mut canonical, &bundle, &key_file, None)?;
     Ok((bundle, keys))
 }
 
@@ -284,11 +303,17 @@ fn assert_append_restored(validator: &Validator, target: &Path) -> TestResult {
     Ok(())
 }
 
-async fn serve_bundle(
-    bundle: PathBuf,
-) -> TestResult<(String, tokio::task::JoinHandle<io::Result<()>>)> {
+type BundleServer = (
+    String,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<io::Result<()>>,
+);
+
+async fn serve_bundle(bundle: PathBuf) -> TestResult<BundleServer> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}/bundle", listener.local_addr()?);
+    let payload_requests = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&payload_requests);
     let server = tokio::spawn(async move {
         loop {
             let (socket, _) = listener.accept().await?;
@@ -300,6 +325,9 @@ async fn serve_bundle(
                 .nth(1)
                 .and_then(|path| path.strip_prefix("/bundle/"))
                 .ok_or_else(|| io::Error::other("unexpected fixture request"))?;
+            if !matches!(path, MANIFEST_FILE | SIGNATURE_FILE) {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
             let bytes = fs::read(bundle.join(path))?;
             loop {
                 let mut header = String::new();
@@ -321,7 +349,77 @@ async fn serve_bundle(
             socket.shutdown().await?;
         }
     });
-    Ok((url, server))
+    Ok((url, payload_requests, server))
+}
+
+fn bootstrap_args(source: String, keys: [[u8; 32]; 1]) -> BootstrapArgs {
+    BootstrapArgs {
+        source,
+        public_key: keys.to_vec(),
+        spot_check_blocks: NonZeroU32::MIN,
+        sealed_history_output: None,
+    }
+}
+
+#[tokio::test]
+async fn http_preflight_refusals_fetch_no_payload() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let validator = Validator::fixture()?;
+    let config = validator.config()?;
+    let (bundle, keys) = signed_bundle(root.path(), &validator)?;
+    let (url, requests, server) = serve_bundle(bundle).await?;
+    let mut args = bootstrap_args(url, keys);
+    let occupied = root.path().join("occupied");
+    fs::create_dir(&occupied)?;
+    fs::write(occupied.join("marker"), b"preserve")?;
+    let failure = prepare_source(&args, &occupied, &config).await;
+    assert!(
+        matches!(failure, Err(SnapshotCommandError::Snapshot(EdgeSnapshotError::Refused(reason))) if reason.contains("occupied"))
+    );
+
+    let target = root.path().join("restored");
+    args.sealed_history_output = Some(occupied);
+    let failure = prepare_source(&args, &target, &config).await;
+    assert!(
+        matches!(failure, Err(SnapshotCommandError::Snapshot(EdgeSnapshotError::Refused(reason))) if reason.contains("occupied"))
+    );
+
+    args.sealed_history_output = None;
+    let other_network = NetworkUpgradeActivations::new(Network::ZcashTestnet, Vec::new())?;
+    let other_schedule = NetworkUpgradeActivations::new(config.activations.network(), Vec::new())?;
+    for incompatible in [
+        EdgeSnapshotStoreConfig {
+            activations: &other_network,
+            ..config
+        },
+        EdgeSnapshotStoreConfig {
+            activations: &other_schedule,
+            ..config
+        },
+        EdgeSnapshotStoreConfig {
+            workload: CanonicalStoreWorkload::Explorer,
+            ..config
+        },
+        EdgeSnapshotStoreConfig {
+            raw_blob_retention: RawBlobRetention::Transactions,
+            ..config
+        },
+        EdgeSnapshotStoreConfig {
+            reorg_policy: CanonicalReorgPolicy::new(2)?,
+            ..config
+        },
+    ] {
+        let failure = prepare_source(&args, &target, &incompatible).await;
+        assert!(
+            matches!(failure, Err(SnapshotCommandError::Snapshot(EdgeSnapshotError::Refused(reason))) if reason.contains("store identity"))
+        );
+    }
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
+    assert!(!target.exists());
+    assert!(!root.path().join("restored.bootstrap.download").exists());
+    assert!(!root.path().join("restored.bootstrap.staging").exists());
+    server.abort();
+    Ok(())
 }
 
 #[tokio::test]
@@ -339,12 +437,11 @@ async fn validator_refuses_each_mismatched_anchor_before_publication() -> TestRe
         let policy = config.reorg_policy;
         let activations = &publisher.activations;
         let failure = prepare_bootstrapped_store(
+            EdgeSnapshotDestination::reserve(&target, None, false)?,
             EdgeSnapshotBootstrap {
                 source: &bundle,
-                target: &target,
                 trusted_keys: &keys,
                 spot_check_blocks: NonZeroU32::MIN,
-                sealed_history_output: None,
             },
             config,
             |mut evidence| async move {

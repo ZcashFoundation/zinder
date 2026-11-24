@@ -52,5 +52,7 @@ Verified snapshot bootstrap uses the configured `NodeSource` to attest the chain
 
 ## Revision history
 
+- 2026-11-24. Linked ADR-0024 for validator attestation before snapshot publication.
+
 - 2026-11-23. Decision 5 adds the light-wallet composition's node-backed reads to the reasons a reader calls the node.
 - 2026-11-23. Evidence records what decision 5 rests on.

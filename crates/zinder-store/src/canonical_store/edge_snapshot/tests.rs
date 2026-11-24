@@ -12,11 +12,7 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
     let root = tempfile::tempdir()?;
     let (_source_directory, mut source) = admitted_source()?;
     let old_key = source.cursor_auth_key;
-    let event = MempoolEvent::Invalidated {
-        transaction_id: TransactionId::from_bytes([17; 32]),
-        reason: MempoolEvictionReason::Conflict,
-    };
-    source.append_mempool_event(event, UnixTimestampMillis::new(1))?;
+    seed_mempool(&source)?;
     let signing_key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
         .map_err(|_| "key generation failed")?;
     let publisher =
@@ -26,10 +22,12 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
     let sealed = root.path().join("opaque");
     fs::create_dir(&sealed)?;
     fs::write(sealed.join("segment"), b"opaque history")?;
-    export_edge_snapshot(&mut source, &bundle, signing_key.as_ref(), Some(&sealed))?;
+    let key_file = root.path().join("signer.der");
+    fs::write(&key_file, signing_key.as_ref())?;
+    export_edge_snapshot(&mut source, &bundle, &key_file, Some(&sealed))?;
     assert_eq!(old_key, source.cursor_auth_key);
     let history = MempoolEventHistoryRequest::with_default_limit(None);
-    assert_eq!(source.mempool_event_history(history)?.len(), 1);
+    assert_eq!(source.mempool_event_history(history)?.len(), 3);
     let activations = source
         .network_upgrade_activations()
         .ok_or("missing schedule")?
@@ -45,13 +43,12 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
     let sealed_output = root.path().join("sealed");
     let run = || EdgeSnapshotBootstrap {
         source: &bundle,
-        target: &target,
         trusted_keys: &keys,
         spot_check_blocks: DEFAULT_SPOT_CHECK_BLOCKS,
-        sealed_history_output: Some(&sealed_output),
     };
+    let reserve = || EdgeSnapshotDestination::reserve(&target, Some(&sealed_output), false);
     assert!(
-        prepare_bootstrapped_store(run(), config(), |_| async {
+        prepare_bootstrapped_store(reserve()?, run(), config(), |_| async {
             Err(refused("validator mismatch"))
         })
         .await
@@ -63,13 +60,13 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
     check_corrupt_files(&bundle, || {
         let stage = root.path().join("probe");
         create_private_dir(&stage)?;
-        let staged = stage_files(&run(), &stage);
+        let staged = stage_files(&run(), &stage, &config());
         fs::remove_dir_all(stage)?;
         assert!(staged.is_err());
         Ok(())
     })?;
 
-    prepare_bootstrapped_store(run(), config(), |evidence| async move {
+    prepare_bootstrapped_store(reserve()?, run(), config(), |evidence| async move {
         assert_eq!(evidence.checkpoint.block_id.height, BlockHeight::new(4096));
         assert!((32..=33).contains(&evidence.blocks.len()));
         assert!(
@@ -86,7 +83,19 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
     assert_eq!(restored.mempool_event_history(history)?, []);
     assert_eq!(restored.ready_evidence(), source.ready_evidence());
     assert_eq!(fs::read(sealed_output.join("segment"))?, b"opaque history");
-    assert!(Workspace::new(&target, ".bootstrap.staging").is_err());
+    assert!(reserve().is_err());
+    assert!(!root.path().join("sealed.bootstrap.staging").exists());
+    Ok(())
+}
+
+fn seed_mempool(source: &RocksDbCanonicalStore) -> TestResult {
+    for (sequence, seed) in [(1, 17), (2, 18), (3, 19)] {
+        let event = MempoolEvent::Invalidated {
+            transaction_id: TransactionId::from_bytes([seed; 32]),
+            reason: MempoolEvictionReason::Conflict,
+        };
+        source.append_mempool_event(event, UnixTimestampMillis::new(sequence))?;
+    }
     Ok(())
 }
 
@@ -134,6 +143,10 @@ fn check_corrupt_files(bundle: &Path, mut check: impl FnMut() -> TestResult) -> 
     fs::write(bundle.join("unexpected"), b"extra")?;
     check()?;
     fs::remove_file(bundle.join("unexpected"))?;
+    fs::create_dir(bundle.join("unsigned-directory"))?;
+    fs::write(bundle.join("unsigned-directory").join("unsigned"), b"extra")?;
+    check()?;
+    fs::remove_dir_all(bundle.join("unsigned-directory"))?;
     std::os::unix::fs::symlink(&sst, bundle.join("symlink"))?;
     check()?;
     fs::remove_file(bundle.join("symlink"))?;
@@ -155,6 +168,8 @@ fn signature_and_paths_are_strict() -> TestResult {
             network_id: Network::ZcashRegtest.id(),
             genesis_hash: Network::ZcashRegtest.genesis_hash().as_bytes(),
             activation_fingerprint: [0; 32],
+            workload: CanonicalStoreWorkload::Wallet,
+            raw_blob_retention: RawBlobRetention::None,
             reorg_window_blocks: 2,
             history_floor: block(),
             snapshot: block(),
@@ -197,5 +212,65 @@ fn signature_and_paths_are_strict() -> TestResult {
         assert!(EdgeSnapshotManifest::verify(&bytes, signature.as_ref(), &[key]).is_err());
         manifest.files.pop();
     }
+    Ok(())
+}
+
+#[test]
+fn export_refuses_signing_key_alias_and_nested_output_before_staging() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let (_source_directory, mut source) = admitted_source()?;
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| "key generation failed")?;
+    let history = root.path().join("history");
+    fs::create_dir(&history)?;
+    let key_path = root.path().join("key.der");
+    fs::write(&key_path, key.as_ref())?;
+    let alias = history.join("key-alias");
+    fs::hard_link(&key_path, &alias)?;
+    let bundle = root.path().join("bundle");
+    for path in [&key_path, &alias] {
+        let failure = export_edge_snapshot(&mut source, &bundle, path, Some(&history));
+        assert!(
+            matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("signing key"))
+        );
+        assert!(!bundle.exists());
+        assert!(!root.path().join("bundle.export.staging").exists());
+    }
+    fs::remove_file(alias)?;
+    let nested = history.join("snapshot");
+    let failure = export_edge_snapshot(&mut source, &nested, &key_path, Some(&history));
+    assert!(
+        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("overlap"))
+    );
+    assert!(!nested.exists());
+    assert!(!history.join("snapshot.export.staging").exists());
+    Ok(())
+}
+
+#[test]
+fn reservation_refuses_workspace_overlap_and_occupied_sidecar() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let target = root.path().join("canonical");
+    let staging = root.path().join("canonical.bootstrap.staging");
+    let download = root.path().join("canonical.bootstrap.download");
+    let occupied = root.path().join("occupied");
+    fs::create_dir(&occupied)?;
+    fs::write(occupied.join("segment"), b"preserved")?;
+    fs::create_dir(&staging)?;
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&staging, &alias)?;
+    for sidecar in [
+        staging.join("sidecar"),
+        alias.join("sidecar"),
+        download.clone(),
+        occupied.clone(),
+    ] {
+        let failure = EdgeSnapshotDestination::reserve(&target, Some(&sidecar), true);
+        assert!(matches!(failure, Err(EdgeSnapshotError::Refused(_))));
+        assert!(!target.exists());
+        assert!(!download.exists());
+    }
+    assert_eq!(fs::read(occupied.join("segment"))?, b"preserved");
+    assert_eq!(fs::read_dir(&staging)?.count(), 0);
     Ok(())
 }

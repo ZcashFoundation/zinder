@@ -6,7 +6,7 @@ use std::{
     future::Future,
     io::{self, Read, Write},
     num::NonZeroU32,
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zinder_core::{
     BlockHeight, BlockId, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
-    NetworkUpgradeActivations, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootIndex, SubtreeRootRange, TransactionId,
+    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprintVersion, SUBTREE_LEAF_COUNT,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionId,
 };
 
 use crate::RocksDbResourceBudget;
@@ -44,6 +44,7 @@ pub const DEFAULT_SPOT_CHECK_BLOCKS: NonZeroU32 = NonZeroU32::MIN.saturating_add
 
 const FORMAT: &str = "zinder-edge-snapshot.v1";
 const SIGNATURE_DOMAIN: &[u8] = b"zinder-edge-snapshot.v1\0";
+const MAX_SNAPSHOT_ENTRIES: usize = 65_536;
 const CANONICAL: &str = "canonical-rocksdb";
 const SEALED: &str = "sealed-history";
 const POOLS: [ShieldedProtocol; 3] = [
@@ -98,6 +99,8 @@ struct ManifestAnchors {
     network_id: u32,
     genesis_hash: [u8; 32],
     activation_fingerprint: [u8; 32],
+    workload: CanonicalStoreWorkload,
+    raw_blob_retention: RawBlobRetention,
     reorg_window_blocks: u32,
     history_floor: ManifestBlock,
     snapshot: ManifestBlock,
@@ -170,11 +173,43 @@ impl EdgeSnapshotManifest {
             .map(|file| (file.path.as_str(), file.bytes, file.sha256))
     }
 
+    /// Refuses a signed snapshot whose store identity differs from the receiver's.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when the network, genesis, activation schedule, workload,
+    /// raw blob retention, or replacement depth differs.
+    pub fn validate_store_config(
+        &self,
+        config: &EdgeSnapshotStoreConfig<'_>,
+    ) -> Result<(), EdgeSnapshotError> {
+        let network = config.activations.network();
+        let fingerprint = config
+            .activations
+            .fingerprint(NetworkUpgradeActivationsFingerprintVersion::CURRENT);
+        let anchors = &self.anchors;
+        if anchors.network_id != network.id()
+            || anchors.genesis_hash != network.genesis_hash().as_bytes()
+            || anchors.activation_fingerprint != fingerprint.as_bytes()
+            || anchors.workload != config.workload
+            || anchors.raw_blob_retention != config.raw_blob_retention
+            || anchors.reorg_window_blocks != config.reorg_policy.reorg_window_blocks()
+        {
+            return Err(refused(
+                "signed snapshot store identity differs from the receiver configuration",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_inventory(&self) -> Result<(), EdgeSnapshotError> {
         if self.format != FORMAT
             || self.anchors.canonical_schema_version != CANONICAL_STORE_SCHEMA_VERSION
         {
             return Err(refused("unsupported snapshot format"));
+        }
+        if self.files.len() > MAX_SNAPSHOT_ENTRIES {
+            return Err(refused("snapshot inventory exceeds the entry limit"));
         }
         let mut paths = BTreeSet::new();
         for file in &self.files {
@@ -191,6 +226,10 @@ impl EdgeSnapshotManifest {
                 return Err(refused("unsafe, unexpected, or duplicate snapshot path"));
             }
         }
+        let directories = manifest_directories(paths.iter().copied());
+        if paths.len() + directories.len() + 2 > MAX_SNAPSHOT_ENTRIES {
+            return Err(refused("snapshot inventory exceeds the entry limit"));
+        }
         if !paths.contains("canonical-rocksdb/CURRENT")
             || !paths.contains(
                 format!("{CANONICAL}/{CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME}").as_str(),
@@ -198,14 +237,9 @@ impl EdgeSnapshotManifest {
             || !paths
                 .iter()
                 .any(|path| path.starts_with("canonical-rocksdb/MANIFEST-"))
-            || paths.iter().any(|path| {
-                path.rsplit_once('/').is_some_and(|(parent, _)| {
-                    std::iter::successors(Some(parent), |path| {
-                        path.rsplit_once('/').map(|(prefix, _)| prefix)
-                    })
-                    .any(|prefix| paths.contains(prefix))
-                })
-            })
+            || directories
+                .iter()
+                .any(|directory| paths.contains(directory))
         {
             return Err(refused("incomplete or conflicting snapshot inventory"));
         }
@@ -342,6 +376,8 @@ impl EdgeSnapshotAttestation {
             network_id: store.network().id(),
             genesis_hash: store.network().genesis_hash().as_bytes(),
             activation_fingerprint: schedule.activations_fingerprint().as_bytes(),
+            workload: store.workload(),
+            raw_blob_retention: store.raw_blob_retention(),
             reorg_window_blocks: store.reorg_policy().reorg_window_blocks(),
             history_floor: self.history_floor.into(),
             snapshot: self.checkpoint.block_id.into(),
@@ -473,8 +509,22 @@ fn reset_local_state(store: &RocksDbCanonicalStore) -> Result<(), EdgeSnapshotEr
     .map_err(|error| refused(error.to_string()))?;
     let mut changes = WriteBatch::default();
     let events = column_family(db, MEMPOOL_EVENT_COLUMN_FAMILY)?;
-    for row in db.iterator_cf(&events, IteratorMode::Start) {
-        changes.delete_cf(&events, row.map_err(db_error)?.0);
+    let first = db
+        .iterator_cf(&events, IteratorMode::Start)
+        .next()
+        .transpose()
+        .map_err(db_error)?;
+    if let Some((first, _)) = first {
+        let (last, _) = db
+            .iterator_cf(&events, IteratorMode::End)
+            .next()
+            .transpose()
+            .map_err(db_error)?
+            .ok_or_else(|| refused("mempool event range changed during sanitization"))?;
+        // Appending a zero byte places the exclusive end immediately after the last key.
+        let mut end = last.into_vec();
+        end.push(0);
+        changes.delete_range_cf(&events, first.as_ref(), end.as_slice());
     }
     changes.delete(MEMPOOL_EVENT_SEQUENCE_KEY);
     changes.delete(MEMPOOL_EVENT_RETENTION_FLOOR_KEY);
@@ -507,15 +557,23 @@ fn reset_local_state(store: &RocksDbCanonicalStore) -> Result<(), EdgeSnapshotEr
 pub fn export_edge_snapshot(
     store: &mut RocksDbCanonicalStore,
     output: &Path,
-    signing_key: &[u8],
+    signing_key: &Path,
     sealed_history: Option<&Path>,
 ) -> Result<(), EdgeSnapshotError> {
-    // PKCS#8 v1 carries only the seed. Ring derives its public key and
-    // checks the embedded public key when the publisher supplies v2.
-    let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(signing_key)
+    let output = resolve_destination(output)?;
+    let stage = sibling_path(&output, ".export.staging")?;
+    let signing_path = signing_key.canonicalize()?;
+    let key_file = open_regular(&signing_path)?;
+    let metadata = key_file.metadata()?;
+    let signing_identity = (metadata.dev(), metadata.ino());
+    let sealed = sealed_history
+        .map(|path| ExportHistory::inspect(path, &output, &stage, &signing_path, signing_identity))
+        .transpose()?;
+    // PKCS#8 v1 carries only the seed. Ring checks the embedded public key in v2.
+    let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&read_bounded(&key_file, 1024)?)
         .map_err(|_| refused("invalid Ed25519 PKCS#8 signing key"))?;
     let anchors = EdgeSnapshotAttestation::read(store)?.manifest_anchors(store)?;
-    let work = Workspace::new(output, ".export.staging")?;
+    let work = Workspace::create(stage)?;
     let working_copy = work.0.join("working-copy");
     store.create_owner_checkpoint_physical(&working_copy)?;
     let config = EdgeSnapshotStoreConfig {
@@ -550,19 +608,8 @@ pub fn export_edge_snapshot(
             sha256,
         });
     }
-    if let Some(sealed_history) = sealed_history {
-        for relative in inventory(sealed_history)?.into_keys() {
-            let input = open_snapshot_file(sealed_history, &relative)?;
-            let relative = format!("{SEALED}/{relative}");
-            let destination = clean_bundle.join(&relative);
-            fs::create_dir_all(parent(&destination))?;
-            let (bytes, sha256) = transfer_from(input, Some(&destination), None)?;
-            files.push(SnapshotFile {
-                path: relative,
-                bytes,
-                sha256,
-            });
-        }
+    if let Some(sealed) = sealed {
+        sealed.copy_to(&clean_bundle, &mut files)?;
     }
     let manifest = EdgeSnapshotManifest {
         format: FORMAT.to_owned(),
@@ -580,21 +627,143 @@ pub fn export_edge_snapshot(
     )?;
     fs::write(clean_bundle.join(MANIFEST_FILE), encoded)?;
     sync_tree(&clean_bundle)?;
-    publish(&clean_bundle, output)
+    publish(&clean_bundle, &output)
 }
 
-/// Local snapshot inputs and destinations.
+struct ExportHistory<'a> {
+    root: PathBuf,
+    paths: Vec<String>,
+    signing_path: &'a Path,
+    signing_identity: (u64, u64),
+}
+
+impl<'a> ExportHistory<'a> {
+    fn inspect(
+        root: &Path,
+        output: &Path,
+        stage: &Path,
+        signing_path: &'a Path,
+        signing_identity: (u64, u64),
+    ) -> Result<Self, EdgeSnapshotError> {
+        if !fs::symlink_metadata(root)?.is_dir() {
+            return Err(refused("sealed-history input must be a real directory"));
+        }
+        let root = root.canonicalize()?;
+        require_disjoint(&[&root, output, stage])?;
+        let paths = inventory(&root)?.into_keys().collect();
+        let sealed = Self {
+            root,
+            paths,
+            signing_path,
+            signing_identity,
+        };
+        for relative in &sealed.paths {
+            sealed.open_file(relative)?;
+        }
+        Ok(sealed)
+    }
+
+    fn open_file(&self, relative: &str) -> Result<File, EdgeSnapshotError> {
+        let input = open_snapshot_file(&self.root, relative)?;
+        let metadata = input.metadata()?;
+        if self.root.join(relative) == self.signing_path
+            || (metadata.dev(), metadata.ino()) == self.signing_identity
+        {
+            return Err(refused(
+                "sealed-history input contains the publisher signing key",
+            ));
+        }
+        Ok(input)
+    }
+
+    fn copy_to(
+        &self,
+        bundle: &Path,
+        files: &mut Vec<SnapshotFile>,
+    ) -> Result<(), EdgeSnapshotError> {
+        for relative in &self.paths {
+            let input = self.open_file(relative)?;
+            let path = format!("{SEALED}/{relative}");
+            let destination = bundle.join(&path);
+            fs::create_dir_all(parent(&destination))?;
+            let (bytes, sha256) = transfer_from(input, Some(&destination), None)?;
+            files.push(SnapshotFile {
+                path,
+                bytes,
+                sha256,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A canonical destination and its exclusively reserved private workspaces.
+///
+/// Dropping the reservation removes the workspaces it created. Destination
+/// paths are checked again at publication.
+pub struct EdgeSnapshotDestination {
+    target: PathBuf,
+    stage: Workspace,
+    download: Option<Workspace>,
+    sealed: Option<(PathBuf, Workspace)>,
+}
+
+impl EdgeSnapshotDestination {
+    /// Checks every destination and reserves private scratch directories.
+    ///
+    /// Set `download` for an HTTP source that needs a private download directory.
+    ///
+    /// # Errors
+    ///
+    /// Refuses occupied or overlapping destinations and preexisting scratch directories.
+    pub fn reserve(
+        target: &Path,
+        sealed_history_output: Option<&Path>,
+        download: bool,
+    ) -> Result<Self, EdgeSnapshotError> {
+        let target = resolve_destination(target)?;
+        let stage = sibling_path(&target, ".bootstrap.staging")?;
+        let download = download
+            .then(|| sibling_path(&target, ".bootstrap.download"))
+            .transpose()?;
+        let sealed = sealed_history_output.map(resolve_destination).transpose()?;
+        let sealed_stage = sealed
+            .as_deref()
+            .map(|path| sibling_path(path, ".bootstrap.staging"))
+            .transpose()?;
+        let mut paths = vec![target.as_path(), stage.as_path()];
+        paths.extend(download.as_deref());
+        paths.extend(sealed.as_deref());
+        paths.extend(sealed_stage.as_deref());
+        require_disjoint(&paths)?;
+        Ok(Self {
+            target,
+            stage: Workspace::create(stage)?,
+            download: download.map(Workspace::create).transpose()?,
+            sealed: sealed
+                .zip(sealed_stage)
+                .map(|(path, stage)| Ok::<_, EdgeSnapshotError>((path, Workspace::create(stage)?)))
+                .transpose()?,
+        })
+    }
+
+    /// Returns the reserved HTTP download directory when requested.
+    #[must_use]
+    pub fn download_path(&self) -> Option<&Path> {
+        self.download
+            .as_ref()
+            .map(|workspace| workspace.0.as_path())
+    }
+}
+
+/// Local inputs for verifying a downloaded or published snapshot.
 pub struct EdgeSnapshotBootstrap<'a> {
-    /// Immutable local directory containing the downloaded or published bundle.
+    /// Immutable local directory containing the bundle.
     pub source: &'a Path,
-    /// Destination canonical primary path.
-    pub target: &'a Path,
     /// Acceptable raw Ed25519 publisher public keys.
     pub trusted_keys: &'a [[u8; 32]],
     /// Positive number of random retained blocks to verify.
     pub spot_check_blocks: NonZeroU32,
-    /// Optional separate destination for verified opaque files.
-    pub sealed_history_output: Option<&'a Path>,
 }
 
 /// Verifies and privately admits a snapshot, awaits validator approval, and
@@ -610,6 +779,7 @@ pub struct EdgeSnapshotBootstrap<'a> {
 /// filesystem failure. After successful rename, a directory sync error
 /// reports uncertain durability and the target may already be visible.
 pub async fn prepare_bootstrapped_store<F, E>(
+    destination: EdgeSnapshotDestination,
     bootstrap: EdgeSnapshotBootstrap<'_>,
     config: EdgeSnapshotStoreConfig<'_>,
     attest: impl FnOnce(EdgeSnapshotAttestation) -> F,
@@ -618,9 +788,9 @@ where
     F: Future<Output = Result<(), E>>,
     E: From<EdgeSnapshotError>,
 {
-    let work = Workspace::new(bootstrap.target, ".bootstrap.staging")?;
-    let canonical = work.0.join(CANONICAL);
-    let manifest = stage_files(&bootstrap, &work.0)?;
+    let stage = &destination.stage.0;
+    let canonical = stage.join(CANONICAL);
+    let manifest = stage_files(&bootstrap, stage, &config)?;
     let staged_store = config.open(&canonical)?;
     let mut evidence = EdgeSnapshotAttestation::read(&staged_store)?;
     if evidence.manifest_anchors(&staged_store)? != manifest.anchors {
@@ -634,17 +804,15 @@ where
     fs::set_permissions(&canonical, fs::Permissions::from_mode(0o700))
         .map_err(EdgeSnapshotError::from)?;
     sync_tree(&canonical)?;
-    commit_bootstrap(&bootstrap, &work.0, &canonical)?;
+    commit_bootstrap(&destination, &canonical)?;
     Ok(())
 }
 
 fn stage_files(
     bootstrap: &EdgeSnapshotBootstrap<'_>,
     stage: &Path,
+    config: &EdgeSnapshotStoreConfig<'_>,
 ) -> Result<EdgeSnapshotManifest, EdgeSnapshotError> {
-    let mut files = inventory(bootstrap.source)?;
-    take_file(&mut files, MANIFEST_FILE)?;
-    take_file(&mut files, SIGNATURE_FILE)?;
     let verified = EdgeSnapshotManifest::verify(
         &read_bounded(
             open_snapshot_file(bootstrap.source, MANIFEST_FILE)?,
@@ -653,13 +821,9 @@ fn stage_files(
         &read_bounded(open_snapshot_file(bootstrap.source, SIGNATURE_FILE)?, 64)?,
         bootstrap.trusted_keys,
     )?;
-    if files.len() != verified.files.len() {
-        return Err(refused(
-            "snapshot directory does not match the signed inventory",
-        ));
-    }
+    verified.validate_store_config(config)?;
+    validate_local_inventory(bootstrap.source, &verified)?;
     for (path, bytes, sha256) in verified.files() {
-        take_file(&mut files, path)?;
         let target = stage.join(path);
         fs::create_dir_all(parent(&target))?;
         let input = open_snapshot_file(bootstrap.source, path)?;
@@ -687,30 +851,19 @@ fn stage_files(
     Ok(verified)
 }
 
-fn take_file(
-    files: &mut BTreeMap<String, PathBuf>,
-    path: &str,
-) -> Result<PathBuf, EdgeSnapshotError> {
-    files
-        .remove(path)
-        .ok_or_else(|| refused(format!("missing snapshot file: {path}")))
-}
-
 fn commit_bootstrap(
-    bootstrap: &EdgeSnapshotBootstrap<'_>,
-    stage: &Path,
+    destination: &EdgeSnapshotDestination,
     canonical: &Path,
 ) -> Result<(), EdgeSnapshotError> {
-    let sealed = stage.join(SEALED);
-    let Some(output) = bootstrap.sealed_history_output.filter(|_| sealed.is_dir()) else {
-        return publish(canonical, bootstrap.target);
+    let target = &destination.target;
+    let sealed = destination.stage.0.join(SEALED);
+    let Some((output, sidecar)) = &destination.sealed else {
+        return publish(canonical, target);
     };
-    if output == bootstrap.target {
-        return Err(refused(
-            "sealed history and canonical destinations must differ",
-        ));
+    require_empty_or_absent(output)?;
+    if !sealed.is_dir() {
+        return publish(canonical, target);
     }
-    let sidecar = Workspace::new(output, ".bootstrap.staging")?;
     let files = sidecar.0.join(SEALED);
     create_private_dir(&files)?;
     for (relative, source) in inventory(&sealed)? {
@@ -723,17 +876,17 @@ fn commit_bootstrap(
     let commit = File::open(parent(output))
         .and_then(|directory| directory.sync_all())
         .map_err(EdgeSnapshotError::from)
-        .and_then(|()| rename_no_replace(canonical, bootstrap.target));
+        .and_then(|()| rename_no_replace(canonical, target));
     if let Err(error) = commit {
         fs::remove_dir_all(output)?;
         File::open(parent(output))?.sync_all()?;
         return Err(error);
     }
-    File::open(parent(bootstrap.target))?.sync_all()?;
+    File::open(parent(target))?.sync_all()?;
     Ok(())
 }
 
-fn read_bounded(input: File, limit: u64) -> Result<Vec<u8>, EdgeSnapshotError> {
+fn read_bounded(input: impl Read, limit: u64) -> Result<Vec<u8>, EdgeSnapshotError> {
     let mut bytes = Vec::new();
     input.take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
@@ -822,11 +975,59 @@ fn transfer_from(
     Ok((bytes, hash.finalize().into()))
 }
 
+fn manifest_directories<'a>(paths: impl Iterator<Item = &'a str>) -> BTreeSet<&'a str> {
+    paths
+        .flat_map(|path| {
+            std::iter::successors(path.rsplit_once('/').map(|(prefix, _)| prefix), |path| {
+                path.rsplit_once('/').map(|(prefix, _)| prefix)
+            })
+        })
+        .collect()
+}
+
+fn validate_local_inventory(
+    root: &Path,
+    manifest: &EdgeSnapshotManifest,
+) -> Result<(), EdgeSnapshotError> {
+    let mut files: BTreeSet<_> = manifest.files().map(|(path, _, _)| path).collect();
+    let directories = manifest_directories(files.iter().copied());
+    files.extend([MANIFEST_FILE, SIGNATURE_FILE]);
+    walk_inventory(root, |relative, _, is_directory| {
+        let listed = if is_directory {
+            directories.contains(relative)
+        } else {
+            files.remove(relative)
+        };
+        if !listed {
+            return Err(refused(format!("unlisted snapshot entry: {relative}")));
+        }
+        Ok(())
+    })?;
+    if !files.is_empty() {
+        return Err(refused("snapshot directory is missing signed files"));
+    }
+    Ok(())
+}
+
 fn inventory(root: &Path) -> Result<BTreeMap<String, PathBuf>, EdgeSnapshotError> {
+    let mut files = BTreeMap::new();
+    walk_inventory(root, |relative, path, is_directory| {
+        if !is_directory {
+            files.insert(relative.to_owned(), path.to_path_buf());
+        }
+        Ok(())
+    })?;
+    Ok(files)
+}
+
+fn walk_inventory(
+    root: &Path,
+    mut visit: impl FnMut(&str, &Path, bool) -> Result<(), EdgeSnapshotError>,
+) -> Result<(), EdgeSnapshotError> {
     if !fs::symlink_metadata(root)?.is_dir() {
         return Err(refused("snapshot input must be a real directory"));
     }
-    let mut files = BTreeMap::new();
+    let mut remaining = MAX_SNAPSHOT_ENTRIES;
     let mut directories = vec![(0, root.to_path_buf())];
     while let Some((depth, directory)) = directories.pop() {
         let mut entries = fs::read_dir(directory)?.peekable();
@@ -834,21 +1035,24 @@ fn inventory(root: &Path) -> Result<BTreeMap<String, PathBuf>, EdgeSnapshotError
             return Err(refused("empty snapshot directory"));
         }
         for entry in entries {
+            remaining = remaining
+                .checked_sub(1)
+                .ok_or_else(|| refused("snapshot exceeds the entry limit"))?;
             let entry = entry?;
             if !entry.file_name().to_str().is_some_and(valid_component) {
                 return Err(refused("unsafe snapshot filename"));
             }
             let path = entry.path();
             let kind = entry.file_type()?;
+            let relative = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(Path::to_str)
+                .ok_or_else(|| refused("invalid snapshot path"))?;
             if kind.is_file() {
-                let relative = path
-                    .strip_prefix(root)
-                    .ok()
-                    .and_then(Path::to_str)
-                    .ok_or_else(|| refused("invalid snapshot path"))?
-                    .to_owned();
-                files.insert(relative, path);
+                visit(relative, &path, false)?;
             } else if kind.is_dir() && depth < 15 {
+                visit(relative, &path, true)?;
                 directories.push((depth + 1, path));
             } else {
                 return Err(refused(
@@ -857,7 +1061,7 @@ fn inventory(root: &Path) -> Result<BTreeMap<String, PathBuf>, EdgeSnapshotError
             }
         }
     }
-    Ok(files)
+    Ok(())
 }
 
 fn sync_tree(root: &Path) -> Result<(), EdgeSnapshotError> {
@@ -916,17 +1120,40 @@ fn publish(source: &Path, target: &Path) -> Result<(), EdgeSnapshotError> {
 
 struct Workspace(PathBuf);
 
+fn resolve_destination(path: &Path) -> Result<PathBuf, EdgeSnapshotError> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| refused("missing destination filename"))?;
+    let resolved = parent(path).canonicalize()?.join(name);
+    require_empty_or_absent(&resolved)?;
+    Ok(resolved)
+}
+
+fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf, EdgeSnapshotError> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| refused("missing destination filename"))?
+        .to_os_string();
+    name.push(suffix);
+    Ok(parent(path).join(name))
+}
+
+fn require_disjoint(paths: &[&Path]) -> Result<(), EdgeSnapshotError> {
+    for (index, path) in paths.iter().enumerate() {
+        if paths[index + 1..]
+            .iter()
+            .any(|other| path.starts_with(other) || other.starts_with(path))
+        {
+            return Err(refused("snapshot paths must not overlap"));
+        }
+    }
+    Ok(())
+}
+
 impl Workspace {
-    fn new(target: &Path, suffix: &str) -> Result<Self, EdgeSnapshotError> {
-        require_empty_or_absent(target)?;
-        let mut name = target
-            .file_name()
-            .ok_or_else(|| refused("missing destination filename"))?
-            .to_os_string();
-        name.push(suffix);
-        let stage = parent(target).join(name);
-        create_private_dir(&stage)?;
-        Ok(Self(stage))
+    fn create(path: PathBuf) -> Result<Self, EdgeSnapshotError> {
+        create_private_dir(&path)?;
+        Ok(Self(path))
     }
 }
 
