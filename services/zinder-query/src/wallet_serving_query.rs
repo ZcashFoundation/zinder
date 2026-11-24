@@ -1104,7 +1104,7 @@ where
             move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 // The location, the header of its block, and the transaction's
-                // bytes come back from one read, and a miss is a proven
+                // retained bytes come back from one read, and a miss is a proven
                 // absence over the reader's complete history.
                 let Some(transaction) = pair
                     .canonical()
@@ -1124,9 +1124,11 @@ where
                 let raw_transaction_bytes =
                     match (transaction.transaction_blob, &self.cold_transactions) {
                         (Some(blob), _) => Some(blob.raw_transaction_bytes),
-                        (None, Some(source)) => {
-                            Some(source.fetch(pair.canonical(), location).await?)
-                        }
+                        (None, Some(source)) => tokio::select! {
+                            biased;
+                            () = pair.reads_revoked() => return Err(pair.revoked_read_error()),
+                            bytes = source.fetch(pair.canonical(), location) => Some(bytes?),
+                        },
                         (None, None) => None,
                     };
                 let chain_context = MinedTransactionChainContext::from_response_epoch(

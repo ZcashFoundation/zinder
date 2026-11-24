@@ -210,12 +210,94 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn revoking_the_pair_releases_a_transaction_stalled_at_the_node() -> Result<()> {
+        use crate::{
+            OrderedBroadcaster, RocksDbCanonicalReader, RocksDbWalletReader, WalletQueryApi,
+            WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+        };
+        use zinder_store::RawBlobRetention;
+        use zinder_testkit::FixtureTransactionRows;
+
+        let schedule = verified_node_schedule()?;
+        let chain = ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::None)
+            .extend_blocks(1);
+        let block = chain
+            .blocks()
+            .first()
+            .ok_or_else(|| eyre!("missing fixture block"))?;
+        let id = TransactionId::from_bytes([0x55; 32]);
+        let rows = FixtureTransactionRows::coinbase(id, block.height, block.hash, vec![0x55]);
+        let mut store =
+            WalletServingStoreFixture::from_chain(&chain.with_transaction_rows(rows), &schedule)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?);
+        let epoch = pair.canonical_fence().chain_epoch_id();
+        let (entered, mut calls) = mpsc::unbounded_channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let tip = pair.canonical_fence().visible_tip();
+        let stub = blocked_transaction_stub(tip, String::new(), entered, Arc::clone(&gate));
+        let node = cold_fetch_node(&schedule, tip, stub)?;
+        let source = ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            node.url(),
+            NodeAuth::None,
+            Duration::from_secs(20),
+        )?;
+        let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
+            Arc::clone(&pair),
+        ))
+        .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
+        .with_verified_cold_transactions();
+        let idle_owners = Arc::strong_count(&pair);
+        let mut requests = JoinSet::new();
+        let stalled_query = query.clone();
+        requests.spawn(async move { stalled_query.transaction(id, Some(epoch)).await });
+        assert_eq!(
+            timeout(Duration::from_secs(5), calls.recv()).await?,
+            Some(encode_rpc_transaction_id_hex(id)),
+        );
+        assert!(Arc::strong_count(&pair) > idle_owners);
+
+        assert!(pair.revoke_reads());
+        let result = timeout(Duration::from_secs(2), requests.join_next()).await;
+        // The stub stays blocked until the query has returned or the test deadline expires.
+        let (released, ready) = &*gate;
+        *released.lock() = true;
+        ready.notify_all();
+
+        let failure = result?.ok_or_else(|| eyre!("cold read task disappeared"))??;
+        assert!(
+            matches!(failure, Err(QueryError::ChainEpochPinUnavailable { chain_epoch_id }) if chain_epoch_id == epoch),
+            "unexpected transaction response: {failure:?}",
+        );
+        assert_eq!(Arc::strong_count(&pair), idle_owners);
+        assert!(matches!(
+            query.transaction(id, Some(epoch)).await,
+            Err(QueryError::ChainEpochPinUnavailable { chain_epoch_id }) if chain_epoch_id == epoch
+        ));
+        assert_eq!(calls.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        Ok(())
+    }
+
     fn cold_fetch_fixture() -> Result<(
         WalletServingStoreFixture,
         Arc<crate::RocksDbCanonicalReader>,
         NetworkUpgradeActivations,
     )> {
-        let schedule = NetworkUpgradeActivations::new(
+        let schedule = verified_node_schedule()?;
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+        let reader = Arc::new(crate::RocksDbCanonicalReader::new(store.take_readers()?.0)?);
+        Ok((store, reader, schedule))
+    }
+
+    fn verified_node_schedule() -> Result<NetworkUpgradeActivations> {
+        Ok(NetworkUpgradeActivations::new(
             Network::ZcashRegtest,
             sample_regtest_upgrade_activations()
                 .activations()
@@ -228,11 +310,7 @@ mod tests {
                     },
                 )
                 .collect(),
-        )?;
-        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-        let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
-        let reader = Arc::new(crate::RocksDbCanonicalReader::new(store.take_readers()?.0)?);
-        Ok((store, reader, schedule))
+        )?)
     }
 
     fn blocked_transaction_stub(
