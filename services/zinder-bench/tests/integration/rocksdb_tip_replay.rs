@@ -378,7 +378,7 @@ fn run_tip_replay(inputs: &TipReplayInputs, fixture: &Path, extra: &[&str]) -> R
 }
 
 fn tip_replay_command(inputs: &TipReplayInputs, fixture: &Path, extra: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-bench"));
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-bench"));
     command
         .arg("rocksdb-tip-replay")
         .arg("--fixture")
@@ -397,7 +397,7 @@ fn tip_replay_command(inputs: &TipReplayInputs, fixture: &Path, extra: &[&str]) 
 }
 
 fn compare_reports(baseline: &Path, candidate: &Path, comparison: &Path) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+    Ok(Command::new(zinder_testkit::bin_exe!("zinder-bench"))
         .arg("compare-tip-replay-reports")
         .arg("--baseline")
         .arg(baseline)
@@ -1277,7 +1277,7 @@ fn tip_reorg_command(
     reorg_window_blocks: u32,
     extra: &[&str],
 ) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-bench"));
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-bench"));
     command
         .arg("rocksdb-tip-reorg")
         .arg("--fixture")

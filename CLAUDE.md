@@ -85,14 +85,22 @@ Single-test execution under nextest: `cargo nextest run -p <crate> -E 'test(<tes
 
 The pull request workflows cancel a superseded run when the pull request gets a
 new push, give every job a timeout, and write Rust caches only from `main`.
+`ci-pr` builds the workspace tests once as a nextest archive, runs them in four
+shards and a tiers job, and reports one `ci gate` check. Its Rust jobs skip
+only pull requests that change nothing but prose no test reads.
 Tools such as `cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`,
 and `cargo-mutants` are never compiled from source in CI. `scripts/install-ci-tool.sh <name>`
 installs the prebuilt release asset pinned in `.github/ci-tools.lock` after
 verifying its sha256; change a tool's version, URL, and checksum together
-there. Keep the workflow-level `env` block identical across jobs that share a
-`Swatinem/rust-cache` key, because the action hashes `CARGO_*` and `RUST*`
-variables into it. The [Testing Runbook](docs/runbooks/testing.md#continuous-integration)
-describes the full policy.
+there. Every external action, including those in `.github/actions/`, is pinned
+to a full commit SHA. Keep the `CARGO_*` workflow-level variables identical in
+`ci-pr.yml`, `live-tests.yml`, and `protocol-contracts.yml`, because they share
+the `test` `Swatinem/rust-cache` key and the action hashes `CARGO_*` and
+`RUST*` variables into it. Release image and archive builds restore
+third-party crates through `.github/actions/buildkit-cargo-cache`, which only
+`binary-archives` saves, from `main`; leave `release.yml` uncached. The
+[Testing Runbook](docs/runbooks/testing.md#continuous-integration) describes the
+full policy.
 
 ## Pull Request Release Notes
 

@@ -27,7 +27,7 @@ pub fn check_release_image_config(
     required_env: &[(&str, &str)],
 ) -> Result<()> {
     let executable = executable.as_ref();
-    let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let config_path = crate::manifest_dir!()
         .join("../../deploy/config/images")
         .join(config_file_name);
     let config_text = std::fs::read_to_string(&config_path)

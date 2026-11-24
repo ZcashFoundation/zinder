@@ -2,9 +2,36 @@ name: build-images
 
 # Build every runtime image on PRs that could affect Rust binaries, Docker
 # contexts, or the image workflow. Tagged releases push through release.yml.
+# Pushes to main save the build-base layer cache that pull requests read. The
+# Cargo cache these builds restore is saved by binary-archives.yml.
 
 on:
   pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".dockerignore"
+      - "crates/**"
+      - "services/**"
+      - "tools/**"
+      - "deploy/Dockerfile"
+      - "deploy/docker-compose.yml"
+      - "deploy/release-images.json"
+      - "deploy/release-single-volume-images.json"
+      - "deploy/canonical-runtime-entrypoint"
+      - "deploy/materialize-indexer-tls"
+      - "deploy/wallet-serving-runtime-entrypoint"
+      - "deploy/wallet-serving-explorer-runtime-entrypoint"
+      - "deploy/wallet-serving-healthcheck"
+      - "deploy/config/wallet-serving/**"
+      - "scripts/validate-deployment-admission.sh"
+      - "scripts/test-deployment-admission.sh"
+      - "buf.yaml"
+      - ".github/workflows/build-images.yml"
+  push:
+    branches:
+      - main
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -33,8 +60,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -70,7 +97,7 @@ jobs:
             runner: ubuntu-24.04-arm
     env:
       PR_TAG: pr-${{ github.event.pull_request.number || 'manual' }}-${{ matrix.platform.name }}
-      CACHE_SCOPE: zinder-rust-pr-${{ matrix.platform.name }}
+      CACHE_SCOPE: zinder-build-base-${{ matrix.platform.name }}
       PLATFORM_REF: ${{ matrix.platform.ref }}
       RELEASE_IMAGES_JSON: ${{ needs.verify.outputs.release_images }}
       SMOKE_BUILD_GIT_COMMIT: 0123456789abcdef0123456789abcdef01234567
@@ -79,6 +106,12 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Restore the BuildKit Cargo cache
+        uses: ./.github/actions/buildkit-cargo-cache
+        with:
+          mode: restore
+          arch: ${{ matrix.platform.name }}
 
       - name: Build and smoke test images
         run: |
@@ -112,7 +145,6 @@ jobs:
               --load \
               --tag "${image_name}:${PR_TAG}" \
               --cache-from "type=gha,scope=${CACHE_SCOPE}" \
-              --cache-to "type=gha,scope=${CACHE_SCOPE},mode=max" \
               .
 
             docker image inspect "${image_name}:${PR_TAG}" \
@@ -159,3 +191,17 @@ jobs:
               -c 'test "$(id -u zinder):$(id -g zinder)" = "10001:10001"'
             export_image_root "$image_name"
           done <<< "$single_volume_image_names"
+
+      # One export of the build-base stage, from main only. Later stages copy
+      # the workspace and change on every commit, so their layers are not
+      # worth caching.
+      - name: Save the build-base layer cache
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker buildx build \
+            --file deploy/Dockerfile \
+            --target zinder-build-base \
+            --platform "$PLATFORM_REF" \
+            --cache-from "type=gha,scope=${CACHE_SCOPE}" \
+            --cache-to "type=gha,scope=${CACHE_SCOPE},mode=max" \
+            .

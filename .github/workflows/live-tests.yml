@@ -68,8 +68,11 @@ concurrency:
 
 # Swatinem/rust-cache hashes every CARGO_* and RUST* variable into its key.
 # The test cache is shared with ci-pr.yml, so keep this block identical there.
+# ci-pr.yml's test build saves that cache from main; these jobs only read it.
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   PROTOC: /does/not/exist
 
 jobs:
@@ -106,18 +109,21 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-
-      # Both legs restore the shared test cache. Only the Zebra leg saves it,
-      # and only from the default branch (the scheduled nightly run).
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.node == 'zebra' }}
+          cache-key: test
+          tools: cargo-nextest
 
-      - name: Install cargo-nextest
-        run: scripts/install-ci-tool.sh cargo-nextest
+      # The live tests compile while the node starts and mines. The wait step
+      # below fails the job if this build failed.
+      - name: Start compiling the live tests
+        run: |
+          # The inner shell expands its own variables.
+          # shellcheck disable=SC2016
+          nohup bash -c '
+            cargo nextest run --locked --workspace --profile=ci-live --no-run
+            echo "$?" > "$RUNNER_TEMP/live-build.status"
+          ' > "$RUNNER_TEMP/live-build.log" 2>&1 < /dev/null &
 
       # Zebra runs as a step rather than a service container because its
       # Regtest activation heights and funding streams come from a mounted
@@ -234,6 +240,14 @@ jobs:
       - name: Advance regtest chain to a testable height
         run: scripts/mine-live-regtest.sh "${ZINDER_NODE__JSON_RPC_ADDR}" 120
 
+      - name: Wait for the live tests to compile
+        run: |
+          while [[ ! -f "$RUNNER_TEMP/live-build.status" ]]; do
+            sleep 5
+          done
+          cat "$RUNNER_TEMP/live-build.log"
+          exit "$(cat "$RUNNER_TEMP/live-build.status")"
+
       # The activation test runs first and alone: it broadcasts below NU7,
       # mines across the activation, and broadcasts again after it, so it needs
       # the pre-NU7 tip that the rest of the suite would otherwise mine past.
@@ -289,16 +303,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install cargo-nextest
-        run: scripts/install-ci-tool.sh cargo-nextest
+          cache-key: test
+          tools: cargo-nextest
 
       - name: Run T3 live tests against testnet
         env:
@@ -328,16 +336,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install cargo-nextest
-        run: scripts/install-ci-tool.sh cargo-nextest
+          cache-key: test
+          tools: cargo-nextest
 
       - name: Run T3 live tests against mainnet
         env:

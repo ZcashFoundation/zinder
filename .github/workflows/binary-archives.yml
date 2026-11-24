@@ -22,14 +22,39 @@ on:
       - "scripts/test-release-sbom.sh"
       - "services/**"
       - "tools/**"
+  # Pushes to main build the same archives to save the BuildKit Cargo cache
+  # that pull requests restore. This workflow alone saves it.
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/binary-archives.yml"
+      - ".github/workflows/release.yml"
+      - ".dockerignore"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "LICENSE"
+      - "README.md"
+      - "crates/**"
+      - "deploy/Dockerfile"
+      - "deploy/release-images.json"
+      - "rust-toolchain.toml"
+      - "scripts/build-release-binary-archive.sh"
+      - "scripts/check-release-binary-archive.sh"
+      - "scripts/check-release-sbom.sh"
+      - "scripts/generate-release-sbom.sh"
+      - "scripts/test-release-binary-archive.sh"
+      - "scripts/test-release-sbom.sh"
+      - "services/**"
+      - "tools/**"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: binary-archives-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   archive:
@@ -41,11 +66,13 @@ jobs:
       matrix:
         platform:
           - name: x86_64-v3-unknown-linux-gnu
+            arch: amd64
             docker: linux/amd64
             rust: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             jemalloc_page_size: 4096
           - name: aarch64-unknown-linux-gnu
+            arch: arm64
             docker: linux/arm64
             rust: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
@@ -57,6 +84,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      - name: Restore the BuildKit Cargo cache
+        uses: ./.github/actions/buildkit-cargo-cache
+        with:
+          mode: restore
+          arch: ${{ matrix.platform.arch }}
+
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -64,6 +97,7 @@ jobs:
 
       - name: Build and verify binary archive
         env:
+          BUILD_BASE_CACHE: zinder-build-base-${{ matrix.platform.arch }}
           JEMALLOC_PAGE_SIZE: ${{ matrix.platform.jemalloc_page_size }}
           RUST_TARGET: ${{ matrix.platform.rust }}
           TARGET_PLATFORM: ${{ matrix.platform.docker }}
@@ -77,7 +111,8 @@ jobs:
           docker buildx build \
             --platform "$TARGET_PLATFORM" \
             --target release-binaries \
-            --build-arg "RELEASE_CACHE_SCOPE=pr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUST_TARGET}" \
+            --build-arg "RELEASE_CACHE_SCOPE=shared" \
+            --cache-from "type=gha,scope=${BUILD_BASE_CACHE}" \
             --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
             --build-arg "ZINDER_BUILD_GIT_COMMIT=${commit}" \
             --output "type=local,dest=${RUNNER_TEMP}/binary-export" \
@@ -128,7 +163,15 @@ jobs:
               done
             '
 
+      - name: Save the BuildKit Cargo cache
+        if: github.ref == 'refs/heads/main'
+        uses: ./.github/actions/buildkit-cargo-cache
+        with:
+          mode: save
+          arch: ${{ matrix.platform.arch }}
+
       - name: Upload binary archive and SBOM
+        if: github.event_name != 'push'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binary-${{ matrix.platform.name }}

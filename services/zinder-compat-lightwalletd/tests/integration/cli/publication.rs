@@ -21,8 +21,7 @@ use crate::common::shielded_catalog_keys;
 
 #[test]
 fn history_publisher_prints_its_effective_configuration() -> Result<()> {
-    let base =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config/history-publisher.toml");
+    let base = zinder_testkit::manifest_dir!().join("../../deploy/config/history-publisher.toml");
     let shipped: toml::Table = toml::from_str(&fs::read_to_string(&base)?)?;
     assert_eq!(
         shipped["storage"]["raw_blob_policy"].as_str(),
@@ -417,10 +416,7 @@ fn publication_command(primary: &Path, scratch: &Path, catalog: &Path, private: 
         .kill_on_drop(true)
         .env("ZINDER_NETWORK__NAME", "zcash-regtest")
         .arg("--config")
-        .arg(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../deploy/config/history-publisher.toml"),
-        )
+        .arg(zinder_testkit::manifest_dir!().join("../../deploy/config/history-publisher.toml"))
         .arg("--canonical-primary-path")
         .arg(primary)
         .arg("--canonical-secondary-root")

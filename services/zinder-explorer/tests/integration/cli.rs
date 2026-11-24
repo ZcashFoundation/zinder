@@ -67,8 +67,8 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
 
 #[test]
 fn wallet_serving_explorer_image_config_resolves() -> eyre::Result<()> {
-    let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../deploy/config/wallet-serving/explorer.toml");
+    let config_path =
+        zinder_testkit::manifest_dir!().join("../../deploy/config/wallet-serving/explorer.toml");
 
     let output = zinder_explorer_command()
         .args(["--config", path_str(&config_path)?, "--print-config"])

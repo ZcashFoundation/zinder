@@ -769,7 +769,7 @@ fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
 #[test]
 fn packaged_wallet_configs_select_dense_construction_unless_overridden_or_serving_explorer()
 -> Result<(), Box<dyn Error>> {
-    let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/config");
+    let configs = zinder_testkit::manifest_dir!().join("../../deploy/config");
     let temporary = tempdir()?;
     let token = temporary.path().join("fixture.token");
     fs::write(&token, "fixture-token\n")?;

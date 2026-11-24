@@ -4,6 +4,15 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
+# Composite actions run with the same trust as the workflows that call them,
+# so their external references are held to the same pinning rule.
+search_roots=(.github/workflows)
+for root in .github/actions scripts/release-wallet-action; do
+  if [[ -d "${root}" ]]; then
+    search_roots+=("${root}")
+  fi
+done
+
 status=0
 while IFS= read -r -d '' workflow; do
   while IFS=: read -r line_number line; do
@@ -22,7 +31,7 @@ while IFS= read -r -d '' workflow; do
     fi
   done < <(grep -nE '^[[:space:]-]*uses:[[:space:]]*' "${workflow}" || true)
 done < <(
-  find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) -print0
+  find "${search_roots[@]}" -type f \( -name '*.yml' -o -name '*.yaml' \) -print0
 )
 
 exit "${status}"

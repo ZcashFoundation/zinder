@@ -245,7 +245,7 @@ fn wallet_serving_accepts_node_fallbacks_only_with_a_primary_node() -> eyre::Res
 /// secondary roots and with the cache budget pinned as query's is.
 #[test]
 fn wallet_serving_image_config_resolves() -> eyre::Result<()> {
-    let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let config_path = zinder_testkit::manifest_dir!()
         .join("../../deploy/config/wallet-serving/compat-lightwalletd.toml");
     let temporary = tempdir()?;
     let token_path = temporary.path().join("ingest.token");

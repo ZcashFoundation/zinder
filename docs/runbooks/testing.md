@@ -58,9 +58,11 @@ git diff --check
 ```
 
 `scripts/test-nextest-selectors.sh` checks that every test-name predicate in
-the nextest profiles and live workflow selects a compiled test, including
-ignored tests. It checks exclusions individually and reuses the workspace
-test binaries.
+the nextest profiles and the `ci-pr`, live, and parity workflows selects a
+compiled test, including ignored tests. It checks exclusions individually and
+reuses the workspace test binaries. With `NEXTEST_ARCHIVE_FILE` set to a
+`cargo nextest archive` of this tree, it lists the archived tests instead and
+needs neither Cargo nor rustc.
 
 The `dependency hygiene` CI job also runs script tests for release, deployment,
 storage-benchmark, and entrypoint policy. When you change one of those areas,
@@ -213,20 +215,31 @@ exercises it.
 
 | Workflow | Runs on | What it checks |
 | --- | --- | --- |
-| `ci-pr` | Every pull request, pushes to `main`, and weekly | The `rust` job runs format, check, clippy, docs, and the `ci`, `ci-postgres`, `ci-parity`, and `ci-perf` profiles. `dependency hygiene` runs the changelog, runbook, alignment, and release-policy scripts, `cargo deny`, and `cargo machete`. Other jobs check the SDK packages and the vendored protocols. Coverage and mutation run only on the weekly schedule or a manual run. |
+| `ci-pr` | Every pull request, pushes to `main`, and weekly | The Rust jobs below, `dependency hygiene` (changelog, runbook, alignment, and release-policy scripts, `cargo deny`, and `cargo machete`), and the vendored protocols. `ci gate` passes only when all of them do. Coverage and mutation run only on the weekly schedule or a manual run. |
 | `protocol-contracts` | Pull requests and `main` pushes that touch the protocol | Checked-in generated code, `proto breaking` (pull requests only), and capability coverage |
 | `live-tests` | Node-facing pull requests, nightly Regtest, weekly Testnet, and manual Mainnet | The T3 suite, once against Zebra and once against Zakura on Regtest |
-| `parity-compat` | Node-facing pull requests and nightly | Live parity against a reference lightwalletd and a pinned CBB light client, on both nodes |
-| `binary-archives` | Pull requests that touch build inputs | Release binary archives for both platforms |
-| `build-images` | Pull requests that touch images or deployment files | Deployment admission and runtime image smoke builds |
+| `parity-compat` | Node-facing pull requests and nightly | Live parity against a reference lightwalletd and a pinned CBB light client, on both nodes, from binaries that `build parity binaries` compiles once |
+| `binary-archives` | Pull requests and `main` pushes that touch build inputs | Release binary archives for both platforms |
+| `build-images` | Pull requests and `main` pushes that touch images or deployment files | Deployment admission and runtime image smoke builds |
+
+The `ci-pr` Rust jobs run in parallel:
+
+| Job | What it runs |
+| --- | --- |
+| `changes` | Decides whether the Rust jobs run. They are skipped only when every file a pull request changes is under `.changes/`, `docs/adrs/`, or `docs/architecture/`, is `AGENTS.md` or `README.md`, or is a Markdown file under `scripts/wallet-clients/`. Anything else, including the runbooks, the reference pages, and `CLAUDE.md` that doc-contract tests read, runs them. |
+| `fmt` | `cargo fmt`, the canonical storage defaults check, and `git diff --check` |
+| `lint` | `cargo check`, the hermetic `zinder-proto` build, `cargo clippy`, and `cargo doc` |
+| `test build` | Builds the workspace tests and examples once and uploads them as a `cargo nextest archive` |
+| `test (shard N/4)` | The `ci` profile from the archive, split into four `hash` partitions |
+| `test tiers` | From the same archive: the nextest selector check, the paired wallet reader measurement, the ext4 protected-history tests, and the `ci-postgres`, `ci-parity`, and `ci-perf` profiles |
+| Pasta and LtHash16 parity | Assembly and portable backends, including the assembly-enabled Pasta guard, on x86-64 and AArch64 |
+| `public SDK packages` | The registry packages and an extracted consumer build |
 
 All workflows follow these rules:
 
-- **A new push cancels the superseded run.** `ci-pr`, `protocol-contracts`,
-  `live-tests`, and `parity-compat` group runs by workflow, event, and pull
-  request number. Runs on `main`, scheduled runs, and manual runs are never
-  cancelled. `binary-archives` and `build-images` cancel any older run for the
-  same pull request or reference, including a manual one.
+- **A new push cancels the superseded run.** Every workflow groups pull
+  request runs by pull request and cancels the older one. Runs on `main`,
+  scheduled runs, and manual runs are never cancelled.
 - **Every job has a timeout.** A hung job stops at its `timeout-minutes`.
 - **Tools come from checksum-pinned release assets.** No job compiles
   `cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`, or
@@ -236,13 +249,35 @@ All workflows follow these rules:
   `~/.cargo/bin`. To bump a tool, change its version, URL, and checksum
   together. The lock has x86_64 assets only, because no tool-installing job
   runs on arm64.
+- **External actions are pinned to commit SHAs.**
+  `scripts/test-workflow-action-pins.sh` checks every `uses:` in the
+  workflows, the composite actions under `.github/actions/`, and
+  `scripts/release-wallet-action/`. The `setup-rust` composite action installs
+  the toolchain, the Rust cache, and CI tools for every Rust job.
+- **Archived tests run without a toolchain.** Jobs that run a nextest archive
+  install only `cargo-nextest` and call `cargo-nextest nextest` directly, so
+  rustup never installs the toolchain from `rust-toolchain.toml`. Tests must
+  therefore follow [Writing tests that CI can run](#writing-tests-that-ci-can-run).
 - **Rust caches are written from `main` only.** Every `Swatinem/rust-cache`
-  step saves only when `github.ref` is `refs/heads/main`. The `ci-pr` `rust`
-  job and all `live-tests` jobs share the `test` key, `parity-compat` uses
-  `parity`, and other jobs use their own keys. In a two-node matrix, only the
-  Zebra leg saves. The action hashes every `CARGO_*` and `RUST*` variable into
-  the key, so jobs that share a key must keep identical workflow-level `env`
-  blocks.
+  step saves only when `github.ref` is `refs/heads/main`. The `ci-pr`
+  `test build` job saves the `test` key, which the `live-tests` jobs and
+  capability coverage only read. `lint`, `parity-compat`, and the other jobs
+  use their own keys. The action hashes every `CARGO_*` and `RUST*` variable
+  into the key, so `ci-pr`, `live-tests`, and `protocol-contracts` keep
+  identical `CARGO_*` workflow-level variables, including
+  `CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG` set to
+  `line-tables-only`.
+- **Release builds restore third-party crates from `main`.** BuildKit does
+  not export `RUN --mount=type=cache` directories with `--cache-to`, so the
+  `buildkit-cargo-cache` composite action moves the Cargo registry, git, and
+  target cache mounts of `deploy/Dockerfile` through the Actions cache. Its key
+  covers the toolchain, the Dockerfile before the workspace copy, and the
+  third-party `Cargo.lock` entries, so workspace-only changes reuse it, and a
+  prefix match seeds a build after a dependency bump. `binary-archives` saves
+  it from `main` without workspace artifacts, and both `binary-archives` and
+  `build-images` restore it. `build-images` saves the `zinder-build-base` layer
+  cache once per platform from `main`. `release.yml` builds without either
+  cache.
 - **Live and parity share one path filter.** Keep the `paths` lists in
   `live-tests.yml` and `parity-compat.yml` identical.
 - **Live and parity Cargo commands use `--locked`**, so a stale lockfile fails
@@ -606,7 +641,9 @@ above. The harness creates fresh stores for both policies. It submits one
 signed spend and compares pending `GetTransaction`, `GetMempoolTx`, and
 `GetMempoolStream` on the ordinary wallet endpoint and both light-wallet
 instances. It stops the named node for the outage checks and restarts it on exit.
-Use `zakura-regtest` for the Zakura lane.
+Use `zakura-regtest` for the Zakura lane. With `NEXTEST_ARCHIVE_FILE` set to an
+archive of the compat acceptance tests, the harness runs them from the archive
+instead of building them, as the parity workflow does.
 
 ```bash
 ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \

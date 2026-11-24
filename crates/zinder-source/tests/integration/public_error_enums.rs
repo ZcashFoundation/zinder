@@ -17,7 +17,7 @@ const MINIMUM_PUBLIC_ERROR_ENUMS: usize = 5;
 /// a caller's `match`.
 #[test]
 fn public_error_enums_are_non_exhaustive() -> Result<()> {
-    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let source_root = zinder_testkit::manifest_dir!().join("src");
     let mut error_enums = Vec::new();
     let mut offenders = Vec::new();
     for source_path in rust_source_files(&source_root)? {

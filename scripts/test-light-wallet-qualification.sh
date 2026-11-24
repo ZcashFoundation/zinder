@@ -26,6 +26,14 @@ for binary in zinder-ingest zinder-compat-lightwalletd; do
   [[ -x "$bin_dir/$binary" ]] || { echo "missing binary: $bin_dir/$binary" >&2; exit 2; }
 done
 
+# NEXTEST_ARCHIVE_FILE runs the tests from an archive of the compat package's
+# acceptance tests instead of building them.
+if [[ -n "${NEXTEST_ARCHIVE_FILE:-}" ]]; then
+  nextest_run=(cargo-nextest nextest run --archive-file "$NEXTEST_ARCHIVE_FILE" --workspace-remap "$PWD")
+else
+  nextest_run=(cargo nextest run --locked -p zinder-compat-lightwalletd --test acceptance)
+fi
+
 # Both nodes can identify Regtest as BIP70 "test". The matrix activation
 # heights distinguish its disposable chain from the public test network.
 rpc_request='{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}'
@@ -133,7 +141,7 @@ run_tests() {
     ZINDER_TEST_LIGHT_WALLET_NODE_STOPPED="$stopped" \
     ZINDER_TEST_PARITY_ZINDER_ADDR="http://127.0.0.1:$((port + 2))" \
     ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR="$reference" \
-    cargo nextest run --locked -p zinder-compat-lightwalletd --test acceptance \
+    "${nextest_run[@]}" \
       --profile=ci-live --run-ignored=all --retries 0 --test-threads 1 -E "$filter"
 }
 

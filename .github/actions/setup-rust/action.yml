@@ -1,0 +1,54 @@
+name: setup-rust
+description: >-
+  Install the pinned Rust toolchain, optionally restore a Swatinem/rust-cache
+  key, and install checksum-pinned CI tools from .github/ci-tools.lock.
+
+inputs:
+  components:
+    description: Comma-separated rustup components, such as `clippy, rustfmt`.
+    required: false
+    default: ""
+  cache-key:
+    description: >-
+      Swatinem/rust-cache shared key. Leave empty to skip the cache. Jobs that
+      share a key must keep identical workflow-level `CARGO_*` and `RUST*`
+      environment variables, because the action hashes them into the key.
+    required: false
+    default: ""
+  save-cache:
+    description: >-
+      `true` to save the cache after the job. Callers pass
+      `github.ref == 'refs/heads/main'` so only the default branch writes.
+    required: false
+    default: "false"
+  tools:
+    description: Space-separated tool names that scripts/install-ci-tool.sh installs.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+      with:
+        components: ${{ inputs.components }}
+
+    - name: Cache Cargo
+      if: inputs.cache-key != ''
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.save-cache == 'true' }}
+
+    - name: Install CI tools
+      if: inputs.tools != ''
+      shell: bash
+      env:
+        CI_TOOLS: ${{ inputs.tools }}
+      run: |
+        set -euo pipefail
+        read -r -a tools <<< "${CI_TOOLS}"
+        for tool in "${tools[@]}"; do
+          "${GITHUB_WORKSPACE}/scripts/install-ci-tool.sh" "${tool}"
+        done

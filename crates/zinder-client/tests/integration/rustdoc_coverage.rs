@@ -8,7 +8,7 @@
 //! method declaration is preceded by a `/// # Examples` line within its
 //! rustdoc block.
 
-use std::{fs, path::PathBuf};
+use std::fs;
 
 use eyre::{Result, eyre};
 
@@ -27,7 +27,7 @@ fn every_public_endpoint_backed_method_has_an_examples_block() -> Result<()> {
 }
 
 fn assert_trait_methods_have_examples(trait_declaration: &str) -> Result<()> {
-    let chain_index_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/chain_index.rs");
+    let chain_index_path = zinder_testkit::manifest_dir!().join("src/chain_index.rs");
     let source = fs::read_to_string(&chain_index_path)
         .map_err(|error| eyre!("failed to read {}: {error}", chain_index_path.display()))?;
 
@@ -203,7 +203,7 @@ fn extract_endpoint_backed_body_matches_known_method_set() -> Result<()> {
 }
 
 fn assert_trait_includes_methods(trait_declaration: &str, must_include: &[&str]) -> Result<()> {
-    let chain_index_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/chain_index.rs");
+    let chain_index_path = zinder_testkit::manifest_dir!().join("src/chain_index.rs");
     let source = fs::read_to_string(&chain_index_path)
         .map_err(|error| eyre!("failed to read {}: {error}", chain_index_path.display()))?;
     let trait_body = extract_trait_body(&source, trait_declaration)?;
