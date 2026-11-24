@@ -23,7 +23,10 @@ use zinder_wallet_projection::{
 
 use crate::{
     RocksDbWalletError, RocksDbWalletStore,
-    store::{decode_only_control, required_column_family_names, wallet_column_family_descriptors},
+    store::{
+        WALLET_DATA_COLUMN_FAMILIES, decode_only_control, required_column_family_names,
+        wallet_column_family_descriptors,
+    },
 };
 
 /// Result of one explicit wallet-secondary catch-up barrier.
@@ -303,6 +306,17 @@ impl RocksDbWalletSecondary {
         self.store
             .bounded_open
             .record_block_cache_entry_gauges(zinder_store::StoreRole::WalletSecondary);
+    }
+
+    /// Publishes per-column-family integer properties and level file counts
+    /// for one serving generation under the `wallet_secondary` store role.
+    pub fn record_column_family_property_gauges(&self) {
+        self.store
+            .bounded_open
+            .record_column_family_property_gauges(
+                zinder_store::StoreRole::WalletSecondary,
+                &WALLET_DATA_COLUMN_FAMILIES.map(|(name, _)| name),
+            );
     }
 
     /// Samples the memory this secondary holds outside its block cache.

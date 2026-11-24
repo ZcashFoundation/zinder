@@ -447,6 +447,17 @@ impl BoundedRocksDbOpen {
         record_cache_entries(&self.db, role);
     }
 
+    /// Publishes per-column-family integer properties and level file counts
+    /// without sampling per-file estimates, block cache, tickers, or WAL.
+    ///
+    /// Serving publishers call this on the blocking pool for the single newest
+    /// active generation at the instance-memory cadence, so per-family SST size
+    /// and compaction properties stay observable without duplicating shared
+    /// cache or ticker gauges or triggering per-file scans.
+    pub fn record_column_family_property_gauges(&self, role: StoreRole, families: &[&'static str]) {
+        record_cf_property_gauges(&self.db, role, families, &[]);
+    }
+
     /// Samples the memory this instance holds outside its block cache.
     ///
     /// The table-reader estimate looks up the reader of every table file in
@@ -775,30 +786,20 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
     record_single_instance_resource_gauges(inputs, true);
 }
 
-fn record_single_instance_resource_gauges(
-    inputs: &RocksDbResourceGaugeInputs<'_>,
-    sample_wal: bool,
+fn record_cf_property_gauges(
+    db: &DB,
+    role: StoreRole,
+    families: &[&'static str],
+    per_file_properties: &[&'static str],
 ) {
-    let store_role = inputs.store_role.as_str();
-    // Replay and materialized views already expose these file-by-file estimates.
-    // Adding them to a writer commit would make sampling scale with its SST count.
-    let per_file_properties: &[&str] = match inputs.store_role {
-        StoreRole::CanonicalSecondary
-        | StoreRole::MaterializedViewPrimary
-        | StoreRole::MaterializedViewSecondary => &PER_FILE_PROPERTIES,
-        StoreRole::CanonicalPrimary
-        | StoreRole::WalletPrimary
-        | StoreRole::WalletSecondary
-        | StoreRole::TreeStateVerificationSecondary => &[],
-    };
-    for cf_name in inputs.column_family_names {
-        let Some(column_family) = inputs.db.cf_handle(cf_name) else {
+    let store_role = role.as_str();
+    for cf_name in families {
+        let Some(column_family) = db.cf_handle(cf_name) else {
             continue;
         };
-        record_level_gauges(inputs, cf_name, &column_family);
+        record_level_gauges(db, role, cf_name, &column_family);
         for &property in PER_CF_INT_PROPERTIES.iter().chain(per_file_properties) {
-            let Ok(Some(property_sample)) =
-                inputs.db.property_int_value_cf(&column_family, property)
+            let Ok(Some(property_sample)) = db.property_int_value_cf(&column_family, property)
             else {
                 continue;
             };
@@ -811,6 +812,30 @@ fn record_single_instance_resource_gauges(
             .set(u64_to_f64(property_sample));
         }
     }
+}
+
+fn record_single_instance_resource_gauges(
+    inputs: &RocksDbResourceGaugeInputs<'_>,
+    sample_wal: bool,
+) {
+    let store_role = inputs.store_role.as_str();
+    // Replay and materialized views already expose these file-by-file estimates.
+    // Adding them to a writer commit would make sampling scale with its SST count.
+    let per_file_properties: &[&'static str] = match inputs.store_role {
+        StoreRole::CanonicalSecondary
+        | StoreRole::MaterializedViewPrimary
+        | StoreRole::MaterializedViewSecondary => &PER_FILE_PROPERTIES,
+        StoreRole::CanonicalPrimary
+        | StoreRole::WalletPrimary
+        | StoreRole::WalletSecondary
+        | StoreRole::TreeStateVerificationSecondary => &[],
+    };
+    record_cf_property_gauges(
+        inputs.db,
+        inputs.store_role,
+        inputs.column_family_names,
+        per_file_properties,
+    );
     for property in DB_INT_PROPERTIES {
         let Ok(Some(property_sample)) = inputs.db.property_int_value(property) else {
             continue;
@@ -1190,7 +1215,7 @@ const PER_FILE_PROPERTIES: [&str; 3] = [
     TABLE_READERS_MEMORY_PROPERTY,
 ];
 
-const PER_CF_INT_PROPERTIES: [&str; 9] = [
+const PER_CF_INT_PROPERTIES: [&str; 10] = [
     "rocksdb.size-all-mem-tables",
     "rocksdb.cur-size-active-mem-table",
     "rocksdb.estimate-pending-compaction-bytes",
@@ -1200,6 +1225,7 @@ const PER_CF_INT_PROPERTIES: [&str; 9] = [
     "rocksdb.num-running-flushes",
     "rocksdb.compaction-pending",
     "rocksdb.base-level",
+    "rocksdb.live-sst-files-size",
 ];
 
 /// Write-controller properties reported by the whole database instance rather
@@ -1333,6 +1359,7 @@ mod tests {
             "rocksdb.estimate-pending-compaction-bytes",
             "rocksdb.num-running-compactions",
             "rocksdb.base-level",
+            "rocksdb.live-sst-files-size",
         ] {
             assert!(PER_CF_INT_PROPERTIES.contains(&property));
         }
@@ -1743,6 +1770,149 @@ mod tests {
         }));
         assert!(exposition.contains("zinder_store_block_cache_entry_bytes"));
         Ok(())
+    }
+
+    #[test]
+    fn primary_reports_live_sst_files_size_for_flushed_column_families()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let mut primary = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary { path: root.path() },
+            RocksDbResourceBudget::for_local_tests(),
+            |cache, _| {
+                ["rows", "empty"]
+                    .into_iter()
+                    .map(|name| {
+                        let mut options = Options::default();
+                        options
+                            .set_block_based_table_factory(&build_block_based_table_factory(cache));
+                        keep_blocks_of_dropped_table_files(&mut options);
+                        ColumnFamilyDescriptor::new(name, options)
+                    })
+                    .collect()
+            },
+        )?;
+        primary.resource_gauge_throttle = ResourceGaugeThrottle::new(Duration::ZERO);
+        write_row(&primary, 7)?;
+        let rows = primary.db.cf_handle("rows").ok_or("rows must open")?;
+        let expected_bytes = primary
+            .db
+            .property_int_value_cf(&rows, "rocksdb.live-sst-files-size")?
+            .ok_or("flushed column family must report live SST size")?;
+        assert!(expected_bytes > 0);
+        drop(rows);
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        primary.record_resource_gauges(StoreRole::CanonicalPrimary, &["rows", "empty"]);
+        let exposition = recorder.handle().render();
+        assert_eq!(
+            cf_property_gauge(
+                &exposition,
+                "canonical_primary",
+                "rows",
+                "rocksdb.live-sst-files-size"
+            ),
+            Some(u64_to_f64(expected_bytes))
+        );
+        assert_eq!(
+            cf_property_gauge(
+                &exposition,
+                "canonical_primary",
+                "empty",
+                "rocksdb.live-sst-files-size"
+            ),
+            Some(0.0)
+        );
+        for per_file_property in super::PER_FILE_PROPERTIES {
+            assert_eq!(
+                cf_property_gauge(&exposition, "canonical_primary", "rows", per_file_property),
+                None
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_column_family_property_gauges_report_live_sst_size_without_cache_or_tickers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary_dir = tempfile::tempdir()?;
+        let secondary_dir = tempfile::tempdir()?;
+        let primary = open_rows_primary(primary_dir.path())?;
+        write_row(&primary, 7)?;
+        let budget = RocksDbResourceBudget::for_local_tests();
+        let shared = SharedSecondaryResources::new(budget);
+        let secondary = open_bounded_rocksdb(
+            RocksDbOpenRole::Secondary {
+                primary_path: primary_dir.path(),
+                secondary_path: secondary_dir.path(),
+            },
+            &shared,
+            rows_family,
+        )?;
+        let rows = secondary.db.cf_handle("rows").ok_or("rows must open")?;
+        let expected_bytes = secondary
+            .db
+            .property_int_value_cf(&rows, "rocksdb.live-sst-files-size")?
+            .ok_or("secondary must report live SST size")?;
+        assert!(expected_bytes > 0);
+        drop(rows);
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        secondary.record_column_family_property_gauges(StoreRole::CanonicalSecondary, &["rows"]);
+        let exposition = recorder.handle().render();
+        assert_eq!(
+            cf_property_gauge(
+                &exposition,
+                "canonical_secondary",
+                "rows",
+                "rocksdb.live-sst-files-size"
+            ),
+            Some(u64_to_f64(expected_bytes))
+        );
+        assert_eq!(
+            cf_property_gauge(
+                &exposition,
+                "canonical_secondary",
+                "rows",
+                "rocksdb.num-files-at-level0"
+            ),
+            Some(1.0)
+        );
+        for per_file_property in super::PER_FILE_PROPERTIES {
+            assert_eq!(
+                cf_property_gauge(
+                    &exposition,
+                    "canonical_secondary",
+                    "rows",
+                    per_file_property
+                ),
+                None
+            );
+        }
+        assert!(!exposition.contains("zinder_store_block_cache_"));
+        assert!(!exposition.contains("zinder_store_rocksdb_ticker"));
+        assert!(!exposition.contains("zinder_store_wal_bytes"));
+        Ok(())
+    }
+
+    fn cf_property_gauge(
+        exposition: &str,
+        store_role: &str,
+        cf: &str,
+        property: &str,
+    ) -> Option<f64> {
+        let role_label = format!("store_role=\"{store_role}\"");
+        let cf_label = format!("cf=\"{cf}\"");
+        let property_label = format!("property=\"{property}\"");
+        let line = exposition.lines().find(|line| {
+            line.starts_with("zinder_store_rocksdb_property{")
+                && line.contains(&role_label)
+                && line.contains(&cf_label)
+                && line.contains(&property_label)
+        })?;
+        line.rsplit_once(' ')?.1.parse().ok()
     }
 
     fn primary_gauge(exposition: &str, metric: &str, label: &str) -> Option<f64> {

@@ -1514,8 +1514,9 @@ impl WalletServingPairPublisher {
     }
 
     /// Publishes shared cache usage, cumulative tickers, and the number of open
-    /// generations, and once per throttle interval the memory the open
-    /// generations hold outside the caches.
+    /// generations, and once per throttle interval the cache composition,
+    /// per-column-family properties of the newest published pair, and the
+    /// memory the open generations hold outside the caches.
     async fn record_resource_gauges(&mut self) {
         self.store_resources
             .canonical
@@ -1536,14 +1537,25 @@ impl WalletServingPairPublisher {
         }
     }
 
-    /// Publishes the memtable and table-reader memory of every open
-    /// generation, summed for each store.
+    /// Publishes cache composition and per-column-family properties for the
+    /// newest published pair, plus the memtable and table-reader memory of
+    /// every open generation summed for each store.
     ///
     /// The sample looks up every table file's reader, so it runs on the
     /// blocking pool. Published readers are shared with that task, and a
     /// candidate moves to it and back as it does for catch-up. A task that
     /// fails drops the candidate, and a later refresh opens its slot cold.
     async fn record_instance_memory(&mut self) {
+        let newest_published = self.published_generation.and_then(|generation| {
+            match &self.generations[generation].state {
+                SecondaryGenerationState::Published { readers, .. } => {
+                    Some((Arc::clone(&readers.canonical), Arc::clone(&readers.wallet)))
+                }
+                SecondaryGenerationState::Vacant | SecondaryGenerationState::Candidate { .. } => {
+                    None
+                }
+            }
+        });
         let published =
             self.generations
                 .iter()
@@ -1565,10 +1577,15 @@ impl WalletServingPairPublisher {
             })
             .collect::<Vec<_>>();
         let sampled = tokio::task::spawn_blocking(move || {
-            // Every published pair sees the same two caches, even when a retired pair is pinned.
-            if let Some((canonical, wallet)) = published.first() {
+            // Sample cache composition and per-CF properties once from the
+            // single newest published pair, even when retired pairs remain pinned.
+            if let Some((canonical, wallet)) =
+                newest_published.as_ref().or_else(|| published.first())
+            {
                 canonical.record_block_cache_entry_gauges();
+                canonical.record_column_family_property_gauges();
                 wallet.record_block_cache_entry_gauges();
+                wallet.record_column_family_property_gauges();
             }
             let canonical = published
                 .iter()
@@ -7426,6 +7443,131 @@ mod tests {
         Ok(())
     }
 
+    /// Exports `rocksdb.live-sst-files-size` from the single newest published pair.
+    ///
+    /// Runs on the blocking pool without emitting per-file estimates or
+    /// overcounting across retained generations. Because a thread-local
+    /// recorder does not reach `spawn_blocking`, this test installs a
+    /// process-wide recorder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publisher_exports_live_sst_size_for_newest_published_pair_without_per_file_properties()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        metrics::set_global_recorder(recorder)
+            .map_err(|_| "another test in this process installed a global recorder")?;
+        let mut primaries = UnspentOutputPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher_every(Duration::from_millis(1))
+            .await?;
+        let first = slot.capture();
+        let initial_wallet_utxo_sst = cf_property_sample(
+            &rendered_metrics.render(),
+            "wallet_secondary",
+            "transparent_unspent_output",
+            "rocksdb.live-sst-files-size",
+        )
+        .ok_or("bootstrap must export wallet_secondary transparent_unspent_output live SST size")?;
+        assert!(initial_wallet_utxo_sst > 0.0);
+
+        primaries.append_block()?;
+        publisher.instance_memory_throttle = ResourceGaugeThrottle::new(Duration::ZERO);
+        publisher.refresh_and_record().await;
+        let second = slot.capture();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_ne!(publisher.published_generation, Some(0));
+        let exposition = rendered_metrics.render();
+        assert_serving_live_sst_gauges(&exposition, &publisher, initial_wallet_utxo_sst)?;
+
+        drop((first, second, slot, publisher));
+        primaries.shutdown().await
+    }
+
+    /// Asserts that serving secondaries export per-family `rocksdb.live-sst-files-size`
+    /// from the single newest published pair without emitting per-file estimates
+    /// or duplicating shared cache and ticker series.
+    fn assert_serving_live_sst_gauges(
+        exposition: &str,
+        publisher: &WalletServingPairPublisher,
+        initial_wallet_utxo_sst: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let newest_generation = publisher
+            .published_generation
+            .ok_or("publisher must record its newest published generation")?;
+        let SecondaryGenerationState::Published { readers, .. } =
+            &publisher.generations[newest_generation].state
+        else {
+            return Err("newest published generation must be published".into());
+        };
+        let expected_compact_sst_bytes = readers
+            .canonical
+            .rocksdb_property_value_cf("compact_block", "rocksdb.live-sst-files-size")?
+            .ok_or("canonical secondary must report compact_block live SST size")?
+            .parse::<f64>()?;
+        assert!(expected_compact_sst_bytes > 0.0);
+        assert_eq!(
+            cf_property_sample(
+                exposition,
+                "canonical_secondary",
+                "compact_block",
+                "rocksdb.live-sst-files-size"
+            ),
+            Some(expected_compact_sst_bytes),
+            "canonical_secondary must report the single newest generation's live SST size"
+        );
+        let wallet_utxo_sst_bytes = cf_property_sample(
+            exposition,
+            "wallet_secondary",
+            "transparent_unspent_output",
+            "rocksdb.live-sst-files-size",
+        )
+        .ok_or("wallet_secondary must export transparent_unspent_output live SST size")?;
+        assert!(wallet_utxo_sst_bytes > 0.0);
+        assert!(
+            wallet_utxo_sst_bytes < initial_wallet_utxo_sst * 2.0,
+            "wallet_secondary live SST size ({wallet_utxo_sst_bytes}) must not double across retained generations (initial={initial_wallet_utxo_sst})"
+        );
+        for wallet_family in [
+            "transparent_unspent_output_by_address",
+            "transparent_address_transaction",
+            "transparent_address_balance",
+        ] {
+            let family_bytes = cf_property_sample(
+                exposition,
+                "wallet_secondary",
+                wallet_family,
+                "rocksdb.live-sst-files-size",
+            )
+            .ok_or("wallet_secondary must export live SST size for populated family")?;
+            assert!(
+                family_bytes > 0.0,
+                "wallet_secondary {wallet_family} must report non-zero live SST size"
+            );
+        }
+        for store_role in ["canonical_secondary", "wallet_secondary"] {
+            let capacity_prefix =
+                format!("zinder_store_block_cache_capacity_bytes{{store_role=\"{store_role}\"}} ");
+            assert_eq!(
+                exposition
+                    .lines()
+                    .filter(|line| line.starts_with(&capacity_prefix))
+                    .count(),
+                1
+            );
+        }
+        for expensive_property in [
+            "rocksdb.estimate-live-data-size",
+            "rocksdb.total-sst-files-size",
+            "rocksdb.estimate-table-readers-mem",
+        ] {
+            assert!(
+                !exposition.contains(expensive_property),
+                "serving secondaries must not export per-file property {expensive_property}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn refresh_counter_includes_unchanged_fences_and_failed_attempts()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -7459,6 +7601,26 @@ mod tests {
                 .parse::<f64>()
                 .ok()
         })
+    }
+
+    /// Reads one `zinder_store_rocksdb_property` gauge sample by store role,
+    /// column family, and property name.
+    fn cf_property_sample(
+        exposition: &str,
+        store_role: &str,
+        cf: &str,
+        property: &str,
+    ) -> Option<f64> {
+        let role_label = format!("store_role=\"{store_role}\"");
+        let cf_label = format!("cf=\"{cf}\"");
+        let property_label = format!("property=\"{property}\"");
+        let line = exposition.lines().find(|line| {
+            line.starts_with("zinder_store_rocksdb_property{")
+                && line.contains(&role_label)
+                && line.contains(&cf_label)
+                && line.contains(&property_label)
+        })?;
+        line.rsplit_once(' ')?.1.trim().parse().ok()
     }
 
     /// Reads one `generation_wait_total` series from a Prometheus exposition.

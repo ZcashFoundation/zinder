@@ -514,7 +514,7 @@ within each process.
 | `zinder_store_wal_bytes_limit` | gauge | `store_role` | Configured WAL limit. Only primary opens apply it. |
 | `zinder_store_max_background_jobs` | gauge | `store_role` | Configured background job limit on a primary. |
 | `zinder_store_rocksdb_io_mode` | gauge | `store_role`, `mode` | 1 for the I/O mode: `direct` or `buffered`. |
-| `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes. |
+| `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes and per-family live SST size (`rocksdb.live-sst-files-size`). |
 | `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
 
 Ingest samples the canonical primary after bulk loads, while following the
@@ -524,7 +524,9 @@ most once per second. Writers sample WAL size at most once every 15 seconds.
 
 For each data column family, `rocksdb.num-files-at-level0` includes zero.
 Levels 1 through 6 acquire a file-count series when they hold SSTs.
-When a level empties, its previous count clears to zero. The `cf` label is
+When a level empties, its previous count clears to zero. Each data column
+family also exports `rocksdb.live-sst-files-size` (live on-disk SST bytes)
+alongside its memtable and compaction integer properties. The `cf` label is
 `__db__` for database-wide write pressure.
 
 Inspect `rocksdb.aggregated-table-properties` offline for index and filter
@@ -534,12 +536,16 @@ every file's in-memory metadata. Replay and materialized-view stores retain
 their existing estimates of live data size, total SST size, and table-reader
 memory.
 
-Serving publishers report the cache footprint, cache entries, tickers, and
-summed instance memory. Compact-block mode serves only the canonical store.
-Cache usage includes pinned bytes. Each store shares one cache and one set of tickers
+Serving publishers report the cache footprint, cache entries, tickers,
+per-column-family `zinder_store_rocksdb_property` gauges (including
+`rocksdb.live-sst-files-size` and level file counts), and summed instance
+memory. Compact-block mode serves only the canonical store. Cache usage
+includes pinned bytes. Each store shares one cache and one set of tickers
 across generations. Recycling a generation preserves its reads in the
-cumulative totals. Serving publishers sample cache composition on the blocking
-pool, using one handle per cache at the 15-second instance-memory cadence.
+cumulative totals. Serving publishers sample cache composition and
+per-column-family properties on the blocking pool, using the single newest
+active generation per store (`canonical_secondary`, `wallet_secondary`) at
+the 15-second instance-memory cadence.
 
 `zinder_store_rocksdb_ticker` uses upstream names for its `ticker` label.
 The store's `statistics_level` must be `tickers` or `full`.
