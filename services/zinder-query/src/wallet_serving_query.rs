@@ -718,7 +718,7 @@ where
     async fn served_tip_snapshot(&self) -> Result<ServedTipSnapshot, QueryError> {
         serving_read::record("visible_tip_block", None, async {
             let pair = self.serving_pair_slot.capture_ephemeral();
-            serving_read::read_pair(&self.serving_pair_slot, pair, None, |pair| async move {
+            serving_read::read_ephemeral_pair(&self.serving_pair_slot, pair, |pair| async move {
                 Ok(ServedTipSnapshot {
                     chain_epoch: pair.chain_epoch(),
                     block_time_unix_seconds: pair.visible_tip_block_time().await?,

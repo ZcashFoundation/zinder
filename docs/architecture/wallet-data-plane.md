@@ -28,7 +28,7 @@ A retained epoch still answers after a reorg replaces its blocks, because a pin 
 
 `TransparentAddressUnspentOutputs`, `CompactBlocksInRange`, and `FullBlocksInRange` hold their epoch across many storage reads. If one of these streams is still running 30 seconds after its epoch leaves retention, the server ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE` after the items it already sent. Those items are not a complete answer. Discard them and read again at a newer epoch. Every other read is one bounded storage read and finishes on its own.
 
-A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. Together they delay a new block by at most about 90 seconds. A burst of blocks that no workflow reads by epoch is not delayed.
+A reader keeps at most three replaced epochs open. While retained epochs and slow streams hold all of them, it postpones publishing new blocks. Together they delay a new block by at most about 90 seconds. A burst of blocks that no workflow reads by epoch does not wait on retention.
 
 ## Methods
 

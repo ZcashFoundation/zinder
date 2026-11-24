@@ -3,11 +3,14 @@
 //! Each reader runtime owns no canonical or wallet primary handle. It catches
 //! up only an inactive generation, authenticates that generation against the
 //! canonical writer control plane, and atomically publishes it as one
-//! immutable canonical/wallet pair. A replaced pair keeps answering reads
-//! pinned to its chain epoch for one retention window, however fast later
-//! blocks arrive: while every spare generation still holds such a pair, the
+//! immutable canonical/wallet pair. A replaced pair that a request observed,
+//! because a response could expose its chain epoch, keeps answering reads
+//! pinned to that epoch for one retention window, however fast later blocks
+//! arrive: while every spare generation still holds such a pair, the
 //! publisher publishes nothing and then publishes the writer's latest fence,
-//! so blocks in a burst share one publication. Each generation stays
+//! so blocks in a burst share one publication. A replaced pair that no
+//! request observed is released at once, so a burst that no workflow pins
+//! never waits. Each generation stays
 //! frozen until every in-flight request has dropped its captured pair `Arc`;
 //! the publisher then catches that same open generation up for a later
 //! publication, so a slot is opened cold only on its first use or after a
@@ -212,6 +215,37 @@ impl RetainedPair {
     }
 }
 
+impl PublishedPairs {
+    /// Reports whether the current pair answers `chain_epoch_id`.
+    fn serves(&self, chain_epoch_id: ChainEpochId) -> bool {
+        self.current.canonical_fence().chain_epoch_id() == chain_epoch_id
+    }
+
+    /// Returns the pair that answers a pin on `chain_epoch_id` at `now`: the
+    /// current pair, else a retained pair inside its window without a missing
+    /// table file, else the current pair at another epoch.
+    fn pinned_pair(
+        &self,
+        chain_epoch_id: ChainEpochId,
+        now: Instant,
+    ) -> Arc<WalletServingReadPair> {
+        if self.serves(chain_epoch_id) {
+            return Arc::clone(&self.current);
+        }
+        self.retained
+            .iter()
+            .find(|retained| {
+                retained.is_within_window(now)
+                    && !retained.pair.has_missing_table_file()
+                    && retained.pair.canonical_fence().chain_epoch_id() == chain_epoch_id
+            })
+            .map_or_else(
+                || Arc::clone(&self.current),
+                |retained| Arc::clone(&retained.pair),
+            )
+    }
+}
+
 impl std::fmt::Debug for WalletServingPairSlot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let published = self.published.load();
@@ -287,41 +321,37 @@ impl WalletServingPairSlot {
     ///
     /// A retained pair answers a pin that names its epoch until its retention
     /// window ends, even before the publisher releases it, unless a read
-    /// found one of its table files missing. Every other pin, and an absent
-    /// one, captures the current pair, so the caller's epoch check still
-    /// reports a pin that no pair serves.
+    /// found one of its table files missing. Every other pin captures the
+    /// current pair, so the caller's epoch check still reports a pin that no
+    /// pair serves.
     ///
     /// An absent pin captures as [`Self::capture`] does, because the response
-    /// exposes the epoch of the pair it answers. A pin that names an epoch
-    /// came from such a response, so it observes nothing new.
+    /// exposes the epoch of the pair it answers. A pin that the current pair
+    /// answers observes that pair too, because the caller holds its epoch
+    /// from some response, perhaps one of another replica, and may pin it
+    /// again after the pair is replaced.
     #[must_use]
     pub(crate) fn capture_at(
         &self,
         chain_epoch_id: Option<ChainEpochId>,
     ) -> Arc<WalletServingReadPair> {
-        if chain_epoch_id.is_none() {
+        let Some(chain_epoch_id) = chain_epoch_id else {
             return self.capture();
-        }
-        let published = self.published.load();
-        let serves = |pair: &WalletServingReadPair| {
-            chain_epoch_id.is_some_and(|id| pair.canonical_fence().chain_epoch_id() == id)
         };
-        if serves(&published.current) {
-            return Arc::clone(&published.current);
+        let published = self.published.load();
+        if !published.serves(chain_epoch_id) || published.current.is_observed_for_epoch_pin() {
+            return published.pinned_pair(chain_epoch_id, Instant::now());
         }
-        let now = Instant::now();
-        published
-            .retained
-            .iter()
-            .find(|retained| {
-                retained.is_within_window(now)
-                    && !retained.pair.has_missing_table_file()
-                    && serves(&retained.pair)
-            })
-            .map_or_else(
-                || Arc::clone(&published.current),
-                |retained| Arc::clone(&retained.pair),
-            )
+        drop(published);
+        // A publication may have replaced the pair before the lock was taken,
+        // so the pin is selected again from the pairs published under it.
+        let _observation = self.observation.lock();
+        let published = self.published.load();
+        let pair = published.pinned_pair(chain_epoch_id, Instant::now());
+        if Arc::ptr_eq(&pair, &published.current) && published.serves(chain_epoch_id) {
+            pair.mark_observed_for_epoch_pin();
+        }
+        pair
     }
 
     /// Makes `pair` current as the publisher would, for tests outside this
@@ -340,18 +370,20 @@ impl WalletServingPairSlot {
     ///
     /// Returns the pairs that leave the slot: the replaced pair when no
     /// request observed it, retained pairs at `pair`'s epoch, which `pair` now
-    /// answers, and pairs missing a table file. A
-    /// schedule revision or a replacement for a pair missing a table file
-    /// republishes the current epoch, so the pair it replaces leaves at once
-    /// instead of keeping a generation that no pin can reach. Every other
-    /// retained pair stays until its window ends. Only the publisher writes
-    /// the slot, so the load and store below cannot race another publication.
+    /// answers, and pairs missing a table file. A schedule revision or a
+    /// replacement for a pair missing a table file republishes the current
+    /// epoch, so the pair it replaces leaves at once instead of keeping a
+    /// generation that no pin can reach. The republished pair inherits the
+    /// observation of the pairs it replaces, because a client that received
+    /// the epoch may still pin it. Every other observed pair stays until its
+    /// window ends. Only the publisher writes the slot, so the load and store
+    /// below cannot race another publication.
     fn publish(
         &self,
         pair: Arc<WalletServingReadPair>,
         replaced_at: Instant,
     ) -> Vec<Arc<WalletServingReadPair>> {
-        let _observation = self.observation.lock();
+        let observation = self.observation.lock();
         let previous = self.published.load_full();
         let chain_epoch_id = pair.canonical_fence().chain_epoch_id();
         let (released, retained): (Vec<_>, Vec<_>) = std::iter::once(RetainedPair {
@@ -364,10 +396,17 @@ impl WalletServingPairSlot {
                 || retained.pair.has_missing_table_file()
                 || !retained.pair.is_observed_for_epoch_pin()
         });
+        if released.iter().any(|released| {
+            released.pair.canonical_fence().chain_epoch_id() == chain_epoch_id
+                && released.pair.is_observed_for_epoch_pin()
+        }) {
+            pair.mark_observed_for_epoch_pin();
+        }
         self.published.store(Arc::new(PublishedPairs {
             current: pair,
             retained,
         }));
+        drop(observation);
         self.signals.publication.send_replace(());
         released.into_iter().map(|released| released.pair).collect()
     }
@@ -420,24 +459,28 @@ impl WalletServingPairSlot {
     }
 
     /// Reports `pair` as missing a table file and waits, for at most
-    /// [`MISSING_TABLE_FILE_REPLACEMENT_WAIT`], for a pair that answers
-    /// `chain_epoch_id` without that mark.
+    /// [`MISSING_TABLE_FILE_REPLACEMENT_WAIT`], for `capture` to return a pair
+    /// without that mark.
     ///
-    /// Returns `None` when no such pair is published in time. A pin whose
-    /// epoch only the marked pair served gets the current pair, at another
-    /// epoch, so the caller's epoch check refuses it.
+    /// `capture` selects the replacement the way the read selected `pair`,
+    /// with [`Self::capture_at`] for a read that observes its pair and
+    /// [`Self::capture_ephemeral`] for one that does not, so recovery never
+    /// changes whether the replacement is retained. Returns `None` when no
+    /// unmarked pair is published in time. A pin whose epoch only the marked
+    /// pair served gets the current pair, at another epoch, so the caller's
+    /// epoch check refuses it.
     pub(crate) async fn replace_missing_table_file_pair(
         &self,
         pair: Arc<WalletServingReadPair>,
         error: &crate::QueryError,
-        chain_epoch_id: Option<ChainEpochId>,
+        capture: impl Fn() -> Arc<WalletServingReadPair>,
     ) -> Option<Arc<WalletServingReadPair>> {
         let mut publications = self.signals.publication.subscribe();
         self.report_missing_table_file(&pair, error);
         drop(pair);
         let deadline = Instant::now() + MISSING_TABLE_FILE_REPLACEMENT_WAIT;
         loop {
-            let replacement = self.capture_at(chain_epoch_id);
+            let replacement = capture();
             if !replacement.has_missing_table_file() {
                 return Some(replacement);
             }
@@ -7913,6 +7956,67 @@ mod tests {
         primaries.shutdown().await
     }
 
+    /// A tip poll that finds a table file of its pair deleted recovers on an
+    /// ephemeral replacement, so tip polling alone still holds no retention
+    /// window when the next block arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tip_snapshot_recovering_from_a_missing_table_file_retains_no_pair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let mut primaries =
+            AdvancingPrimaries::start_through(BlockHeight::new(SPLIT_TIP_HEIGHT)).await?;
+        let canonical_primary_path = primaries.close_canonical_primary()?;
+        split_rows_into_table_files(&canonical_primary_path)?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher_every(
+                zinder_runtime::Readiness::default(),
+                Duration::from_hours(1),
+            )
+            .await?;
+        let stale_pair = slot.capture_ephemeral();
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        compact_away_table_files(&canonical_primary_path)?;
+
+        let replace_the_marked_pair = async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !slot.capture_ephemeral().has_missing_table_file() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| "the tip read never found a missing table file")?;
+            publisher.refresh_once().await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let (snapshot, replaced) =
+            tokio::join!(query.served_tip_snapshot(), replace_the_marked_pair);
+        replaced?;
+        assert_eq!(snapshot?.chain_epoch, stale_pair.chain_epoch());
+        let replacement = slot.capture_ephemeral();
+        assert!(!Arc::ptr_eq(&replacement, &stale_pair));
+        assert!(
+            !replacement.is_observed_for_epoch_pin(),
+            "recovery must not observe the replacement"
+        );
+
+        primaries.reopen_canonical_primary()?;
+        let moved = primaries.append_block()?;
+        publisher.refresh_once().await?;
+        assert_eq!(slot.capture_ephemeral().canonical_fence(), moved);
+        assert_eq!(slot.retained_pair_count(), 0);
+        assert!(publisher.generation_wait.is_none());
+        assert_eq!(
+            generation_waits(&rendered_metrics.render(), "retention_window"),
+            0
+        );
+
+        drop((stale_pair, replacement, query, slot));
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
     /// A read pinned to the epoch of a pair missing a table file is refused
     /// with the pin error once the replacement serves the writer's newer
     /// fence, and an unpinned read is answered there.
@@ -9568,55 +9672,155 @@ mod retention_tests {
         Ok(())
     }
 
-    /// A capture racing a publication never loses its pin.
-    ///
-    /// Either the capture came first and the publication retains the pair, or
-    /// the publication came first and the capture returns the replacement.
+    /// A pair captured before its replacement is retained for the window.
     #[test]
-    fn a_capture_racing_a_publication_never_loses_its_pin() -> Result<(), Box<dyn Error>> {
-        const ROUNDS: usize = 5_000;
+    fn a_capture_before_a_publication_keeps_its_pair_pinnable() -> Result<(), Box<dyn Error>> {
         let history = address_history()?;
         let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
-        let barrier = std::sync::Barrier::new(2);
-        let mut captured_before_publication = 0_usize;
-        for round in 0..ROUNDS {
-            for pair in &pairs {
-                pair.clear_observation_for_test();
-            }
-            let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
-            let captured = std::thread::scope(|scope| {
-                let capturing = scope.spawn(|| {
-                    barrier.wait();
-                    slot.capture()
-                });
-                barrier.wait();
-                let released = slot.publish(Arc::clone(&pairs[1]), Instant::now());
-                let captured = capturing
-                    .join()
-                    .map_err(|_| "the capturing thread panicked")?;
-                Ok::<_, Box<dyn Error>>((captured, released))
-            })?;
-            let (captured, released) = captured;
-            let epoch = captured.canonical_fence().chain_epoch_id();
-            assert!(
-                Arc::ptr_eq(&slot.capture_at(Some(epoch)), &captured),
-                "round {round}: the captured pair must still answer its epoch"
-            );
-            if Arc::ptr_eq(&captured, &pairs[0]) {
-                captured_before_publication += 1;
-                assert!(
-                    released.is_empty(),
-                    "round {round}: an observed pair must be retained"
-                );
-            }
-        }
+        let epoch = pairs[0].canonical_fence().chain_epoch_id();
+        let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+
+        assert!(Arc::ptr_eq(&slot.capture(), &pairs[0]));
         assert!(
-            captured_before_publication > 0,
-            "the race must have produced both orderings"
+            slot.publish(Arc::clone(&pairs[1]), Instant::now())
+                .is_empty()
+        );
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &pairs[0]));
+        Ok(())
+    }
+
+    /// A capture after the publication observes the replacement, and the
+    /// next publication retains it.
+    #[test]
+    fn a_capture_after_a_publication_observes_the_replacement() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 2)?;
+        let epoch = pairs[1].canonical_fence().chain_epoch_id();
+        let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+
+        let released = slot.publish(Arc::clone(&pairs[1]), Instant::now());
+        assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &pairs[0])));
+        assert_eq!(released.len(), 1);
+        assert!(Arc::ptr_eq(&slot.capture(), &pairs[1]));
+        assert!(
+            slot.publish(Arc::clone(&pairs[2]), Instant::now())
+                .is_empty()
+        );
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &pairs[1]));
+        Ok(())
+    }
+
+    /// A pin that the current pair answers observes it, because the caller
+    /// holds an epoch that came from some response.
+    #[test]
+    fn an_explicit_pin_on_the_current_pair_keeps_it_pinnable() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
+        let epoch = pairs[0].canonical_fence().chain_epoch_id();
+        let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &pairs[0]));
+        assert!(
+            slot.publish(Arc::clone(&pairs[1]), Instant::now())
+                .is_empty()
+        );
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &pairs[0]));
+        assert_eq!(slot.retained_pair_count(), 1);
+        Ok(())
+    }
+
+    /// A pin that no pair answers, and an ephemeral capture, observe nothing.
+    #[test]
+    fn a_pin_no_pair_answers_and_an_ephemeral_capture_observe_nothing() -> Result<(), Box<dyn Error>>
+    {
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
+        let unserved = pairs[1].canonical_fence().chain_epoch_id();
+        let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(unserved)), &pairs[0]));
+        assert!(Arc::ptr_eq(&slot.capture_ephemeral(), &pairs[0]));
+        let released = slot.publish(Arc::clone(&pairs[1]), Instant::now());
+        assert_eq!(released.len(), 1);
+        assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &pairs[0])));
+        assert_eq!(slot.retained_pair_count(), 0);
+        Ok(())
+    }
+
+    /// Captures and publications racing on shared threads never lose a pin.
+    ///
+    /// Each round replays one race on a fresh slot, with a capture that
+    /// observes by absence of a pin on even rounds and by an explicit pin on
+    /// odd rounds. Whichever order the scheduler picks, the pair a capture
+    /// returned still answers its epoch inside the window. The test counts no
+    /// outcomes, so no scheduling frequency can fail it, and it records
+    /// failures instead of asserting inside a round, so a failure cannot leave
+    /// a thread waiting at the barrier.
+    #[test]
+    fn concurrent_captures_and_publications_never_lose_a_pin() -> Result<(), Box<dyn Error>> {
+        const ROUNDS: usize = 20_000;
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
+        let first_epoch = pairs[0].canonical_fence().chain_epoch_id();
+        let start = std::sync::Barrier::new(3);
+        let finish = std::sync::Barrier::new(3);
+        let slot_of_round = parking_lot::Mutex::new(None::<WalletServingPairSlot>);
+        let captured_in_round = parking_lot::Mutex::new(None::<Arc<WalletServingReadPair>>);
+        let mut failures = Vec::new();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for round in 0..ROUNDS {
+                    start.wait();
+                    let slot = slot_of_round.lock().clone();
+                    *captured_in_round.lock() = slot.map(|slot| {
+                        if round % 2 == 0 {
+                            slot.capture()
+                        } else {
+                            slot.capture_at(Some(first_epoch))
+                        }
+                    });
+                    finish.wait();
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..ROUNDS {
+                    start.wait();
+                    let slot = slot_of_round.lock().clone();
+                    if let Some(slot) = slot {
+                        drop(slot.publish(Arc::clone(&pairs[1]), Instant::now()));
+                    }
+                    finish.wait();
+                }
+            });
+            for round in 0..ROUNDS {
+                for pair in &pairs {
+                    pair.clear_observation_for_test();
+                }
+                let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+                *slot_of_round.lock() = Some(slot.clone());
+                start.wait();
+                finish.wait();
+                let captured = captured_in_round.lock().take();
+                if let Some(captured) = captured {
+                    let epoch = captured.canonical_fence().chain_epoch_id();
+                    if !Arc::ptr_eq(&slot.capture_at(Some(epoch)), &captured) {
+                        failures.push(round);
+                    }
+                }
+            }
+        });
+
+        assert!(
+            failures.is_empty(),
+            "rounds {failures:?} lost the pin of the pair they captured"
         );
         Ok(())
     }
 
+    /// A pair republished at its own epoch leaves no retained duplicate, and
+    /// keeps the observation of the pair it replaces, so a client that holds
+    /// the epoch can still pin it when the next block arrives.
     #[test]
     fn a_pair_republished_at_its_own_epoch_leaves_the_slot_at_once() -> Result<(), Box<dyn Error>> {
         let history = address_history()?;
@@ -9629,15 +9833,14 @@ mod retention_tests {
         let epoch = first.canonical_fence().chain_epoch_id();
         assert_eq!(republished.canonical_fence().chain_epoch_id(), epoch);
         let slot = WalletServingPairSlot::new(Arc::clone(&first));
+        drop(slot.capture());
 
         let released = slot.publish(Arc::clone(&republished), Instant::now());
         assert_eq!(released.len(), 1);
         assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &first)));
         assert_eq!(slot.retained_pair_count(), 0);
-        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &republished));
 
         writer.append_live_block(&history.chain)?;
-        drop(slot.capture());
         assert!(
             slot.publish(serving_pair(&mut writer)?, Instant::now())
                 .is_empty()
@@ -9646,6 +9849,31 @@ mod retention_tests {
             Arc::ptr_eq(&slot.capture_at(Some(epoch)), &republished),
             "the republished pair answers its epoch once it is replaced"
         );
+        Ok(())
+    }
+
+    /// A republished pair whose predecessor no request observed leaves with
+    /// the next publication, because no client holds its epoch.
+    #[test]
+    fn an_unobserved_republished_pair_is_released_when_replaced() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let mut writer = CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(&history.chain).through(BlockHeight::new(1)),
+            &sample_regtest_upgrade_activations(),
+        )?;
+        let first = serving_pair(&mut writer)?;
+        let republished = serving_pair(&mut writer)?;
+        let slot = WalletServingPairSlot::new(Arc::clone(&first));
+
+        assert_eq!(
+            slot.publish(Arc::clone(&republished), Instant::now()).len(),
+            1
+        );
+        writer.append_live_block(&history.chain)?;
+        let released = slot.publish(serving_pair(&mut writer)?, Instant::now());
+        assert_eq!(released.len(), 1);
+        assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &republished)));
+        assert_eq!(slot.retained_pair_count(), 0);
         Ok(())
     }
 
