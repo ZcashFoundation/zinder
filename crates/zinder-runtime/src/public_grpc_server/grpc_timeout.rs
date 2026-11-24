@@ -8,7 +8,11 @@
 
 use std::{
     future::Future,
-    pin::Pin,
+    pin::{Pin, pin},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -43,6 +47,26 @@ fn client_deadline(headers: &http::HeaderMap) -> Option<Duration> {
     }
 }
 
+/// Marks a request whose `grpc-timeout` expired before its response started.
+///
+/// [`GrpcDeadline`] puts one in each request it bounds and sets it before it
+/// drops the call it abandoned, so middleware inside the deadline, such as
+/// the wallet RPC metrics, can record `DEADLINE_EXCEEDED` as its outcome.
+#[derive(Clone, Debug, Default)]
+pub(super) struct DeadlineExpiry(Arc<AtomicBool>);
+
+impl DeadlineExpiry {
+    /// Reports whether the request's deadline expired before its response
+    /// started.
+    pub(super) fn expired(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// The Tower service that bounds response start time after readiness.
 #[derive(Clone, Debug)]
 pub struct GrpcDeadline<S> {
@@ -71,28 +95,39 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: http::Request<Body>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
         let deadline = client_deadline(request.headers());
-        Box::pin(respond_within(deadline, self.inner.call(request)))
+        let expiry = DeadlineExpiry::default();
+        if deadline.is_some() {
+            request.extensions_mut().insert(expiry.clone());
+        }
+        Box::pin(respond_within(deadline, expiry, self.inner.call(request)))
     }
 }
 
 async fn respond_within<B, E>(
     deadline: Option<Duration>,
+    expiry: DeadlineExpiry,
     response: impl Future<Output = Result<http::Response<B>, E>>,
 ) -> Result<http::Response<Body>, E>
 where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<axum::BoxError>,
 {
-    let outcome = match deadline {
-        Some(deadline) => match tokio::time::timeout(deadline, response).await {
-            Ok(outcome) => outcome,
-            Err(_) => return Ok(Status::deadline_exceeded("Timeout expired").into_http()),
-        },
-        None => response.await,
+    let Some(deadline) = deadline else {
+        return response.await.map(|response| response.map(Body::new));
     };
-    outcome.map(|response| response.map(Body::new))
+    // The call stays pinned here until this function returns, so the
+    // expiry is marked before the abandoned call is dropped.
+    let mut response = pin!(response);
+    tokio::select! {
+        biased;
+        outcome = &mut response => outcome.map(|response| response.map(Body::new)),
+        () = tokio::time::sleep(deadline) => {
+            expiry.mark();
+            Ok(Status::deadline_exceeded("Timeout expired").into_http())
+        }
+    }
 }
 
 /// A service error carrying a status becomes a response. Other errors reach
@@ -154,6 +189,7 @@ mod tests {
     {
         let response = respond_within(
             Some(Duration::from_millis(10)),
+            super::DeadlineExpiry::default(),
             future::pending::<Result<http::Response<Body>, std::convert::Infallible>>(),
         )
         .await?;

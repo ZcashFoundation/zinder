@@ -98,7 +98,9 @@ impl TipWait {
             max_wait,
             max_blocks_ahead: max_blocks_ahead.get(),
             waiters: Arc::new(Semaphore::new(
-                usize::try_from(max_waiters.get()).unwrap_or(Semaphore::MAX_PERMITS),
+                usize::try_from(max_waiters.get())
+                    .unwrap_or(Semaphore::MAX_PERMITS)
+                    .min(Semaphore::MAX_PERMITS),
             )),
             shutdown: CancellationToken::new(),
         }

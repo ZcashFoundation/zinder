@@ -366,3 +366,46 @@ async fn an_http1_connection_carries_a_slow_call_after_a_finished_one() -> Resul
     assert_eq!(second.to_bytes().len(), expected);
     Ok(())
 }
+
+/// A call the client's deadline abandons reports `DEADLINE_EXCEEDED` on the
+/// wire and in the wallet RPC metrics, which run inside the deadline.
+#[tokio::test]
+async fn an_expired_deadline_reaches_the_wallet_rpc_metrics() -> Result<()> {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (scripts, _calls) = mpsc::unbounded_channel();
+    let server = tokio::spawn(
+        PublicGrpcServer::new(STALL)
+            .layer(WalletRpcMetricsLayer::Lightwalletd)
+            .layer(tower::layer::layer_fn(|inner: tonic::service::Routes| {
+                tower::service_fn(move |request| {
+                    let mut inner = inner.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        inner.call(request).await
+                    }
+                })
+            }))
+            .add_service(Scripted {
+                scripts,
+                produced: Arc::default(),
+                freed: Arc::default(),
+            })
+            .serve_with_incoming(listener),
+    );
+
+    let response = within_wait_limit(raw_request(address, 65_535, Some("50m"))).await??;
+    server.abort();
+    assert_eq!(
+        Status::from_header_map(response.headers()).map(|status| status.code()),
+        Some(Code::DeadlineExceeded)
+    );
+    let rendered = metrics.render();
+    let expired = r#"zinder_wallet_rpc_requests_total{surface="lightwalletd",method="GetBlockRange",grpc_code="deadline_exceeded",error_class="none"} 1"#;
+    assert!(rendered.lines().any(|line| line == expired), "{rendered}");
+    assert!(!rendered.contains(r#"grpc_code="cancelled""#), "{rendered}");
+    Ok(())
+}
