@@ -136,8 +136,7 @@ impl TransparentAddressDeltasConsumer {
 
     /// Returns the transaction id one stored delta row names.
     ///
-    /// Rows this release writes store the id as 32 internal-order bytes; rows
-    /// an earlier release wrote store its RPC hex form, which still decodes.
+    /// Stored delta rows encode the transaction id as 32 internal-order bytes.
     pub fn stored_transaction_id(
         record: &TransparentAddressDeltasRecord,
     ) -> Result<TransactionId, WireDecodeError> {

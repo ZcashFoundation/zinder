@@ -119,8 +119,8 @@ impl TransparentAddressActivityConsumer {
 
     /// Returns the transaction id one stored activity row names.
     ///
-    /// Rows this release writes store the id as 32 internal-order bytes; rows
-    /// an earlier release wrote store its RPC hex form, which still decodes.
+    /// Stored activity rows encode the transaction id as 32 internal-order
+    /// bytes.
     pub fn stored_transaction_id(
         record: &TransparentAddressActivityRecord,
     ) -> Result<TransactionId, WireDecodeError> {
