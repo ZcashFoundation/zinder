@@ -1,0 +1,17 @@
+kind: changed
+body: >-
+  Sealed wallet-history segments use the unified ZSHRNG01 format that stores
+  both the compact-block and the nullifier-only projection of every settled
+  block. GetBlockRangeNullifiers now serves its range zero-copy from those
+  segments and the in-memory tail instead of re-encoding stored rows, in both
+  ascending and descending order, and a pool selection of Sapling and Orchard
+  alone serves the same frames below Ironwood activation. A range request
+  whose pool selection omits only Ironwood reads stored frames below
+  activation and canonical rows above it. The 64 MiB tail budget now counts
+  each cached row's shielded and nullifier frames together. Existing
+  ZSHRNG02 catalogs are not readable by the new format: republish segments
+  into a fresh catalog directory before switching readers.
+time: 2026-11-24T07:20:53Z
+custom:
+    Bump: major
+    PR: "538"
