@@ -266,11 +266,68 @@ fn reservation_refuses_workspace_overlap_and_occupied_sidecar() -> TestResult {
         occupied.clone(),
     ] {
         let failure = EdgeSnapshotDestination::reserve(&target, Some(&sidecar), true);
-        assert!(matches!(failure, Err(EdgeSnapshotError::Refused(_))));
+        let expected = if sidecar == occupied {
+            "occupied"
+        } else {
+            "overlap"
+        };
+        assert!(
+            matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains(expected))
+        );
         assert!(!target.exists());
         assert!(!download.exists());
     }
     assert_eq!(fs::read(occupied.join("segment"))?, b"preserved");
     assert_eq!(fs::read_dir(&staging)?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn canonical_target_cannot_equal_the_sidecar_workspace() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let history = root.path().join("history");
+    let canonical = root.path().join("history.bootstrap.staging");
+    let failure = EdgeSnapshotDestination::reserve(&canonical, Some(&history), false);
+    assert!(
+        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("overlap"))
+    );
+    assert_eq!(fs::read_dir(root.path())?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn incompatible_local_manifest_refuses_before_any_payload_is_copied() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let (_source_directory, mut source) = admitted_source()?;
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| "key generation failed")?;
+    let publisher = Ed25519KeyPair::from_pkcs8(key.as_ref()).map_err(|_| "key parsing failed")?;
+    let keys = [publisher.public_key().as_ref().try_into()?];
+    let key_path = root.path().join("signer.der");
+    fs::write(&key_path, key.as_ref())?;
+    let bundle = root.path().join("bundle");
+    export_edge_snapshot(&mut source, &bundle, &key_path, None)?;
+    let target = root.path().join("restored");
+    let destination = EdgeSnapshotDestination::reserve(&target, None, false)?;
+    let activations = NetworkUpgradeActivations::new(Network::ZcashRegtest, Vec::new())?;
+    let config = EdgeSnapshotStoreConfig {
+        activations: &activations,
+        workload: source.workload(),
+        raw_blob_retention: source.raw_blob_retention(),
+        reorg_policy: source.reorg_policy(),
+        resource_budget: RocksDbResourceBudget::for_local_tests(),
+    };
+    let input = EdgeSnapshotBootstrap {
+        source: &bundle,
+        trusted_keys: &keys,
+        spot_check_blocks: DEFAULT_SPOT_CHECK_BLOCKS,
+    };
+    let stage = &destination.stage.0;
+    let failure = stage_files(&input, stage, &config);
+    assert!(
+        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("store identity"))
+    );
+    assert_eq!(fs::read_dir(stage)?.count(), 0);
+    assert!(!target.exists());
     Ok(())
 }
