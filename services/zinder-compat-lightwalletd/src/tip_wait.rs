@@ -43,6 +43,9 @@ pub const DEFAULT_TIP_WAIT_MAX_WAITERS: NonZeroU32 = match NonZeroU32::new(256) 
     None => NonZeroU32::MIN,
 };
 
+#[cfg(test)]
+mod tests;
+
 const WAITS_COUNTER: &str = "zinder_compat_tip_wait_total";
 const WAIT_DURATION_HISTOGRAM: &str = "zinder_compat_tip_wait_duration_seconds";
 const WAITERS_GAUGE: &str = "zinder_compat_tip_waiters";

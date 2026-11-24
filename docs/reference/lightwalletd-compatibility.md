@@ -104,9 +104,34 @@ How each engine uses the tip calls:
 | Vizor (`chainapsis/vizor-wallet` `a69183b`) | Never. | Retries after 2, 4, and 8 seconds, then shows "Network connection lost. We'll keep trying automatically." In Automatic mode it sets the server aside for a minute and switches; a custom endpoint retries every 10 seconds. A send fails while the tip call fails. Automatic mode also leaves a server whose tip has not advanced for 5 minutes when another is higher. | Server tip plus 1 plus 40 blocks, or 120 from NU7. |
 | Zingo (`zingolabs/zingolib` `658dea0`, pepper-sync) | Never. | The sync pass ends with an error it classes as recoverable; a failing `GetLightdInfo` stops a sync before it starts. | Wallet tip plus 1 plus 40 blocks, or 120 from NU7. |
 
+### Waiting for a height just past the tip
+
+Readers behind a load balancer publish each block at slightly different times, and the balancer routes every request on its own. A wallet can learn tip H+1 from one reader and then ask another, still at H, for block H+1. Instead of failing at once, Zinder waits briefly for the height to arrive. For how this fits a multi-reader deployment, see [More than one reader on a host](../architecture/service-operations.md#more-than-one-reader-on-a-host).
+
+These methods wait when they select a height:
+
+- `GetBlock` and `GetBlockNullifiers`, by height or by height and hash.
+- `GetBlockRange` and `GetBlockRangeNullifiers`, and the encoded block range methods `GetEncodedBlockRange` and `GetEncodedBlockRangeNullifiers`. A range waits on its higher end, whichever end the request names first.
+- `GetTreeState` by height, in the serving modes that answer it: wallet and light-wallet serving.
+
+A hash-only selector never waits and keeps its immediate `NOT_FOUND`. `GetLatestBlock`, `GetLightdInfo`, `GetLatestTreeState`, `GetTransaction`, `SendTransaction`, the mempool methods, the transparent-address methods, `GetSubtreeRoots`, and native `WalletQuery` never wait.
+
+A request waits only when its height is above the visible tip by at most `compat.tip_wait_max_blocks` blocks (default 2). It waits up to `compat.tip_wait_ms` milliseconds (default 3000, and 0 turns the wait off). At most `compat.tip_wait_max_waiters` requests (default 256) wait at once, and a request that finds them all taken answers at once. [Configuration](configuration.md) lists the settings and their limits. The default wait is provisional until cross-region skew has been measured, and operators can raise it.
+
+A waiting request wakes each time the reader publishes a new tip and checks the fresh tip, with no polling:
+
+- When the height arrives, the method runs as if it had been there from the start.
+- When the wait expires, the method answers with its usual status against the fresh tip: `OUT_OF_RANGE` with `block N is newer than latest block M` for block reads, and `INVALID_ARGUMENT` for `GetTreeState`. There is no new status or error reason.
+- When a publication moves the tip down so that the height is outside the window, the wait ends at once.
+- When the reader adopts a different block at the awaited height, a request by height alone serves the local block. A request by height and hash gets the usual `NOT_FOUND` with `requested block hash does not match indexed block`.
+- When shutdown begins, every wait ends at once.
+- When the client sets a `grpc-timeout` shorter than the wait, the request ends with `DEADLINE_EXCEEDED`. A public listener answers any expired `grpc-timeout` whose response has not started with `DEADLINE_EXCEEDED`, as the gRPC status-code specification and grpc-go servers such as lightwalletd do.
+
+A waiting request holds no reader generation, serving pair, or block-range stream slot, so waiting requests never use the stream slots below. [Metrics](metrics.md#zinder-compat-lightwalletd) lists `zinder_compat_tip_wait_total`, `zinder_compat_tip_wait_duration_seconds`, and `zinder_compat_tip_waiters`.
+
 ### `GetBlock` and `GetBlockNullifiers`
 
-A `BlockID` with a height reads that height. Zinder also accepts a 32-byte hash in internal byte order for these two methods. Height 0 with a hash selects the block by hash. Height 0 with an empty hash is an unspecified identifier and returns `INVALID_ARGUMENT`. A height above the visible tip returns `OUT_OF_RANGE`. A hash that is not in the best chain, or a hash that does not match the block at the given height, returns `NOT_FOUND`. A best-chain block whose compact block the store does not hold also returns `NOT_FOUND`, but with the [reason](error-vocabulary.md) `ARTIFACT_UNAVAILABLE`, where a hash that is not in the best chain carries `BLOCK_NOT_IN_BEST_CHAIN`.
+A `BlockID` with a height reads that height. Zinder also accepts a 32-byte hash in internal byte order for these two methods. Height 0 with a hash selects the block by hash. Height 0 with an empty hash is an unspecified identifier and returns `INVALID_ARGUMENT`. A height above the visible tip returns `OUT_OF_RANGE` once the [tip wait](#waiting-for-a-height-just-past-the-tip) ends. A hash that is not in the best chain, or a hash that does not match the block at the given height, returns `NOT_FOUND`. A best-chain block whose compact block the store does not hold also returns `NOT_FOUND`, but with the [reason](error-vocabulary.md) `ARTIFACT_UNAVAILABLE`, where a hash that is not in the best chain carries `BLOCK_NOT_IN_BEST_CHAIN`.
 
 `GetBlock` supports these lookups in every serving mode. In compact-blocks serving it returns the stored block without pool filtering. `GetBlockNullifiers` is available in wallet and light-wallet serving and returns `UNIMPLEMENTED` in compact-blocks serving.
 
@@ -133,10 +158,12 @@ These outcomes fail the call before any block is sent:
 | Missing bound or height above `uint32` | `INVALID_ARGUMENT` |
 | No block-range stream slot returned within 10 seconds, or the queue for one is full | `UNAVAILABLE` |
 | An admitted request includes `POOL_TYPE_INVALID` (0) | `UNKNOWN` |
-| Higher bound above the visible tip | `OUT_OF_RANGE` |
+| Higher bound above the visible tip, once the [tip wait](#waiting-for-a-height-just-past-the-tip) ends | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
 | A block missing inside retained history, where the read of the first chunk reaches it | `UNAVAILABLE` |
 | A stored block of the first chunk that a lightwalletd message cannot carry, such as a transaction fee above `uint32` | `DATA_LOSS` |
+
+The tip wait happens before the first header is sent and before the request takes a stream slot, so a stream never sends a prefix and then waits. The longest delay before a range response's headers is the tip wait plus the 10-second slot wait below.
 
 Once a stream has started, a client can rely on the following:
 
@@ -219,7 +246,7 @@ On Linux, the publisher automatically enables SHA-256 fs-verity with 4,096-byte 
 
 ### `GetTreeState` and `GetLatestTreeState`
 
-`GetTreeState` answers retained heights at or after Sapling activation from Zinder's store, where lightwalletd asks its node. Before activation it returns `INVALID_ARGUMENT`, matching Go lightwalletd v0.6.2, for both height and hash requests. Native WalletQuery tree-state reads still return pre-activation states with inactive pools absent. A positive `height` takes precedence and ignores `hash`. An empty hash at height zero is an unspecified selector and returns `INVALID_ARGUMENT`. The genesis hash returns the pre-Sapling error even when retained history starts at a later checkpoint. With `height = 0`, send the 32 bytes obtained by hex-decoding `TreeState.hash` in RPC byte order. A wallet starting from `CompactBlock.prevHash` reverses those bytes once to request the predecessor’s tree state. A hash outside the best chain and a height above the visible tip both return `INVALID_ARGUMENT`, matching lightwalletd's status for a failed `z_gettreestate` lookup. A refused rebuild returns `UNAVAILABLE`. Other height lookup statuses follow [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots).
+`GetTreeState` answers retained heights at or after Sapling activation from Zinder's store, where lightwalletd asks its node. Before activation it returns `INVALID_ARGUMENT`, matching Go lightwalletd v0.6.2, for both height and hash requests. Native WalletQuery tree-state reads still return pre-activation states with inactive pools absent. A positive `height` takes precedence and ignores `hash`. An empty hash at height zero is an unspecified selector and returns `INVALID_ARGUMENT`. The genesis hash returns the pre-Sapling error even when retained history starts at a later checkpoint. With `height = 0`, send the 32 bytes obtained by hex-decoding `TreeState.hash` in RPC byte order. A wallet starting from `CompactBlock.prevHash` reverses those bytes once to request the predecessor’s tree state. A hash outside the best chain and a height above the visible tip, once the [tip wait](#waiting-for-a-height-just-past-the-tip) ends, both return `INVALID_ARGUMENT`, matching lightwalletd's status for a failed `z_gettreestate` lookup. A refused rebuild returns `UNAVAILABLE`. Other height lookup statuses follow [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots).
 
 Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild limit. A rebuild that finds every slot taken waits up to `compat.tree_state_replay_wait_ms` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS`, 0 to 5,000 ms, 2,000 by default), then fails with `UNAVAILABLE`, the code a full block-range limit returns, so a wallet retries both limits the same way. It fails at once when every waiting place is taken. `compat.tree_state_replay_waiters_per_slot` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT`, 1 to 256, 64 by default) sets the waiting places per slot. Native `TreeStateAtHeight` refuses the same rebuild with `RESOURCE_EXHAUSTED` and `TREE_STATE_REPLAY_LIMIT_REACHED`. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip. It returns `INVALID_ARGUMENT` when that checkpoint precedes Sapling activation.
 

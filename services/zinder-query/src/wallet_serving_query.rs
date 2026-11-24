@@ -2324,6 +2324,38 @@ mod tree_state_replay_limit_tests {
         Ok(())
     }
 
+    /// A subscription taken before a read wakes on the publication that
+    /// replaces the pair the read saw, and holds no pair while it waits.
+    #[tokio::test]
+    async fn a_publication_subscription_wakes_on_the_next_publication() -> Result<(), Box<dyn Error>>
+    {
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let activations = sample_regtest_upgrade_activations();
+        let mut original = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let mut updated =
+            WalletServingStoreFixture::from_chain(&chain.extend_blocks(1), &activations)?;
+        let read_pair = |store: &mut WalletServingStoreFixture| -> Result<_, Box<dyn Error>> {
+            let (canonical, wallet) = store.take_readers()?;
+            Ok(Arc::new(WalletServingReadPair::new(
+                Arc::new(RocksDbCanonicalReader::new(canonical)?),
+                Arc::new(RocksDbWalletReader::new(wallet)),
+            )?))
+        };
+        let slot = WalletServingPairSlot::new(read_pair(&mut original)?);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        let mut publications = query
+            .subscribe_publications()
+            .ok_or("a slot-backed query publishes replacements")?;
+        let seen = query.visible_tip_block(None).await?.height;
+        assert!(!publications.has_changed()?);
+
+        slot.publish_for_test(read_pair(&mut updated)?);
+        tokio::time::timeout(Duration::from_secs(1), publications.changed()).await??;
+        let advanced = query.visible_tip_block(None).await?.height;
+        assert_eq!(advanced.value(), seen.value() + 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn replacement_serves_the_waiting_wallet_before_a_later_wallet()
     -> Result<(), Box<dyn Error>> {

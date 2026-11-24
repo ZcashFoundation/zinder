@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use zinder_compat_lightwalletd::{
     IngestControlMempoolSurface, LightwalletdGrpcAdapter, LightwalletdPing, NodeTipWitness,
-    spawn_ingest_control_tip_change_publisher, spawn_node_tip_witness,
+    TipWait, spawn_ingest_control_tip_change_publisher, spawn_node_tip_witness,
 };
 use zinder_runtime::{
     OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase, SupervisedRuntime,
@@ -318,6 +318,7 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
             lightwalletd_config.max_concurrent_block_range_streams,
         )
         .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
+        .with_tip_wait(configured_tip_wait(&lightwalletd_config, &cancel))
         .with_node_tip_witness(node_tip_witness)
         .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let grpc_adapter = match &catalog_refresh {
@@ -374,6 +375,9 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
             .stale_tip_limit
             .limit()
             .map(|limit| limit.as_secs()),
+        tip_wait_ms = lightwalletd_config.tip_wait.as_millis(),
+        tip_wait_max_blocks = lightwalletd_config.tip_wait_max_blocks.get(),
+        tip_wait_max_waiters = lightwalletd_config.tip_wait_max_waiters.get(),
         tree_state_replay_wait_ms = tree_state_replay_wait.as_millis(),
         tree_state_replay_waiters_per_slot = tree_state_replay_waiters_per_slot.get(),
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
@@ -581,6 +585,7 @@ async fn run_canonical(
                 lightwalletd_config.max_concurrent_block_range_streams,
             )
             .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
+            .with_tip_wait(configured_tip_wait(&lightwalletd_config, &cancel))
             .with_node_tip_witness(node_tip_witness)
             .with_ping(configured_ping(&lightwalletd_config, &cancel));
             let adapter = match &catalog_refresh {
@@ -620,6 +625,7 @@ async fn run_canonical(
                     lightwalletd_config.max_concurrent_block_range_streams,
                 )
                 .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
+                .with_tip_wait(configured_tip_wait(&lightwalletd_config, &cancel))
                 .with_node_tip_witness(node_tip_witness)
                 .with_ping(configured_ping(&lightwalletd_config, &cancel));
             let grpc_adapter = match &catalog_refresh {
@@ -654,6 +660,9 @@ async fn run_canonical(
             .stale_tip_limit
             .limit()
             .map(|limit| limit.as_secs()),
+        tip_wait_ms = lightwalletd_config.tip_wait.as_millis(),
+        tip_wait_max_blocks = lightwalletd_config.tip_wait_max_blocks.get(),
+        tip_wait_max_waiters = lightwalletd_config.tip_wait_max_waiters.get(),
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
@@ -771,6 +780,23 @@ fn spawn_configured_node_tip_witness(
         lightwalletd_config.storage.secondary_catchup_interval,
         cancel.clone(),
     )
+}
+
+/// Builds the tip wait from configuration, ended by a graceful shutdown. A
+/// zero wait disables it.
+fn configured_tip_wait(
+    lightwalletd_config: &config::LightwalletdConfig,
+    shutdown: &CancellationToken,
+) -> TipWait {
+    if lightwalletd_config.tip_wait.is_zero() {
+        return TipWait::disabled();
+    }
+    TipWait::new(
+        lightwalletd_config.tip_wait,
+        lightwalletd_config.tip_wait_max_blocks,
+        lightwalletd_config.tip_wait_max_waiters,
+    )
+    .with_shutdown(shutdown.clone())
 }
 
 fn configured_ping(
