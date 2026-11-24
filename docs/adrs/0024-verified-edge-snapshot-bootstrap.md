@@ -31,11 +31,6 @@ that boundary. The publisher keeps its own store and credentials.
   using the canonical store byte order for block hashes and the typed source
   byte order for tree roots.
 
-The receiver refuses a snapshot whose first retained block is above the first
-block its writer requires, which is block 1 without a checkpoint override and
-the block after the override otherwise. Manifest preflight enforces this before
-any payload is copied or downloaded, and attestation enforces it again, so
-normal writer startup never rejects a published bootstrap.
 - `manifest.v1.sig`, exactly 64 raw Ed25519 signature bytes. The publisher
   signs the ASCII format identifier followed by a NUL byte and the exact JSON
   bytes on disk. The receiver checks the signature against at least one
@@ -70,12 +65,14 @@ any payload is copied or downloaded, and attestation enforces it again. A
 writer started with the same `checkpoint_height` applies the same rule, so
 normal writer startup never rejects a published bootstrap.
 
-Bundled sealed history must cover no block above the snapshot boundary, because
-the compatibility runtime admits it against the canonical chain the bundle
-carries. A bundle copies files without their fs-verity protection, so a
-reader that sets `require_fs_verity = true` needs `fsverity enable --hash-alg
-sha256 --block-size 4096 FILE` run on each destination segment before it
-admits the catalog.
+Bundled sealed history must fit the snapshot's canonical store. When the
+compatibility runtime admits the catalog, its first segment must not start below
+the store's first retained block, and its last segment must not end above the
+settled canonical tip, which is the snapshot boundary until ingest advances. A
+bundle copies files without their fs-verity protection, so a reader that sets
+`require_fs_verity = true` needs `fsverity enable --hash-alg sha256
+--block-size 4096 FILE` run on each destination segment before it admits the
+catalog.
 
 After cold admission, the receiver compares the signed anchors with evidence
 read back from the store. The configured `NodeSource` must also attest:

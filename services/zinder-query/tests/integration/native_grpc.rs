@@ -767,6 +767,65 @@ async fn lean_wallet_transaction_miss_verifies_the_forwarding_node_before_the_me
     Ok(())
 }
 
+/// An unpinned lookup below the history floor of a lean store verifies the
+/// forwarding node first, so a stopped node is `UNAVAILABLE` and the mempool
+/// is never consulted.
+#[tokio::test]
+async fn lean_wallet_history_floor_miss_verifies_the_forwarding_node_first() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(3);
+    let tip = chain
+        .blocks()
+        .last()
+        .ok_or_else(|| eyre!("missing fixture tip"))?;
+    let schedule = one_upgrade_per_height()?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(2)),
+        &schedule,
+    )?;
+    let mut store_fixture = writer.into_serving_store_fixture()?;
+    let node = verifiable_node(&schedule, tip.hash)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?);
+    let ingest_control = StaticIngestControl::new();
+    let mempool = ingest_control.clone();
+    let (ingest_control_addr, cancel, server_task) =
+        spawn_ingest_control_server(ingest_control).await?;
+    let admitted = AdmittedIngestControl::connect(
+        &format!("http://{ingest_control_addr}"),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let source = zinder_source::ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        node.url(),
+        zinder_source::NodeAuth::None,
+        Duration::from_secs(2),
+    )?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(pair),
+        admitted,
+    )
+    .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
+    .with_verified_cold_transactions();
+    let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
+    let unknown = TransactionId::from_bytes([0x4a; 32]);
+
+    drop(node);
+    let unverified = transaction_status(&adapter, unknown, None).await?;
+    assert_eq!(unverified.code(), Code::Unavailable, "{unverified:?}");
+    assert_eq!(mempool.mempool_transaction_call_count(), 0);
+
+    cancel.cancel();
+    server_task.await??;
+    Ok(())
+}
+
 fn one_upgrade_per_height() -> eyre::Result<zinder_core::NetworkUpgradeActivations> {
     Ok(zinder_core::NetworkUpgradeActivations::new(
         Network::ZcashRegtest,

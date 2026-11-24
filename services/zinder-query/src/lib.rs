@@ -340,8 +340,10 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     ///
     /// A caller consults the live mempool after a canonical miss only once
     /// this succeeds, so a lookup never reports a pending answer or an
-    /// absence while the forwarding node is down, ahead of the served tip, or
-    /// on another tip. A query whose store retains transaction bodies, or that
+    /// absence while the forwarding node is unreachable, behind the served
+    /// tip, or on a different chain from the served tip. A node that holds
+    /// the served tip on its best chain passes even when it has mined further.
+    /// A query whose store retains transaction bodies, or that
     /// has no forwarding node, has nothing to verify and succeeds.
     async fn verify_forwarding_node(
         &self,
