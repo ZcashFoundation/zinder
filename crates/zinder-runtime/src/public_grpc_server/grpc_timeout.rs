@@ -1,8 +1,10 @@
 //! The deadline a client sets with the `grpc-timeout` request header.
 //!
-//! A response that has not started by the deadline ends with `CANCELLED`,
-//! as tonic's own server ends it. The deadline does not bound a response
-//! stream once its headers are sent.
+//! A response that has not started by the deadline ends with
+//! `DEADLINE_EXCEEDED`, the code the gRPC status-code specification assigns to
+//! an expired deadline and the one grpc-go servers, such as lightwalletd,
+//! return. tonic's own server returns `CANCELLED` instead. The deadline does
+//! not bound a response stream once its headers are sent.
 
 use std::{
     future::Future,
@@ -86,7 +88,7 @@ where
     let outcome = match deadline {
         Some(deadline) => match tokio::time::timeout(deadline, response).await {
             Ok(outcome) => outcome,
-            Err(_) => return Ok(Status::cancelled("Timeout expired").into_http()),
+            Err(_) => return Ok(Status::deadline_exceeded("Timeout expired").into_http()),
         },
         None => response.await,
     };
@@ -148,8 +150,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_response_that_misses_the_deadline_is_cancelled()
-    -> Result<(), std::convert::Infallible> {
+    async fn a_response_that_misses_the_deadline_exceeds_it() -> Result<(), std::convert::Infallible>
+    {
         let response = respond_within(
             Some(Duration::from_millis(10)),
             future::pending::<Result<http::Response<Body>, std::convert::Infallible>>(),
@@ -158,7 +160,7 @@ mod tests {
         let status = tonic::Status::from_header_map(response.headers());
         assert_eq!(
             status.map(|status| status.code()),
-            Some(tonic::Code::Cancelled)
+            Some(tonic::Code::DeadlineExceeded)
         );
         Ok(())
     }

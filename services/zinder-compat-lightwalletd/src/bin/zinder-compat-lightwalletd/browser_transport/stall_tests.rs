@@ -519,7 +519,7 @@ async fn check_browser_deadline(encoding: &'static str) -> Result<()> {
     );
     assert_eq!(
         Status::from_header_map(response.headers()).map(|status| status.code()),
-        Some(tonic::Code::Cancelled)
+        Some(tonic::Code::DeadlineExceeded)
     );
     assert!(
         within_wait_limit(response.into_body().collect())

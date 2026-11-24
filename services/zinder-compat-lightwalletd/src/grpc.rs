@@ -55,6 +55,7 @@ use crate::node_tip_witness::NodeTipWitness;
 use crate::ping::LightwalletdPing;
 use crate::request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
 use crate::stale_tip::StaleTipLimit;
+use crate::tip_wait::TipWait;
 
 /// A server-streaming response of the `CompactTxStreamer` adapters.
 pub(crate) type GrpcStream<T> =
@@ -264,6 +265,20 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     #[must_use]
     pub fn with_node_tip_witness(mut self, node_tip_witness: NodeTipWitness) -> Self {
         self.block_methods = self.block_methods.with_node_tip_witness(node_tip_witness);
+        self
+    }
+
+    /// Lets a block read that names a height just past the visible tip wait
+    /// briefly for that height instead of failing at once.
+    ///
+    /// Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`,
+    /// `GetBlockRangeNullifiers`, the encoded range methods, and, where this
+    /// adapter serves it, `GetTreeState`, when they select by height. The
+    /// adapter defaults to [`TipWait::disabled`]; the
+    /// `zinder-compat-lightwalletd` binary sets the configured wait.
+    #[must_use]
+    pub fn with_tip_wait(mut self, tip_wait: TipWait) -> Self {
+        self.block_methods = self.block_methods.with_tip_wait(tip_wait);
         self
     }
 
@@ -499,6 +514,10 @@ where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
     type View = ChainEpoch;
+
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        WalletQueryApi::subscribe_publications(self)
+    }
 
     async fn capture_view(&self) -> Result<ChainEpoch, Status> {
         self.visible_tip_block(None)
@@ -900,6 +919,10 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.query_api, "get_encoded_block_range", &request)
+            .await?;
         let range = self.published_history.as_ref().map_or_else(
             || (None, self.live_tail.clone()),
             |history| history.encoded_range(),
@@ -907,7 +930,7 @@ where
         self.block_methods
             .published_block_range(
                 &self.query_api,
-                &request.into_inner(),
+                &request,
                 range,
                 CompactBlockShape::for_range,
             )
@@ -925,6 +948,14 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<lightwalletd::EncodedBlockRangeStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(
+                &self.query_api,
+                "get_encoded_block_range_nullifiers",
+                &request,
+            )
+            .await?;
         let range = self.published_history.as_ref().map_or_else(
             || (None, self.live_tail.clone()),
             |history| history.encoded_range(),
@@ -932,7 +963,7 @@ where
         self.block_methods
             .published_block_range(
                 &self.query_api,
-                &request.into_inner(),
+                &request,
                 range,
                 CompactBlockShape::for_nullifier_range,
             )
@@ -970,22 +1001,26 @@ where
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
-        block_methods::compact_block(
-            &self.query_api,
-            &request.into_inner(),
-            CompactBlockShape::FULL_BLOCK,
-        )
-        .await
-        .map(Response::new)
+        let block_id = request.into_inner();
+        self.block_methods
+            .await_block_tip(&self.query_api, "get_block", &block_id)
+            .await?;
+        block_methods::compact_block(&self.query_api, &block_id, CompactBlockShape::FULL_BLOCK)
+            .await
+            .map(Response::new)
     }
 
     async fn get_block_nullifiers(
         &self,
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::CompactBlock>, Status> {
+        let block_id = request.into_inner();
+        self.block_methods
+            .await_block_tip(&self.query_api, "get_block_nullifiers", &block_id)
+            .await?;
         block_methods::compact_block(
             &self.query_api,
-            &request.into_inner(),
+            &block_id,
             CompactBlockShape::BLOCK_NULLIFIERS,
         )
         .await
@@ -1000,6 +1035,9 @@ where
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let request = request.into_inner();
         self.block_methods
+            .await_range_tip(&self.query_api, "get_block_range", &request)
+            .await?;
+        self.block_methods
             .block_range(&self.query_api, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
@@ -1012,6 +1050,9 @@ where
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
         let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.query_api, "get_block_range_nullifiers", &request)
+            .await?;
         self.block_methods
             .block_range(
                 &self.query_api,
@@ -1157,6 +1198,11 @@ where
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
+        if let RequestedBlock::Height(height) = block {
+            self.block_methods
+                .await_tip(&self.query_api, "get_tree_state", height)
+                .await?;
+        }
         let view = self.query_api.capture_view().await?;
         reject_genesis_tree_state(block, view.network)?;
         let height = resolve_block_height(&self.query_api, &view, block)

@@ -44,6 +44,7 @@ use crate::compact_block_messages::{CompactBlockShape, ironwood_active_at_or_bel
 use crate::network_tip_estimate::estimated_network_height;
 use crate::node_tip_witness::NodeTipWitness;
 use crate::stale_tip::{StaleTipLimit, TipBlockTime, TipBlockTimeCache, unix_now_seconds};
+use crate::tip_wait::TipWait;
 
 /// The chain view a chunk read answers at.
 pub(crate) enum ChunkView<View> {
@@ -135,6 +136,16 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
 
     /// Captures the chain view current now, without a storage read.
     fn capture_view(&self) -> impl Future<Output = Result<Self::View, Status>> + Send;
+
+    /// Subscribes to publications of newer views, so a request can wait for
+    /// the visible tip to advance without polling.
+    ///
+    /// The receiver reports a change for every view published after this
+    /// call, so a caller subscribes before it captures the view it compares.
+    /// `None` means the mode publishes no newer views, and no request waits.
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        None
+    }
 
     /// Captures the chain view for one single-shot tip call, such as
     /// `GetLatestBlock` or `GetLightdInfo`, which expose no epoch and read
@@ -244,6 +255,7 @@ pub(crate) struct BlockMethods {
     tip_block_times: TipBlockTimeCache,
     node_tip_witness: NodeTipWitness,
     unix_clock: UnixClock,
+    tip_wait: TipWait,
 }
 
 impl std::fmt::Debug for BlockMethods {
@@ -257,6 +269,7 @@ impl std::fmt::Debug for BlockMethods {
             .field("stale_tip_limit", &self.stale_tip_limit.limit())
             .field("tip_block_times", &self.tip_block_times)
             .field("node_tip_witness", &self.node_tip_witness)
+            .field("tip_wait", &self.tip_wait)
             .finish_non_exhaustive()
     }
 }
@@ -271,6 +284,7 @@ impl Default for BlockMethods {
             tip_block_times: TipBlockTimeCache::default(),
             node_tip_witness: NodeTipWitness::default(),
             unix_clock: Arc::new(unix_now_seconds),
+            tip_wait: TipWait::disabled(),
         }
     }
 }
@@ -321,6 +335,62 @@ impl BlockMethods {
     pub(crate) fn with_node_tip_witness(mut self, node_tip_witness: NodeTipWitness) -> Self {
         self.node_tip_witness = node_tip_witness;
         self
+    }
+
+    /// Sets how long and how far past the visible tip a height-selected read
+    /// waits for its height.
+    pub(crate) fn with_tip_wait(mut self, tip_wait: TipWait) -> Self {
+        self.tip_wait = tip_wait;
+        self
+    }
+
+    /// Waits, within the configured tip wait, for the visible tip to reach
+    /// `requested` before the method `method` reads it.
+    ///
+    /// Call it after the request is parsed and before any slot, permit, or
+    /// view is taken. It fails only with the status a tip capture failed with.
+    pub(crate) async fn await_tip<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        method: &'static str,
+        requested: BlockHeight,
+    ) -> Result<(), Status> {
+        self.tip_wait.await_height(reads, method, requested).await
+    }
+
+    /// Runs [`Self::await_tip`] for a `GetBlock` or `GetBlockNullifiers`
+    /// request that selects its block by height, with or without a hash.
+    ///
+    /// A hash-only or malformed selector never waits, so the method answers
+    /// it at once with its own status.
+    pub(crate) async fn await_block_tip<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        method: &'static str,
+        block_id: &lightwalletd::BlockId,
+    ) -> Result<(), Status> {
+        match requested_block(block_id, decode_internal_block_hash) {
+            Ok(RequestedBlock::Height(height)) => self.await_tip(reads, method, height).await,
+            Ok(RequestedBlock::Hash(_)) | Err(_) => Ok(()),
+        }
+    }
+
+    /// Runs [`Self::await_tip`] for a block-range request at the highest
+    /// height it names, in either order.
+    ///
+    /// A malformed range never waits, so the method answers it at once with
+    /// its own status. The wait runs before the method takes a range-stream
+    /// slot, so waiting requests never hold one.
+    pub(crate) async fn await_range_tip<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        method: &'static str,
+        request: &lightwalletd::BlockRange,
+    ) -> Result<(), Status> {
+        match block_range_from_request(request) {
+            Ok((range, _is_descending)) => self.await_tip(reads, method, range.end).await,
+            Err(_) => Ok(()),
+        }
     }
 
     /// Judges tip ages at the Unix time `unix_clock` reports.

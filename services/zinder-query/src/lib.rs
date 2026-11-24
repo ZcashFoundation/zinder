@@ -111,6 +111,16 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         None
     }
 
+    /// Subscribes to replacements of the serving data this query reads, so a
+    /// caller can wait for a newer visible tip without polling.
+    ///
+    /// The receiver reports a change for every replacement made after this
+    /// call. `None` means the query publishes no replacements, and a caller
+    /// must not wait for one.
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        None
+    }
+
     /// Returns the immutable structural capability set derived when this query
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;

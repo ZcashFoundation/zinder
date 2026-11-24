@@ -735,6 +735,10 @@ where
         })
     }
 
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        Some(self.serving_pair_slot.subscribe_publications())
+    }
+
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
         &self.native_endpoint_capabilities
     }
