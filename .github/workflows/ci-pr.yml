@@ -57,7 +57,7 @@ jobs:
           rust_needed=true
           if [[ "${EVENT_NAME}" == pull_request ]] \
             && git rev-parse --verify --quiet 'HEAD^2' >/dev/null \
-            && changed="$(git diff --name-only 'HEAD^1' HEAD)" \
+            && changed="$(git diff --no-renames --name-only 'HEAD^1' HEAD)" \
             && [[ -n "${changed}" ]] \
             && ! grep -qvE "${prose_only}" <<< "${changed}"; then
             rust_needed=false
@@ -81,9 +81,6 @@ jobs:
 
       - name: Format
         run: cargo fmt --all --check
-
-      - name: Check canonical store defaults across runtimes
-        run: python3 scripts/test-canonical-storage-defaults.py
 
       - name: Diff hygiene
         run: git diff --check
@@ -216,11 +213,16 @@ jobs:
           set -euo pipefail
           archive_dir="${RUNNER_TEMP}/nextest-archive"
           mkdir -p "${archive_dir}"
-          cargo build --locked --workspace --all-features --examples
+          cargo build --locked --workspace --all-features --example wallet-reader-fixture
           cargo nextest archive --locked --workspace --all-features \
             --archive-file "${archive_dir}/nextest.tar.zst" --zstd-level 1
           cp target/debug/examples/wallet-reader-fixture "${archive_dir}/"
           ls -l "${archive_dir}"
+
+      # Reads the runtime binaries that the archive build leaves in
+      # target/debug.
+      - name: Check canonical store defaults across runtimes
+        run: python3 scripts/test-canonical-storage-defaults.py
 
       - name: Upload the test archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

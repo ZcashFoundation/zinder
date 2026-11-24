@@ -19,7 +19,7 @@ on:
     # manifest and lockfile that pin the consensus cohort, the node
     # configurations, the mining and indexer TLS scripts, the CBB report
     # validator, the CI tool installer and its lock (which pins cargo-nextest),
-    # and both workflows.
+    # the shared Rust setup action, and both workflows.
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -39,6 +39,7 @@ on:
       - "scripts/validate-cbb-interop-report.sh"
       - "scripts/install-ci-tool.sh"
       - ".github/ci-tools.lock"
+      - ".github/actions/setup-rust/**"
       - ".github/workflows/live-tests.yml"
       - ".github/workflows/parity-compat.yml"
 

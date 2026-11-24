@@ -227,9 +227,9 @@ The `ci-pr` Rust jobs run in parallel:
 | Job | What it runs |
 | --- | --- |
 | `changes` | Decides whether the Rust jobs run. They are skipped only when every file a pull request changes is under `.changes/`, `docs/adrs/`, or `docs/architecture/`, is `AGENTS.md` or `README.md`, or is a Markdown file under `scripts/wallet-clients/`. Anything else, including the runbooks, the reference pages, and `CLAUDE.md` that doc-contract tests read, runs them. |
-| `fmt` | `cargo fmt`, the canonical storage defaults check, and `git diff --check` |
+| `fmt` | `cargo fmt` and `git diff --check` |
 | `lint` | `cargo check`, the hermetic `zinder-proto` build, `cargo clippy`, and `cargo doc` |
-| `test build` | Builds the workspace tests and examples once and uploads them as a `cargo nextest archive` |
+| `test build` | Builds the workspace tests once, uploads them as a `cargo nextest archive` with the wallet reader fixture, and checks the canonical storage defaults of the built runtimes |
 | `test (shard N/4)` | The `ci` profile from the archive, split into four `hash` partitions |
 | `test tiers` | From the same archive: the nextest selector check, the paired wallet reader measurement, the ext4 protected-history tests, and the `ci-postgres`, `ci-parity`, and `ci-perf` profiles |
 | Pasta and LtHash16 parity | Assembly and portable backends, including the assembly-enabled Pasta guard, on x86-64 and AArch64 |
@@ -239,7 +239,9 @@ All workflows follow these rules:
 
 - **A new push cancels the superseded run.** Every workflow groups pull
   request runs by pull request and cancels the older one. Runs on `main`,
-  scheduled runs, and manual runs are never cancelled.
+  scheduled runs, and manual runs are never cancelled. `binary-archives` and
+  `build-images` queue them per branch, so two `main` runs never save the
+  same cache at once.
 - **Every job has a timeout.** A hung job stops at its `timeout-minutes`.
 - **Tools come from checksum-pinned release assets.** No job compiles
   `cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`, or
@@ -253,7 +255,8 @@ All workflows follow these rules:
   `scripts/test-workflow-action-pins.sh` checks every `uses:` in the
   workflows, the composite actions under `.github/actions/`, and
   `scripts/release-wallet-action/`. The `setup-rust` composite action installs
-  the toolchain, the Rust cache, and CI tools for every Rust job.
+  the toolchain, the Rust cache, and CI tools for every Rust job. A workflow
+  with a `paths` filter lists the composite actions it calls.
 - **Archived tests run without a toolchain.** Jobs that run a nextest archive
   install only `cargo-nextest` and call `cargo-nextest nextest` directly, so
   rustup never installs the toolchain from `rust-toolchain.toml`. Tests must
@@ -276,8 +279,10 @@ All workflows follow these rules:
   prefix match seeds a build after a dependency bump. `binary-archives` saves
   it from `main` without workspace artifacts, and both `binary-archives` and
   `build-images` restore it. `build-images` saves the `zinder-build-base` layer
-  cache once per platform from `main`. `release.yml` builds without either
-  cache.
+  cache once per platform from `main`. Both workflows run
+  `crazy-max/ghaction-github-runtime` first, because `docker buildx build`
+  reaches the Actions cache only through the `ACTIONS_*` variables it
+  exports. `release.yml` builds without either cache.
 - **Live and parity share one path filter.** Keep the `paths` lists in
   `live-tests.yml` and `parity-compat.yml` identical.
 - **Live and parity Cargo commands use `--locked`**, so a stale lockfile fails

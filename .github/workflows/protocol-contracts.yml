@@ -16,6 +16,7 @@ on:
       - "crates/zinder-proto/src/capabilities.rs"
       - "tools/zinder-proto-codegen/**"
       - ".github/workflows/protocol-contracts.yml"
+      - ".github/actions/setup-rust/**"
   push:
     branches:
       - main
@@ -33,6 +34,7 @@ on:
       - "crates/zinder-proto/src/capabilities.rs"
       - "tools/zinder-proto-codegen/**"
       - ".github/workflows/protocol-contracts.yml"
+      - ".github/actions/setup-rust/**"
   workflow_dispatch:
 
 permissions:

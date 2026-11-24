@@ -20,7 +20,7 @@ on:
     # manifest and lockfile that pin the consensus cohort, the node
     # configurations, the mining and indexer TLS scripts, the CBB report
     # validator, the CI tool installer and its lock (which pins cargo-nextest),
-    # and both workflows.
+    # the shared Rust setup action, and both workflows.
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -40,6 +40,7 @@ on:
       - "scripts/validate-cbb-interop-report.sh"
       - "scripts/install-ci-tool.sh"
       - ".github/ci-tools.lock"
+      - ".github/actions/setup-rust/**"
       - ".github/workflows/live-tests.yml"
       - ".github/workflows/parity-compat.yml"
   schedule:
@@ -241,11 +242,17 @@ jobs:
         run: scripts/mine-live-regtest.sh "${ZINDER_NODE__JSON_RPC_ADDR}" 120
 
       - name: Wait for the live tests to compile
+        timeout-minutes: 30
         run: |
-          while [[ ! -f "$RUNNER_TEMP/live-build.status" ]]; do
+          for _ in $(seq 1 360); do
+            [[ -f "$RUNNER_TEMP/live-build.status" ]] && break
             sleep 5
           done
           cat "$RUNNER_TEMP/live-build.log"
+          if [[ ! -f "$RUNNER_TEMP/live-build.status" ]]; then
+            echo "::error::The live tests did not finish compiling within 30 minutes"
+            exit 1
+          fi
           exit "$(cat "$RUNNER_TEMP/live-build.status")"
 
       # The activation test runs first and alone: it broadcasts below NU7,
