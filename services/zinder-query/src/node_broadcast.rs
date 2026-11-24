@@ -1176,6 +1176,20 @@ async fn verify_node_endpoint(
     source: &impl BroadcastNodeProbe,
     target: &VerificationTarget,
 ) -> Result<PassedVerification, VerificationFailure> {
+    let passed = verify_node_schedule(source, target).await?;
+    verify_served_tip(source, target)
+        .await
+        .map_err(VerificationFailure::Inconclusive)?;
+    Ok(passed)
+}
+
+/// Checks that the endpoint lists `sendrawtransaction` and that its
+/// activation table agrees with the writer-admitted schedule through the
+/// height after the served tip, without checking the tip itself.
+async fn verify_node_schedule(
+    source: &impl BroadcastNodeProbe,
+    target: &VerificationTarget,
+) -> Result<PassedVerification, VerificationFailure> {
     let capabilities = source
         .probe_capabilities()
         .await
@@ -1194,9 +1208,6 @@ async fn verify_node_endpoint(
             VerificationRefusal::ScheduleMismatch,
         ));
     }
-    verify_served_tip(source, target)
-        .await
-        .map_err(VerificationFailure::Inconclusive)?;
     Ok(PassedVerification {
         capabilities: UpstreamNodeCapabilities::from_probed(capabilities),
         node_activations,
@@ -1210,16 +1221,35 @@ async fn verify_served_tip(
     if source.holds_block(target.fence.visible_tip()).await? {
         Ok(())
     } else {
-        Err(SourceError::SourceProtocolMismatch {
-            reason: "node best chain holds another block at the served tip height",
-        })
+        Err(served_tip_mismatch())
     }
 }
 
+fn served_tip_mismatch() -> SourceError {
+    SourceError::SourceProtocolMismatch {
+        reason: "node best chain holds another block at the served tip height",
+    }
+}
+
+/// Verification of the one node a light-wallet reader forwards reads to.
+///
+/// The schedule check confirms that the node lists `sendrawtransaction` and
+/// that its activation table agrees with the writer-admitted schedule through
+/// the height after the served tip. A pass holds for
+/// [`STALE_VERIFICATION_GRACE`] against the same basis, and concurrent
+/// callers share one check. An inconclusive repeat, such as an unreachable,
+/// rate-limited, or lagging node, fails the callers that waited on it but
+/// never discards the earlier pass or forces later callers into a full
+/// verification of their own.
+///
+/// The served-tip check confirms that the node's best chain holds a block.
+/// Concurrent callers checking the same block share one `getblockhash` call,
+/// and no answer is reused once that call returns.
 #[derive(Default)]
 pub(crate) struct LightWalletNodeVerification {
     schedule: Mutex<LightWalletNodeVerificationSchedule>,
     failed_attempts: AtomicU64,
+    tip_checks: TipChecks,
 }
 
 #[derive(Default)]
@@ -1231,7 +1261,10 @@ enum LightWalletNodeVerificationSchedule {
 }
 
 impl LightWalletNodeVerification {
-    pub(crate) async fn verify(
+    /// Verifies the node's capabilities and activation table against
+    /// `target`, reusing a pass against the same basis for up to
+    /// [`STALE_VERIFICATION_GRACE`].
+    pub(crate) async fn verify_schedule_and_capabilities(
         &self,
         source: &impl BroadcastNodeProbe,
         target: &VerificationTarget,
@@ -1240,24 +1273,19 @@ impl LightWalletNodeVerification {
         // arriving after it can retry even while earlier waiters are draining.
         let observed_failures = self.failed_attempts.load(Ordering::Acquire);
         let mut schedule = self.schedule.lock().await;
-        let verified = matches!(
+        if matches!(
             &*schedule,
             LightWalletNodeVerificationSchedule::Verified(basis, activations, checked)
                 if *basis == target.basis
                     && checked.elapsed() < STALE_VERIFICATION_GRACE
                     && target.agrees_with(activations)
-        );
-        if verified {
+        ) {
             drop(schedule);
-            let tip_check = verify_served_tip(source, target).await;
-            if tip_check.is_err() {
-                *self.schedule.lock().await = LightWalletNodeVerificationSchedule::Unverified;
-            }
-            return tip_check;
+            return Ok(());
         }
 
         if self.failed_attempts.load(Ordering::Relaxed) != observed_failures {
-            return Err(match *schedule {
+            let shared = match *schedule {
                 LightWalletNodeVerificationSchedule::Refused(basis, refusal)
                     if basis == target.basis =>
                 {
@@ -1267,34 +1295,179 @@ impl LightWalletNodeVerification {
                 | LightWalletNodeVerificationSchedule::Refused(..)
                 | LightWalletNodeVerificationSchedule::Verified(..) => {
                     SourceError::NodeUnavailable {
-                        reason:
-                            "concurrent verification did not confirm the served schedule and tip"
-                                .to_owned(),
+                        reason: "concurrent verification did not confirm the served schedule"
+                            .to_owned(),
                     }
                 }
-            });
+            };
+            drop(schedule);
+            return Err(shared);
         }
 
-        *schedule = LightWalletNodeVerificationSchedule::Unverified;
-        let evidence = verify_node_endpoint(source, target)
-            .await
-            .map_err(|failure| {
+        let outcome = match verify_node_schedule(source, target).await {
+            Ok(evidence) => {
+                *schedule = LightWalletNodeVerificationSchedule::Verified(
+                    target.basis,
+                    evidence.node_activations,
+                    Instant::now(),
+                );
+                Ok(())
+            }
+            Err(failure) => {
                 self.failed_attempts.fetch_add(1, Ordering::Release);
                 match failure {
                     VerificationFailure::Refused(refusal) => {
                         *schedule =
                             LightWalletNodeVerificationSchedule::Refused(target.basis, refusal);
-                        refusal.error()
+                        Err(refusal.error())
                     }
-                    VerificationFailure::Inconclusive(error) => error,
+                    VerificationFailure::Inconclusive(error) => Err(error),
                 }
-            })?;
-        *schedule = LightWalletNodeVerificationSchedule::Verified(
-            target.basis,
-            evidence.node_activations,
-            Instant::now(),
-        );
+            }
+        };
         drop(schedule);
-        Ok(())
+        outcome
+    }
+
+    /// Verifies the schedule as [`Self::verify_schedule_and_capabilities`]
+    /// does, then that the node's best chain holds the served tip of
+    /// `target`.
+    pub(crate) async fn verify<Source>(
+        &self,
+        source: &Source,
+        target: &VerificationTarget,
+    ) -> Result<(), SourceError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        self.verify_schedule_and_capabilities(source, target)
+            .await?;
+        self.verify_served_tip(source, target).await
+    }
+
+    /// Verifies the schedule as [`Self::verify`] does, then checks the served
+    /// tip through `source` alone, without joining a check another caller
+    /// started.
+    pub(crate) async fn verify_with_own_tip_check(
+        &self,
+        source: &impl BroadcastNodeProbe,
+        target: &VerificationTarget,
+    ) -> Result<(), SourceError> {
+        self.verify_schedule_and_capabilities(source, target)
+            .await?;
+        verify_served_tip(source, target).await
+    }
+
+    /// Verifies that the node's best chain holds the served tip of `target`,
+    /// sharing the call with concurrent callers checking the same block.
+    pub(crate) async fn verify_served_tip<Source>(
+        &self,
+        source: &Source,
+        target: &VerificationTarget,
+    ) -> Result<(), SourceError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        if self.holds_block(source, target.fence.visible_tip()).await? {
+            Ok(())
+        } else {
+            Err(served_tip_mismatch())
+        }
+    }
+
+    /// Returns whether the node's best chain holds `block`, sharing one
+    /// `getblockhash` call with concurrent callers asking about the same
+    /// block. The answer is not kept after the call returns.
+    pub(crate) async fn holds_block<Source>(
+        &self,
+        source: &Source,
+        block: zinder_core::BlockId,
+    ) -> Result<bool, SourceError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        self.tip_checks.holds_block(source, block).await
     }
 }
+
+type TipCheck = futures_util::future::BoxFuture<'static, Result<bool, Arc<SourceError>>>;
+
+/// Running checks by block, each with the number that tells it apart from a
+/// later check of the same block, and the next such number.
+type RunningTipChecks = (
+    std::collections::HashMap<
+        zinder_core::BlockId,
+        (u64, futures_util::future::WeakShared<TipCheck>),
+    >,
+    u64,
+);
+
+/// Served-tip checks in progress, by block.
+#[derive(Default)]
+struct TipChecks {
+    running: Arc<parking_lot::Mutex<RunningTipChecks>>,
+}
+
+impl TipChecks {
+    async fn holds_block<Source>(
+        &self,
+        source: &Source,
+        block: zinder_core::BlockId,
+    ) -> Result<bool, SourceError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        use futures_util::FutureExt as _;
+
+        let check = {
+            let mut running = self.running.lock();
+            let joined = running.0.get(&block).and_then(|(_, weak)| weak.upgrade());
+            let check = joined.unwrap_or_else(|| {
+                let flight = running.1;
+                running.1 += 1;
+                let registry = Arc::clone(&self.running);
+                let source = source.clone();
+                let check = async move {
+                    let held = source.holds_block(block).await.map_err(Arc::new);
+                    // Leave the running set before answering, so a caller
+                    // arriving after this answer makes its own call.
+                    let mut running = registry.lock();
+                    if running
+                        .0
+                        .get(&block)
+                        .is_some_and(|(current, _)| *current == flight)
+                    {
+                        running.0.remove(&block);
+                    }
+                    drop(running);
+                    held
+                }
+                .boxed()
+                .shared();
+                running.0.retain(|_, (_, weak)| weak.upgrade().is_some());
+                if let Some(weak) = check.downgrade() {
+                    running.0.insert(block, (flight, weak));
+                }
+                check
+            });
+            drop(running);
+            check
+        };
+        check
+            .await
+            .map_err(crate::forwarded_read::owned_source_error)
+    }
+
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        self.running
+            .lock()
+            .0
+            .values()
+            .filter(|(_, weak)| weak.upgrade().is_some())
+            .count()
+    }
+}
+
+#[cfg(test)]
+mod tests;

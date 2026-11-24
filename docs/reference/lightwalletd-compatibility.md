@@ -54,7 +54,64 @@ Light-wallet serving supports the methods in the Wallet serving column, with nod
 | `GetStandardFee` | Served when a configured node implements `getstandardfee` | `UNIMPLEMENTED` | See [`GetStandardFee`](#getstandardfee) |
 | `Ping` | Refused unless enabled | Refused unless enabled | See above |
 
-Local wallet reads that span several lookups use the chain epoch captured by the handler. Block-range streams follow the chain under the continuity rules below. Light-wallet's forwarded reads follow the method-specific checks below. A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`, as [Readiness](readiness.md) describes.
+Local wallet reads that span several lookups use the chain epoch captured by the handler. Block-range streams follow the chain under the continuity rules below. Light-wallet's forwarded reads follow the method-specific checks below and the admission rules in [Node-forwarded reads](#node-forwarded-reads). A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`, as [Readiness](readiness.md) describes.
+
+## Node-forwarded reads
+
+Some methods read data the store does not hold from the configured `[node]`. Which methods do this depends on the serving mode and on whether the store retains transaction bodies.
+
+| Method | `wallet` with retained bodies | `wallet` without bodies | `light-wallet` without bodies |
+| --- | --- | --- | --- |
+| `GetLatestBlock`, `GetLightdInfo`, `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, `GetTreeState`, `GetLatestTreeState`, `GetSubtreeRoots` | Local | Local | Local |
+| `GetMempoolTx`, `GetMempoolStream` | Ingest control | Ingest control | Ingest control |
+| `GetTransaction` for a mined transaction | Local | Forwarded body | Forwarded body |
+| `GetTaddressTxids`, `GetTaddressTransactions` | Local | Local rows, forwarded bodies | Forwarded IDs and bodies |
+| `GetTaddressBalance`, `GetTaddressBalanceStream`, `GetAddressUtxos`, `GetAddressUtxosStream` | Local | Local | Forwarded |
+| `SendTransaction`, `GetStandardFee` | Node | Node | Node |
+
+A `light-wallet` store that retains transaction bodies serves mined `GetTransaction` locally and forwards only the address methods.
+
+### Admission
+
+Each process bounds its forwarded reads in two layers.
+
+The first layer is a budget of node calls, `compat.forwarded_read_max_concurrent` (32 by default). A forwarded read holds a slot only while one node call runs. It never holds a slot while a client reads its response. Each kind of read has a reserved floor and a cap, and the remaining slots are shared:
+
+| Kind | Reserved at 32 slots | Cap at 32 slots |
+| --- | --- | --- |
+| Transaction bodies, for `GetTransaction` | 12 | 24 |
+| Address UTXO and balance lookups | 4 | 8 |
+| Address history pages and history row bodies | 4 | 16 |
+
+Twelve slots are shared at the default. Other budgets scale the same proportions, and every kind keeps at least one reserved slot from three slots up. Address history therefore cannot take the slots that transaction lookups reserve.
+
+The second layer bounds what a forwarded response holds while the client reads it. At most 16 unspent-output responses and 32 address-history streams are open at once, each with 128 waiting places. A request takes its response slot before any node-call slot.
+
+A request that finds its kind's slots taken waits in arrival order for up to `compat.forwarded_read_wait_ms` (10,000 ms by default). Each kind has `compat.forwarded_read_waiters_per_slot` waiting places per slot of its cap (16 by default). When the wait ends, or when every waiting place is taken, the request fails with `UNAVAILABLE`, which wallets retry. This is the same code a full block-range or tree-state rebuild limit returns. `RESOURCE_EXHAUSTED` stays reserved for size and row limits that a retry cannot pass. A client deadline shorter than the wait ends the wait at that deadline. A request whose client leaves gives up its place at once. Native `WalletQuery` refuses the same reads with `RESOURCE_EXHAUSTED` and `FORWARDED_READ_LIMIT_REACHED`.
+
+`compact-blocks` serving forwards nothing and refuses these settings. The admission metrics are listed in [Metrics](metrics.md#forwarded-reads).
+
+### Verified transaction bytes
+
+Mined transaction bodies read from the node pass two checks. The node must report the transaction in the block the local `transaction_location` record names. The bytes must match the digest in that record. Verified bodies go into a cache of `compat.forwarded_transaction_cache_bytes` (64 MiB by default, 0 disables it), shared by `GetTransaction` and address history rows. A cached body is served without a node call or a slot. Concurrent lookups of the same transaction share one node call. A lookup that leaves does not cancel the call for the others. Failed lookups are never cached.
+
+### Served-tip checks
+
+Every forwarded read first confirms that the node's network-upgrade schedule matches the served one. That check is shared by concurrent requests and kept for up to a minute. Whether the read also checks the served tip with `getblockhash` depends on whether the node's reply proves which chain it came from:
+
+| Method | Separate tip check |
+| --- | --- |
+| `GetTransaction` for a mined transaction | None. The reply names the mining block, and the bytes match the recorded digest. |
+| `GetTransaction` for a transaction the served chain does not hold | Before the mempool answers |
+| `GetAddressUtxos`, `GetAddressUtxosStream`, `GetTaddressBalance`, `GetTaddressBalanceStream` | None. Each `getaddressutxos` page reports the tip it answered at, and it must be the served tip. |
+| `GetTaddressTxids`, `GetTaddressTransactions` | Before and after each page of IDs, and once at the end of the stream |
+| `SendTransaction`, `GetStandardFee` | Before the call |
+
+Concurrent checks of the same tip share one `getblockhash` call, and its answer is not reused after it returns. A failed tip check fails only the requests that waited on it. [ADR-0003](../adrs/0003-epoch-bound-reads-and-storage-roles.md) Decision 7 records why these checks keep forwarded answers inside the served chain view.
+
+### Retaining transaction bodies locally
+
+`GetTransaction` and address history rows are the forwarded reads with the highest volume, because wallets fetch every transaction they find while scanning. A public deployment with many concurrent wallets, or a node that is remote, pruning, or shared with other workloads, can serve them locally instead. Build the canonical store with `storage.raw_blob_policy = "transactions"` and select `compat.serving = "light-wallet"` or `"wallet"` explicitly, or use the `wallet-archive` profile. The bodies take about 251 GiB on Mainnet. The policy is fixed when the store is built, so an existing store must be rebuilt to retain them. See [Configuration](configuration.md#deployment-profiles).
 
 ## Method behavior
 
@@ -271,9 +328,9 @@ The request must carry a transaction id; an empty hash is `INVALID_ARGUMENT`. Zi
 
 Wallet SDKs treat height 0 as pending and `NOT_FOUND` as an unknown id, so a just-broadcast transaction reads as pending.
 
-Light-wallet serving uses the admitted store's persisted retention. A missing body in a store that retains transaction bodies returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. If the store omits transaction bodies, Zinder looks up the transaction's canonical location and fetches the body from the verified node. The mined block must match the local location, and the bytes must match the digest in the indexed `transaction_location` record. A digest mismatch returns `DATA_LOSS`. A transaction absent from the captured canonical view goes through the ingest mempool lookup after node verification when the store omits transaction bodies.
+Light-wallet serving uses the admitted store's persisted retention. A missing body in a store that retains transaction bodies returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. If the store omits transaction bodies, Zinder looks up the transaction's canonical location and reads the body as [Verified transaction bytes](#verified-transaction-bytes) describes. A digest mismatch returns `DATA_LOSS`. A transaction absent from the captured canonical view goes through the ingest mempool lookup after a served-tip check when the store omits transaction bodies.
 
-Each light-wallet listener admits up to eight forwarded transaction lookups at once. Additional lookups fail with `RESOURCE_EXHAUSTED` before reading transaction evidence or calling the node. Retry with backoff. Reads of retained transaction bodies use the local path.
+Forwarded lookups wait for a slot as [Admission](#admission) describes. Reads of retained transaction bodies use the local path.
 
 ### `SendTransaction`
 
@@ -322,9 +379,9 @@ lightwalletd rejects a span wider than 10,000,000 blocks. Zinder clamps the end 
 
 Wallet serving pins the history to one epoch. It reads 1,000 entries at a time and sends each transaction as it reads it, at most 8 transactions ahead of the client. A stream still reading one minute after a new block replaces its epoch ends with `CHAIN_EPOCH_PIN_UNAVAILABLE`.
 
-Light-wallet serving bounds forwarded history to the captured tip and releases the reader before the node calls. It checks the node's hash at that tip's height before and after each ID lookup. For each returned transaction, it checks the reported block and bytes against the indexed `transaction_location` record and its digest, checks canonical order, and confirms the tip before sending the row. These checks validate returned rows. Completeness still depends on the node's address index, and a fork the node leaves and returns to between the two hash checks can go undetected. The stream is best-effort.
+Light-wallet serving bounds forwarded history to the captured tip and releases the reader before the node calls. It checks the node's hash at that tip's height before and after each ID lookup. For each returned transaction, it reads the indexed `transaction_location` record first. The location must fall inside the page's height range and follow the previous row in canonical order. The body then comes from the verified cache or the node, checked against the record's block and digest. Rows need no tip check of their own, because each one is bound to the served view through its local record. The stream checks the tip once more before it ends. These checks validate returned rows. Completeness still depends on the node's address index, and a fork the node leaves and returns to between the two hash checks can go undetected. The stream is best-effort.
 
-A light-wallet listener admits up to two forwarded history requests across both methods. When both slots are in use, another request returns `RESOURCE_EXHAUSTED` and can retry with backoff. Each admitted request has 60 seconds from the start of node verification, including time spent waiting for the client to read. At that deadline the stream ends with `DEADLINE_EXCEEDED` after any rows it has already sent. Treat those rows as an incomplete result and request the range again. When a stream ends or is dropped, any canonical evidence read in flight keeps its slot until the read finishes.
+Forwarded history waits for a stream slot and then for node-call slots as [Admission](#admission) describes. Each admitted request has 60 seconds from its arrival, including time spent waiting for a slot or for the client to read. At that deadline the stream ends with `DEADLINE_EXCEEDED` after any rows it has already sent. Treat those rows as an incomplete result and request the range again. When a stream is dropped while it prepares a row, the stream slot stays taken until that row's work ends. A stream dropped while it waits for the client frees its slot at once.
 
 A failure can end either kind of stream after it has delivered rows. For forwarded history, a lost tip or unreachable node can return `UNAVAILABLE`, and a digest mismatch returns `DATA_LOSS`. Treat any stream that ends with an error as incomplete and request the range again.
 
@@ -349,7 +406,7 @@ One response returns at most 100,000 outputs. The handling of an oversized respo
 - In wallet serving, `GetAddressUtxosStream` sends rows as it merges them, at most 64 ahead of the client. A request that would return more sends the first 100,000 rows and then ends with `RESOURCE_EXHAUSTED`. A later failure such as `CHAIN_EPOCH_PIN_UNAVAILABLE` also ends the stream after the rows already sent. Treat a stream that ends with an error as incomplete.
 - In light-wallet serving, both methods fetch the node results and check the response limit before sending any rows. A response that exceeds the limit returns `RESOURCE_EXHAUSTED` without a partial output list. Each node page must name the captured canonical tip. For a bounded prefix, Zinder verifies the outputs at the cutoff height before selecting rows in wallet order.
 
-A light-wallet listener runs one node lookup at a time across the unspent-output and balance methods. Once it finishes fetching and checking the node's results, it releases the node slot so another lookup can start while a client reads its outputs. Two unspent-output responses can hold rows at a time, within the per-response row limit. A streamed reply holds its slot until its row iterator ends or is dropped. A unary reply holds its slot until its body ends after the send-stall layer hands the buffered data to the transport, or until the handler body is dropped on disconnect or a send stall. The bound covers the listener’s buffered reply. Bytes already handed to the transport are outside this bound. When the node slot or both unspent-output response slots are in use, the affected request returns `RESOURCE_EXHAUSTED` and can retry with backoff.
+In light-wallet serving, the unspent-output and balance methods share the UTXO kind of node-call slots, and each node page holds a slot only while it is read. The unspent-output methods also take one of the unspent-output response slots before their first node call, as [Admission](#admission) describes. A streamed reply holds its response slot until its row iterator ends or is dropped. A unary reply holds its response slot until its body ends or fails after the send-stall layer hands the buffered data to the transport, or until the handler body is dropped on disconnect or a send stall. The bound covers the listener’s buffered reply. Bytes already handed to the transport are outside this bound.
 
 In wallet serving, both methods read each distinct address at one chain epoch and merge the addresses' outputs in response order as they send them. Each address is read in pages that double only as its rows are sent. Its first page holds an even share of 8,192 outputs, capped at 1,024 and at a positive `maxEntries`, but never fewer than 16. A request that lists up to eight distinct addresses therefore reads up to 1,024 outputs of each in one page.
 

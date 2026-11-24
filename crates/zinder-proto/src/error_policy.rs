@@ -137,7 +137,9 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
 
         ErrorReason::ExplorerMethodDisabled => ReasonPolicy::new(Code::Unimplemented, NonRetryable),
 
-        ErrorReason::TreeStateReplayLimitReached | ErrorReason::CompactBlockStreamLimitReached => {
+        ErrorReason::TreeStateReplayLimitReached
+        | ErrorReason::CompactBlockStreamLimitReached
+        | ErrorReason::ForwardedReadLimitReached => {
             ReasonPolicy::new(Code::ResourceExhausted, RetryAfterBackoff)
         }
     }

@@ -1113,7 +1113,7 @@ where
             Err(error @ QueryError::CanonicalHistoryUnavailable { .. }) => {
                 CanonicalTransactionMiss::BelowHistoryFloor(status_from_query_error(&error))
             }
-            Err(error) => return Err(status_from_query_error(&error)),
+            Err(error) => return Err(forwarded_read_status(&error)),
         };
 
         // A store without transaction bodies verifies its forwarding node
@@ -1122,7 +1122,7 @@ where
         self.query_api
             .verify_forwarding_node(Some(at_epoch_id))
             .await
-            .map_err(|error| status_from_query_error(&error))?;
+            .map_err(|error| forwarded_read_status(&error))?;
         self.pending_transaction(transaction_id, canonical_miss)
             .await
             .map(Response::new)
@@ -1433,7 +1433,7 @@ where
             .query_api
             .transaction(transaction_id, Some(self.at_epoch_id))
             .await
-            .map_err(|error| status_from_query_error(&error))?;
+            .map_err(|error| forwarded_read_status(&error))?;
         raw_transaction_from_mined(mined_transaction_from_status(response.status)?)
     }
 }
@@ -1972,6 +1972,19 @@ fn tree_state_status(error: &QueryError) -> Status {
     status_from_query_error(error)
 }
 
+/// Maps a read that may be forwarded to the node to the lightwalletd status.
+///
+/// A read refused for want of a forwarded-read slot is `UNAVAILABLE`, as a
+/// full block-range or tree-state rebuild limit is, so a wallet retries every
+/// admission limit the same way. Native `WalletQuery` keeps
+/// `RESOURCE_EXHAUSTED` with its typed reason.
+fn forwarded_read_status(error: &QueryError) -> Status {
+    if matches!(error, QueryError::ForwardedReadLimitReached { .. }) {
+        return Status::unavailable(error.to_string());
+    }
+    status_from_query_error(error)
+}
+
 /// Maps a subtree-root read failure to the lightwalletd status.
 ///
 /// A page read after the entry epoch is retired fails with `UNAVAILABLE`, so a
@@ -2388,6 +2401,21 @@ mod tests {
     use zinder_core::{
         ArtifactSchemaVersion, ChainTipMetadata, TransparentAddressBalance, UnixTimestampMillis,
     };
+
+    #[test]
+    fn a_forwarded_read_refusal_is_unavailable_and_other_errors_keep_their_status() {
+        let refused = forwarded_read_status(&QueryError::ForwardedReadLimitReached {
+            kind: "transaction",
+            max_concurrent: 24,
+        });
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert!(refused.message().contains("retry with backoff"));
+        let corrupt = forwarded_read_status(&QueryError::ArtifactCorrupt {
+            family: zinder_store::ArtifactFamily::TransactionLocation,
+            reason: "probe".to_owned(),
+        });
+        assert_eq!(corrupt.code(), tonic::Code::DataLoss);
+    }
 
     fn test_chain_epoch() -> ChainEpoch {
         ChainEpoch {

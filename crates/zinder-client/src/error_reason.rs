@@ -94,6 +94,7 @@ define_error_reasons! {
     BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
     CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
     NodeRateLimited => "NODE_RATE_LIMITED",
+    ForwardedReadLimitReached => "FORWARDED_READ_LIMIT_REACHED",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -159,6 +160,7 @@ mod tests {
             WireErrorReason::BroadcastBudgetExhausted,
             WireErrorReason::CompactBlockStreamLimitReached,
             WireErrorReason::NodeRateLimited,
+            WireErrorReason::ForwardedReadLimitReached,
         ];
 
         for generated in generated_reasons {

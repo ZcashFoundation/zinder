@@ -18,7 +18,7 @@ use zinder_testkit::{ChainFixture, RpcReply, method};
 
 use super::{
     ADDRESS, Fixture, UtxoNode, balance_request, one_upgrade_per_height, populated_utxo_fixture,
-    utxo_request, utxos_at,
+    populated_utxo_fixture_with, two_response_slots, utxo_request, utxos_at,
 };
 
 const HEIGHTS: u8 = 100;
@@ -221,7 +221,7 @@ fn unary_utxo_request() -> Result<http::Request<Body>> {
 
 #[tokio::test]
 async fn two_unfinished_unary_utxo_bodies_refuse_a_third_but_allow_balance() -> Result<()> {
-    let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
+    let fixture = populated_utxo_fixture_with(2, 1, UtxoNode::Zakura, two_response_slots())?;
     let service = GrpcSendStallLayer::new(Duration::from_hours(1))
         .layer(fixture.adapter.clone().into_server());
     let unary = async || {
@@ -243,8 +243,8 @@ async fn two_unfinished_unary_utxo_bodies_refuse_a_third_but_allow_balance() -> 
     let refusal = unary().await?;
     let status = Status::from_header_map(refusal.headers())
         .ok_or_else(|| eyre!("a third unary response was admitted"))?;
-    assert_eq!(status.code(), Code::ResourceExhausted);
-    assert!(status.message().contains("response limit"));
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(status.message().contains("utxo_response"), "{status:?}");
 
     let balance = fixture
         .adapter

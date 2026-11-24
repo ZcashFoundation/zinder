@@ -14,7 +14,7 @@ use std::{
 use futures_util::stream::try_unfold;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::mpsc,
     time::{Instant, timeout_at},
 };
 use tokio_stream::{self as stream, Stream, StreamExt as _};
@@ -30,7 +30,9 @@ use zinder_core::{
 };
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
 use zinder_query::{
-    ArtifactKey, CanonicalReader, LightWalletNodeQuery, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+    ArtifactKey, CanonicalReader, FORWARDED_HISTORY_DEADLINE, ForwardedReadKind,
+    ForwardedReadLimit, ForwardedReadRefused, ForwardedResponseKind, ForwardedResponsePermit,
+    ForwardedTransactionError, LightWalletNodeQuery, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
     MinedTransactionDigest, QueryError, RocksDbCanonicalReader, StorageReadError, SubtreeRoots,
     VerifiedNodeTarget, parse_receivable_transparent_address, read_on_blocking_thread,
     status_from_query_error,
@@ -55,30 +57,27 @@ use crate::CanonicalReaderSlot;
 use crate::block_methods::{self, RequestedBlock, requested_block};
 use crate::compact_block_messages::CompactBlockShape;
 
-const FORWARDED_TRANSACTION_SLOTS: usize = 8;
-const FORWARDED_HISTORY_SLOTS: usize = 2;
-const FORWARDED_HISTORY_DEADLINE: Duration = Duration::from_secs(60);
-const FORWARDED_UTXO_RESPONSE_SLOTS: usize = 2;
-
 /// The canonical reader and node-backed methods for light-wallet serving.
 #[derive(Clone)]
 pub struct NodeBackedLightWallet {
     slot: CanonicalReaderSlot,
     query: LightWalletNodeQuery,
-    utxo_slots: Arc<Semaphore>,
-    utxo_response_slots: Arc<Semaphore>,
-    history_slots: Arc<Semaphore>,
-    transaction_slots: Arc<Semaphore>,
+    reads: ForwardedReadLimit,
 }
 
 impl LightwalletdGrpcAdapter<NodeBackedLightWallet> {
-    /// Serves local block data, retained transactions, and node-backed wallet lookups without a projector.
+    /// Serves local block data, retained transactions, and node-backed wallet
+    /// lookups without a projector.
+    ///
+    /// Reads forwarded to `node` wait for slots of `reads` and share its
+    /// verified transaction byte cache.
     #[must_use]
     pub fn for_light_wallet(
         slot: CanonicalReaderSlot,
         node: ZebraJsonRpcSource,
         replay_wait: Duration,
         replay_waiters_per_slot: NonZeroU32,
+        reads: ForwardedReadLimit,
     ) -> Self {
         let readers = slot.clone();
         let query = LightWalletNodeQuery::new(
@@ -87,14 +86,7 @@ impl LightwalletdGrpcAdapter<NodeBackedLightWallet> {
             replay_wait,
             replay_waiters_per_slot,
         );
-        Self::new(NodeBackedLightWallet {
-            slot,
-            query,
-            utxo_slots: Arc::new(Semaphore::new(1)),
-            utxo_response_slots: Arc::new(Semaphore::new(FORWARDED_UTXO_RESPONSE_SLOTS)),
-            history_slots: Arc::new(Semaphore::new(FORWARDED_HISTORY_SLOTS)),
-            transaction_slots: Arc::new(Semaphore::new(FORWARDED_TRANSACTION_SLOTS)),
-        })
+        Self::new(NodeBackedLightWallet { slot, query, reads })
     }
 
     /// Wraps this adapter in a tonic service with request field bounds and
@@ -170,49 +162,55 @@ impl LightwalletdGrpcAdapter<NodeBackedLightWallet> {
 
     /// Answers `GetTransaction` from the served chain's location and recorded
     /// digest, with only the bytes read from the node.
+    ///
+    /// The node reports the block that mines the transaction and its bytes
+    /// must match the recorded digest, so a mined transaction needs no
+    /// separate served-tip check. A canonical miss checks the tip before the
+    /// mempool answers.
     async fn forwarded_transaction(
         &self,
         reader: Arc<RocksDbCanonicalReader>,
         id: TransactionId,
     ) -> Result<lightwalletd::RawTransaction, Status> {
-        let permit = Arc::clone(&self.query_api.transaction_slots)
-            .try_acquire_owned()
-            .map_err(|_| {
-                Status::resource_exhausted(
-                    "forwarded transaction lookup limit reached; retry with backoff",
-                )
-            })?;
         let view = served_view(&reader)?;
         let span = tracing::Span::current();
-        // The storage read owns admission even if the caller drops the
-        // request. Only the caller can proceed from evidence to the node.
-        let (evidence, _permit) = tokio::task::spawn_blocking(move || {
-            let evidence = span
-                .in_scope(|| read_on_blocking_thread(forwarded_transaction_evidence(&reader, id)));
-            (evidence, permit)
+        let evidence = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| read_on_blocking_thread(forwarded_transaction_evidence(&reader, id)))
         })
         .await
         .map_err(|error| {
             Status::unavailable(format!("transaction evidence read failed: {error}"))
-        })?;
-        let evidence = evidence?;
-        let node = self.query_api.node(&view).await?;
+        })??;
         match evidence {
             ForwardedTransactionEvidence::Mined(mined) => {
-                let reported = node
-                    .fetch_mined_transaction_bytes(id)
-                    .await
-                    .map_err(node_status)?
-                    .ok_or_else(|| {
-                        outside_served_view(
-                            "node does not mine the transaction in the served block",
+                let reads = &self.query_api.reads;
+                let height = u64::from(mined.location.block_height.value());
+                let bytes = if let Some(bytes) = reads.cached_transaction(&mined) {
+                    bytes
+                } else {
+                    let deadline = reads.deadline();
+                    let node = self.query_api.schedule_node(&view).await?;
+                    reads
+                        .mined_transaction_bytes(
+                            node,
+                            mined,
+                            ForwardedReadKind::Transaction,
+                            deadline,
                         )
-                    })?;
-                served_transaction(mined, reported)
+                        .await
+                        .map_err(forwarded_transaction_status)?
+                };
+                Ok(lightwalletd::RawTransaction {
+                    data: bytes.to_vec(),
+                    height,
+                })
             }
             // A forwarded lookup reports an unverified node the same way for
             // every transaction, including ones the served view does not mine.
-            ForwardedTransactionEvidence::Missing(miss) => self.pending_transaction(id, miss).await,
+            ForwardedTransactionEvidence::Missing(miss) => {
+                self.query_api.node(&view).await?;
+                self.pending_transaction(id, miss).await
+            }
         }
     }
 }
@@ -244,6 +242,7 @@ async fn forwarded_transaction_evidence(
 }
 
 impl NodeBackedLightWallet {
+    /// Verifies the node's schedule and that it holds the served tip.
     async fn node(&self, view: &ServedView) -> Result<&ZebraJsonRpcSource, Status> {
         self.query
             .verified_node(&view.target)
@@ -251,15 +250,13 @@ impl NodeBackedLightWallet {
             .map_err(|error| status_from_query_error(&QueryError::Node(error)))
     }
 
-    /// Admits one node UTXO lookup per instance, including those behind a balance.
-    fn utxo_permit(&self) -> Result<OwnedSemaphorePermit, Status> {
-        Arc::clone(&self.utxo_slots)
-            .try_acquire_owned()
-            .map_err(|_| {
-                Status::resource_exhausted(
-                    "a node UTXO response is in progress; retry with backoff",
-                )
-            })
+    /// Verifies only the node's schedule, for a read whose reply binds
+    /// itself to the served tip.
+    async fn schedule_node(&self, view: &ServedView) -> Result<&ZebraJsonRpcSource, Status> {
+        self.query
+            .schedule_verified_node(&view.target)
+            .await
+            .map_err(|error| status_from_query_error(&QueryError::Node(error)))
     }
 
     async fn balance(
@@ -288,10 +285,16 @@ impl NodeBackedLightWallet {
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         // The node's balance RPC does not report the tip it answered at, so
         // the balance is summed from outputs the node attests at the served tip.
-        let _permit = self.utxo_permit()?;
+        let deadline = self.reads.deadline();
         let view = served_view(&self.slot.capture())?;
-        let node = self.node(&view).await?;
-        let unspent = served_utxo_page(node, &lookup, BlockHeight::new(0), None, view.tip).await?;
+        let reads = NodeReads {
+            node: self.schedule_node(&view).await?,
+            limit: &self.reads,
+            kind: ForwardedReadKind::Utxo,
+            deadline,
+        };
+        let unspent =
+            served_utxo_page(&reads, &lookup, BlockHeight::new(0), None, view.tip).await?;
         let exceeds = || Status::out_of_range("transparent address balance exceeds i64");
         let balance_zat = unspent
             .outputs
@@ -307,7 +310,8 @@ impl NodeBackedLightWallet {
         &self,
         request: lightwalletd::GetAddressUtxosArg,
         response_limit: NonZeroU32,
-    ) -> Result<Option<(Vec<SourceTransparentUnspentOutput>, OwnedSemaphorePermit)>, Status> {
+    ) -> Result<Option<(Vec<SourceTransparentUnspentOutput>, ForwardedResponsePermit)>, Status>
+    {
         if request.addresses.is_empty() {
             return Ok(None);
         }
@@ -327,16 +331,22 @@ impl NodeBackedLightWallet {
             u32::try_from(request.start_height)
                 .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?,
         );
-        let response_permit = Arc::clone(&self.utxo_response_slots)
-            .try_acquire_owned()
-            .map_err(|_| {
-                Status::resource_exhausted("node UTXO response limit reached; retry with backoff")
-            })?;
-        let mut rows = {
-            let _node_permit = self.utxo_permit()?;
-            let node = self.node(&view).await?;
-            wallet_ordered_utxos(node, &lookup, height, request.max_entries, view.tip).await?
+        // The response slot is taken before any node-call slot, so this
+        // request never holds a node-call slot while it waits.
+        let deadline = self.reads.deadline();
+        let response_permit = self
+            .reads
+            .admit_response(ForwardedResponseKind::UtxoResponse, deadline)
+            .await
+            .map_err(forwarded_read_refused)?;
+        let reads = NodeReads {
+            node: self.schedule_node(&view).await?,
+            limit: &self.reads,
+            kind: ForwardedReadKind::Utxo,
+            deadline,
         };
+        let mut rows =
+            wallet_ordered_utxos(&reads, &lookup, height, request.max_entries, view.tip).await?;
         let count = wallet_utxo_response_len(rows.len(), request.max_entries, response_limit)?;
         if count == 0 {
             return Ok(None);
@@ -369,20 +379,25 @@ impl NodeBackedLightWallet {
             [indexed_address(&filter.address, epoch.network)?],
         )
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let permit = Arc::clone(&self.history_slots)
-            .try_acquire_owned()
-            .map_err(|_| {
-                Status::resource_exhausted(
-                    "forwarded address history limit reached; retry with backoff",
-                )
-            })?;
         let view = served_view(&reader)?;
         drop(reader);
         let deadline = Instant::now() + FORWARDED_HISTORY_DEADLINE;
+        let permit = self
+            .reads
+            .admit_response(
+                ForwardedResponseKind::HistoryStream,
+                self.reads.deadline().min(deadline),
+            )
+            .await
+            .map_err(forwarded_read_refused)?;
         let history = timeout_at(deadline, async {
-            let node = self.node(&view).await?;
+            // Every page is bracketed by its own tip checks, so the stream
+            // starts without a separate served-tip check.
+            let node = self.schedule_node(&view).await?;
             let mut history = NodeAddressHistory {
                 node: node.clone(),
+                query: self.query.clone(),
+                reads: self.reads.clone(),
                 slot: self.slot.clone(),
                 lookup,
                 pending: vec![(range.start_height, range.end_height)],
@@ -390,6 +405,7 @@ impl NodeBackedLightWallet {
                 page: IntoIter::default(),
                 page_range: (range.start_height, range.end_height),
                 last_position: None,
+                deadline,
             };
             history.read_page().await?;
             Ok::<_, Status>(history)
@@ -399,7 +415,7 @@ impl NodeBackedLightWallet {
         if history.page.as_slice().is_empty() && history.pending.is_empty() {
             return Ok(Box::pin(stream::empty()));
         }
-        Ok(history.into_stream(permit, deadline))
+        Ok(history.into_stream(permit))
     }
 }
 
@@ -421,20 +437,49 @@ fn served_view(reader: &RocksDbCanonicalReader) -> Result<ServedView, Status> {
     })
 }
 
-/// Keeps node bytes for a served transaction only when the node mines it in
-/// the served block and they are the bytes ingest committed there.
-fn served_transaction(
-    mined: MinedTransactionDigest,
-    (reported, bytes): (BlockId, Vec<u8>),
-) -> Result<lightwalletd::RawTransaction, Status> {
-    let location = mined.location;
-    mined
-        .verify_node_bytes(reported, &bytes)
-        .map_err(|error| status_from_query_error(&error))?;
-    Ok(lightwalletd::RawTransaction {
-        data: bytes,
-        height: u64::from(location.block_height.value()),
-    })
+/// One request's node calls of a single kind, each run under its own
+/// node-call slot so no slot is held between calls.
+struct NodeReads<'a> {
+    node: &'a ZebraJsonRpcSource,
+    limit: &'a ForwardedReadLimit,
+    kind: ForwardedReadKind,
+    deadline: Instant,
+}
+
+impl NodeReads<'_> {
+    async fn call<T>(
+        &self,
+        call: impl Future<Output = Result<T, SourceError>>,
+    ) -> Result<T, Status> {
+        self.limit
+            .node_call(self.kind, self.deadline, call)
+            .await
+            .map_err(forwarded_read_refused)?
+            .map_err(node_status)
+    }
+}
+
+/// Reports a forwarded read refused for want of a slot as `UNAVAILABLE`.
+///
+/// A full block-range or tree-state rebuild limit returns the same code, so a
+/// wallet retries every admission limit the same way. `RESOURCE_EXHAUSTED`
+/// stays reserved for deterministic size and row caps.
+fn forwarded_read_refused(refused: ForwardedReadRefused) -> Status {
+    Status::unavailable(refused.to_string())
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Other failures follow the shared query status policy."
+)]
+fn forwarded_transaction_status(error: ForwardedTransactionError) -> Status {
+    match QueryError::from(error) {
+        QueryError::ForwardedReadLimitReached { .. } => Status::unavailable(
+            "forwarded transaction reads are at their limit; retry with backoff",
+        ),
+        QueryError::Node(error) => node_status(error),
+        error => status_from_query_error(&error),
+    }
 }
 
 fn wallet_utxo_response_len(
@@ -467,20 +512,25 @@ fn indexed_address(text: &str, network: Network) -> Result<Address, Status> {
 ///
 /// A complete page is read when `limit` is unset.
 async fn served_utxo_page(
-    node: &ZebraJsonRpcSource,
+    reads: &NodeReads<'_>,
     lookup: &TransparentAddressLookup,
     height: BlockHeight,
     limit: Option<TransparentAddressRowLimit>,
     served: BlockId,
 ) -> Result<SourceTransparentUtxoPage, Status> {
+    let node = reads.node;
     let page = match limit {
-        None => node.fetch_transparent_address_utxos(lookup, height).await,
-        Some(limit) => {
-            node.fetch_transparent_address_utxo_page(lookup, height, limit)
+        None => {
+            reads
+                .call(node.fetch_transparent_address_utxos(lookup, height))
                 .await
         }
-    }
-    .map_err(node_status)?;
+        Some(limit) => {
+            reads
+                .call(node.fetch_transparent_address_utxo_page(lookup, height, limit))
+                .await
+        }
+    }?;
     if page.tip == served {
         Ok(page)
     } else {
@@ -495,7 +545,7 @@ async fn served_utxo_page(
 /// Complete the last height before sorting a bounded prefix. A second lookup
 /// starts at that height so earlier outputs cannot exhaust its row budget.
 async fn wallet_ordered_utxos(
-    node: &ZebraJsonRpcSource,
+    node: &NodeReads<'_>,
     lookup: &TransparentAddressLookup,
     height: BlockHeight,
     max_entries: u32,
@@ -584,6 +634,8 @@ fn utxo_reply(
 /// digest ingest committed.
 struct NodeAddressHistory {
     node: ZebraJsonRpcSource,
+    query: LightWalletNodeQuery,
+    reads: ForwardedReadLimit,
     slot: CanonicalReaderSlot,
     lookup: TransparentAddressLookup,
     pending: Vec<(BlockHeight, BlockHeight)>,
@@ -591,13 +643,27 @@ struct NodeAddressHistory {
     page: IntoIter<TransactionId>,
     page_range: (BlockHeight, BlockHeight),
     last_position: Option<(BlockHeight, u32)>,
+    /// When the whole request, stream included, must end.
+    deadline: Instant,
 }
 
+/// The stream slot of a forwarded address history, which the response stream
+/// and its worker share.
+///
+/// Dropping either owner releases the slot unless the worker is in the
+/// middle of an iteration or a blocking evidence read, which each keep their
+/// own reference until they end.
 #[derive(Clone)]
-struct HistoryAdmission(Arc<parking_lot::Mutex<Option<Arc<OwnedSemaphorePermit>>>>);
+struct HistoryAdmission(Arc<parking_lot::Mutex<Option<Arc<ForwardedResponsePermit>>>>);
 
 impl HistoryAdmission {
-    fn reserve_evidence(&self) -> Result<Arc<OwnedSemaphorePermit>, Status> {
+    fn new(permit: ForwardedResponsePermit) -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(Some(Arc::new(permit)))))
+    }
+
+    /// Returns a reference to the slot for work that must keep it until the
+    /// work ends, or `CANCELLED` once the stream has been dropped.
+    fn reserve_evidence(&self) -> Result<Arc<ForwardedResponsePermit>, Status> {
         self.0
             .lock()
             .clone()
@@ -614,24 +680,30 @@ impl Drop for HistoryAdmission {
 impl NodeAddressHistory {
     fn into_stream(
         mut self,
-        permit: OwnedSemaphorePermit,
-        deadline: Instant,
+        permit: ForwardedResponsePermit,
     ) -> GrpcStream<lightwalletd::RawTransaction> {
+        let deadline = self.deadline;
         let (demand, mut requests) = mpsc::channel(1);
         let (rows, received) = mpsc::channel(1);
-        // Either owner can release stream admission. A blocking evidence
-        // read keeps its own reference until the read actually finishes.
-        let admission = HistoryAdmission(Arc::new(parking_lot::Mutex::new(Some(Arc::new(permit)))));
+        let admission = HistoryAdmission::new(permit);
         let worker_admission = admission.clone();
         let task = tokio::spawn(async move {
             let admission = worker_admission;
             timeout_at(deadline, async {
                 while requests.recv().await.is_some() {
+                    // An iteration keeps the slot until it ends even when the
+                    // client drops the stream meanwhile. A worker idle
+                    // between client polls holds no reference, so dropping
+                    // a paused stream frees the slot at once.
+                    let Ok(iteration) = admission.reserve_evidence() else {
+                        return Ok::<_, Status>(());
+                    };
                     let row = tokio::select! {
                         biased;
-                        () = rows.closed() => return Ok::<_, Status>(()),
+                        () = rows.closed() => return Ok(()),
                         row = self.next(&admission) => row?,
                     };
+                    drop(iteration);
                     let Some(row) = row else {
                         return Ok(());
                     };
@@ -658,13 +730,28 @@ impl NodeAddressHistory {
         ))
     }
 
+    /// Returns when a node call starting now stops waiting for a slot.
+    fn call_deadline(&self) -> Instant {
+        self.reads.deadline().min(self.deadline)
+    }
+
     async fn read_page(&mut self) -> Result<(), Status> {
         self.page = IntoIter::default();
         while let Some((start, end)) = self.pending.pop() {
             match self
-                .node
-                .fetch_transparent_address_transaction_ids(&self.lookup, start, end, self.served)
+                .reads
+                .node_call(
+                    ForwardedReadKind::History,
+                    self.call_deadline(),
+                    self.node.fetch_transparent_address_transaction_ids(
+                        &self.lookup,
+                        start,
+                        end,
+                        self.served,
+                    ),
+                )
                 .await
+                .map_err(forwarded_read_refused)?
             {
                 Ok(ids) => {
                     if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
@@ -691,13 +778,15 @@ impl NodeAddressHistory {
         Ok(())
     }
 
+    /// Checks that the node still holds the served tip, sharing the call
+    /// with concurrent requests checking the same tip.
     async fn verify_served_tip(&self) -> Result<(), Status> {
-        let hash = self
-            .node
-            .fetch_block_hash(self.served.height)
+        if self
+            .query
+            .node_holds_block(self.served)
             .await
-            .map_err(node_status)?;
-        if hash == self.served.hash {
+            .map_err(node_status)?
+        {
             Ok(())
         } else {
             Err(history_changed())
@@ -729,37 +818,50 @@ impl NodeAddressHistory {
         })?
     }
 
+    /// Returns the next row: the served location and digest of the next
+    /// listed transaction, checked against the page range and canonical
+    /// order, with its bytes from the verified cache or the node.
+    ///
+    /// Each page is bracketed by its own tip checks and every row binds to the
+    /// served view through its local location and committed digest, so rows
+    /// need no tip check of their own; the stream checks the tip once more
+    /// at its end.
     async fn next(
         &mut self,
         admission: &HistoryAdmission,
     ) -> Result<Option<lightwalletd::RawTransaction>, Status> {
         loop {
             if let Some(id) = self.page.next() {
-                let reported = self
-                    .node
-                    .fetch_mined_transaction_bytes(id)
-                    .await
-                    .map_err(node_status)?
-                    .ok_or_else(history_changed)?;
-                let (start, end) = self.page_range;
-                if reported.0.height < start || reported.0.height > end {
-                    return Err(history_changed());
-                }
                 let mined = self.served_location(id, admission).await?;
                 let position = (
                     mined.location.block_height,
                     mined.location.tx_index_in_block,
                 );
-                let row = served_transaction(mined, reported)?;
+                let (start, end) = self.page_range;
+                if position.0 < start || position.0 > end {
+                    return Err(history_changed());
+                }
                 if self.last_position.is_some_and(|last| last >= position) {
                     return Err(Status::data_loss(
                         "node address history is out of canonical transaction order",
                     ));
                 }
-                self.verify_served_tip().await?;
+                let bytes = self
+                    .reads
+                    .mined_transaction_bytes(
+                        &self.node,
+                        mined,
+                        ForwardedReadKind::History,
+                        self.call_deadline(),
+                    )
+                    .await
+                    .map_err(history_transaction_status)?;
                 self.last_position = Some(position);
                 self.page_range.0 = position.0;
-                return Ok(Some(row));
+                return Ok(Some(lightwalletd::RawTransaction {
+                    data: bytes.to_vec(),
+                    height: u64::from(position.0.value()),
+                }));
             }
             if self.pending.is_empty() {
                 self.verify_served_tip().await?;
@@ -767,6 +869,19 @@ impl NodeAddressHistory {
             }
             self.read_page().await?;
         }
+    }
+}
+
+/// A row the node no longer mines in its served block means the history
+/// changed under the stream.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Every other failure maps as a GetTransaction failure does."
+)]
+fn history_transaction_status(error: ForwardedTransactionError) -> Status {
+    match error {
+        ForwardedTransactionError::OutsideServedView => history_changed(),
+        error => forwarded_transaction_status(error),
     }
 }
 
@@ -1237,7 +1352,7 @@ impl compact_tx_streamer_server::CompactTxStreamer
 
 #[derive(Clone)]
 struct UtxoResponsePermit {
-    _permit: Arc<OwnedSemaphorePermit>,
+    _permit: Arc<ForwardedResponsePermit>,
 }
 
 fn reserve_utxo_response_body(mut response: http::Response<Body>) -> http::Response<Body> {
@@ -1268,7 +1383,9 @@ impl HttpBody for ReservedUtxoBody {
         let frame = Pin::new(&mut self.body).poll_frame(cx);
         // The outer send-stall layer polls for trailers only after handing
         // all pieces of the previous data frame to the transport.
-        if matches!(&frame, Poll::Ready(None))
+        // A body error is terminal too, so the slot is released even while
+        // the consumer keeps the failed body.
+        if matches!(&frame, Poll::Ready(None | Some(Err(_))))
             || matches!(&frame, Poll::Ready(Some(Ok(frame))) if frame.is_trailers())
         {
             self.permit.take();
@@ -1289,6 +1406,23 @@ impl HttpBody for ReservedUtxoBody {
 mod tests {
     use super::*;
 
+    /// Takes every free response slot of `kind`, so the next request must
+    /// wait for one of the returned permits to drop.
+    async fn take_every_slot(
+        reads: &ForwardedReadLimit,
+        kind: ForwardedResponseKind,
+    ) -> Vec<ForwardedResponsePermit> {
+        let mut held = Vec::new();
+        while let Ok(permit) = reads.admit_response(kind, Instant::now()).await {
+            held.push(permit);
+        }
+        held
+    }
+
+    async fn slot_free(reads: &ForwardedReadLimit, kind: ForwardedResponseKind) -> bool {
+        reads.admit_response(kind, Instant::now()).await.is_ok()
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_send_stall_releases_unary_utxo_admission_while_a_piece_is_still_held()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1296,9 +1430,11 @@ mod tests {
         use tower::{Layer as _, ServiceExt as _};
         use zinder_runtime::GrpcSendStallLayer;
 
-        let slots = Arc::new(Semaphore::new(1));
+        let reads = ForwardedReadLimit::default();
+        let kind = ForwardedResponseKind::UtxoResponse;
+        let mut held = take_every_slot(&reads, kind).await;
         let permit = UtxoResponsePermit {
-            _permit: Arc::new(Arc::clone(&slots).try_acquire_owned()?),
+            _permit: Arc::new(held.pop().ok_or("no response slot")?),
         };
         let data = vec![0_u8; 256 * 1024];
         let data_len = data.len();
@@ -1322,10 +1458,10 @@ mod tests {
 
         let piece = body.frame().await.ok_or("missing first piece")??;
         assert!(piece.data_ref().is_some_and(|data| data.len() < data_len));
-        assert_eq!(slots.available_permits(), 0);
-        let returned_permit =
-            tokio::time::timeout(Duration::from_secs(10), Arc::clone(&slots).acquire_owned())
-                .await??;
+        assert!(!slot_free(&reads, kind).await);
+        let returned_permit = reads
+            .admit_response(kind, Instant::now() + Duration::from_secs(10))
+            .await?;
 
         let status = body.frame().await.ok_or("missing stall status")??;
         assert_eq!(
@@ -1336,7 +1472,73 @@ mod tests {
             Some(tonic::Code::DeadlineExceeded)
         );
         drop((returned_permit, body, piece));
-        assert_eq!(slots.available_permits(), 1);
+        assert!(slot_free(&reads, kind).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_body_error_releases_unary_utxo_admission_while_the_body_is_kept()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use http_body_util::{BodyExt as _, StreamBody};
+
+        let reads = ForwardedReadLimit::default();
+        let kind = ForwardedResponseKind::UtxoResponse;
+        let mut held = take_every_slot(&reads, kind).await;
+        let permit = UtxoResponsePermit {
+            _permit: Arc::new(held.pop().ok_or("no response slot")?),
+        };
+        let failing = StreamBody::new(tokio_stream::iter([Err::<
+            Frame<<Body as HttpBody>::Data>,
+            Status,
+        >(Status::internal(
+            "encoding failed",
+        ))]));
+        let mut response = http::Response::new(Body::new(failing));
+        response.extensions_mut().insert(permit);
+        let mut body = reserve_utxo_response_body(response).into_body();
+
+        assert!(!slot_free(&reads, kind).await);
+        assert!(matches!(body.frame().await, Some(Err(_))));
+        assert!(
+            slot_free(&reads, kind).await,
+            "a failed body kept its response slot"
+        );
+        drop(body);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_during_an_iteration_keeps_its_slot_until_the_iteration_ends()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reads = ForwardedReadLimit::default();
+        let kind = ForwardedResponseKind::HistoryStream;
+        let mut held = take_every_slot(&reads, kind).await;
+        let stream = HistoryAdmission::new(held.pop().ok_or("no stream slot")?);
+        let worker = stream.clone();
+
+        let iteration = worker.reserve_evidence()?;
+        drop(stream);
+        assert!(
+            !slot_free(&reads, kind).await,
+            "a replacement entered while the dropped stream's iteration still ran"
+        );
+        drop(iteration);
+        assert!(slot_free(&reads, kind).await);
+        assert!(worker.reserve_evidence().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_idle_dropped_stream_frees_its_slot_at_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reads = ForwardedReadLimit::default();
+        let kind = ForwardedResponseKind::HistoryStream;
+        let mut held = take_every_slot(&reads, kind).await;
+        let stream = HistoryAdmission::new(held.pop().ok_or("no stream slot")?);
+        let _worker_waiting_for_demand = stream.clone();
+
+        drop(stream);
+        assert!(slot_free(&reads, kind).await);
         Ok(())
     }
 

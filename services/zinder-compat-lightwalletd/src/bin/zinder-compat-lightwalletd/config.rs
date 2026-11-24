@@ -20,7 +20,7 @@ use zinder_compat_lightwalletd::{
 use zinder_core::Network;
 use zinder_query::{
     DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
-    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    ForwardedReadConfig, MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
@@ -93,6 +93,9 @@ pub(crate) struct LightwalletdConfig {
     /// Most tree-state rebuilds that wait for each rebuild slot in wallet
     /// serving. Compact-block serving has none.
     pub(crate) tree_state_replay_waiters_per_slot: Option<NonZeroU32>,
+    /// Admission and cache settings for reads forwarded to the node in
+    /// wallet and light-wallet serving. Compact-block serving forwards none.
+    pub(crate) forwarded_reads: Option<ForwardedReadConfig>,
     /// How old the served tip may be before `GetLatestBlock` and
     /// `GetLightdInfo` fail with `UNAVAILABLE`.
     pub(crate) stale_tip_limit: StaleTipLimit,
@@ -353,6 +356,10 @@ struct CompatSection {
     max_concurrent_block_range_streams: Option<u32>,
     tree_state_replay_wait_ms: Option<u64>,
     tree_state_replay_waiters_per_slot: Option<u32>,
+    forwarded_read_max_concurrent: Option<u32>,
+    forwarded_read_wait_ms: Option<u64>,
+    forwarded_read_waiters_per_slot: Option<u32>,
+    forwarded_transaction_cache_bytes: Option<u64>,
     stale_tip_limit_ms: Option<u64>,
     tip_wait_ms: Option<u64>,
     tip_wait_max_blocks: Option<u32>,
@@ -499,6 +506,7 @@ fn resolve_lightwalletd_config(
         resolve_wallet_storage(serving, wallet.unwrap_or_default(), &storage)?;
     let (tree_state_replay_wait, tree_state_replay_waiters_per_slot) =
         resolve_tree_state_replay(serving, &config.compat)?;
+    let forwarded_reads = resolve_forwarded_reads(serving, &config.compat)?;
     let (tip_wait, tip_wait_max_blocks, tip_wait_max_waiters) =
         resolve_tip_wait(&config.compat, storage.secondary_catchup_interval)?;
     let ResolvedIngestControlReader {
@@ -553,6 +561,7 @@ fn resolve_lightwalletd_config(
         max_concurrent_block_range_streams,
         tree_state_replay_wait,
         tree_state_replay_waiters_per_slot,
+        forwarded_reads,
         stale_tip_limit,
         tip_wait,
         tip_wait_max_blocks,
@@ -722,6 +731,18 @@ impl LightwalletdConfigToml {
                 tree_state_replay_waiters_per_slot: config
                     .tree_state_replay_waiters_per_slot
                     .map(NonZeroU32::get),
+                forwarded_read_max_concurrent: config
+                    .forwarded_reads
+                    .map(|reads| reads.max_concurrent().get()),
+                forwarded_read_wait_ms: config
+                    .forwarded_reads
+                    .map(|reads| u64::try_from(reads.wait().as_millis()).unwrap_or(u64::MAX)),
+                forwarded_read_waiters_per_slot: config
+                    .forwarded_reads
+                    .map(|reads| reads.waiters_per_slot().get()),
+                forwarded_transaction_cache_bytes: config
+                    .forwarded_reads
+                    .map(|reads| reads.transaction_cache_bytes()),
                 stale_tip_limit_ms: config.stale_tip_limit.limit().map_or(0, |limit| {
                     u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
                 }),
@@ -753,6 +774,14 @@ struct CompatToml {
     tree_state_replay_wait_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tree_state_replay_waiters_per_slot: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forwarded_read_max_concurrent: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forwarded_read_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forwarded_read_waiters_per_slot: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forwarded_transaction_cache_bytes: Option<u64>,
     stale_tip_limit_ms: u64,
     tip_wait_ms: u64,
     tip_wait_max_blocks: u32,
@@ -869,6 +898,48 @@ fn resolve_tree_state_replay_waiters_per_slot(
                 ))
             }),
     }
+}
+
+/// Resolves the forwarded-read admission and cache settings, which only
+/// wallet and light-wallet serving use.
+fn resolve_forwarded_reads(
+    serving: CompatServing,
+    compat: &CompatSection,
+) -> Result<Option<ForwardedReadConfig>, ConfigError> {
+    let configured = [
+        (
+            "forwarded_read_max_concurrent",
+            compat.forwarded_read_max_concurrent.is_some(),
+        ),
+        (
+            "forwarded_read_wait_ms",
+            compat.forwarded_read_wait_ms.is_some(),
+        ),
+        (
+            "forwarded_read_waiters_per_slot",
+            compat.forwarded_read_waiters_per_slot.is_some(),
+        ),
+        (
+            "forwarded_transaction_cache_bytes",
+            compat.forwarded_transaction_cache_bytes.is_some(),
+        ),
+    ];
+    if serving == CompatServing::CompactBlocks {
+        return match configured.iter().find(|(_, set)| *set) {
+            Some((field, _)) => Err(ConfigError::invalid(format!(
+                "compat.serving = \"compact-blocks\" does not accept compat.{field}, because compact-block serving forwards no wallet read to a node; remove it or select compat.serving = \"wallet\""
+            ))),
+            None => Ok(None),
+        };
+    }
+    ForwardedReadConfig::resolve(
+        compat.forwarded_read_max_concurrent,
+        compat.forwarded_read_wait_ms,
+        compat.forwarded_read_waiters_per_slot,
+        compat.forwarded_transaction_cache_bytes,
+    )
+    .map(Some)
+    .map_err(|error| ConfigError::invalid(format!("compat.{error}")))
 }
 
 /// Shortest accepted nonzero `compat.stale_tip_limit_ms`, which keeps a

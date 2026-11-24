@@ -595,6 +595,11 @@ pub enum ErrorReason {
     /// already holds its JSON-RPC connection or request limit. The node is up;
     /// retry with backoff.
     NodeRateLimited = 57,
+    /// RESOURCE_EXHAUSTED family.
+    /// A wallet read the server forwards to its node was refused because every
+    /// node-call or response slot of its kind stayed taken through the wait, or
+    /// every waiting place was taken. Retry with backoff.
+    ForwardedReadLimitReached = 58,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -661,6 +666,7 @@ impl ErrorReason {
             Self::BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
             Self::CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
             Self::NodeRateLimited => "NODE_RATE_LIMITED",
+            Self::ForwardedReadLimitReached => "FORWARDED_READ_LIMIT_REACHED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -732,6 +738,7 @@ impl ErrorReason {
                 Some(Self::CompactBlockStreamLimitReached)
             }
             "NODE_RATE_LIMITED" => Some(Self::NodeRateLimited),
+            "FORWARDED_READ_LIMIT_REACHED" => Some(Self::ForwardedReadLimitReached),
             _ => None,
         }
     }

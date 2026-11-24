@@ -544,8 +544,11 @@ impl<NativeIngest>
 {
     /// Enables verified mined transaction byte reads from the configured primary node
     /// when the admitted canonical store has no transaction blobs.
+    ///
+    /// The reads wait for node-call slots of `reads` and share its verified
+    /// byte cache with every other user of the same limit.
     #[must_use]
-    pub fn with_verified_cold_transactions(mut self) -> Self {
+    pub fn with_verified_cold_transactions(mut self, reads: crate::ForwardedReadLimit) -> Self {
         if !self
             .admitted_raw_blob_retention()
             .retains_transaction_blobs()
@@ -555,7 +558,7 @@ impl<NativeIngest>
                 .and_then(OrderedBroadcaster::primary_source)
         {
             self.cold_transactions = Some(Arc::new(
-                crate::cold_transaction::ColdTransactionSource::new(source.clone()),
+                crate::cold_transaction::ColdTransactionSource::new(source.clone(), reads),
             ));
             self.native_endpoint_capabilities = self
                 .native_endpoint_capabilities

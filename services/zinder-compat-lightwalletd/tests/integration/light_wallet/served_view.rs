@@ -330,7 +330,8 @@ async fn address_state_from_a_tip_the_node_left_and_regained_is_unavailable() ->
 }
 
 #[tokio::test]
-async fn a_node_on_another_chain_at_the_served_height_is_unavailable() -> Result<()> {
+async fn a_node_on_another_chain_at_the_served_height_answers_only_self_attested_reads()
+-> Result<()> {
     let (fixture, _) = served_view_fixture(
         |served| {
             if let Some(tip) = served.last_mut() {
@@ -340,29 +341,47 @@ async fn a_node_on_another_chain_at_the_served_height_is_unavailable() -> Result
         false,
         [],
     )?;
+    // SERVED is mined at height 1, below the fork: the node reports it in the
+    // served block with the recorded bytes, which binds the answer to the
+    // served view without a tip check.
+    let mined = fixture
+        .adapter
+        .get_transaction(transaction(SERVED))
+        .await?
+        .into_inner();
+    assert_eq!((mined.height, mined.data), (1, vec![0x55]));
     let missing = TransactionId::from_bytes([3; 32]);
-    for id in [SERVED, ABOVE, missing] {
+    for id in [ABOVE, missing] {
         node_unavailable(fixture.adapter.get_transaction(transaction(id)).await)?;
     }
+    // The node attests its own tip with every unspent-output page, and the
+    // history page request checks the served tip before it asks.
     address_state_unavailable(&fixture).await?;
-    node_unavailable(
+    for history in [
         fixture
             .adapter
             .get_taddress_txids(history_request(1, 2))
-            .await,
-    )?;
-    node_unavailable(
+            .await
+            .map(drop),
         fixture
             .adapter
             .get_taddress_transactions(history_request(1, 2))
-            .await,
-    )?;
-    for forwarded in [
-        "getrawtransaction",
-        "getaddressbalance",
-        "getaddressutxos",
-        "getaddresstxids",
+            .await
+            .map(drop),
     ] {
+        let status = history
+            .err()
+            .ok_or_else(|| eyre!("history answered from another chain"))?;
+        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    }
+    let fetched: Vec<_> = fixture
+        .node
+        .requests_for("getrawtransaction")?
+        .into_iter()
+        .map(|request| request.params[0].clone())
+        .collect();
+    assert_eq!(fetched, [json!(encode_rpc_transaction_id_hex(SERVED))]);
+    for forwarded in ["getaddressbalance", "getaddresstxids"] {
         assert!(
             fixture.node.requests_for(forwarded)?.is_empty(),
             "{forwarded} reached a node on another chain"
