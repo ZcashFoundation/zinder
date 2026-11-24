@@ -16,6 +16,7 @@ on:
       - "crates/zinder-proto/src/capabilities.rs"
       - "tools/zinder-proto-codegen/**"
       - ".github/workflows/protocol-contracts.yml"
+      - ".github/actions/setup-rust/**"
   push:
     branches:
       - main
@@ -33,6 +34,7 @@ on:
       - "crates/zinder-proto/src/capabilities.rs"
       - "tools/zinder-proto-codegen/**"
       - ".github/workflows/protocol-contracts.yml"
+      - ".github/actions/setup-rust/**"
   workflow_dispatch:
 
 permissions:
@@ -42,9 +44,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Swatinem/rust-cache hashes every CARGO_* and RUST* variable into its key.
+# Capability coverage reads ci-pr.yml's test cache, so keep the CARGO_*
+# variables identical to that workflow's.
 env:
   BUF_VERSION: "1.75.0"
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   PROTOC_VERSION: "36.2"
 
 jobs:
@@ -57,7 +64,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+        uses: ./.github/actions/setup-rust
 
       - name: Install Buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
@@ -133,16 +140,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Reads ci-pr.yml's test cache and never saves, so this job keeps no
+      # cache of its own.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: ./.github/actions/setup-rust
         with:
-          shared-key: capability-coverage
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-key: test
 
       - name: Check ChainIndex capability coverage
         env:
           PROTOC: /does/not/exist
-        run: cargo test -p zinder-client typed_chain_index_covers_every_advertised_wallet_capability
+        run: cargo test --locked -p zinder-client --test acceptance typed_chain_index_covers_every_advertised_wallet_capability

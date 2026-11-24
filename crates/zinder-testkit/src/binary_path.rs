@@ -1,10 +1,11 @@
-//! Locates a package's service binary from an integration test.
+//! Locates a package's service binary and source tree from an integration test.
 //!
-//! Cargo bakes `CARGO_BIN_EXE_<name>` into the test at compile time, so the
-//! path names the machine that built it. A nextest archive that runs on
-//! another machine needs the runtime `NEXTEST_BIN_EXE_<name>` that nextest sets
-//! to the extracted binary. Tests call [`bin_exe!`](crate::bin_exe) so both
-//! cases resolve without the call site knowing which one applies.
+//! Cargo bakes `CARGO_BIN_EXE_<name>` and `CARGO_MANIFEST_DIR` into the test at
+//! compile time, so the paths name the machine that built it. A nextest archive
+//! that runs elsewhere needs the runtime `NEXTEST_BIN_EXE_<name>` and
+//! `CARGO_MANIFEST_DIR` that nextest sets for the extracted archive. Tests call
+//! [`bin_exe!`](crate::bin_exe) and [`manifest_dir!`](crate::manifest_dir) so
+//! both cases resolve without the call site knowing which one applies.
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -38,6 +39,26 @@ macro_rules! bin_exe {
         $crate::binary_path::select_binary_path(
             ::std::env::var_os(::std::concat!("NEXTEST_BIN_EXE_", $name)),
             ::std::env!(::std::concat!("CARGO_BIN_EXE_", $name)),
+        )
+    };
+}
+
+/// Resolves the manifest directory of the package under test.
+///
+/// Prefers the `CARGO_MANIFEST_DIR` that nextest sets at run time, remapped by
+/// `--workspace-remap`, and falls back to the directory Cargo bakes in at
+/// compile time. Use it instead of `env!("CARGO_MANIFEST_DIR")` when a test
+/// reads files from the source tree.
+///
+/// ```ignore
+/// let deploy = zinder_testkit::manifest_dir!().join("../../deploy");
+/// ```
+#[macro_export]
+macro_rules! manifest_dir {
+    () => {
+        $crate::binary_path::select_binary_path(
+            ::std::env::var_os("CARGO_MANIFEST_DIR"),
+            ::std::env!("CARGO_MANIFEST_DIR"),
         )
     };
 }

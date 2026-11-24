@@ -13,15 +13,18 @@
     reason = "Integration test names describe the proxy contract under test."
 )]
 
-use std::fs;
+use std::{fs, path::PathBuf};
 
 use eyre::{Result, ensure, eyre};
 use zinder_runtime::{ENVIRONMENT_VARIABLES, PROXY_CLIENT_ADDRESS_HEADER};
 
 const CADDYFILE: &str = include_str!("../../../../deploy/compat-lightwalletd.Caddyfile");
 const TLS_RUNBOOK: &str = include_str!("../../../../docs/runbooks/exposing-over-tls.md");
-const DEPLOY_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
 const BASE_COMPOSE_FILE: &str = "docker-compose.yml";
+
+fn deploy_directory() -> PathBuf {
+    zinder_testkit::manifest_dir!().join("../../deploy")
+}
 
 /// The base Compose file and every overlay that adds to its `zinder-ingest`
 /// service, as `(file name, contents)` pairs.
@@ -30,7 +33,7 @@ const BASE_COMPOSE_FILE: &str = "docker-compose.yml";
 /// how the service is built, so the overlay runs merged with it.
 fn wallet_serving_compose_files() -> Result<Vec<(String, String)>> {
     let mut files = Vec::new();
-    for entry in fs::read_dir(DEPLOY_DIRECTORY)? {
+    for entry in fs::read_dir(deploy_directory())? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -277,7 +280,8 @@ fn the_runbook_names_every_network_that_reaches_a_trusting_listener() -> Result<
     let compose_files = wallet_serving_compose_files()?;
     ensure!(
         compose_files.len() > 1,
-        "found no overlay merged with deploy/{BASE_COMPOSE_FILE} in {DEPLOY_DIRECTORY}"
+        "found no overlay merged with deploy/{BASE_COMPOSE_FILE} in {}",
+        deploy_directory().display()
     );
     let mut checked = 0;
     for (file, contents) in &compose_files {

@@ -1,12 +1,32 @@
 #!/usr/bin/env bash
 # Verify each test predicate on its own, including exclusions inside a larger filter.
+#
+# Set NEXTEST_ARCHIVE_FILE to list tests from a `cargo nextest archive` instead
+# of building the workspace. The archive must come from this source tree, and
+# neither cargo nor rustc needs to be installed.
 set -euo pipefail
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
-cargo metadata --locked --format-version=1 > "$scratch/cargo.json"
-cargo nextest list --locked --workspace \
-  --list-type=binaries-only --message-format=json > "$scratch/binaries.json"
+if [[ -n "${NEXTEST_ARCHIVE_FILE:-}" ]]; then
+  mkdir "$scratch/archive"
+  cargo-nextest nextest list --archive-file "$NEXTEST_ARCHIVE_FILE" \
+    --extract-to "$scratch/archive" --workspace-remap "$PWD" \
+    --list-type=binaries-only --message-format=json > /dev/null
+  nextest=(cargo-nextest nextest)
+  reuse_build=(
+    --cargo-metadata "$scratch/archive/target/nextest/cargo-metadata.json"
+    --binaries-metadata "$scratch/archive/target/nextest/binaries-metadata.json"
+    --target-dir-remap "$scratch/archive/target"
+    --workspace-remap "$PWD"
+  )
+else
+  cargo metadata --locked --format-version=1 > "$scratch/cargo.json"
+  cargo nextest list --locked --workspace \
+    --list-type=binaries-only --message-format=json > "$scratch/binaries.json"
+  nextest=(cargo nextest)
+  reuse_build=(--cargo-metadata "$scratch/cargo.json" --binaries-metadata "$scratch/binaries.json")
+fi
 
 check_selectors() {
   local source=$1
@@ -16,7 +36,7 @@ check_selectors() {
     | sort -u > "$scratch/selectors" || return 2
   local selector
   while IFS= read -r selector; do
-    cargo nextest list --cargo-metadata "$scratch/cargo.json" --binaries-metadata "$scratch/binaries.json" \
+    "${nextest[@]}" list "${reuse_build[@]}" \
       --run-ignored=all --message-format=oneline "$@" -E "$selector" > "$scratch/matches" || return 2
     if [[ ! -s "$scratch/matches" ]]; then
       echo "$source: no listed test matches $selector" >&2
@@ -38,6 +58,7 @@ if ! grep -Fxq "$scratch/regression.toml: no listed test matches $bogus" "$scrat
 fi
 
 check_selectors .config/nextest.toml --ignore-default-filter
+check_selectors .github/workflows/ci-pr.yml --ignore-default-filter
 check_selectors .github/workflows/live-tests.yml --profile=ci-live
 check_selectors .github/workflows/parity-compat.yml --profile=ci-live
 check_selectors scripts/test-light-wallet-qualification.sh --profile=ci-live

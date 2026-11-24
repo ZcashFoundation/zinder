@@ -8,7 +8,10 @@
 //! as a whole, so the file must stay parseable and must not carry settings
 //! beyond the listeners and `security.allow_public_bind`.
 
-use std::{path::Path, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use eyre::{Result, WrapErr as _, ensure, eyre};
 
@@ -27,8 +30,8 @@ pub fn check_release_image_config(
     required_env: &[(&str, &str)],
 ) -> Result<()> {
     let executable = executable.as_ref();
-    let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../deploy/config/images")
+    let config_path = workspace_root(&crate::manifest_dir!())?
+        .join("deploy/config/images")
         .join(config_file_name);
     let config_text = std::fs::read_to_string(&config_path)
         .wrap_err_with(|| format!("read {}", config_path.display()))?;
@@ -75,4 +78,17 @@ pub fn check_release_image_config(
         );
     }
     Ok(())
+}
+
+/// The nearest ancestor of `manifest_dir` whose `Cargo.toml` declares
+/// `[workspace]`.
+fn workspace_root(manifest_dir: &Path) -> Result<PathBuf> {
+    manifest_dir
+        .ancestors()
+        .find(|directory| {
+            std::fs::read_to_string(directory.join("Cargo.toml"))
+                .is_ok_and(|manifest| manifest.lines().any(|line| line.trim() == "[workspace]"))
+        })
+        .map(Path::to_path_buf)
+        .ok_or_else(|| eyre!("no workspace Cargo.toml above {}", manifest_dir.display()))
 }
