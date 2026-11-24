@@ -1286,6 +1286,8 @@ pub struct WalletServingPairPublisher {
     observed_lag_chain_epochs: u64,
     #[cfg(test)]
     candidate_preparations: CandidatePreparationCounts,
+    #[cfg(test)]
+    metrics_recorder: Option<Arc<metrics_exporter_prometheus::PrometheusRecorder>>,
 }
 
 impl WalletServingPairPublisher {
@@ -1350,6 +1352,8 @@ impl WalletServingPairPublisher {
             observed_lag_chain_epochs: 0,
             #[cfg(test)]
             candidate_preparations: CandidatePreparationCounts::default(),
+            #[cfg(test)]
+            metrics_recorder: None,
         };
         publisher.prepare_candidate(0).await?;
         publisher.converge_and_publish(0).await?;
@@ -1547,14 +1551,12 @@ impl WalletServingPairPublisher {
     /// fails drops the candidate, and a later refresh opens its slot cold.
     async fn record_instance_memory(&mut self) {
         let newest_published = self.published_generation.and_then(|generation| {
-            match &self.generations[generation].state {
-                SecondaryGenerationState::Published { readers, .. } => {
-                    Some((Arc::clone(&readers.canonical), Arc::clone(&readers.wallet)))
-                }
-                SecondaryGenerationState::Vacant | SecondaryGenerationState::Candidate { .. } => {
-                    None
-                }
-            }
+            let SecondaryGenerationState::Published { readers, .. } =
+                &self.generations[generation].state
+            else {
+                return None;
+            };
+            Some((Arc::clone(&readers.canonical), Arc::clone(&readers.wallet)))
         });
         let published =
             self.generations
@@ -1576,16 +1578,26 @@ impl WalletServingPairPublisher {
                     .map(|candidate| (generation, candidate))
             })
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        let metrics_recorder = self.metrics_recorder.clone();
         let sampled = tokio::task::spawn_blocking(move || {
-            // Sample cache composition and per-CF properties once from the
-            // single newest published pair, even when retired pairs remain pinned.
             if let Some((canonical, wallet)) =
                 newest_published.as_ref().or_else(|| published.first())
             {
-                canonical.record_block_cache_entry_gauges();
-                canonical.record_column_family_property_gauges();
-                wallet.record_block_cache_entry_gauges();
-                wallet.record_column_family_property_gauges();
+                let record = || {
+                    canonical.record_block_cache_entry_gauges();
+                    canonical.record_column_family_property_gauges();
+                    wallet.record_block_cache_entry_gauges();
+                    wallet.record_column_family_property_gauges();
+                };
+                #[cfg(test)]
+                if let Some(recorder) = metrics_recorder {
+                    metrics::with_local_recorder(recorder.as_ref(), record);
+                } else {
+                    record();
+                }
+                #[cfg(not(test))]
+                record();
             }
             let canonical = published
                 .iter()
@@ -7445,105 +7457,152 @@ mod tests {
 
     /// Exports `rocksdb.live-sst-files-size` from the single newest published pair.
     ///
-    /// Runs on the blocking pool without emitting per-file estimates or
-    /// overcounting across retained generations. Because a thread-local
-    /// recorder does not reach `spawn_blocking`, this test installs a
-    /// process-wide recorder.
+    /// Flushes additional SST bytes on both primaries before refreshing so the
+    /// retained and newest generations report distinct live SST sizes, propagates
+    /// a fixture-scoped recorder into the blocking sampler so parallel `cargo test`
+    /// runs never cross-contaminate, and compares both exported gauges strictly
+    /// against the newest pair without per-file estimates.
     #[tokio::test(flavor = "multi_thread")]
     async fn publisher_exports_live_sst_size_for_newest_published_pair_without_per_file_properties()
     -> Result<(), Box<dyn std::error::Error>> {
-        let recorder = PrometheusBuilder::new().build_recorder();
+        let recorder = Arc::new(PrometheusBuilder::new().build_recorder());
         let rendered_metrics = recorder.handle();
-        metrics::set_global_recorder(recorder)
-            .map_err(|_| "another test in this process installed a global recorder")?;
+        let _recorder_guard = metrics::set_default_local_recorder(recorder.as_ref());
         let mut primaries = UnspentOutputPrimaries::start().await?;
         let (mut publisher, slot) = primaries
             .bootstrap_publisher_every(Duration::from_millis(1))
             .await?;
+        publisher.metrics_recorder = Some(Arc::clone(&recorder));
         let first = slot.capture();
-        let initial_wallet_utxo_sst = cf_property_sample(
-            &rendered_metrics.render(),
-            "wallet_secondary",
-            "transparent_unspent_output",
-            "rocksdb.live-sst-files-size",
-        )
-        .ok_or("bootstrap must export wallet_secondary transparent_unspent_output live SST size")?;
-        assert!(initial_wallet_utxo_sst > 0.0);
+        let retained_generation = publisher
+            .published_generation
+            .ok_or("bootstrap must record its published generation")?;
+        let retained_sizes = generation_live_sst_bytes(&publisher, retained_generation)?;
+        assert!(retained_sizes.compact_block > 0.0);
+        assert!(retained_sizes.wallet_utxo > 0.0);
 
         primaries.append_block()?;
+        flush_serving_pair_primaries_for_distinct_sst_sizes(&mut primaries)?;
         publisher.instance_memory_throttle = ResourceGaugeThrottle::new(Duration::ZERO);
         publisher.refresh_and_record().await;
         let second = slot.capture();
         assert!(!Arc::ptr_eq(&first, &second));
-        assert_ne!(publisher.published_generation, Some(0));
+        let newest_generation = publisher
+            .published_generation
+            .ok_or("refresh must record its newest published generation")?;
+        assert_ne!(newest_generation, retained_generation);
+        let newest_sizes = generation_live_sst_bytes(&publisher, newest_generation)?;
+        assert!(newest_sizes.compact_block > retained_sizes.compact_block);
+        assert!(newest_sizes.wallet_utxo > retained_sizes.wallet_utxo);
+        assert!(newest_sizes.wallet_reorg_undo > retained_sizes.wallet_reorg_undo);
+
         let exposition = rendered_metrics.render();
-        assert_serving_live_sst_gauges(&exposition, &publisher, initial_wallet_utxo_sst)?;
+        assert_serving_live_sst_gauges(&exposition, retained_sizes, newest_sizes);
 
         drop((first, second, slot, publisher));
         primaries.shutdown().await
     }
 
-    /// Asserts that serving secondaries export per-family `rocksdb.live-sst-files-size`
-    /// from the single newest published pair without emitting per-file estimates
-    /// or duplicating shared cache and ticker series.
-    fn assert_serving_live_sst_gauges(
-        exposition: &str,
+    #[derive(Clone, Copy)]
+    struct GenerationLiveSstBytes {
+        compact_block: f64,
+        wallet_utxo: f64,
+        wallet_reorg_undo: f64,
+    }
+
+    fn generation_live_sst_bytes(
         publisher: &WalletServingPairPublisher,
-        initial_wallet_utxo_sst: f64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let newest_generation = publisher
-            .published_generation
-            .ok_or("publisher must record its newest published generation")?;
+        generation: usize,
+    ) -> Result<GenerationLiveSstBytes, Box<dyn std::error::Error>> {
         let SecondaryGenerationState::Published { readers, .. } =
-            &publisher.generations[newest_generation].state
+            &publisher.generations[generation].state
         else {
-            return Err("newest published generation must be published".into());
+            return Err("selected generation must be published".into());
         };
-        let expected_compact_sst_bytes = readers
+        let compact_block = readers
             .canonical
             .rocksdb_property_value_cf("compact_block", "rocksdb.live-sst-files-size")?
             .ok_or("canonical secondary must report compact_block live SST size")?
             .parse::<f64>()?;
-        assert!(expected_compact_sst_bytes > 0.0);
-        assert_eq!(
-            cf_property_sample(
-                exposition,
+        let wallet_utxo = readers
+            .wallet
+            .rocksdb_property_value_cf("transparent_unspent_output", "rocksdb.live-sst-files-size")?
+            .ok_or("wallet secondary must report transparent_unspent_output live SST size")?
+            .parse::<f64>()?;
+        let wallet_reorg_undo = readers
+            .wallet
+            .rocksdb_property_value_cf("reorg_undo", "rocksdb.live-sst-files-size")?
+            .ok_or("wallet secondary must report reorg_undo live SST size")?
+            .parse::<f64>()?;
+        Ok(GenerationLiveSstBytes {
+            compact_block,
+            wallet_utxo,
+            wallet_reorg_undo,
+        })
+    }
+
+    fn flush_serving_pair_primaries_for_distinct_sst_sizes(
+        primaries: &mut UnspentOutputPrimaries,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        drop(primaries.writer.take_canonical_primary()?);
+        {
+            let (canonical_db, _) = open_raw_primary(primaries.writer.canonical_primary_path())?;
+            let compact_cf = canonical_db
+                .cf_handle("compact_block")
+                .ok_or("compact_block family must open")?;
+            canonical_db.flush_cf(&compact_cf)?;
+        }
+        let (wallet_db, _) = open_raw_primary(&primaries.wallet_primary_path)?;
+        let undo_cf = wallet_db
+            .cf_handle("reorg_undo")
+            .ok_or("reorg_undo family must open")?;
+        wallet_db.flush_cf(&undo_cf)?;
+        split_family_rows(&wallet_db, "transparent_unspent_output")
+    }
+
+    /// Verifies serving secondaries export newest-pair `rocksdb.live-sst-files-size`.
+    ///
+    /// Also confirms no per-file estimates are emitted and shared cache capacity
+    /// series are not duplicated.
+    fn assert_serving_live_sst_gauges(
+        exposition: &str,
+        retained: GenerationLiveSstBytes,
+        newest: GenerationLiveSstBytes,
+    ) {
+        for (store_role, cf, retained_bytes, newest_bytes) in [
+            (
                 "canonical_secondary",
                 "compact_block",
-                "rocksdb.live-sst-files-size"
+                retained.compact_block,
+                newest.compact_block,
             ),
-            Some(expected_compact_sst_bytes),
-            "canonical_secondary must report the single newest generation's live SST size"
-        );
-        let wallet_utxo_sst_bytes = cf_property_sample(
-            exposition,
-            "wallet_secondary",
-            "transparent_unspent_output",
-            "rocksdb.live-sst-files-size",
-        )
-        .ok_or("wallet_secondary must export transparent_unspent_output live SST size")?;
-        assert!(wallet_utxo_sst_bytes > 0.0);
-        assert!(
-            wallet_utxo_sst_bytes < initial_wallet_utxo_sst * 2.0,
-            "wallet_secondary live SST size ({wallet_utxo_sst_bytes}) must not double across retained generations (initial={initial_wallet_utxo_sst})"
-        );
-        for wallet_family in [
-            "transparent_unspent_output_by_address",
-            "transparent_address_transaction",
-            "transparent_address_balance",
-        ] {
-            let family_bytes = cf_property_sample(
-                exposition,
+            (
                 "wallet_secondary",
-                wallet_family,
-                "rocksdb.live-sst-files-size",
-            )
-            .ok_or("wallet_secondary must export live SST size for populated family")?;
-            assert!(
-                family_bytes > 0.0,
-                "wallet_secondary {wallet_family} must report non-zero live SST size"
+                "transparent_unspent_output",
+                retained.wallet_utxo,
+                newest.wallet_utxo,
+            ),
+            (
+                "wallet_secondary",
+                "reorg_undo",
+                retained.wallet_reorg_undo,
+                newest.wallet_reorg_undo,
+            ),
+        ] {
+            let exported =
+                cf_property_sample(exposition, store_role, cf, "rocksdb.live-sst-files-size");
+            assert_eq!(
+                exported,
+                Some(newest_bytes),
+                "{store_role} {cf} must report the single newest generation's live SST size"
+            );
+            assert_ne!(
+                exported,
+                Some(retained_bytes),
+                "{store_role} {cf} must not report the retained generation's stale live SST size"
             );
         }
+        assert!(exposition.contains("zinder_store_block_cache_entries{"));
         for store_role in ["canonical_secondary", "wallet_secondary"] {
             let capacity_prefix =
                 format!("zinder_store_block_cache_capacity_bytes{{store_role=\"{store_role}\"}} ");
@@ -7565,7 +7624,6 @@ mod tests {
                 "serving secondaries must not export per-file property {expensive_property}"
             );
         }
-        Ok(())
     }
 
     #[tokio::test]

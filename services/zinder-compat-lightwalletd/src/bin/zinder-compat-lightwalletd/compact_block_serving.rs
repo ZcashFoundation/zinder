@@ -249,6 +249,8 @@ pub(crate) struct CompactBlockPublisher {
     /// confirmed tip, and the halt the writer last reported, which
     /// writer-status failures republish.
     writer_attestation: WriterAttestation,
+    #[cfg(test)]
+    metrics_recorder: Option<Arc<metrics_exporter_prometheus::PrometheusRecorder>>,
 }
 
 impl CompactBlockPublisher {
@@ -310,6 +312,8 @@ impl CompactBlockPublisher {
             resources,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
             writer_attestation,
+            #[cfg(test)]
+            metrics_recorder: None,
         };
         publisher.record_resource_gauges().await;
         Ok((publisher, slot))
@@ -599,13 +603,22 @@ impl CompactBlockPublisher {
         }
         let active = self.slot.capture();
         let retired = self.retired.clone();
+        #[cfg(test)]
+        let metrics_recorder = self.metrics_recorder.clone();
         let sampled = tokio::task::spawn_blocking(move || {
-            active.secondary().record_block_cache_entry_gauges();
-            active.secondary().record_column_family_property_gauges();
-            std::iter::once(active)
-                .chain(retired)
-                .map(|generation| generation.secondary().instance_memory())
-                .sum()
+            let sample = || {
+                active.secondary().record_block_cache_entry_gauges();
+                active.secondary().record_column_family_property_gauges();
+                std::iter::once(active)
+                    .chain(retired)
+                    .map(|generation| generation.secondary().instance_memory())
+                    .sum()
+            };
+            #[cfg(test)]
+            if let Some(recorder) = metrics_recorder {
+                return metrics::with_local_recorder(recorder.as_ref(), sample);
+            }
+            sample()
         })
         .await;
         if let Ok(instances) = sampled {
@@ -1629,25 +1642,26 @@ mod tests {
 
     /// Exports `rocksdb.live-sst-files-size` from the single active generation.
     ///
-    /// Runs on the blocking pool without emitting per-file estimates or
-    /// overcounting across a retained generation. Because a thread-local
-    /// recorder does not reach `spawn_blocking`, this test installs a
-    /// process-wide recorder.
+    /// Flushes additional `compact_block` SST bytes before replacement so the
+    /// retained and active generations report distinct sizes, propagates a
+    /// fixture-scoped recorder into the blocking sampler so parallel `cargo test`
+    /// runs never cross-contaminate, and verifies no per-file estimates are
+    /// emitted.
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
-        reason = "The test keeps writer setup, generation replacement, and global Prometheus assertions in one path."
+        reason = "The test keeps writer setup, SST flush, generation replacement, and Prometheus assertions in one path."
     )]
     async fn publisher_exports_live_sst_size_for_active_generation_without_per_file_properties()
     -> Result<(), Box<dyn std::error::Error>> {
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let recorder =
+            Arc::new(metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder());
         let rendered_metrics = recorder.handle();
-        metrics::set_global_recorder(recorder)
-            .map_err(|_| "another test in this process installed a global recorder")?;
+        let _recorder_guard = metrics::set_default_local_recorder(recorder.as_ref());
         let temporary = tempfile::tempdir()?;
+        let primary_path = temporary.path().join("canonical-primary");
         let activations = lifecycle_activations();
-        let (primary, blocks) =
-            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let (primary, blocks) = lifecycle_store(&primary_path, &activations)?;
         let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
@@ -1666,7 +1680,7 @@ mod tests {
         let serving_readiness = CompactServingReadiness::new(Readiness::default());
         let budget = RocksDbResourceBudget::for_local_tests();
         let config = CompactBlockServingConfig {
-            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_primary_path: primary_path.clone(),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
             requirements: transaction_requirements(),
@@ -1680,7 +1694,14 @@ mod tests {
         };
         let (mut publisher, slot) =
             CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
+        publisher.metrics_recorder = Some(Arc::clone(&recorder));
         let initial = slot.capture();
+        let retained_compact_sst_bytes = initial
+            .secondary()
+            .rocksdb_property_value_cf("compact_block", "rocksdb.live-sst-files-size")?
+            .ok_or("retained secondary must report compact_block live SST size")?
+            .parse::<f64>()?;
+        assert!(retained_compact_sst_bytes > 0.0);
 
         let second = blocks
             .get(1)
@@ -1698,18 +1719,36 @@ mod tests {
             &activations,
         )?;
         control.set_writer_status(lifecycle_writer_status(&primary));
+        drop(primary);
+        {
+            let families =
+                rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), &primary_path)?;
+            let db = rust_rocksdb::DB::open_cf(
+                &rust_rocksdb::Options::default(),
+                &primary_path,
+                &families,
+            )?;
+            let compact_cf = db
+                .cf_handle("compact_block")
+                .ok_or("compact_block family must open")?;
+            db.flush_cf(&compact_cf)?;
+        }
         publisher.refresh().await;
         let active = slot.capture();
         assert!(!Arc::ptr_eq(&initial, &active));
 
-        publisher.instance_memory_throttle = ResourceGaugeThrottle::new(Duration::ZERO);
-        publisher.record_resource_gauges().await;
-        let expected_compact_sst_bytes = active
+        let active_compact_sst_bytes = active
             .secondary()
             .rocksdb_property_value_cf("compact_block", "rocksdb.live-sst-files-size")?
             .ok_or("active secondary must report compact_block live SST size")?
             .parse::<f64>()?;
-        assert!(expected_compact_sst_bytes > 0.0);
+        assert!(
+            active_compact_sst_bytes > retained_compact_sst_bytes,
+            "flushed compact_block append must increase active SST size ({active_compact_sst_bytes}) above retained ({retained_compact_sst_bytes})"
+        );
+
+        publisher.instance_memory_throttle = ResourceGaugeThrottle::new(Duration::ZERO);
+        publisher.record_resource_gauges().await;
         let exposition = rendered_metrics.render();
         let compact_sst_gauge = exposition.lines().find_map(|line| {
             (line.starts_with("zinder_store_rocksdb_property{")
@@ -1719,7 +1758,8 @@ mod tests {
             .then(|| line.rsplit_once(' ')?.1.parse::<f64>().ok())
             .flatten()
         });
-        assert_eq!(compact_sst_gauge, Some(expected_compact_sst_bytes));
+        assert_eq!(compact_sst_gauge, Some(active_compact_sst_bytes));
+        assert_ne!(compact_sst_gauge, Some(retained_compact_sst_bytes));
         assert!(exposition.contains("zinder_store_block_cache_entries{"));
         assert_eq!(
             exposition

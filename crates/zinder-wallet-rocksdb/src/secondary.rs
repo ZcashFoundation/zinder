@@ -319,6 +319,22 @@ impl RocksDbWalletSecondary {
             );
     }
 
+    /// Reads one engine property at this secondary's view of a column family.
+    /// An unsupported property returns `None`.
+    pub fn rocksdb_property_value_cf(
+        &self,
+        family: &'static str,
+        property: &str,
+    ) -> Result<Option<String>, RocksDbWalletError> {
+        let db = &self.store.bounded_open.db;
+        let cf = db
+            .cf_handle(family)
+            .ok_or(RocksDbWalletError::ColumnFamilyUnavailable { name: family })?;
+        db.property_value_cf(&cf, property).map_err(|source| {
+            RocksDbWalletError::rocksdb("read wallet secondary column family property", source)
+        })
+    }
+
     /// Samples the memory this secondary holds outside its block cache.
     #[must_use]
     pub fn instance_memory(&self) -> RocksDbInstanceMemory {
