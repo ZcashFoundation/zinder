@@ -1238,8 +1238,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` \
                       streams the compatibility server serves. A valid request past the limit \
-                      waits up to 10 seconds for a slot, then fails with `UNAVAILABLE`. Must \
-                      be in 1..=65536; defaults to 100.",
+                      waits in a bounded queue of up to three times this limit (300 waiters by \
+                      default, holding no chunk buffers) for up to 10 seconds for a slot, then \
+                      fails with `UNAVAILABLE`. Raise this setting (for example to 200) on \
+                      higher-concurrency public endpoints when memory allows and slot wait or \
+                      refusal metrics rise. Must be in 1..=65536; defaults to 100.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS",

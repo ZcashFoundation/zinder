@@ -972,6 +972,23 @@ fn slot_wait_samples(rendered: &str, outcome: &str) -> Option<u64> {
         .find_map(|line| line.strip_prefix(series.as_str())?.parse::<u64>().ok())
 }
 
+/// Returns how many open block-range streams `rendered` reports.
+fn open_block_range_streams(rendered: &str) -> Option<u64> {
+    rendered.lines().find_map(|line| {
+        line.strip_prefix("zinder_compat_block_range_streams_open ")?
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+/// Returns how many block-range stream refusals `rendered` reports for `reason`.
+fn block_range_refusals(rendered: &str, reason: &str) -> Option<u64> {
+    let series = format!("zinder_compat_block_range_stream_refusals_total{{reason=\"{reason}\"}} ");
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(series.as_str())?.parse::<u64>().ok())
+}
+
 /// Returns how many samples `rendered` holds for the block-range `stage`.
 fn block_range_stage_samples(rendered: &str, stage: &str) -> Option<u64> {
     let series =
@@ -2485,8 +2502,9 @@ async fn a_block_range_request_past_the_limit_waits_for_the_next_slot() -> eyre:
 /// A client that disconnects while its block-range request waits for a slot
 /// gives back its place in the queue.
 ///
-/// One slot admits one waiter. If the disconnected request still waited, the
-/// next request would find the queue full and fail at once.
+/// One slot admits three waiters. Two other wallets hold the first two places;
+/// if the disconnected third request still waited, the next request would find
+/// the queue full and fail at once.
 #[tokio::test]
 async fn a_disconnected_waiting_client_gives_back_its_place_in_the_queue() -> eyre::Result<()> {
     let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -2503,19 +2521,7 @@ async fn a_disconnected_waiting_client_gives_back_its_place_in_the_queue() -> ey
         .with_later_chunk_gate(Arc::clone(&later_chunk_gate));
     let adapter = LightwalletdGrpcAdapter::new(recorder)
         .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let server_addr = listener.local_addr()?;
-    let server = adapter.clone().into_server();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let server_handle = tokio::spawn(async move {
-        Server::builder()
-            .add_service(server)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-    });
-    let endpoint = format!("http://{server_addr}");
+    let (endpoint, shutdown_tx, server_handle) = spawn_compat_server(adapter).await?;
 
     let mut syncing_wallet = CompactTxStreamerClient::connect(endpoint.clone()).await?;
     let mut open_stream = syncing_wallet
@@ -2523,6 +2529,18 @@ async fn a_disconnected_waiting_client_gives_back_its_place_in_the_queue() -> ey
         .await?
         .into_inner();
     assert!(open_stream.message().await?.is_some());
+    let mut staying_waiters = Vec::new();
+    for _ in 0..2 {
+        let endpoint = endpoint.clone();
+        staying_waiters.push(tokio::spawn(async move {
+            let mut client = CompactTxStreamerClient::connect(endpoint).await?;
+            let stream = client
+                .get_block_range(block_range_request(1, 10))
+                .await?
+                .into_inner();
+            collect_grpc_stream(stream).await
+        }));
+    }
     let waiting_wallet = tokio::spawn({
         let endpoint = endpoint.clone();
         async move {
@@ -2532,7 +2550,7 @@ async fn a_disconnected_waiting_client_gives_back_its_place_in_the_queue() -> ey
         }
     });
     tokio::time::sleep(REFUSAL_WAIT).await;
-    assert!(!waiting_wallet.is_finished(), "the second wallet must wait");
+    assert!(!waiting_wallet.is_finished(), "the third waiter must wait");
     waiting_wallet.abort();
     assert!(
         waiting_wallet
@@ -2550,10 +2568,11 @@ async fn a_disconnected_waiting_client_gives_back_its_place_in_the_queue() -> ey
 
     let mut next_wallet = CompactTxStreamerClient::connect(endpoint).await?;
     let next_request = tokio::spawn(async move {
-        next_wallet
+        let stream = next_wallet
             .get_block_range(block_range_request(11, 20))
-            .await
-            .map(tonic::Response::into_inner)
+            .await?
+            .into_inner();
+        collect_grpc_stream(stream).await
     });
     tokio::time::sleep(REFUSAL_WAIT).await;
     assert!(
@@ -2563,8 +2582,220 @@ async fn a_disconnected_waiting_client_gives_back_its_place_in_the_queue() -> ey
     drop(open_stream);
     drop(syncing_wallet);
     later_chunk_gate.add_permits(1);
-    let admitted = next_request.await??;
-    drop(admitted);
+    for waiter in staying_waiters {
+        assert_eq!(waiter.await??.len(), 10);
+    }
+    assert_eq!(next_request.await??.len(), 10);
+
+    let _ = shutdown_tx.send(());
+    server_handle.await??;
+    Ok(())
+}
+
+async fn spawn_compat_server<QueryApi>(
+    adapter: LightwalletdGrpcAdapter<QueryApi>,
+) -> eyre::Result<(
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+)>
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let server_addr = listener.local_addr()?;
+    let server = adapter.into_server();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    Ok((format!("http://{server_addr}"), shutdown_tx, server_handle))
+}
+
+async fn collect_grpc_stream(
+    mut stream: tonic::Streaming<lightwalletd::CompactBlock>,
+) -> eyre::Result<Vec<lightwalletd::CompactBlock>> {
+    let mut blocks = Vec::new();
+    while let Some(block) = stream.message().await? {
+        blocks.push(block);
+    }
+    Ok(blocks)
+}
+
+/// A finished or mid-stream-errored block-range stream releases its slot as
+/// soon as it ends, even while the response wrapper has not yet been dropped.
+#[tokio::test]
+async fn a_finished_block_range_stream_releases_its_slot_before_response_drop() -> eyre::Result<()>
+{
+    use tokio_stream::StreamExt as _;
+    use zinder_proto::compat::lightwalletd::EncodedBlockRange as _;
+
+    let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = metrics_recorder.handle();
+    let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(2_500));
+    let adapter = LightwalletdGrpcAdapter::new(recorder)
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
+        .with_block_range_admission_wait(std::time::Duration::ZERO);
+
+    // 1. GetBlockRange drained to None releases its slot while still alive.
+    let mut first = adapter
+        .get_block_range(Request::new(block_range_request(1, 10)))
+        .await?
+        .into_inner();
+    let mut count = 0usize;
+    while let Some(block) = first.next().await {
+        let _ = block?;
+        count += 1;
+    }
+    assert_eq!(count, 10);
+    assert_eq!(open_block_range_streams(&metrics_handle.render()), Some(0));
+    let second = adapter
+        .get_block_range(Request::new(block_range_request(11, 20)))
+        .await?
+        .into_inner();
+    drop(first);
+    assert_eq!(collect_stream(second).await?.len(), 10);
+    assert_eq!(open_block_range_streams(&metrics_handle.render()), Some(0));
+
+    // 2. EncodedBlockRange drained to None releases its slot while still alive.
+    let mut encoded_first = adapter
+        .get_encoded_block_range(Request::new(block_range_request(1, 10)))
+        .await?
+        .into_inner();
+    let mut encoded_count = 0usize;
+    while let Some(encoded_block) = encoded_first.next().await {
+        let _ = encoded_block?;
+        encoded_count += 1;
+    }
+    assert_eq!(encoded_count, 10);
+    assert_eq!(open_block_range_streams(&metrics_handle.render()), Some(0));
+    let mut encoded_second = adapter
+        .get_encoded_block_range(Request::new(block_range_request(11, 20)))
+        .await?
+        .into_inner();
+    drop(encoded_first);
+    while let Some(encoded_block) = encoded_second.next().await {
+        let _ = encoded_block?;
+    }
+    drop(encoded_second);
+    assert_eq!(open_block_range_streams(&metrics_handle.render()), Some(0));
+
+    // 3. A mid-stream error releases its slot immediately without polling to
+    // None or dropping the response stream.
+    let mut errored = adapter
+        .get_encoded_block_range(Request::new(block_range_request(1_005, 0)))
+        .await?
+        .into_inner();
+    let mut saw_not_found = false;
+    while let Some(outcome) = errored.next().await {
+        if let Err(status) = outcome {
+            assert_eq!(status.code(), Code::NotFound);
+            saw_not_found = true;
+            break;
+        }
+    }
+    assert!(
+        saw_not_found,
+        "descending range past height 1 must end NotFound"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while open_block_range_streams(&metrics_handle.render()) != Some(0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let after_error = adapter
+        .get_block_range(Request::new(block_range_request(1, 5)))
+        .await?
+        .into_inner();
+    drop(errored);
+    assert_eq!(collect_stream(after_error).await?.len(), 5);
+    assert_eq!(open_block_range_streams(&metrics_handle.render()), Some(0));
+    Ok(())
+}
+
+/// Runs `client_count` synchronized concurrent gRPC clients, each issuing
+/// `rounds` back-to-back `GetBlockRange` streams, and asserts every stream
+/// succeeds with all expected blocks.
+async fn run_concurrent_block_range_wave(
+    clients: &[CompactTxStreamerClient<tonic::transport::Channel>],
+    client_count: usize,
+    rounds: usize,
+) -> eyre::Result<()> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(client_count));
+    let mut handles = Vec::with_capacity(client_count);
+    for idx in 0..client_count {
+        let mut client = clients[idx % clients.len()].clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            for _ in 0..rounds {
+                let stream = client
+                    .get_block_range(block_range_request(1, 10))
+                    .await?
+                    .into_inner();
+                let blocks = collect_grpc_stream(stream).await?;
+                assert_one_linked_chain(&blocks, 1, 10);
+            }
+            Ok::<_, eyre::Report>(())
+        }));
+    }
+    for handle in handles {
+        handle.await??;
+    }
+    Ok(())
+}
+
+/// 200 back-to-back clients and a 256-client burst suffer zero refusals.
+///
+/// Under the default 100-slot, 3x-waiter limit, every stream completes with no
+/// `UNAVAILABLE` / `waiters_full` refusal and
+/// `zinder_compat_block_range_streams_open` returns to 0 afterward.
+#[tokio::test]
+async fn concurrent_clients_at_default_capacity_and_256_burst_suffer_no_refusals()
+-> eyre::Result<()> {
+    let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = metrics_recorder.handle();
+    let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(100));
+    let adapter = LightwalletdGrpcAdapter::new(recorder);
+    let (endpoint, shutdown_tx, server_handle) = spawn_compat_server(adapter).await?;
+
+    let mut clients = Vec::with_capacity(4);
+    for _ in 0..4 {
+        clients.push(CompactTxStreamerClient::connect(endpoint.clone()).await?);
+    }
+
+    // 200 concurrent clients running back-to-back streams (previously hit
+    // `waiters_full` when finished streams held slots until body drop).
+    run_concurrent_block_range_wave(&clients, 200, 3).await?;
+    // 256-client simultaneous burst queued cleanly under the 3x (300) waiter cap.
+    run_concurrent_block_range_wave(&clients, 256, 1).await?;
+
+    let rendered = metrics_handle.render();
+    assert_eq!(
+        block_range_refusals(&rendered, "waiters_full").unwrap_or(0),
+        0,
+        "200 back-to-back clients and a 256-client burst must incur zero waiters_full refusals"
+    );
+    assert_eq!(
+        block_range_refusals(&rendered, "wait_timeout").unwrap_or(0),
+        0,
+        "200 back-to-back clients and a 256-client burst must incur zero wait_timeout refusals"
+    );
+    assert_eq!(open_block_range_streams(&rendered), Some(0));
 
     let _ = shutdown_tx.send(());
     server_handle.await??;
