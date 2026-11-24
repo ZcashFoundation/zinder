@@ -3,6 +3,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::{
+    borrow::Borrow,
     io,
     path::Path,
     sync::Arc,
@@ -10,7 +11,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use zinder_compat_lightwalletd::{CanonicalReaderSlot, PublishedShieldedHistory};
-use zinder_query::WalletServingPairSlot;
+use zinder_query::{CanonicalReader, WalletServingPairSlot, WalletServingReadPair};
 use zinder_runtime::{ConfigError, SupervisedTasks};
 
 use super::config::{HistoryLocation, LightwalletdConfigError, ShieldedHistorySection};
@@ -20,57 +21,71 @@ pub(super) enum CatalogSource {
     Compact(CanonicalReaderSlot),
 }
 
-impl CatalogSource {
-    async fn open(
-        &self,
-        config: &ShieldedHistorySection,
-    ) -> Result<PublishedShieldedHistory, tonic::Status> {
-        match self {
-            Self::Wallet(slot) => config.open(slot.capture_ephemeral().canonical()).await,
-            Self::Compact(slot) => config.open(slot.capture().as_ref()).await,
-        }
-    }
+/// The canonical source one verification reads, captured when the catalog
+/// read ends and dropped as soon as the verification does.
+enum CapturedSource {
+    Wallet(Arc<WalletServingReadPair>),
+    Compact(Arc<zinder_query::RocksDbCanonicalReader>),
+}
 
-    async fn verify_source(&self, history: &PublishedShieldedHistory) -> Result<(), tonic::Status> {
+impl Borrow<dyn CanonicalReader> for CapturedSource {
+    fn borrow(&self) -> &(dyn CanonicalReader + 'static) {
         match self {
-            Self::Wallet(slot) => {
-                history
-                    .verify_source(slot.capture_ephemeral().canonical())
-                    .await
-            }
-            Self::Compact(slot) => history.verify_source(slot.capture().as_ref()).await,
-        }
-    }
-
-    async fn refresh(&self, history: &PublishedShieldedHistory) -> Result<bool, tonic::Status> {
-        match self {
-            Self::Wallet(slot) => history.refresh(slot.capture_ephemeral().canonical()).await,
-            Self::Compact(slot) => history.refresh(slot.capture().as_ref()).await,
+            Self::Wallet(pair) => pair.canonical(),
+            Self::Compact(reader) => reader.as_ref(),
         }
     }
 }
 
-impl ShieldedHistorySection {
+impl CatalogSource {
+    fn capture(&self) -> CapturedSource {
+        match self {
+            Self::Wallet(slot) => CapturedSource::Wallet(slot.capture_ephemeral()),
+            Self::Compact(slot) => CapturedSource::Compact(slot.capture()),
+        }
+    }
+
     async fn open(
         &self,
-        source: &dyn zinder_query::CanonicalReader,
+        config: &ShieldedHistorySection,
     ) -> Result<PublishedShieldedHistory, tonic::Status> {
+        config.open(|| self.capture()).await
+    }
+
+    async fn verify_source(&self, history: &PublishedShieldedHistory) -> Result<(), tonic::Status> {
+        let source = self.capture();
+        history.verify_source(source.borrow()).await
+    }
+
+    async fn refresh(&self, history: &PublishedShieldedHistory) -> Result<bool, tonic::Status> {
+        history.refresh_captured(|| self.capture()).await
+    }
+}
+
+impl ShieldedHistorySection {
+    async fn open<Capture>(
+        &self,
+        capture: Capture,
+    ) -> Result<PublishedShieldedHistory, tonic::Status>
+    where
+        Capture: FnOnce() -> CapturedSource,
+    {
         match &self.location {
             HistoryLocation::Manifest(path) => {
-                PublishedShieldedHistory::open(
+                PublishedShieldedHistory::open_captured(
                     path,
                     &self.publisher_key,
                     self.require_fs_verity,
-                    source,
+                    capture,
                 )
                 .await
             }
             HistoryLocation::Directory(path) => {
-                PublishedShieldedHistory::follow_publisher(
+                PublishedShieldedHistory::follow_publisher_captured(
                     path,
                     &self.publisher_key,
                     self.require_fs_verity,
-                    source,
+                    capture,
                 )
                 .await
             }

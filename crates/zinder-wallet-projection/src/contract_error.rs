@@ -185,7 +185,7 @@ pub enum WalletProjectionContractError {
     #[error("wallet source sequence digest must use version 1")]
     ReadySourceSequenceVersionMismatch,
     /// Readiness requires the `LtHash16` UTXO commitment with `ChaCha12` expansion.
-    #[error("wallet readiness requires UTXO commitment scheme 2 (LtHash16, ChaCha12 expansion)")]
+    #[error("wallet readiness requires UTXO commitment scheme 1 (LtHash16, ChaCha12 expansion)")]
     ReadyUtxoCommitmentSchemeMismatch,
     /// A persisted build lease uses an unsupported lease encoding version.
     #[error("wallet projection build lease has unsupported version {encoded}")]

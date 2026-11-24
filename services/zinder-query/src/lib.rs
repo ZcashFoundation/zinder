@@ -132,6 +132,17 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         None
     }
 
+    /// Returns the chain epoch of the serving data current now, without
+    /// keeping that data readable for epoch pins.
+    ///
+    /// A probe that exposes no epoch, such as a tip or staleness check, reads
+    /// it this way. The caller must not pin a read to the returned epoch.
+    /// `None` means the query has no such read, and the caller reads the
+    /// epoch through [`Self::visible_tip_block`].
+    fn current_chain_epoch(&self) -> Option<ChainEpoch> {
+        None
+    }
+
     /// Returns the immutable structural capability set derived when this query
     /// was composed and admitted.
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities;
@@ -323,6 +334,23 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError>;
+
+    /// Verifies the node that supplies this query's transaction bytes against
+    /// the served tip of `at_epoch_id`, or of the current epoch when `None`.
+    ///
+    /// A caller consults the live mempool after a canonical miss only once
+    /// this succeeds, so a lookup never reports a pending answer or an
+    /// absence while the forwarding node is unreachable, behind the served
+    /// tip, or on a different chain from the served tip. A node that holds
+    /// the served tip on its best chain passes even when it has mined further.
+    /// A query whose store retains transaction bodies, or that
+    /// has no forwarding node, has nothing to verify and succeeds.
+    async fn verify_forwarding_node(
+        &self,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<(), QueryError> {
+        Ok(())
+    }
 
     /// Reads the indexed transaction at `(height, tx_index)`.
     ///

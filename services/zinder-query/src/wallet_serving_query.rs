@@ -635,6 +635,16 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
         self.serving_pair_slot.capture_ephemeral()
     }
 
+    /// Records the served height a broadcast node must reach, holding the
+    /// current pair only for the call.
+    fn track_broadcast_height(&self) {
+        if let Some(node_verifications) = &self.node_verifications {
+            let pair = self.capture_pair();
+            node_verifications.track_broadcast_height(&pair);
+            drop(pair);
+        }
+    }
+
     /// Selects the pair a read pinned to `at_epoch_id` captures, or the
     /// current pair when the read is unpinned.
     fn pin(&self, at_epoch_id: Option<ChainEpochId>) -> serving_read::SlotPin<'_> {
@@ -746,6 +756,10 @@ where
                 .chain_epoch()
                 .visible_tip_height,
         )
+    }
+
+    fn current_chain_epoch(&self) -> Option<ChainEpoch> {
+        Some(self.serving_pair_slot.capture_ephemeral().chain_epoch())
     }
 
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
@@ -1164,6 +1178,28 @@ where
         .await
     }
 
+    async fn verify_forwarding_node(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<(), QueryError> {
+        let Some(source) = &self.cold_transactions else {
+            return Ok(());
+        };
+        serving_read::run(
+            "verify_forwarding_node",
+            self.pin(at_epoch_id),
+            move |pair| async move {
+                Self::chain_epoch(&pair, at_epoch_id)?;
+                tokio::select! {
+                    biased;
+                    () = pair.reads_revoked() => Err(pair.revoked_read_error()),
+                    verified = source.verify_served_tip(pair.canonical()) => verified,
+                }
+            },
+        )
+        .await
+    }
+
     async fn transaction_at_block_index(
         &self,
         _height: BlockHeight,
@@ -1568,7 +1604,6 @@ where
             {
                 return Err(unavailable(WALLET_BROADCAST_TRANSACTION_V1));
             }
-            let pair = self.capture_pair();
             if raw_transaction.len() > zinder_core::MAX_RAW_TRANSACTION_BYTES {
                 return Err(QueryError::BroadcastTransactionTooLarge {
                     actual: raw_transaction.len(),
@@ -1576,9 +1611,9 @@ where
                 });
             }
             let reservation = self.broadcast_bytes.try_reserve(raw_transaction.len())?;
-            if let Some(node_verifications) = &self.node_verifications {
-                node_verifications.track_broadcast_height(&pair);
-            }
+            // The pair is released before the node call, so a slow node never
+            // keeps a replaced generation alive past its retirement bound.
+            self.track_broadcast_height();
             reservation
                 .hold_during(self.broadcaster.broadcast_transaction(raw_transaction))
                 .await
@@ -1589,10 +1624,7 @@ where
 
     async fn standard_fee(&self) -> Result<StandardFee, QueryError> {
         serving_read::record("standard_fee", None, async {
-            let pair = self.capture_pair();
-            if let Some(node_verifications) = &self.node_verifications {
-                node_verifications.track_broadcast_height(&pair);
-            }
+            self.track_broadcast_height();
             self.broadcaster
                 .standard_fee()
                 .await
@@ -2330,6 +2362,29 @@ mod tree_state_replay_limit_tests {
         drop(held_slot);
 
         assert_eq!(waiting.await??.height, reconstructed);
+        Ok(())
+    }
+
+    /// A probe that exposes no epoch reads the current epoch without marking
+    /// the pair observed, so it never retains a replaced generation for pins.
+    #[tokio::test]
+    async fn current_chain_epoch_leaves_the_pair_unobserved() -> Result<(), Box<dyn Error>> {
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let mut store =
+            WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?);
+        let expected = pair.chain_epoch();
+        let slot = WalletServingPairSlot::new(pair);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+
+        assert_eq!(query.current_chain_epoch(), Some(expected));
+        assert!(!slot.capture_ephemeral().is_observed_for_epoch_pin());
+        query.visible_tip_block(None).await?;
+        assert!(slot.capture_ephemeral().is_observed_for_epoch_pin());
         Ok(())
     }
 

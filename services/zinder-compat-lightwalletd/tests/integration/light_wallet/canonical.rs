@@ -1107,6 +1107,132 @@ async fn lean_wallet_verifies_and_caches_mined_bytes_without_forwarding_address_
     Ok(())
 }
 
+/// A lean `wallet` miss verifies its node before the mempool answers.
+///
+/// An unreachable or skewed node is `UNAVAILABLE`. A store that retains
+/// bodies consults the mempool without the node.
+#[tokio::test]
+async fn lean_wallet_miss_verifies_the_node_before_the_mempool_and_retained_bodies_do_not()
+-> Result<()> {
+    let control = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    for retention in [RawBlobRetention::None, RawBlobRetention::Transactions] {
+        assert_miss_behavior(retention, &control).await?;
+    }
+    control.shutdown().await?;
+    Ok(())
+}
+
+async fn assert_miss_behavior(
+    retention: RawBlobRetention,
+    control: &IngestControlFixture,
+) -> Result<()> {
+    let schedule = super::one_upgrade_per_height()?;
+    let tip = super::served_tip(1)?;
+    let pending_id = TransactionId::from_bytes([0x22; 32]);
+    let missing = TransactionId::from_bytes([0x33; 32]);
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(retention)
+        .extend_blocks(1);
+    let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let node = super::verifiable_node(&schedule, tip.hash, [])?;
+    let query = lean_wallet_query(&mut store, &node)?.with_verified_cold_transactions();
+    let lean = retention == RawBlobRetention::None;
+    assert_eq!(query.has_verified_cold_tx_source(), lean);
+    let epoch = zinder_query::WalletQueryApi::visible_tip_block(&query, None)
+        .await?
+        .chain_epoch;
+    let pending = MempoolEntry::new(
+        pending_id,
+        None,
+        RawTransactionBytes::new(vec![0x22]),
+        CompactTransactionData::default(),
+        MempoolObservation {
+            first_seen_chain_epoch: epoch,
+            first_seen_unix_millis: epoch.created_at,
+        },
+    )?;
+    control.set_mempool_entries(std::slice::from_ref(&pending));
+    // The fixture's mempool answers at an epoch of its own, so an absence
+    // is read from an adapter without a mempool surface.
+    let bare = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query.clone())?;
+    let adapter = bare
+        .clone()
+        .with_mempool_surface(Arc::new(IngestControlMempoolSurface::new(
+            control.endpoint().to_owned(),
+        )));
+
+    let reply = adapter
+        .get_transaction(transaction(pending_id))
+        .await?
+        .into_inner();
+    assert_eq!((reply.height, reply.data), (0, vec![0x22]));
+    let status = bare
+        .get_transaction(transaction(missing))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("an absent transaction was found"))?;
+    assert_eq!(status.code(), Code::NotFound);
+
+    let skewed_result = skewed_pending_lookup(&chain, control, pending_id).await;
+
+    drop(node);
+    let outage = [
+        adapter.get_transaction(transaction(pending_id)).await,
+        bare.get_transaction(transaction(missing)).await,
+    ];
+    if lean {
+        assert_eq!(
+            skewed_result.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        for answer in outage {
+            node_unavailable(
+                &answer
+                    .err()
+                    .ok_or_else(|| eyre!("a stopped node answered"))?,
+            );
+        }
+    } else {
+        assert!(skewed_result.is_ok());
+        assert_eq!(
+            outage[0].as_ref().ok().map(|reply| reply.get_ref().height),
+            Some(0)
+        );
+        assert_eq!(
+            outage[1].as_ref().err().map(Status::code),
+            Some(Code::NotFound)
+        );
+    }
+    Ok(())
+}
+
+/// Looks up a pending transaction through a node that sits on another tip
+/// than the served one.
+async fn skewed_pending_lookup(
+    chain: &ChainFixture,
+    control: &IngestControlFixture,
+    pending_id: TransactionId,
+) -> Result<lightwalletd::RawTransaction, Status> {
+    let schedule =
+        super::one_upgrade_per_height().map_err(|error| Status::internal(error.to_string()))?;
+    let skewed_tip = super::served_tip(2).map_err(|error| Status::internal(error.to_string()))?;
+    let internal = |error: eyre::Report| Status::internal(error.to_string());
+    let skewed = super::verifiable_node(&schedule, skewed_tip.hash, []).map_err(internal)?;
+    let mut store = WalletServingStoreFixture::from_chain(chain, &schedule)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let query = lean_wallet_query(&mut store, &skewed)
+        .map_err(internal)?
+        .with_verified_cold_transactions();
+    LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)
+        .map_err(|error| Status::internal(error.to_string()))?
+        .with_mempool_surface(Arc::new(IngestControlMempoolSurface::new(
+            control.endpoint().to_owned(),
+        )))
+        .get_transaction(transaction(pending_id))
+        .await
+        .map(tonic::Response::into_inner)
+}
+
 #[tokio::test]
 async fn lean_wallet_history_selects_local_rows_and_verifies_cold_bodies() -> Result<()> {
     use zinder_core::wire::encode_rpc_transaction_id_hex;

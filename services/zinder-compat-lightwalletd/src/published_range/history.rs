@@ -1,4 +1,5 @@
 use std::{
+    borrow::Borrow,
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -60,7 +61,28 @@ impl PublishedShieldedHistory {
         require_fs_verity: bool,
         source: &dyn CanonicalReader,
     ) -> Result<Self, Status> {
-        Self::admit(manifest, None, publisher_key, require_fs_verity, source).await
+        Self::open_captured(manifest, publisher_key, require_fs_verity, || source).await
+    }
+
+    /// Opens signed settled history like [`Self::open`], capturing the
+    /// canonical source only once the catalog is read, so a caller that
+    /// captures a replaceable serving pair holds it for the verification
+    /// alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a signature, segment, or canonical anchor fails verification.
+    pub async fn open_captured<Source, Capture>(
+        manifest: &Path,
+        publisher_key: &Path,
+        require_fs_verity: bool,
+        capture: Capture,
+    ) -> Result<Self, Status>
+    where
+        Capture: FnOnce() -> Source,
+        Source: Borrow<dyn CanonicalReader>,
+    {
+        Self::admit(manifest, None, publisher_key, require_fs_verity, capture).await
     }
 
     /// Follows an active publisher and serves canonical ranges until its first segment.
@@ -75,23 +97,47 @@ impl PublishedShieldedHistory {
         require_fs_verity: bool,
         source: &dyn CanonicalReader,
     ) -> Result<Self, Status> {
+        Self::follow_publisher_captured(directory, publisher_key, require_fs_verity, || source)
+            .await
+    }
+
+    /// Follows an active publisher like [`Self::follow_publisher`], capturing
+    /// the canonical source only once the catalog is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing publisher state, rollback, or catalog admission failure.
+    pub async fn follow_publisher_captured<Source, Capture>(
+        directory: &Path,
+        publisher_key: &Path,
+        require_fs_verity: bool,
+        capture: Capture,
+    ) -> Result<Self, Status>
+    where
+        Capture: FnOnce() -> Source,
+        Source: Borrow<dyn CanonicalReader>,
+    {
         Self::admit(
             &directory.join("current.json"),
             Some(directory),
             publisher_key,
             require_fs_verity,
-            source,
+            capture,
         )
         .await
     }
 
-    async fn admit(
+    async fn admit<Source, Capture>(
         manifest: &Path,
         publisher_directory: Option<&Path>,
         publisher_key: &Path,
         require_fs_verity: bool,
-        source: &dyn CanonicalReader,
-    ) -> Result<Self, Status> {
+        capture: Capture,
+    ) -> Result<Self, Status>
+    where
+        Capture: FnOnce() -> Source,
+        Source: Borrow<dyn CanonicalReader>,
+    {
         let path = manifest.to_owned();
         let directory = publisher_directory.map(Path::to_owned);
         let publisher_key = publisher_key.to_owned();
@@ -108,7 +154,8 @@ impl PublishedShieldedHistory {
         .map_err(|error| Status::internal(error.to_string()))?
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
         if let Some(catalog) = &catalog {
-            catalog.verify_source(source).await?;
+            let source = capture();
+            catalog.verify_source(source.borrow()).await?;
         }
         Ok(Self {
             current: ArcSwap::from_pointee(catalog.map_or_else(
@@ -155,6 +202,22 @@ impl PublishedShieldedHistory {
     ///
     /// A signature, storage, or chain error leaves the active catalog serving existing requests.
     pub async fn refresh(&self, source: &dyn CanonicalReader) -> Result<bool, Status> {
+        self.refresh_captured(|| source).await
+    }
+
+    /// Admits an extension like [`Self::refresh`], capturing the canonical
+    /// source only once the catalog is read and only when a catalog needs
+    /// verifying, so a caller that captures a replaceable serving pair holds
+    /// it for the verification alone.
+    ///
+    /// # Errors
+    ///
+    /// A signature, storage, or chain error leaves the active catalog serving existing requests.
+    pub async fn refresh_captured<Source, Capture>(&self, capture: Capture) -> Result<bool, Status>
+    where
+        Capture: FnOnce() -> Source,
+        Source: Borrow<dyn CanonicalReader>,
+    {
         let current = self.snapshot();
         let previous = current.catalog().cloned();
         let manifest = self.manifest.clone();
@@ -176,13 +239,15 @@ impl PublishedShieldedHistory {
         let Some(candidate) = candidate else {
             return Ok(false);
         };
+        let source = capture();
         if let Some(active) = current.catalog()
             && candidate.segments().len() == active.segments().len()
         {
-            active.verify_source(source).await?;
+            active.verify_source(source.borrow()).await?;
             return Ok(false);
         }
-        candidate.verify_source(source).await?;
+        candidate.verify_source(source.borrow()).await?;
+        drop(source);
         let next = Arc::new(HistorySnapshot::Published(Arc::new(candidate)));
         let displaced = self.current.compare_and_swap(&current, next);
         Ok(Arc::ptr_eq(&current, &displaced))
