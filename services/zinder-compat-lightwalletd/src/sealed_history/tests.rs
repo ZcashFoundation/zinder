@@ -79,12 +79,13 @@ fn trailer_of(path: &Path) -> eyre::Result<([u8; 32], Vec<u8>)> {
 }
 
 fn index_offset_of(bytes: &[u8]) -> eyre::Result<usize> {
-    Ok(usize::from_be_bytes(
+    let raw = u64::from_be_bytes(
         bytes
             .get(104..112)
             .and_then(|raw| raw.try_into().ok())
             .ok_or_else(|| invalid("short test header"))?,
-    ))
+    );
+    Ok(usize::try_from(raw).map_err(|_| invalid("test index offset exceeds address space"))?)
 }
 
 #[test]
