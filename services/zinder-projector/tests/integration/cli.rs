@@ -562,3 +562,47 @@ fn path_str(path: &Path) -> eyre::Result<&str> {
     path.to_str()
         .ok_or_else(|| eyre::eyre!("test path is not UTF-8: {path:?}"))
 }
+
+#[test]
+fn wallet_profiles_supply_omitted_retention_and_round_trip_printed_config() -> eyre::Result<()> {
+    let directory = tempdir()?;
+    let config_path = directory.path().join("projector.toml");
+    for profile in ["wallet", "wallet-archive"] {
+        let initial = || {
+            let mut command = projector_command();
+            command
+                .env_clear()
+                .args([
+                    "--print-config",
+                    "--network",
+                    "zcash-regtest",
+                    "--build-owner-hex",
+                    "00112233445566778899aabbccddeeff",
+                    "--lease-duration-seconds",
+                    "14400",
+                ])
+                .env("ZINDER_DEPLOYMENT__PROFILE", profile);
+            command
+        };
+        let output = initial().output()?;
+        assert!(output.status.success(), "{output:?}");
+        let rendered = String::from_utf8(output.stdout)?;
+        assert!(rendered.contains(&format!("[deployment]\nprofile = \"{profile}\"")));
+        assert!(!rendered.contains("raw_blob_policy ="));
+        fs::write(&config_path, &rendered)?;
+
+        let round_trip = projector_command()
+            .env_clear()
+            .args(["--print-config", "--config", path_str(&config_path)?])
+            .output()?;
+        assert!(round_trip.status.success(), "{round_trip:?}");
+        assert_eq!(String::from_utf8(round_trip.stdout)?, rendered);
+
+        let conflict = initial()
+            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+            .output()?;
+        assert!(!conflict.status.success(), "{conflict:?}");
+        assert!(String::from_utf8(conflict.stderr)?.contains("requires storage.raw_blob_policy"));
+    }
+    Ok(())
+}

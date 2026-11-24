@@ -19,7 +19,6 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::BlockHeight;
 use zinder_runtime::{ComposedReadiness, IngestPhase};
 use zinder_source::{MempoolSourceAdmissionLimits, NodeTarget};
-use zinder_store::CanonicalStoreWorkload;
 
 use crate::{CanonicalPipelineLimits, NodeSourceKind, RawBlobPolicy};
 
@@ -164,9 +163,6 @@ pub struct IngestRuntimeConfig {
     pub materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Optional raw-byte blob write policy for canonical ingest.
     pub raw_blob_policy: RawBlobPolicy,
-    /// Canonical workload the writer builds and reopens, fixed by the selected
-    /// deployment profile and `Wallet` otherwise.
-    pub workload: CanonicalStoreWorkload,
     /// Number of near-tip blocks the canonical store keeps replaceable by a
     /// reorg.
     pub reorg_window_blocks: u32,

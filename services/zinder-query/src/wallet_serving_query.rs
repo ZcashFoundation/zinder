@@ -563,6 +563,28 @@ impl<NativeIngest>
         }
         self
     }
+    /// Monitors the query's broadcast nodes and, when configured, the primary
+    /// node that supplies cold transaction bytes. Node outages degrade readiness
+    /// while local reads remain available.
+    #[must_use]
+    pub fn spawn_node_readiness_probe(
+        &self,
+        readiness: crate::WalletServingReadiness,
+        poll_interval: std::time::Duration,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        use crate::wallet_serving_pair_publisher::{WalletNodeProbe, spawn_wallet_node_probe};
+
+        let probe = self.broadcaster.as_ref().map(|nodes| {
+            WalletNodeProbe::new(
+                nodes.clone(),
+                self.serving_pair_slot.clone(),
+                poll_interval,
+                self.has_verified_cold_tx_source(),
+            )
+        });
+        spawn_wallet_node_probe(probe, readiness, cancel)
+    }
 }
 
 impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {

@@ -42,9 +42,6 @@ pub struct CanonicalWriterConfig {
     pub checkpoint_height: Option<BlockHeight>,
     /// Immutable raw-byte retention contract for fresh construction and reopen.
     pub raw_blob_retention: RawBlobRetention,
-    /// Canonical workload fixed by the deployment profile: `Wallet` unless the
-    /// Explorer profile requests per-block final roots and value-pool evidence.
-    pub workload: CanonicalStoreWorkload,
     /// Reorg window depth, which also places fresh construction's build tip,
     /// and so the baseline settled tip, this far below the node's tip.
     pub reorg_window_blocks: u32,
@@ -321,7 +318,7 @@ fn open_existing_store(
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &config.storage_path,
         network_upgrade_activations,
-        config.workload,
+        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
@@ -357,7 +354,7 @@ fn recover_staged_store(
     match RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         staging_path,
         network_upgrade_activations,
-        config.workload,
+        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
@@ -369,7 +366,7 @@ fn recover_staged_store(
             let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
                 &config.storage_path,
                 network_upgrade_activations,
-                config.workload,
+                CanonicalStoreWorkload::Wallet,
                 config.raw_blob_retention,
                 CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
                 config.resource_budget,
@@ -514,7 +511,7 @@ where
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &config.storage_path,
         network_upgrade_activations,
-        config.workload,
+        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
@@ -542,7 +539,7 @@ fn create_fresh_canonical_builder(
 ) -> Result<RocksDbCanonicalBuilder, CanonicalStoreError> {
     let builder = RocksDbCanonicalBuilder::create_fresh(
         staging_path,
-        config.workload,
+        CanonicalStoreWorkload::Wallet,
         build_plan,
         config.resource_budget,
     )?;
@@ -1297,7 +1294,6 @@ mod tests {
             ),
             checkpoint_height: None,
             raw_blob_retention: RawBlobRetention::Transactions,
-            workload: CanonicalStoreWorkload::Wallet,
             reorg_window_blocks: 1,
             tree_state_checkpoint_selection: None,
             follow: CanonicalFollowConfig {
@@ -1478,7 +1474,6 @@ mod tests {
             ),
             checkpoint_height: Some(BlockHeight::new(0)),
             raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
-            workload: CanonicalStoreWorkload::Wallet,
             reorg_window_blocks: 100,
             tree_state_checkpoint_selection: None,
             follow: CanonicalFollowConfig {

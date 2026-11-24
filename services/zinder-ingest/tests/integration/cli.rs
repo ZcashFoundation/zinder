@@ -927,7 +927,7 @@ fn deployment_profiles_render_and_reject_conflicting_retention() -> Result<(), B
         .replace("coverage = \"wallet-serving\"\n", "");
     fs::write(&config_path, config)?;
 
-    for profile in ["light-wallet", "wallet", "wallet-archive", "explorer"] {
+    for profile in ["light-wallet", "wallet", "wallet-archive"] {
         let output = zinder_ingest_command()
             .args(["--print-config", "--config", path_str(&config_path)?])
             .env("ZINDER_DEPLOYMENT__PROFILE", profile)

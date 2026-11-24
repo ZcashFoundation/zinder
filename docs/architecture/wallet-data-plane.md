@@ -123,10 +123,10 @@ At 30 ms per rebuild, about the 99th percentile measured on Testnet, one slot ca
 
 `Transaction(transaction_id, at_epoch_id)` returns where a transaction is, as a `TransactionLocation` with one of two arms:
 
-- `mined`: block height, hash, and position; `chain_context` with the consensus branch id, block time, and confirmations computed against the answering epoch's visible tip; and `raw_transaction_bytes` when ingest retains transaction blobs (`raw_blob_policy` is `transactions` or `all`).
+- `mined`: block height, hash, and position; `chain_context` with the consensus branch id, block time, and confirmations computed against the answering epoch's visible tip; and `raw_transaction_bytes` when the server advertises `wallet.read.transaction_bytes_v1`. The server reads retained transaction blobs or retrieves the exact bytes from the verified cold-byte source and checks them against the indexed digest.
 - `in_mempool`: the live `MempoolEntry`, including raw bytes and transparent outputs and spends.
 
-Without `at_epoch_id`, the server reads the canonical chain first. On a miss, it asks the writer's live mempool through ingest control, with a 15-second timeout. With `at_epoch_id`, the lookup reads only that epoch's canonical chain and never the mempool. To learn whether a transaction is pending, make an unpinned lookup.
+Without `at_epoch_id`, the server reads the canonical chain first. On a miss, it asks the writer's live mempool through ingest control, with a 15-second timeout. With `at_epoch_id`, the lookup locates the transaction in that epoch's canonical chain and skips the mempool. To learn whether a transaction is pending, make an unpinned lookup.
 
 ### Absence
 

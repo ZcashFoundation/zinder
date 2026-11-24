@@ -85,7 +85,6 @@ async fn canonical_writer_publishes_visible_reorg_for_invalidated_zebra_suffix()
         },
         checkpoint_height: Some(checkpoint_height),
         raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
-        workload: zinder_store::CanonicalStoreWorkload::Wallet,
         reorg_window_blocks: REORG_WINDOW_BLOCKS,
         tree_state_checkpoint_selection: None,
         follow: CanonicalFollowConfig {

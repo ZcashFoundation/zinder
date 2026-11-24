@@ -369,10 +369,6 @@ fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {
             "storage.canonical_secondary_path",
             DEFAULT_CANONICAL_SECONDARY_PATH,
         )?
-        .with_default(
-            "storage.raw_blob_policy",
-            DEFAULT_RAW_BLOB_RETENTION.as_kebab_case(),
-        )?
         .with_default("wallet.path", DEFAULT_WALLET_PATH)?
         .with_default("projector.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
@@ -542,7 +538,7 @@ fn resolve_expected_raw_blob_retention(
     configured: Option<RawBlobRetention>,
 ) -> Result<RawBlobRetention, ConfigError> {
     let Some(profile) = profile else {
-        return require_field(configured, "storage.raw_blob_policy");
+        return Ok(configured.unwrap_or(DEFAULT_RAW_BLOB_RETENTION));
     };
     if matches!(profile, DeploymentProfile::LightWallet) {
         return Err(ConfigError::invalid(

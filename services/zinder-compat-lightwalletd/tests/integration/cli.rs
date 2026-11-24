@@ -1071,3 +1071,68 @@ fn path_str(path: &Path) -> eyre::Result<&str> {
     path.to_str()
         .ok_or_else(|| eyre::eyre!("path is not valid UTF-8: {}", path.display()))
 }
+
+#[tokio::test]
+async fn wallet_profiles_refuse_checkpointed_canonical_history() -> eyre::Result<()> {
+    use std::time::Duration;
+
+    use zinder_core::{BlockHeight, Network};
+    use zinder_store::RawBlobRetention;
+    use zinder_testkit::{
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, IngestControlFixture,
+        sample_regtest_upgrade_activations,
+    };
+
+    let network = Network::ZcashRegtest;
+    let control = IngestControlFixture::spawn(network).await?;
+    let activations = sample_regtest_upgrade_activations();
+    for (profile, retention) in [
+        ("wallet", RawBlobRetention::None),
+        ("wallet-archive", RawBlobRetention::All),
+    ] {
+        let chain = ChainFixture::new(network)
+            .with_raw_blob_retention(retention)
+            .extend_blocks(2);
+        let baseline = CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(1));
+        let writer = CanonicalWriterFixture::publish(&baseline, &activations)?;
+        let reorg_window = writer
+            .canonical_primary()?
+            .reorg_policy()
+            .reorg_window_blocks();
+        let directory = tempfile::tempdir()?;
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"))
+                .env_clear()
+                .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+                .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+                .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+                .env(
+                    "ZINDER_STORAGE__SECONDARY_PATH",
+                    directory.path().join("canonical-secondary"),
+                )
+                .env("ZINDER_WALLET__PATH", directory.path().join("wallet"))
+                .env(
+                    "ZINDER_WALLET__SECONDARY_PATH",
+                    directory.path().join("wallet-secondary"),
+                )
+                .env("ZINDER_INGEST_CONTROL__ADDR", control.endpoint())
+                .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:1")
+                .env(
+                    "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+                    reorg_window.to_string(),
+                )
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await??;
+        assert!(!output.status.success(), "{profile} unexpectedly started");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("lacks required BlockHistory coverage"),
+            "{profile} failed for a different reason: {stderr}",
+        );
+    }
+    control.shutdown().await?;
+    Ok(())
+}

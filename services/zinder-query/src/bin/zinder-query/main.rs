@@ -12,7 +12,6 @@ use zinder_query::{
     AdmittedIngestControl, OrderedBroadcaster, WalletEndpointMetadata, WalletQueryApi,
     WalletQueryGrpcAdapter, WalletServingPairConfig, WalletServingPairPublisher,
     WalletServingQuery, WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
-    spawn_wallet_node_readiness_probe,
 };
 use zinder_runtime::{
     OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase, SupervisedRuntime,
@@ -201,7 +200,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
                 wallet_primary_path: query_config.wallet_primary_path.clone(),
                 wallet_secondary_root: query_config.wallet_secondary_root.clone(),
                 network: query_config.network,
-                expected_raw_blob_retention: query_config.storage.expected_raw_blob_retention,
+                canonical_requirements: query_config.canonical_requirements(),
                 canonical_reorg_policy: query_config.canonical_reorg_policy,
                 canonical_resource_budget: query_config.storage.canonical_rocksdb_budget,
                 wallet_resource_budget: query_config.wallet_rocksdb_budget,
@@ -225,14 +224,14 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         .value();
     open_storage_phase.complete();
 
-    let query = WalletServingQuery::from_admitted_native_serving_pair(
-        pair_slot.clone(),
-        ingest_control.clone(),
-    )
-    .with_node_broadcast(node_broadcast.clone())
-    .with_verified_cold_transactions()
-    .with_tree_state_replay_wait(query_config.tree_state_replay_wait)
-    .with_tree_state_replay_waiters_per_slot(query_config.tree_state_replay_waiters_per_slot);
+    let query =
+        WalletServingQuery::from_admitted_native_serving_pair(pair_slot, ingest_control.clone())
+            .with_node_broadcast(node_broadcast)
+            .with_verified_cold_transactions()
+            .with_tree_state_replay_wait(query_config.tree_state_replay_wait)
+            .with_tree_state_replay_waiters_per_slot(
+                query_config.tree_state_replay_waiters_per_slot,
+            );
     let endpoint_metadata = WalletEndpointMetadata {
         network: encode_zinder_native_chain_name(query_config.network).to_owned(),
         service_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -255,13 +254,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let runtime = SupervisedRuntime::new(RuntimeService::Query);
     let _signal_handle = runtime.request_shutdown_on_terminating_signal();
     let cancel = runtime.stopping();
-    let grpc_adapter = WalletQueryGrpcAdapter::new(query, endpoint_metadata)
-        .with_traffic_readiness(readiness.clone())
-        .with_shutdown(cancel.clone());
-
-    let node_readiness_handle = spawn_wallet_node_readiness_probe(
-        node_broadcast,
-        pair_slot,
+    let node_readiness_handle = query.spawn_node_readiness_probe(
         serving_readiness.clone(),
         query_config
             .node
@@ -273,6 +266,10 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             ),
         cancel.clone(),
     );
+    let grpc_adapter = WalletQueryGrpcAdapter::new(query, endpoint_metadata)
+        .with_traffic_readiness(readiness.clone())
+        .with_shutdown(cancel.clone());
+
     // Health and serving-pair refresh observe the same ingest control plane, so
     // they intentionally share one configured freshness cadence.
     let ingest_control_health_poll_interval = query_config.storage.secondary_catchup_interval;

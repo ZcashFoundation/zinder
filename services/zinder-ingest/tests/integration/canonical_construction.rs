@@ -697,7 +697,6 @@ fn held_construction_writer_config(
         ),
         checkpoint_height: None,
         raw_blob_retention: RawBlobRetention::Transactions,
-        workload: zinder_store::CanonicalStoreWorkload::Wallet,
         reorg_window_blocks: 100,
         tree_state_checkpoint_selection: None,
         follow: CanonicalFollowConfig {

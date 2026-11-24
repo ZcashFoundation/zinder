@@ -71,7 +71,6 @@ supplies.
 | `light-wallet` | Wallet | None | Ingest and node-backed lightwalletd compatibility |
 | `wallet` | Wallet | None | Ingest, projector, native query, and wallet compatibility |
 | `wallet-archive` | Wallet | All | Ingest, projector, native query, and wallet compatibility |
-| `explorer` | Explorer | All | Ingest with bundled Explorer views, wallet serving, and Explorer |
 
 All profiles build complete canonical history. For `wallet`, give the native
 query and compatibility processes a primary `[node]` that can supply mined

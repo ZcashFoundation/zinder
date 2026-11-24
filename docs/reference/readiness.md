@@ -332,7 +332,7 @@ The readiness report lists reader dependency failures under `degraded`.
 
 | Input | Used by | When degraded |
 | --- | --- | --- |
-| `node_source` | Transaction broadcast, and `GetStandardFee` in wallet-mode compatibility | No verified node endpoint answers (`node_unavailable`), the node reports it is not synchronized (`upstream_not_ready`), or it lacks a required method (`node_capability_missing`). Not present without `[node]`. |
+| `node_source` | Transaction broadcast, `GetStandardFee` in wallet-mode compatibility, and cold transaction bytes in lean wallet serving | No verified node endpoint answers (`node_unavailable`), the node reports it is not synchronized (`upstream_not_ready`), or it lacks a required method (`node_capability_missing`). Lean wallet readiness checks the primary node because it supplies cold bytes. A healthy broadcast fallback can still accept broadcasts during a primary outage. |
 | `node_source` in light-wallet serving | [Forwarded wallet calls](lightwalletd-compatibility.md#runtime-serving-selection) | The configured node fails the dependency probe. The report carries its cause under `degraded`. |
 | `ingest_control` | Mempool snapshots and events, unmined transaction lookups | Ingest control fails (`ingest_control_unavailable`), the writer's mempool waits on its node (`node_unavailable`), or the writer reports `upstream_not_ready`. |
 

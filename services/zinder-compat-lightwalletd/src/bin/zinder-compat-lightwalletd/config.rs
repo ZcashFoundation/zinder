@@ -184,11 +184,13 @@ pub(crate) enum LightwalletdConfigError {
 
 impl LightwalletdConfig {
     pub(crate) fn canonical_requirements(&self) -> CanonicalStoreRequirements {
-        let requirements = if self.serving == CompatServing::LightWallet {
-            DeploymentProfile::LightWallet.canonical_requirement()
-        } else {
-            CanonicalStoreRequirements::default()
-        };
+        let profile = self.profile.or_else(|| {
+            (self.serving == CompatServing::LightWallet).then_some(DeploymentProfile::LightWallet)
+        });
+        let requirements = profile.map_or_else(
+            CanonicalStoreRequirements::default,
+            DeploymentProfile::canonical_requirement,
+        );
         requirements.with_blob_retention(self.storage.expected_raw_blob_retention)
     }
 }

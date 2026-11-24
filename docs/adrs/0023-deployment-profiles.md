@@ -35,7 +35,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
    - Current certification reads the full replay history. Omitting settled replay requires authenticated evidence for the settled prefix at cold admission and at restore, and enough retained replay for reorg replacement and for every consumer that reads it, as the wallet projector and Explorer views do.
 
    The encoding of transaction evidence, the construction of prefix evidence, and the length of retained replay belong to the format specification.
-6. **Wallet profiles retain complete history.** `wallet` runs the projector, native query, and wallet compatibility without raw blobs. Its serving runtimes require a verified primary node byte source. `wallet-archive` runs the same wallet services and keeps all raw blobs. `explorer` builds the Explorer stored set, retains all raw blobs, and enables the bundled Explorer views.
+6. **Wallet profiles retain complete history.** `wallet` runs the projector, native query, and wallet compatibility without raw blobs. Its serving runtimes require a verified primary node byte source. `wallet-archive` runs the same wallet services and keeps all raw blobs. An Explorer profile waits for canonical publication to authenticate daily value-pool evidence and for live writes to supply final note-commitment roots.
 
 [Configuration](../reference/configuration.md) lists the settings, and [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#runtime-serving-selection) describes each serving mode.
 
@@ -48,7 +48,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
 - Decision 4, verification of forwarded answers: measured, as [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7 records ([#480](https://github.com/ZcashFoundation/zinder/issues/480), [#481](https://github.com/ZcashFoundation/zinder/pull/481)).
 - Decision 5, the location and digest of every mined transaction: measured. Node bytes that differ from the recorded digest fail with `DATA_LOSS`, and the wrong-bytes and wrong-block tests fail with their guards disabled ([#481](https://github.com/ZcashFoundation/zinder/pull/481)).
 - Decision 5, the precondition for omitting settled replay: judgment about a format that is not built. Replay is about 20 GiB of a Mainnet canonical store ([#364](https://github.com/ZcashFoundation/zinder/issues/364)), and current cold certification reads all of it. The format specification ([#381](https://github.com/ZcashFoundation/zinder/issues/381)) reopens it if it authenticates the settled prefix another way.
-- Decision 6, fixed stored sets for the wallet and Explorer profiles: judgment. Mainnet disk and rebuild measurements are tracked in [#364](https://github.com/ZcashFoundation/zinder/issues/364).
+- Decision 6, fixed stored sets for the wallet profiles: judgment. Mainnet disk and rebuild measurements are tracked in [#364](https://github.com/ZcashFoundation/zinder/issues/364).
 
 ## Consequences
 
@@ -69,7 +69,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
 ## Revision history
 
 - 2026-11-24. Decision 3 notes the signed settled-history projection also supplies nullifier-range payloads, which the light-wallet profile's `GetBlockRangeNullifiers` stream reads zero-copy.
-- 2026-11-24. Decisions 1, 4, and 6 add the lean wallet, wallet archive, and Explorer profiles.
+- 2026-11-24. Decisions 1, 4, and 6 add the lean wallet and wallet archive profiles.
 - 2026-11-23. Decision 1 distinguishes listener and ingest config output from the publisher's effective settings.
 - 2026-11-23. Decision 4 distinguishes the wallet deployment's node calls from the Explorer's tip observation.
 - 2026-11-23. The consequences describe bounded forwarded history concurrency and request time.

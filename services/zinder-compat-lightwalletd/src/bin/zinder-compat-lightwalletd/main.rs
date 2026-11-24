@@ -35,7 +35,7 @@ use zinder_query::{
     AdmittedIngestControl, CanonicalReader as _, DEFAULT_TREE_STATE_REPLAY_WAIT,
     DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, OrderedBroadcaster, WalletServingPairConfig,
     WalletServingPairPublisher, WalletServingQuery, WalletServingReadiness,
-    spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
+    spawn_wallet_ingest_control_readiness_probe,
 };
 
 #[global_allocator]
@@ -261,9 +261,7 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
                 wallet_primary_path,
                 wallet_secondary_root,
                 network: lightwalletd_config.network,
-                expected_raw_blob_retention: lightwalletd_config
-                    .storage
-                    .expected_raw_blob_retention,
+                canonical_requirements: lightwalletd_config.canonical_requirements(),
                 canonical_reorg_policy: lightwalletd_config.canonical_reorg_policy,
                 canonical_resource_budget: lightwalletd_config.storage.canonical_rocksdb_budget,
                 wallet_resource_budget: wallet_rocksdb_budget,
@@ -303,12 +301,13 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
     let tree_state_replay_waiters_per_slot = lightwalletd_config
         .tree_state_replay_waiters_per_slot
         .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT);
-    let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot.clone())
-        .with_node_broadcast(node_broadcast.clone())
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot)
+        .with_node_broadcast(node_broadcast)
         .with_verified_cold_transactions()
         .with_tree_state_replay_wait(tree_state_replay_wait)
         .with_tree_state_replay_waiters_per_slot(tree_state_replay_waiters_per_slot);
-    let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?;
+    let grpc_adapter =
+        LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query.clone())?;
     let (incoming, listen_addr) = browser_transport::bind(lightwalletd_config.listen_addr)?;
     let runtime = SupervisedRuntime::new(RuntimeService::CompatLightwalletd);
     let cancel = runtime.stopping();
@@ -335,9 +334,7 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
     )
     .await?;
     let _signal_handle = runtime.request_shutdown_on_terminating_signal();
-    let node_readiness_handle = spawn_wallet_node_readiness_probe(
-        node_broadcast,
-        serving_pair_slot,
+    let node_readiness_handle = wallet_query.spawn_node_readiness_probe(
         serving_readiness.clone(),
         lightwalletd_config
             .broadcaster
@@ -349,6 +346,7 @@ async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
             ),
         cancel.clone(),
     );
+    drop(wallet_query);
     // Health and serving-pair refresh observe the same ingest control plane, so
     // they intentionally share one configured freshness cadence.
     let ingest_control_readiness_handle = spawn_wallet_ingest_control_readiness_probe(

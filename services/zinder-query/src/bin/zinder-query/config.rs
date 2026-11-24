@@ -26,7 +26,10 @@ use zinder_runtime::{
     resolve_wallet_projection_reader_rocksdb_budget,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
-use zinder_store::{CanonicalReorgPolicy, CanonicalStoreBuildPlanError, RocksDbResourceBudget};
+use zinder_store::{
+    CanonicalReorgPolicy, CanonicalStoreBuildPlanError, CanonicalStoreRequirements,
+    RocksDbResourceBudget,
+};
 
 /// Resolved native wallet-query runtime configuration.
 #[derive(Clone, Debug)]
@@ -56,6 +59,19 @@ pub(super) struct QueryConfig {
     pub(super) node: Option<NodeTarget>,
     /// Endpoints broadcast tries after `node`, in position order.
     pub(super) node_fallbacks: Vec<NodeTarget>,
+}
+
+impl QueryConfig {
+    pub(super) fn canonical_requirements(&self) -> CanonicalStoreRequirements {
+        self.profile.map_or_else(
+            || {
+                CanonicalStoreRequirements::for_blob_retention(
+                    self.storage.expected_raw_blob_retention,
+                )
+            },
+            DeploymentProfile::canonical_requirement,
+        )
+    }
 }
 
 /// Command-line overrides for the native wallet-query command.
