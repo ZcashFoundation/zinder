@@ -338,7 +338,7 @@ mod tests {
             staging
                 .join("backup")
                 .join(CANONICAL_CHECKPOINT_DIRECTORY_NAME)
-                .join("canonical-construction-manifest.v4.json"),
+                .join("canonical-construction-manifest.v1.json"),
         )?;
         let archive = root.join("backup");
         assert!(
@@ -522,8 +522,9 @@ mod tests {
             restored_primary,
             secondary,
             source.network(),
-            source.workload(),
-            source.raw_blob_retention(),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                source.raw_blob_retention(),
+            ),
             source.reorg_policy(),
             RocksDbResourceBudget::for_local_tests(),
         )?;

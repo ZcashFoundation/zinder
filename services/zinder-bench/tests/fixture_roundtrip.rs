@@ -478,7 +478,7 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
         report["contract_identity"],
         "rocksdb-raw-blob-retention-comparison"
     );
-    assert_eq!(report["report_format_version"], 3);
+    assert_eq!(report["report_format_version"], 1);
     assert_eq!(
         report["arm_execution_order"],
         serde_json::json!(["transactions", "all"])
@@ -511,7 +511,7 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
     );
     assert_eq!(
         report["transactions"]["logical_replay_identity"]["subtree_root_sequence_digest_version"],
-        2
+        1
     );
     assert_eq!(
         report["transactions"]["raw_blob_counts"]["transaction_blob_count"],
@@ -740,7 +740,7 @@ async fn canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold
     );
     assert_eq!(
         outcome.subtree_root_load_evidence.sequence_digest_version,
-        2
+        1
     );
     assert_eq!(outcome.subtree_root_load_evidence.subtree_root_count, 1);
     let subtree_range = SubtreeRootRange::new(
@@ -766,8 +766,9 @@ async fn canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold
         &canonical_store_path,
         &secondary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(
+            RawBlobRetention::Transactions,
+        ),
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -814,7 +815,7 @@ async fn canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_read
     }
 
     let report: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
-    assert_eq!(report["report_format_version"], 5);
+    assert_eq!(report["report_format_version"], 1);
     assert_eq!(
         report["measurement_kind"],
         "rocksdb-canonical-fixture-replay"
@@ -1062,7 +1063,7 @@ async fn canonical_fixture_replay_cli_defaults_to_cadence_and_tip_and_supports_e
         &output_directory.path().join("dense-report.json"),
         Some("every-block"),
     )?;
-    assert_eq!(dense_report["report_format_version"], 5);
+    assert_eq!(dense_report["report_format_version"], 1);
     assert_eq!(
         dense_report["resource_limits"]["tree_state_checkpoint_coverage"],
         "every-block"
@@ -1099,7 +1100,7 @@ async fn canonical_fixture_replay_cli_defaults_to_cadence_and_tip_and_supports_e
         &output_directory.path().join("sparse-report.json"),
         None,
     )?;
-    assert_eq!(sparse_report["report_format_version"], 5);
+    assert_eq!(sparse_report["report_format_version"], 1);
     assert_eq!(
         sparse_report["resource_limits"]["tree_state_checkpoint_coverage"],
         "cadence-and-tip"
@@ -1559,7 +1560,7 @@ async fn canonical_fixture_checkpoint_capture_rejects_disconnected_segment_bound
 }
 
 #[test]
-fn fixture_v3_requires_exact_contract_identity() -> Result<()> {
+fn fixture_v1_requires_exact_contract_identity() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut missing_identity = serde_json::to_value(&fixture.manifest)?;
     missing_identity
@@ -1591,7 +1592,7 @@ fn fixture_v3_requires_exact_contract_identity() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_unknown_manifest_fields() -> Result<()> {
+fn fixture_v1_rejects_unknown_manifest_fields() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut unknown_field = serde_json::to_value(&fixture.manifest)?;
     unknown_field
@@ -1613,7 +1614,7 @@ fn fixture_v3_rejects_unknown_manifest_fields() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_format_v2_without_compatibility_decoding() -> Result<()> {
+fn fixture_v1_rejects_format_v2_without_compatibility_decoding() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut encoded = serde_json::to_value(&fixture.manifest)?;
     encoded["fixture_format_version"] = serde_json::json!(2);
@@ -1635,7 +1636,7 @@ fn fixture_v3_rejects_format_v2_without_compatibility_decoding() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_requires_an_exact_completing_block_hash() -> Result<()> {
+fn fixture_v1_requires_an_exact_completing_block_hash() -> Result<()> {
     let mut fixture = write_regtest_fixture()?;
     let completing_block = BlockId::new(fixture.block.height, fixture.block.hash);
     fixture.manifest.subtree_roots.sapling = vec![subtree_root_record(0, 0x51, completing_block)];
@@ -1676,7 +1677,7 @@ fn fixture_source_rejects_an_in_range_completing_block_hash_mismatch() -> Result
 }
 
 #[test]
-fn fixture_v3_rejects_invalid_subtree_root_prefix_shape() -> Result<()> {
+fn fixture_v1_rejects_invalid_subtree_root_prefix_shape() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let completing_block = BlockId::new(fixture.block.height, fixture.block.hash);
     let root = subtree_root_record(0, 0x51, completing_block);
@@ -1987,7 +1988,7 @@ async fn fixture_source_rejects_short_missing_or_disconnected_exact_subtree_rang
 }
 
 #[test]
-fn fixture_v3_requires_digest_evidence() -> Result<()> {
+fn fixture_v1_requires_digest_evidence() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut missing_digest_evidence = serde_json::to_value(&fixture.manifest)?;
     missing_digest_evidence
@@ -2010,7 +2011,7 @@ fn fixture_v3_requires_digest_evidence() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_inconsistent_counts() -> Result<()> {
+fn fixture_v1_rejects_inconsistent_counts() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut inconsistent_digest_count = fixture.manifest.clone();
     inconsistent_digest_count
@@ -2041,7 +2042,7 @@ fn fixture_v3_rejects_inconsistent_counts() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_unknown_digest_version() -> Result<()> {
+fn fixture_v1_rejects_unknown_digest_version() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut unknown_digest_version = fixture.manifest;
     unknown_digest_version
@@ -2066,7 +2067,7 @@ fn fixture_v3_rejects_unknown_digest_version() -> Result<()> {
 }
 
 #[test]
-fn fixture_v3_rejects_uppercase_sequence_digest_hex() -> Result<()> {
+fn fixture_v1_rejects_uppercase_sequence_digest_hex() -> Result<()> {
     let fixture = write_regtest_fixture()?;
     let mut uppercase_sequence_digest = fixture.manifest;
     uppercase_sequence_digest

@@ -30,16 +30,16 @@ use super::{
 
 /// Fixed sidecar name copied with every owner-created canonical checkpoint.
 pub(super) const CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME: &str =
-    "canonical-construction-manifest.v4.json";
+    "canonical-construction-manifest.v1.json";
 /// Exact immutable construction-manifest format accepted by this release.
-pub const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 4;
+pub const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 1;
 const MAX_CONSTRUCTION_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const CONSTRUCTION_MANIFEST_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.file.v4\0";
+    b"zinder.canonical.construction-manifest.file.v1\0";
 const CONSTRUCTION_BUILD_PLAN_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.build-plan.v4\0";
+    b"zinder.canonical.construction-manifest.build-plan.v1\0";
 const CONSTRUCTION_CHECKPOINT_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.checkpoint.v4\0";
+    b"zinder.canonical.construction-manifest.checkpoint.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CanonicalConstructionProofProvenance {
@@ -516,7 +516,8 @@ impl PersistedConstructionManifest {
             || self.block_evidence.sequence_digest_version != 1
             || self.block_evidence.block_digest_version != 1
             || self.block_evidence.replay_format_version != 1
-            || self.subtree_evidence.sequence_digest_version != 2
+            || self.subtree_evidence.sequence_digest_version
+                != super::subtree_load::SUBTREE_ROOT_SEQUENCE_DIGEST_VERSION
         {
             return Err(CanonicalStoreError::publication(
                 "construction manifest has unsupported source evidence",

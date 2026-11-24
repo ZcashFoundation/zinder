@@ -266,11 +266,7 @@ jq -e \
     and (.memory_current_bytes | nonnegative_integer)
     and (.storage_bytes | nonnegative_integer);
 
-  # Report format 6 carries wallet schema 2 and the ChaCha12 commitment
-  # scheme. Archived formats 4 and 5 keep the wallet schema 1 and lthash16
-  # contract they were produced under, and no report may mix the two.
   . as $report
-  | ($report.report_format_version >= 6) as $current_wallet_contract
   | ($resources | length) == 1
   and ($resources[0] as $resource
     | $report
@@ -290,8 +286,7 @@ jq -e \
       "wallet_storage_ready"
     ])
     and .contract_identity == "benchmark-report"
-    and (.report_format_version == 4 or .report_format_version == 5
-      or .report_format_version == 6)
+    and .report_format_version == 1
     and .measurement_kind == "rocksdb-storage-lifecycle"
     and (.storage_candidate
       | exact_keys([
@@ -373,20 +368,12 @@ jq -e \
           "wallet_value_encoding_version"
         ])
       and .canonical_store_identity == "canonical"
-      and .canonical_store_schema_version == 7
+      and .canonical_store_schema_version == 1
       and .wallet_store_identity == "wallet"
-      and .wallet_store_schema_version == (if $current_wallet_contract then 2 else 1 end)
-      and .wallet_projection_schema_version == (if $current_wallet_contract then 2 else 1 end)
-      and .wallet_value_encoding_version == 2)
-    and (($report.report_format_version >= 5) as $has_v5_fields
-      | (
-          $has_v5_fields
-          or (
-            $expected_tree_state_checkpoint_coverage == ""
-            and $expected_canonical_publication_mode == ""
-          )
-        )
-      and (.resource_limits
+      and .wallet_store_schema_version == 1
+      and .wallet_projection_schema_version == 1
+      and .wallet_value_encoding_version == 1)
+    and ((.resource_limits
       | exact_keys(
           [
             "block_prepare_concurrency",
@@ -404,11 +391,12 @@ jq -e \
             "wallet_max_secondary_sort_memory_bytes_per_sorter",
             "wallet_max_temporary_file_bytes_per_sorter",
             "wallet_rocksdb",
-            "wallet_sst_target_logical_bytes"
-          ] + (if $has_v5_fields then ["canonical_publication_mode", "tree_state_checkpoint_coverage"] else [] end)
+            "wallet_sst_target_logical_bytes",
+            "canonical_publication_mode",
+            "tree_state_checkpoint_coverage"
+          ]
         )
       and (
-        if $has_v5_fields then
           (.tree_state_checkpoint_coverage == "every-block"
             or .tree_state_checkpoint_coverage == "cadence-and-tip")
           and (
@@ -421,9 +409,6 @@ jq -e \
             $expected_canonical_publication_mode == ""
             or .canonical_publication_mode == $expected_canonical_publication_mode
           )
-        else
-          true
-        end
       )
       and ([
         .request_timeout_seconds,
@@ -466,7 +451,7 @@ jq -e \
     and (.phase_durations
       | report_phase_durations
       and (
-        if $has_v5_fields and $report.resource_limits.canonical_publication_mode == "trusted-fresh" then
+        if $report.resource_limits.canonical_publication_mode == "trusted-fresh" then
           .canonical_cold_validation_seconds == 0
         else
           true
@@ -493,8 +478,9 @@ jq -e \
             "visible_epoch_id",
             "visible_event_sequence",
             "visible_tip",
-            "workload"
-          ] + (if $has_v5_fields then ["tree_state_checkpoint_count"] else [] end)
+            "workload",
+            "tree_state_checkpoint_count"
+          ]
         )
       and .scope == "canonical-storage-ready"
       and .workload == "wallet"
@@ -508,16 +494,12 @@ jq -e \
       and .block_count == .visible_tip.height
       and (.transaction_count | positive_integer)
       and (
-        if $has_v5_fields then
           (.tree_state_checkpoint_count | positive_integer)
           and .tree_state_checkpoint_count == expected_tree_state_checkpoint_count(
             $report.resource_limits.tree_state_checkpoint_coverage;
             .first_retained_block.height;
             .visible_tip.height
           )
-        else
-          true
-        end
       )
       and (.subtree_root_count | nonnegative_integer)
       and .replay_format_version == 1
@@ -578,7 +560,7 @@ jq -e \
         and .utxo_count == $report.wallet_storage_ready.row_counts.transparent_unspent_output_count
         and (.total_value_zat | nonnegative_integer)
         and .commitment_scheme
-          == (if $current_wallet_contract then "lthash16-chacha12" else "lthash16" end)
+          == "lthash16-chacha12"
         and (.commitment_accumulator_hex | hex_bytes(2048))
         and (.commitment_display_digest_hex | hex_bytes(32)))
       and .scanned_block_count == $report.canonical_storage_ready.block_count

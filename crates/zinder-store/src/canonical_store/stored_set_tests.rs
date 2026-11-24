@@ -56,7 +56,7 @@ fn published_sets_admit_reader_supersets_and_require_exact_writer_and_manifest_i
                 let secondary_path = temporary
                     .path()
                     .join(format!("secondary-{workload:?}-{requested}"));
-                let reader = RocksDbCanonicalSecondary::open_ready_requiring(
+                let reader = RocksDbCanonicalSecondary::open_ready(
                     &path,
                     secondary_path,
                     &activations,

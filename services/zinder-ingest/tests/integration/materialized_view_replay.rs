@@ -1031,8 +1031,9 @@ fn open_secondary(
         store_path,
         temporary_path.join("canonical-secondary"),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(
+            zinder_store::RawBlobRetention::Transactions,
+        ),
         CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)

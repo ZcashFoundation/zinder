@@ -95,7 +95,7 @@ validate_report() {
       and test("(^sha256:|@sha256:)[0-9A-Fa-f]{64}$")
       and ((capture("sha256:(?<digest>[0-9A-Fa-f]{64})$").digest | test("^0+$")) | not);
     .contract_identity == "benchmark-report"
-    and .report_format_version == 4
+    and .report_format_version == 1
     and .measurement_kind == "canonical-replay-storage"
     and .storage_candidate.id == $candidate
     and .storage_candidate.canonical_engine == $engine
@@ -107,7 +107,7 @@ validate_report() {
     and .round_trip.replay_format_version == 1
     and .round_trip.semantic_replay_validated == true
     and .fixture.contract_identity == "canonical-fixture"
-    and .fixture.fixture_format_version == 3
+    and .fixture.fixture_format_version == 1
     and (.fixture.canonical_artifact_schema_version > 0)
     and (.fixture.digest_sha256 | lowercase_sha256)
     and .fixture.canonical_block_facts_digest_evidence.block_digest_version == 1

@@ -680,8 +680,7 @@ impl PublishedStore {
             &self.primary_path,
             self.secondary_root.path().join("replay"),
             &self.activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::None,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;

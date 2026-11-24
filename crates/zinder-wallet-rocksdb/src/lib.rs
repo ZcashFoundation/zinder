@@ -3,6 +3,11 @@
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
 compile_error!("Zinder supports only 32-bit and 64-bit pointer-width targets.");
 
+const _: () = assert!(
+    zinder_wallet_projection::REQUIRED_CANONICAL_STORE_SCHEMA_VERSION
+        == zinder_store::CANONICAL_STORE_SCHEMA_VERSION
+);
+
 mod accumulator_hashing;
 mod build;
 mod build_lock;

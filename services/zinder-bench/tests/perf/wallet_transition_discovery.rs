@@ -68,8 +68,8 @@ const FAN_OUT_OUTPUTS_PER_TRANSACTION: u32 = 16;
 const HISTORY_OUTPUT_COUNT: u32 = 4_096;
 const SUPPORTED_REORG_DEPTH: u32 = 100;
 const OUTPUT_VALUE_ZAT: u64 = 10;
-const FIXTURE_FORMAT_VERSION: u16 = 2;
-const REPORT_FORMAT_VERSION: u16 = 2;
+const FIXTURE_FORMAT_VERSION: u16 = 1;
+const REPORT_FORMAT_VERSION: u16 = 1;
 const REPORT_PATH_ENV: &str = "ZINDER_WALLET_TRANSITION_REPORT";
 const SOFTWARE_REVISION_ENV: &str = "ZINDER_WALLET_TRANSITION_SOFTWARE_REVISION";
 const REPORTED_PERF_METRICS: [PerfMetric; 11] = [
@@ -571,8 +571,9 @@ fn prepare_fixture(stratum: Stratum) -> Result<PreparedFixture> {
         &canonical_path,
         temporary.path().join("canonical-secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(
+            RawBlobRetention::Transactions,
+        ),
         CanonicalReorgPolicy::new(SUPPORTED_REORG_DEPTH)?,
         CANONICAL_READER_BUDGET,
     )?;

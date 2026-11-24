@@ -1014,8 +1014,7 @@ async fn assert_native_retention_case(
         writer.canonical_primary_path(),
         scratch.path(),
         Network::ZcashRegtest,
-        zinder_store::CanonicalStoreWorkload::Wallet,
-        minimum,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(minimum),
         matching_canonical.reorg_policy(),
         zinder_store::RocksDbResourceBudget::for_local_tests(),
     )?;

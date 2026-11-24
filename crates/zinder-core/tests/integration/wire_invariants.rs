@@ -258,7 +258,7 @@ fn network_to_wire_string_match_lives_only_in_wire_module() -> Result<()> {
 
 #[test]
 fn utxo_set_commitment_personal_lives_only_in_wire_module() -> Result<()> {
-    const PERSONAL_TAG_LITERAL: &str = "ZinderUtxoRoot_2";
+    const PERSONAL_TAG_LITERAL: &str = "ZinderUtxoRoot_1";
     const PERSONAL_ALLOWLIST: &[&str] = &["crates/zinder-core/src/wire/utxo_set_commitment.rs"];
 
     let root = workspace_root()?;

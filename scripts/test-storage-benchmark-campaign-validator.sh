@@ -15,34 +15,29 @@ fail() {
 producer_report_format_version="$(sed -n \
   's/^pub const REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
   "$repository_root/services/zinder-bench/src/report.rs")"
-[[ "$producer_report_format_version" == "4" ]] ||
-  fail "canonical-replay-storage producer report format version must stay v4"
+[[ "$producer_report_format_version" == "1" ]] ||
+  fail "canonical-replay-storage producer report format version must stay v1"
 producer_canonical_fixture_report_format_version="$(sed -n \
   's/^pub const ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
   "$repository_root/services/zinder-bench/src/report.rs")"
-[[ "$producer_canonical_fixture_report_format_version" == "5" ]] ||
-  fail "rocksdb-canonical-fixture-replay producer report format version must be v5"
+[[ "$producer_canonical_fixture_report_format_version" == "1" ]] ||
+  fail "rocksdb-canonical-fixture-replay producer report format version must be v1"
 producer_lifecycle_report_format_version="$(sed -n \
   's/^pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
   "$repository_root/services/zinder-bench/src/report.rs")"
-[[ "$producer_lifecycle_report_format_version" == "6" ]] ||
-  fail "rocksdb-storage-lifecycle producer report format version must be v6"
+[[ "$producer_lifecycle_report_format_version" == "1" ]] ||
+  fail "rocksdb-storage-lifecycle producer report format version must be v1"
 producer_fixture_format_version="$(sed -n \
   's/^pub const FIXTURE_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
   "$repository_root/services/zinder-bench/src/fixture.rs")"
-[[ "$producer_fixture_format_version" == "3" ]] ||
-  fail "producer fixture format version must be the exact v3 campaign contract"
+[[ "$producer_fixture_format_version" == "1" ]] ||
+  fail "producer fixture format version must be the exact v1 campaign contract"
 grep -Fq ".report_format_version == $producer_report_format_version" \
   "$validator" ||
   fail "$(basename "$validator") does not require producer report format $producer_report_format_version"
 grep -Fq ".report_format_version == $producer_lifecycle_report_format_version" \
   "$storage_lifecycle_validator" ||
   fail "$(basename "$storage_lifecycle_validator") does not support producer report format $producer_lifecycle_report_format_version"
-for archived_format in 4 5; do
-  grep -Fq ".report_format_version == $archived_format" \
-    "$storage_lifecycle_validator" ||
-    fail "$(basename "$storage_lifecycle_validator") does not retain archived report format $archived_format"
-done
 grep -Fq ".fixture.fixture_format_version == $producer_fixture_format_version" \
   "$validator" ||
   fail "campaign validator does not require producer fixture format $producer_fixture_format_version"
@@ -52,15 +47,11 @@ producer_store_version() {
   sed -nE "s/^pub const ${constant}: u16 = ([A-Z0-9_]+);$/\1/p" "$repository_root/$source"
 }
 
-# A pin is either fixed (`and .field == N`) or keyed on the report format
-# (`and .field == (if $current_wallet_contract then N else M end)`); the
-# current-format value N must equal the producer's constant.
 check_lifecycle_pin() {
   local field="$1" expected="$2" pinned
   [[ "$expected" =~ ^[0-9]+$ ]] || fail "could not resolve producer version for $field"
   pinned="$(sed -nE \
     -e "s/^[[:space:]]+and [.]$field == ([0-9]+)[)]?[[:space:]]*$/\1/p" \
-    -e "s/^[[:space:]]+and [.]$field == [(]if [$]current_wallet_contract then ([0-9]+) else [0-9]+ end[)][)]?[[:space:]]*$/\1/p" \
     "$storage_lifecycle_validator")"
   [[ "$pinned" == "$expected" ]] ||
     fail "lifecycle validator pins $field to ${pinned:-<missing>}, producer requires $expected"
@@ -156,7 +147,7 @@ write_report() {
     ($candidate == "rocksdb-canonical-replay-storage") as $is_rocksdb
     | {
         contract_identity: "benchmark-report",
-        report_format_version: 4,
+        report_format_version: 1,
         measurement_kind: "canonical-replay-storage",
         provenance: {
           benchmark_version: "0.1.0",
@@ -179,8 +170,8 @@ write_report() {
         },
         fixture: {
           contract_identity: "canonical-fixture",
-          fixture_format_version: 3,
-          canonical_artifact_schema_version: 18,
+          fixture_format_version: 1,
+          canonical_artifact_schema_version: 1,
           canonical_block_facts_digest_evidence: {
             block_digest_version: 1,
             sequence_digest_version: 1,
@@ -952,9 +943,7 @@ write_lifecycle_evidence() {
       max_temporary_file_bytes: 68719476736,
       final_run_file_bytes: 0
     };
-    ($report_format_version >= 5) as $has_v5_fields
-    | ($report_format_version >= 6) as $current_wallet_contract
-    | {
+    {
       contract_identity: "benchmark-report",
       report_format_version: $report_format_version,
       measurement_kind: "rocksdb-storage-lifecycle",
@@ -996,11 +985,11 @@ write_lifecycle_evidence() {
       },
       contracts: {
         canonical_store_identity: "canonical",
-        canonical_store_schema_version: 7,
+        canonical_store_schema_version: 1,
         wallet_store_identity: "wallet",
-        wallet_store_schema_version: (if $current_wallet_contract then 2 else 1 end),
-        wallet_projection_schema_version: (if $current_wallet_contract then 2 else 1 end),
-        wallet_value_encoding_version: 2
+        wallet_store_schema_version: 1,
+        wallet_projection_schema_version: 1,
+        wallet_value_encoding_version: 1
       },
       resource_limits: (
         {
@@ -1019,17 +1008,10 @@ write_lifecycle_evidence() {
           wallet_max_secondary_sort_memory_bytes_per_sorter: 1073741824,
           wallet_max_temporary_file_bytes_per_sorter: 68719476736,
           wallet_sst_target_logical_bytes: 134217728,
-          wallet_max_accounted_reorg_undo_bytes: 536870912
-        } + (
-          if $has_v5_fields then
-            {
-              tree_state_checkpoint_coverage: $coverage,
-              canonical_publication_mode: $publication_mode
-            }
-          else
-            {}
-          end
-        )
+          wallet_max_accounted_reorg_undo_bytes: 536870912,
+          tree_state_checkpoint_coverage: $coverage,
+          canonical_publication_mode: $publication_mode
+        }
       ),
       acceptance: {
         canonical_storage_ready: {
@@ -1079,8 +1061,9 @@ write_lifecycle_evidence() {
           physical_store_bytes: 15000,
           database_io_mode: "buffered",
           source_tip_checkpoint_authenticated: true,
-          cold_reopen_evidence_match: true
-        } + (if $has_v5_fields then {tree_state_checkpoint_count: $checkpoint_count} else {} end)
+          cold_reopen_evidence_match: true,
+          tree_state_checkpoint_count: $checkpoint_count
+        }
       ),
       wallet_storage_ready: {
         scope: "wallet-storage-ready",
@@ -1105,7 +1088,7 @@ write_lifecycle_evidence() {
         utxo_summary: {
           utxo_count: 0,
           total_value_zat: 0,
-          commitment_scheme: (if $current_wallet_contract then "lthash16-chacha12" else "lthash16" end),
+          commitment_scheme: "lthash16-chacha12",
           commitment_accumulator_hex: ("00" * 2048),
           commitment_display_digest_hex: ("1" * 64)
         },
@@ -1217,13 +1200,13 @@ validate_lifecycle_case() {
 }
 
 lifecycle_every_block="$scratch_directory/lifecycle-every-block"
-write_lifecycle_evidence "$lifecycle_every_block" 6 "every-block" 206 "trusted-fresh" 0
+write_lifecycle_evidence "$lifecycle_every_block" 1 "every-block" 206 "trusted-fresh" 0
 validate_lifecycle_case "$lifecycle_every_block" >/dev/null \
-  || fail "valid v6 every-block trusted-fresh lifecycle report was rejected without explicit args"
+  || fail "valid v1 every-block trusted-fresh lifecycle report was rejected without explicit args"
 validate_lifecycle_case "$lifecycle_every_block" "every-block" >/dev/null \
-  || fail "valid v6 every-block trusted-fresh lifecycle report was rejected with matching coverage arg"
+  || fail "valid v1 every-block trusted-fresh lifecycle report was rejected with matching coverage arg"
 validate_lifecycle_case "$lifecycle_every_block" "every-block" "trusted-fresh" >/dev/null \
-  || fail "valid v6 every-block trusted-fresh lifecycle report was rejected with matching mode arg"
+  || fail "valid v1 every-block trusted-fresh lifecycle report was rejected with matching mode arg"
 if validate_lifecycle_case "$lifecycle_every_block" "cadence-and-tip" >/dev/null 2>&1; then
   fail "every-block lifecycle report was accepted when cadence-and-tip was expected"
 fi
@@ -1232,113 +1215,78 @@ if validate_lifecycle_case "$lifecycle_every_block" "every-block" "cold-certifie
 fi
 
 lifecycle_sparse="$scratch_directory/lifecycle-sparse"
-write_lifecycle_evidence "$lifecycle_sparse" 6 "cadence-and-tip" 4 "trusted-fresh" 0
+write_lifecycle_evidence "$lifecycle_sparse" 1 "cadence-and-tip" 4 "trusted-fresh" 0
 validate_lifecycle_case "$lifecycle_sparse" >/dev/null \
-  || fail "valid v6 cadence-and-tip trusted-fresh lifecycle report was rejected without explicit args"
+  || fail "valid v1 cadence-and-tip trusted-fresh lifecycle report was rejected without explicit args"
 validate_lifecycle_case "$lifecycle_sparse" "cadence-and-tip" >/dev/null \
-  || fail "valid v6 cadence-and-tip trusted-fresh lifecycle report was rejected with matching coverage arg"
+  || fail "valid v1 cadence-and-tip trusted-fresh lifecycle report was rejected with matching coverage arg"
 validate_lifecycle_case "$lifecycle_sparse" "cadence-and-tip" "trusted-fresh" >/dev/null \
-  || fail "valid v6 cadence-and-tip trusted-fresh lifecycle report was rejected with matching mode arg"
+  || fail "valid v1 cadence-and-tip trusted-fresh lifecycle report was rejected with matching mode arg"
 if validate_lifecycle_case "$lifecycle_sparse" "every-block" >/dev/null 2>&1; then
   fail "cadence-and-tip lifecycle report was accepted when every-block was expected"
 fi
 
 lifecycle_cold_certified="$scratch_directory/lifecycle-cold-certified"
-write_lifecycle_evidence "$lifecycle_cold_certified" 6 "every-block" 206 "cold-certified" 1.0
+write_lifecycle_evidence "$lifecycle_cold_certified" 1 "every-block" 206 "cold-certified" 1.0
 validate_lifecycle_case "$lifecycle_cold_certified" >/dev/null \
-  || fail "valid v6 cold-certified lifecycle report was rejected without explicit args"
+  || fail "valid v1 cold-certified lifecycle report was rejected without explicit args"
 validate_lifecycle_case "$lifecycle_cold_certified" "every-block" >/dev/null \
-  || fail "valid v6 cold-certified lifecycle report was rejected with matching coverage arg"
+  || fail "valid v1 cold-certified lifecycle report was rejected with matching coverage arg"
 validate_lifecycle_case "$lifecycle_cold_certified" "every-block" "cold-certified" >/dev/null \
-  || fail "valid v6 cold-certified lifecycle report was rejected with matching mode arg"
+  || fail "valid v1 cold-certified lifecycle report was rejected with matching mode arg"
 if validate_lifecycle_case "$lifecycle_cold_certified" "every-block" "trusted-fresh" >/dev/null 2>&1; then
   fail "cold-certified lifecycle report was accepted when trusted-fresh was expected"
 fi
 
 lifecycle_trusted_nonzero_cold="$scratch_directory/lifecycle-trusted-nonzero-cold"
-write_lifecycle_evidence "$lifecycle_trusted_nonzero_cold" 6 "every-block" 206 "trusted-fresh" 1.0
+write_lifecycle_evidence "$lifecycle_trusted_nonzero_cold" 1 "every-block" 206 "trusted-fresh" 1.0
 if validate_lifecycle_case "$lifecycle_trusted_nonzero_cold" >/dev/null 2>&1; then
-  fail "v5 trusted-fresh lifecycle report with nonzero canonical_cold_validation_seconds was accepted"
+  fail "v1 trusted-fresh lifecycle report with nonzero canonical_cold_validation_seconds was accepted"
 fi
 if validate_lifecycle_case "$lifecycle_trusted_nonzero_cold" "every-block" "trusted-fresh" >/dev/null 2>&1; then
-  fail "v5 trusted-fresh lifecycle report with nonzero canonical_cold_validation_seconds was accepted with explicit mode"
+  fail "v1 trusted-fresh lifecycle report with nonzero canonical_cold_validation_seconds was accepted with explicit mode"
 fi
 
 lifecycle_invalid_mode="$scratch_directory/lifecycle-invalid-mode"
-write_lifecycle_evidence "$lifecycle_invalid_mode" 6 "every-block" 206 "unknown-mode" 0
+write_lifecycle_evidence "$lifecycle_invalid_mode" 1 "every-block" 206 "unknown-mode" 0
 if validate_lifecycle_case "$lifecycle_invalid_mode" >/dev/null 2>&1; then
-  fail "v5 lifecycle report with invalid canonical_publication_mode was accepted"
+  fail "v1 lifecycle report with invalid canonical_publication_mode was accepted"
 fi
 
 lifecycle_missing_mode="$scratch_directory/lifecycle-missing-mode"
-write_lifecycle_evidence "$lifecycle_missing_mode" 6 "every-block" 206 "trusted-fresh" 0
+write_lifecycle_evidence "$lifecycle_missing_mode" 1 "every-block" 206 "trusted-fresh" 0
 mutate_report "$lifecycle_missing_mode/report.json" 'del(.resource_limits.canonical_publication_mode)'
 if validate_lifecycle_case "$lifecycle_missing_mode" >/dev/null 2>&1; then
-  fail "v5 lifecycle report missing canonical_publication_mode was accepted"
+  fail "v1 lifecycle report missing canonical_publication_mode was accepted"
 fi
 
 lifecycle_mismatched_count="$scratch_directory/lifecycle-mismatched-count"
-write_lifecycle_evidence "$lifecycle_mismatched_count" 6 "every-block" 4 "trusted-fresh" 0
+write_lifecycle_evidence "$lifecycle_mismatched_count" 1 "every-block" 4 "trusted-fresh" 0
 if validate_lifecycle_case "$lifecycle_mismatched_count" "every-block" >/dev/null 2>&1; then
   fail "every-block lifecycle report with sparse checkpoint count was accepted"
 fi
 
 lifecycle_missing_count="$scratch_directory/lifecycle-missing-count"
-write_lifecycle_evidence "$lifecycle_missing_count" 6 "every-block" 206 "trusted-fresh" 0
+write_lifecycle_evidence "$lifecycle_missing_count" 1 "every-block" 206 "trusted-fresh" 0
 mutate_report "$lifecycle_missing_count/report.json" 'del(.canonical_storage_ready.tree_state_checkpoint_count)'
 if validate_lifecycle_case "$lifecycle_missing_count" >/dev/null 2>&1; then
-  fail "v5 lifecycle report omitting tree_state_checkpoint_count was accepted"
+  fail "v1 lifecycle report omitting tree_state_checkpoint_count was accepted"
 fi
 
-lifecycle_archived_v4="$scratch_directory/lifecycle-archived-v4"
-write_lifecycle_evidence "$lifecycle_archived_v4" 4 "" 0 "" 1.0
-validate_lifecycle_case "$lifecycle_archived_v4" >/dev/null \
-  || fail "archived pre-coverage v4 lifecycle report was rejected"
-if validate_lifecycle_case "$lifecycle_archived_v4" "every-block" >/dev/null 2>&1; then
-  fail "archived v4 lifecycle report was accepted when every-block was required"
-fi
-if validate_lifecycle_case "$lifecycle_archived_v4" "every-block" "trusted-fresh" >/dev/null 2>&1; then
-  fail "archived v4 lifecycle report was accepted when trusted-fresh was required"
-fi
-
-lifecycle_archived_v5="$scratch_directory/lifecycle-archived-v5"
-write_lifecycle_evidence "$lifecycle_archived_v5" 5 "every-block" 206 "trusted-fresh" 0
-validate_lifecycle_case "$lifecycle_archived_v5" "every-block" "trusted-fresh" >/dev/null \
-  || fail "archived v5 lifecycle report with wallet schema 1 and lthash16 was rejected"
-
-lifecycle_v4_with_v5_fields="$scratch_directory/lifecycle-v4-with-v5-fields"
-write_lifecycle_evidence "$lifecycle_v4_with_v5_fields" 5 "every-block" 206 "trusted-fresh" 0
-mutate_report "$lifecycle_v4_with_v5_fields/report.json" '.report_format_version = 4'
-if validate_lifecycle_case "$lifecycle_v4_with_v5_fields" >/dev/null 2>&1; then
-  fail "v4 lifecycle report carrying v5 fields was accepted"
-fi
-
-# A report must carry exactly its own format's wallet contract: wallet schema 1
-# and lthash16 for formats 4 and 5, wallet schema 2 and lthash16-chacha12 for 6.
 expect_lifecycle_rejected() {
-  local name="$1" format="$2" mutation="$3"
+  local name="$1" mutation="$2"
   local directory="$scratch_directory/lifecycle-$name"
-  if [[ "$format" == 4 ]]; then
-    write_lifecycle_evidence "$directory" 4 "" 0 "" 1.0
-  else
-    write_lifecycle_evidence "$directory" "$format" "every-block" 206 "trusted-fresh" 0
-  fi
+  write_lifecycle_evidence "$directory" 1 "every-block" 206 "trusted-fresh" 0
   mutate_report "$directory/report.json" "$mutation"
   if validate_lifecycle_case "$directory" >/dev/null 2>&1; then
     fail "lifecycle report $name was accepted"
   fi
 }
-expect_lifecycle_rejected v6-old-store-schema 6 \
-  '.contracts.wallet_store_schema_version = 1 | .contracts.wallet_projection_schema_version = 1'
-expect_lifecycle_rejected v6-old-commitment-scheme 6 \
-  '.wallet_storage_ready.utxo_summary.commitment_scheme = "lthash16"'
-expect_lifecycle_rejected v6-mixed-projection-schema 6 '.contracts.wallet_projection_schema_version = 1'
-expect_lifecycle_rejected v5-new-store-schema 5 \
-  '.contracts.wallet_store_schema_version = 2 | .contracts.wallet_projection_schema_version = 2'
-expect_lifecycle_rejected v5-new-commitment-scheme 5 \
-  '.wallet_storage_ready.utxo_summary.commitment_scheme = "lthash16-chacha12"'
-expect_lifecycle_rejected v4-new-contract 4 \
-  '.contracts.wallet_store_schema_version = 2 | .contracts.wallet_projection_schema_version = 2 | .wallet_storage_ready.utxo_summary.commitment_scheme = "lthash16-chacha12"'
-expect_lifecycle_rejected unknown-version 6 '.report_format_version = 7'
+expect_lifecycle_rejected wrong-store-schema '.contracts.wallet_store_schema_version = 2'
+expect_lifecycle_rejected wrong-commitment-scheme '.wallet_storage_ready.utxo_summary.commitment_scheme = "lthash16"'
+expect_lifecycle_rejected wrong-projection-schema '.contracts.wallet_projection_schema_version = 2'
+for obsolete_version in 4 5 6; do
+  expect_lifecycle_rejected "obsolete-version-$obsolete_version" ".report_format_version = $obsolete_version"
+done
 
 printf 'storage benchmark campaign validator tests passed\n'

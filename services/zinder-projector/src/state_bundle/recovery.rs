@@ -37,10 +37,6 @@ impl StateBundleManifest {
         root: &Path,
         wallet_admission: WalletRecoveryAdmissionConfig<'_>,
     ) -> Result<CanonicalOwnerCheckpointEvidence, StateBundleError> {
-        require_manifest_value(
-            self.fence.network_upgrade_schedule.is_some(),
-            "private restore requires a capture with its writer-admitted network-upgrade schedule",
-        )?;
         let network = self.network()?;
         let plan = &self.canonical_checkpoint.build_plan;
         let window = self

@@ -1,0 +1,6 @@
+kind: changed
+body: Zinder now uses schema v1 for canonical, wallet, and materialized-view stores. The native network contract remains at revision 15. Build fresh stores side by side before cutover, then capture new state bundles and recovery archives and regenerate benchmark fixtures and reports. Rust callers opening canonical secondaries must pass explicit CanonicalStoreRequirements.
+time: 2026-11-24T05:07:27.102806301Z
+custom:
+    Bump: major
+    PR: "535"

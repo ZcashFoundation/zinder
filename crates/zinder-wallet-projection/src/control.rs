@@ -1120,10 +1120,10 @@ mod tests {
             hex::encode(&encoded),
             concat!(
                 "77616c6c6574",
-                "0002",
-                "0002",
+                "0001",
+                "0001",
                 "00000003",
-                "0006",
+                "0001",
                 "00000001",
                 "0001",
                 "0001",
@@ -1174,14 +1174,14 @@ mod tests {
             .windows(versioned_accumulator.len())
             .position(|window| window == versioned_accumulator.as_slice())
             .unwrap_or_else(|| unreachable!("encoded READY evidence holds its accumulator"));
-        encoded[offset..offset + 2].copy_from_slice(&1_u16.to_be_bytes());
+        encoded[offset..offset + 2].copy_from_slice(&2_u16.to_be_bytes());
 
         // The schema is current, so only the READY accumulator version is stale.
         assert_eq!(
             WalletStoreControlRecord::decode(&encoded),
             Err(
                 WalletProjectionContractError::UnsupportedProjectionAccumulatorVersion {
-                    encoded: 1
+                    encoded: 2
                 }
             )
         );
@@ -1299,12 +1299,12 @@ mod tests {
 
         let mut wrong_schema = encoded.clone();
         let schema_offset = WALLET_PROJECTION_STORE_IDENTITY.len();
-        wrong_schema[schema_offset..schema_offset + 2].copy_from_slice(&1_u16.to_be_bytes());
+        wrong_schema[schema_offset..schema_offset + 2].copy_from_slice(&2_u16.to_be_bytes());
         assert_eq!(
             WalletStoreControlRecord::decode(&wrong_schema),
             Err(
                 WalletProjectionContractError::UnsupportedWalletProjectionSchemaVersion {
-                    encoded: 1,
+                    encoded: 2,
                     supported: WALLET_PROJECTION_SCHEMA_VERSION,
                 }
             )

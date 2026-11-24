@@ -52,7 +52,7 @@ pub trait CanonicalReader: Send + Sync + 'static {
     fn network(&self) -> Network;
 
     /// Returns the network-upgrade schedule the canonical writer admitted
-    /// with this fence, or `None` before the writer's first admission.
+    /// with this fence.
     fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule>;
 
     /// Returns the raw-blob retention the store was built with.

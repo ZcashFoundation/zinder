@@ -771,8 +771,7 @@ fn open_secondary(
         temporary.path().join("canonical"),
         temporary.path().join("canonical-secondary"),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)

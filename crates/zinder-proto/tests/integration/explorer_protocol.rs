@@ -709,40 +709,19 @@ fn transparent_address_records_round_trip_an_internal_transaction_id() -> eyre::
     let deltas = round_trip(&explorer::TransparentAddressDeltasRecord {
         block_time_unix_seconds: 1_700_000_000,
         value_zat: -9_000,
-        internal_transaction_id: internal_transaction_id.clone(),
-        ..Default::default()
+        transaction_id: internal_transaction_id.clone(),
     })?;
     let activity = round_trip(&explorer::TransparentAddressActivityRecord {
         net_value_zat: Some(4_000),
         output_count: 1,
-        internal_transaction_id: internal_transaction_id.clone(),
+        transaction_id: internal_transaction_id.clone(),
         ..Default::default()
     })?;
 
-    assert_eq!(deltas.internal_transaction_id, internal_transaction_id);
-    assert_eq!(deltas.transaction_id, "");
+    assert_eq!(deltas.transaction_id, internal_transaction_id);
     assert_eq!(deltas.value_zat, -9_000);
-    assert_eq!(activity.internal_transaction_id, internal_transaction_id);
-    assert_eq!(activity.transaction_id, "");
+    assert_eq!(activity.transaction_id, internal_transaction_id);
     assert_eq!(activity.net_value_zat, Some(4_000));
-    Ok(())
-}
-
-#[test]
-fn transparent_address_records_written_with_rpc_hex_decode_without_internal_bytes()
--> eyre::Result<()> {
-    let transaction_id = "ab".repeat(32);
-    let encoded = explorer::TransparentAddressDeltasRecord {
-        transaction_id: transaction_id.clone(),
-        block_time_unix_seconds: 1_700_000_000,
-        value_zat: 5_000,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let decoded = explorer::TransparentAddressDeltasRecord::decode(encoded.as_slice())?;
-
-    assert_eq!(decoded.transaction_id, transaction_id);
-    assert_eq!(decoded.internal_transaction_id, [] as [u8; 0]);
     Ok(())
 }
 

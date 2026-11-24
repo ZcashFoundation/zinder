@@ -110,11 +110,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Oldest native wallet contract revision this client can safely consume.
-///
-/// Revision 8 adds `TransparentOutpointSpendStatus` and removes the transparent
-/// reads that no packaged consumer calls. It keeps the revision 7
-/// `CompactBlocksInRange` stream, which sends the chain view once as a leading
-/// header instead of on every block.
 pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 8;
 
 impl RemoteChainIndex {
@@ -1447,10 +1442,7 @@ fn tree_state_from_response(
     response: wallet::TreeStateResponse,
 ) -> Result<TreeStateArtifact, IndexerError> {
     let block_time_seconds = response.block_time_seconds.ok_or_else(|| {
-        IndexerError::malformed(
-            "tree_state.block_time_seconds",
-            "field is missing from a contract revision 2 response",
-        )
+        IndexerError::malformed("tree_state.block_time_seconds", "required field is missing")
     })?;
     Ok(TreeStateArtifact::new(
         BlockHeight::new(response.height),
@@ -2429,9 +2421,7 @@ fn verify_transaction_absence(
     }
 }
 
-/// Returns whether `status` is a `NOT_FOUND` that a server below contract
-/// revision 6 used for every transaction miss, which cannot be told apart
-/// from a storage or history failure.
+/// Returns whether a `NOT_FOUND` lacks enough evidence to verify transaction absence.
 fn is_unverified_transaction_absence(code: tonic::Code, details: &ErrorDetails) -> bool {
     if code != tonic::Code::NotFound {
         return false;
@@ -3086,12 +3076,15 @@ mod tests {
 
     #[test]
     fn contract_revision_eight_is_the_minimum() {
-        assert!(matches!(
-            ensure_supported_contract_revision(7),
-            Err(IndexerError::FailedPrecondition { .. })
-        ));
-        assert!(ensure_supported_contract_revision(8).is_ok());
-        assert!(ensure_supported_contract_revision(9).is_ok());
+        for revision in 0..8 {
+            assert!(matches!(
+                ensure_supported_contract_revision(revision),
+                Err(IndexerError::FailedPrecondition { .. })
+            ));
+        }
+        for revision in [8, 9, zinder_proto::CONTRACT_REVISION] {
+            assert!(ensure_supported_contract_revision(revision).is_ok());
+        }
     }
 
     #[test]

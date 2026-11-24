@@ -13,8 +13,7 @@ use zinder_query::{
     read_on_blocking_thread,
 };
 use zinder_store::{
-    ArtifactFamily, BlockHashLookup, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbResourceBudget,
+    ArtifactFamily, BlockHashLookup, RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, sample_regtest_upgrade_activations,
@@ -92,8 +91,9 @@ impl RocksDbReaderHarness {
                     .path()
                     .join(format!("canonical-{}", self.readers_opened)),
                 primary.network(),
-                CanonicalStoreWorkload::Wallet,
-                primary.raw_blob_retention(),
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    primary.raw_blob_retention(),
+                ),
                 primary.reorg_policy(),
                 RocksDbResourceBudget::for_local_tests(),
             )?,

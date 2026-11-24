@@ -163,12 +163,9 @@ pub(super) enum StoredDataAdmission {
 enum ActivationAdmission {
     /// The persisted construction fingerprint must equal this one.
     ConstructionBaseline(NetworkUpgradeActivationsFingerprint),
-    /// A node-observed table, admitted against the writer-admitted schedule
-    /// through the visible tip, or against the construction baseline before
-    /// the writer's first admission.
+    /// A node-observed table, admitted against the writer schedule through the tip.
     NodeObserved(NetworkUpgradeActivations),
-    /// The caller brings no table and adopts the writer-admitted schedule,
-    /// refusing a READY store whose writer has not admitted one yet.
+    /// The caller adopts the writer-admitted schedule.
     WriterAdmitted,
 }
 
@@ -295,6 +292,7 @@ impl RocksDbCanonicalStore {
         cursor_auth_key: [u8; 32],
         ready_evidence: &CanonicalStoreReadyEvidence,
         subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
+        activation_schedule: CanonicalActivationSchedule,
         replay_tail: AuthenticatedReplayTail,
     ) -> Self {
         let stored_set = build_plan.admitted_stored_set(workload, subtree_root_coverage);
@@ -307,7 +305,7 @@ impl RocksDbCanonicalStore {
             stored_set,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
-            activation_schedule: None,
+            activation_schedule: Some(activation_schedule),
             revised_reorg_policy: None,
             replay_tail,
         }
@@ -427,8 +425,7 @@ impl RocksDbCanonicalStore {
         }
     }
 
-    /// Returns the schedule revision admitted by the canonical writer, or
-    /// `None` for a store that no writer of this release has opened yet.
+    /// Returns the schedule revision bound to this READY store.
     #[must_use]
     pub const fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule> {
         self.activation_schedule.as_ref()
@@ -466,65 +463,31 @@ impl RocksDbCanonicalStore {
         observed_activations: &NetworkUpgradeActivations,
     ) -> Result<Option<CanonicalActivationSchedule>, CanonicalStoreError> {
         let visible_tip = self.ready_evidence.visible_tip;
-        let schedule = if let Some(previous) = &self.activation_schedule {
-            if !observed_activations.preserves_through(previous.activations(), visible_tip.height) {
-                return Err(CanonicalStoreError::admission(
-                    self.bounded_open.db.path(),
-                    format!(
-                        "node activation table differs from admitted schedule revision {} at or below canonical tip {}; refusing admission",
-                        previous.revision(),
-                        visible_tip.height.value(),
-                    ),
-                ));
-            }
-            if observed_activations == previous.activations() {
-                return Ok(None);
-            }
-            CanonicalActivationSchedule::successor(
-                previous,
-                visible_tip,
-                observed_activations.clone(),
+        let previous = self.activation_schedule.as_ref().ok_or_else(|| {
+            CanonicalStoreError::admission(
+                self.bounded_open.db.path(),
+                "READY activation schedule is absent",
             )
-            .map_err(|reason| CanonicalStoreError::admission(self.bounded_open.db.path(), reason))?
-        } else {
-            let baseline = self.build_plan.network_upgrade_activations_fingerprint();
-            let prefix_len = observed_activations
-                .matching_fingerprint_prefix_len(baseline)
-                .ok_or_else(|| {
-                    CanonicalStoreError::admission(
-                        self.bounded_open.db.path(),
-                        "node activation table does not extend the table this store was built with as an exact prefix; restore the original activations on the node and restart the writer",
-                    )
-                })?;
-            let prior = NetworkUpgradeActivations::new(
-                self.network(),
-                observed_activations.activations()[..prefix_len].to_vec(),
-            )
-            .map_err(|error| {
-                CanonicalStoreError::admission(self.bounded_open.db.path(), error.to_string())
-            })?;
-            if !observed_activations.preserves_through(&prior, visible_tip.height) {
-                return Err(CanonicalStoreError::admission(
-                    self.bounded_open.db.path(),
-                    format!(
-                        "node activation table adds an activation at or below canonical tip {}; refusing admission",
-                        visible_tip.height.value(),
-                    ),
-                ));
-            }
-            CanonicalActivationSchedule::initial(
-                observed_activations.clone(),
-                baseline.as_bytes(),
-                u32::try_from(prefix_len).map_err(|_| {
-                    CanonicalStoreError::admission(
-                        self.bounded_open.db.path(),
-                        "construction activation prefix length exceeds u32",
-                    )
-                })?,
-                visible_tip,
-            )
-            .map_err(|reason| CanonicalStoreError::admission(self.bounded_open.db.path(), reason))?
-        };
+        })?;
+        if !observed_activations.preserves_through(previous.activations(), visible_tip.height) {
+            return Err(CanonicalStoreError::admission(
+                self.bounded_open.db.path(),
+                format!(
+                    "node activation table differs from admitted schedule revision {} at or below canonical tip {}; refusing admission",
+                    previous.revision(),
+                    visible_tip.height.value(),
+                ),
+            ));
+        }
+        if observed_activations == previous.activations() {
+            return Ok(None);
+        }
+        let schedule = CanonicalActivationSchedule::successor(
+            previous,
+            visible_tip,
+            observed_activations.clone(),
+        )
+        .map_err(|reason| CanonicalStoreError::admission(self.bounded_open.db.path(), reason))?;
         Ok(Some(schedule))
     }
 
@@ -550,7 +513,7 @@ impl RocksDbCanonicalStore {
                 .ok_or_else(|| {
                 CanonicalStoreError::admission(
                     self.bounded_open.db.path(),
-                    "activation schedule control trailer was not persisted",
+                    "activation schedule binding was not persisted",
                 )
             })?;
         if stored_schedule != *schedule {
@@ -1346,14 +1309,7 @@ pub(super) fn validate_open_store_control(
         admitted_schedule.as_ref(),
         visible_tip,
     )
-    .map_err(|refusal| match refusal {
-        ActivationRefusal::Mismatch(reason) => CanonicalStoreError::admission(path, reason),
-        ActivationRefusal::ScheduleNotAdmitted => {
-            CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted {
-                path: path.to_path_buf(),
-            }
-        }
-    })?;
+    .map_err(|reason| CanonicalStoreError::admission(path, reason))?;
     let expected_schedule_key_count = match persisted.activation_schedule_binding {
         Some(binding) => usize::try_from(binding.revision).map_err(|_| {
             CanonicalStoreError::admission(path, "activation schedule revision exceeds memory size")
@@ -1443,73 +1399,37 @@ fn reorg_policy_lowering_refused(
     )
 }
 
-/// Why a caller's activation expectation does not admit the persisted store.
-enum ActivationRefusal {
-    /// The caller's table contradicts the persisted identity.
-    Mismatch(&'static str),
-    /// The caller adopts the writer-admitted schedule, and the writer of this
-    /// READY store has not admitted one yet.
-    ScheduleNotAdmitted,
-}
-
-/// Checks the caller's activation expectation against persisted identity.
-///
-/// Construction and exact re-admission compare the immutable construction
-/// fingerprint. A writer opening for schedule admission defers to
-/// [`RocksDbCanonicalStore::admit_network_upgrade_schedule`]. A reader with a
-/// node-observed table is admitted only when the writer has already admitted
-/// a schedule that agrees with that table through the visible tip; before the
-/// first admission, the reader's table must equal the construction baseline.
-/// A reader without a table adopts the writer-admitted schedule, so it needs
-/// one to exist.
+/// Checks node-observed tables through the visible tip. A writer opening to
+/// revise its schedule checks the replacement before writing it.
 fn validate_activation_expectation(
     expectation: &CanonicalStoreAdmissionExpectation,
     persisted_fingerprint: NetworkUpgradeActivationsFingerprint,
     admitted_schedule: Option<&CanonicalActivationSchedule>,
     visible_tip: Option<zinder_core::BlockHeight>,
-) -> Result<(), ActivationRefusal> {
-    let exact_baseline = |expected_fingerprint: NetworkUpgradeActivationsFingerprint| {
-        if persisted_fingerprint == expected_fingerprint {
-            Ok(())
-        } else {
-            Err(ActivationRefusal::Mismatch(
-                "persisted network upgrade activations do not equal the requested activation table; restart the canonical writer so it admits the node's schedule",
-            ))
-        }
-    };
-    let observed = match &expectation.activations {
-        ActivationAdmission::ConstructionBaseline(fingerprint) => {
-            return exact_baseline(*fingerprint);
-        }
-        ActivationAdmission::WriterAdmitted => {
-            return match (admitted_schedule, visible_tip) {
-                (Some(_), Some(_)) | (None, None) => Ok(()),
-                (None, Some(_)) => Err(ActivationRefusal::ScheduleNotAdmitted),
-                (Some(_), None) => Err(ActivationRefusal::Mismatch(
-                    "BUILDING store control must not bind an activation schedule",
-                )),
-            };
-        }
-        ActivationAdmission::NodeObserved(observed) => observed,
-    };
-    match (admitted_schedule, visible_tip) {
-        (_, Some(_)) if expectation.allow_schedule_update => Ok(()),
-        (Some(admitted), Some(visible_tip)) => {
-            if observed.preserves_through(admitted.activations(), visible_tip) {
-                Ok(())
-            } else {
-                Err(ActivationRefusal::Mismatch(
+) -> Result<(), &'static str> {
+    let expected_fingerprint = match &expectation.activations {
+        ActivationAdmission::ConstructionBaseline(fingerprint) => *fingerprint,
+        ActivationAdmission::WriterAdmitted => return Ok(()),
+        ActivationAdmission::NodeObserved(observed) => {
+            if let (Some(admitted), Some(visible_tip)) = (admitted_schedule, visible_tip) {
+                if expectation.allow_schedule_update
+                    || observed.preserves_through(admitted.activations(), visible_tip)
+                {
+                    return Ok(());
+                }
+                return Err(
                     "node network upgrade activations differ from the writer-admitted schedule at or below the visible tip",
-                ))
+                );
             }
+            observed.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
         }
-        (None, _) => {
-            exact_baseline(observed.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1))
-        }
-        (Some(_), None) => Err(ActivationRefusal::Mismatch(
-            "BUILDING store control must not bind an activation schedule",
-        )),
+    };
+    if persisted_fingerprint != expected_fingerprint {
+        return Err(
+            "persisted network upgrade activations do not equal the requested activation table; restart the canonical writer so it admits the node's schedule",
+        );
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1762,7 +1682,7 @@ mod tests {
         let mut control = db.get(STORE_CONTROL_KEY)?.ok_or("control should exist")?;
         let schema_version_start = CANONICAL_STORE_IDENTITY.len();
         control[schema_version_start..schema_version_start + 2]
-            .copy_from_slice(&1_u16.to_le_bytes());
+            .copy_from_slice(&7_u16.to_le_bytes());
         db.put(STORE_CONTROL_KEY, &control)?;
         drop(db);
 
@@ -1779,7 +1699,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("schema version 1 does not equal required version 7"),
+                .contains("schema version 7 does not equal required version 1"),
             "{error}"
         );
         assert_eq!(read_control(&path)?, control);
@@ -1867,7 +1787,7 @@ mod tests {
     #[test]
     fn contract_identity_and_schema_are_exact() {
         assert_eq!(CANONICAL_STORE_IDENTITY, "canonical");
-        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 7);
+        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 1);
     }
 
     fn read_control(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

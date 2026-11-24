@@ -20,7 +20,6 @@ use zinder_core::{
     explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
     wire::{
         decode_rpc_transaction_id_hex, encode_internal_transaction_id, encode_rpc_block_hash_hex,
-        encode_rpc_transaction_id_hex,
     },
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
@@ -1166,15 +1165,12 @@ struct SeedDelta {
 /// Seeds the `transparent_address_deltas` column family for one address with
 /// the given events, mirroring what `TransparentAddressDeltasConsumer` writes
 /// at commit time.
-///
-/// Every other row stores its transaction id in the RPC hex form earlier
-/// releases wrote, so reads cover both stored encodings.
 fn seed_transparent_address_deltas(
     materialized_view_store: &MaterializedViewStore,
     address: TransparentAddressScriptHash,
     deltas: &[SeedDelta],
 ) -> Result<()> {
-    for (row_index, delta) in deltas.iter().enumerate() {
+    for delta in deltas {
         let key = TransparentAddressDeltasConsumer::key_for_event(
             address,
             BlockHeight::new(delta.height),
@@ -1183,20 +1179,10 @@ fn seed_transparent_address_deltas(
             delta.event_index,
         );
         let transaction_id = decode_rpc_transaction_id_hex(&delta.transaction_id)?;
-        let record = if row_index % 2 == 0 {
-            TransparentAddressDeltasRecord {
-                internal_transaction_id: encode_internal_transaction_id(transaction_id).to_vec(),
-                block_time_unix_seconds: 1_700_000_000 + i64::from(delta.height),
-                value_zat: delta.value_zat,
-                ..TransparentAddressDeltasRecord::default()
-            }
-        } else {
-            TransparentAddressDeltasRecord {
-                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-                block_time_unix_seconds: 1_700_000_000 + i64::from(delta.height),
-                value_zat: delta.value_zat,
-                ..TransparentAddressDeltasRecord::default()
-            }
+        let record = TransparentAddressDeltasRecord {
+            transaction_id: encode_internal_transaction_id(transaction_id).to_vec(),
+            block_time_unix_seconds: 1_700_000_000 + i64::from(delta.height),
+            value_zat: delta.value_zat,
         };
         materialized_view_store.put_consumer(
             TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,

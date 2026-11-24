@@ -859,15 +859,10 @@ fn with_future_upgrade(table: &NetworkUpgradeActivations) -> TestResult<NetworkU
     )?)
 }
 
-/// Before a READY store's first schedule revision, a fallback may start
-/// ingest only with the construction table.
-///
-/// A fallback with an upgrade appended would make the writer admit it as
-/// revision 1, which only `[node]` may bring. This holds for a published
-/// construction still staged beside the store path, which the writer
-/// recovers before following.
+/// A fallback must match the writer's schedule even when the READY store
+/// still sits at the staging path.
 #[tokio::test]
-async fn startup_refuses_a_fallback_that_would_admit_the_first_schedule_revision() -> TestResult {
+async fn startup_refuses_a_fallback_that_would_revise_the_staged_store_schedule() -> TestResult {
     let directory = tempdir()?;
     let storage_path = directory.path().join("canonical");
     let (blocks, staged_store) =
@@ -893,7 +888,7 @@ async fn startup_refuses_a_fallback_that_would_admit_the_first_schedule_revision
         NodeEndpointAdmissions::admit(&only_appended, Network::ZcashRegtest, Some(&store_summary))
             .await
             .err()
-            .ok_or("a fallback must not bring the first schedule revision")?;
+            .ok_or("a fallback must not revise the staged store schedule")?;
     let message = refusal.to_string();
     assert!(message.contains("position 1: excluded"), "{message}");
 

@@ -16,9 +16,9 @@ use zinder_core::{
 use crate::{BoundedRocksDbOpen, RocksDbOpenRole, open_bounded_rocksdb};
 
 use super::{
-    CanonicalEventFence, CanonicalSequenceCheckpoint, CanonicalStoreBuildState,
-    CanonicalStoreError, CanonicalStoreReadyEvidence, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore,
+    CanonicalActivationSchedule, CanonicalEventFence, CanonicalSequenceCheckpoint,
+    CanonicalStoreBuildState, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore,
     block_load::{
         CanonicalBlockLoadEvidence, CanonicalTrustedFreshBlockEvidence,
         TreeStateCheckpointCoverage, read_persisted_tip_metadata,
@@ -31,7 +31,10 @@ use super::{
         CanonicalConstructionFamilyEvidence, CanonicalConstructionManifestDraft,
         CanonicalConstructionManifestInputs,
     },
-    control::{DecodedStoreControl, decode_store_control, encode_ready_store_control},
+    control::{
+        ControlRevisions, DecodedStoreControl, decode_store_control,
+        encode_ready_store_control_with_revisions,
+    },
     displaced_archive::validate_permanent_reorg_archive,
     replay_tail::AuthenticatedReplayTail,
     rocksdb::{
@@ -85,6 +88,7 @@ pub struct ValidatedRocksDbCanonicalBuild {
     workload: super::CanonicalStoreWorkload,
     build_plan: super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
+    activation_schedule: CanonicalActivationSchedule,
     ready_evidence: CanonicalStoreReadyEvidence,
     construction_manifest: CanonicalConstructionManifestDraft,
     retained_sequence_checkpoints: VecDeque<CanonicalSequenceCheckpoint>,
@@ -113,6 +117,7 @@ struct PublicationContext {
     workload: super::CanonicalStoreWorkload,
     build_plan: super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
+    activation_schedule: CanonicalActivationSchedule,
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     block_evidence: CanonicalBlockLoadEvidence,
     trusted_fresh_block_evidence: CanonicalTrustedFreshBlockEvidence,
@@ -207,7 +212,17 @@ impl PublicationContext {
                         "the fixed canonical tip was not confirmed by the node source",
                     )
                 })?;
+        let activations = builder.construction_activations.clone().ok_or_else(|| {
+            CanonicalStoreError::publication("canonical construction activation table is absent")
+        })?;
+        let activation_schedule = CanonicalActivationSchedule::first_revision(
+            activations,
+            builder.build_plan.network_upgrade_activations_fingerprint(),
+            builder.build_plan.build_tip(),
+        )
+        .map_err(|error| CanonicalStoreError::publication(error.to_string()))?;
         Ok(Self {
+            activation_schedule,
             store_path: builder.store_path.clone(),
             resource_budget: builder.resource_budget,
             network: builder.network,
@@ -274,6 +289,7 @@ impl PublicationContext {
             workload: self.workload,
             build_plan: self.build_plan,
             cursor_auth_key: self.cursor_auth_key,
+            activation_schedule: self.activation_schedule,
             ready_evidence,
             construction_manifest,
             retained_sequence_checkpoints,
@@ -342,6 +358,7 @@ impl PublicationContext {
             workload: self.workload,
             build_plan: self.build_plan,
             cursor_auth_key: self.cursor_auth_key,
+            activation_schedule: self.activation_schedule,
             ready_evidence,
             construction_manifest,
             retained_sequence_checkpoints: cold_validation.replay.retained_sequence_checkpoints,
@@ -415,6 +432,7 @@ fn ready_evidence_from_cold_replay(
             )
         })?;
     Ok(CanonicalStoreReadyEvidence {
+        schema_version: crate::CANONICAL_STORE_SCHEMA_VERSION,
         first_retained_block: BlockId::new(evidence.first_height, evidence.first_hash),
         visible_tip: BlockId::new(evidence.tip_height, evidence.tip_hash),
         visible_epoch: BASELINE_EPOCH_ID,
@@ -455,6 +473,7 @@ fn ready_evidence_from_trusted_fresh(
         ));
     }
     Ok(CanonicalStoreReadyEvidence {
+        schema_version: crate::CANONICAL_STORE_SCHEMA_VERSION,
         first_retained_block: BlockId::new(evidence.first_height, evidence.first_hash),
         visible_tip,
         visible_epoch: BASELINE_EPOCH_ID,
@@ -618,7 +637,7 @@ impl ValidatedRocksDbCanonicalBuild {
         })
     }
 
-    /// Atomically publishes epoch 1, event 1, and READY with a synced WAL write.
+    /// Atomically publishes epoch 1, event 1, activation schedule revision 1, and READY with a synced WAL write.
     #[allow(
         clippy::too_many_lines,
         reason = "baseline publication binds the manifest, epoch, event, and READY control in one synced write"
@@ -657,11 +676,15 @@ impl ValidatedRocksDbCanonicalBuild {
         let encoded_publication = EncodedBaselinePublication {
             epoch: encode_baseline_epoch(&ready_evidence, prepared.publication, self.tip_metadata),
             event: encode_baseline_event(&ready_evidence),
-            control: encode_ready_store_control(
+            control: encode_ready_store_control_with_revisions(
                 self.workload,
                 &self.build_plan,
                 self.cursor_auth_key,
                 &ready_evidence,
+                ControlRevisions {
+                    activation_schedule_binding: Some(self.activation_schedule.binding()),
+                    revised_reorg_policy: None,
+                },
             )
             .map_err(|source| CanonicalStoreError::publication(source.to_string()))?,
         };
@@ -671,11 +694,9 @@ impl ValidatedRocksDbCanonicalBuild {
         batch.put_cf(&epoch_family, epoch_key, encoded_publication.epoch);
         batch.put_cf(&event_family, event_key, encoded_publication.event);
         batch.put(STORE_CONTROL_KEY, &encoded_publication.control);
-        if batch.len() != 3 {
-            return Err(CanonicalStoreError::publication(
-                "baseline publication batch must contain exactly three writes",
-            ));
-        }
+        self.activation_schedule
+            .put_into(&mut batch)
+            .map_err(CanonicalStoreError::publication)?;
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(false);
         write_options.set_sync(true);
@@ -695,6 +716,7 @@ impl ValidatedRocksDbCanonicalBuild {
             &self.build_plan,
             &ready_evidence,
             &encoded_publication,
+            &self.activation_schedule,
         )
         .map_err(
             |source| CanonicalStoreError::PublicationCommittedButUnverified {
@@ -711,6 +733,7 @@ impl ValidatedRocksDbCanonicalBuild {
             self.cursor_auth_key,
             &ready_evidence,
             subtree_root_coverage,
+            self.activation_schedule,
             replay_tail,
         ))
     }
@@ -1578,6 +1601,7 @@ fn validate_exact_publication_readback(
     build_plan: &super::CanonicalStoreBuildPlan,
     ready_evidence: &CanonicalStoreReadyEvidence,
     expected: &EncodedBaselinePublication,
+    schedule: &CanonicalActivationSchedule,
 ) -> Result<AuthenticatedReplayTail, CanonicalStoreError> {
     let epoch_family = column_family(db, CHAIN_EPOCH_COLUMN_FAMILY)?;
     let event_family = column_family(db, CHAIN_EVENT_COLUMN_FAMILY)?;
@@ -1604,13 +1628,26 @@ fn validate_exact_publication_readback(
         || control.as_deref() != Some(expected.control.as_slice())
     {
         return Err(CanonicalStoreError::publication(
-            "atomic baseline publication readback differs from its three writes",
+            "atomic baseline publication readback differs from its epoch, event, or control write",
         ));
     }
     let decoded_control = decode_store_control(db.path(), &expected.control)?;
     if decoded_control.build_state != CanonicalStoreBuildState::Ready(*ready_evidence) {
         return Err(CanonicalStoreError::publication(
             "READY control does not contain the validated baseline evidence",
+        ));
+    }
+    let persisted_schedule = CanonicalActivationSchedule::read_bound(
+        db,
+        db.path(),
+        schedule.binding(),
+        build_plan
+            .network_upgrade_activations_fingerprint()
+            .as_bytes(),
+    )?;
+    if persisted_schedule != *schedule {
+        return Err(CanonicalStoreError::publication(
+            "baseline activation schedule readback differs from its write",
         ));
     }
     validate_ready_publication(db, build_plan, build_plan.reorg_policy(), ready_evidence)
@@ -2055,6 +2092,7 @@ mod tests {
 
     fn ready_evidence() -> CanonicalStoreReadyEvidence {
         CanonicalStoreReadyEvidence {
+            schema_version: crate::CANONICAL_STORE_SCHEMA_VERSION,
             first_retained_block: BlockId::new(
                 BlockHeight::new(10),
                 BlockHash::from_bytes([1; 32]),

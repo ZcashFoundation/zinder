@@ -165,7 +165,9 @@ impl WalletServingReadPair {
             canonical_epoch.visible_tip_height,
             canonical_epoch.visible_tip_hash,
         );
-        if canonical_epoch.network != canonical.network
+        if canonical_fence.schema_version()
+            != zinder_wallet_projection::REQUIRED_CANONICAL_STORE_SCHEMA_VERSION
+            || canonical_epoch.network != canonical.network
             || canonical_epoch.id != canonical_fence.chain_epoch_id()
             || canonical_visible_tip != canonical_fence.visible_tip()
         {

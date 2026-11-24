@@ -11,9 +11,8 @@ use crate::{
 
 /// Version of the full wallet-row accumulator durable encoding.
 ///
-/// Version 2 expands rows with a `BLAKE2b` root and `ChaCha12`. Version 1
-/// expanded them with BLAKE2X and is no longer read.
-pub const WALLET_PROJECTION_ACCUMULATOR_VERSION: u16 = 2;
+/// Version 1 expands rows with a `BLAKE2b` root and `ChaCha12`.
+pub const WALLET_PROJECTION_ACCUMULATOR_VERSION: u16 = 1;
 
 /// Length in bytes of the full wallet-row accumulator: 1,024 `u16` lanes.
 pub const WALLET_PROJECTION_ACCUMULATOR_LEN: usize = LTHASH16_EXPANSION_LEN;
@@ -22,11 +21,11 @@ pub const WALLET_PROJECTION_ACCUMULATOR_LEN: usize = LTHASH16_EXPANSION_LEN;
 const DISPLAY_DIGEST_LEN: usize = 32;
 
 /// `BLAKE2b` root personalization for wallet projection rows. Its trailing
-/// `2` matches [`WALLET_PROJECTION_ACCUMULATOR_VERSION`].
-const PROJECTION_ROW_ROOT_PERSONAL: [u8; 16] = *b"ZinderWProjRoot2";
+/// `1` matches [`WALLET_PROJECTION_ACCUMULATOR_VERSION`].
+const PROJECTION_ROW_ROOT_PERSONAL: [u8; 16] = *b"ZinderWProjRoot1";
 
 /// Domain-separated preimage prefix for one durable wallet row.
-const PROJECTION_ROW_DOMAIN: &[u8] = b"zinder:wallet-projection:row:v2\0";
+const PROJECTION_ROW_DOMAIN: &[u8] = b"zinder:wallet-projection:row:v1\0";
 
 /// Durable row families committed by the wallet projection accumulator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -769,19 +768,19 @@ mod tests {
         let lanes = builder.accumulator().as_bytes();
         assert_eq!(
             hex::encode(&lanes[..16]),
-            "e3088f27c34a44476bde42abc55cb18e"
+            "fa0b300c332ad3ce5ed6ecf39bf0f3fd"
         );
         assert_eq!(
             hex::encode(&lanes[1024..1040]),
-            "619fa7e15a61cb83ee9acc57d3cf857a"
+            "7db295ab4b3d6343a79b3577ef4b4b26"
         );
         assert_eq!(
             hex::encode(&lanes[2032..]),
-            "fad1210b44455ec968fdf660b272aae5"
+            "921f4a296028aa33ea7bc7f32bb09452"
         );
         assert_eq!(
             hex::encode(builder.finish().as_bytes()),
-            "d4e07ecae473b8591e1496ea943965e8c2044f9fc3ddf3815844811b014cfa4c"
+            "be0058a447ee9896fc6fa76f5970f8180770095f33bfea10b2d8612cb829bbe8"
         );
         Ok(())
     }
@@ -792,15 +791,15 @@ mod tests {
         for (message, expected) in [
             (
                 Vec::new(),
-                "01917c84c6c5c55f4216756ffd6bd38c52622f1f735a2f6e63fbb6f39b64295a",
+                "3b0c46d3915120433f935234e2b6061134cd259a5755a0fcdfde6bc3d6e92ae3",
             ),
             (
                 patterned_bytes(64, 0x00),
-                "556fc968e30ef2356ce84cd2e03632dffbfee21336829c8ea0f68d833630d6b7",
+                "449413001c1079b37a698b25bf319f074063b596e47b182df0db242d881260b9",
             ),
             (
                 patterned_bytes(300, 0x5a),
-                "40a73d90c92643987ba854a485afcd7259894ea8aa2b6d7b7262784d51ea81b4",
+                "2ed1331251ea65667df0af7413870f17281b7e1d202957a771da509b29b292e2",
             ),
         ] {
             assert_eq!(

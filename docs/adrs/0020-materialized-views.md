@@ -43,6 +43,9 @@ chain, and readers must be able to tell partial results from complete ones.
 7. **Admission is exact.** Every open, primary or secondary, requires the
    store's recorded container format and view manifest to match the running
    release exactly: the same view set, column families, and schema versions.
+   Container format 1 stores transparent address activity and delta transaction
+   IDs as 32 internal-order bytes. Explorer responses render these IDs in RPC
+   hex order at the protocol boundary.
    A mismatch fails before the store is changed. Opening never clears rows,
    resets cursors, or creates missing views.
 8. **Schema changes need a fresh store.** A key or payload change raises that
@@ -91,3 +94,7 @@ The mechanism, the bundled views, and the rebuild procedure are in
   storage returns the new block, not the one whose rows the view wrote.
 - **Infer completeness from a shared tip.** A shared tip cannot prove that
   one view is contiguous or that its rows come from the same snapshot.
+
+## Revision history
+
+- 2026-11-24. Decision 7 specifies the format 1 container and binary transparent transaction IDs.

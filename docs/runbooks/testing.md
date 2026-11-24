@@ -764,31 +764,18 @@ live mempool composition.
 
 ## Specialized procedures
 
-### Canonical schema v7 interoperability
+### Canonical schema v1 admission
 
-Run this gate from a committed candidate checkout when changing canonical v7
-construction, admission, or stored rows. It runs outside the default CI
-profile and uses a local host with the Rust toolchain, nextest, and enough
-space for two scoped builds.
-
-```bash
-scripts/test-canonical-v7-interop.sh
-```
-
-The script checks out `00030603` and the candidate's committed `HEAD` with
-separate build directories. Each revision publishes fixture stores for
-`none`, `transactions`, and `all` retention and the other opens each store
-as a writer and secondary. The test checks typed reads, compares row fingerprints from independent
-publications, and verifies the empty families dictated by the workload and
-retention. The script writes results to
-standard output and standard error, and removes its checkouts and fixtures
-on exit.
-
-To check a second schema v7 revision after merging upstream, fetch it and
-pass it explicitly. The default baseline remains `00030603`.
+Run the canonical-store tests after changing construction, admission, or
+persisted rows. The control-record tests check exact schema v1 bytes for
+every workload and retention policy. The store-open tests check that admission
+refuses unsupported schema markers without rewriting store control. The
+publication crash tests check that the initial schedule and READY control
+survive together. The wallet adapter integration tests check that the wallet
+projection requires the schema the canonical store publishes.
 
 ```bash
-scripts/test-canonical-v7-interop.sh --baseline origin/main
+cargo nextest run --profile=ci -p zinder-store -p zinder-wallet-rocksdb
 ```
 
 ### Reorg sweep

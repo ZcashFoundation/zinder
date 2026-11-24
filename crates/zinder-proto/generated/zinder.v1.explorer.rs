@@ -1586,26 +1586,18 @@ pub struct TransparentAddressDeltasResponse {
 /// `(address_script_hash, ascending_height, in_block_position, kind, index)`.
 /// The handler projects this onto `TransparentAddressDeltasEntry`, pulling
 /// the height from the key.
-///
-/// A row carries its transaction id in exactly one of `transaction_id` and
-/// `internal_transaction_id`. Rows written before `internal_transaction_id`
-/// existed set `transaction_id`; newer rows set `internal_transaction_id`.
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressDeltasRecord {
-    /// Canonical transaction id in RPC byte order (64 lowercase hex
-    /// characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-    #[prost(string, tag = "1")]
-    pub transaction_id: ::prost::alloc::string::String,
+    /// Canonical transaction ID as 32 bytes in internal byte order.
+    #[prost(bytes = "vec", tag = "1")]
+    pub transaction_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(int64, tag = "2")]
     pub block_time_unix_seconds: i64,
     /// Signed value the event moved for the address; positive for a received
     /// output, negative for a spent prevout.
     #[prost(sint64, tag = "3")]
     pub value_zat: i64,
-    /// Canonical transaction id as 32 bytes in internal byte order.
-    #[prost(bytes = "vec", tag = "4")]
-    pub internal_transaction_id: ::prost::alloc::vec::Vec<u8>,
 }
 /// `ExplorerQuery.FeeSummary` request.
 ///
@@ -2618,17 +2610,12 @@ pub struct NetworkUpgradeStatusResponse {
 /// carries `(address_script_hash, reverse_height, in_block_position)`.
 /// The handler projects this onto the wire `TransparentAddressActivityEntry`
 /// shape and pulls the height + timestamp it already knows from the key.
-///
-/// A row carries its transaction id in exactly one of `transaction_id` and
-/// `internal_transaction_id`. Rows written before `internal_transaction_id`
-/// existed set `transaction_id`; newer rows set `internal_transaction_id`.
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressActivityRecord {
-    /// Canonical transaction id in RPC byte order (64 lowercase hex
-    /// characters). Reference: Zcash protocol spec term `\rpcByteOrder`.
-    #[prost(string, tag = "1")]
-    pub transaction_id: ::prost::alloc::string::String,
+    /// Canonical transaction ID as 32 bytes in internal byte order.
+    #[prost(bytes = "vec", tag = "1")]
+    pub transaction_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(int64, tag = "2")]
     pub block_time_unix_seconds: i64,
     /// Net transparent value the transaction moved for this address
@@ -2649,9 +2636,6 @@ pub struct TransparentAddressActivityRecord {
     /// explaining why `net_value_zat` is unset rather than guessing.
     #[prost(enumeration = "PrevoutResolutionStatus", tag = "6")]
     pub prevout_resolution_status: i32,
-    /// Canonical transaction id as 32 bytes in internal byte order.
-    #[prost(bytes = "vec", tag = "7")]
-    pub internal_transaction_id: ::prost::alloc::vec::Vec<u8>,
 }
 /// Per-transaction record materialized by `TransactionFeesConsumer`.
 ///

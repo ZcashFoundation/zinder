@@ -43,7 +43,7 @@ use zinder_wallet_rocksdb::{
 /// Exact bundle identity admitted by this release.
 pub const STATE_BUNDLE_IDENTITY: &str = "state-bundle";
 /// Exact state-bundle manifest format admitted by this release.
-pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 3;
+pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 1;
 /// Only certified physical topology represented by a state bundle.
 pub const STATE_BUNDLE_TOPOLOGY: &str = "rocksdb-single-host";
 /// Fixed canonical checkpoint directory within a bundle.
@@ -182,8 +182,7 @@ pub struct StateBundleFence {
     visible_tip: BlockManifest,
     settled_tip: BlockManifest,
     sequence_digest: SequenceDigestManifest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    network_upgrade_schedule: Option<NetworkUpgradeScheduleManifest>,
+    network_upgrade_schedule: NetworkUpgradeScheduleManifest,
 }
 
 impl StateBundleFence {
@@ -206,11 +205,9 @@ impl StateBundleFence {
     }
 
     /// Writer-admitted network-upgrade schedule identity at this fence.
-    ///
-    /// Legacy format-2 bundles predate this identity and return `None`.
     #[must_use]
-    pub const fn network_upgrade_schedule(&self) -> Option<&NetworkUpgradeScheduleManifest> {
-        self.network_upgrade_schedule.as_ref()
+    pub const fn network_upgrade_schedule(&self) -> &NetworkUpgradeScheduleManifest {
+        &self.network_upgrade_schedule
     }
 }
 
@@ -435,16 +432,9 @@ impl StateBundleManifest {
             self.identity == STATE_BUNDLE_IDENTITY,
             "identity must be exactly state-bundle",
         )?;
-        let supported_format = matches!(
-            (
-                self.format_version,
-                self.fence.network_upgrade_schedule.is_some()
-            ),
-            (2, false) | (STATE_BUNDLE_FORMAT_VERSION, true)
-        );
         require_manifest_value(
-            supported_format,
-            "format version and activation-schedule evidence are incompatible; format 2 omits schedule identity and format 3 requires it",
+            self.format_version == STATE_BUNDLE_FORMAT_VERSION,
+            "state bundle format version must be 1",
         )?;
         require_manifest_value(
             self.topology == STATE_BUNDLE_TOPOLOGY,
@@ -1152,9 +1142,9 @@ impl StateBundleFence {
             visible_tip: BlockManifest::from_block(canonical.visible_tip),
             settled_tip: BlockManifest::from_block(canonical.settled_tip),
             sequence_digest: SequenceDigestManifest::from_digest(canonical.visible_sequence_digest),
-            network_upgrade_schedule: Some(NetworkUpgradeScheduleManifest::from_admitted(
+            network_upgrade_schedule: NetworkUpgradeScheduleManifest::from_admitted(
                 &canonical.admitted_schedule,
-            )),
+            ),
         }
     }
 
@@ -1171,10 +1161,7 @@ impl StateBundleFence {
             "fence settled tip must not exceed visible tip",
         )?;
         self.sequence_digest.validate("fence sequence digest")?;
-        if let Some(schedule) = &self.network_upgrade_schedule {
-            schedule.validate()?;
-        }
-        Ok(())
+        self.network_upgrade_schedule.validate()
     }
 }
 
@@ -2248,30 +2235,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn legacy_format_two_manifest_without_schedule_identity_remains_readable()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let manifest = StateBundleManifest::from_admitted(
-            "bundle-a",
-            &sample_canonical_admission(7),
-            &sample_wallet_admission(7)?,
-        )?;
-        let mut legacy = serde_json::to_value(manifest)?;
-        legacy["format_version"] = Value::from(2);
-        legacy
-            .as_object_mut()
-            .and_then(|object| object.get_mut("fence"))
-            .and_then(Value::as_object_mut)
-            .ok_or("manifest fence must be an object")?
-            .remove("network_upgrade_schedule");
-
-        let decoded: StateBundleManifest = serde_json::from_value(legacy)?;
-        decoded.validate(Network::ZcashRegtest)?;
-        assert_eq!(decoded.format_version(), 2);
-        assert!(decoded.fence().network_upgrade_schedule().is_none());
-        Ok(())
-    }
-
-    #[test]
     fn raised_reorg_window_is_recorded_only_when_it_differs_from_construction()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut raised = sample_canonical_control_response(7);
@@ -2327,22 +2290,22 @@ pub(crate) mod tests {
         for (pointer, observed) in [
             (
                 "/wallet_checkpoint/schema_version",
-                "wallet schema version 1",
+                "wallet schema version 2",
             ),
             (
                 "/wallet_checkpoint/utxo_commitment_scheme",
-                "UTXO commitment scheme 1",
+                "UTXO commitment scheme 2",
             ),
         ] {
             let mut stale = valid.clone();
             *stale
                 .pointer_mut(pointer)
-                .ok_or("test mutation pointer must resolve")? = Value::from(1);
+                .ok_or("test mutation pointer must resolve")? = Value::from(2);
             let decoded = serde_json::from_value::<StateBundleManifest>(stale)?;
             let message = decoded
                 .validate(Network::ZcashRegtest)
                 .err()
-                .ok_or("a schema-1 wallet checkpoint was admitted")?
+                .ok_or("a incompatible wallet checkpoint was admitted")?
                 .to_string();
             assert!(message.contains(observed), "{message}");
             assert!(message.contains("this release reads only"), "{message}");
@@ -2359,13 +2322,13 @@ pub(crate) mod tests {
             Network::ZcashRegtest,
             &admitted.ready,
             WALLET_PROJECTION_STORE_IDENTITY,
-            1,
+            2,
             None,
         )
         .err()
-        .ok_or("a schema-1 wallet checkpoint was admitted")?
+        .ok_or("a incompatible wallet checkpoint was admitted")?
         .to_string();
-        assert!(message.contains("wallet schema version 1"), "{message}");
+        assert!(message.contains("wallet schema version 2"), "{message}");
         assert!(
             message.contains(&format!(
                 "this release reads only version {WALLET_ROCKSDB_SCHEMA_VERSION}"
@@ -2391,7 +2354,7 @@ pub(crate) mod tests {
                 .ok_or("construction manifest test version overflow")?;
         let mutations: [(&str, Value); 21] = [
             ("/identity", Value::String("state_bundle".to_owned())),
-            ("/format_version", Value::from(1)),
+            ("/format_version", Value::from(0)),
             ("/format_version", Value::from(2)),
             ("/topology", Value::String("mixed-runtime".to_owned())),
             ("/candidate_id", Value::String("../outside".to_owned())),
@@ -2425,10 +2388,8 @@ pub(crate) mod tests {
                 "/canonical_checkpoint/build_plan/history_predecessor/block_id/hash",
                 Value::String(hex::encode([0x99; 32])),
             ),
-            // Schema 1 and UTXO commitment scheme 1 are the BLAKE2X wallet
-            // format, which this release refuses.
-            ("/wallet_checkpoint/schema_version", Value::from(1)),
-            ("/wallet_checkpoint/utxo_commitment_scheme", Value::from(1)),
+            ("/wallet_checkpoint/schema_version", Value::from(2)),
+            ("/wallet_checkpoint/utxo_commitment_scheme", Value::from(2)),
             (
                 "/wallet_checkpoint/database_identity_sha256",
                 Value::String("not-a-sha256".to_owned()),

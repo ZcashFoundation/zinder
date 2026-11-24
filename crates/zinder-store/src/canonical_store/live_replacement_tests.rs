@@ -285,8 +285,7 @@ fn all_retention_keeps_block_blobs_across_append_replacement_secondary_and_reope
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::All,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -379,8 +378,7 @@ fn no_blob_retention_preserves_transaction_locations_across_the_complete_store_l
         &store_path,
         &secondary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::None,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -824,8 +822,7 @@ fn secondary_wallet_events_reconstruct_historical_branches_across_multiple_reorg
         &store_path,
         &secondary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         CanonicalReorgPolicy::new(32)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1048,8 +1045,7 @@ fn wallet_resume_stores(
         &path,
         temporary.path().join("secondary"),
         &super::test_network_upgrade_activations(Network::ZcashTestnet)?,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         store.reorg_policy(),
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1421,8 +1417,9 @@ fn writer_raises_the_reorg_window_in_place_across_restart_and_never_lowers_it()
                 &store_path,
                 temporary.path().join("stale-secondary"),
                 &activations,
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::Transactions,
+                crate::CanonicalStoreRequirements::for_blob_retention(
+                    RawBlobRetention::Transactions,
+                ),
                 construction,
                 RocksDbResourceBudget::for_local_tests(),
             )
@@ -1439,8 +1436,7 @@ fn writer_raises_the_reorg_window_in_place_across_restart_and_never_lowers_it()
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         raised,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1509,8 +1505,7 @@ fn secondary_refuses_a_writer_raise_until_it_reopens_with_the_raised_window()
             &store_path,
             temporary.path().join(name),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
             CanonicalReorgPolicy::new(window)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1551,8 +1546,7 @@ fn incremental_replay_tails_match_a_complete_derivation_across_appends_and_repla
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         CanonicalReorgPolicy::new(window)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1635,8 +1629,7 @@ fn secondary_lagging_beyond_one_window_matches_a_complete_derivation()
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         CanonicalReorgPolicy::new(window)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1933,8 +1926,7 @@ fn secondary_point_reads_agree_with_the_bounded_replay_range_scan()
         &store_path,
         &secondary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;

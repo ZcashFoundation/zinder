@@ -6,8 +6,8 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreError, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore,
     live_replacement_tests::{published_store, replacement_block},
 };
 use crate::{
@@ -348,8 +348,7 @@ fn open_secondary(
         store_path,
         secondary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)

@@ -44,8 +44,16 @@ impl BackgroundSecondaryHandle for RocksDbCanonicalSecondary {
             &opening.primary_path,
             &opening.secondary_path,
             &opening.activations,
-            opening.workload,
-            opening.raw_blob_retention,
+            if opening.workload == CanonicalStoreWorkload::Explorer {
+                zinder_store::CanonicalStoreRequirements::new(&[
+                    zinder_store::CanonicalStoredData::FinalNoteCommitmentRoots,
+                ])
+                .with_blob_retention(opening.raw_blob_retention)
+            } else {
+                zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                    opening.raw_blob_retention,
+                )
+            },
             opening.reorg_policy,
             opening.resource_budget,
         )
@@ -58,7 +66,6 @@ impl BackgroundSecondaryHandle for RocksDbTreeStateVerifier {
             &opening.primary_path,
             &opening.secondary_path,
             &opening.activations,
-            opening.workload,
             opening.raw_blob_retention,
             opening.reorg_policy,
             opening.resource_budget,

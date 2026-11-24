@@ -692,7 +692,7 @@ async fn tip_replay_reports_the_requested_io_modes_and_wallet_statistics_deltas(
 
     let report = read_json(&report_path)?;
 
-    assert_eq!(report["report_format_version"], 2);
+    assert_eq!(report["report_format_version"], 1);
     let io_mode = &report["configuration"]["rocksdb_io_mode"];
     assert_eq!(io_mode["requested"]["canonical"], "buffered");
     assert_eq!(io_mode["requested"]["wallet"], "buffered");
@@ -1209,8 +1209,9 @@ impl SpendLinks {
                 .path()
                 .join(format!("{name}-links-secondary")),
             &inputs.activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(
+                RawBlobRetention::Transactions,
+            ),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;

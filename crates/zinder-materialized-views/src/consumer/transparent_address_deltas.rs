@@ -43,7 +43,7 @@ use zinder_core::{BlockHeight, TransactionId, TransparentAddressScriptHash};
 use zinder_proto::v1::explorer::TransparentAddressDeltasRecord;
 
 use crate::consumer::address_value_event::{
-    address_value_events, decode_stored_transaction_id, internal_transaction_ids_by_position,
+    address_value_events, internal_transaction_ids_by_position,
 };
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
@@ -136,12 +136,11 @@ impl TransparentAddressDeltasConsumer {
 
     /// Returns the transaction id one stored delta row names.
     ///
-    /// Rows this release writes store the id as 32 internal-order bytes; rows
-    /// an earlier release wrote store its RPC hex form, which still decodes.
+    /// Stored delta rows encode the transaction id as 32 internal-order bytes.
     pub fn stored_transaction_id(
         record: &TransparentAddressDeltasRecord,
     ) -> Result<TransactionId, WireDecodeError> {
-        decode_stored_transaction_id(&record.internal_transaction_id, &record.transaction_id)
+        zinder_core::wire::decode_internal_transaction_id(&record.transaction_id)
     }
 }
 
@@ -184,13 +183,12 @@ impl BlockKeyedConsumer for TransparentAddressDeltasConsumer {
                 event.event_index,
             );
             let record = TransparentAddressDeltasRecord {
-                internal_transaction_id: transaction_ids
+                transaction_id: transaction_ids
                     .get(event.in_block_position as usize)
                     .cloned()
                     .unwrap_or_default(),
                 block_time_unix_seconds: block.block_time_unix_seconds,
                 value_zat,
-                ..TransparentAddressDeltasRecord::default()
             };
             let mut payload = Vec::with_capacity(record.encoded_len());
             record.encode(&mut payload).map_err(|error| {
@@ -298,7 +296,7 @@ mod tests {
 
     use rust_rocksdb::WriteBatch;
     use tempfile::tempdir;
-    use zinder_core::wire::{encode_internal_transaction_id, encode_rpc_transaction_id_hex};
+    use zinder_core::wire::encode_internal_transaction_id;
     use zinder_core::{
         BlockHash, TransactionFactsArtifact, TransactionId, TransactionLocation,
         TransparentOutputFact,
@@ -375,34 +373,12 @@ mod tests {
             .ok_or("the received output must write a delta row")?;
         let record = TransparentAddressDeltasRecord::decode(payload.as_slice())?;
         assert_eq!(
-            record.internal_transaction_id,
+            record.transaction_id,
             encode_internal_transaction_id(transaction_id)
         );
-        assert_eq!(record.transaction_id, "");
         assert_eq!(
             TransparentAddressDeltasConsumer::stored_transaction_id(&record)?,
             transaction_id
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn delta_rows_written_in_rpc_hex_still_name_their_transaction() -> TestResult {
-        let transaction_id = TransactionId::from_bytes([0x2a; 32]);
-        let legacy = TransparentAddressDeltasRecord {
-            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-            ..TransparentAddressDeltasRecord::default()
-        };
-        assert_eq!(
-            TransparentAddressDeltasConsumer::stored_transaction_id(&legacy)?,
-            transaction_id
-        );
-        assert!(
-            TransparentAddressDeltasConsumer::stored_transaction_id(
-                &TransparentAddressDeltasRecord::default()
-            )
-            .is_err(),
-            "a row with neither encoding names no transaction"
         );
         Ok(())
     }

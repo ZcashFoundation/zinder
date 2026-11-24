@@ -39,6 +39,7 @@ pub struct RocksDbCanonicalBuilder {
     pub(super) workload: CanonicalStoreWorkload,
     pub(super) build_plan: CanonicalStoreBuildPlan,
     pub(super) tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
+    pub(super) construction_activations: Option<NetworkUpgradeActivations>,
     pub(super) canonical_block_evidence: Option<CanonicalBlockLoadEvidence>,
     pub(super) canonical_block_staged_ssts: Option<Vec<CanonicalStagedSstEvidence>>,
     pub(super) trusted_fresh_block_evidence: Option<CanonicalTrustedFreshBlockEvidence>,
@@ -93,6 +94,7 @@ impl RocksDbCanonicalBuilder {
             workload,
             build_plan,
             tree_state_checkpoint_coverage: TreeStateCheckpointCoverage::CadenceAndTip,
+            construction_activations: None,
             canonical_block_evidence: None,
             canonical_block_staged_ssts: None,
             trusted_fresh_block_evidence: None,
@@ -274,6 +276,7 @@ impl RocksDbCanonicalBuilder {
         validate_block_load_range(&self.build_plan, &prepared.evidence)?;
         let ingested = ingest_canonical_block_ssts(&self.bounded_open.db, prepared)?;
         staging.remove()?;
+        self.construction_activations = Some(network_upgrade_activations.clone());
         self.canonical_block_evidence = Some(ingested.evidence);
         self.canonical_block_staged_ssts = Some(ingested.staged_ssts);
         self.trusted_fresh_block_evidence = Some(ingested.trusted_fresh_evidence);
@@ -497,7 +500,7 @@ mod tests {
             validate_compact_block_payload,
         },
         block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, validate_persisted_block_replays},
-        control::{decode_store_control, encode_ready_store_control},
+        control::{decode_store_control, encode_ready_store_control_with_revisions},
         displaced_archive::{
             encode_test_archive_record, encode_test_archive_state, encode_test_event_context,
             encode_test_hash_pointer_rows, encode_test_order_key,
@@ -1069,7 +1072,7 @@ mod tests {
 
         assert_ready_construction_manifest_binding(&store_path, &published)?;
         let manifest =
-            fs::read_to_string(store_path.join("canonical-construction-manifest.v4.json"))?;
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v1.json"))?;
         assert!(manifest.contains("\"evidence_provenance\":\"cold-certification\""));
 
         assert_eq!(published.ready_evidence().visible_epoch.value(), 1);
@@ -1234,8 +1237,7 @@ mod tests {
             &store_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::All,
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1655,7 +1657,7 @@ mod tests {
                 .contains("zinder_store_canonical_publication_family_scan")
         );
         let manifest =
-            fs::read_to_string(store_path.join("canonical-construction-manifest.v4.json"))?;
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v1.json"))?;
         assert!(manifest.contains("\"evidence_provenance\":\"trusted-fresh-writer\""));
         assert_eq!(published.ready_evidence().visible_block_count, 2);
         assert_eq!(
@@ -1686,10 +1688,10 @@ mod tests {
         let binding = published.ready_evidence().construction_manifest_sha256;
         drop(published);
 
-        let manifest_path = store_path.join("canonical-construction-manifest.v4.json");
+        let manifest_path = store_path.join("canonical-construction-manifest.v1.json");
         std::fs::remove_file(&manifest_path)?;
         std::fs::write(
-            store_path.join("canonical-construction-manifest.v1.json"),
+            store_path.join("canonical-construction-manifest.v4.json"),
             b"{}",
         )?;
         let activations =
@@ -1707,7 +1709,7 @@ mod tests {
         assert!(
             missing
                 .to_string()
-                .contains("canonical-construction-manifest.v4.json")
+                .contains("canonical-construction-manifest.v1.json")
         );
 
         std::fs::write(&manifest_path, b"{}")?;
@@ -1726,8 +1728,7 @@ mod tests {
             &store_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -2149,13 +2150,13 @@ mod tests {
         let error = store
             .admit_network_upgrade_schedule(&unprovable)
             .err()
-            .ok_or("legacy schedule without a matching prefix proof must be rejected")?;
-        assert!(error.to_string().contains("exact prefix"));
+            .ok_or("historical schedule change must be rejected")?;
+        assert!(error.to_string().contains("at or below canonical tip"));
         assert_eq!(
             store
                 .network_upgrade_schedule()
                 .map(crate::CanonicalActivationSchedule::revision),
-            None
+            Some(1)
         );
 
         let mut extended_entries = baseline.activations().to_vec();
@@ -2176,14 +2177,13 @@ mod tests {
             store
                 .network_upgrade_schedule()
                 .map(crate::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         let mut secondary = RocksDbCanonicalSecondary::open_ready(
             &store_path,
             temporary.path().join("canonical-secondary"),
             &baseline,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2191,7 +2191,7 @@ mod tests {
             secondary
                 .network_upgrade_schedule()
                 .map(crate::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         assert_eq!(secondary.network_upgrade_activations(), Some(&extended));
         let expected_fence = store.event_fence();
@@ -2221,7 +2221,7 @@ mod tests {
             store
                 .network_upgrade_schedule()
                 .map(crate::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         assert_eq!(store.network_upgrade_activations(), Some(&extended));
         let mut changed_at_new_tip = extended.activations().to_vec();
@@ -2248,7 +2248,7 @@ mod tests {
             .activation_schedule
             .as_ref()
             .ok_or("cold checkpoint must expose its admitted schedule")?;
-        assert_eq!(checkpoint_schedule.revision(), 1);
+        assert_eq!(checkpoint_schedule.revision(), 2);
         assert_eq!(checkpoint_schedule.activations(), &extended);
 
         let mut revised_entries = extended.activations().to_vec();
@@ -2264,14 +2264,14 @@ mod tests {
             store
                 .network_upgrade_schedule()
                 .map(crate::CanonicalActivationSchedule::revision),
-            Some(2)
+            Some(3)
         );
         secondary.try_catch_up()?;
         assert_eq!(
             secondary
                 .network_upgrade_schedule()
                 .map(crate::CanonicalActivationSchedule::revision),
-            Some(2)
+            Some(3)
         );
         assert_eq!(secondary.network_upgrade_activations(), Some(&revised));
         let old_checkpoint_evidence = RocksDbCanonicalStore::cold_admit_owner_checkpoint(
@@ -2284,7 +2284,7 @@ mod tests {
                 .activation_schedule
                 .as_ref()
                 .map(crate::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
 
         let mut historical_entries = revised.activations().to_vec();
@@ -2310,7 +2310,7 @@ mod tests {
             reopened
                 .network_upgrade_schedule()
                 .map(crate::CanonicalActivationSchedule::revision),
-            Some(2)
+            Some(3)
         );
         assert_eq!(reopened.network_upgrade_activations(), Some(&revised));
         Ok(())
@@ -2350,7 +2350,7 @@ mod tests {
             before
                 .network_upgrade_schedule()
                 .map(crate::CanonicalActivationSchedule::revision),
-            None
+            Some(1)
         );
         drop(before);
 
@@ -2371,7 +2371,7 @@ mod tests {
             after
                 .network_upgrade_schedule()
                 .map(crate::CanonicalActivationSchedule::revision),
-            Some(1)
+            Some(2)
         );
         assert_eq!(after.network_upgrade_activations(), Some(&extended));
         Ok(())
@@ -3306,6 +3306,12 @@ mod tests {
         )?;
         assert_eq!(reopened.ready_evidence().visible_epoch.value(), 1);
         assert_eq!(reopened.ready_evidence().visible_event_sequence, 1);
+        assert_eq!(
+            reopened
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            Some(1)
+        );
         Ok(())
     }
 
@@ -3389,11 +3395,12 @@ mod tests {
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([9; 32]));
         db.put(
             STORE_CONTROL_KEY,
-            encode_ready_store_control(
+            encode_ready_store_control_with_revisions(
                 decoded_control.workload,
                 &decoded_control.build_plan,
                 decoded_control.cursor_auth_key,
                 &wrong_evidence,
+                decoded_control.revisions(),
             )?,
         )?;
         db.flush_wal(true)?;
@@ -4122,7 +4129,7 @@ mod tests {
         );
         assert!(
             store_path
-                .join("canonical-construction-manifest.v4.json")
+                .join("canonical-construction-manifest.v1.json")
                 .is_file()
         );
         let manifest_binding =
@@ -4230,6 +4237,10 @@ mod tests {
                 return Err(format!("{name} must remain empty before atomic publication").into());
             }
         }
+        assert!(
+            db.get(super::super::activation_schedule::schedule_key(1))?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -4319,11 +4330,12 @@ mod tests {
             corrupted_sequence_checkpoint(evidence.sequence_checkpoint, corruption);
         db.put(
             STORE_CONTROL_KEY,
-            encode_ready_store_control(
+            encode_ready_store_control_with_revisions(
                 decoded.workload,
                 &decoded.build_plan,
                 decoded.cursor_auth_key,
                 &evidence,
+                decoded.revisions(),
             )?,
         )?;
         db.flush_wal(true)?;

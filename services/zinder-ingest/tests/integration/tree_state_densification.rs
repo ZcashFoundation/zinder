@@ -656,8 +656,7 @@ async fn every_runtime_admits_and_serves_a_densified_store() -> eyre::Result<()>
         &primary_path,
         primary_path.with_extension("compat-secondary"),
         Network::ZcashRegtest,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::None,
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;

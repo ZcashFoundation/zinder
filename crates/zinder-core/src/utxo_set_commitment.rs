@@ -47,7 +47,7 @@ impl UtxoSetCommitmentScheme {
     pub const fn id(self) -> u32 {
         match self {
             Self::Unspecified => 0,
-            Self::LtHash16ChaCha12 => 2,
+            Self::LtHash16ChaCha12 => 1,
         }
     }
 
@@ -56,7 +56,7 @@ impl UtxoSetCommitmentScheme {
     pub const fn from_id(scheme_id: u32) -> Option<Self> {
         match scheme_id {
             0 => Some(Self::Unspecified),
-            2 => Some(Self::LtHash16ChaCha12),
+            1 => Some(Self::LtHash16ChaCha12),
             _ => None,
         }
     }
@@ -430,7 +430,7 @@ mod tests {
             block_height: BlockHeight::new(419_200),
         });
         let expected =
-            hex::decode("f4719b540deecc97b5f4fa029875910946dc224d221ec2f8bef8703ec4dbd783")
+            hex::decode("2aba63e2c2490a0a06c5cc94295ff8d096c32c7b0dcb575d55721f0d88756579")
                 .unwrap_or_default();
         assert_eq!(commitment.display_digest().to_vec(), expected);
     }
@@ -441,13 +441,12 @@ mod tests {
             UtxoSetCommitmentScheme::from_id(0),
             Some(UtxoSetCommitmentScheme::Unspecified)
         );
-        // Scheme 1, the BLAKE2X expansion, is no longer read.
-        assert_eq!(UtxoSetCommitmentScheme::from_id(1), None);
+        assert_eq!(UtxoSetCommitmentScheme::from_id(2), None);
         assert_eq!(
-            UtxoSetCommitmentScheme::from_id(2),
+            UtxoSetCommitmentScheme::from_id(1),
             Some(UtxoSetCommitmentScheme::LtHash16ChaCha12)
         );
         assert_eq!(UtxoSetCommitmentScheme::from_id(3), None);
-        assert_eq!(UtxoSetCommitmentScheme::LtHash16ChaCha12.id(), 2);
+        assert_eq!(UtxoSetCommitmentScheme::LtHash16ChaCha12.id(), 1);
     }
 }
