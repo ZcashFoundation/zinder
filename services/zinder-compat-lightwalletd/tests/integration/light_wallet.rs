@@ -30,7 +30,8 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT,
-    DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, RocksDbCanonicalReader, WalletServingReadiness,
+    DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT, ForwardedReadConfig, ForwardedReadLimit,
+    ForwardedResponseKind, RocksDbCanonicalReader, WalletServingReadiness,
     spawn_wallet_ingest_control_readiness_probe,
 };
 use zinder_runtime::{Readiness, ReadinessState};
@@ -65,8 +66,17 @@ impl Fixture {
         replies: impl IntoIterator<Item = JsonRpcStub>,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::with_node_timeout_and_reads(blocks, replies, timeout, ForwardedReadLimit::default())
+    }
+
+    fn with_node_timeout_and_reads(
+        blocks: u32,
+        replies: impl IntoIterator<Item = JsonRpcStub>,
+        timeout: Duration,
+        reads: ForwardedReadLimit,
+    ) -> Result<Self> {
         let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(blocks);
-        Self::from_chain(&chain, &one_upgrade_per_height()?, replies, timeout)
+        Self::with_reads(&chain, &one_upgrade_per_height()?, replies, timeout, reads)
     }
 
     fn from_chain(
@@ -75,14 +85,12 @@ impl Fixture {
         replies: impl IntoIterator<Item = JsonRpcStub>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::from_chain_with_options(
+        Self::with_reads(
             chain,
             schedule,
             replies,
-            ZebraJsonRpcSourceOptions {
-                request_timeout: timeout,
-                ..ZebraJsonRpcSourceOptions::default()
-            },
+            timeout,
+            ForwardedReadLimit::default(),
         )
     }
 
@@ -92,7 +100,32 @@ impl Fixture {
         options: ZebraJsonRpcSourceOptions,
     ) -> Result<Self> {
         let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-        Self::from_chain_with_options(&chain, &one_upgrade_per_height()?, replies, options)
+        Self::from_chain_with_options(
+            &chain,
+            &one_upgrade_per_height()?,
+            replies,
+            options,
+            ForwardedReadLimit::default(),
+        )
+    }
+
+    fn with_reads(
+        chain: &ChainFixture,
+        schedule: &zinder_core::NetworkUpgradeActivations,
+        replies: impl IntoIterator<Item = JsonRpcStub>,
+        timeout: Duration,
+        reads: ForwardedReadLimit,
+    ) -> Result<Self> {
+        Self::from_chain_with_options(
+            chain,
+            schedule,
+            replies,
+            ZebraJsonRpcSourceOptions {
+                request_timeout: timeout,
+                ..ZebraJsonRpcSourceOptions::default()
+            },
+            reads,
+        )
     }
 
     fn from_chain_with_options(
@@ -100,6 +133,7 @@ impl Fixture {
         schedule: &zinder_core::NetworkUpgradeActivations,
         replies: impl IntoIterator<Item = JsonRpcStub>,
         options: ZebraJsonRpcSourceOptions,
+        reads: ForwardedReadLimit,
     ) -> Result<Self> {
         let tip = chain
             .blocks()
@@ -128,6 +162,7 @@ impl Fixture {
             source,
             DEFAULT_TREE_STATE_REPLAY_WAIT,
             DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+            reads,
         );
         Ok(Self {
             adapter,
@@ -136,6 +171,39 @@ impl Fixture {
             _store: store,
         })
     }
+}
+
+/// Default node-call budget with two address-history streams and two
+/// unspent-output response bodies, and no place to wait for either, so a
+/// third stream or response is refused at once.
+fn two_response_slots() -> ForwardedReadLimit {
+    let two = std::num::NonZeroU32::MIN.saturating_add(1);
+    ForwardedReadLimit::new(
+        ForwardedReadConfig::default()
+            .with_response_limit(ForwardedResponseKind::HistoryStream, two, 0)
+            .with_response_limit(ForwardedResponseKind::UtxoResponse, two, 0),
+    )
+}
+
+/// A three-slot node-call budget, one slot per kind, that refuses a call at
+/// once when its kind's slot is taken.
+fn one_node_call_per_kind() -> Result<ForwardedReadLimit> {
+    Ok(ForwardedReadLimit::new(ForwardedReadConfig::resolve(
+        Some(3),
+        Some(0),
+        None,
+        None,
+    )?))
+}
+
+/// Asserts that a forwarded read was refused for want of a slot, which the
+/// lightwalletd surface reports as retryable `UNAVAILABLE`.
+fn refused_for_admission(status: &Status) {
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert!(
+        status.message().contains("retry with backoff"),
+        "{status:?}"
+    );
 }
 
 /// The tip of the `blocks`-block chain a [`Fixture`] serves.
@@ -188,6 +256,13 @@ fn history_request(start: u64, end: u64) -> Request<lightwalletd::TransparentAdd
 fn history_fixture(
     replies: impl IntoIterator<Item = JsonRpcStub>,
 ) -> Result<(Fixture, Arc<AtomicBool>)> {
+    history_fixture_with(replies, two_response_slots())
+}
+
+fn history_fixture_with(
+    replies: impl IntoIterator<Item = JsonRpcStub>,
+    reads: ForwardedReadLimit,
+) -> Result<(Fixture, Arc<AtomicBool>)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
     let hashes: Vec<_> = chain.blocks().iter().map(|block| block.hash).collect();
     let chain = HISTORY.iter().fold(chain, |chain, &(byte, height, index)| {
@@ -213,7 +288,7 @@ fn history_fixture(
         }
     };
     let tip_hash = block_hash.clone();
-    let fixture = Fixture::from_chain(
+    let fixture = Fixture::with_reads(
         &chain,
         &one_upgrade_per_height()?,
         [
@@ -244,6 +319,7 @@ fn history_fixture(
         .into_iter()
         .chain(replies),
         Duration::from_secs(2),
+        reads,
     )?;
     Ok((fixture, replaced))
 }
@@ -307,10 +383,7 @@ async fn two_of_four_concurrent_history_requests_complete_while_a_reader_pauses(
     for outcome in futures_util::future::join_all(requests).await {
         match outcome {
             Ok(response) => streams.push(response.into_inner()),
-            Err(status) => {
-                assert_eq!(status.code(), Code::ResourceExhausted);
-                assert!(status.message().contains("retry with backoff"));
-            }
+            Err(status) => refused_for_admission(&status),
         }
     }
     let admitted = streams.len();
@@ -325,6 +398,39 @@ async fn two_of_four_concurrent_history_requests_complete_while_a_reader_pauses(
         assert!(slow.next().await.is_none());
     }
     assert_eq!(admitted, 2, "completed history requests out of four");
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_requests_beyond_the_stream_limit_wait_for_a_slot() -> Result<()> {
+    let two = std::num::NonZeroU32::MIN.saturating_add(1);
+    let reads = ForwardedReadLimit::new(ForwardedReadConfig::default().with_response_limit(
+        ForwardedResponseKind::HistoryStream,
+        two,
+        4,
+    ));
+    let (fixture, _) = history_fixture_with(
+        [method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))],
+        reads,
+    )?;
+    let adapter = &fixture.adapter;
+    let requests = (0..6).map(|_| async move {
+        let mut history = adapter
+            .get_taddress_transactions(history_request(1, 1))
+            .await?
+            .into_inner();
+        let mut rows = 0;
+        while history.next().await.transpose()?.is_some() {
+            rows += 1;
+        }
+        Ok::<_, Status>(rows)
+    });
+    let completed = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures_util::future::try_join_all(requests),
+    )
+    .await??;
+    assert_eq!(completed, [2; 6], "every queued history request completes");
     Ok(())
 }
 
@@ -355,7 +461,7 @@ async fn history_deadline_releases_admission_without_polling_a_slow_response() -
                 .get_taddress_txids(history_request(1, 1))
                 .await
             {
-                Err(status) if status.code() == Code::ResourceExhausted => {
+                Err(status) if status.code() == Code::Unavailable => {
                     tokio::task::yield_now().await;
                 }
                 result => break result,
@@ -392,11 +498,10 @@ async fn dropping_a_history_stream_immediately_releases_its_slot() -> Result<()>
     let refused = fixture
         .adapter
         .get_taddress_txids(history_request(1, 1))
-        .await;
-    assert_eq!(
-        refused.err().map(|status| status.code()),
-        Some(Code::ResourceExhausted)
-    );
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a third history stream was admitted"))?;
+    refused_for_admission(&refused);
     drop(first);
     let replacement = fixture
         .adapter
@@ -464,18 +569,19 @@ async fn history_evidence_admission() -> Result<()> {
     let refused = fixture
         .adapter
         .get_taddress_txids(history_request(1, 1))
-        .await;
-    assert_eq!(
-        refused.err().map(|status| status.code()),
-        Some(Code::ResourceExhausted)
-    );
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a stream was admitted while dropped evidence reads ran"))?;
+    refused_for_admission(&refused);
     release
         .send(())
         .map_err(|()| eyre!("blocking pool gate closed early"))?;
     blocking_slot.await?;
     // The sole blocking worker completes both admitted reads before this marker.
+    // Each row reads its served evidence before its bytes, so the streams that
+    // ended during those reads never call the node.
     tokio::task::spawn_blocking(|| ()).await?;
-    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 2);
+    assert!(fixture.node.requests_for("getrawtransaction")?.is_empty());
     let first = fixture
         .adapter
         .get_taddress_txids(history_request(1, 1))
@@ -516,7 +622,7 @@ async fn cancelling_the_first_history_page_frees_admission() -> Result<()> {
         .await
         .err()
         .ok_or_else(|| eyre!("history stream bypassed two pending page fetches"))?;
-    assert_eq!(refused.code(), Code::ResourceExhausted);
+    refused_for_admission(&refused);
     assert_eq!(fixture.node.requests()?.len(), before);
     drop(first);
     drop(resume_node);
@@ -628,8 +734,13 @@ async fn a_transaction_mined_outside_its_history_page_ends_the_stream() -> Resul
     Ok(())
 }
 
+/// A node reorg inside the last page fails the stream at its end.
+///
+/// Rows bind to the served view through their local location and recorded
+/// digest, so the reorg does not refuse the next row. The stream-end tip
+/// check then fails the stream, and the client retries.
 #[tokio::test]
-async fn a_reorg_within_the_last_history_page_refuses_the_next_row() -> Result<()> {
+async fn a_reorg_within_the_last_history_page_fails_the_stream_at_its_end() -> Result<()> {
     for start in [1, 4] {
         let (fixture, replaced) = history_fixture([
             method("getaddresstxids").reply_with(|params| {
@@ -657,12 +768,53 @@ async fn a_reorg_within_the_last_history_page_refuses_the_next_row() -> Result<(
             Some(4)
         );
         replaced.store(true, Ordering::Release);
+        assert_eq!(
+            history.next().await.transpose()?.map(|row| row.height),
+            Some(4),
+            "the second served row binds to the served view"
+        );
         assert!(
             matches!(history.next().await, Some(Err(status)) if status.code() == Code::Unavailable),
-            "a replacement at the end of {start}..=4 must abort the stream"
+            "a replacement at the end of {start}..=4 must fail the stream"
         );
         assert!(history.next().await.is_none());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn warm_address_history_reads_no_transaction_and_checks_no_tip_per_row() -> Result<()> {
+    let (fixture, _) = history_fixture([
+        method("getrawtransaction").reply_with(|params| verbose_reply(&params[0], 1))
+    ])?;
+    let calls = |method: &str| {
+        fixture
+            .node
+            .requests_for(method)
+            .map(|requests| requests.len())
+    };
+    let mut per_run = Vec::new();
+    for _ in 0..2 {
+        let (fetched, tip_checks) = (calls("getrawtransaction")?, calls("getblockhash")?);
+        let mut history = fixture
+            .adapter
+            .get_taddress_transactions(history_request(1, 1))
+            .await?
+            .into_inner();
+        let mut rows = Vec::new();
+        while let Some(row) = history.next().await.transpose()? {
+            rows.push(row.data);
+        }
+        assert_eq!(rows, [vec![0x03], vec![0x02]]);
+        per_run.push((
+            calls("getrawtransaction")? - fetched,
+            calls("getblockhash")? - tip_checks,
+        ));
+    }
+    // A cold run fetches both rows; the warm run serves them from the
+    // verified cache. Either way the only tip checks are the page's bracket
+    // and the stream's end, whatever the row count.
+    assert_eq!(per_run, [(2, 3), (0, 3)]);
     Ok(())
 }
 
@@ -1340,6 +1492,20 @@ fn populated_utxo_fixture(
     next_height_rows: u32,
     node: UtxoNode,
 ) -> Result<Fixture> {
+    populated_utxo_fixture_with(
+        first_height_rows,
+        next_height_rows,
+        node,
+        ForwardedReadLimit::default(),
+    )
+}
+
+fn populated_utxo_fixture_with(
+    first_height_rows: u32,
+    next_height_rows: u32,
+    node: UtxoNode,
+    reads: ForwardedReadLimit,
+) -> Result<Fixture> {
     let script = hex::encode(
         zinder_source::parse_transparent_address(ADDRESS)?
             .script()
@@ -1358,7 +1524,7 @@ fn populated_utxo_fixture(
         (6, "03".repeat(32), next_height_rows),
     ];
     let tip = served_tip(6)?;
-    Fixture::with_node_timeout(
+    Fixture::with_node_timeout_and_reads(
         6,
         [method("getaddressutxos").reply_with(move |params| {
             let (start, limit) = match node {
@@ -1396,6 +1562,7 @@ fn populated_utxo_fixture(
             utxos_at(tip, &Value::Array(rows))
         })],
         Duration::from_secs(30),
+        reads,
     )
 }
 
@@ -1508,7 +1675,17 @@ async fn a_node_that_supplies_the_complete_utxo_page_needs_one_read() -> Result<
 
 #[tokio::test]
 async fn utxo_response_slots_release_on_drain_or_drop_and_leave_room_for_balance() -> Result<()> {
-    let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
+    // One UTXO node-call slot and two response slots: the balance below can
+    // run only because paused response bodies hold no node-call slot.
+    let two = std::num::NonZeroU32::MIN.saturating_add(1);
+    let reads = ForwardedReadLimit::new(
+        ForwardedReadConfig::resolve(Some(3), Some(0), None, None)?.with_response_limit(
+            ForwardedResponseKind::UtxoResponse,
+            two,
+            0,
+        ),
+    );
+    let fixture = populated_utxo_fixture_with(2, 1, UtxoNode::Zakura, reads)?;
     let adapter = &fixture.adapter;
     for cancel in [false, true] {
         let mut first = adapter
@@ -1523,8 +1700,7 @@ async fn utxo_response_slots_release_on_drain_or_drop_and_leave_room_for_balance
             .await
             .err()
             .ok_or_else(|| eyre!("a third request bypassed UTXO response admission"))?;
-        assert_eq!(refused.code(), Code::ResourceExhausted);
-        assert!(refused.message().contains("retry with backoff"));
+        refused_for_admission(&refused);
         assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), before);
         let balance = adapter.get_taddress_balance(balance_request()).await?;
         assert_eq!(balance.into_inner().value_zat, 3);
@@ -1541,15 +1717,20 @@ async fn utxo_response_slots_release_on_drain_or_drop_and_leave_room_for_balance
 }
 
 #[tokio::test]
-async fn a_pending_balance_holds_utxo_admission_until_it_answers() -> Result<()> {
+async fn a_pending_balance_holds_its_utxo_node_call_slot_until_it_answers() -> Result<()> {
     let tip = served_tip(1)?;
-    let fixture = Fixture::new([
-        method("getaddressutxos").reply(RpcReply::delayed(
-            Duration::from_millis(300),
-            utxos_at(tip, &json!([])),
-        )),
-        method("getaddressutxos").reply(utxos_at(tip, &json!([]))),
-    ])?;
+    let fixture = Fixture::with_node_timeout_and_reads(
+        1,
+        [
+            method("getaddressutxos").reply(RpcReply::delayed(
+                Duration::from_millis(300),
+                utxos_at(tip, &json!([])),
+            )),
+            method("getaddressutxos").reply(utxos_at(tip, &json!([]))),
+        ],
+        Duration::from_secs(2),
+        one_node_call_per_kind()?,
+    )?;
     let mut pending = Box::pin(fixture.adapter.get_taddress_balance(balance_request()));
     tokio::select! {
         _ = &mut pending => return Err(eyre!("delayed balance arrived before inspection")),
@@ -1565,7 +1746,7 @@ async fn a_pending_balance_holds_utxo_admission_until_it_answers() -> Result<()>
         .await;
     for refused in [utxos.err(), balance.err()] {
         let status = refused.ok_or_else(|| eyre!("a request bypassed a pending balance"))?;
-        assert_eq!(status.code(), Code::ResourceExhausted);
+        refused_for_admission(&status);
     }
     assert_eq!(pending.await?.into_inner().value_zat, 0);
     assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), 1);
@@ -1576,13 +1757,18 @@ async fn a_pending_balance_holds_utxo_admission_until_it_answers() -> Result<()>
 #[tokio::test]
 async fn cancelling_a_pending_unary_utxo_read_frees_admission() -> Result<()> {
     let tip = served_tip(1)?;
-    let fixture = Fixture::new([
-        method("getaddressutxos").reply(RpcReply::delayed(
-            Duration::from_millis(200),
-            utxos_at(tip, &json!([])),
-        )),
-        method("getaddressutxos").reply(utxos_at(tip, &json!([]))),
-    ])?;
+    let fixture = Fixture::with_node_timeout_and_reads(
+        1,
+        [
+            method("getaddressutxos").reply(RpcReply::delayed(
+                Duration::from_millis(200),
+                utxos_at(tip, &json!([])),
+            )),
+            method("getaddressutxos").reply(utxos_at(tip, &json!([]))),
+        ],
+        Duration::from_secs(2),
+        one_node_call_per_kind()?,
+    )?;
     let mut pending = Box::pin(fixture.adapter.get_address_utxos(utxo_request(0)));
     tokio::select! {
         _ = &mut pending => return Err(eyre!("delayed read arrived before cancellation")),
@@ -1597,7 +1783,7 @@ async fn cancelling_a_pending_unary_utxo_read_frees_admission() -> Result<()> {
         .await
         .err()
         .ok_or_else(|| eyre!("stream bypassed pending unary UTXO read"))?;
-    assert_eq!(refused.code(), Code::ResourceExhausted);
+    refused_for_admission(&refused);
     assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), 1);
     drop(pending);
     assert_eq!(
@@ -1609,6 +1795,48 @@ async fn cancelling_a_pending_unary_utxo_read_frees_admission() -> Result<()> {
             .address_utxos,
         Vec::<lightwalletd::GetAddressUtxosReply>::new()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_wallet_overlapping_utxo_balance_and_history_reads_wait_instead_of_failing()
+-> Result<()> {
+    // One node-call slot per kind, with waiting places, so every overlapping
+    // read beyond the first must queue.
+    let reads = ForwardedReadLimit::new(ForwardedReadConfig::resolve(
+        Some(3),
+        Some(10_000),
+        Some(4),
+        None,
+    )?);
+    let fixture = populated_utxo_fixture_with(2, 1, UtxoNode::Zakura, reads)?;
+    let adapter = &fixture.adapter;
+    let streams = (0..2).map(|_| async move {
+        let mut outputs = adapter
+            .get_address_utxos_stream(utxo_request(0))
+            .await?
+            .into_inner();
+        let mut rows = 0;
+        while outputs.next().await.transpose()?.is_some() {
+            rows += 1;
+        }
+        Ok::<_, Status>(rows)
+    });
+    let balances =
+        (0..2).map(|_| async move { adapter.get_taddress_balance(balance_request()).await });
+    let (streams, balances) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures_util::future::join(
+            futures_util::future::try_join_all(streams),
+            futures_util::future::try_join_all(balances),
+        ),
+    )
+    .await?;
+    assert_eq!(streams?, [3, 3]);
+    for balance in balances? {
+        assert_eq!(balance.into_inner().value_zat, 3);
+    }
+    assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), 4);
     Ok(())
 }
 

@@ -9,8 +9,8 @@ use std::{
 use clap::{Parser, Subcommand};
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{
-    AdmittedIngestControl, OrderedBroadcaster, WalletEndpointMetadata, WalletQueryApi,
-    WalletQueryGrpcAdapter, WalletServingPairConfig, WalletServingPairPublisher,
+    AdmittedIngestControl, ForwardedReadLimit, OrderedBroadcaster, WalletEndpointMetadata,
+    WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairConfig, WalletServingPairPublisher,
     WalletServingQuery, WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
 };
 use zinder_runtime::{
@@ -227,7 +227,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let query =
         WalletServingQuery::from_admitted_native_serving_pair(pair_slot, ingest_control.clone())
             .with_node_broadcast(node_broadcast)
-            .with_verified_cold_transactions()
+            .with_verified_cold_transactions(ForwardedReadLimit::new(query_config.forwarded_reads))
             .with_tree_state_replay_wait(query_config.tree_state_replay_wait)
             .with_tree_state_replay_waiters_per_slot(
                 query_config.tree_state_replay_waiters_per_slot,

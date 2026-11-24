@@ -33,6 +33,7 @@ use zinder_store::{
 mod broadcast_byte_budget;
 mod cold_transaction;
 mod compact_block_fence;
+mod forwarded_read;
 mod grpc;
 mod ingest_control;
 mod light_wallet;
@@ -52,6 +53,14 @@ mod wallet_serving_query;
 
 pub use broadcast_byte_budget::BROADCAST_BYTE_BUDGET;
 pub use compact_block_fence::{CompactBlockFence, CompactBlockSource};
+pub use forwarded_read::{
+    DEFAULT_FORWARDED_READ_MAX_CONCURRENT, DEFAULT_FORWARDED_READ_WAIT,
+    DEFAULT_FORWARDED_READ_WAITERS_PER_SLOT, DEFAULT_FORWARDED_TRANSACTION_CACHE_BYTES,
+    FORWARDED_HISTORY_DEADLINE, ForwardedReadConfig, ForwardedReadConfigError, ForwardedReadKind,
+    ForwardedReadLimit, ForwardedReadRefused, ForwardedResponseKind, ForwardedResponsePermit,
+    ForwardedTransactionError, MAX_FORWARDED_READ_MAX_CONCURRENT, MAX_FORWARDED_READ_WAIT,
+    MAX_FORWARDED_READ_WAITERS_PER_SLOT, MAX_FORWARDED_TRANSACTION_CACHE_BYTES,
+};
 pub use grpc::{
     DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS, TransactionStatusLookup,
     WALLET_QUERY_FIELD_LIMITS, WalletEndpointMetadata, WalletQueryGrpcAdapter,
@@ -588,6 +597,7 @@ pub fn describe_request_metrics() {
     tree_state_replay_limit::describe_metrics();
     grpc::describe_compact_block_stream_metrics();
     broadcast_byte_budget::describe_metrics();
+    forwarded_read::describe_metrics();
 }
 
 pub(crate) fn record_wallet_query_outcome<Response>(
@@ -654,6 +664,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::CompactBlockStreamLimitReached { .. }) => {
             "compact_block_stream_limit_reached"
         }
+        Some(QueryError::ForwardedReadLimitReached { .. }) => "forwarded_read_limit_reached",
         Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
@@ -1261,6 +1272,18 @@ pub enum QueryError {
         max_streams: NonZeroU32,
     },
 
+    /// A read forwarded to the node found every slot of its kind taken, and
+    /// either no slot freed within the wait or every waiting place was taken.
+    #[error(
+        "forwarded {kind} reads are at their limit of {max_concurrent} at once; retry with backoff"
+    )]
+    ForwardedReadLimitReached {
+        /// The refused kind, as the `kind` metric label names it.
+        kind: &'static str,
+        /// Most reads of the kind that run at once.
+        max_concurrent: u32,
+    },
+
     /// A blocking read task failed unexpectedly (panic or runtime shutdown).
     #[error("query read task failed: {reason}")]
     BlockingTaskFailed {
@@ -1401,6 +1424,7 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::CompactBlockStreamLimitReached { .. } => {
                 ErrorReason::CompactBlockStreamLimitReached
             }
+            Self::ForwardedReadLimitReached { .. } => ErrorReason::ForwardedReadLimitReached,
             Self::BlockingTaskFailed { .. } => ErrorReason::BlockingTaskFailed,
             Self::Node(source_error) if source_error.is_node_capability_missing() => {
                 ErrorReason::NodeCapabilityMissing
@@ -1546,6 +1570,10 @@ mod error_reason_tests {
             QueryError::CompactBlockStreamLimitReached {
                 max_streams: NonZeroU32::MIN,
             },
+            QueryError::ForwardedReadLimitReached {
+                kind: "transaction",
+                max_concurrent: 24,
+            },
             QueryError::BlockingTaskFailed {
                 reason: "probe".to_owned(),
             },
@@ -1649,6 +1677,20 @@ mod error_reason_tests {
             tonic_types::StatusExt::get_details_error_info(&status)
                 .map(|error_info| error_info.reason),
             Some("COMPACT_BLOCK_STREAM_LIMIT_REACHED".to_owned())
+        );
+    }
+
+    #[test]
+    fn forwarded_read_refusal_is_resource_exhausted_on_the_wire() {
+        let status = crate::status_from_query_error(&QueryError::ForwardedReadLimitReached {
+            kind: "transaction",
+            max_concurrent: 24,
+        });
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            tonic_types::StatusExt::get_details_error_info(&status)
+                .map(|error_info| error_info.reason),
+            Some("FORWARDED_READ_LIMIT_REACHED".to_owned())
         );
     }
 

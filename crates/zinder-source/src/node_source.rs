@@ -298,6 +298,19 @@ pub trait BroadcastNodeProbe: Send + Sync + 'static {
     /// An endpoint that holds no block at that height, such as one that has
     /// not reached it yet, returns an error instead of `false`.
     async fn holds_block(&self, block: BlockId) -> Result<bool, SourceError>;
+
+    /// Returns the view of this endpoint that verification calls through, or
+    /// `None` to call through the endpoint itself.
+    ///
+    /// A verification can hold state that readiness probes also wait on. A
+    /// source whose calls share a bounded budget returns a view with its own
+    /// call slot, so such a verification never queues behind other calls.
+    fn verification_view(&self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 /// Node-backed transaction broadcast boundary.

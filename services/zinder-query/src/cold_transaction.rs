@@ -1,135 +1,86 @@
 //! Bounded reads of mined transaction bytes from the verified primary node.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
-
-use parking_lot::Mutex;
-use tokio::sync::Semaphore;
-use zinder_core::{SerializedBytesDigest, TransactionId, TransactionLocation};
-use zinder_source::{SourceError, ZebraJsonRpcSource};
+use zinder_core::TransactionLocation;
+use zinder_source::ZebraJsonRpcSource;
 
 use crate::{
-    CanonicalReader, MinedTransactionDigest, QueryError,
-    node_broadcast::{LightWalletNodeVerification, VerificationTarget},
+    CanonicalReader, ForwardedReadKind, ForwardedReadLimit, MinedTransactionDigest, QueryError,
+    node_broadcast::{AdmittedTipCheck, LightWalletNodeVerification, VerificationTarget},
 };
 
-const FETCH_SLOTS: usize = 32;
-const CACHE_BYTES: usize = 64 * 1024 * 1024;
-
+/// Reads mined transaction bytes the store omits from the primary node,
+/// through the process's forwarded-read limit and its verified byte cache.
 pub(crate) struct ColdTransactionSource {
     node: ZebraJsonRpcSource,
     verification: LightWalletNodeVerification,
-    slots: Semaphore,
-    cache: Mutex<TransactionCache>,
+    reads: ForwardedReadLimit,
 }
 
 impl ColdTransactionSource {
-    pub(crate) fn new(node: ZebraJsonRpcSource) -> Self {
+    pub(crate) fn new(node: ZebraJsonRpcSource, reads: ForwardedReadLimit) -> Self {
         Self {
             node,
             verification: LightWalletNodeVerification::default(),
-            slots: Semaphore::new(FETCH_SLOTS),
-            cache: Mutex::default(),
+            reads,
         }
     }
 
-    /// Verifies the node against the served tip of `reader`, so a caller
-    /// that consults live state after a canonical miss knows the node follows
-    /// the served chain.
+    /// Verifies the node against the served schedule and tip of `reader`, so
+    /// a caller that consults live state after a canonical miss knows the
+    /// node follows the served chain.
+    ///
+    /// Schedule and capability checks use the readiness view; the foreground
+    /// served-tip check takes one `Transaction` slot of `reads` inside its
+    /// shared tip check.
     pub(crate) async fn verify_served_tip(
         &self,
         reader: &dyn CanonicalReader,
     ) -> Result<(), QueryError> {
-        let _slot = self.acquire_slot()?;
-        self.verify_target(reader).await
-    }
-
-    fn acquire_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, QueryError> {
-        self.slots.try_acquire().map_err(|_| {
-            QueryError::Node(SourceError::NodeUnavailable {
-                reason: "cold transaction fetch slots are full; retry with backoff".to_owned(),
-            })
-        })
-    }
-
-    async fn verify_target(&self, reader: &dyn CanonicalReader) -> Result<(), QueryError> {
+        let deadline = self.reads.deadline();
         let target = VerificationTarget::from_canonical(reader).map_err(QueryError::Node)?;
         self.verification
-            .verify(&self.node, &target)
+            .verify_schedule_and_capabilities(&self.node, &target)
             .await
-            .map_err(QueryError::Node)
+            .map_err(QueryError::Node)?;
+        self.verification
+            .verify_served_tip_admitted(
+                &self.node,
+                &target,
+                AdmittedTipCheck {
+                    limit: &self.reads,
+                    kind: ForwardedReadKind::Transaction,
+                    deadline,
+                },
+            )
+            .await
     }
 
+    /// Returns the bytes the served chain mines at `location`, from the cache
+    /// or verified against the node's containing block and the committed
+    /// digest.
     pub(crate) async fn fetch(
         &self,
         reader: &dyn CanonicalReader,
         location: TransactionLocation,
     ) -> Result<Vec<u8>, QueryError> {
         let mined = MinedTransactionDigest::from_location(location)?;
-        let key = (location.transaction_id, mined.serialized_bytes_digest);
-        let cached = self.cache.lock().get(key);
-        if let Some(bytes) = cached {
+        if let Some(bytes) = self.reads.cached_transaction(&mined) {
             return Ok(bytes.to_vec());
         }
-
-        let _slot = self.acquire_slot()?;
-        self.verify_target(reader).await?;
-        let (block, bytes) = self
-            .node
-            .fetch_mined_transaction_bytes(location.transaction_id)
+        let deadline = self.reads.deadline();
+        let target = VerificationTarget::from_canonical(reader).map_err(QueryError::Node)?;
+        // The node reports the block that mines the transaction, and the bytes
+        // must match the digest the served chain committed, so the reply binds
+        // itself to the served view without a separate tip check.
+        self.verification
+            .verify_schedule_and_capabilities(&self.node, &target)
             .await
-            .map_err(QueryError::Node)?
-            .ok_or_else(|| {
-                QueryError::Node(SourceError::NodeUnavailable {
-                    reason: "node does not mine the transaction in the served block".to_owned(),
-                })
-            })?;
-        mined.verify_node_bytes(block, &bytes)?;
-        self.cache
-            .lock()
-            .insert(key, Arc::from(bytes.as_slice()), CACHE_BYTES);
-        Ok(bytes)
-    }
-}
-
-type CacheKey = (TransactionId, SerializedBytesDigest);
-
-#[derive(Default)]
-struct TransactionCache {
-    entries: HashMap<CacheKey, (u64, Arc<[u8]>)>,
-    lru: BTreeMap<u64, CacheKey>,
-    clock: u64,
-    bytes: usize,
-}
-
-impl TransactionCache {
-    fn get(&mut self, key: CacheKey) -> Option<Arc<[u8]>> {
-        let (tick, bytes) = self.entries.get_mut(&key)?;
-        self.lru.remove(tick);
-        self.clock += 1;
-        *tick = self.clock;
-        self.lru.insert(*tick, key);
-        Some(Arc::clone(bytes))
-    }
-
-    fn insert(&mut self, key: CacheKey, bytes: Arc<[u8]>, capacity: usize) {
-        if bytes.len() > capacity || self.get(key).is_some() {
-            return;
-        }
-        while self.bytes + bytes.len() > capacity {
-            let Some((_, oldest)) = self.lru.pop_first() else {
-                break;
-            };
-            if let Some((_, removed)) = self.entries.remove(&oldest) {
-                self.bytes -= removed.len();
-            }
-        }
-        self.clock += 1;
-        self.bytes += bytes.len();
-        self.lru.insert(self.clock, key);
-        self.entries.insert(key, (self.clock, bytes));
+            .map_err(QueryError::Node)?;
+        let bytes = self
+            .reads
+            .mined_transaction_bytes(&self.node, mined, ForwardedReadKind::Transaction, deadline)
+            .await?;
+        Ok(bytes.to_vec())
     }
 }
 
@@ -137,14 +88,15 @@ impl TransactionCache {
 mod tests {
     use super::*;
 
-    use std::{pin::pin, task::Poll, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     use eyre::{Result, eyre};
-    use parking_lot::Condvar;
+    use parking_lot::{Condvar, Mutex};
     use serde_json::json;
     use tokio::{sync::mpsc, task::JoinSet, time::timeout};
     use zinder_core::{
-        BlockHeight, BlockId, Network, NetworkUpgradeActivations,
+        BlockHeight, BlockId, Network, NetworkUpgradeActivations, SerializedBytesDigest,
+        TransactionId,
         wire::{encode_branch_id_hex, encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex},
     };
     use zinder_source::NodeAuth;
@@ -154,7 +106,12 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn cold_fetch_refuses_a_thirty_third_miss_and_releases_a_cancelled_slot() -> Result<()> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scenario walks admission, queueing, refusal, cancellation, and caching in order"
+    )]
+    async fn cold_fetches_beyond_the_share_queue_and_a_cancelled_slot_goes_to_the_oldest()
+    -> Result<()> {
         let (_store, reader, schedule) = cold_fetch_fixture()?;
         let tip = reader.event_fence().visible_tip();
         let location = |byte| TransactionLocation {
@@ -168,47 +125,92 @@ mod tests {
                 0,
             )
         };
-        let replacement = location(33);
+        let replacement = location(9);
         let replacement_txid = encode_rpc_transaction_id_hex(replacement.transaction_id);
         let (entered, mut calls) = mpsc::unbounded_channel();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let stub =
             blocked_transaction_stub(tip, replacement_txid.clone(), entered, Arc::clone(&gate));
         let node = cold_fetch_node(&schedule, tip, stub)?;
-        let source = Arc::new(ColdTransactionSource::new(ZebraJsonRpcSource::new(
-            Network::ZcashRegtest,
-            node.url(),
-            NodeAuth::None,
-            Duration::from_secs(20),
-        )?));
+        // Four node-call slots give transaction lookups a cap of two and, at
+        // one waiter per slot, two waiting places.
+        let limit = ForwardedReadLimit::new(crate::ForwardedReadConfig::resolve(
+            Some(4),
+            Some(10_000),
+            Some(1),
+            None,
+        )?);
+        let source = Arc::new(ColdTransactionSource::new(
+            ZebraJsonRpcSource::new(
+                Network::ZcashRegtest,
+                node.url(),
+                NodeAuth::None,
+                Duration::from_secs(20),
+            )?,
+            limit.clone(),
+        ));
+        let counts = || limit.node_call_counts(ForwardedReadKind::Transaction);
+        let settle = |expected| async move {
+            timeout(Duration::from_secs(5), async {
+                while counts() != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| eyre!("transaction slots never reached {expected:?}"))
+        };
         let mut misses = JoinSet::new();
         let mut spawn_miss = |byte| {
             let (source, reader, location) = (source.clone(), reader.clone(), location(byte));
             misses.spawn(async move { source.fetch(reader.as_ref(), location).await })
         };
         let first = spawn_miss(0);
-        for byte in 1..32 {
-            spawn_miss(byte);
+        spawn_miss(1);
+        for _ in 0..2 {
+            timeout(Duration::from_secs(10), calls.recv())
+                .await?
+                .ok_or_else(|| eyre!("node never received the cold request"))?;
         }
-        timeout(Duration::from_secs(10), async {
-            for _ in 0..32 {
-                calls
-                    .recv()
-                    .await
-                    .ok_or_else(|| eyre!("node never received the cold request"))?;
-            }
-            Ok::<_, eyre::Report>(())
-        })
-        .await??;
+        spawn_miss(2);
+        settle((2, 1)).await?;
+        spawn_miss(3);
+        settle((2, 2)).await?;
 
-        let mut excess = pin!(source.fetch(reader.as_ref(), location(32)));
-        assert!(matches!(futures_util::poll!(&mut excess),
-            Poll::Ready(Err(QueryError::Node(SourceError::NodeUnavailable { reason })))
-                if reason.contains("cold transaction fetch slots are full")
-        ));
+        let excess = timeout(
+            Duration::from_secs(5),
+            source.fetch(reader.as_ref(), location(4)),
+        )
+        .await?;
+        assert!(
+            matches!(
+                excess,
+                Err(QueryError::ForwardedReadLimitReached {
+                    kind: "transaction",
+                    max_concurrent: 2
+                })
+            ),
+            "{excess:?}"
+        );
         assert_eq!(calls.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+
         first.abort();
         assert!(matches!(misses.join_next().await, Some(Err(error)) if error.is_cancelled()));
+        assert_eq!(
+            timeout(Duration::from_secs(5), calls.recv()).await?,
+            Some(encode_rpc_transaction_id_hex(location(2).transaction_id)),
+            "the freed slot did not go to the oldest waiting miss"
+        );
+
+        let (released, ready) = &*gate;
+        *released.lock() = true;
+        ready.notify_all();
+        while let Some(reply) = misses.join_next().await {
+            assert_eq!(reply??, [0x55]);
+        }
+        assert_eq!(
+            calls.try_recv()?,
+            encode_rpc_transaction_id_hex(location(3).transaction_id)
+        );
         assert_eq!(
             timeout(
                 Duration::from_secs(5),
@@ -218,14 +220,13 @@ mod tests {
             [0x55]
         );
         assert_eq!(calls.try_recv()?, replacement_txid);
+        assert_eq!(
+            source.fetch(reader.as_ref(), replacement).await?,
+            [0x55],
+            "a cached transaction was refetched"
+        );
         assert_eq!(calls.try_recv(), Err(mpsc::error::TryRecvError::Empty));
-
-        let (released, ready) = &*gate;
-        *released.lock() = true;
-        ready.notify_all();
-        while let Some(reply) = misses.join_next().await {
-            assert_eq!(reply??, [0x55]);
-        }
+        assert_eq!(counts(), (0, 0));
         Ok(())
     }
 
@@ -271,7 +272,7 @@ mod tests {
             Arc::clone(&pair),
         ))
         .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
-        .with_verified_cold_transactions();
+        .with_verified_cold_transactions(crate::ForwardedReadLimit::default());
         let idle_owners = Arc::strong_count(&pair);
         let mut requests = JoinSet::new();
         let stalled_query = query.clone();
@@ -388,24 +389,86 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn cache_evicts_by_bytes_and_recency_and_separates_digests() {
-        let mut cache = TransactionCache::default();
-        let key = |byte| {
-            (
-                TransactionId::from_bytes([1; 32]),
-                SerializedBytesDigest::from_bytes([byte; 32]),
+    #[tokio::test]
+    async fn canonical_miss_tip_check_waits_for_the_forwarding_budget_and_coalesces() -> Result<()>
+    {
+        let (_store, reader, schedule) = cold_fetch_fixture()?;
+        let tip = reader.event_fence().visible_tip();
+        let mined_loc = TransactionLocation {
+            serialized_bytes_sha256: Some(
+                SerializedBytesDigest::from_serialized_bytes(&[0x55]).as_bytes(),
+            ),
+            ..TransactionLocation::new(
+                TransactionId::from_bytes([0x11; 32]),
+                tip.height,
+                tip.hash,
+                0,
             )
         };
-        cache.insert(key(1), Arc::from([1, 1]), 4);
-        cache.insert(key(2), Arc::from([2, 2]), 4);
-        assert_eq!(cache.get(key(1)).as_deref(), Some([1, 1].as_slice()));
-        cache.insert(key(3), Arc::from([3, 3]), 4);
-        assert!(cache.get(key(2)).is_none());
-        assert_eq!(cache.get(key(3)).as_deref(), Some([3, 3].as_slice()));
-        cache.insert(key(4), Arc::from([4; 5]), 4);
-        assert!(cache.get(key(4)).is_none());
-        assert_eq!(cache.bytes, 4);
+        let (entered, mut calls) = mpsc::unbounded_channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let stub = blocked_transaction_stub(tip, String::new(), entered, Arc::clone(&gate));
+        let node = cold_fetch_node(&schedule, tip, stub)?;
+        let limit = ForwardedReadLimit::new(crate::ForwardedReadConfig::resolve(
+            Some(1),
+            Some(50),
+            Some(1),
+            None,
+        )?);
+        let source = Arc::new(ColdTransactionSource::new(
+            ZebraJsonRpcSource::new(
+                Network::ZcashRegtest,
+                node.url(),
+                NodeAuth::None,
+                Duration::from_secs(20),
+            )?,
+            limit.clone(),
+        ));
+
+        let mined_task = tokio::spawn({
+            let (source, reader) = (Arc::clone(&source), Arc::clone(&reader));
+            async move { source.fetch(reader.as_ref(), mined_loc).await }
+        });
+        assert!(
+            timeout(Duration::from_secs(5), calls.recv())
+                .await?
+                .is_some()
+        );
+        assert!(node.requests_for("getblockhash")?.is_empty());
+
+        let refused = source.verify_served_tip(reader.as_ref()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(QueryError::ForwardedReadLimitReached {
+                    kind: "transaction",
+                    max_concurrent: 1
+                })
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            node.requests_for("getblockhash")?.is_empty(),
+            "canonical-miss tip check bypassed the forwarding budget"
+        );
+
+        let (released, ready) = &*gate;
+        *released.lock() = true;
+        ready.notify_all();
+        assert_eq!(mined_task.await??, [0x55]);
+
+        let (a, b) = tokio::join!(
+            source.verify_served_tip(reader.as_ref()),
+            source.verify_served_tip(reader.as_ref()),
+        );
+        a?;
+        b?;
+        assert_eq!(node.requests_for("getblockhash")?.len(), 1);
+        assert_eq!(
+            limit.node_call_counts(ForwardedReadKind::Transaction),
+            (0, 0)
+        );
+        Ok(())
     }
 
     #[test]

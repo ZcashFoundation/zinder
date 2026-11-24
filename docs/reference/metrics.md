@@ -389,6 +389,30 @@ success and otherwise the error's snake-case name, such as
 is established. The native gRPC adapter also records `chain_events` and the
 mempool proxies, with the gRPC code name as `error_class`.
 
+### Forwarded reads
+
+These series cover reads a process forwards to its node, as
+[Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads)
+describes: lean wallet serving in `zinder-query` and `zinder-compat-lightwalletd`,
+and light-wallet serving. `kind` is `transaction`, `utxo`, or `history` for a
+node-call slot, and `utxo_response` or `history_stream` for a response slot.
+Every gauge and refusal series starts at zero when the process starts.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `zinder_forwarded_read_active` | gauge | `kind` | Reads holding a slot of the kind now. |
+| `zinder_forwarded_read_queued` | gauge | `kind` | Reads waiting for a slot of the kind now. |
+| `zinder_forwarded_read_wait_duration_seconds` | histogram | `kind`, `outcome` | Time a read waited before it took a slot (`admitted`), was refused (`refused`), or its client went away (`cancelled`). |
+| `zinder_forwarded_read_refusals_total` | counter | `kind`, `reason` | Reads refused: `waiters_full` when every waiting place was taken, `wait_timeout` when no slot freed within `forwarded_read_wait_ms`, and `node_rate_limited` when the node refused the call with HTTP 429. |
+| `zinder_forwarded_transaction_cache_lookups_total` | counter | `outcome` | Mined transaction body lookups: `hit` from the verified cache, `coalesced` onto a node call already running for the same transaction, or `miss` starting a node call. |
+
+A sustained `zinder_forwarded_read_queued` near the kind's waiting places, or
+growth in `waiters_full` or `wait_timeout` refusals, means wallets need more
+node calls than the budget allows. Raise `forwarded_read_max_concurrent` only
+while the node has spare JSON-RPC connections. `node_rate_limited` refusals
+mean the node itself is at its connection limit. A high `miss` share on a busy
+public deployment is the case for retaining transaction bodies locally.
+
 ### Serving pair
 
 A reader serves from a published pair of read-only store copies and refreshes

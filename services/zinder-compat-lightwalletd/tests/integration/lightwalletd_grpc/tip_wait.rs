@@ -251,6 +251,7 @@ impl Mode for LightWallet {
             node,
             DEFAULT_TREE_STATE_REPLAY_WAIT,
             DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+            zinder_query::ForwardedReadLimit::default(),
         )
         .with_tip_wait(tip_wait))
     }

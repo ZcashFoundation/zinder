@@ -67,12 +67,89 @@ impl LightWalletNodeQuery {
 
     /// Verifies the configured node against the schedule and tip of `target`,
     /// the reader generation a forwarded read answers for.
+    ///
+    /// The schedule check is shared and reused for up to a minute; the tip
+    /// check is shared only with concurrent callers checking the same tip.
     pub async fn verified_node(
         &self,
         target: &VerifiedNodeTarget,
     ) -> Result<&ZebraJsonRpcSource, SourceError> {
         self.verification.verify(&self.source, &target.0).await?;
         Ok(&self.source)
+    }
+
+    /// Verifies the configured node's capabilities and upgrade schedule
+    /// against `target`, without checking that its best chain holds the
+    /// served tip.
+    ///
+    /// Use it only for a read whose node reply binds itself to the served
+    /// chain view: mined transaction bytes the node reports in the served
+    /// block, unspent outputs the node reports at the served tip, or address
+    /// history pages bracketed by their own tip checks.
+    pub async fn schedule_verified_node(
+        &self,
+        target: &VerifiedNodeTarget,
+    ) -> Result<&ZebraJsonRpcSource, SourceError> {
+        self.verification
+            .verify_schedule_and_capabilities(&self.source, &target.0)
+            .await?;
+        Ok(&self.source)
+    }
+
+    /// Verifies the configured node against the schedule and tip of `target`,
+    /// charging the tip check against `reads` as a `kind` call inside the
+    /// shared check.
+    pub async fn verify_admitted_node(
+        &self,
+        target: &VerifiedNodeTarget,
+        reads: &crate::ForwardedReadLimit,
+        kind: crate::ForwardedReadKind,
+        deadline: tokio::time::Instant,
+    ) -> Result<&ZebraJsonRpcSource, QueryError> {
+        self.verification
+            .verify_schedule_and_capabilities(&self.source, &target.0)
+            .await
+            .map_err(QueryError::Node)?;
+        self.verification
+            .verify_served_tip_admitted(
+                &self.source,
+                &target.0,
+                crate::node_broadcast::AdmittedTipCheck {
+                    limit: reads,
+                    kind,
+                    deadline,
+                },
+            )
+            .await?;
+        Ok(&self.source)
+    }
+
+    /// Returns whether the configured node's best chain holds `block`,
+    /// sharing one call with concurrent callers asking about the same block.
+    pub async fn node_holds_block(&self, block: BlockId) -> Result<bool, SourceError> {
+        self.verification.holds_block(&self.source, block).await
+    }
+
+    /// Returns whether the configured node's best chain holds `block`,
+    /// charging one `kind` slot of `reads` inside the shared check.
+    pub async fn node_holds_block_admitted(
+        &self,
+        block: BlockId,
+        reads: &crate::ForwardedReadLimit,
+        kind: crate::ForwardedReadKind,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, QueryError> {
+        self.verification
+            .holds_block_admitted(
+                &self.source,
+                block,
+                crate::node_broadcast::AdmittedTipCheck {
+                    limit: reads,
+                    kind,
+                    deadline,
+                },
+            )
+            .await
     }
 
     /// Verifies the configured node against the currently served reader, and
@@ -89,13 +166,24 @@ impl LightWalletNodeQuery {
 
     /// Verifies `node`, the configured node or a view of it, against the
     /// currently served reader, and refuses when that reader changes during
-    /// verification. Every view shares one verification state.
+    /// verification. Every view shares one schedule verification.
+    ///
+    /// The configured node shares its tip check with concurrent forwarded
+    /// requests. Any other view, such as the readiness-probe view, makes its
+    /// own tip check through its own call slots, so it never waits on a call
+    /// that holds a shared slot.
     pub(crate) async fn verify_current<'node>(
         &self,
         node: &'node ZebraJsonRpcSource,
     ) -> Result<&'node ZebraJsonRpcSource, SourceError> {
         let target = VerifiedNodeTarget::of((self.capture)().as_ref())?;
-        self.verification.verify(node, &target.0).await?;
+        if std::ptr::eq(node, &raw const self.source) {
+            self.verification.verify(node, &target.0).await?;
+        } else {
+            self.verification
+                .verify_with_own_tip_check(node, &target.0)
+                .await?;
+        }
         if !target.0.still_served_by((self.capture)().as_ref()) {
             return Err(SourceError::NodeUnavailable {
                 reason:

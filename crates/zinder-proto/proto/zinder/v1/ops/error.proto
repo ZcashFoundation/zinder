@@ -158,4 +158,10 @@ enum ErrorReason {
   // already holds its JSON-RPC connection or request limit. The node is up;
   // retry with backoff.
   NODE_RATE_LIMITED = 57;
+
+  // RESOURCE_EXHAUSTED family.
+  // A wallet read the server forwards to its node was refused because every
+  // node-call or response slot of its kind stayed taken through the wait, or
+  // every waiting place was taken. Retry with backoff.
+  FORWARDED_READ_LIMIT_REACHED = 58;
 }
