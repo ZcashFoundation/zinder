@@ -181,6 +181,7 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         WireErrorReason::TreeStateReplayLimitReached,
         WireErrorReason::BroadcastBudgetExhausted,
         WireErrorReason::CompactBlockStreamLimitReached,
+        WireErrorReason::NodeRateLimited,
     ];
 
     for reason in reasons {

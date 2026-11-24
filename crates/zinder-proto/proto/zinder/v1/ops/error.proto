@@ -152,4 +152,10 @@ enum ErrorReason {
   // serves its limit of open block-range streams. Retry with backoff; a slot
   // frees when an open stream ends.
   COMPACT_BLOCK_STREAM_LIMIT_REACHED = 56;
+
+  // UNAVAILABLE family.
+  // The upstream node refused a forwarded call with HTTP 429 because it
+  // already holds its JSON-RPC connection or request limit. The node is up;
+  // retry with backoff.
+  NODE_RATE_LIMITED = 57;
 }

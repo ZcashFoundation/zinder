@@ -73,7 +73,8 @@ pub(crate) enum SourceRecoveryDecision {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SourceRecoveryBackoff {
     /// Backoff applied when the upstream node is unreachable
-    /// ([`SourceFailureClass::NodeUnreachable`]).
+    /// ([`SourceFailureClass::NodeUnreachable`]) or refused the request
+    /// with HTTP 429 ([`SourceFailureClass::NodeRateLimited`]).
     pub node_unreachable: Duration,
     /// Backoff applied when the upstream view changed under us
     /// ([`SourceFailureClass::UpstreamViewChanged`]).
@@ -122,7 +123,9 @@ impl SourceRecoveryBackoff {
     )]
     pub(crate) fn for_class(self, class: SourceFailureClass) -> Duration {
         match class {
-            SourceFailureClass::NodeUnreachable => self.node_unreachable,
+            SourceFailureClass::NodeUnreachable | SourceFailureClass::NodeRateLimited => {
+                self.node_unreachable
+            }
             SourceFailureClass::UpstreamViewChanged => self.view_changed,
             SourceFailureClass::StreamDisconnected => self.stream_disconnected,
             _ => self.operator_action,
@@ -378,6 +381,10 @@ mod tests {
             "node_unreachable"
         );
         assert_eq!(
+            SourceFailureClass::NodeRateLimited.label(),
+            "node_rate_limited"
+        );
+        assert_eq!(
             SourceFailureClass::UpstreamViewChanged.label(),
             "upstream_view_changed"
         );
@@ -395,6 +402,30 @@ mod tests {
         );
         assert_eq!(SourceFailureClass::Malformed.label(), "malformed");
         assert_eq!(SourceFailureClass::Configuration.label(), "configuration");
+    }
+
+    #[test]
+    fn rate_limited_node_backs_off_like_an_unreachable_node() {
+        let backoff = SourceRecoveryBackoff {
+            node_unreachable: std::time::Duration::from_secs(2),
+            view_changed: std::time::Duration::from_millis(250),
+            stream_disconnected: std::time::Duration::from_secs(3),
+            operator_action: std::time::Duration::from_secs(10),
+            retry_exhausted: std::time::Duration::from_secs(2),
+        };
+        let error = IngestError::Source(SourceError::NodeRateLimited {
+            operation: "getblock",
+        });
+        let SourceRecoveryDecision::Recover {
+            failure_class,
+            backoff: chosen,
+            ..
+        } = decide_recovery(&error, backoff)
+        else {
+            unreachable!("a rate-limited node must be recoverable")
+        };
+        assert_eq!(failure_class, SourceFailureClass::NodeRateLimited);
+        assert_eq!(chosen, backoff.node_unreachable);
     }
 
     #[test]

@@ -353,6 +353,12 @@ where
                     attempt.pass_over(PassOver::NodeUnreachable);
                     attempt.unreachable = Some(error);
                 }
+                Err(error)
+                    if error.upstream_classification() == SourceFailureClass::NodeRateLimited =>
+                {
+                    attempt.pass_over(PassOver::NodeRateLimited);
+                    attempt.rate_limited = Some(error);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -362,8 +368,9 @@ where
     /// Reads the recommended fee from the first verified endpoint, in
     /// preference order, that answers.
     ///
-    /// Moves to the next endpoint when one is unreachable or does not
-    /// implement `getstandardfee`, and leaves the preferred endpoint in place.
+    /// Moves to the next endpoint when one is unreachable, refuses the call
+    /// with HTTP 429, or does not implement `getstandardfee`, and leaves the
+    /// preferred endpoint in place.
     /// Fails as unreachable when an endpoint was unreachable and none
     /// answered. Also fails as unreachable when an endpoint still awaits its
     /// first-contact verification and none answered, because that endpoint
@@ -387,7 +394,10 @@ where
             match source.standard_fee().await {
                 Ok(fee) => return Ok(fee),
                 Err(error)
-                    if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
+                    if matches!(
+                        error.upstream_classification(),
+                        SourceFailureClass::NodeUnreachable | SourceFailureClass::NodeRateLimited
+                    ) =>
                 {
                     unreachable = Some(error);
                 }
@@ -442,6 +452,7 @@ impl<Source> OrderedBroadcaster<Source> {
 #[derive(Clone, Copy, Debug)]
 enum PassOver {
     NodeUnreachable,
+    NodeRateLimited,
     BadConsensusBranch,
 }
 
@@ -449,6 +460,7 @@ impl PassOver {
     const fn label(self) -> &'static str {
         match self {
             Self::NodeUnreachable => "node_unreachable",
+            Self::NodeRateLimited => "node_rate_limited",
             Self::BadConsensusBranch => "bad_consensus_branch",
         }
     }
@@ -461,6 +473,9 @@ struct BroadcastAttempt {
     /// The last failure of an unreachable endpoint. Such an endpoint may have
     /// received the transaction before it failed.
     unreachable: Option<SourceError>,
+    /// The last HTTP 429 refusal. The refusing endpoint did not read the
+    /// transaction, so the refusal is retryable.
+    rate_limited: Option<SourceError>,
     branch_rejection: Option<BroadcastRejected>,
 }
 
@@ -503,9 +518,11 @@ impl BroadcastAttempt {
 
     /// Ends a broadcast that no endpoint answered with anything other than a
     /// consensus-branch rejection. An unreachable endpoint may have accepted
-    /// the transaction, so its failure takes precedence over a rejection.
+    /// the transaction, so its failure takes precedence over a rejection. A
+    /// rate-limited endpoint may accept the transaction on a retry, so its
+    /// refusal also takes precedence over a rejection.
     fn exhausted(self) -> Result<TransactionBroadcastOutcome, SourceError> {
-        if let Some(error) = self.unreachable {
+        if let Some(error) = self.unreachable.or(self.rate_limited) {
             return Err(error);
         }
         self.branch_rejection

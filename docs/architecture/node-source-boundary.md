@@ -30,6 +30,16 @@ own refusal messages.
 JSON-RPC is required. The indexer gRPC endpoint is optional and changes only
 how ingest follows the mempool.
 
+The JSON-RPC library exposes no connection-pool limit, so every concurrent call
+can open another HTTP connection. `ZebraJsonRpcSource` therefore admits its
+calls through `node.max_concurrent_requests` slots, shared by every clone of
+the source. A call waits for a slot for at most its own timeout, which for
+`sendrawtransaction` is `node.broadcast_timeout_secs` and includes the wait.
+`tip_id` probes and the `getblockchaininfo` health fallback use one slot of
+their own, so calls that hold every shared slot never delay a readiness probe.
+[Configuration](../reference/configuration.md#the-node-sections) gives the
+default and the sizing rule.
+
 ## The `NodeSource` contract
 
 `NodeSource` is the trait ingest reads the chain through. It provides:
@@ -195,12 +205,22 @@ another network or chain. See
 | Class | Meaning |
 | --- | --- |
 | `node_unreachable` | The endpoint cannot be reached or refused the credentials |
+| `node_rate_limited` | The node refused the call with HTTP 429 because it holds its connection limit |
 | `upstream_view_changed` | The node's best chain changed during the operation |
 | `stream_disconnected` | An indexer subscription disconnected |
 | `capability_missing` | The node cannot provide a required operation |
 | `protocol_mismatch` | A response violates the expected wire contract |
 | `malformed` | Node bytes cannot be parsed |
 | `configuration` | The adapter configuration or a request limit refused the operation |
+
+Zebra refuses a connection over its JSON-RPC connection limit with HTTP 429.
+The source reports it as `NodeRateLimited`, classed `node_rate_limited`. The
+node is up and the connection works, so the refusal never counts toward the
+client rebuild described under [Authentication](#authentication): a fresh
+client would open more connections to a node that refuses them for having too
+many. Ingest retries the same node after the `node_unreachable` backoff and does
+not switch endpoints. A reader's broadcast and fee read try the next verified
+endpoint, and readers report the gRPC reason `NODE_RATE_LIMITED`.
 
 Some refusals are permanent: a fast-synced Zakura node lacks old trees and
 subtree roots, and Zebra refuses a damaged stored block. The source reports

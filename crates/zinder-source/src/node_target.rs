@@ -26,6 +26,7 @@
 //! | `ZINDER_NODE__AUTH__COOKIE` | Cookie-auth inline credentials |
 //! | `ZINDER_NODE__REQUEST_TIMEOUT_SECS` | [`NodeTarget::request_timeout`] |
 //! | `ZINDER_NODE__MAX_RESPONSE_BYTES` | [`NodeTarget::max_response_bytes`] |
+//! | `ZINDER_NODE__MAX_CONCURRENT_REQUESTS` | [`NodeTarget::max_concurrent_requests`] |
 //!
 //! Cookie credentials may be supplied either by file path or inline (but not
 //! both). Inline credentials let `PaaS`-style deployments inject the secret
@@ -36,7 +37,13 @@
 //! decides whether the channel uses TLS; see
 //! [ADR-0007](../../../docs/adrs/0007-node-failure-recovery-and-transport-policy.md).
 
-use std::{collections::BTreeMap, fmt, num::NonZeroU64, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    num::{NonZeroU32, NonZeroU64},
+    path::PathBuf,
+    time::Duration,
+};
 
 use secrecy::SecretString;
 use serde::{
@@ -52,6 +59,18 @@ use crate::{CookieSource, DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth};
 
 /// Default per-RPC node request timeout when the configuration omits one.
 pub const DEFAULT_NODE_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Default ceiling on JSON-RPC calls one process has in flight to one node
+/// endpoint.
+///
+/// Zebra's JSON-RPC server accepts 100 connections by default and answers
+/// HTTP 429 beyond that. 64 leaves room for a second Zinder process and
+/// operator tooling sharing the node, while staying above the forwarded-read
+/// slots a reader holds, so reader traffic is not throttled twice.
+pub const DEFAULT_NODE_MAX_CONCURRENT_REQUESTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
+
+/// Largest accepted `node.max_concurrent_requests`.
+pub const MAX_NODE_MAX_CONCURRENT_REQUESTS: u32 = 1024;
 
 /// Default poll cadence for [`NodeHealthConfig::poll_interval`].
 pub const DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS: u64 = 30_000;
@@ -92,6 +111,12 @@ pub struct NodeTarget {
     ///
     /// `None` falls back to `request_timeout`.
     pub broadcast_timeout: Option<Duration>,
+    /// Most JSON-RPC calls this process has in flight to the node at once.
+    ///
+    /// Calls beyond it wait for a free slot, for at most their own timeout.
+    /// Upstream-health probes use a separate slot, so a saturated budget
+    /// never fails readiness.
+    pub max_concurrent_requests: NonZeroU32,
     /// Resolved upstream-health probe configuration.
     ///
     /// `None` uses the default JSON-RPC fallback settings.
@@ -170,6 +195,7 @@ impl NodeTarget {
             request_timeout,
             max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: DEFAULT_NODE_MAX_CONCURRENT_REQUESTS,
             health: None,
         }
     }
@@ -178,6 +204,16 @@ impl NodeTarget {
     #[must_use]
     pub fn with_broadcast_timeout(mut self, broadcast_timeout: Option<Duration>) -> Self {
         self.broadcast_timeout = broadcast_timeout;
+        self
+    }
+
+    /// Sets the most JSON-RPC calls this process has in flight to the node.
+    #[must_use]
+    pub const fn with_max_concurrent_requests(
+        mut self,
+        max_concurrent_requests: NonZeroU32,
+    ) -> Self {
+        self.max_concurrent_requests = max_concurrent_requests;
         self
     }
 
@@ -243,6 +279,8 @@ impl NodeTarget {
                 reason: "node.max_response_bytes must be greater than zero",
             })?;
         let broadcast_timeout = section.broadcast_timeout_secs.map(Duration::from_secs);
+        let max_concurrent_requests =
+            resolve_max_concurrent_requests(section.max_concurrent_requests)?;
         let node_auth = resolve_node_auth(section.auth)?;
         let health = resolve_node_health(section.health)?;
         let indexer_grpc_addr = nonempty_optional(section.indexer_grpc_addr);
@@ -259,6 +297,7 @@ impl NodeTarget {
         .with_indexer_grpc_addr(indexer_grpc_addr)
         .with_indexer_tls(indexer_tls)
         .with_broadcast_timeout(broadcast_timeout)
+        .with_max_concurrent_requests(max_concurrent_requests)
         .with_health(health))
     }
 
@@ -338,6 +377,10 @@ impl NodeTarget {
                 "ZINDER_NODE__BROADCAST_TIMEOUT_SECS",
                 "node.broadcast_timeout_secs",
             )?,
+            max_concurrent_requests: read_optional_parsed::<u32>(
+                "ZINDER_NODE__MAX_CONCURRENT_REQUESTS",
+                "node.max_concurrent_requests",
+            )?,
             auth: NodeAuthSection {
                 method: read_optional("ZINDER_NODE__AUTH__METHOD"),
                 username: read_optional("ZINDER_NODE__AUTH__USERNAME"),
@@ -394,6 +437,9 @@ pub struct NodeSection {
     /// Overrides `request_timeout_secs` for broadcast calls only. Omit to
     /// fall back to `request_timeout_secs`.
     pub broadcast_timeout_secs: Option<u64>,
+    /// Most JSON-RPC calls this process has in flight to the node at once,
+    /// from 1 to 1024. Omit for 64.
+    pub max_concurrent_requests: Option<u32>,
     /// TLS subsection for an `https://` indexer endpoint.
     pub indexer_tls: NodeIndexerTlsSection,
     /// Authentication subsection.
@@ -680,6 +726,17 @@ pub enum NodeConfigError {
     },
 }
 
+fn resolve_max_concurrent_requests(configured: Option<u32>) -> Result<NonZeroU32, NodeConfigError> {
+    let Some(configured) = configured else {
+        return Ok(DEFAULT_NODE_MAX_CONCURRENT_REQUESTS);
+    };
+    NonZeroU32::new(configured)
+        .filter(|limit| limit.get() <= MAX_NODE_MAX_CONCURRENT_REQUESTS)
+        .ok_or(NodeConfigError::Invalid {
+            reason: "node.max_concurrent_requests must be from 1 to 1024",
+        })
+}
+
 fn resolve_node_health(
     section: NodeHealthSection,
 ) -> Result<Option<NodeHealthConfig>, NodeConfigError> {
@@ -952,6 +1009,7 @@ mod tests {
             request_timeout_secs: Some(15),
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("basic".to_owned()),
@@ -983,6 +1041,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("none".to_owned()),
@@ -1007,6 +1066,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("none".to_owned()),
@@ -1031,6 +1091,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection::default(),
             health: NodeHealthSection::default(),
@@ -1204,6 +1265,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("basic".to_owned()),
@@ -1233,6 +1295,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
@@ -1260,6 +1323,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
@@ -1287,6 +1351,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
@@ -1315,6 +1380,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
@@ -1343,6 +1409,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("oauth".to_owned()),
@@ -1369,6 +1436,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection::default(),
             health: NodeHealthSection::default(),
@@ -1376,6 +1444,58 @@ mod tests {
         let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
         assert!(target.health.is_none());
         Ok(())
+    }
+
+    fn section_with_max_concurrent_requests(max_concurrent_requests: Option<u32>) -> NodeSection {
+        NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            max_concurrent_requests,
+            ..NodeSection::default()
+        }
+    }
+
+    #[test]
+    fn max_concurrent_requests_defaults_below_the_node_connection_limit()
+    -> Result<(), NodeConfigError> {
+        let target = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            section_with_max_concurrent_requests(None),
+        )?;
+        assert_eq!(
+            target.max_concurrent_requests,
+            DEFAULT_NODE_MAX_CONCURRENT_REQUESTS
+        );
+        assert_eq!(target.max_concurrent_requests.get(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn max_concurrent_requests_accepts_one_through_the_maximum() -> Result<(), NodeConfigError> {
+        for configured in [1, 8, MAX_NODE_MAX_CONCURRENT_REQUESTS] {
+            let target = NodeTarget::resolve(
+                Network::ZcashRegtest,
+                section_with_max_concurrent_requests(Some(configured)),
+            )?;
+            assert_eq!(target.max_concurrent_requests.get(), configured);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn max_concurrent_requests_rejects_zero_and_values_above_the_maximum() {
+        for configured in [0, MAX_NODE_MAX_CONCURRENT_REQUESTS + 1] {
+            let outcome = NodeTarget::resolve(
+                Network::ZcashRegtest,
+                section_with_max_concurrent_requests(Some(configured)),
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    Err(NodeConfigError::Invalid { reason }) if reason.contains("max_concurrent_requests")
+                ),
+                "{configured} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1386,6 +1506,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection::default(),
             health: NodeHealthSection {
@@ -1424,6 +1545,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            max_concurrent_requests: None,
             indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection::default(),
             health: NodeHealthSection {

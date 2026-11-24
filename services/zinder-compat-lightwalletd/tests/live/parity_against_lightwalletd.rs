@@ -1964,6 +1964,7 @@ async fn transparent_broadcast_test_key(env: &LiveTestEnv) -> Result<Transparent
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     let schedule = source

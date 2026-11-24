@@ -378,6 +378,7 @@ async fn run_capture_tip_replay_checkpoints(
             request_timeout: Duration::from_secs(args.request_timeout_secs),
             max_response_bytes: require_nonzero_u64(args.max_response_bytes, "max-response-bytes")?,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?;
     let activations =
@@ -416,6 +417,7 @@ async fn run_capture_canonical_fixture_checkpoints(
             request_timeout: Duration::from_secs(args.request_timeout_secs),
             max_response_bytes: require_nonzero_u64(args.max_response_bytes, "max-response-bytes")?,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?;
     let activations =

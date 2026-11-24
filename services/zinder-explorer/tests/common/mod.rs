@@ -50,6 +50,7 @@ pub(crate) async fn fetch_live_network_upgrade_activations(
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     Ok(Arc::new(
@@ -134,6 +135,7 @@ async fn build_live_serving_pair(
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: None,
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     source.probe_capabilities().await?;

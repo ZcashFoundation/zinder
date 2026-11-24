@@ -89,6 +89,7 @@ async fn broadcast_fails_over_to_the_fallback_node_after_the_first_node_stops() 
             request_timeout: env.target.request_timeout,
             max_response_bytes: env.target.max_response_bytes,
             broadcast_timeout: Some(Duration::from_secs(2)),
+            max_concurrent_requests: env.target.max_concurrent_requests,
         },
     )?;
     let nodes = OrderedBroadcaster::new(proxied_node, [live.source]);

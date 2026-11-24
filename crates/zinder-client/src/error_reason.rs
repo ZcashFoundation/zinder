@@ -93,6 +93,7 @@ define_error_reasons! {
     TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
     BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
     CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
+    NodeRateLimited => "NODE_RATE_LIMITED",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -157,6 +158,7 @@ mod tests {
             WireErrorReason::TreeStateReplayLimitReached,
             WireErrorReason::BroadcastBudgetExhausted,
             WireErrorReason::CompactBlockStreamLimitReached,
+            WireErrorReason::NodeRateLimited,
         ];
 
         for generated in generated_reasons {

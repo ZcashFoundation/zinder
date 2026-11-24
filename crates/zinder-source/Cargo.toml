@@ -44,6 +44,7 @@ zinder-proto.workspace = true
 [dev-dependencies]
 eyre.workspace = true
 incrementalmerkletree = { workspace = true, features = ["legacy-api"] }
+metrics-exporter-prometheus.workspace = true
 orchard = { workspace = true, default-features = false }
 proptest.workspace = true
 rcgen.workspace = true

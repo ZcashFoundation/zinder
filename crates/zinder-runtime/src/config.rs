@@ -743,6 +743,8 @@ pub struct NodeToml {
     /// Per-broadcast timeout in seconds, applied only to `sendrawtransaction`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broadcast_timeout_secs: Option<u64>,
+    /// Most JSON-RPC calls the process has in flight to the node at once.
+    pub max_concurrent_requests: u32,
     /// Optional upstream-health probe subsection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<NodeHealthToml>,
@@ -766,6 +768,7 @@ impl NodeToml {
             request_timeout_secs: target.request_timeout.as_secs(),
             max_response_bytes: target.max_response_bytes.get(),
             broadcast_timeout_secs: target.broadcast_timeout.map(|d| d.as_secs()),
+            max_concurrent_requests: target.max_concurrent_requests.get(),
             health: target
                 .health
                 .as_ref()
@@ -869,6 +872,7 @@ mod tests {
                 "json_rpc_addr = \"http://127.0.0.1:18232\"\n",
                 "request_timeout_secs = 30\n",
                 "max_response_bytes = 1\n",
+                "max_concurrent_requests = 64\n",
                 "\n",
                 "[health]\n",
                 "addr = \"http://127.0.0.1:18233/ready\"\n",
@@ -912,6 +916,7 @@ mod tests {
                 "indexer_grpc_addr = \"https://zakura:8230\"\n",
                 "request_timeout_secs = 30\n",
                 "max_response_bytes = 1\n",
+                "max_concurrent_requests = 64\n",
                 "\n",
                 "[indexer_tls]\n",
                 "ca_cert_path = \"/run/secrets/indexer-ca.pem\"\n",
@@ -1104,6 +1109,7 @@ mod tests {
                 "json_rpc_addr = \"http://127.0.0.1:18232\"\n",
                 "request_timeout_secs = 30\n",
                 "max_response_bytes = 1\n",
+                "max_concurrent_requests = 64\n",
                 "\n",
                 "[auth]\n",
                 "method = \"none\"\n",

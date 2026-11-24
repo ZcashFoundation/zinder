@@ -156,6 +156,7 @@ fn source_with_response_limit(
             request_timeout: Duration::from_secs(5),
             max_response_bytes,
             broadcast_timeout: None,
+            ..ZebraJsonRpcSourceOptions::default()
         },
     )?)
 }
@@ -599,6 +600,30 @@ async fn fetch_chain_segment_maps_a_closed_batch_connection_to_node_unavailable(
     );
     assert_eq!(server.batch_sizes(), vec![2]);
     assert_eq!(server.requests_for("getblock")?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_segment_maps_an_http_429_batch_refusal_to_node_rate_limited()
+-> eyre::Result<()> {
+    let blocks = linked_chain(2)?;
+    let server = JsonRpcTestServer::start([
+        tip_stub(tip_of(&blocks)?),
+        method("getblock").reply(RpcReply::rate_limited()),
+    ])?;
+    let source = regtest_source(&server)?;
+
+    let outcome = fetch_from_first_block(&source, 2).await?;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(SourceError::NodeRateLimited {
+                operation: "batch_getblock"
+            })
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
     Ok(())
 }
 

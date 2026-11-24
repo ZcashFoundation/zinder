@@ -194,6 +194,16 @@ pub trait NodeSource: Send + Sync + 'static {
     /// and the caller can skip fetching the full block.
     async fn tip_id(&self) -> Result<BlockId, SourceError>;
 
+    /// Reads the node's best tip for a readiness probe.
+    ///
+    /// A source that bounds its concurrent node calls answers this outside
+    /// that bound, so a probe never waits behind other traffic and a busy
+    /// node is not reported unreachable. The default delegates to
+    /// [`Self::tip_id`].
+    async fn probe_tip_id(&self) -> Result<BlockId, SourceError> {
+        self.tip_id().await
+    }
+
     /// Fetches shielded subtree roots from the configured node.
     async fn fetch_subtree_roots(
         &self,

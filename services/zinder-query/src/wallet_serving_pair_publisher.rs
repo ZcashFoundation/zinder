@@ -949,7 +949,10 @@ where
         {
             match probe_wallet_node_readiness(source).await {
                 Err(error)
-                    if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
+                    if matches!(
+                        error.upstream_classification(),
+                        SourceFailureClass::NodeUnreachable | SourceFailureClass::NodeRateLimited
+                    ) =>
                 {
                     unreachable = Some(error);
                 }
@@ -1089,7 +1092,7 @@ impl crate::LightWalletNodeQuery {
 async fn probe_wallet_node_readiness(
     source: &impl NodeSource,
 ) -> Result<UpstreamHealthSnapshot, SourceError> {
-    source.tip_id().await?;
+    source.probe_tip_id().await?;
     source.poll_upstream_health().await
 }
 

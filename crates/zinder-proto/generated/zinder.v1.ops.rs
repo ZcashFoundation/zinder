@@ -590,6 +590,11 @@ pub enum ErrorReason {
     /// serves its limit of open block-range streams. Retry with backoff; a slot
     /// frees when an open stream ends.
     CompactBlockStreamLimitReached = 56,
+    /// UNAVAILABLE family.
+    /// The upstream node refused a forwarded call with HTTP 429 because it
+    /// already holds its JSON-RPC connection or request limit. The node is up;
+    /// retry with backoff.
+    NodeRateLimited = 57,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -655,6 +660,7 @@ impl ErrorReason {
             Self::TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
             Self::BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
             Self::CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
+            Self::NodeRateLimited => "NODE_RATE_LIMITED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -725,6 +731,7 @@ impl ErrorReason {
             "COMPACT_BLOCK_STREAM_LIMIT_REACHED" => {
                 Some(Self::CompactBlockStreamLimitReached)
             }
+            "NODE_RATE_LIMITED" => Some(Self::NodeRateLimited),
             _ => None,
         }
     }

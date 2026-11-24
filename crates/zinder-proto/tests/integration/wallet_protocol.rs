@@ -1757,6 +1757,39 @@ fn compact_block_stream_limit_status_carries_error_info_through_detail_bytes() -
 }
 
 #[test]
+fn node_rate_limited_refusal_is_unavailable_and_retryable() -> eyre::Result<()> {
+    use tonic_types::StatusExt as _;
+
+    let reason = ops::ErrorReason::NodeRateLimited;
+    assert_eq!(reason.as_str_name(), "NODE_RATE_LIMITED");
+    assert_eq!(
+        ops::ErrorReason::from_str_name("NODE_RATE_LIMITED"),
+        Some(reason)
+    );
+    assert_eq!(ops::ErrorReason::try_from(57)?, reason);
+    let policy = zinder_proto::reason_policy(reason);
+    assert_eq!(policy.code, tonic::Code::Unavailable);
+    assert_eq!(
+        policy.retry,
+        zinder_proto::RetryDisposition::RetryAfterBackoff
+    );
+
+    let status = zinder_proto::status_for_reason(reason, "node rate-limited the call");
+    let received = tonic::Status::with_details(
+        status.code(),
+        status.message().to_owned(),
+        status.details().to_vec().into(),
+    );
+    assert_eq!(received.code(), tonic::Code::Unavailable);
+    let error_info = received
+        .get_details_error_info()
+        .ok_or_else(|| eyre!("the status carries no google.rpc.ErrorInfo"))?;
+    assert_eq!(error_info.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+    assert_eq!(error_info.reason, "NODE_RATE_LIMITED");
+    Ok(())
+}
+
+#[test]
 fn transaction_lookup_reasons_round_trip_by_name_and_scalar() -> eyre::Result<()> {
     for (reason, name, scalar) in [
         (
