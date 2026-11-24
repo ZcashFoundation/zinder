@@ -35,7 +35,7 @@ use tower::{
 };
 
 use super::{
-    HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, HTTP2_MAX_LOCAL_ERROR_RESETS,
+    GrpcDeadline, HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT, HTTP2_MAX_LOCAL_ERROR_RESETS,
     MAX_CONCURRENT_STREAMS_PER_CONNECTION, grpc_timeout,
     release_gate::{GateObserver, ReleaseGate},
     stream_reset::{ResettableStreams, resettable},
@@ -52,8 +52,9 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// [`crate::public_grpc_server`] returns one. Add services with
 /// [`Self::add_service`], then serve the [`PublicGrpcRouter`] it returns.
 #[derive(Clone, Debug)]
-pub struct PublicGrpcServer<L = Identity> {
+pub struct PublicGrpcServer<L = Identity, T = Identity> {
     layers: ServiceBuilder<L>,
+    transport_layers: ServiceBuilder<T>,
     accept_http1: bool,
     send_stall_timeout: Duration,
     write_stall_timeout: Duration,
@@ -67,6 +68,7 @@ impl PublicGrpcServer {
     pub(super) fn new(send_stall_timeout: Duration) -> Self {
         Self {
             layers: ServiceBuilder::new(),
+            transport_layers: ServiceBuilder::new(),
             accept_http1: false,
             send_stall_timeout,
             write_stall_timeout: send_stall_timeout,
@@ -90,7 +92,7 @@ impl PublicGrpcServer {
     }
 }
 
-impl<L> PublicGrpcServer<L> {
+impl<L, T> PublicGrpcServer<L, T> {
     /// Also accepts HTTP/1.1 connections, which gRPC-Web clients use.
     ///
     /// An HTTP/1.1 connection carries one response at a time, so a response
@@ -101,11 +103,30 @@ impl<L> PublicGrpcServer<L> {
         self
     }
 
-    /// Wraps every service in `layer`, inside the layers added before it.
+    /// Wraps every service in `layer`, inside the deadline and the layers added before it.
     #[must_use]
-    pub fn layer<NewLayer>(self, layer: NewLayer) -> PublicGrpcServer<Stack<NewLayer, L>> {
+    pub fn layer<NewLayer>(self, layer: NewLayer) -> PublicGrpcServer<Stack<NewLayer, L>, T> {
         PublicGrpcServer {
             layers: self.layers.layer(layer),
+            transport_layers: self.transport_layers,
+            accept_http1: self.accept_http1,
+            send_stall_timeout: self.send_stall_timeout,
+            write_stall_timeout: self.write_stall_timeout,
+            gate_observer: self.gate_observer,
+        }
+    }
+
+    /// Wraps the deadline and services in a transport adapter, inside
+    /// transport adapters added before it. Use this for HTTP translation
+    /// that also needs to format a gRPC timeout response.
+    #[must_use]
+    pub fn transport_layer<NewLayer>(
+        self,
+        layer: NewLayer,
+    ) -> PublicGrpcServer<L, Stack<NewLayer, T>> {
+        PublicGrpcServer {
+            layers: self.layers,
+            transport_layers: self.transport_layers.layer(layer),
             accept_http1: self.accept_http1,
             send_stall_timeout: self.send_stall_timeout,
             write_stall_timeout: self.write_stall_timeout,
@@ -114,7 +135,7 @@ impl<L> PublicGrpcServer<L> {
     }
 
     /// Starts the listener's router with `service`.
-    pub fn add_service<S>(self, service: S) -> PublicGrpcRouter<L>
+    pub fn add_service<S>(self, service: S) -> PublicGrpcRouter<L, T>
     where
         S: Service<http::Request<Body>, Error = Infallible>
             + NamedService
@@ -135,12 +156,12 @@ impl<L> PublicGrpcServer<L> {
 
 /// The services of a public gRPC listener, ready to serve.
 #[derive(Debug)]
-pub struct PublicGrpcRouter<L = Identity> {
-    server: PublicGrpcServer<L>,
+pub struct PublicGrpcRouter<L = Identity, T = Identity> {
+    server: PublicGrpcServer<L, T>,
     routes: RoutesBuilder,
 }
 
-impl<L> PublicGrpcRouter<L> {
+impl<L, T> PublicGrpcRouter<L, T> {
     /// Adds `service` to the listener.
     #[must_use]
     pub fn add_service<S>(mut self, service: S) -> Self
@@ -157,7 +178,18 @@ impl<L> PublicGrpcRouter<L> {
         self.routes.add_service(service);
         self
     }
+}
 
+impl<L, T, InnerBody> PublicGrpcRouter<L, T>
+where
+    L: Layer<Routes>,
+    L::Service: Service<http::Request<Body>, Response = http::Response<InnerBody>>,
+    <L::Service as Service<http::Request<Body>>>::Error: 'static,
+    <L::Service as Service<http::Request<Body>>>::Future: Send + 'static,
+    InnerBody: http_body::Body<Data = Bytes> + Send + 'static,
+    InnerBody::Error: Into<axum::BoxError>,
+    T: Layer<GrpcDeadline<L::Service>>,
+{
     /// Binds `addr` and serves until `signal` completes.
     ///
     /// Once `signal` completes, the listener stops accepting connections,
@@ -172,13 +204,12 @@ impl<L> PublicGrpcRouter<L> {
         signal: impl Future<Output = ()>,
     ) -> io::Result<()>
     where
-        L: Layer<Routes>,
-        L::Service: Service<http::Request<Body>, Response = http::Response<ResponseBody>>
+        T::Service: Service<http::Request<Body>, Response = http::Response<ResponseBody>>
             + Clone
             + Send
             + 'static,
-        <L::Service as Service<http::Request<Body>>>::Future: Send + 'static,
-        <L::Service as Service<http::Request<Body>>>::Error: Into<axum::BoxError>,
+        <T::Service as Service<http::Request<Body>>>::Future: Send + 'static,
+        <T::Service as Service<http::Request<Body>>>::Error: Into<axum::BoxError>,
         ResponseBody: http_body::Body<Data = Bytes> + Send + 'static,
         ResponseBody::Error: Into<axum::BoxError>,
     {
@@ -193,13 +224,12 @@ impl<L> PublicGrpcRouter<L> {
     /// Never returns an error; the result matches the other serve methods.
     pub async fn serve_with_incoming<ResponseBody>(self, listener: TcpListener) -> io::Result<()>
     where
-        L: Layer<Routes>,
-        L::Service: Service<http::Request<Body>, Response = http::Response<ResponseBody>>
+        T::Service: Service<http::Request<Body>, Response = http::Response<ResponseBody>>
             + Clone
             + Send
             + 'static,
-        <L::Service as Service<http::Request<Body>>>::Future: Send + 'static,
-        <L::Service as Service<http::Request<Body>>>::Error: Into<axum::BoxError>,
+        <T::Service as Service<http::Request<Body>>>::Future: Send + 'static,
+        <T::Service as Service<http::Request<Body>>>::Error: Into<axum::BoxError>,
         ResponseBody: http_body::Body<Data = Bytes> + Send + 'static,
         ResponseBody::Error: Into<axum::BoxError>,
     {
@@ -220,22 +250,21 @@ impl<L> PublicGrpcRouter<L> {
         signal: impl Future<Output = ()>,
     ) -> io::Result<()>
     where
-        L: Layer<Routes>,
-        L::Service: Service<http::Request<Body>, Response = http::Response<ResponseBody>>
+        T::Service: Service<http::Request<Body>, Response = http::Response<ResponseBody>>
             + Clone
             + Send
             + 'static,
-        <L::Service as Service<http::Request<Body>>>::Future: Send + 'static,
-        <L::Service as Service<http::Request<Body>>>::Error: Into<axum::BoxError>,
+        <T::Service as Service<http::Request<Body>>>::Future: Send + 'static,
+        <T::Service as Service<http::Request<Body>>>::Error: Into<axum::BoxError>,
         ResponseBody: http_body::Body<Data = Bytes> + Send + 'static,
         ResponseBody::Error: Into<axum::BoxError>,
     {
-        let router = self
-            .routes
-            .routes()
-            .into_axum_router()
-            .layer(axum::middleware::from_fn(grpc_timeout::enforce));
-        let service = self.server.layers.service(Routes::from(router).prepare());
+        let routes = self.routes.routes().prepare();
+        let middleware = self.server.layers.service(routes);
+        let service = self
+            .server
+            .transport_layers
+            .service(GrpcDeadline::new(middleware));
         let connections = Connections {
             builder: connection_builder(self.server.accept_http1, self.server.send_stall_timeout),
             send_stall_timeout: self.server.send_stall_timeout,

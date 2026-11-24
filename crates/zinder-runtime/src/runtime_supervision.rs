@@ -68,9 +68,9 @@ pub const GRPC_SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// entrypoint's 20-second grace window.
 pub const GRPC_SERVER_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The tonic router type that [`SupervisedRuntime::public_grpc_router`]
+/// The gRPC router type that [`SupervisedRuntime::public_grpc_router`]
 /// returns.
-pub type SupervisedGrpcRouter<L = Identity> = crate::PublicGrpcRouter<
+pub type SupervisedGrpcRouter<L = Identity, T = Identity> = crate::PublicGrpcRouter<
     Stack<
         Stack<
             GrpcSendStallLayer,
@@ -78,6 +78,7 @@ pub type SupervisedGrpcRouter<L = Identity> = crate::PublicGrpcRouter<
         >,
         L,
     >,
+    T,
 >;
 
 /// A runtime's public gRPC listener and background tasks, supervised so that
@@ -224,18 +225,19 @@ impl SupervisedRuntime {
     /// Builds the same supervised router with an outer transport adapter.
     /// Pass the application service with its reflection descriptor set.
     /// The adapter translates incoming requests before the supervisor and receive
-    /// limits inspect native gRPC frames.
+    /// limits inspect native gRPC frames. Register it with
+    /// [`crate::PublicGrpcServer::transport_layer`] so it can format deadline responses.
     ///
     /// # Errors
     ///
     /// Returns an error when reflection cannot describe the application service.
-    pub fn public_grpc_router_with_transport<S, L, ResponseBody>(
+    pub fn public_grpc_router_with_transport<S, L, T, ResponseBody>(
         &self,
         (application_service, descriptor_set): (S, &'static [u8]),
         client_address: ClientAddressSource,
         readiness: &Readiness,
-        transport: impl FnOnce(crate::PublicGrpcServer) -> crate::PublicGrpcServer<L>,
-    ) -> Result<SupervisedGrpcRouter<L>, tonic_reflection::server::Error>
+        transport: impl FnOnce(crate::PublicGrpcServer) -> crate::PublicGrpcServer<L, T>,
+    ) -> Result<SupervisedGrpcRouter<L, T>, tonic_reflection::server::Error>
     where
         L: Clone,
         S: Service<

@@ -4,11 +4,16 @@
 //! as tonic's own server ends it. The deadline does not bound a response
 //! stream once its headers are sent.
 
-use std::time::Duration;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use axum::{extract::Request, middleware::Next, response::Response};
 use bytes::Bytes;
 use tonic::{Status, body::Body};
+use tower::Service;
 
 const GRPC_TIMEOUT_HEADER: &str = "grpc-timeout";
 
@@ -36,22 +41,56 @@ fn client_deadline(headers: &http::HeaderMap) -> Option<Duration> {
     }
 }
 
-/// Applies the deadline inside the transport adapters so they can translate
-/// the trailers-only cancellation just like a response from the handler.
-pub(super) async fn enforce(request: Request, next: Next) -> Response {
-    respond_within(client_deadline(request.headers()), next.run(request)).await
+/// The Tower service that bounds response start time after readiness.
+#[derive(Clone, Debug)]
+pub struct GrpcDeadline<S> {
+    inner: S,
 }
 
-async fn respond_within(
-    deadline: Option<Duration>,
-    response: impl Future<Output = Response>,
-) -> Response {
-    match deadline {
-        Some(deadline) => tokio::time::timeout(deadline, response)
-            .await
-            .unwrap_or_else(|_| Status::cancelled("Timeout expired").into_http()),
-        None => response.await,
+impl<S> GrpcDeadline<S> {
+    pub(super) const fn new(inner: S) -> Self {
+        Self { inner }
     }
+}
+
+impl<S, B> Service<http::Request<Body>> for GrpcDeadline<S>
+where
+    S: Service<http::Request<Body>, Response = http::Response<B>>,
+    S::Error: 'static,
+    S::Future: Send + 'static,
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<axum::BoxError>,
+{
+    type Response = http::Response<Body>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<Body>) -> Self::Future {
+        let deadline = client_deadline(request.headers());
+        Box::pin(respond_within(deadline, self.inner.call(request)))
+    }
+}
+
+async fn respond_within<B, E>(
+    deadline: Option<Duration>,
+    response: impl Future<Output = Result<http::Response<B>, E>>,
+) -> Result<http::Response<Body>, E>
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<axum::BoxError>,
+{
+    let outcome = match deadline {
+        Some(deadline) => match tokio::time::timeout(deadline, response).await {
+            Ok(outcome) => outcome,
+            Err(_) => return Ok(Status::cancelled("Timeout expired").into_http()),
+        },
+        None => response.await,
+    };
+    outcome.map(|response| response.map(Body::new))
 }
 
 /// A service error carrying a status becomes a response. Other errors reach
@@ -109,13 +148,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_response_that_misses_the_deadline_is_cancelled() {
-        let response = respond_within(Some(Duration::from_millis(10)), future::pending()).await;
+    async fn a_response_that_misses_the_deadline_is_cancelled()
+    -> Result<(), std::convert::Infallible> {
+        let response = respond_within(
+            Some(Duration::from_millis(10)),
+            future::pending::<Result<http::Response<Body>, std::convert::Infallible>>(),
+        )
+        .await?;
         let status = tonic::Status::from_header_map(response.headers());
         assert_eq!(
             status.map(|status| status.code()),
             Some(tonic::Code::Cancelled)
         );
+        Ok(())
     }
 
     #[test]

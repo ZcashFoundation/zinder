@@ -29,7 +29,7 @@ use zinder_runtime::{
 };
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
-use super::{SERVICE_NAME, transport_layers};
+use super::{SERVICE_NAME, transport_layers, wallet_layers};
 
 const WALLET_ORIGIN: &str = "https://wallet.example";
 const TEXT: &str = "application/grpc-web-text+proto";
@@ -59,7 +59,8 @@ fn service(
         GrpcReceiveLimits::new(NonZeroUsize::MIN, RECEIVE_TIMEOUT),
         ClientAddressSource::Connection,
     );
-    Ok(transport_layers(&[HeaderValue::from_static(WALLET_ORIGIN)]).layer(receive.layer(guard)))
+    Ok(transport_layers(&[HeaderValue::from_static(WALLET_ORIGIN)])
+        .layer(wallet_layers(true).layer(receive.layer(guard))))
 }
 
 fn request(method: &str, encoding: &'static str, body: Body) -> Result<Request<Body>> {
@@ -318,7 +319,7 @@ async fn wallet_rpc_in_wallet_mode_counts_one_lightwalletd_range_across_query_re
     let query =
         WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)));
     let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?.into_server();
-    let native = transport_layers(&[]).layer(adapter);
+    let native = transport_layers(&[]).layer(wallet_layers(false).layer(adapter));
     let id = lightwalletd::BlockId {
         height: 1,
         hash: vec![],

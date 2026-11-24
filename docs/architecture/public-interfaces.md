@@ -133,6 +133,12 @@ Every other crate is internal: `zinder-store`, `zinder-source`,
 
 ## Rust API shape
 
+On a public gRPC listener, register application middleware with
+`PublicGrpcServer::layer`. The client's `grpc-timeout` covers the work
+those layers do after readiness and before the response starts. Register
+gRPC-Web and CORS adapters with `PublicGrpcServer::transport_layer` so
+they can format a deadline response for the client.
+
 - Public operations accept and return domain types, not RocksDB handles,
   column families, or untyped byte maps.
 - Writer and reader roles use different types. A read-only process cannot get

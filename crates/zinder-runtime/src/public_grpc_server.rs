@@ -95,6 +95,7 @@ use zinder_proto::compat::lightwalletd::compact_tx_streamer_server;
 
 pub(crate) use self::call_termination::OpenGrpcCalls;
 pub use self::call_termination::{GrpcCallTermination, GrpcCallTerminationLayer};
+pub use self::grpc_timeout::GrpcDeadline;
 use self::send_stall::ResponseCancellation;
 pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
 pub use self::serving::{PublicGrpcRouter, PublicGrpcServer};
@@ -246,13 +247,13 @@ pub(crate) fn public_grpc_transport(send_stall_timeout: Duration) -> PublicGrpcS
 /// behind the traffic gate, and reflection and health outside it.
 ///
 /// Open health `Watch` streams end once `drain` is cancelled.
-pub(crate) fn supervised_router<S, L, ResponseBody>(
-    server: PublicGrpcServer<L>,
+pub(crate) fn supervised_router<S, L, T, ResponseBody>(
+    server: PublicGrpcServer<L, T>,
     application_service: S,
     descriptor_set: &'static [u8],
     readiness: &Readiness,
     drain: &CancellationToken,
-) -> Result<PublicGrpcRouter<L>, tonic_reflection::server::Error>
+) -> Result<PublicGrpcRouter<L, T>, tonic_reflection::server::Error>
 where
     S: Service<http::Request<Body>, Response = http::Response<ResponseBody>, Error = Infallible>
         + NamedService

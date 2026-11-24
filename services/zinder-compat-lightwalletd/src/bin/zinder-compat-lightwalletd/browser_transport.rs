@@ -4,7 +4,11 @@ use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Versi
 use tokio::net::TcpListener;
 use tonic::{Status, body::Body, server::NamedService};
 use tonic_web::GrpcWebLayer;
-use tower::{Layer, Service, ServiceBuilder};
+use tower::{
+    Layer, Service, ServiceBuilder,
+    layer::util::{Identity, Stack},
+    util::Either,
+};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     validate_request::{ValidateRequest, ValidateRequestHeaderLayer},
@@ -78,7 +82,12 @@ where
         ),
         listener.client_address,
         readiness,
-        |server| server.accept_http1(enabled).layer(transport),
+        |server| {
+            server
+                .accept_http1(enabled)
+                .transport_layer(transport)
+                .layer(wallet_layers(enabled))
+        },
     )?;
     Ok(Box::pin(router.serve_with_incoming_shutdown(
         incoming,
@@ -111,6 +120,16 @@ where
         }))
         .option_layer(enabled.then(|| browser_cors(browser_origins)))
         .option_layer(enabled.then(GrpcWebLayer::new))
+        .into_inner()
+}
+
+type WalletLayers = Stack<
+    Either<ValidateRequestHeaderLayer<UnsupportedBrowserCall>, Identity>,
+    Stack<zinder_runtime::WalletRpcMetricsLayer, Identity>,
+>;
+
+fn wallet_layers(enabled: bool) -> WalletLayers {
+    ServiceBuilder::new()
         .layer(zinder_runtime::WalletRpcMetricsLayer::Lightwalletd)
         .option_layer(enabled.then(|| ValidateRequestHeaderLayer::custom(UnsupportedBrowserCall)))
         .into_inner()

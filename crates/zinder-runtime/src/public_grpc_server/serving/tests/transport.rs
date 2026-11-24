@@ -264,6 +264,38 @@ async fn a_request_deadline_counts_from_when_the_service_is_ready() -> Result<()
     Ok(())
 }
 
+#[tokio::test]
+async fn a_request_deadline_includes_registered_middleware() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (scripts, mut calls) = mpsc::unbounded_channel();
+    let server = tokio::spawn(
+        PublicGrpcServer::new(STALL)
+            .layer(tower::layer::layer_fn(|inner: tonic::service::Routes| {
+                tower::service_fn(move |request| {
+                    let mut inner = inner.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        inner.call(request).await
+                    }
+                })
+            }))
+            .add_service(Scripted {
+                scripts,
+                produced: Arc::default(),
+                freed: Arc::default(),
+            })
+            .serve_with_incoming(listener),
+    );
+
+    let response = within_wait_limit(raw_request(address, 65_535, Some("50m"))).await??;
+    server.abort();
+    let status = Status::from_header_map(response.headers());
+    assert_eq!(status.map(|status| status.code()), Some(Code::Cancelled));
+    assert!(calls.try_recv().is_err(), "the request reached the handler");
+    Ok(())
+}
+
 /// A method whose response is one message in a body that reports its end
 /// with its last frame, as tonic-web's gRPC-Web bodies do.
 #[derive(Clone)]
