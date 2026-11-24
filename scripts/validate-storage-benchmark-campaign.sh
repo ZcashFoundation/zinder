@@ -315,8 +315,8 @@ while IFS=$'\t' read -r rocksdb_report rocksdb_resources postgres_report postgre
   postgres_path="$(resolve_artifact_path "$postgres_report")"
   postgres_client_resources_path="$(resolve_artifact_path "$postgres_client_resources")"
   postgres_database_resources_path="$(resolve_artifact_path "$postgres_database_resources")"
-  validate_report "$rocksdb_path" "rocksdb-canonical-replay-storage" "rocksdb" "rocksdb-single-host"
-  validate_report "$postgres_path" "postgres-canonical-replay-storage" "postgres" "postgres-scale-out"
+  validate_report "$rocksdb_path" "rocksdb-canonical-replay-storage" "rocksdb" "rocksdb"
+  validate_report "$postgres_path" "postgres-canonical-replay-storage" "postgres" "postgres-diagnostic"
 
   rocksdb_trial_id="$(jq -er '.provenance.run.trial_id' "$rocksdb_path")"
   postgres_trial_id="$(jq -er '.provenance.run.trial_id' "$postgres_path")"

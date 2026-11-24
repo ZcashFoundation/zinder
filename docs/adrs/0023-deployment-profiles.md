@@ -12,7 +12,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
 
 ## Decision
 
-1. **A profile coordinates the settings of a deployment's processes.** `deployment.profile`, in the shared `[deployment]` section ([ADR-0021](0021-shared-configuration-sections.md)), names the profile that the runtimes of one deployment read. The operator still launches each process. A profile fixes:
+1. **A profile coordinates the settings of a deployment's processes.** `deployment.profile`, in the shared `[deployment]` section ([ADR-0021](0021-shared-configuration-sections.md)), names the profile that the runtimes of one deployment read. The operator still launches each process. Profiles compose orthogonal optional storage and runtime modules over the shared canonical core (settled-supplement retention policy, single-copy raw block vault, decoupled transparent wallet projection, and optional isolated Explorer consumer). A profile fixes:
    - what the canonical writer stores: its coverage, raw-blob retention, and Explorer views;
    - which composition each reader serves; and
    - the minimum data its readers require ([ADR-0004](0004-storage-and-deployment-topologies.md) decision 2).
@@ -68,6 +68,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
 
 ## Revision history
 
+- 2026-11-24. Decision 1 defines deployment profiles as compositions of orthogonal optional modules over the shared canonical core.
 - 2026-11-24. Decision 3 notes the signed settled-history projection also supplies nullifier-range payloads, which the light-wallet profile's `GetBlockRangeNullifiers` stream reads zero-copy.
 - 2026-11-24. Decisions 1, 4, and 6 add the lean wallet and wallet archive profiles.
 - 2026-11-23. Decision 1 distinguishes listener and ingest config output from the publisher's effective settings.

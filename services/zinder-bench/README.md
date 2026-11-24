@@ -1340,7 +1340,7 @@ campaign case's `match` list when comparing reports that expose this flag.
 - `storage_candidate`: identifies `rocksdb-canonical-fixture-replay`,
   `rocksdb-storage-lifecycle`, `rocksdb-canonical-replay-storage`, or
   `postgres-canonical-replay-storage`, including the logical model and the
-  `rocksdb-single-host` or `postgres-scale-out` topology represented by that
+  `rocksdb` or `postgres-diagnostic` topology represented by that
   arm. This is candidate identity, not topology certification.
 - `fixture.contract_identity`, `fixture.fixture_format_version`,
   `fixture.canonical_artifact_schema_version`,

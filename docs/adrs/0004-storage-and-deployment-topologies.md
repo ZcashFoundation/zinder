@@ -4,8 +4,8 @@ Status: Accepted
 
 | Topology | Role | Status |
 | --- | --- | --- |
-| `rocksdb-single-host` | Self-hosters and small deployments | Implemented, supported, and advertised. |
-| `postgres-horizontal` | Hosted fleets | Decided. Not implemented, not certified, and not advertised. |
+| `rocksdb` | Self-hosters and small deployments | Implemented, supported, and advertised. |
+| `postgres` | Hosted fleets | Decided. Not implemented, not certified, and not advertised. |
 
 The PostgreSQL arm of `zinder-bench` is a diagnostic benchmark. It is not a deployment mode.
 
@@ -29,9 +29,9 @@ The longest outages observed so far came from the Zcash node, not from storage. 
 
    Holding more data never changes which composition a reader runs. The admitted store's persisted data is one input to capabilities ([ADR-0014](0014-consumer-neutral-wallet-data-plane.md)), and the installed handlers, dependencies, and readiness rules decide the rest ([ADR-0015](0015-wallet-runtime-composition.md), [ADR-0016](0016-wallet-serving-readiness.md)).
 3. **One topology per deployment.** All stores of one deployment use the same engine. Parity between topologies is promised only on the public wallet contracts: native `WalletQuery` and lightwalletd compatibility.
-4. **`rocksdb-single-host` is the supported topology.** The canonical and wallet primaries live on one host filesystem, each with one owner. Readers open secondaries with process-unique metadata paths ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md)). Private, authenticated control APIs coordinate fences, leases, mempool state, and recovery.
+4. **`rocksdb` is the supported topology.** The canonical and wallet primaries live on one host filesystem, each with one owner. Readers open secondaries with process-unique metadata paths ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md)). Private, authenticated control APIs coordinate fences, leases, mempool state, and recovery.
 5. **A backup of a deployment that serves a wallet projection is a coherent pair.** A canonical checkpoint alone is not a wallet-serving backup. A restore authenticates the canonical fence and wallet digest together, restores both into fresh paths, and passes wallet-serving admission before traffic. Independently timed directory copies are not a backup. Private restore uses an independently retained SHA-256 of the exact outer manifest, validates both checkpoint databases, releases the source projector's retention leases, and publishes one fresh directory. A private replacement retains the cursor authentication identity for its own deployment. [Private backups](../runbooks/private-backups.md) describes admission before cutover.
-6. **`postgres-horizontal` is the decided topology for hosted fleets.** Its objective is operability: stateless, replaceable Zinder processes, readers that upgrade without downtime, and recovery from a lost host in minutes. The objective does not rest on a measured load limit of `rocksdb-single-host`. Its first form is deliberately small:
+6. **`postgres` is the decided topology for hosted fleets.** Its objective is operability: stateless, replaceable Zinder processes, readers that upgrade without downtime, and recovery from a lost host in minutes. The objective does not rest on a measured load limit of `rocksdb`. Its first form is deliberately small:
    - Canonical and wallet data live in one database per network, in separate schemas, so one snapshot covers both.
    - Readers query the primary only. Replica reads come later, if the primary's read capacity limits serving.
    - One ingest and one projector run, each with a durable ownership row and writer term. Standby writers come later.
@@ -39,9 +39,9 @@ The longest outages observed so far came from the Zcash node, not from storage. 
    - The proxy terminates TLS, limits clients, and routes traffic to ready readers. The lightwalletd compatibility reader serves gRPC-Web on its existing port when the operator enables browser origins. This gives native and browser wallets one endpoint and lets local developers use the same transport without installing a translating proxy.
    - One set of binaries carries both engines, and configuration selects the topology.
 
-   The topology exists for operators who run a managed database, such as a cloud provider's managed PostgreSQL. They scale, replicate, and back up the database with their provider's tools, and run Zinder as stateless processes they can replace or upgrade one at a time. It is a different deployment model, not a response to a performance limit of `rocksdb-single-host`.
+   The topology exists for operators who run a managed database, such as a cloud provider's managed PostgreSQL. They scale, replicate, and back up the database with their provider's tools, and run Zinder as stateless processes they can replace or upgrade one at a time. It is a different deployment model, not a response to a performance limit of `rocksdb`.
 7. **A benchmark gate precedes PostgreSQL build work.** On Mainnet-shaped data, all four must hold: a block commits in under 2 seconds while readers run; long block-range streaming reaches at least half of RocksDB's rate per reader; a from-scratch Mainnet build of canonical and wallet data finishes within four times the RocksDB build time on the same host and data; and the PostgreSQL canonical and wallet data are less than twice the size of the RocksDB stores built from the same data. Each factor is a chosen tolerance, not a measured limit. A missed threshold sends that part of the design back for rework.
-8. **Reads become engine-neutral first.** Read interfaces with RocksDB behind them and a conformance suite for both engines ship before any PostgreSQL reader. Writers keep engine-specific code. Slice 1 then adds a PostgreSQL canonical writer behind stateless lightwalletd-compatible servers, and slice 2 adds wallet projection and native queries. `postgres-horizontal` becomes certified and advertised at the end of slice 2. Writer standby and the Explorer follow.
+8. **Reads become engine-neutral first, and both engines share one logical canonical model.** Read interfaces with RocksDB behind them and a conformance suite for both engines ship before any PostgreSQL reader. Both topologies share one block-intrinsic canonical model (an immutable settled prefix split between shielded scanning data and block supplement facts, plus an optional single-copy raw block vault and a 1,000-block live tail—mapped to flat segments plus RocksDB on `rocksdb` and packed multi-block chunks plus live-tail tables on `postgres`), while keeping canonical, wallet projection, and Explorer writers decoupled. Writers keep engine-specific code. Slice 1 then adds a PostgreSQL canonical writer behind stateless lightwalletd-compatible servers, and slice 2 adds wallet projection and native queries. `postgres` becomes certified and advertised at the end of slice 2. Writer standby and the Explorer follow.
 9. **Every release declares an upgrade class.** The classes are compatible, additive schema change, projection layout change, and canonical layout change. During a compatible or additive upgrade, the old and new releases must each read and write correctly against the same schema and each other's rows. A layout change raises the affected store's schema version, and each release refuses a store at any other version. A layout change requires a fresh store, built from scratch in a fresh path. Zinder has no in-place migration. Team-operated deployments schedule the rebuild and keep no mandatory rollback lane. A release serves only from a store at its own version, so a self-hoster who wants a fallback keeps the previous binaries and store until the new store passes admission. The release workflow does not record the class, and Zinder has no upgrade command or migration job.
 
 Regional RocksDB instances can initialize independent single-host writers from verified snapshots. Each instance owns its copy and follows its configured validator. [ADR-0024](0024-verified-edge-snapshot-bootstrap.md).
@@ -59,15 +59,15 @@ Regional RocksDB instances can initialize independent single-host writers from v
 
 - Canonical throughput does not depend on wallet index lookups, and wallet or Explorer schemas can be rebuilt without redefining chain truth.
 - Operators keep the supported primaries on one host filesystem and give each reader its own secondary metadata path.
-- Until `postgres-horizontal` is certified, hosted deployments keep release downtime and the full rebuild cost.
-- Under `postgres-horizontal`, three commitments change:
-  - A reorg that replaces the blocks a native read pinned ends that read with a retryable error, and the client restarts its walk. Under `rocksdb-single-host`, a retained serving pair keeps answering its epoch.
+- Until `postgres` is certified, hosted deployments keep release downtime and the full rebuild cost.
+- Under `postgres`, three commitments change:
+  - A reorg that replaces the blocks a native read pinned ends that read with a retryable error, and the client restarts its walk. Under `rocksdb`, a retained serving pair keeps answering its epoch.
   - A reader keeps serving block, balance, and history reads while ingest is unreachable. Mempool methods fail, and so does a transaction lookup that misses canonical storage and needs the mempool to answer.
   - With one ingest, an ingest outage longer than the staleness ceiling stops all reads. This is accepted until the standby slice.
 - A reader's raw-blob setting is a minimum, so one canonical store can serve readers with different needs. Changing what a store holds still needs a new store.
 - Clients re-establish event cursors and pins after a canonical layout change, because epoch ids and event sequences count commits in each store.
 - A canonical layout change costs each affected deployment a full rebuild, including any wallet projection and Explorer views, and a serving outage for its length unless the operator builds beside the running deployment. Zinder accepts this cost because no release reads two canonical layouts, and an operator can keep a fallback without Zinder requiring one.
-- `postgres-horizontal` is not chosen to save storage. The gate allows twice the RocksDB size, and the database is the deployment's only stateful component.
+- `postgres` is not chosen to save storage. The gate allows twice the RocksDB size, and the database is the deployment's only stateful component.
 - A deployment that omits transaction bodies and the wallet projection stores far less. On Mainnet at height 3,593,347, transaction bodies (`transaction_blob`) measured 251.1 GiB of the canonical store and the wallet projection 46.9 GiB ([#364](https://github.com/ZcashFoundation/zinder/issues/364)). The size threshold must therefore name the stored set it compares, including raw-blob retention, and use the same set on both engines.
 
 ## Alternatives rejected
@@ -84,6 +84,8 @@ Regional RocksDB instances can initialize independent single-host writers from v
 - **In-place migration.** It needs conversion code per family, recovery for a half-converted store, and tests for every pair of versions. A rebuild reuses the tested construction path.
 
 ## Revision history
+
+- 2026-11-24. Simplified the topology identifiers to `rocksdb` and `postgres`, and updated Decision 8 to bind both engines to one logical canonical model (settled split plus 1,000-block live tail) while keeping canonical, wallet projection, and Explorer writers separate.
 
 - 2026-11-24. Linked ADR-0024 for bootstrapping an independent single-host RocksDB deployment.
 

@@ -192,7 +192,7 @@ write_report() {
           canonical_engine: (if $is_rocksdb then "rocksdb" else "postgres" end),
           canonical_model: "block-granular-canonical-replays",
           diagnostic_projection_engine: null,
-          topology: (if $is_rocksdb then "rocksdb-single-host" else "postgres-scale-out" end)
+          topology: (if $is_rocksdb then "rocksdb" else "postgres-diagnostic" end)
         },
         round_trip: {
           scope: "block-local-canonical-replay",
@@ -620,7 +620,7 @@ wrong_topology_campaign="$scratch_directory/wrong-topology"
 cp -R "$valid_campaign" "$wrong_topology_campaign"
 mutate_report \
   "$wrong_topology_campaign/postgres-canonical-replay-storage-trial-04.json" \
-  '.storage_candidate.topology = "rocksdb-single-host"'
+  '.storage_candidate.topology = "rocksdb"'
 expect_failure "wrong topology" "$wrong_topology_campaign"
 
 null_configuration_campaign="$scratch_directory/null-configuration"
@@ -971,7 +971,7 @@ write_lifecycle_evidence() {
         canonical_engine: "rocksdb",
         canonical_model: "canonical-replay-storage",
         diagnostic_projection_engine: null,
-        topology: "rocksdb-single-host"
+        topology: "rocksdb"
       },
       source: {
         family: "zebra-json-rpc",

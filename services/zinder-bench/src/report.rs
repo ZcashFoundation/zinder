@@ -177,7 +177,7 @@ impl StorageCandidateIdentity {
             id: "rocksdb-canonical-replay-storage",
             canonical_engine: "rocksdb",
             canonical_model: "block-granular-canonical-replays",
-            topology: "rocksdb-single-host",
+            topology: "rocksdb",
         }
     }
 
@@ -188,7 +188,7 @@ impl StorageCandidateIdentity {
             id: "postgres-canonical-replay-storage",
             canonical_engine: "postgres",
             canonical_model: "block-granular-canonical-replays",
-            topology: "postgres-scale-out",
+            topology: "postgres-diagnostic",
         }
     }
 
@@ -199,7 +199,7 @@ impl StorageCandidateIdentity {
             id: "rocksdb-storage-lifecycle",
             canonical_engine: "rocksdb",
             canonical_model: "canonical-replay-storage",
-            topology: "rocksdb-single-host",
+            topology: "rocksdb",
         }
     }
 
@@ -210,7 +210,7 @@ impl StorageCandidateIdentity {
             id: "rocksdb-canonical-fixture-replay",
             canonical_engine: "rocksdb",
             canonical_model: "canonical-replay-storage",
-            topology: "rocksdb-single-host",
+            topology: "rocksdb",
         }
     }
 }
@@ -1619,7 +1619,7 @@ fn validate_canonical_fixture_report_identity_and_resources(
     if report.storage_candidate.id != "rocksdb-canonical-fixture-replay"
         || report.storage_candidate.canonical_engine != "rocksdb"
         || report.storage_candidate.canonical_model != "canonical-replay-storage"
-        || report.storage_candidate.topology != "rocksdb-single-host"
+        || report.storage_candidate.topology != "rocksdb"
         || !is_lowercase_sha256(&report.replay_plan_digest_sha256)
         || report.replay_plan_fixture_manifest_sha256 != report.fixture.digest_sha256
         || !is_lowercase_sha256(&report.fixture.digest_sha256)
@@ -1772,10 +1772,10 @@ impl RocksDbStorageLifecycleReport {
         let wallet = &self.wallet_storage_ready;
         if self.storage_candidate.id != "rocksdb-storage-lifecycle"
             || self.storage_candidate.canonical_engine != "rocksdb"
-            || self.storage_candidate.topology != "rocksdb-single-host"
+            || self.storage_candidate.topology != "rocksdb"
         {
             return Err(BenchError::report_format(
-                "storage lifecycle candidate identity is not the RocksDB single-host contract",
+                "storage lifecycle candidate identity is not the RocksDB contract",
             ));
         }
         if self.contracts.canonical_store_identity != zinder_store::CANONICAL_STORE_IDENTITY
