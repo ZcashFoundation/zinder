@@ -300,7 +300,7 @@ jq -e \
       and .canonical_engine == "rocksdb"
       and .canonical_model == "canonical-replay-storage"
       and .diagnostic_projection_engine == null
-      and .topology == "rocksdb-single-host")
+      and .topology == "rocksdb")
     and (.provenance
       | exact_keys([
           "benchmark_version",

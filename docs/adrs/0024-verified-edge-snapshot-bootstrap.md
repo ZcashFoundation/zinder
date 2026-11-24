@@ -130,7 +130,7 @@ directories and retry. If the parent directory sync fails after canonical
 rename, inspect the visible target and rerun normal store admission before
 following. An existing canonical primary must be preserved.
 
-A bundle initializes a separate `rocksdb-single-host` writer with its own
+A bundle initializes a separate `rocksdb` writer with its own
 storage ownership. Capacity, recovery times, and shared storage topologies
 require separate qualification.
 
@@ -146,3 +146,7 @@ its validator. Run `zinder-ingest bootstrap-from-snapshot --source BUNDLE
 `BUNDLE`. Repeat `--public-key` during a publisher key transition.
 `--spot-check-blocks` sets a positive sample count, and
 `--sealed-history-output DIR` publishes the verified optional files.
+
+## Revision history
+
+- 2026-11-24. Renamed topology identifier `rocksdb-single-host` to `rocksdb` to match ADR-0004.

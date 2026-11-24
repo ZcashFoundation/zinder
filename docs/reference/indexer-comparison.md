@@ -553,7 +553,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^ztr-replica]: A remote-mode instance imports sealed ranges once at startup, from the one `--replicate-from` source, then follows whichever Zakura node `--remote-rpc` names, which need not be the peer's node. Peers do not replicate to each other continuously, and the Replicator and `export-snapshot` of a replica serve each range it has sealed. Embedded mode does not import from a peer ([replicate/mod.rs](https://github.com/zcashlabs/ztreamer/blob/498258159d868d5592ff44c75e9b311353d51e35/crates/daemon/src/replicate/mod.rs#L121-L160), [README.md](https://github.com/zcashlabs/ztreamer/blob/498258159d868d5592ff44c75e9b311353d51e35/README.md#L59-L66)).
 
-[^zinder-single-host]: Only the `rocksdb-single-host` topology exists, and `postgres-horizontal` is decided but not implemented ([ADR-0035](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/adrs/0035-canonical-storage-topologies.md#L64-L70)).
+[^zinder-single-host]: Only the `rocksdb` topology exists, and `postgres` is decided but not implemented ([ADR-0035](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/adrs/0035-canonical-storage-topologies.md#L64-L70)).
 
 [^zebra-snap]: The Zcash Foundation publishes unsigned state snapshots that you extract into `cache_dir` by hand ([snapshots.md](https://github.com/ZcashFoundation/zebra/blob/86f3ac7e4dcf7644a88222b8678790ed68734e63/book/src/user/snapshots.md#L52-L57)).
 
