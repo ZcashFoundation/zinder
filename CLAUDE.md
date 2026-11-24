@@ -266,6 +266,16 @@ artifacts and add a generated message round-trip test in
 
 `.gitignore` excludes `target/`, `.tmp/`, `*.rocksdb/`, `*.zinder-store/`, `*.profraw`, and `lcov.info`. Use `.tmp/` for ad-hoc TOML configs, scratch stores, and fixture captures. Per-network store paths must be distinct (`zcash-mainnet`, `zcash-testnet`, `zcash-regtest`); a store opened for one `Network` rejects commits from another.
 
+Durable local investigation artifacts live in the main checkout's ignored `docs/investigations/`, shared across git worktrees so results survive ephemeral worktree removal. Resolve that directory from either the main checkout or any worktree with:
+
+```bash
+investigations="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/docs/investigations"
+```
+
+- Keep transient scratch files, ad-hoc configs, fixtures, scratch stores, and Rust build directories in the active worktree's `.tmp/`.
+- Place durable benchmark results, performance profiles, metrics datasets, charts, and investigation reports in a dedicated subdirectory per campaign under `docs/investigations/` (`<YYYY-MM-DD>-<slug>/`, following any local `README.md` or catalog scripts present there).
+- Never copy compiled binaries, `*.rocksdb` or `*.zinder-store` stores, `target/` directories, or cloned repositories into `docs/investigations/`, and never commit `docs/investigations/`.
+
 ## Doc Maintenance Rule
 
 When a change alters a service boundary, public API, storage byte layout, protocol surface, or vocabulary, update the owning document in `docs/` in the same change.

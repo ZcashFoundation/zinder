@@ -58,6 +58,10 @@ Test functions under `tests/live/` use plain `snake_case_describing_behavior` na
 
 Tests should exercise public boundaries and contract shapes: append, reorg, settlement, cursor validation, storage recovery, and parser edge cases. Tier organization is by directory: T0 unit (`#[cfg(test)] mod tests` in `src/`), T1 integration (`tests/integration/`), T2 perf (`tests/perf/`), T3 live (`tests/live/`). T3 tests are double-gated by `#[ignore = LIVE_TEST_IGNORE_REASON]` and `zinder_testkit::live::require_live()`; mainnet is rejected by default. Mutation testing is targeted at critical storage and parser functions through the CI workflow; expand that target set when changing those contracts.
 
+## Investigation & Benchmark Artifacts
+
+Keep transient scratch files, ad-hoc configs, scratch stores, fixtures, and Rust build directories in the active worktree's ignored `.tmp/`. Place durable local investigation artifacts — benchmark results, profiles, metrics datasets, charts, and investigation reports — in the main checkout's ignored `docs/investigations/`, resolved from either the main checkout or any git worktree with `"$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/docs/investigations"`. Store each campaign in its own dated subdirectory (`<YYYY-MM-DD>-<slug>/`, or follow any local `README.md` or catalog tooling present there). Never place compiled binaries, `*.rocksdb` or `*.zinder-store` stores, `target/` directories, or cloned repositories in `docs/investigations/`, and never commit `docs/investigations/`. See [CLAUDE.md §Local Storage Conventions](CLAUDE.md#local-storage-conventions).
+
 ## Commit & Pull Request Guidelines
 
 Use full Conventional Commits syntax for commits and pull request titles, for
