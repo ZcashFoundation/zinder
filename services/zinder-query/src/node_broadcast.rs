@@ -1383,6 +1383,28 @@ impl LightWalletNodeVerification {
         }
     }
 
+    /// Verifies that the node's best chain holds the served tip of `target`,
+    /// charging one `check.kind` slot of `check.limit` inside the shared tip
+    /// check.
+    pub(crate) async fn verify_served_tip_admitted<Source>(
+        &self,
+        source: &Source,
+        target: &VerificationTarget,
+        check: AdmittedTipCheck<'_>,
+    ) -> Result<(), crate::QueryError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        if self
+            .holds_block_admitted(source, target.fence.visible_tip(), check)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(crate::QueryError::Node(served_tip_mismatch()))
+        }
+    }
+
     /// Returns whether the node's best chain holds `block`, sharing one
     /// `getblockhash` call with concurrent callers asking about the same
     /// block. The answer is not kept after the call returns.
@@ -1396,21 +1418,74 @@ impl LightWalletNodeVerification {
     {
         self.tip_checks.holds_block(source, block).await
     }
+
+    /// Returns whether the node's best chain holds `block`, charging one
+    /// `check.kind` slot of `check.limit` inside the shared check.
+    pub(crate) async fn holds_block_admitted<Source>(
+        &self,
+        source: &Source,
+        block: zinder_core::BlockId,
+        check: AdmittedTipCheck<'_>,
+    ) -> Result<bool, crate::QueryError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        self.tip_checks
+            .holds_block_admitted(source, block, check)
+            .await
+    }
 }
 
-type TipCheck = futures_util::future::BoxFuture<'static, Result<bool, Arc<SourceError>>>;
+/// Admission parameters for a foreground served-tip check.
+#[derive(Clone, Copy)]
+pub(crate) struct AdmittedTipCheck<'a> {
+    pub(crate) limit: &'a crate::ForwardedReadLimit,
+    pub(crate) kind: crate::ForwardedReadKind,
+    pub(crate) deadline: tokio::time::Instant,
+}
 
-/// Running checks by block, each with the number that tells it apart from a
-/// later check of the same block, and the next such number.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum TipCheckKey {
+    Unadmitted(zinder_core::BlockId),
+    Admitted(zinder_core::BlockId, crate::ForwardedReadKind),
+}
+
+#[derive(Clone)]
+enum TipCheckError {
+    Refused(crate::ForwardedReadRefused),
+    Node(Arc<SourceError>),
+}
+
+impl TipCheckError {
+    fn into_query_error(self) -> crate::QueryError {
+        match self {
+            Self::Refused(refused) => refused.into(),
+            Self::Node(error) => {
+                crate::QueryError::Node(crate::forwarded_read::owned_source_error(error))
+            }
+        }
+    }
+
+    fn into_source_error(self) -> SourceError {
+        match self {
+            Self::Refused(refused) => SourceError::NodeUnavailable {
+                reason: refused.to_string(),
+            },
+            Self::Node(error) => crate::forwarded_read::owned_source_error(error),
+        }
+    }
+}
+
+type TipCheck = futures_util::future::BoxFuture<'static, Result<bool, TipCheckError>>;
+
+/// Running checks by key, each with the number that tells it apart from a
+/// later check of the same key, and the next such number.
 type RunningTipChecks = (
-    std::collections::HashMap<
-        zinder_core::BlockId,
-        (u64, futures_util::future::WeakShared<TipCheck>),
-    >,
+    std::collections::HashMap<TipCheckKey, (u64, futures_util::future::WeakShared<TipCheck>)>,
     u64,
 );
 
-/// Served-tip checks in progress, by block.
+/// Served-tip checks in progress, by key.
 #[derive(Default)]
 struct TipChecks {
     running: Arc<parking_lot::Mutex<RunningTipChecks>>,
@@ -1425,27 +1500,71 @@ impl TipChecks {
     where
         Source: BroadcastNodeProbe + Clone,
     {
+        let source = source.clone();
+        self.run(TipCheckKey::Unadmitted(block), move || async move {
+            source
+                .holds_block(block)
+                .await
+                .map_err(|error| TipCheckError::Node(Arc::new(error)))
+        })
+        .await
+        .map_err(TipCheckError::into_source_error)
+    }
+
+    async fn holds_block_admitted<Source>(
+        &self,
+        source: &Source,
+        block: zinder_core::BlockId,
+        check: AdmittedTipCheck<'_>,
+    ) -> Result<bool, crate::QueryError>
+    where
+        Source: BroadcastNodeProbe + Clone,
+    {
+        let source = source.clone();
+        let limit = check.limit.clone();
+        let kind = check.kind;
+        let deadline = check.deadline;
+        self.run(TipCheckKey::Admitted(block, kind), move || async move {
+            limit
+                .node_call(kind, deadline, source.holds_block(block))
+                .await
+                .map_err(TipCheckError::Refused)?
+                .map_err(|error| TipCheckError::Node(Arc::new(error)))
+        })
+        .await
+        .map_err(TipCheckError::into_query_error)
+    }
+
+    async fn run<Check, Started>(
+        &self,
+        key: TipCheckKey,
+        start: Check,
+    ) -> Result<bool, TipCheckError>
+    where
+        Check: FnOnce() -> Started,
+        Started: Future<Output = Result<bool, TipCheckError>> + Send + 'static,
+    {
         use futures_util::FutureExt as _;
 
         let check = {
             let mut running = self.running.lock();
-            let joined = running.0.get(&block).and_then(|(_, weak)| weak.upgrade());
+            let joined = running.0.get(&key).and_then(|(_, weak)| weak.upgrade());
             let check = joined.unwrap_or_else(|| {
                 let flight = running.1;
                 running.1 += 1;
                 let registry = Arc::clone(&self.running);
-                let source = source.clone();
+                let started = start();
                 let check = async move {
-                    let held = source.holds_block(block).await.map_err(Arc::new);
+                    let held = started.await;
                     // Leave the running set before answering, so a caller
                     // arriving after this answer makes its own call.
                     let mut running = registry.lock();
                     if running
                         .0
-                        .get(&block)
+                        .get(&key)
                         .is_some_and(|(current, _)| *current == flight)
                     {
-                        running.0.remove(&block);
+                        running.0.remove(&key);
                     }
                     drop(running);
                     held
@@ -1454,16 +1573,14 @@ impl TipChecks {
                 .shared();
                 running.0.retain(|_, (_, weak)| weak.upgrade().is_some());
                 if let Some(weak) = check.downgrade() {
-                    running.0.insert(block, (flight, weak));
+                    running.0.insert(key, (flight, weak));
                 }
                 check
             });
             drop(running);
             check
         };
-        check
-            .await
-            .map_err(crate::forwarded_read::owned_source_error)
+        check.await
     }
 
     #[cfg(test)]

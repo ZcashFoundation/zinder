@@ -345,6 +345,165 @@ async fn a_forwarded_transaction_that_waits_past_the_wait_is_unavailable() -> Re
 }
 
 #[tokio::test]
+async fn canonical_miss_get_transaction_charges_the_forwarding_budget_before_tip_check()
+-> Result<()> {
+    let reads = zinder_query::ForwardedReadLimit::new(zinder_query::ForwardedReadConfig::resolve(
+        Some(1),
+        Some(50),
+        Some(1),
+        None,
+    )?);
+    let (fixture, gate) = gated_transactions(0x51..=0x51, reads)?;
+    let mined_task = tokio::spawn({
+        let adapter = fixture.adapter.clone();
+        async move {
+            adapter
+                .get_transaction(transaction(TransactionId::from_bytes([0x51; 32])))
+                .await
+        }
+    });
+    gate.wait_for_entered(1).await?;
+
+    let refused = fixture
+        .adapter
+        .get_transaction(transaction(TransactionId::from_bytes([0x99; 32])))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("canonical miss bypassed the one-slot forwarding budget"))?;
+    assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+    assert!(
+        fixture.node.requests_for("getblockhash")?.is_empty(),
+        "getblockhash ran while the sole forwarding slot was held"
+    );
+
+    gate.open();
+    assert_eq!(mined_task.await??.into_inner().data, [0x51]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn coalesced_malformed_hex_get_transaction_preserves_data_loss() -> Result<()> {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let codes = coalesced_get_transaction_codes(
+        zinder_source::ZebraJsonRpcSourceOptions::default(),
+        TransactionId::from_bytes([0x51; 32]),
+        &handle,
+        |txid, served| {
+            RpcReply::result(json!({
+                "hex": "zz",
+                "txid": txid,
+                "height": served.height.value(),
+                "blockhash": encode_rpc_block_hash_hex(served.hash),
+            }))
+        },
+    )
+    .await?;
+    assert_eq!(codes, [Code::DataLoss, Code::DataLoss]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn coalesced_oversized_get_transaction_preserves_resource_exhausted() -> Result<()> {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let codes = coalesced_get_transaction_codes(
+        zinder_source::ZebraJsonRpcSourceOptions {
+            request_timeout: Duration::from_secs(30),
+            max_response_bytes: std::num::NonZeroU64::new(2048).ok_or_else(|| eyre!("non-zero"))?,
+            ..zinder_source::ZebraJsonRpcSourceOptions::default()
+        },
+        TransactionId::from_bytes([0x51; 32]),
+        &handle,
+        |txid, served| {
+            RpcReply::result(json!({
+                "hex": "55".repeat(2048),
+                "txid": txid,
+                "height": served.height.value(),
+                "blockhash": encode_rpc_block_hash_hex(served.hash),
+            }))
+        },
+    )
+    .await?;
+    assert_eq!(codes, [Code::ResourceExhausted, Code::ResourceExhausted]);
+    Ok(())
+}
+
+async fn coalesced_get_transaction_codes(
+    options: zinder_source::ZebraJsonRpcSourceOptions,
+    id: TransactionId,
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+    reply: fn(&str, zinder_core::BlockId) -> RpcReply,
+) -> Result<[Code; 2]> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let block = chain
+        .blocks()
+        .first()
+        .ok_or_else(|| eyre!("missing block"))?;
+    let served = zinder_core::BlockId::new(block.height, block.hash);
+    let chain = chain.with_transaction_rows(FixtureTransactionRows::coinbase(
+        id,
+        served.height,
+        served.hash,
+        vec![0x51],
+    ));
+    let gate = NodeGate {
+        entered: Arc::default(),
+        gate: Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new())),
+    };
+    let (node_gate, entered) = (Arc::clone(&gate.gate), Arc::clone(&gate.entered));
+    let fixture = Fixture::from_chain_with_options(
+        &chain,
+        &super::one_upgrade_per_height()?,
+        [method("getrawtransaction").reply_with(move |params| {
+            entered.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let (released, opened) = &*node_gate;
+            let mut released = released.lock();
+            opened.wait_while_for(
+                &mut released,
+                |released| !*released,
+                Duration::from_secs(20),
+            );
+            reply(params[0].as_str().unwrap_or_default(), served)
+        })],
+        options,
+        zinder_query::ForwardedReadLimit::default(),
+    )?;
+    let spawn_lookup = || {
+        let adapter = fixture.adapter.clone();
+        tokio::spawn(async move { adapter.get_transaction(transaction(id)).await })
+    };
+    let leader = spawn_lookup();
+    gate.wait_for_entered(1).await?;
+    let follower = spawn_lookup();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !handle
+            .render()
+            .contains("zinder_forwarded_transaction_cache_lookups_total{outcome=\"coalesced\"} 1")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("follower lookup never coalesced"))?;
+    gate.open();
+    let (first, second) = tokio::join!(leader, follower);
+    assert_eq!(gate.entered(), 1);
+    assert_eq!(fixture.node.requests_for("getrawtransaction")?.len(), 1);
+    let first_code = first?
+        .err()
+        .ok_or_else(|| eyre!("expected first lookup refusal"))?
+        .code();
+    let second_code = second?
+        .err()
+        .ok_or_else(|| eyre!("expected second lookup refusal"))?
+        .code();
+    Ok([first_code, second_code])
+}
+
+#[tokio::test]
 async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_location()
 -> Result<()> {
     let mined = TransactionId::from_bytes([0x55; 32]);

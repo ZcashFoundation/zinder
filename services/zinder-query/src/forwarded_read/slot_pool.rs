@@ -74,45 +74,73 @@ impl PoolState {
         }
     }
 
-    fn release(&mut self, class: usize) {
+    /// Returns `true` when the returned slot belonged to `class`'s reserved
+    /// floor, or `false` when it came from `elastic_free`.
+    fn release(&mut self, class: usize) -> bool {
         let elastic_free = &mut self.elastic_free;
-        if let Some(state) = self.classes.get_mut(class) {
-            state.active -= 1;
-            if state.active >= state.share.reserved {
-                *elastic_free += 1;
-            }
+        let Some(state) = self.classes.get_mut(class) else {
+            return false;
+        };
+        state.active -= 1;
+        if state.active >= state.share.reserved {
+            *elastic_free += 1;
+            false
+        } else {
+            true
         }
     }
 
-    /// Hands free slots to the oldest waiters that may use them, starting with
-    /// `first`, whose slot was just returned.
-    fn dispatch(&mut self, pool: &Arc<SlotPool>, first: usize) {
+    /// Admits the oldest live waiter of `class` while `class` can take a slot,
+    /// discarding cancelled waiters without losing the slot.
+    fn dispatch_one(&mut self, pool: &Arc<SlotPool>, class: usize) -> bool {
+        while self.can_admit(class) {
+            let Some((_, waiter)) = self
+                .classes
+                .get_mut(class)
+                .and_then(|state| state.waiters.pop_front())
+            else {
+                return false;
+            };
+            self.allocate(class);
+            if let Err(mut unclaimed) = waiter.send(PoolSlot::new(pool, class)) {
+                // The waiter left after it was queued; the slot is still
+                // free, and releasing it here keeps the pool lock.
+                unclaimed.pool = None;
+                let _ = self.release(class);
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Hands free slots to the oldest waiters that may use them: a returned
+    /// reserved slot goes to its own kind first, and shared capacity rotates
+    /// fairly across kinds so no busy kind starves another.
+    fn dispatch(&mut self, pool: &Arc<SlotPool>, returned_reserved: Option<usize>) {
+        if let Some(first) = returned_reserved {
+            let _ = self.dispatch_one(pool, first);
+        }
         let count = self.classes.len();
-        let mut order = Vec::with_capacity(count + 1);
-        order.push(first);
-        order.extend((0..count).map(|offset| (self.rotation + offset) % count));
-        for class in order {
-            while self.can_admit(class) {
-                let Some((_, waiter)) = self
-                    .classes
-                    .get_mut(class)
-                    .and_then(|state| state.waiters.pop_front())
-                else {
+        if count > 0 {
+            loop {
+                let start = self.rotation % count;
+                let mut progressed = false;
+                for offset in 0..count {
+                    let class = (start + offset) % count;
+                    if self.dispatch_one(pool, class) {
+                        self.rotation = (class + 1) % count;
+                        progressed = true;
+                        break;
+                    }
+                }
+                if !progressed {
                     break;
-                };
-                self.allocate(class);
-                if let Err(mut unclaimed) = waiter.send(PoolSlot::new(pool, class)) {
-                    // The waiter left after it was queued; the slot is still
-                    // free, and releasing it here keeps the pool lock.
-                    unclaimed.pool = None;
-                    self.release(class);
-                } else {
-                    self.rotation = (class + 1) % count;
                 }
             }
-            if let Some(state) = self.classes.get(class) {
-                state.record_gauges();
-            }
+        }
+        for state in &self.classes {
+            state.record_gauges();
         }
     }
 }
@@ -235,8 +263,8 @@ impl SlotPool {
 
     fn give_back(self: &Arc<Self>, class: usize) {
         let mut state = self.state.lock();
-        state.release(class);
-        state.dispatch(self, class);
+        let returned_reserved = state.release(class).then_some(class);
+        state.dispatch(self, returned_reserved);
     }
 
     #[cfg(test)]

@@ -5,7 +5,7 @@ use zinder_source::ZebraJsonRpcSource;
 
 use crate::{
     CanonicalReader, ForwardedReadKind, ForwardedReadLimit, MinedTransactionDigest, QueryError,
-    node_broadcast::{LightWalletNodeVerification, VerificationTarget},
+    node_broadcast::{AdmittedTipCheck, LightWalletNodeVerification, VerificationTarget},
 };
 
 /// Reads mined transaction bytes the store omits from the primary node,
@@ -28,15 +28,31 @@ impl ColdTransactionSource {
     /// Verifies the node against the served schedule and tip of `reader`, so
     /// a caller that consults live state after a canonical miss knows the
     /// node follows the served chain.
+    ///
+    /// Schedule and capability checks use the readiness view; the foreground
+    /// served-tip check takes one `Transaction` slot of `reads` inside its
+    /// shared tip check.
     pub(crate) async fn verify_served_tip(
         &self,
         reader: &dyn CanonicalReader,
     ) -> Result<(), QueryError> {
+        let deadline = self.reads.deadline();
         let target = VerificationTarget::from_canonical(reader).map_err(QueryError::Node)?;
         self.verification
-            .verify(&self.node, &target)
+            .verify_schedule_and_capabilities(&self.node, &target)
             .await
-            .map_err(QueryError::Node)
+            .map_err(QueryError::Node)?;
+        self.verification
+            .verify_served_tip_admitted(
+                &self.node,
+                &target,
+                AdmittedTipCheck {
+                    limit: &self.reads,
+                    kind: ForwardedReadKind::Transaction,
+                    deadline,
+                },
+            )
+            .await
     }
 
     /// Returns the bytes the served chain mines at `location`, from the cache
@@ -371,6 +387,88 @@ mod tests {
                 .reply_with(move |_| RpcReply::result(json!(encode_rpc_block_hash_hex(tip.hash)))),
             fetch,
         ])
+    }
+
+    #[tokio::test]
+    async fn canonical_miss_tip_check_waits_for_the_forwarding_budget_and_coalesces() -> Result<()>
+    {
+        let (_store, reader, schedule) = cold_fetch_fixture()?;
+        let tip = reader.event_fence().visible_tip();
+        let mined_loc = TransactionLocation {
+            serialized_bytes_sha256: Some(
+                SerializedBytesDigest::from_serialized_bytes(&[0x55]).as_bytes(),
+            ),
+            ..TransactionLocation::new(
+                TransactionId::from_bytes([0x11; 32]),
+                tip.height,
+                tip.hash,
+                0,
+            )
+        };
+        let (entered, mut calls) = mpsc::unbounded_channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let stub = blocked_transaction_stub(tip, String::new(), entered, Arc::clone(&gate));
+        let node = cold_fetch_node(&schedule, tip, stub)?;
+        let limit = ForwardedReadLimit::new(crate::ForwardedReadConfig::resolve(
+            Some(1),
+            Some(50),
+            Some(1),
+            None,
+        )?);
+        let source = Arc::new(ColdTransactionSource::new(
+            ZebraJsonRpcSource::new(
+                Network::ZcashRegtest,
+                node.url(),
+                NodeAuth::None,
+                Duration::from_secs(20),
+            )?,
+            limit.clone(),
+        ));
+
+        let mined_task = tokio::spawn({
+            let (source, reader) = (Arc::clone(&source), Arc::clone(&reader));
+            async move { source.fetch(reader.as_ref(), mined_loc).await }
+        });
+        assert!(
+            timeout(Duration::from_secs(5), calls.recv())
+                .await?
+                .is_some()
+        );
+        assert!(node.requests_for("getblockhash")?.is_empty());
+
+        let refused = source.verify_served_tip(reader.as_ref()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(QueryError::ForwardedReadLimitReached {
+                    kind: "transaction",
+                    max_concurrent: 1
+                })
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            node.requests_for("getblockhash")?.is_empty(),
+            "canonical-miss tip check bypassed the forwarding budget"
+        );
+
+        let (released, ready) = &*gate;
+        *released.lock() = true;
+        ready.notify_all();
+        assert_eq!(mined_task.await??, [0x55]);
+
+        let (a, b) = tokio::join!(
+            source.verify_served_tip(reader.as_ref()),
+            source.verify_served_tip(reader.as_ref()),
+        );
+        a?;
+        b?;
+        assert_eq!(node.requests_for("getblockhash")?.len(), 1);
+        assert_eq!(
+            limit.node_call_counts(ForwardedReadKind::Transaction),
+            (0, 0)
+        );
+        Ok(())
     }
 
     #[test]

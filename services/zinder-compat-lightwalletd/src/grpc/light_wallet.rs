@@ -208,7 +208,18 @@ impl LightwalletdGrpcAdapter<NodeBackedLightWallet> {
             // A forwarded lookup reports an unverified node the same way for
             // every transaction, including ones the served view does not mine.
             ForwardedTransactionEvidence::Missing(miss) => {
-                self.query_api.node(&view).await?;
+                let reads = &self.query_api.reads;
+                let deadline = reads.deadline();
+                self.query_api
+                    .query
+                    .verify_admitted_node(
+                        &view.target,
+                        reads,
+                        ForwardedReadKind::Transaction,
+                        deadline,
+                    )
+                    .await
+                    .map_err(|error| super::forwarded_read_status(&error))?;
                 self.pending_transaction(id, miss).await
             }
         }
@@ -472,14 +483,16 @@ fn forwarded_read_refused(refused: ForwardedReadRefused) -> Status {
     clippy::wildcard_enum_match_arm,
     reason = "Other failures follow the shared query status policy."
 )]
-fn forwarded_transaction_status(error: ForwardedTransactionError) -> Status {
-    match QueryError::from(error) {
-        QueryError::ForwardedReadLimitReached { .. } => Status::unavailable(
-            "forwarded transaction reads are at their limit; retry with backoff",
-        ),
+fn forwarded_query_status(error: QueryError) -> Status {
+    match error {
+        QueryError::ForwardedReadLimitReached { .. } => Status::unavailable(error.to_string()),
         QueryError::Node(error) => node_status(error),
         error => status_from_query_error(&error),
     }
+}
+
+fn forwarded_transaction_status(error: ForwardedTransactionError) -> Status {
+    forwarded_query_status(QueryError::from(error))
 }
 
 fn wallet_utxo_response_len(
@@ -778,14 +791,20 @@ impl NodeAddressHistory {
         Ok(())
     }
 
-    /// Checks that the node still holds the served tip, sharing the call
-    /// with concurrent requests checking the same tip.
+    /// Checks that the node still holds the served tip, charging one history
+    /// slot and sharing the call with concurrent requests checking the same
+    /// tip.
     async fn verify_served_tip(&self) -> Result<(), Status> {
         if self
             .query
-            .node_holds_block(self.served)
+            .node_holds_block_admitted(
+                self.served,
+                &self.reads,
+                ForwardedReadKind::History,
+                self.call_deadline(),
+            )
             .await
-            .map_err(node_status)?
+            .map_err(forwarded_query_status)?
         {
             Ok(())
         } else {

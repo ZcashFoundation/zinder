@@ -401,8 +401,70 @@ pub(crate) fn owned_source_error(error: Arc<SourceError>) -> SourceError {
         SourceError::SourceProtocolMismatch { reason } => {
             SourceError::SourceProtocolMismatch { reason }
         }
+        SourceError::InvalidRawTransactionHex { source } => {
+            SourceError::InvalidRawTransactionHex { source: *source }
+        }
+        SourceError::SourceResponseTooLarge {
+            operation,
+            max_response_bytes,
+        } => SourceError::SourceResponseTooLarge {
+            operation,
+            max_response_bytes: *max_response_bytes,
+        },
+        SourceError::NodeResponseTooLarge { operation, reason } => {
+            SourceError::NodeResponseTooLarge {
+                operation,
+                reason: reason.clone(),
+            }
+        }
+        SourceError::TransparentAddressRowLimitExceeded {
+            operation,
+            max_rows,
+        } => SourceError::TransparentAddressRowLimitExceeded {
+            operation,
+            max_rows: *max_rows,
+        },
+        SourceError::TransparentAddressIndexesUnavailable { reason } => {
+            SourceError::TransparentAddressIndexesUnavailable {
+                reason: reason.clone(),
+            }
+        }
+        SourceError::BlockCommittedDuringRead { operation, reason } => {
+            SourceError::BlockCommittedDuringRead {
+                operation,
+                reason: reason.clone(),
+            }
+        }
+        SourceError::ChainTipChangedDuringFetch {
+            operation,
+            attempts,
+        } => SourceError::ChainTipChangedDuringFetch {
+            operation,
+            attempts: *attempts,
+        },
         SourceError::NodeCapabilityMissing { capability } => SourceError::NodeCapabilityMissing {
             capability: *capability,
+        },
+        SourceError::HistoricalTreeStateUnavailable { height, reason } => {
+            SourceError::HistoricalTreeStateUnavailable {
+                height: *height,
+                reason: reason.clone(),
+            }
+        }
+        SourceError::HistoricalBlockBodyUnavailable { height, reason } => {
+            SourceError::HistoricalBlockBodyUnavailable {
+                height: *height,
+                reason: reason.clone(),
+            }
+        }
+        SourceError::HistoricalSubtreeRootsUnavailable {
+            protocol,
+            start_index,
+            reason,
+        } => SourceError::HistoricalSubtreeRootsUnavailable {
+            protocol: *protocol,
+            start_index: *start_index,
+            reason: reason.clone(),
         },
         other => SourceError::NodeUnavailable {
             reason: other.to_string(),

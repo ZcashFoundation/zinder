@@ -96,10 +96,60 @@ impl LightWalletNodeQuery {
         Ok(&self.source)
     }
 
+    /// Verifies the configured node against the schedule and tip of `target`,
+    /// charging the tip check against `reads` as a `kind` call inside the
+    /// shared check.
+    pub async fn verify_admitted_node(
+        &self,
+        target: &VerifiedNodeTarget,
+        reads: &crate::ForwardedReadLimit,
+        kind: crate::ForwardedReadKind,
+        deadline: tokio::time::Instant,
+    ) -> Result<&ZebraJsonRpcSource, QueryError> {
+        self.verification
+            .verify_schedule_and_capabilities(&self.source, &target.0)
+            .await
+            .map_err(QueryError::Node)?;
+        self.verification
+            .verify_served_tip_admitted(
+                &self.source,
+                &target.0,
+                crate::node_broadcast::AdmittedTipCheck {
+                    limit: reads,
+                    kind,
+                    deadline,
+                },
+            )
+            .await?;
+        Ok(&self.source)
+    }
+
     /// Returns whether the configured node's best chain holds `block`,
     /// sharing one call with concurrent callers asking about the same block.
     pub async fn node_holds_block(&self, block: BlockId) -> Result<bool, SourceError> {
         self.verification.holds_block(&self.source, block).await
+    }
+
+    /// Returns whether the configured node's best chain holds `block`,
+    /// charging one `kind` slot of `reads` inside the shared check.
+    pub async fn node_holds_block_admitted(
+        &self,
+        block: BlockId,
+        reads: &crate::ForwardedReadLimit,
+        kind: crate::ForwardedReadKind,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, QueryError> {
+        self.verification
+            .holds_block_admitted(
+                &self.source,
+                block,
+                crate::node_broadcast::AdmittedTipCheck {
+                    limit: reads,
+                    kind,
+                    deadline,
+                },
+            )
+            .await
     }
 
     /// Verifies the configured node against the currently served reader, and
