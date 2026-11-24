@@ -1,6 +1,7 @@
 use std::{
     fs,
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 #[cfg(unix)]
@@ -22,23 +23,26 @@ use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
     CanonicalBuildBlock, CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest,
     CanonicalLiveAppend, CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, ProjectionBuildAnchor,
-    ProjectionBuildLease, ProjectionBuildLeaseId, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReplayScan, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload, ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId,
+    RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_testkit::process_crash;
 use zinder_wallet_projection::{
     WALLET_PROJECTION_STORE_IDENTITY, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
-    WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildLeaseRequest,
-    WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionFamilyRowCounts,
-    WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition,
+    WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildLease,
+    WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner, WalletProjectionContractError,
+    WalletProjectionFamilyRowCounts, WalletProjectionRetainedEventAnchor,
+    WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildReport,
     RocksDbWalletBuildStore, RocksDbWalletError, RocksDbWalletFollowingStore, RocksDbWalletStore,
     WALLET_ROCKSDB_SCHEMA_VERSION, WalletBuildLeaseHeartbeat, WalletBuildLeasePhase,
-    WalletProjectionBuildLeaseExecution, WalletRecoveryAdmissionConfig,
-    build_wallet_from_canonical, build_wallet_from_canonical_with_lease_and_heartbeat,
+    WalletProjectionBuildLeaseExecution, WalletProjectionReplaySource,
+    WalletRecoveryAdmissionConfig, build_wallet_from_canonical,
+    build_wallet_from_canonical_with_lease_and_heartbeat,
     validate_wallet_projection_pre_promotion_fence,
 };
 
@@ -975,6 +979,113 @@ fn an_over_limit_hashing_worker_count_is_refused_before_building_state_exists()
         })
     ));
     assert!(!wallet_path.exists());
+    Ok(())
+}
+
+/// A replay source that reports a canonical store whose schema version differs
+/// from the wallet projection contract while every other fence field matches,
+/// and records whether a replay scan was opened.
+struct SchemaVersionMismatchReplaySource<'a> {
+    network: Network,
+    ready: CanonicalStoreReadyEvidence,
+    scan_invocations: &'a AtomicU64,
+}
+
+impl WalletProjectionReplaySource for SchemaVersionMismatchReplaySource<'_> {
+    fn wallet_projection_network(&self) -> Network {
+        self.network
+    }
+
+    fn wallet_projection_ready_evidence(&self) -> CanonicalStoreReadyEvidence {
+        self.ready
+    }
+
+    fn wallet_projection_scan(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
+        self.scan_invocations.fetch_add(1, Ordering::Relaxed);
+        Err(CanonicalStoreError::ReplayCancelled)
+    }
+}
+
+fn schema_version_mismatch_source<'a>(
+    canonical_store: &RocksDbCanonicalStore,
+    scan_invocations: &'a AtomicU64,
+) -> SchemaVersionMismatchReplaySource<'a> {
+    let mut ready = canonical_store.ready_evidence();
+    ready.schema_version = 2;
+    SchemaVersionMismatchReplaySource {
+        network: canonical_store.network(),
+        ready,
+        scan_invocations,
+    }
+}
+
+#[test]
+fn canonical_schema_mismatch_is_rejected_at_build_startup_before_scanning_or_creating_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let scan_invocations = AtomicU64::new(0);
+    let source = schema_version_mismatch_source(&canonical_store, &scan_invocations);
+    let wallet_path = temporary.path().join("wallet-schema-mismatch");
+    let staging_path = temporary
+        .path()
+        .join("wallet-schema-mismatch.projection-load-staging");
+    let initialization_path = temporary.path().join("wallet-schema-mismatch.initializing");
+
+    assert!(matches!(
+        build_wallet_from_canonical(
+            &source,
+            &wallet_path,
+            RocksDbWalletBuildOptions::for_local_tests(),
+        ),
+        Err(RocksDbWalletError::CanonicalSourceFenceMismatch { .. })
+    ));
+    assert_eq!(scan_invocations.load(Ordering::Relaxed), 0);
+    assert!(!wallet_path.exists());
+    assert!(!staging_path.exists());
+    assert!(!initialization_path.exists());
+    Ok(())
+}
+
+#[test]
+fn pre_promotion_fence_rejects_a_canonical_schema_mismatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let scan_invocations = AtomicU64::new(0);
+    let source = schema_version_mismatch_source(&canonical_store, &scan_invocations);
+    let ready = source.wallet_projection_ready_evidence();
+    let pinned_anchor = WalletCanonicalSourceIdentity::new(
+        WalletProjectionSourcePosition::new(
+            ready.visible_epoch,
+            ready.visible_tip,
+            ready.visible_event_sequence,
+        ),
+        CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+            ready.sequence_digest_version,
+            ready.visible_block_count,
+            ready.visible_sequence_digest,
+        ),
+        ready.sequence_checkpoint.through(),
+    );
+    let lease = WalletProjectionBuildLease::from_request(
+        WalletProjectionBuildLeaseRequest::new(
+            WalletProjectionBuildOwner::from_bytes([0x91; 16]),
+            pinned_anchor,
+            WalletProjectionRetainedEventAnchor::new(ready.visible_event_sequence),
+            UnixTimestampMillis::new(1),
+        ),
+        0,
+        source.wallet_projection_network(),
+    );
+
+    assert!(matches!(
+        validate_wallet_projection_pre_promotion_fence(&source, lease),
+        Err(RocksDbWalletError::CanonicalSourceFenceMismatch { .. })
+    ));
+    assert_eq!(scan_invocations.load(Ordering::Relaxed), 0);
     Ok(())
 }
 
