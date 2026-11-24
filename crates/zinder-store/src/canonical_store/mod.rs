@@ -11,6 +11,7 @@ mod builder;
 mod construction_manifest;
 mod control;
 mod displaced_archive;
+pub mod edge_snapshot;
 mod event_lifecycle;
 #[cfg(test)]
 mod event_lifecycle_tests;

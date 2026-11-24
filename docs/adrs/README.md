@@ -74,6 +74,7 @@ stop the debate from being repeated.
 | [0021](0021-shared-configuration-sections.md) | Shared configuration sections | Shared configuration sections live in `zinder-runtime`, and each runtime composes only what it uses. |
 | [0022](0022-release-artifacts.md) | Release artifacts | Releases ship reproducible GNU/Linux binaries with signatures, provenance, and SBOMs. |
 | [0023](0023-deployment-profiles.md) | Deployment profiles | A profile coordinates what a deployment's writer stores and what its readers serve and require. Light wallet is the only named profile, and only the light-wallet composition forwards indexed reads to the node. |
+| [0024](0024-verified-edge-snapshot-bootstrap.md) | Verified edge snapshot bootstrap | Publisher signatures and validator attestation admit a private canonical checkpoint before it becomes a writer. |
 
 ## Earlier numbering
 

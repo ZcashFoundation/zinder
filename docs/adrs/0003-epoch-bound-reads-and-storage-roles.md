@@ -26,6 +26,8 @@ Lightwalletd compatibility block ranges, including `GetBlockRangeNullifiers`, re
 
 [Storage backend](../architecture/storage-backend.md) describes the store roles and secondary catch-up, and [Wallet data plane](../architecture/wallet-data-plane.md) describes read consistency for clients. [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#runtime-serving-selection) lists which serving mode forwards which method.
 
+A separate canonical writer can initialize from a publisher checkpoint after private READY admission and validator attestation. The receiver rotates its cursor authentication key before taking ownership. [ADR-0024](0024-verified-edge-snapshot-bootstrap.md).
+
 ## Evidence
 
 - Decision 1 and the paragraph after the decisions: judgment. Pinning an indexed lookup keeps one response on one chain. A block range or an event subscription is paced by its client, so no retained epoch covers it, and it proves continuity by hash linkage or by cursor instead ([ADR-0015](0015-wallet-runtime-composition.md) decision 9, [ADR-0013](0013-chain-event-streams.md)). The tip check lets light-wallet subtree streams keep their starting bounds without holding a reader generation for the whole stream. A delivered response that joins two chains reopens it.
@@ -57,6 +59,7 @@ Lightwalletd compatibility block ranges, including `GetBlockRangeNullifiers`, re
 ## Revision history
 
 - 2026-11-24. Decision 7 binds lean wallet byte retrieval to indexed transaction evidence.
+- 2026-11-24. Linked ADR-0024 for initializing an independent writer from a verified snapshot.
 
 - 2026-11-24. Decision 4 makes secondary storage requirements explicit.
 

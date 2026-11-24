@@ -44,6 +44,8 @@ The longest outages observed so far came from the Zcash node, not from storage. 
 8. **Reads become engine-neutral first.** Read interfaces with RocksDB behind them and a conformance suite for both engines ship before any PostgreSQL reader. Writers keep engine-specific code. Slice 1 then adds a PostgreSQL canonical writer behind stateless lightwalletd-compatible servers, and slice 2 adds wallet projection and native queries. `postgres-horizontal` becomes certified and advertised at the end of slice 2. Writer standby and the Explorer follow.
 9. **Every release declares an upgrade class.** The classes are compatible, additive schema change, projection layout change, and canonical layout change. During a compatible or additive upgrade, the old and new releases must each read and write correctly against the same schema and each other's rows. A layout change raises the affected store's schema version, and each release refuses a store at any other version. A layout change requires a fresh store, built from scratch in a fresh path. Zinder has no in-place migration. Team-operated deployments schedule the rebuild and keep no mandatory rollback lane. A release serves only from a store at its own version, so a self-hoster who wants a fallback keeps the previous binaries and store until the new store passes admission. The release workflow does not record the class, and Zinder has no upgrade command or migration job.
 
+Regional RocksDB instances can initialize independent single-host writers from verified snapshots. Each instance owns its copy and follows its configured validator. [ADR-0024](0024-verified-edge-snapshot-bootstrap.md).
+
 ## Evidence
 
 - Decision 6: judgment. It serves operators who run a managed database and does not relieve a measured limit, so no RocksDB measurement reopens it. Its cost is a second storage engine to build and certify. Decision 7's gate is the observation that reopens it: a threshold the design cannot be reworked to meet. The Context gives the current RocksDB rebuild and restore figures, which this purpose does not depend on.
@@ -82,6 +84,8 @@ The longest outages observed so far came from the Zcash node, not from storage. 
 - **In-place migration.** It needs conversion code per family, recovery for a half-converted store, and tests for every pair of versions. A rebuild reuses the tested construction path.
 
 ## Revision history
+
+- 2026-11-24. Linked ADR-0024 for bootstrapping an independent single-host RocksDB deployment.
 
 - 2026-11-20. Specified private, same-schema restore into an inactive RocksDB deployment and the identity retained by its cursors.
 

@@ -19,6 +19,8 @@ metrics.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 rust-rocksdb.workspace = true
+ring.workspace = true
+rustix.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -36,6 +38,7 @@ incrementalmerkletree.workspace = true
 metrics-exporter-prometheus.workspace = true
 sapling.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
 zcash_primitives.workspace = true
 zinder-testkit.workspace = true
 

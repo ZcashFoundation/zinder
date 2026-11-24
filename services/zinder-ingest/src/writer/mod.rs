@@ -594,7 +594,10 @@ fn validate_retained_history_coverage(
     )
 }
 
-fn configured_first_available_height(checkpoint_height: Option<BlockHeight>) -> BlockHeight {
+/// Returns the first block a store must retain to satisfy a writer configured
+/// with `checkpoint_height`: genesis's successor, or the checkpoint's successor.
+#[must_use]
+pub fn configured_first_available_height(checkpoint_height: Option<BlockHeight>) -> BlockHeight {
     checkpoint_height.map_or(BlockHeight::new(1), |checkpoint_height| {
         BlockHeight::new(checkpoint_height.value().saturating_add(1))
     })

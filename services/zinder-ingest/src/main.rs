@@ -61,6 +61,7 @@ use crate::config::{
 
 mod cli;
 mod config;
+mod edge_snapshot;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
@@ -174,6 +175,8 @@ enum Command {
     /// Probe the operational endpoint once and exit 0 only when it answers
     /// HTTP 200. Reads only `[ops] listen_addr` from the `--config` file.
     Healthcheck(OpsHealthcheckArgs),
+    #[command(flatten)]
+    Snapshot(edge_snapshot::SnapshotCommand),
 }
 
 #[tokio::main]
@@ -1673,6 +1676,15 @@ async fn run_runtime(cli: Cli) -> ExitCode {
         Some(Command::Probe) => run_probe(config_path, overrides).await,
         Some(Command::Healthcheck(healthcheck)) => {
             return run_healthcheck(&healthcheck, config_path.as_deref());
+        }
+        Some(Command::Snapshot(command)) => {
+            return match Box::pin(edge_snapshot::run(command, config_path, overrides)).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    tracing::error!(%error, "edge snapshot command failed");
+                    ExitCode::FAILURE
+                }
+            };
         }
         None => Box::pin(run_ingest(config_path, overrides)).await,
     };

@@ -5,6 +5,7 @@
 
 mod block_hash_index;
 mod canonical_store;
+pub use canonical_store::edge_snapshot;
 mod chain_event;
 mod event_stream;
 mod format;
