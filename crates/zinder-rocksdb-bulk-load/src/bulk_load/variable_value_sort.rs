@@ -14,7 +14,9 @@ use std::{
 };
 use tempfile::{Builder as TemporaryDirectoryBuilder, TempDir};
 
-use super::{BulkLoadError, MAX_MERGE_FAN_IN, path_unavailable};
+#[cfg(test)]
+use super::MAX_MERGE_FAN_IN;
+use super::{BulkLoadError, effective_merge_fan_in, path_unavailable, validate_merge_fan_in};
 
 const VALUE_LENGTH_BYTES: u64 = 8;
 
@@ -119,13 +121,14 @@ impl TemporaryFileBudget {
 
     /// Reserves one more initial run of a sort that already holds a run.
     ///
-    /// A sort that ends with more than `MAX_MERGE_FAN_IN` runs merges them in
-    /// passes that write every record again while the input runs still exist,
-    /// so admission keeps room for twice the total run bytes. A sort that ends
-    /// with fewer runs streams its final merge and stays under that
-    /// reservation. Refusing here, before the run is written, stops a sort that
-    /// cannot finish while records are still arriving instead of after the
-    /// whole input has been spilled.
+    /// A sort that ends with more runs than the active merge fan-in (up to
+    /// `MAX_MERGE_FAN_IN`, reduced when process file-descriptor headroom is
+    /// tight) merges them in passes that write every record again while the
+    /// input runs still exist, so admission keeps room for twice the total run
+    /// bytes. A sort that ends with fewer runs streams its final merge and
+    /// stays under that reservation. Refusing here, before the run is written,
+    /// stops a sort that cannot finish while records are still arriving instead
+    /// of after the whole input has been spilled.
     fn reserve_merged_run(&mut self, bytes: u64) -> Result<(), BulkLoadError> {
         let required_bytes = self
             .bytes_in_use
@@ -276,18 +279,28 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
 
     /// Finishes all runs and opens a bounded streaming reader over sorted records.
     ///
-    /// Merge passes write merged runs only while more than `MAX_MERGE_FAN_IN`
-    /// runs remain. The reader merges the remaining runs as it is read, so the
-    /// last merge never writes a run and reads it back.
-    pub fn finish(mut self) -> Result<SortedVariableValues<KEY_LEN>, BulkLoadError> {
+    /// Merge passes write merged runs only while more runs remain than the
+    /// active merge fan-in (up to `MAX_MERGE_FAN_IN`, reduced when process
+    /// file-descriptor headroom is tight). The reader merges the remaining runs
+    /// as it is read, so the last merge never writes a run and reads it back.
+    pub fn finish(self) -> Result<SortedVariableValues<KEY_LEN>, BulkLoadError> {
+        let merge_fan_in = effective_merge_fan_in();
+        self.finish_with_fan_in(merge_fan_in)
+    }
+
+    fn finish_with_fan_in(
+        mut self,
+        merge_fan_in: usize,
+    ) -> Result<SortedVariableValues<KEY_LEN>, BulkLoadError> {
+        validate_merge_fan_in(merge_fan_in)?;
         let flush_started = Instant::now();
         self.flush_run()?;
         self.durations.final_run_flush = flush_started.elapsed();
         let mut runs = std::mem::take(&mut self.runs);
-        if runs.len() > MAX_MERGE_FAN_IN {
+        if runs.len() > merge_fan_in {
             let merge_started = Instant::now();
-            while runs.len() > MAX_MERGE_FAN_IN {
-                runs = self.merge_pass(runs)?;
+            while runs.len() > merge_fan_in {
+                runs = self.merge_pass(runs, merge_fan_in)?;
                 self.merge_pass_count = self
                     .merge_pass_count
                     .checked_add(1)
@@ -300,7 +313,7 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
                 .checked_add(run.file_bytes)
                 .ok_or_else(|| BulkLoadError::invalid("final run bytes exceed u64::MAX"))
         })?;
-        let source = SortedRunSource::open(runs)?;
+        let source = SortedRunSource::open(runs, merge_fan_in)?;
         let evidence = VariableValueSortEvidence {
             record_count: self.record_count,
             initial_run_count: self.initial_run_count,
@@ -423,12 +436,16 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
             .map_err(|source| path_unavailable(path, source))
     }
 
-    fn merge_pass(&mut self, runs: Vec<RunFile>) -> Result<Vec<RunFile>, BulkLoadError> {
+    fn merge_pass(
+        &mut self,
+        runs: Vec<RunFile>,
+        merge_fan_in: usize,
+    ) -> Result<Vec<RunFile>, BulkLoadError> {
         let mut pending = runs.into_iter();
         let mut merged = Vec::new();
         let mut group_index = 0_u64;
         loop {
-            let group = pending.by_ref().take(MAX_MERGE_FAN_IN).collect::<Vec<_>>();
+            let group = pending.by_ref().take(merge_fan_in).collect::<Vec<_>>();
             if group.is_empty() {
                 break;
             }
@@ -439,7 +456,7 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
                     "merge-{:04}-{:08}.bin",
                     self.merge_pass_count, group_index
                 ));
-                merged.push(self.merge_group(group, output_path)?);
+                merged.push(self.merge_group(group, output_path, merge_fan_in)?);
             }
             group_index = group_index
                 .checked_add(1)
@@ -452,8 +469,14 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
         &mut self,
         input_runs: Vec<RunFile>,
         output_path: PathBuf,
+        merge_fan_in: usize,
     ) -> Result<RunFile, BulkLoadError> {
-        merge_group_with_budget::<KEY_LEN>(&mut self.temporary_files, input_runs, output_path)
+        merge_group_with_budget::<KEY_LEN>(
+            &mut self.temporary_files,
+            input_runs,
+            output_path,
+            merge_fan_in,
+        )
     }
 }
 
@@ -748,11 +771,24 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
         })
     }
 
-    /// Merges any runs beyond `MAX_MERGE_FAN_IN` and opens the streaming reader.
+    /// Merges excess runs and opens a bounded streaming reader.
+    ///
+    /// Runs above the active merge fan-in (up to `MAX_MERGE_FAN_IN`, reduced
+    /// when process file-descriptor headroom is tight) are merged into passes.
     pub fn finish(
         self,
-        mut staged: StagedParallelVariableRuns<KEY_LEN>,
+        staged: StagedParallelVariableRuns<KEY_LEN>,
     ) -> Result<SortedVariableValues<KEY_LEN>, BulkLoadError> {
+        let merge_fan_in = effective_merge_fan_in();
+        self.finish_with_fan_in(staged, merge_fan_in)
+    }
+
+    fn finish_with_fan_in(
+        self,
+        mut staged: StagedParallelVariableRuns<KEY_LEN>,
+        merge_fan_in: usize,
+    ) -> Result<SortedVariableValues<KEY_LEN>, BulkLoadError> {
+        validate_merge_fan_in(merge_fan_in)?;
         if staged.sorter_id != self.sorter_id {
             return Err(BulkLoadError::invalid(
                 "cannot finish variable-value runs staged by another sorter",
@@ -761,13 +797,16 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
         let mut temporary_files = self.shared_budget.into_inner().temporary_files;
         let mut runs = staged.runs;
         let mut merge_pass_count = 0_u64;
-        if runs.len() > MAX_MERGE_FAN_IN {
+        if runs.len() > merge_fan_in {
             let merge_started = Instant::now();
-            while runs.len() > MAX_MERGE_FAN_IN {
+            while runs.len() > merge_fan_in {
                 runs = merge_pass_with_budget::<KEY_LEN>(
                     self.workspace.path(),
                     &mut temporary_files,
-                    merge_pass_count,
+                    MergePassBudget {
+                        pass_count: merge_pass_count,
+                        fan_in: merge_fan_in,
+                    },
                     runs,
                 )?;
                 merge_pass_count = merge_pass_count
@@ -781,7 +820,7 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
                 .checked_add(run.file_bytes)
                 .ok_or_else(|| BulkLoadError::invalid("final run bytes exceed u64::MAX"))
         })?;
-        let source = SortedRunSource::open(runs)?;
+        let source = SortedRunSource::open(runs, merge_fan_in)?;
         let evidence = VariableValueSortEvidence {
             record_count: staged.record_count,
             initial_run_count: staged.initial_run_count,
@@ -1035,17 +1074,24 @@ fn write_staged_records_run<const KEY_LEN: usize>(
         .map_err(|source| path_unavailable(path, source))
 }
 
+#[derive(Clone, Copy)]
+struct MergePassBudget {
+    pass_count: u64,
+    fan_in: usize,
+}
+
 fn merge_pass_with_budget<const KEY_LEN: usize>(
     workspace_path: &Path,
     temporary_files: &mut TemporaryFileBudget,
-    merge_pass_count: u64,
+    pass: MergePassBudget,
     runs: Vec<RunFile>,
 ) -> Result<Vec<RunFile>, BulkLoadError> {
+    validate_merge_fan_in(pass.fan_in)?;
     let mut pending = runs.into_iter();
     let mut merged = Vec::new();
     let mut group_index = 0_u64;
     loop {
-        let group = pending.by_ref().take(MAX_MERGE_FAN_IN).collect::<Vec<_>>();
+        let group = pending.by_ref().take(pass.fan_in).collect::<Vec<_>>();
         if group.is_empty() {
             break;
         }
@@ -1053,11 +1099,12 @@ fn merge_pass_with_budget<const KEY_LEN: usize>(
             merged.extend(group);
         } else {
             let output_path =
-                workspace_path.join(format!("merge-{merge_pass_count:04}-{group_index:08}.bin"));
+                workspace_path.join(format!("merge-{:04}-{group_index:08}.bin", pass.pass_count));
             merged.push(merge_group_with_budget::<KEY_LEN>(
                 temporary_files,
                 group,
                 output_path,
+                pass.fan_in,
             )?);
         }
         group_index = group_index
@@ -1071,6 +1118,7 @@ fn merge_group_with_budget<const KEY_LEN: usize>(
     temporary_files: &mut TemporaryFileBudget,
     input_runs: Vec<RunFile>,
     output_path: PathBuf,
+    merge_fan_in: usize,
 ) -> Result<RunFile, BulkLoadError> {
     let input_file_bytes = input_runs.iter().try_fold(0_u64, |total, run| {
         total
@@ -1079,8 +1127,8 @@ fn merge_group_with_budget<const KEY_LEN: usize>(
     })?;
     let output_file_bytes = input_file_bytes;
     temporary_files.reserve(output_file_bytes)?;
-    let merge_result = merge_run_group::<KEY_LEN>(&input_runs, &output_path);
-    if let Err(source) = merge_result {
+    let merge_outcome = merge_run_group::<KEY_LEN>(&input_runs, &output_path, merge_fan_in);
+    if let Err(source) = merge_outcome {
         discard_reserved_file(&output_path, temporary_files, output_file_bytes)?;
         return Err(source);
     }
@@ -1288,7 +1336,8 @@ enum SortedRunSource<const KEY_LEN: usize> {
     Drained,
     /// One run, read front to back.
     Single(RunReader),
-    /// At most `MAX_MERGE_FAN_IN` runs, merged by smallest key as they are read.
+    /// At most the active merge fan-in runs (up to `MAX_MERGE_FAN_IN`), merged
+    /// by smallest key as they are read.
     Merging {
         runs: Vec<RunReader>,
         heads: BinaryHeap<Reverse<([u8; KEY_LEN], usize, u64)>>,
@@ -1297,10 +1346,11 @@ enum SortedRunSource<const KEY_LEN: usize> {
 }
 
 impl<const KEY_LEN: usize> SortedRunSource<KEY_LEN> {
-    fn open(mut runs: Vec<RunFile>) -> Result<Self, BulkLoadError> {
-        if runs.len() > MAX_MERGE_FAN_IN {
+    fn open(mut runs: Vec<RunFile>, merge_fan_in: usize) -> Result<Self, BulkLoadError> {
+        validate_merge_fan_in(merge_fan_in)?;
+        if runs.len() > merge_fan_in {
             return Err(BulkLoadError::invalid(
-                "variable merge exceeded its fixed file-descriptor fan-in",
+                "variable merge exceeded its file-descriptor fan-in",
             ));
         }
         if runs.len() <= 1 {
@@ -1395,10 +1445,12 @@ struct RunHead<const KEY_LEN: usize> {
 fn merge_run_group<const KEY_LEN: usize>(
     input_runs: &[RunFile],
     output_path: &Path,
+    merge_fan_in: usize,
 ) -> Result<(), BulkLoadError> {
-    if input_runs.len() > MAX_MERGE_FAN_IN {
+    validate_merge_fan_in(merge_fan_in)?;
+    if input_runs.len() > merge_fan_in {
         return Err(BulkLoadError::invalid(
-            "variable merge exceeded its fixed file-descriptor fan-in",
+            "variable merge exceeded its file-descriptor fan-in",
         ));
     }
     let mut readers = Vec::with_capacity(input_runs.len());
@@ -1531,6 +1583,12 @@ fn encoded_run_record_bytes<const KEY_LEN: usize>(value_len: usize) -> Result<u6
         .checked_add(VALUE_LENGTH_BYTES)
         .and_then(|bytes| bytes.checked_add(value_bytes))
         .ok_or_else(|| BulkLoadError::invalid("encoded run record bytes exceed u64::MAX"))
+}
+
+#[cfg(test)]
+pub(super) fn one_record_memory_limit_bytes<const KEY_LEN: usize>(value_len: usize) -> u64 {
+    u64::try_from(size_of::<StagedVariableValue<KEY_LEN>>().saturating_add(value_len))
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1897,7 +1955,8 @@ mod tests {
     fn exactly_the_fan_in_streams_without_a_written_merge() -> Result<(), Box<dyn std::error::Error>>
     {
         let temporary = TempDir::new()?;
-        let fan_in = u16::try_from(MAX_MERGE_FAN_IN)?;
+        let active_fan_in = effective_merge_fan_in();
+        let fan_in = u16::try_from(active_fan_in)?;
         let max_temporary_bytes = u64::from(fan_in)
             .saturating_mul(encoded_run_record_bytes::<2>(1)?)
             .saturating_mul(2);
@@ -1911,7 +1970,7 @@ mod tests {
             staged_sort.push(number.to_be_bytes(), &[number.to_be_bytes()[1]])?;
         }
         let mut sorted_records = staged_sort.finish()?;
-        assert_eq!(sorted_records.run_paths().len(), MAX_MERGE_FAN_IN);
+        assert_eq!(sorted_records.run_paths().len(), active_fan_in);
         assert_eq!(sorted_records.evidence().merge_pass_count, 0);
         let mut keys = Vec::new();
         while let Some(record) = sorted_records.next_record()? {

@@ -1,5 +1,5 @@
 kind: changed
-body: Raised external sort merge fan-in from `64` to `256` runs and recycled half of `projector.build.max_outpoint_sort_memory_bytes` into the address-transaction sorter after outpoint sorting completes to eliminate intermediate merge spills during Mainnet wallet construction, added ancestor cgroup v2 `memory.max` and `memory.high` detection so processes honor systemd slice memory caps, created missing parent directories for `zinder-projector`'s canonical secondary path at startup, and reported exact configured paths and underlying OS errors on missing-directory failures across `zinder-projector` and `publish-shielded-history`.
+body: Raised external sort merge fan-in up to `256` runs (automatically scaled down when process file-descriptor headroom is tight) and recycled half of `projector.build.max_outpoint_sort_memory_bytes` into the address-transaction sorter after outpoint sorting completes to eliminate intermediate merge spills during Mainnet wallet construction, added ancestor cgroup v2 `memory.max` and `memory.high` detection so processes honor systemd slice memory caps, created missing parent directories for `zinder-projector`'s canonical secondary path at startup, and reported exact configured paths and underlying error causes across `zinder-projector` and `publish-shielded-history`.
 time: 2026-11-25T12:34:13Z
 custom:
     Bump: patch

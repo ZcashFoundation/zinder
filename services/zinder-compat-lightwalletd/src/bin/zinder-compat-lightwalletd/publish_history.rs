@@ -151,6 +151,20 @@ struct SecondaryOpenError {
     source: CanonicalStoreError,
 }
 
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut nested = error.source();
+    while let Some(cause) = nested {
+        let cause_text = cause.to_string();
+        if !cause_text.is_empty() && !rendered.contains(&cause_text) {
+            rendered.push_str(": ");
+            rendered.push_str(&cause_text);
+        }
+        nested = cause.source();
+    }
+    rendered
+}
+
 impl fmt::Display for SecondaryOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -158,7 +172,7 @@ impl fmt::Display for SecondaryOpenError {
             "could not open canonical secondary {} against canonical primary {}: {}",
             self.secondary_path.display(),
             self.primary_path.display(),
-            self.source
+            format_error_chain(&self.source)
         )
     }
 }
@@ -269,6 +283,39 @@ mod tests {
         let message = wrapped.to_string();
         assert!(message.contains("/secondary"), "{message}");
         assert!(message.contains("/canonical"), "{message}");
+    }
+
+    #[test]
+    fn wrapped_secondary_open_error_displays_nested_rocksdb_cause() -> io::Result<()> {
+        let files = tempfile::tempdir()?;
+        let missing_primary = files.path().join("missing/canonical");
+        let Err(rocks_error) =
+            rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), &missing_primary)
+        else {
+            return Err(io::Error::other("missing RocksDB path should fail list_cf"));
+        };
+        let rocks_message = rocks_error.to_string();
+        let wrapped = io::Error::other(SecondaryOpenError {
+            primary_path: missing_primary.clone(),
+            secondary_path: PathBuf::from("/secondary"),
+            source: CanonicalStoreError::RocksDbOperation {
+                operation: "open canonical secondary",
+                source: rocks_error,
+            },
+        });
+        assert!(!reader_invalidated(&wrapped));
+        let rendered = wrapped.to_string();
+        assert!(rendered.contains("/secondary"), "{rendered}");
+        assert!(
+            rendered.contains(&missing_primary.display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("canonical store RocksDB open canonical secondary failed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&rocks_message), "{rendered}");
+        Ok(())
     }
 
     #[test]

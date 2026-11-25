@@ -18,5 +18,8 @@ sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
+
 [lints]
 workspace = true
