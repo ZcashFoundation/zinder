@@ -1,6 +1,0 @@
-kind: changed
-body: Canonical schema v1 now stores the serialized transaction SHA-256 digest in each 72-byte transaction location value. Rebuild pre-release canonical stores that use the 40-byte layout. New canonical and wallet SSTs use compression selected by column family, with Zstandard level 3 for cold canonical data and LZ4 for frequently accessed data.
-time: 2026-11-24T06:40:42.349790129Z
-custom:
-    Bump: major
-    PR: "536"

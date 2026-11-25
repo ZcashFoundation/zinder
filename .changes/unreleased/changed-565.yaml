@@ -1,6 +1,0 @@
-kind: changed
-body: 'Wallet reads that `light-wallet` and lean `wallet` serving forward to the node, such as `GetTransaction`, transparent address history, and UTXO lookups, now wait up to 10 seconds for one of 32 shared node-call slots instead of failing at once, and repeated transaction lookups are served from a 64 MiB verified cache; tune them with `forwarded_read_max_concurrent`, `forwarded_read_wait_ms`, `forwarded_read_waiters_per_slot`, and `forwarded_transaction_cache_bytes` under `[query]` or `[compat]`. A read still refused after the wait returns `UNAVAILABLE` on the lightwalletd surface and `RESOURCE_EXHAUSTED` with the new `FORWARDED_READ_LIMIT_REACHED` reason natively, and the `zinder_forwarded_read_*` and `zinder_forwarded_transaction_cache_lookups_total` metrics report the queue.'
-time: 2026-11-24T22:52:00.000000000Z
-custom:
-    Bump: minor
-    PR: "565"

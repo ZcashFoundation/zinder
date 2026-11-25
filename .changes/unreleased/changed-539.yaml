@@ -1,6 +1,0 @@
-kind: changed
-body: Choose wallet for complete wallet history and a local transparent index without storing raw blobs. Mined transaction bodies are verified against the canonical transaction digest when fetched from the primary node. Choose wallet-archive to retain all raw blobs. Replace the removed light-wallet-qualification serving alias with light-wallet.
-time: 2026-11-24T09:17:52.897339362Z
-custom:
-    Bump: major
-    PR: "539"

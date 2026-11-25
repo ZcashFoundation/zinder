@@ -1,6 +1,0 @@
-kind: added
-body: Operators can export an Ed25519-signed canonical RocksDB snapshot and bootstrap an independent ingest writer from a local directory or HTTP(S). Bootstrap verifies the signed file inventory and checks consensus anchors against the configured validator before installing the store with fresh cursor authentication.
-time: 2026-11-24T09:27:01.806798152Z
-custom:
-    Bump: minor
-    PR: "541"

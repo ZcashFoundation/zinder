@@ -1,6 +1,0 @@
-kind: fixed
-body: When a Zebra node refuses a JSON-RPC call with HTTP 429 because it holds its connection limit, Zinder now reports it as the retryable `UNAVAILABLE` reason `NODE_RATE_LIMITED` instead of `NODE_UNAVAILABLE`, counts it in `zinder_node_rate_limited_total`, and moves a broadcast to the next configured node. Each process now keeps at most `node.max_concurrent_requests` calls (default 64) in flight to one node, and readiness probes no longer wait behind those calls. When several Zinder processes share one node, keep the sum of their limits below the node's connection limit.
-time: 2026-11-24T21:23:28.694941774Z
-custom:
-    Bump: minor
-    PR: "562"
