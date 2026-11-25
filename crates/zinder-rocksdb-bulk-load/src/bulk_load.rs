@@ -949,24 +949,25 @@ impl PipelineControl {
     }
 
     fn abort(&self) {
+        let mut guard = self.state.lock();
+        guard.aborted = true;
         self.aborted_flag.store(true, Ordering::Release);
-        self.state.lock().aborted = true;
+        drop(guard);
         self.released.notify_all();
     }
 
     fn fail(&self, failure: BulkLoadError) {
-        self.aborted_flag.store(true, Ordering::Release);
         let mut guard = self.state.lock();
         if guard.error.is_none() {
             guard.error = Some(failure);
         }
         guard.aborted = true;
+        self.aborted_flag.store(true, Ordering::Release);
         drop(guard);
         self.released.notify_all();
     }
 
     fn fail_if_unterminated(&self, reason: &'static str) {
-        self.aborted_flag.store(true, Ordering::Release);
         let mut guard = self.state.lock();
         if !guard.aborted {
             if guard.error.is_none() {
@@ -974,6 +975,7 @@ impl PipelineControl {
             }
             guard.aborted = true;
         }
+        self.aborted_flag.store(true, Ordering::Release);
         drop(guard);
         self.released.notify_all();
     }
@@ -2271,5 +2273,71 @@ mod tests {
                 if reason.contains("strictly increasing")
         ));
         Ok(())
+    }
+
+    #[test]
+    fn pipeline_control_publishes_aborted_flag_after_recording_root_error() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Duration,
+        };
+
+        let fail_control = Arc::new(PipelineControl::new(1024));
+        let entered_fail = Arc::new(AtomicBool::new(false));
+        let fail_guard = fail_control.state.lock();
+        thread::scope(|scope| {
+            let control_for_thread = Arc::clone(&fail_control);
+            let entered_for_thread = Arc::clone(&entered_fail);
+            let handle = scope.spawn(move || {
+                entered_for_thread.store(true, Ordering::Release);
+                control_for_thread
+                    .fail(BulkLoadError::invalid("simulated write worker root error"));
+            });
+            while !entered_fail.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(10));
+            assert!(
+                !fail_control.is_aborted(),
+                "aborted_flag must not become visible before root error is recorded"
+            );
+            drop(fail_guard);
+            assert!(handle.join().is_ok());
+        });
+        assert!(fail_control.is_aborted());
+        assert!(matches!(
+            fail_control.check_error(),
+            Err(BulkLoadError::InvalidInput { ref reason })
+                if reason == "simulated write worker root error"
+        ));
+
+        let unterminated_control = Arc::new(PipelineControl::new(1024));
+        let entered_unterminated = Arc::new(AtomicBool::new(false));
+        let unterminated_guard = unterminated_control.state.lock();
+        thread::scope(|scope| {
+            let control_for_thread = Arc::clone(&unterminated_control);
+            let entered_for_thread = Arc::clone(&entered_unterminated);
+            let handle = scope.spawn(move || {
+                entered_for_thread.store(true, Ordering::Release);
+                control_for_thread
+                    .fail_if_unterminated("worker terminated unexpectedly without closing");
+            });
+            while !entered_unterminated.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(10));
+            assert!(
+                !unterminated_control.is_aborted(),
+                "aborted_flag must not become visible before unterminated error is recorded"
+            );
+            drop(unterminated_guard);
+            assert!(handle.join().is_ok());
+        });
+        assert!(unterminated_control.is_aborted());
+        assert!(matches!(
+            unterminated_control.check_error(),
+            Err(BulkLoadError::InvalidInput { ref reason })
+                if reason == "worker terminated unexpectedly without closing"
+        ));
     }
 }

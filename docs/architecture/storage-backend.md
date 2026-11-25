@@ -193,7 +193,7 @@ scanning the unsettled suffix serially for `reorg_undo`). Construction hashes
 rows on `projector.build.accumulator_hashing_workers` threads, in batches,
 while the build thread drains its sorters and writes SST files (and, above 1 worker,
 overlaps the secondary address-index/balance and address-transaction sort-and-drain
-branches, splitting hashing threads between them, while offloading `SstFileWriter`
+branches, sharing the build's hashing worker pool and global batch budget between them, while offloading `SstFileWriter`
 writes and dual SHA-256 evidence hashing onto bounded-memory worker queues capped
 at `clamp(sst_target_logical_bytes / 8, 64 KiB, 4 MiB)` per open bulk SST writer,
 at most 12 MiB across the 3 concurrent secondary writers). Each batch is allocated

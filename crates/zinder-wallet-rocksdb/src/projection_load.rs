@@ -1485,16 +1485,6 @@ impl Drop for SetAbortOnUnwind<'_> {
     }
 }
 
-fn secondary_branch_hashing_workers(total: NonZeroU32) -> (NonZeroU32, NonZeroU32) {
-    let total_workers = total.get();
-    let index_workers = (total_workers / 2).max(1);
-    let tx_workers = total_workers.saturating_sub(index_workers).max(1);
-    (
-        NonZeroU32::new(index_workers).unwrap_or(NonZeroU32::MIN),
-        NonZeroU32::new(tx_workers).unwrap_or(NonZeroU32::MIN),
-    )
-}
-
 fn derive_secondary_address_artifacts(
     config: WalletProjectionLoadConfig<'_>,
     sorters: SecondaryDerivationSorters,
@@ -1504,24 +1494,23 @@ fn derive_secondary_address_artifacts(
 ) -> Result<SecondaryAddressDerivationArtifacts, RocksDbWalletError> {
     let step_started = Instant::now();
     let aborted = AtomicBool::new(false);
-    let (index_branch, tx_branch) = if config.accumulator_hashing_workers.get() == 1 {
-        let index_branch = match run_address_index_branch(
-            config,
-            sorters.address_index,
-            NonZeroU32::MIN,
-            &aborted,
-        ) {
-            SecondaryBranchOutcome::Completed(completed) => completed,
-            SecondaryBranchOutcome::Failed(error) => return Err(error),
-            SecondaryBranchOutcome::SiblingAborted => {
-                return Err(RocksDbWalletError::SecondaryDerivationWorkerStopped);
-            }
-        };
+    let branch_pool = accumulators.take_branch_hashing_pool()?;
+    let (index_branch, tx_branch) = if let Some(pool) = branch_pool.as_ref() {
+        run_concurrent_secondary_branches(config, sorters, retained_undo, pool, &aborted)?
+    } else {
+        let index_branch =
+            match run_address_index_branch(config, sorters.address_index, None, &aborted) {
+                SecondaryBranchOutcome::Completed(completed) => completed,
+                SecondaryBranchOutcome::Failed(error) => return Err(error),
+                SecondaryBranchOutcome::SiblingAborted => {
+                    return Err(RocksDbWalletError::SecondaryDerivationWorkerStopped);
+                }
+            };
         let tx_branch = match run_address_transaction_branch(
             config,
             sorters.address_transaction,
             retained_undo,
-            NonZeroU32::MIN,
+            None,
             &aborted,
         ) {
             SecondaryBranchOutcome::Completed(completed) => completed,
@@ -1531,9 +1520,10 @@ fn derive_secondary_address_artifacts(
             }
         };
         (index_branch, tx_branch)
-    } else {
-        run_concurrent_secondary_branches(config, sorters, retained_undo, &aborted)?
     };
+    if let Some(pool) = branch_pool {
+        accumulators.restore_branch_hashing_pool(pool);
+    }
     accumulators.combine_branch(&index_branch.accumulators)?;
     accumulators.combine_branch(&tx_branch.accumulators)?;
     sst_evidence.merge(&index_branch.evidence)?;
@@ -1562,6 +1552,7 @@ fn run_concurrent_secondary_branches(
     config: WalletProjectionLoadConfig<'_>,
     sorters: SecondaryDerivationSorters,
     retained_undo: &mut RetainedUndo,
+    branch_pool: &crate::accumulator_hashing::BranchHashingPool,
     aborted: &AtomicBool,
 ) -> Result<
     (
@@ -1570,8 +1561,7 @@ fn run_concurrent_secondary_branches(
     ),
     RocksDbWalletError,
 > {
-    let (index_workers, tx_workers) =
-        secondary_branch_hashing_workers(config.accumulator_hashing_workers);
+    let (index_hashing, tx_hashing) = branch_pool.split_two();
     std::thread::scope(|scope| {
         let tx_handle = std::thread::Builder::new()
             .name("zinder-addr-tx".to_owned())
@@ -1580,7 +1570,7 @@ fn run_concurrent_secondary_branches(
                     config,
                     sorters.address_transaction,
                     retained_undo,
-                    tx_workers,
+                    Some(tx_hashing),
                     aborted,
                 )
             })
@@ -1590,7 +1580,7 @@ fn run_concurrent_secondary_branches(
                 },
             )?;
         let index_outcome =
-            run_address_index_branch(config, sorters.address_index, index_workers, aborted);
+            run_address_index_branch(config, sorters.address_index, Some(index_hashing), aborted);
         let tx_join = tx_handle.join();
         resolve_secondary_branch_outcomes(index_outcome, tx_join)
     })
@@ -1624,7 +1614,7 @@ fn resolve_secondary_branch_outcomes(
 fn run_address_index_branch(
     config: WalletProjectionLoadConfig<'_>,
     sorter: VariableValueSorter<ADDRESS_UNSPENT_KEY_BYTES>,
-    hashing_workers: NonZeroU32,
+    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
     aborted: &AtomicBool,
 ) -> SecondaryBranchOutcome<AddressIndexBranchOutput> {
     let _abort_on_unwind = SetAbortOnUnwind(aborted);
@@ -1658,7 +1648,7 @@ fn run_address_index_branch(
             "wallet-address-balance",
         )?;
         let mut branch_accumulators =
-            ConstructionAccumulators::start(config.network, hashing_workers)?;
+            ConstructionAccumulators::start_optional_branch(config.network, branch_hashing);
         let mut branch_evidence = WalletProjectionSstEvidence::default();
         let mut targets = AddressIndexTargets {
             index_writer: &mut index_writer,
@@ -1701,7 +1691,7 @@ fn run_address_transaction_branch(
     config: WalletProjectionLoadConfig<'_>,
     sorter: VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
     retained_undo: &mut RetainedUndo,
-    hashing_workers: NonZeroU32,
+    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
     aborted: &AtomicBool,
 ) -> SecondaryBranchOutcome<AddressTransactionBranchOutput> {
     let _abort_on_unwind = SetAbortOnUnwind(aborted);
@@ -1730,7 +1720,7 @@ fn run_address_transaction_branch(
             "wallet-address-transaction",
         )?;
         let mut branch_accumulators =
-            ConstructionAccumulators::start(config.network, hashing_workers)?;
+            ConstructionAccumulators::start_optional_branch(config.network, branch_hashing);
         let mut branch_evidence = WalletProjectionSstEvidence::default();
         let mut targets = AddressTransactionTargets {
             writer: &mut writer,
@@ -3610,7 +3600,7 @@ mod tests {
     }
 
     #[test]
-    fn pipelined_sst_queue_budget_and_worker_split_stay_bounded() -> Result<(), Box<dyn Error>> {
+    fn pipelined_sst_queue_budget_stays_bounded() {
         assert_eq!(pipelined_sst_queue_budget_bytes(0), 64 * 1024);
         assert_eq!(pipelined_sst_queue_budget_bytes(512 * 1024), 64 * 1024);
         assert_eq!(
@@ -3621,13 +3611,6 @@ mod tests {
             pipelined_sst_queue_budget_bytes(128 * 1024 * 1024),
             4 * 1024 * 1024
         );
-
-        for count in 2_u32..=64 {
-            let total = NonZeroU32::new(count).ok_or("zero")?;
-            let (index_workers, tx_workers) = secondary_branch_hashing_workers(total);
-            assert_eq!(index_workers.get() + tx_workers.get(), count);
-        }
-        Ok(())
     }
 
     #[test]
