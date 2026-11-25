@@ -5,14 +5,14 @@ use std::{
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use eyre::{Result, eyre};
 use serde_json::json;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Notify};
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::{Code, Request, Status, transport::Channel};
 use tonic_types::StatusExt as _;
@@ -650,7 +650,11 @@ async fn history_after_a_rollback_the_node_recovers_from_is_unavailable() -> Res
     Ok(())
 }
 
-fn catch_up_node_stubs(node_tip: &Arc<parking_lot::Mutex<BlockId>>) -> Result<[JsonRpcStub; 2]> {
+fn catch_up_node_stubs(
+    node_tip: &Arc<parking_lot::Mutex<BlockId>>,
+    utxo_replies: &Arc<AtomicUsize>,
+    utxo_reply_notify: &Arc<Notify>,
+) -> Result<[JsonRpcStub; 2]> {
     let script = hex::encode(
         zinder_source::parse_transparent_address(ADDRESS)?
             .script()
@@ -658,6 +662,8 @@ fn catch_up_node_stubs(node_tip: &Arc<parking_lot::Mutex<BlockId>>) -> Result<[J
     );
     let tips_for_best = Arc::clone(node_tip);
     let tips_for_utxos = Arc::clone(node_tip);
+    let replies = Arc::clone(utxo_replies);
+    let notify = Arc::clone(utxo_reply_notify);
     Ok([
         method("getbestblockheightandhash").reply_with(move |_| {
             let tip = *tips_for_best.lock();
@@ -677,7 +683,10 @@ fn catch_up_node_stubs(node_tip: &Arc<parking_lot::Mutex<BlockId>>) -> Result<[J
                     &script,
                 ));
             }
-            utxos_at(tip, &json!(rows))
+            let reply = utxos_at(tip, &json!(rows));
+            replies.fetch_add(1, Ordering::Release);
+            notify.notify_waiters();
+            reply
         }),
     ])
 }
@@ -689,6 +698,8 @@ struct CatchUpFixture {
     initial_reader: Arc<RocksDbCanonicalReader>,
     next_reader: Arc<RocksDbCanonicalReader>,
     node_tip: Arc<parking_lot::Mutex<BlockId>>,
+    utxo_replies: Arc<AtomicUsize>,
+    utxo_reply_notify: Arc<Notify>,
     block2: BlockId,
     block3: BlockId,
     block4: BlockId,
@@ -738,7 +749,13 @@ impl CatchUpFixture {
         let next_reader = Arc::new(RocksDbCanonicalReader::new(next_canonical)?);
 
         let node_tip = Arc::new(parking_lot::Mutex::new(block3));
-        let node = verifiable_node(&schedule, block2.hash, catch_up_node_stubs(&node_tip)?)?;
+        let utxo_replies = Arc::new(AtomicUsize::new(0));
+        let utxo_reply_notify = Arc::new(Notify::new());
+        let node = verifiable_node(
+            &schedule,
+            block2.hash,
+            catch_up_node_stubs(&node_tip, &utxo_replies, &utxo_reply_notify)?,
+        )?;
         let source = ZebraJsonRpcSource::new(
             Network::ZcashRegtest,
             node.url(),
@@ -761,6 +778,8 @@ impl CatchUpFixture {
             initial_reader,
             next_reader,
             node_tip,
+            utxo_replies,
+            utxo_reply_notify,
             block2,
             block3,
             block4,
@@ -780,6 +799,25 @@ impl CatchUpFixture {
 
     fn utxo_calls(&self) -> Result<usize> {
         Ok(self.node.requests_for("getaddressutxos")?.len())
+    }
+
+    fn utxo_reply_count(&self) -> usize {
+        self.utxo_replies.load(Ordering::Acquire)
+    }
+
+    async fn await_utxo_replies(&self, target_replies: usize) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let notified = self.utxo_reply_notify.notified();
+                if self.utxo_replies.load(Ordering::Acquire) >= target_replies {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| eyre!("timed out waiting for {target_replies} getaddressutxos replies"))?;
+        Ok(())
     }
 }
 
@@ -870,6 +908,24 @@ async fn utxo_and_balance_refuse_served_tip_mismatch_immediately_when_tip_wait_d
 }
 
 #[tokio::test]
+async fn utxo_and_balance_refuse_immediately_when_forwarded_read_wait_is_zero() -> Result<()> {
+    let zero_wait =
+        ForwardedReadLimit::new(ForwardedReadConfig::resolve(None, Some(0), None, None)?);
+    let fixture = CatchUpFixture::new(default_tip_wait(Duration::from_secs(5)), zero_wait)?;
+    with_served_view_client(fixture.adapter.clone(), async |mut client| {
+        for forwarded_method in ALL_FORWARDED_METHODS {
+            let started = Instant::now();
+            served_tip_mismatch(call_forwarded_method(&mut client, forwarded_method).await)?;
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        Ok(())
+    })
+    .await?;
+    assert_eq!(fixture.utxo_calls()?, ALL_FORWARDED_METHODS.len());
+    Ok(())
+}
+
+#[tokio::test]
 async fn utxo_and_balance_catch_up_within_tip_wait_and_retry_once() -> Result<()> {
     let fixture = CatchUpFixture::new(
         default_tip_wait(Duration::from_secs(3)),
@@ -878,19 +934,21 @@ async fn utxo_and_balance_catch_up_within_tip_wait_and_retry_once() -> Result<()
     for forwarded_method in ALL_FORWARDED_METHODS {
         fixture.reset_to_block2();
         let before_calls = fixture.utxo_calls()?;
-        let slot = fixture.slot.clone();
-        let next_reader = Arc::clone(&fixture.next_reader);
-        let publisher = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            drop(slot.publish(next_reader));
+        let before_replies = fixture.utxo_reply_count();
+        let adapter = fixture.adapter.clone();
+        let in_flight = tokio::spawn(async move {
+            with_served_view_client(adapter, async |mut client| {
+                call_forwarded_method(&mut client, forwarded_method)
+                    .await
+                    .map_err(|status| {
+                        eyre!("{forwarded_method:?} failed after catch-up: {status:?}")
+                    })
+            })
+            .await
         });
-        let answer = with_served_view_client(fixture.adapter.clone(), async |mut client| {
-            call_forwarded_method(&mut client, forwarded_method)
-                .await
-                .map_err(|status| eyre!("{forwarded_method:?} failed after catch-up: {status:?}"))
-        })
-        .await?;
-        publisher.await?;
+        fixture.await_utxo_replies(before_replies + 1).await?;
+        fixture.publish_block3();
+        let answer = in_flight.await??;
         match forwarded_method {
             ForwardedMethod::AddressUtxos | ForwardedMethod::AddressUtxosStream => {
                 assert_eq!(answer, ForwardedAnswer::UtxoHeights(vec![1, 3]));
@@ -942,6 +1000,7 @@ async fn utxo_tip_wait_releases_forwarded_response_permit_before_waiting() -> Re
     ] {
         fixture.reset_to_block2();
         let before_calls = fixture.utxo_calls()?;
+        let before_replies = fixture.utxo_reply_count();
         let adapter = fixture.adapter.clone();
         let in_flight = tokio::spawn(async move {
             with_served_view_client(adapter, async |mut client| {
@@ -951,22 +1010,24 @@ async fn utxo_tip_wait_releases_forwarded_response_permit_before_waiting() -> Re
             })
             .await
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while fixture.utxo_calls()? <= before_calls {
-                tokio::task::yield_now().await;
+        fixture.await_utxo_replies(before_replies + 1).await?;
+        let probe_permit = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(permit) = reads
+                    .admit_response(
+                        ForwardedResponseKind::UtxoResponse,
+                        tokio::time::Instant::now(),
+                    )
+                    .await
+                {
+                    return permit;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            Ok::<_, eyre::Report>(())
         })
-        .await??;
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        .await
+        .map_err(|_| eyre!("response permit stayed held during TipWait"))?;
         assert!(!in_flight.is_finished());
-        let probe_permit = reads
-            .admit_response(
-                ForwardedResponseKind::UtxoResponse,
-                tokio::time::Instant::now(),
-            )
-            .await
-            .map_err(|refused| eyre!("response permit stayed held during TipWait: {refused}"))?;
         drop(probe_permit);
         fixture.publish_block3();
         let answer = in_flight.await??;
@@ -1001,21 +1062,19 @@ async fn utxo_and_balance_do_not_wait_on_same_height_fork_and_retry_at_most_once
     ] {
         fixture.reset_to_block2();
         let before_calls = fixture.utxo_calls()?;
-        let slot = fixture.slot.clone();
-        let next_reader = Arc::clone(&fixture.next_reader);
-        let node_tip = Arc::clone(&fixture.node_tip);
-        let block4 = fixture.block4;
-        let advance = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            *node_tip.lock() = block4;
-            drop(slot.publish(next_reader));
-        });
+        let before_replies = fixture.utxo_reply_count();
         let started = Instant::now();
-        with_served_view_client(fixture.adapter.clone(), async |mut client| {
-            served_tip_mismatch(call_forwarded_method(&mut client, forwarded_method).await)
-        })
-        .await?;
-        advance.await?;
+        let adapter = fixture.adapter.clone();
+        let in_flight = tokio::spawn(async move {
+            with_served_view_client(adapter, async |mut client| {
+                served_tip_mismatch(call_forwarded_method(&mut client, forwarded_method).await)
+            })
+            .await
+        });
+        fixture.await_utxo_replies(before_replies + 1).await?;
+        *fixture.node_tip.lock() = fixture.block4;
+        fixture.publish_block3();
+        in_flight.await??;
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(fixture.utxo_calls()? - before_calls, 2);
     }

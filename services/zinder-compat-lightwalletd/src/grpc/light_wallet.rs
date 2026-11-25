@@ -303,10 +303,9 @@ impl NodeBackedLightWallet {
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         // The node's balance RPC does not report the tip it answered at, so
         // the balance is summed from outputs the node attests at the served tip.
-        let deadline_cap = (!self.reads.config().wait().is_zero()).then_some(self.reads.deadline());
+        let deadline = self.reads.deadline();
         let unspent = self
-            .run_with_tip_wait(method, tip_wait, deadline_cap, || async {
-                let deadline = deadline_cap.unwrap_or_else(|| self.reads.deadline());
+            .run_with_tip_wait(method, tip_wait, deadline, || async {
                 let view = served_view(&self.slot.capture()).map_err(UtxoAttemptError::Status)?;
                 let reads = NodeReads {
                     node: self
@@ -360,10 +359,9 @@ impl NodeBackedLightWallet {
         // The response slot is taken before any node-call slot, so this
         // request never holds a node-call slot while it waits, and it is
         // dropped before TipWait waits on a mismatch.
-        let deadline_cap = (!self.reads.config().wait().is_zero()).then_some(self.reads.deadline());
+        let deadline = self.reads.deadline();
         let (mut rows, response_permit) = self
-            .run_with_tip_wait(method, tip_wait, deadline_cap, || async {
-                let deadline = deadline_cap.unwrap_or_else(|| self.reads.deadline());
+            .run_with_tip_wait(method, tip_wait, deadline, || async {
                 let response_permit = self
                     .reads
                     .admit_response(ForwardedResponseKind::UtxoResponse, deadline)
@@ -406,7 +404,7 @@ impl NodeBackedLightWallet {
         &self,
         method: &'static str,
         tip_wait: &TipWait,
-        deadline_cap: Option<Instant>,
+        deadline: Instant,
         mut attempt: Attempt,
     ) -> Result<T, Status>
     where
@@ -420,7 +418,7 @@ impl NodeBackedLightWallet {
                 answered_tip,
             }) if answered_tip.height > served_tip.height => {
                 let progress = tip_wait
-                    .await_height_until(&self.slot, method, answered_tip.height, deadline_cap)
+                    .await_height_until(&self.slot, method, answered_tip.height, Some(deadline))
                     .await?;
                 if progress != TipWaitProgress::Reached {
                     return Err(served_tip_mismatch(TIP_MISMATCH_MESSAGE));
