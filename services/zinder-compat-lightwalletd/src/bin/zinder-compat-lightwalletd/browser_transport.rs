@@ -160,6 +160,7 @@ fn browser_cors(origins: &[HeaderValue]) -> CorsLayer {
             Status::GRPC_STATUS,
             Status::GRPC_MESSAGE,
             Status::GRPC_STATUS_DETAILS,
+            HeaderName::from_static("grpc-retry-pushback-ms"),
         ])
 }
 

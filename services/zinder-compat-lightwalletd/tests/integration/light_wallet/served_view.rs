@@ -1,16 +1,25 @@
 //! Forwarded answers stay within the served chain view when the node is ahead
 //! of it or on another chain.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use eyre::{Result, eyre};
 use serde_json::json;
-use tokio_stream::StreamExt as _;
-use tonic::{Code, Request, Status};
+use tokio::net::TcpListener;
+use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
+use tonic::{Code, Request, Status, transport::Channel};
 use tonic_types::StatusExt as _;
+use zinder_compat_lightwalletd::{
+    CanonicalReaderSlot, DEFAULT_TIP_WAIT_MAX_BLOCKS, DEFAULT_TIP_WAIT_MAX_WAITERS,
+    LightwalletdGrpcAdapter, NodeBackedLightWallet, TipWait,
+};
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, Network, TransactionId,
     wire::{
@@ -18,11 +27,21 @@ use zinder_core::{
     },
 };
 use zinder_proto::compat::lightwalletd::{
-    self, compact_tx_streamer_server::CompactTxStreamer as _,
+    self, compact_tx_streamer_client::CompactTxStreamerClient,
+    compact_tx_streamer_server::CompactTxStreamer as _,
 };
-use zinder_testkit::{ChainFixture, FixtureTransactionRows, JsonRpcStub, RpcReply, method};
+use zinder_query::{
+    DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    ForwardedReadConfig, ForwardedReadLimit, ForwardedResponseKind, RocksDbCanonicalReader,
+};
+use zinder_source::{NodeAuth, ZebraJsonRpcSource};
+use zinder_testkit::{
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows, JsonRpcStub,
+    JsonRpcTestServer, RpcReply, WalletServingStoreFixture, method,
+};
 
 use super::{ADDRESS, Fixture, address_output, balance_request, history_request, utxos_at};
+use crate::common::verified_node::{one_upgrade_per_height, verifiable_node};
 
 /// Served by the reader at height 1.
 const SERVED: TransactionId = TransactionId::from_bytes([0x55; 32]);
@@ -209,6 +228,60 @@ fn node_unavailable(answer: Result<impl Sized, Status>) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn served_tip_mismatch(answer: Result<impl Sized, Status>) -> Result<()> {
+    let status = answer
+        .err()
+        .ok_or_else(|| eyre!("expected UNAVAILABLE, got an answer"))?;
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert_eq!(
+        status
+            .get_error_details()
+            .error_info()
+            .map(|detail| (detail.domain.as_str(), detail.reason.as_str())),
+        Some(("zinder.dev", "SERVED_TIP_MISMATCH"))
+    );
+    assert!(
+        !status.message().contains("upstream node is unavailable"),
+        "{status:?}"
+    );
+    assert_eq!(
+        status
+            .metadata()
+            .get("grpc-retry-pushback-ms")
+            .and_then(|pushback| pushback.to_str().ok()),
+        Some("1000")
+    );
+    Ok(())
+}
+
+fn balance_stream_request() -> impl tokio_stream::Stream<Item = lightwalletd::Address> {
+    tokio_stream::iter([lightwalletd::Address {
+        address: ADDRESS.to_owned(),
+    }])
+}
+
+async fn with_served_view_client<T>(
+    adapter: LightwalletdGrpcAdapter<NodeBackedLightWallet>,
+    run: impl AsyncFnOnce(CompactTxStreamerClient<Channel>) -> Result<T>,
+) -> Result<T> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _stopped = stopped.await;
+            })
+            .await
+    });
+    let client = CompactTxStreamerClient::connect(endpoint).await?;
+    let outcome = tokio::time::timeout(Duration::from_secs(10), run(client)).await?;
+    let _stopped = stop.send(());
+    server.await??;
+    outcome
+}
+
 async fn history_heights(fixture: &Fixture, txids: bool) -> Result<Vec<u64>> {
     let request = history_request(1, 2);
     let mut history = if txids {
@@ -247,19 +320,27 @@ async fn utxo_heights(fixture: &Fixture) -> Result<(Vec<u64>, Vec<u64>)> {
 }
 
 async fn address_state_unavailable(fixture: &Fixture) -> Result<()> {
-    node_unavailable(
+    served_tip_mismatch(
         fixture
             .adapter
             .get_taddress_balance(balance_request())
             .await,
     )?;
-    node_unavailable(fixture.adapter.get_address_utxos(utxo_request()).await)?;
-    node_unavailable(
+    served_tip_mismatch(fixture.adapter.get_address_utxos(utxo_request()).await)?;
+    served_tip_mismatch(
         fixture
             .adapter
             .get_address_utxos_stream(utxo_request())
             .await,
-    )
+    )?;
+    with_served_view_client(fixture.adapter.clone(), async |mut client| {
+        served_tip_mismatch(
+            client
+                .get_taddress_balance_stream(balance_stream_request())
+                .await,
+        )
+    })
+    .await
 }
 
 #[tokio::test]
@@ -299,6 +380,18 @@ async fn a_node_one_block_ahead_answers_only_for_the_served_tip() -> Result<()> 
             .value_zat,
         1
     );
+    with_served_view_client(fixture.adapter.clone(), async |mut client| {
+        assert_eq!(
+            client
+                .get_taddress_balance_stream(balance_stream_request())
+                .await?
+                .into_inner()
+                .value_zat,
+            1
+        );
+        Ok(())
+    })
+    .await?;
     assert_eq!(utxo_heights(&fixture).await?, (vec![1], vec![1]));
     let raw_reads = fixture.node.requests_for("getrawtransaction")?;
     assert!(
@@ -553,6 +646,378 @@ async fn history_after_a_rollback_the_node_recovers_from_is_unavailable() -> Res
             .err()
             .ok_or_else(|| eyre!("served empty history from a stale tip read"))?;
         assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    }
+    Ok(())
+}
+
+fn catch_up_node_stubs(node_tip: &Arc<parking_lot::Mutex<BlockId>>) -> Result<[JsonRpcStub; 2]> {
+    let script = hex::encode(
+        zinder_source::parse_transparent_address(ADDRESS)?
+            .script()
+            .as_raw_bytes(),
+    );
+    let tips_for_best = Arc::clone(node_tip);
+    let tips_for_utxos = Arc::clone(node_tip);
+    Ok([
+        method("getbestblockheightandhash").reply_with(move |_| {
+            let tip = *tips_for_best.lock();
+            RpcReply::result(json!({"height": tip.height.value(), "hash": tip.hash.as_bytes()}))
+        }),
+        method("getaddressutxos").reply_with(move |_| {
+            let tip = *tips_for_utxos.lock();
+            let mut rows = vec![address_output(
+                &encode_rpc_transaction_id_hex(SERVED),
+                1_u32,
+                &script,
+            )];
+            if tip.height.value() >= 3 {
+                rows.push(address_output(
+                    &encode_rpc_transaction_id_hex(ABOVE),
+                    3_u32,
+                    &script,
+                ));
+            }
+            utxos_at(tip, &json!(rows))
+        }),
+    ])
+}
+
+struct CatchUpFixture {
+    adapter: LightwalletdGrpcAdapter<NodeBackedLightWallet>,
+    node: JsonRpcTestServer,
+    slot: CanonicalReaderSlot,
+    initial_reader: Arc<RocksDbCanonicalReader>,
+    next_reader: Arc<RocksDbCanonicalReader>,
+    node_tip: Arc<parking_lot::Mutex<BlockId>>,
+    block2: BlockId,
+    block3: BlockId,
+    block4: BlockId,
+    _initial_store: WalletServingStoreFixture,
+    _next_store: WalletServingStoreFixture,
+}
+
+impl CatchUpFixture {
+    fn new(tip_wait: TipWait, reads: ForwardedReadLimit) -> Result<Self> {
+        let schedule = one_upgrade_per_height()?;
+        let base_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let first = base_chain
+            .blocks()
+            .first()
+            .map(|block| (block.height, block.hash))
+            .ok_or_else(|| eyre!("missing block 1"))?;
+        let block2 = base_chain
+            .blocks()
+            .get(1)
+            .map(|block| BlockId::new(block.height, block.hash))
+            .ok_or_else(|| eyre!("missing block 2"))?;
+        let block3 = base_chain
+            .blocks()
+            .get(2)
+            .map(|block| BlockId::new(block.height, block.hash))
+            .ok_or_else(|| eyre!("missing block 3"))?;
+        let chain = base_chain.with_transaction_rows(FixtureTransactionRows::coinbase(
+            SERVED,
+            first.0,
+            first.1,
+            vec![0x55],
+        ));
+        let block4 = BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([0x44; 32]));
+        let mut writer = CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(&chain).through(BlockHeight::new(2)),
+            &schedule,
+        )?;
+        let mut initial_store = writer.serving_store_fixture()?;
+        let (mut initial_canonical, _) = initial_store.take_readers()?;
+        initial_canonical.try_catch_up()?;
+        let initial_reader = Arc::new(RocksDbCanonicalReader::new(initial_canonical)?);
+
+        writer.append_live_block(&chain)?;
+        let mut next_store = writer.serving_store_fixture()?;
+        let (mut next_canonical, _) = next_store.take_readers()?;
+        next_canonical.try_catch_up()?;
+        let next_reader = Arc::new(RocksDbCanonicalReader::new(next_canonical)?);
+
+        let node_tip = Arc::new(parking_lot::Mutex::new(block3));
+        let node = verifiable_node(&schedule, block2.hash, catch_up_node_stubs(&node_tip)?)?;
+        let source = ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            node.url(),
+            NodeAuth::None,
+            Duration::from_secs(2),
+        )?;
+        let slot = CanonicalReaderSlot::new(Arc::clone(&initial_reader));
+        let adapter = LightwalletdGrpcAdapter::for_light_wallet(
+            slot.clone(),
+            source,
+            DEFAULT_TREE_STATE_REPLAY_WAIT,
+            DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+            reads,
+        )
+        .with_tip_wait(tip_wait);
+        Ok(Self {
+            adapter,
+            node,
+            slot,
+            initial_reader,
+            next_reader,
+            node_tip,
+            block2,
+            block3,
+            block4,
+            _initial_store: initial_store,
+            _next_store: next_store,
+        })
+    }
+
+    fn reset_to_block2(&self) {
+        drop(self.slot.publish(Arc::clone(&self.initial_reader)));
+        *self.node_tip.lock() = self.block3;
+    }
+
+    fn publish_block3(&self) {
+        drop(self.slot.publish(Arc::clone(&self.next_reader)));
+    }
+
+    fn utxo_calls(&self) -> Result<usize> {
+        Ok(self.node.requests_for("getaddressutxos")?.len())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ForwardedMethod {
+    AddressUtxos,
+    AddressUtxosStream,
+    TaddressBalance,
+    TaddressBalanceStream,
+}
+
+const ALL_FORWARDED_METHODS: [ForwardedMethod; 4] = [
+    ForwardedMethod::AddressUtxos,
+    ForwardedMethod::AddressUtxosStream,
+    ForwardedMethod::TaddressBalance,
+    ForwardedMethod::TaddressBalanceStream,
+];
+
+#[derive(Debug, Eq, PartialEq)]
+enum ForwardedAnswer {
+    Balance(i64),
+    UtxoHeights(Vec<u64>),
+}
+
+async fn call_forwarded_method(
+    client: &mut CompactTxStreamerClient<Channel>,
+    forwarded_method: ForwardedMethod,
+) -> Result<ForwardedAnswer, Status> {
+    match forwarded_method {
+        ForwardedMethod::AddressUtxos => {
+            let reply = client.get_address_utxos(utxo_request()).await?;
+            Ok(ForwardedAnswer::UtxoHeights(
+                reply
+                    .into_inner()
+                    .address_utxos
+                    .into_iter()
+                    .map(|row| row.height)
+                    .collect(),
+            ))
+        }
+        ForwardedMethod::AddressUtxosStream => {
+            let mut stream = client
+                .get_address_utxos_stream(utxo_request())
+                .await?
+                .into_inner();
+            let mut heights = Vec::new();
+            while let Some(row) = stream.next().await.transpose()? {
+                heights.push(row.height);
+            }
+            Ok(ForwardedAnswer::UtxoHeights(heights))
+        }
+        ForwardedMethod::TaddressBalance => {
+            let reply = client.get_taddress_balance(balance_request()).await?;
+            Ok(ForwardedAnswer::Balance(reply.into_inner().value_zat))
+        }
+        ForwardedMethod::TaddressBalanceStream => {
+            let reply = client
+                .get_taddress_balance_stream(balance_stream_request())
+                .await?;
+            Ok(ForwardedAnswer::Balance(reply.into_inner().value_zat))
+        }
+    }
+}
+
+fn default_tip_wait(max_wait: Duration) -> TipWait {
+    TipWait::new(
+        max_wait,
+        DEFAULT_TIP_WAIT_MAX_BLOCKS,
+        DEFAULT_TIP_WAIT_MAX_WAITERS,
+    )
+}
+
+#[tokio::test]
+async fn utxo_and_balance_refuse_served_tip_mismatch_immediately_when_tip_wait_disabled()
+-> Result<()> {
+    let fixture = CatchUpFixture::new(TipWait::disabled(), ForwardedReadLimit::default())?;
+    with_served_view_client(fixture.adapter.clone(), async |mut client| {
+        for forwarded_method in ALL_FORWARDED_METHODS {
+            let started = Instant::now();
+            served_tip_mismatch(call_forwarded_method(&mut client, forwarded_method).await)?;
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        Ok(())
+    })
+    .await?;
+    assert_eq!(fixture.utxo_calls()?, ALL_FORWARDED_METHODS.len());
+    Ok(())
+}
+
+#[tokio::test]
+async fn utxo_and_balance_catch_up_within_tip_wait_and_retry_once() -> Result<()> {
+    let fixture = CatchUpFixture::new(
+        default_tip_wait(Duration::from_secs(3)),
+        ForwardedReadLimit::default(),
+    )?;
+    for forwarded_method in ALL_FORWARDED_METHODS {
+        fixture.reset_to_block2();
+        let before_calls = fixture.utxo_calls()?;
+        let slot = fixture.slot.clone();
+        let next_reader = Arc::clone(&fixture.next_reader);
+        let publisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            drop(slot.publish(next_reader));
+        });
+        let answer = with_served_view_client(fixture.adapter.clone(), async |mut client| {
+            call_forwarded_method(&mut client, forwarded_method)
+                .await
+                .map_err(|status| eyre!("{forwarded_method:?} failed after catch-up: {status:?}"))
+        })
+        .await?;
+        publisher.await?;
+        match forwarded_method {
+            ForwardedMethod::AddressUtxos | ForwardedMethod::AddressUtxosStream => {
+                assert_eq!(answer, ForwardedAnswer::UtxoHeights(vec![1, 3]));
+            }
+            ForwardedMethod::TaddressBalance | ForwardedMethod::TaddressBalanceStream => {
+                assert_eq!(answer, ForwardedAnswer::Balance(2));
+            }
+        }
+        assert_eq!(fixture.utxo_calls()? - before_calls, 2);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn utxo_and_balance_expire_tip_wait_and_refuse_without_extra_retry() -> Result<()> {
+    let wait_duration = Duration::from_millis(120);
+    let fixture = CatchUpFixture::new(
+        default_tip_wait(wait_duration),
+        ForwardedReadLimit::default(),
+    )?;
+    with_served_view_client(fixture.adapter.clone(), async |mut client| {
+        for forwarded_method in ALL_FORWARDED_METHODS {
+            let started = Instant::now();
+            served_tip_mismatch(call_forwarded_method(&mut client, forwarded_method).await)?;
+            assert!(
+                started.elapsed() >= wait_duration,
+                "{forwarded_method:?} returned before tip wait expired"
+            );
+        }
+        Ok(())
+    })
+    .await?;
+    assert_eq!(fixture.utxo_calls()?, ALL_FORWARDED_METHODS.len());
+    Ok(())
+}
+
+#[tokio::test]
+async fn utxo_tip_wait_releases_forwarded_response_permit_before_waiting() -> Result<()> {
+    let one = NonZeroU32::MIN;
+    let reads = ForwardedReadLimit::new(ForwardedReadConfig::default().with_response_limit(
+        ForwardedResponseKind::UtxoResponse,
+        one,
+        0,
+    ));
+    let fixture = CatchUpFixture::new(default_tip_wait(Duration::from_secs(5)), reads.clone())?;
+    for forwarded_method in [
+        ForwardedMethod::AddressUtxos,
+        ForwardedMethod::AddressUtxosStream,
+    ] {
+        fixture.reset_to_block2();
+        let before_calls = fixture.utxo_calls()?;
+        let adapter = fixture.adapter.clone();
+        let in_flight = tokio::spawn(async move {
+            with_served_view_client(adapter, async |mut client| {
+                call_forwarded_method(&mut client, forwarded_method)
+                    .await
+                    .map_err(|status| eyre!("{forwarded_method:?} failed: {status:?}"))
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.utxo_calls()? <= before_calls {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, eyre::Report>(())
+        })
+        .await??;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!in_flight.is_finished());
+        let probe_permit = reads
+            .admit_response(
+                ForwardedResponseKind::UtxoResponse,
+                tokio::time::Instant::now(),
+            )
+            .await
+            .map_err(|refused| eyre!("response permit stayed held during TipWait: {refused}"))?;
+        drop(probe_permit);
+        fixture.publish_block3();
+        let answer = in_flight.await??;
+        assert_eq!(answer, ForwardedAnswer::UtxoHeights(vec![1, 3]));
+        assert_eq!(fixture.utxo_calls()? - before_calls, 2);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn utxo_and_balance_do_not_wait_on_same_height_fork_and_retry_at_most_once() -> Result<()> {
+    let fixture = CatchUpFixture::new(
+        default_tip_wait(Duration::from_secs(5)),
+        ForwardedReadLimit::default(),
+    )?;
+    *fixture.node_tip.lock() =
+        BlockId::new(fixture.block2.height, BlockHash::from_bytes([0xdd; 32]));
+    with_served_view_client(fixture.adapter.clone(), async |mut client| {
+        for forwarded_method in ALL_FORWARDED_METHODS {
+            let started = Instant::now();
+            served_tip_mismatch(call_forwarded_method(&mut client, forwarded_method).await)?;
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        Ok(())
+    })
+    .await?;
+    assert_eq!(fixture.utxo_calls()?, ALL_FORWARDED_METHODS.len());
+
+    for forwarded_method in [
+        ForwardedMethod::AddressUtxos,
+        ForwardedMethod::TaddressBalance,
+    ] {
+        fixture.reset_to_block2();
+        let before_calls = fixture.utxo_calls()?;
+        let slot = fixture.slot.clone();
+        let next_reader = Arc::clone(&fixture.next_reader);
+        let node_tip = Arc::clone(&fixture.node_tip);
+        let block4 = fixture.block4;
+        let advance = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            *node_tip.lock() = block4;
+            drop(slot.publish(next_reader));
+        });
+        let started = Instant::now();
+        with_served_view_client(fixture.adapter.clone(), async |mut client| {
+            served_tip_mismatch(call_forwarded_method(&mut client, forwarded_method).await)
+        })
+        .await?;
+        advance.await?;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(fixture.utxo_calls()? - before_calls, 2);
     }
     Ok(())
 }

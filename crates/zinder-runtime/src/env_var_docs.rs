@@ -1408,7 +1408,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Milliseconds a height-selected lightwalletd block read waits for a height just past the visible tip before it runs unchanged. Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, the encoded block range methods, and, in wallet and light-wallet serving, `GetTreeState` by height. Applies to every serving mode. The worst delay before a block-range response's headers is this wait plus the existing 10-second block-range admission wait. A value of 0 disables the wait. A nonzero value must be at least twice `storage.secondary_catchup_interval_ms`. There is no upper bound. Defaults to 3000, which is provisional pending cross-region skew measurement.",
+        description: "Milliseconds a height-selected lightwalletd block read, or a light-wallet forwarded UTXO or balance read whose node answered ahead of the served tip, waits for a height just past the visible tip before continuing or failing. Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, the encoded block range methods, `GetTreeState` by height (wallet and light-wallet serving), and forwarded `GetAddressUtxos`, `GetAddressUtxosStream`, `GetTaddressBalance`, and `GetTaddressBalanceStream` (light-wallet serving). Applies to every serving mode. The worst delay before a block-range response's headers is this wait plus the existing 10-second block-range admission wait. A value of 0 disables the wait. A nonzero value must be at least twice `storage.secondary_catchup_interval_ms`. There is no upper bound. Defaults to 3000, which is provisional pending cross-region skew measurement.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS",
@@ -1416,7 +1416,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Furthest past the visible tip, in blocks, that a read may name and still wait for the tip. A read naming a height further ahead runs at once. Applies to every serving mode. Must be at least 1, with no upper bound. Defaults to 2.",
+        description: "Furthest past the visible tip, in blocks, that a read may name or observe and still wait for the tip. A read naming or observing a height further ahead runs or refuses at once. Applies to every serving mode. Must be at least 1, with no upper bound. Defaults to 2.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS",
@@ -1424,7 +1424,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Most lightwalletd block reads that may wait for the tip at once. A read that finds every waiting place taken runs at once without waiting. Applies to every serving mode. Must be at least 1. Defaults to 256.",
+        description: "Most lightwalletd reads that may wait for the tip at once. A read that finds every waiting place taken runs or refuses at once without waiting. Applies to every serving mode. Must be at least 1. Defaults to 256.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__PING_VERY_INSECURE",

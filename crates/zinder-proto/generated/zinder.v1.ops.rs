@@ -600,6 +600,11 @@ pub enum ErrorReason {
     /// node-call or response slot of its kind stayed taken through the wait, or
     /// every waiting place was taken. Retry with backoff.
     ForwardedReadLimitReached = 58,
+    /// UNAVAILABLE family.
+    /// A forwarded transparent UTXO or balance lookup answered at a different
+    /// tip than the reader's served tip, or consecutive pages disagreed at that
+    /// tip. The node is up; retry after the `grpc-retry-pushback-ms` delay.
+    ServedTipMismatch = 59,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -667,6 +672,7 @@ impl ErrorReason {
             Self::CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
             Self::NodeRateLimited => "NODE_RATE_LIMITED",
             Self::ForwardedReadLimitReached => "FORWARDED_READ_LIMIT_REACHED",
+            Self::ServedTipMismatch => "SERVED_TIP_MISMATCH",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -739,6 +745,7 @@ impl ErrorReason {
             }
             "NODE_RATE_LIMITED" => Some(Self::NodeRateLimited),
             "FORWARDED_READ_LIMIT_REACHED" => Some(Self::ForwardedReadLimitReached),
+            "SERVED_TIP_MISMATCH" => Some(Self::ServedTipMismatch),
             _ => None,
         }
     }

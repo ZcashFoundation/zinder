@@ -123,6 +123,7 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::BlockingTaskFailed
         | ErrorReason::NodeUnavailable
         | ErrorReason::NodeRateLimited
+        | ErrorReason::ServedTipMismatch
         | ErrorReason::StorageUnavailable
         | ErrorReason::UpstreamUnreachable
         | ErrorReason::ServiceNotReady
