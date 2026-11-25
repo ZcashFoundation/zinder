@@ -761,3 +761,60 @@ fn indexed_block_mark_valid_preserves_invalid_state() {
         VALIDATION_VALID
     );
 }
+
+#[test]
+fn reader_latches_invalid_on_truncated_slab_io_error() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = fixture_blocks()?;
+    let (path, identity) = write_segment(dir.path(), "truncate-src", RawBlockCodec::None, &blocks)?;
+    let original = fs::read(&path)?;
+    let portable_path = dir.path().join("truncate-portable");
+    fs::write(&portable_path, &original)?;
+    let portable_id = RawBlockSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+    let reader = SettledRawBlockSegmentReader::open(
+        &portable_path,
+        &portable_id,
+        SettledRawBlockSegmentOpenOptions::default(),
+    )?;
+    assert_eq!(
+        reader.read_raw_block(BlockHeight::new(4))?,
+        blocks[3].raw_bytes
+    );
+
+    let truncated_file = OpenOptions::new().write(true).open(&portable_path)?;
+    truncated_file.set_len(u64::try_from(HEADER_LEN + 4)?)?;
+    truncated_file.sync_all()?;
+    drop(truncated_file);
+
+    for height in [BlockHeight::new(1), BlockHeight::new(4)] {
+        assert!(matches!(
+            reader.read_raw_block(height),
+            Err(SettledRawBlockSegmentError::Io(_))
+        ));
+        assert!(matches!(
+            reader.read_raw_block(height),
+            Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+        ));
+        assert!(matches!(
+            reader.read_raw_transaction(height, 0),
+            Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+        ));
+    }
+
+    assert!(matches!(
+        reader.read_raw_transaction(BlockHeight::new(2), 0),
+        Err(SettledRawBlockSegmentError::Io(_))
+    ));
+    assert!(matches!(
+        reader.read_raw_block(BlockHeight::new(2)),
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader.read_raw_transaction(BlockHeight::new(2), 0),
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}

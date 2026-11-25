@@ -165,16 +165,7 @@ impl SettledRawBlockSegmentReader {
                 "raw block segment row previously failed validation".to_owned(),
             ));
         }
-        let (rel_offset, frame_len) = frame_span(&self.rows, self.slab_len, row_idx)?;
-        let frame_len_usize = usize::try_from(frame_len).map_err(|_| {
-            SettledRawBlockSegmentError::InvalidFormat("frame length exceeds usize".to_owned())
-        })?;
-        let frame = read_slab_at(
-            &self.file,
-            frame_len_usize,
-            self.slab_offset + u64::from(rel_offset),
-        )?;
-        match self.decode_and_verify_frame(row, &frame, state) {
+        match self.load_and_verify_frame(row_idx, row, state) {
             Ok(raw_block) => {
                 row.mark_valid();
                 Ok(raw_block)
@@ -184,6 +175,24 @@ impl SettledRawBlockSegmentReader {
                 Err(err)
             }
         }
+    }
+
+    fn load_and_verify_frame(
+        &self,
+        row_idx: usize,
+        row: &IndexedBlock,
+        state: u8,
+    ) -> Result<Vec<u8>, SettledRawBlockSegmentError> {
+        let (rel_offset, frame_len) = frame_span(&self.rows, self.slab_len, row_idx)?;
+        let frame_len_usize = usize::try_from(frame_len).map_err(|_| {
+            SettledRawBlockSegmentError::InvalidFormat("frame length exceeds usize".to_owned())
+        })?;
+        let frame = read_slab_at(
+            &self.file,
+            frame_len_usize,
+            self.slab_offset + u64::from(rel_offset),
+        )?;
+        self.decode_and_verify_frame(row, &frame, state)
     }
 
     fn decode_and_verify_frame(
