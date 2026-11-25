@@ -24,7 +24,7 @@ use zinder_ingest::{
     PositionedCanonicalBlock, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
 };
 use zinder_materialized_views::project_block_summary_record;
-use zinder_source::{SourceBlock, decode_rpc_block_hash};
+use zinder_source::SourceBlock;
 use zinder_store::encode_compact_block_artifact;
 use zinder_testkit::{
     FixtureTransactionRows, encode_fixture_block_replay_with_raw_block,
@@ -967,31 +967,15 @@ fn compact_block_builder_rejects_source_identity_mismatch() -> Result<(), Box<dy
     Ok(())
 }
 
-pub(super) fn fixture_source_block() -> Result<SourceBlock, Box<dyn Error>> {
-    fixture_source_block_from(
-        Network::ZcashRegtest,
-        include_str!("../fixtures/z3-regtest-block-1.json"),
-    )
-}
+pub(super) use crate::common::construction_fixture::{
+    fixture_orchard_source_block, fixture_sapling_source_block, fixture_source_block,
+    fixture_source_block_from,
+};
 
 pub(super) fn fixture_ironwood_source_block() -> Result<SourceBlock, Box<dyn Error>> {
     fixture_source_block_from(
         Network::ZcashRegtest,
         include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
-    )
-}
-
-pub(super) fn fixture_sapling_source_block() -> Result<SourceBlock, Box<dyn Error>> {
-    fixture_source_block_from(
-        Network::ZcashTestnet,
-        include_str!("../fixtures/zcash-testnet-sapling-block-1842432.json"),
-    )
-}
-
-pub(super) fn fixture_orchard_source_block() -> Result<SourceBlock, Box<dyn Error>> {
-    fixture_source_block_from(
-        Network::ZcashTestnet,
-        include_str!("../fixtures/zcash-testnet-orchard-block-1842462.json"),
     )
 }
 
@@ -1007,33 +991,6 @@ pub(super) fn fixture_zakura_ironwood_source_block() -> Result<SourceBlock, Box<
         Network::ZcashRegtest,
         include_str!("../fixtures/zakura-1.8.6-regtest-ironwood-block-132.json"),
     )
-}
-
-fn fixture_source_block_from(
-    network: Network,
-    fixture_json: &str,
-) -> Result<SourceBlock, Box<dyn Error>> {
-    let fixture: Value = serde_json::from_str(fixture_json)?;
-    let raw_block_hex = string_field(&fixture, "raw_block_hex")?;
-    let raw_block_bytes = hex::decode(raw_block_hex)?;
-    let height = u32_field(&fixture, "height")?;
-    let source_block =
-        SourceBlock::from_raw_block_bytes(network, BlockHeight::new(height), raw_block_bytes)?;
-
-    assert_eq!(
-        source_block.hash,
-        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
-    );
-    assert_eq!(
-        source_block.parent_hash,
-        decode_rpc_block_hash(string_field(&fixture, "previousblockhash")?)?
-    );
-    assert_eq!(
-        source_block.block_time_seconds,
-        u32_field(&fixture, "time")?
-    );
-
-    Ok(source_block)
 }
 
 fn changed_block_hash(hash: BlockHash) -> BlockHash {
@@ -1070,13 +1027,4 @@ fn string_field<'fixture>(
         .get(field_name)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("fixture field {field_name} must be a string").into())
-}
-
-fn u32_field(fixture: &Value, field_name: &'static str) -> Result<u32, Box<dyn Error>> {
-    let number = fixture
-        .get(field_name)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("fixture field {field_name} must be an integer"))?;
-
-    Ok(u32::try_from(number)?)
 }

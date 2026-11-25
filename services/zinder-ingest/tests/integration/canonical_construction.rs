@@ -4,37 +4,34 @@
 )]
 
 use std::{
-    net::SocketAddr,
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use tempfile::TempDir;
-use tokio::{net::TcpListener, sync::Notify};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zebra_chain::{
     block::{Block as ZebraBlock, Height as ZebraHeight},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
-    transaction::Transaction as ZebraTransaction,
 };
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
-    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers, Network,
-    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
+    BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint,
+    CommitmentTreeFrontier, CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
+    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
 };
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
-    CanonicalFollowConfig, CanonicalWriterConfig, CanonicalWriterError, IngestError,
-    admit_canonical_store, follow_admitted_canonical_store, load_fresh_canonical,
-    load_fresh_canonical_blocks,
+    CanonicalWriterConfig, CanonicalWriterError, IngestError, admit_canonical_store,
+    load_fresh_canonical, load_fresh_canonical_blocks,
 };
 use zinder_runtime::{
-    ComposedReadiness, IngestPhase, OpsServer, Readiness, ReadinessCause, spawn_ops_endpoint,
+    ComposedReadiness, IngestPhase, OpsServer, Readiness, ReadinessCause, install_metrics_recorder,
 };
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceBlockHeader, SourceChainSegment,
@@ -45,13 +42,15 @@ use zinder_store::{
     RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
     TreeStateLookup,
 };
-use zinder_testkit::{frontier_from_note_commitments, sample_regtest_upgrade_activations};
+use zinder_testkit::frontier_from_note_commitments;
+
+use crate::common::construction_fixture::{
+    GatedConstructionSource, MultiBlockConstructionSource, gated_construction_writer_config,
+    held_construction_writer_config, multi_block_writer_config, regtest_activations,
+};
 
 use super::{
-    canonical_block_context::{
-        chained_source_block, pool_commitments, shielded_transactions,
-        shielded_transactions_with_lock_time,
-    },
+    canonical_block_context::shielded_transactions_with_lock_time,
     fixture_block::{
         fixture_ironwood_source_block, fixture_orchard_source_block, fixture_sapling_source_block,
         fixture_source_block, fixture_zakura_ironwood_source_block,
@@ -573,10 +572,6 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
     Ok(())
 }
 
-fn regtest_activations() -> Arc<NetworkUpgradeActivations> {
-    Arc::new(sample_regtest_upgrade_activations())
-}
-
 /// Upper bound for a cancelled construction to return, well inside the
 /// wallet-serving supervisor's 20-second shutdown grace window.
 const CANCELLED_CONSTRUCTION_STOP_BOUND: Duration = Duration::from_secs(5);
@@ -685,35 +680,6 @@ impl NodeSource for HeldConstructionSource {
             height,
             reason: "held construction source has no checkpoint at the requested height".to_owned(),
         })
-    }
-}
-
-fn held_construction_writer_config(
-    storage_path: std::path::PathBuf,
-    activations: Arc<NetworkUpgradeActivations>,
-) -> CanonicalWriterConfig {
-    CanonicalWriterConfig {
-        storage_path,
-        resource_budget: RocksDbResourceBudget::for_local_tests(),
-        construction: CanonicalConstructionConfig::for_local_tests(
-            Duration::from_secs(5),
-            activations,
-        ),
-        checkpoint_height: None,
-        raw_blob_retention: RawBlobRetention::Transactions,
-        reorg_window_blocks: 100,
-        tree_state_checkpoint_selection: None,
-        follow: CanonicalFollowConfig {
-            request_timeout: Duration::from_secs(5),
-            poll_interval: Duration::from_millis(10),
-            lag_threshold_blocks: 0,
-            target_height: None,
-            event_retention_window: None,
-            event_retention_check_interval: Duration::from_secs(1),
-            mempool_ready_gate: None,
-            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
-            node_failover: None,
-        },
     }
 }
 
@@ -845,10 +811,12 @@ async fn shutdown_before_publication_finishes_publishing_and_the_next_start_inst
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn construction_times_each_phase_and_serial_loader_stage()
 -> Result<(), Box<dyn std::error::Error>> {
-    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-    let recorded_metrics = recorder.handle();
-    metrics::set_global_recorder(recorder)
-        .map_err(|_| "another test in this process installed a global recorder")?;
+    let recorded_metrics = install_metrics_recorder(&OpsServer {
+        service_name: "zinder-ingest",
+        service_version: "0.0.0",
+        network_name: "zcash-regtest",
+        advertised_capabilities: Arc::from([]),
+    })?;
     let (source_block, chain_checkpoint) = held_construction_chain()?;
     let source = HeldConstructionSource::new(source_block, chain_checkpoint);
     source.release_chain_segments();
@@ -908,215 +876,6 @@ async fn construction_times_each_phase_and_serial_loader_stage()
         );
     }
     Ok(())
-}
-
-/// Multi-block Regtest source with exact per-height checkpoints and optional
-/// cancellation hooks for construction lifecycle tests.
-#[derive(Clone)]
-struct MultiBlockConstructionSource {
-    genesis: SourceBlock,
-    blocks: Vec<SourceBlock>,
-    checkpoints: Vec<CommitmentTreeCheckpoint>,
-    hold_checkpoint: Option<(BlockHeight, Arc<Notify>)>,
-    chain_segment_requests: Arc<AtomicUsize>,
-    cancel_with_tip_checkpoint: Option<(BlockHeight, CancellationToken)>,
-}
-
-impl MultiBlockConstructionSource {
-    fn build(
-        height_count: u32,
-        activations: &NetworkUpgradeActivations,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let sapling_shielded = shielded_transactions(&fixture_sapling_source_block()?)?;
-        let orchard_shielded = shielded_transactions(&fixture_orchard_source_block()?)?;
-        Self::build_with_transactions(height_count, activations, |height| {
-            Ok(match height {
-                2 => sapling_shielded.clone(),
-                4 => orchard_shielded.clone(),
-                _ => Vec::new(),
-            })
-        })
-    }
-
-    fn build_with_transactions(
-        height_count: u32,
-        activations: &NetworkUpgradeActivations,
-        extra_transactions: impl Fn(
-            u32,
-        )
-            -> Result<Vec<Arc<ZebraTransaction>>, Box<dyn std::error::Error>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let block_one = fixture_source_block()?;
-        let genesis = SourceBlock::new(
-            SourceBlockHeader {
-                network: Network::ZcashRegtest,
-                height: BlockHeight::new(0),
-                hash: block_one.parent_hash,
-                parent_hash: block_one.parent_hash,
-                block_time_seconds: block_one.block_time_seconds.saturating_sub(1),
-            },
-            Vec::new(),
-        );
-        let mut blocks = Vec::with_capacity(usize::try_from(height_count)?);
-        let mut parent_hash = genesis.hash;
-        for height_num in 1..=height_count {
-            let block = if height_num == 1 {
-                block_one.clone()
-            } else {
-                chained_source_block(
-                    BlockHeight::new(height_num),
-                    parent_hash,
-                    u8::try_from(height_num)?,
-                    extra_transactions(height_num)?,
-                )?
-            };
-            parent_hash = block.hash;
-            blocks.push(block);
-        }
-        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
-            BlockHeight::new(0),
-            &CommitmentTreeFrontiers::default(),
-            activations,
-        )?;
-        let mut checkpoints = vec![CommitmentTreeCheckpoint::new(
-            BlockId::new(genesis.height, genesis.hash),
-            genesis.block_time_seconds,
-            accumulator.cross_checked_frontiers()?,
-        )];
-        for block in &blocks {
-            let commitments = pool_commitments(block)?;
-            accumulator.append_block_commitments(
-                block.height,
-                &commitments.sapling,
-                &commitments.orchard,
-                &commitments.ironwood,
-            )?;
-            checkpoints.push(CommitmentTreeCheckpoint::new(
-                BlockId::new(block.height, block.hash),
-                block.block_time_seconds,
-                accumulator.cross_checked_frontiers()?,
-            ));
-        }
-        Ok(Self {
-            genesis,
-            blocks,
-            checkpoints,
-            hold_checkpoint: None,
-            chain_segment_requests: Arc::new(AtomicUsize::new(0)),
-            cancel_with_tip_checkpoint: None,
-        })
-    }
-
-    fn cancelling_at_checkpoint(mut self, height: BlockHeight, cancel: CancellationToken) -> Self {
-        self.cancel_with_tip_checkpoint = Some((height, cancel));
-        self
-    }
-
-    fn checkpoint_at(
-        &self,
-        height: u32,
-    ) -> Result<&CommitmentTreeCheckpoint, Box<dyn std::error::Error>> {
-        self.checkpoints
-            .get(usize::try_from(height)?)
-            .ok_or_else(|| format!("missing checkpoint at height {height}").into())
-    }
-}
-
-#[async_trait]
-impl NodeSource for MultiBlockConstructionSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities::default()
-    }
-
-    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        if height == BlockHeight::new(0) {
-            return Ok(self.genesis.clone());
-        }
-        self.blocks
-            .iter()
-            .find(|block| block.height == height)
-            .cloned()
-            .ok_or_else(|| SourceError::BlockUnavailable {
-                height,
-                reason: "multi-block test source has no block at the requested height".to_owned(),
-            })
-    }
-
-    async fn fetch_chain_segment(
-        &self,
-        limits: SourceChainSegmentLimits,
-    ) -> Result<SourceChainSegment, SourceError> {
-        self.chain_segment_requests.fetch_add(1, Ordering::SeqCst);
-        let next_height =
-            limits
-                .cursor
-                .next_connected_height()
-                .ok_or(SourceError::SourceProtocolMismatch {
-                    reason: "multi-block construction test cursor has no next height",
-                })?;
-        let max_blocks = usize::try_from(limits.max_connected_blocks.get()).unwrap_or(usize::MAX);
-        let segment = self
-            .blocks
-            .iter()
-            .filter(|block| block.height >= next_height)
-            .take(max_blocks)
-            .cloned()
-            .collect::<Vec<_>>();
-        Ok(SourceChainSegment::connected_blocks(segment))
-    }
-
-    async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        let tip = self
-            .blocks
-            .last()
-            .ok_or_else(|| SourceError::BlockUnavailable {
-                height: BlockHeight::new(1),
-                reason: "multi-block test source has no blocks".to_owned(),
-            })?;
-        Ok(BlockId::new(tip.height, tip.hash))
-    }
-
-    async fn fetch_chain_checkpoint(
-        &self,
-        height: BlockHeight,
-        _network_upgrade_activations: &NetworkUpgradeActivations,
-    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
-        let checkpoint = self
-            .checkpoints
-            .iter()
-            .find(|checkpoint| checkpoint.block_id.height == height)
-            .cloned()
-            .ok_or_else(|| SourceError::BlockUnavailable {
-                height,
-                reason: "multi-block test source has no checkpoint at the requested height"
-                    .to_owned(),
-            })?;
-        if let Some((held_height, reached)) = &self.hold_checkpoint
-            && *held_height == height
-        {
-            reached.notify_one();
-            std::future::pending::<()>().await;
-        }
-        if let Some((cancel_height, cancel)) = &self.cancel_with_tip_checkpoint
-            && *cancel_height == height
-        {
-            cancel.cancel();
-        }
-        Ok(checkpoint)
-    }
-}
-
-fn multi_block_writer_config(
-    storage_path: std::path::PathBuf,
-    activations: Arc<NetworkUpgradeActivations>,
-    every_block_tree_state_checkpoints: bool,
-) -> CanonicalWriterConfig {
-    CanonicalWriterConfig {
-        reorg_window_blocks: 1,
-        tree_state_checkpoint_selection: every_block_tree_state_checkpoints
-            .then_some(zinder_store::TreeStateCheckpointSelection::EveryBlock),
-        ..held_construction_writer_config(storage_path, activations)
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2021,325 +1780,6 @@ fn assert_ironwood_activation_checkpoints(
         post_activation_ironwood.final_root()
     );
     assert_eq!(post_activation_ironwood, tip_ironwood);
-    Ok(())
-}
-
-/// Multi-block construction source that holds segment fetches until a test
-/// permits the requested height span to proceed.
-#[derive(Clone)]
-struct GatedConstructionSource {
-    inner: MultiBlockConstructionSource,
-    allowed_through: Arc<AtomicU32>,
-    gate_changed: Arc<Notify>,
-}
-
-impl GatedConstructionSource {
-    fn new(inner: MultiBlockConstructionSource) -> Self {
-        Self {
-            inner,
-            allowed_through: Arc::new(AtomicU32::new(0)),
-            gate_changed: Arc::new(Notify::new()),
-        }
-    }
-
-    fn allow_through(&self, height: u32) {
-        self.allowed_through.store(height, Ordering::SeqCst);
-        self.gate_changed.notify_waiters();
-    }
-}
-
-#[async_trait]
-impl NodeSource for GatedConstructionSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.inner.capabilities()
-    }
-
-    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        self.inner.fetch_block_at(height).await
-    }
-
-    async fn fetch_chain_segment(
-        &self,
-        limits: SourceChainSegmentLimits,
-    ) -> Result<SourceChainSegment, SourceError> {
-        let next_height =
-            limits
-                .cursor
-                .next_connected_height()
-                .ok_or(SourceError::SourceProtocolMismatch {
-                    reason: "gated construction test cursor has no next height",
-                })?;
-        let required_top = next_height
-            .value()
-            .saturating_add(limits.max_connected_blocks.get())
-            .saturating_sub(1);
-        loop {
-            let notified = self.gate_changed.notified();
-            if required_top <= self.allowed_through.load(Ordering::SeqCst) {
-                break;
-            }
-            notified.await;
-        }
-        self.inner.fetch_chain_segment(limits).await
-    }
-
-    async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        self.inner.tip_id().await
-    }
-
-    async fn fetch_chain_checkpoint(
-        &self,
-        height: BlockHeight,
-        network_upgrade_activations: &NetworkUpgradeActivations,
-    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
-        self.inner
-            .fetch_chain_checkpoint(height, network_upgrade_activations)
-            .await
-    }
-}
-
-async fn spawn_ingest_ops_endpoint(
-    readiness: Readiness,
-) -> Result<(SocketAddr, zinder_runtime::OpsEndpointHandle), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let ops_addr = listener.local_addr()?;
-    drop(listener);
-    let handle = spawn_ops_endpoint(
-        ops_addr,
-        OpsServer {
-            service_name: "zinder-ingest",
-            service_version: "0.0.0",
-            network_name: "zcash-regtest",
-            advertised_capabilities: Arc::from([]),
-        },
-        readiness,
-    )
-    .await?;
-    Ok((ops_addr, handle))
-}
-
-async fn fetch_readyz_json(
-    client: &reqwest::Client,
-    ops_addr: SocketAddr,
-) -> Result<(u16, serde_json::Value), Box<dyn std::error::Error>> {
-    let response = client
-        .get(format!("http://{ops_addr}/readyz"))
-        .send()
-        .await?;
-    let status = response.status().as_u16();
-    let parsed_json: serde_json::Value = serde_json::from_str(&response.text().await?)?;
-    Ok((status, parsed_json))
-}
-
-async fn fetch_metrics_text(
-    client: &reqwest::Client,
-    ops_addr: SocketAddr,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let response = client
-        .get(format!("http://{ops_addr}/metrics"))
-        .send()
-        .await?;
-    assert_eq!(response.status().as_u16(), 200);
-    Ok(response.text().await?)
-}
-
-fn prometheus_gauge_sample(
-    metrics_text: &str,
-    name: &str,
-) -> Result<f64, Box<dyn std::error::Error>> {
-    let expected_type = format!("# TYPE {name} gauge");
-    if !metrics_text.lines().any(|line| line == expected_type) {
-        return Err(format!("missing gauge TYPE line for {name} in:\n{metrics_text}").into());
-    }
-    let unlabeled_prefix = format!("{name} ");
-    let labeled_prefix = format!("{name}{{");
-    let sample_text = metrics_text
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix(&unlabeled_prefix).or_else(|| {
-                line.starts_with(&labeled_prefix)
-                    .then(|| line.rsplit(' ').next())
-                    .flatten()
-            })
-        })
-        .ok_or_else(|| format!("missing sample for gauge {name} in:\n{metrics_text}"))?;
-    Ok(sample_text.parse()?)
-}
-
-async fn assert_construction_stage(
-    client: &reqwest::Client,
-    ops_addr: SocketAddr,
-    expected_current: u32,
-    expected_target: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let readyz_json = loop {
-        let (status, body) = fetch_readyz_json(client, ops_addr).await?;
-        if body["current_height"] == expected_current && body["target_height"] == expected_target {
-            assert_eq!(status, 503);
-            break body;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for /readyz current_height={expected_current}, target_height={expected_target}; last={body}"
-            )
-            .into());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-    let expected_lag = u64::from(expected_target.saturating_sub(expected_current));
-    assert_eq!(readyz_json["status"], "not_ready");
-    assert_eq!(readyz_json["phase"], "bulk_catchup");
-    assert_eq!(
-        readyz_json["cause"],
-        serde_json::json!({ "syncing": { "lag_blocks": expected_lag } })
-    );
-
-    let metrics_text = fetch_metrics_text(client, ops_addr).await?;
-    for metric_name in [
-        "zinder_ingest_construction_loaded_height",
-        "zinder_ingest_construction_target_height",
-    ] {
-        assert!(
-            metrics_text
-                .lines()
-                .any(|line| line.starts_with(&format!("# HELP {metric_name} "))),
-            "missing HELP for {metric_name} in:\n{metrics_text}"
-        );
-    }
-    assert_eq!(
-        prometheus_gauge_sample(&metrics_text, "zinder_ingest_construction_loaded_height")?,
-        f64::from(expected_current)
-    );
-    assert_eq!(
-        prometheus_gauge_sample(&metrics_text, "zinder_ingest_construction_target_height")?,
-        f64::from(expected_target)
-    );
-    assert_eq!(
-        prometheus_gauge_sample(&metrics_text, "zinder_readiness_sync_lag_blocks")?,
-        f64::from(expected_current.abs_diff(expected_target))
-    );
-    Ok(())
-}
-
-async fn wait_for_ready_follow(
-    client: &reqwest::Client,
-    ops_addr: SocketAddr,
-    expected_tip: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let (status, body) = fetch_readyz_json(client, ops_addr).await?;
-        if status == 200
-            && body["status"] == "ready"
-            && body["phase"] == "following_tip"
-            && body["current_height"] == expected_tip
-            && body["target_height"] == expected_tip
-        {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("timed out waiting for following_tip readyz: {body}").into());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-fn gated_construction_writer_config(
-    storage_path: std::path::PathBuf,
-    activations: Arc<NetworkUpgradeActivations>,
-    tree_hashing_workers: u32,
-) -> Result<CanonicalWriterConfig, Box<dyn std::error::Error>> {
-    let mut config = multi_block_writer_config(storage_path, activations, false);
-    config.construction.request_timeout = Duration::from_secs(30);
-    config
-        .construction
-        .pipeline_limits
-        .source_segment_max_blocks =
-        NonZeroU32::new(3).ok_or("segment max blocks must be non-zero")?;
-    config
-        .construction
-        .pipeline_limits
-        .source_fetch_max_in_flight_requests =
-        NonZeroU32::new(1).ok_or("in-flight requests must be non-zero")?;
-    config.construction.pipeline_limits.tree_hashing_workers =
-        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
-    Ok(config)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fresh_construction_reports_live_progress_on_readyz_and_metrics()
--> Result<(), Box<dyn std::error::Error>> {
-    let activations = regtest_activations();
-    let source =
-        GatedConstructionSource::new(MultiBlockConstructionSource::build(10, &activations)?);
-    let temporary = TempDir::new()?;
-    let config = gated_construction_writer_config(
-        temporary.path().join("canonical"),
-        Arc::clone(&activations),
-        1,
-    )?;
-    let readiness = Readiness::default();
-    let composed = ComposedReadiness::new(readiness.clone(), &[]);
-    let (ops_addr, ops_handle) = spawn_ingest_ops_endpoint(readiness).await?;
-    let client = reqwest::Client::new();
-
-    let admission_task = tokio::spawn({
-        let source = source.clone();
-        let activations = Arc::clone(&activations);
-        let config = config.clone();
-        let composed = composed.clone();
-        async move {
-            admit_canonical_store(
-                &source,
-                activations,
-                &config,
-                &composed,
-                &CancellationToken::new(),
-            )
-            .await
-        }
-    });
-
-    assert_construction_stage(&client, ops_addr, 0, 9).await?;
-    source.allow_through(3);
-    assert_construction_stage(&client, ops_addr, 3, 9).await?;
-    source.allow_through(6);
-    assert_construction_stage(&client, ops_addr, 6, 9).await?;
-    source.allow_through(9);
-    let store = admission_task.await??;
-    assert_construction_stage(&client, ops_addr, 9, 9).await?;
-
-    let follow_cancel = CancellationToken::new();
-    let follow_task = tokio::spawn({
-        let source = source.clone();
-        let follow = config.follow.clone();
-        let composed = composed.clone();
-        let follow_cancel = follow_cancel.clone();
-        async move {
-            follow_admitted_canonical_store(store, &source, follow, &composed, &follow_cancel, None)
-                .await
-        }
-    });
-    wait_for_ready_follow(&client, ops_addr, 10).await?;
-
-    let metrics_text = fetch_metrics_text(&client, ops_addr).await?;
-    assert_eq!(
-        prometheus_gauge_sample(&metrics_text, "zinder_ingest_construction_loaded_height")?,
-        9.0
-    );
-    assert_eq!(
-        prometheus_gauge_sample(&metrics_text, "zinder_ingest_construction_target_height")?,
-        9.0
-    );
-    assert_eq!(
-        prometheus_gauge_sample(&metrics_text, "zinder_readiness_sync_lag_blocks")?,
-        0.0
-    );
-
-    follow_cancel.cancel();
-    follow_task.await??;
-    ops_handle.shutdown().await?;
     Ok(())
 }
 

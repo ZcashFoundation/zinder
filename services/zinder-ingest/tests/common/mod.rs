@@ -10,6 +10,8 @@
     reason = "Each live test file consumes only a subset of the common helpers."
 )]
 
+pub(crate) mod construction_fixture;
+
 use std::{path::Path, process::Command, sync::Arc};
 
 use eyre::{Result, eyre};
