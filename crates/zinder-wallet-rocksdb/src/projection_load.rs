@@ -1,23 +1,32 @@
 //! Single-scan external construction of wallet projection SSTs.
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     mem::size_of,
     num::NonZeroU32,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender},
+    },
     time::{Duration, Instant},
 };
 
+use parking_lot::{Condvar, Mutex};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFacts,
+    CanonicalBlockFactsDigest, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion, Network,
     TransactionId, ValidatedCanonicalBlockReplay,
 };
 use zinder_rocksdb_bulk_load::{
-    BulkLoadError, OrderedSstWriter, SortedVariableValues, SstFileSet, VariableValueSortDurations,
-    VariableValueSortEvidence, VariableValueSorter,
+    BulkLoadError, OrderedSstWriter, ParallelVariableValueSorter, SortedVariableValues, SstFileSet,
+    VariableValueSortDurations, VariableValueSortEvidence, VariableValueSortShard,
+    VariableValueSorter,
 };
-use zinder_store::CanonicalStoreError;
+use zinder_store::{
+    CanonicalReplaySliceSource, CanonicalStoreError, ObservedCanonicalReplaySequence,
+};
 use zinder_wallet_projection::{
     WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
     WalletAddressUnspentOutputKey, WalletOutpointKey, WalletProjectionAccumulator,
@@ -27,7 +36,8 @@ use zinder_wallet_projection::{
 };
 
 use crate::{
-    RocksDbWalletError, WalletSecondaryRowDerivationPhaseDurations, WalletSstWriteDurations,
+    RocksDbWalletError, WalletProjectionReplaySource, WalletSecondaryRowDerivationPhaseDurations,
+    WalletSstWriteDurations,
     accumulator_hashing::ConstructionAccumulators,
     store::{
         REORG_UNDO_COLUMN_FAMILY, TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
@@ -44,6 +54,22 @@ const SPEND_TRAILER_BYTES: usize = 76;
 const OUTPUT_EVENT_TAG: u8 = 0;
 const SPEND_EVENT_TAG: u8 = 1;
 
+/// Default height span scanned by each parallel canonical-scan chunk.
+pub(crate) const DEFAULT_CANONICAL_SCAN_CHUNK_BLOCKS: NonZeroU32 = match NonZeroU32::new(4_096) {
+    Some(blocks) => blocks,
+    None => NonZeroU32::MIN,
+};
+
+/// Minimum accounted outpoint-sort memory required per parallel scan shard.
+///
+/// Keeps each shard well above any valid transparent output record (~10 KiB
+/// consensus script cap plus metadata) so splitting memory across workers
+/// never refuses a record that would fit under a smaller worker count.
+const MIN_SHARD_OUTPOINT_SORT_MEMORY_BYTES: u64 = 64 * 1024;
+
+/// Maximum height chunks claimed ahead of ordered sequence-digest verification.
+const MAX_IN_FLIGHT_SCAN_CHUNKS: usize = 64;
+
 /// Resource limits for one external projection construction.
 #[derive(Clone, Copy)]
 pub(crate) struct WalletProjectionLoadConfig<'options> {
@@ -59,6 +85,7 @@ pub(crate) struct WalletProjectionLoadConfig<'options> {
     pub(crate) sst_target_logical_bytes: u64,
     pub(crate) max_accounted_reorg_undo_bytes: u64,
     pub(crate) accumulator_hashing_workers: NonZeroU32,
+    pub(crate) scan_chunk_blocks: NonZeroU32,
 }
 
 /// Counts proving the build used one authenticated scan and no prevout reads.
@@ -308,15 +335,268 @@ impl RetainedUndo {
     }
 }
 
+trait OutpointEventSink {
+    fn push_event(
+        &mut self,
+        key: [u8; OUTPOINT_EVENT_KEY_BYTES],
+        encoded_value: &[u8],
+    ) -> Result<(), BulkLoadError>;
+}
+
+impl OutpointEventSink for VariableValueSorter<OUTPOINT_EVENT_KEY_BYTES> {
+    fn push_event(
+        &mut self,
+        key: [u8; OUTPOINT_EVENT_KEY_BYTES],
+        encoded_value: &[u8],
+    ) -> Result<(), BulkLoadError> {
+        self.push(key, encoded_value)
+    }
+}
+
+impl OutpointEventSink for VariableValueSortShard<'_, OUTPOINT_EVENT_KEY_BYTES> {
+    fn push_event(
+        &mut self,
+        key: [u8; OUTPOINT_EVENT_KEY_BYTES],
+        encoded_value: &[u8],
+    ) -> Result<(), BulkLoadError> {
+        self.push(key, encoded_value)
+    }
+}
+
+struct CompletedCanonicalScan {
+    first_block: BlockId,
+    tip: BlockId,
+    source_sequence_digest: CanonicalBlockFactsSequenceDigest,
+    retained_undo: RetainedUndo,
+    scanned_block_count: u64,
+    scanned_transaction_count: u64,
+    staged_output_count: u64,
+    staged_spend_count: u64,
+    canonical_scan: Duration,
+    outpoint_sort: Duration,
+    sorted_outpoints: SortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
+    outpoint_sort_evidence: VariableValueSortEvidence,
+    outpoint_sort_durations: VariableValueSortDurations,
+}
+
+#[derive(Default)]
+struct ScanCounters {
+    blocks: u64,
+    transactions: u64,
+    staged_outputs: u64,
+    staged_spends: u64,
+}
+
+impl ScanCounters {
+    fn combine(&mut self, other: &Self) -> Result<(), RocksDbWalletError> {
+        self.blocks = add_counter(self.blocks, other.blocks)?;
+        self.transactions = add_counter(self.transactions, other.transactions)?;
+        self.staged_outputs = add_counter(self.staged_outputs, other.staged_outputs)?;
+        self.staged_spends = add_counter(self.staged_spends, other.staged_spends)?;
+        Ok(())
+    }
+}
+
+struct CompletedReplayChunk {
+    chunk_index: usize,
+    first_block: BlockId,
+    first_parent_hash: BlockHash,
+    last_block: BlockId,
+    counters: ScanCounters,
+    digests: Vec<CanonicalBlockFactsDigest>,
+}
+
+struct ChunkWindowState {
+    next_to_claim: usize,
+    next_to_verify: usize,
+    stopped: bool,
+}
+
+struct ChunkWindow {
+    chunks: Vec<BlockHeightRange>,
+    max_in_flight: usize,
+    stop_flag: AtomicBool,
+    state: Mutex<ChunkWindowState>,
+    available: Condvar,
+}
+
+impl ChunkWindow {
+    fn new(chunks: Vec<BlockHeightRange>, max_in_flight: usize) -> Self {
+        Self {
+            chunks,
+            max_in_flight: max_in_flight.max(1),
+            stop_flag: AtomicBool::new(false),
+            state: Mutex::new(ChunkWindowState {
+                next_to_claim: 0,
+                next_to_verify: 0,
+                stopped: false,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop_flag.load(Ordering::Relaxed)
+    }
+
+    fn stop(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        self.state.lock().stopped = true;
+        self.available.notify_all();
+    }
+
+    fn claim_next(&self) -> Option<(usize, BlockHeightRange)> {
+        let mut state = self.state.lock();
+        loop {
+            if state.stopped || state.next_to_claim >= self.chunks.len() {
+                return None;
+            }
+            if state.next_to_claim.saturating_sub(state.next_to_verify) < self.max_in_flight {
+                let chunk_index = state.next_to_claim;
+                state.next_to_claim = chunk_index.saturating_add(1);
+                drop(state);
+                return Some((chunk_index, self.chunks[chunk_index]));
+            }
+            self.available.wait(&mut state);
+        }
+    }
+
+    fn mark_verified(&self, next_to_verify: usize) {
+        self.state.lock().next_to_verify = next_to_verify;
+        self.available.notify_all();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only counter: when `Some(n)`, the `n`th canonical-scan worker spawn
+    /// on this thread returns a refused-thread error.
+    static REFUSED_CANONICAL_SCAN_THREAD: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Spawns one scoped canonical-scan worker, converting OS thread-start
+/// failures into [`RocksDbWalletError::CanonicalScanThreadUnavailable`].
+fn spawn_canonical_scan_worker<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    worker_index: usize,
+    task: F,
+) -> Result<std::thread::ScopedJoinHandle<'scope, T>, RocksDbWalletError>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    #[cfg(test)]
+    if let Some(remaining) = REFUSED_CANONICAL_SCAN_THREAD.get() {
+        if remaining == 0 {
+            REFUSED_CANONICAL_SCAN_THREAD.set(None);
+            return Err(RocksDbWalletError::CanonicalScanThreadUnavailable {
+                reason: "injected thread start refusal".to_owned(),
+            });
+        }
+        REFUSED_CANONICAL_SCAN_THREAD.set(Some(remaining - 1));
+    }
+    std::thread::Builder::new()
+        .name(format!("zinder-wallet-scan-{worker_index}"))
+        .spawn_scoped(scope, task)
+        .map_err(
+            |source| RocksDbWalletError::CanonicalScanThreadUnavailable {
+                reason: source.to_string(),
+            },
+        )
+}
+
+/// Splits `[first_height ..= settled_height]` into contiguous inclusive height
+/// chunks of at most `chunk_blocks` blocks each.
+fn partition_settled_height_chunks(
+    first_height: BlockHeight,
+    settled_height: BlockHeight,
+    chunk_blocks: NonZeroU32,
+) -> Vec<BlockHeightRange> {
+    if first_height > settled_height {
+        return Vec::new();
+    }
+    let span = chunk_blocks.get();
+    let mut chunks = Vec::new();
+    let mut current = first_height.value();
+    let last = settled_height.value();
+    loop {
+        let chunk_end = current.saturating_add(span - 1).min(last);
+        chunks.push(BlockHeightRange::inclusive(
+            BlockHeight::new(current),
+            BlockHeight::new(chunk_end),
+        ));
+        if chunk_end == last {
+            break;
+        }
+        current = chunk_end + 1;
+    }
+    chunks
+}
+
+/// Effective worker count for parallel canonical replay scanning.
+///
+/// Caps workers by the configured worker limit, the number of settled chunks,
+/// and the per-shard minimum sort memory so each worker can stage any valid
+/// transparent output without hitting a shrunk shard ceiling.
+fn parallel_scan_worker_count(
+    requested_workers: NonZeroU32,
+    chunk_count: usize,
+    max_outpoint_sort_memory_bytes: u64,
+) -> NonZeroU32 {
+    let max_for_memory = max_outpoint_sort_memory_bytes / MIN_SHARD_OUTPOINT_SORT_MEMORY_BYTES;
+    let workers = u64::from(requested_workers.get())
+        .min(u64::try_from(chunk_count).unwrap_or(u64::MAX))
+        .min(max_for_memory)
+        .min(u64::from(crate::MAX_ACCUMULATOR_HASHING_WORKERS));
+    NonZeroU32::new(u32::try_from(workers).unwrap_or(1)).unwrap_or(NonZeroU32::MIN)
+}
+
+/// Writes all six wallet families from a replay source, scanning the settled
+/// prefix in parallel height chunks when the source supports slices and more
+/// than one worker is active.
+pub(crate) fn write_projection_ssts_from_source<Source>(
+    config: WalletProjectionLoadConfig<'_>,
+    canonical_store: &Source,
+) -> Result<PreparedWalletProjectionLoad, RocksDbWalletError>
+where
+    Source: WalletProjectionReplaySource + ?Sized,
+{
+    if let Some(slice_source) = canonical_store.wallet_projection_slice_source() {
+        let chunks = partition_settled_height_chunks(
+            config.first_retained_block.height,
+            config.settled_tip.height,
+            config.scan_chunk_blocks,
+        );
+        let workers = parallel_scan_worker_count(
+            config.accumulator_hashing_workers,
+            chunks.len(),
+            config.max_outpoint_sort_memory_bytes,
+        );
+        if workers.get() > 1 {
+            let scanned = scan_canonical_replay_parallel(config, &slice_source, chunks, workers)?;
+            return finish_projection_ssts(config, scanned);
+        }
+    }
+    let blocks = canonical_store
+        .wallet_projection_scan()
+        .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
+    write_projection_ssts(config, blocks)
+}
+
 /// Writes all six wallet families from one authenticated canonical replay scan.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the loader keeps the source scan, external drains, and evidence fence in visible order"
-)]
 pub(crate) fn write_projection_ssts(
     config: WalletProjectionLoadConfig<'_>,
     blocks: impl IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
 ) -> Result<PreparedWalletProjectionLoad, RocksDbWalletError> {
+    let scanned = scan_canonical_replay_serial(config, blocks)?;
+    finish_projection_ssts(config, scanned)
+}
+
+fn scan_canonical_replay_serial(
+    config: WalletProjectionLoadConfig<'_>,
+    blocks: impl IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
+) -> Result<CompletedCanonicalScan, RocksDbWalletError> {
     let scan_started = Instant::now();
     let mut outpoint_sorter = VariableValueSorter::<OUTPOINT_EVENT_KEY_BYTES>::new(
         config.staging_path,
@@ -333,113 +613,20 @@ pub(crate) fn write_projection_ssts(
         CanonicalBlockFactsSequenceDigestBuilder::new(CanonicalBlockFactsSequenceDigestVersion::V1);
     let mut first_block = None;
     let mut previous_block = None;
-    let mut scanned_block_count = 0_u64;
-    let mut scanned_transaction_count = 0_u64;
-    let mut staged_output_count = 0_u64;
-    let mut staged_spend_count = 0_u64;
+    let mut counters = ScanCounters::default();
 
     for replay in blocks {
         let replay = replay.map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
-        let reference_digest = replay.reference_digest();
-        let facts = replay.into_facts();
-        let block = BlockId::new(facts.block_header.height, facts.block_header.block_hash);
-        validate_next_block(
-            config.first_retained_block,
+        let block = stage_serial_block(
+            config,
+            replay,
+            &mut first_block,
             previous_block,
-            block,
-            facts.block_header.parent_hash,
+            &mut sequence_digest,
+            &mut retained_undo,
+            &mut outpoint_sorter,
+            &mut counters,
         )?;
-        first_block.get_or_insert(block);
-        let source_sequence_digest_before = sequence_digest.clone().finish();
-        sequence_digest.try_append(reference_digest)?;
-        let source_sequence_digest_after = sequence_digest.clone().finish();
-        scanned_block_count = increment(scanned_block_count)?;
-
-        retained_undo.begin_block(
-            block,
-            facts.block_header.parent_hash,
-            source_sequence_digest_before,
-            source_sequence_digest_after,
-        )?;
-        let mut block_created_outpoints = BTreeSet::new();
-        for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
-            let tx_index_in_block = u32::try_from(transaction_index)
-                .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
-            scanned_transaction_count = increment(scanned_transaction_count)?;
-            let transaction_position = WalletTransactionPosition::new(
-                transaction.public_facts.transaction_id,
-                tx_index_in_block,
-                block,
-            );
-            for (input_position, input) in transaction.transparent_inputs.iter().enumerate() {
-                let expected_input_index = u32::try_from(input_position)
-                    .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
-                if input.input_index != expected_input_index {
-                    return Err(WalletProjectionContractError::FactIndexMismatch.into());
-                }
-                if input.spent_outpoint.is_coinbase_sentinel() {
-                    continue;
-                }
-                let outpoint_key = WalletOutpointKey::new(input.spent_outpoint);
-                outpoint_sorter.push(
-                    outpoint_event_key(outpoint_key, SPEND_EVENT_TAG),
-                    &encode_spend_trailer(StagedSpend {
-                        spent_at: transaction_position,
-                        input_index: input.input_index,
-                    }),
-                )?;
-                staged_spend_count = increment(staged_spend_count)?;
-                if !block_created_outpoints.contains(&outpoint_key) {
-                    retained_undo.add_spent_outpoint(outpoint_key)?;
-                }
-            }
-            for (output_position, output) in transaction.transparent_outputs.iter().enumerate() {
-                let expected_output_index = u32::try_from(output_position)
-                    .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
-                if output.output_index != expected_output_index {
-                    return Err(WalletProjectionContractError::FactIndexMismatch.into());
-                }
-                let outpoint = zinder_core::TransparentOutPoint::new(
-                    transaction.public_facts.transaction_id,
-                    output.output_index,
-                );
-                let outpoint_key = WalletOutpointKey::new(outpoint);
-                let wallet_output = WalletUnspentOutput::new(
-                    outpoint,
-                    output.address_script_hash,
-                    output.value_zat,
-                    output.script_pub_key.clone(),
-                    transaction_position,
-                )?;
-                outpoint_sorter.push(
-                    outpoint_event_key(outpoint_key, OUTPUT_EVENT_TAG),
-                    &wallet_output.encode_value()?,
-                )?;
-                staged_output_count = increment(staged_output_count)?;
-                if config.supported_reorg_depth != 0
-                    && !block_created_outpoints.contains(&outpoint_key)
-                {
-                    retained_undo.reserve_transient(
-                        u64::try_from(size_of::<WalletOutpointKey>()).map_err(|_| {
-                            RocksDbWalletError::WalletProjectionLoadAccountingOverflow
-                        })?,
-                    )?;
-                    block_created_outpoints.insert(outpoint_key);
-                }
-                retained_undo.add_created_outpoint(outpoint_key)?;
-            }
-        }
-        retained_undo.release_transient(
-            u64::try_from(block_created_outpoints.len())
-                .ok()
-                .and_then(|count| {
-                    u64::try_from(size_of::<WalletOutpointKey>())
-                        .ok()
-                        .and_then(|bytes| count.checked_mul(bytes))
-                })
-                .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?,
-        )?;
-        retained_undo.finish_block()?;
         previous_block = Some(block);
     }
     let first_block = first_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
@@ -447,10 +634,542 @@ pub(crate) fn write_projection_ssts(
     let canonical_scan = scan_started.elapsed();
 
     let phase_started = Instant::now();
-    let mut sorted_outpoints = outpoint_sorter.finish()?;
+    let sorted_outpoints = outpoint_sorter.finish()?;
     let outpoint_sort_evidence = sorted_outpoints.evidence();
     let outpoint_sort_durations = sorted_outpoints.durations();
     let outpoint_sort = phase_started.elapsed();
+
+    Ok(CompletedCanonicalScan {
+        first_block,
+        tip,
+        source_sequence_digest: sequence_digest.finish(),
+        retained_undo,
+        scanned_block_count: counters.blocks,
+        scanned_transaction_count: counters.transactions,
+        staged_output_count: counters.staged_outputs,
+        staged_spend_count: counters.staged_spends,
+        canonical_scan,
+        outpoint_sort,
+        sorted_outpoints,
+        outpoint_sort_evidence,
+        outpoint_sort_durations,
+    })
+}
+
+struct ParallelSettledScan<'sorter> {
+    shards: Vec<VariableValueSortShard<'sorter, OUTPOINT_EVENT_KEY_BYTES>>,
+    first_block: Option<BlockId>,
+    previous_block: Option<BlockId>,
+    counters: ScanCounters,
+}
+
+fn scan_canonical_replay_parallel(
+    config: WalletProjectionLoadConfig<'_>,
+    slice_source: &CanonicalReplaySliceSource<'_>,
+    chunks: Vec<BlockHeightRange>,
+    worker_count: NonZeroU32,
+) -> Result<CompletedCanonicalScan, RocksDbWalletError> {
+    let scan_started = Instant::now();
+    let parallel_sorter = ParallelVariableValueSorter::<OUTPOINT_EVENT_KEY_BYTES>::new(
+        config.staging_path,
+        "wallet-outpoint-events",
+        worker_count,
+        config.max_outpoint_sort_memory_bytes,
+        config.max_temporary_file_bytes_per_sorter,
+    )?;
+    let mut retained_undo = RetainedUndo::new(
+        config.supported_reorg_depth,
+        config.settled_tip,
+        config.max_accounted_reorg_undo_bytes,
+    );
+    let mut sequence_digest =
+        CanonicalBlockFactsSequenceDigestBuilder::new(CanonicalBlockFactsSequenceDigestVersion::V1);
+    let mut settled = run_parallel_settled_chunks(
+        &parallel_sorter,
+        slice_source,
+        chunks,
+        config.first_retained_block,
+        &mut sequence_digest,
+    )?;
+    if settled.previous_block != Some(config.settled_tip) {
+        return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
+            reason: "canonical replay settled-height block differs from the admitted settled tip",
+        });
+    }
+    scan_unsettled_suffix(
+        config,
+        slice_source,
+        &mut settled,
+        &mut sequence_digest,
+        &mut retained_undo,
+    )?;
+
+    let ParallelSettledScan {
+        shards,
+        first_block,
+        previous_block,
+        counters,
+    } = settled;
+    let first_block = first_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
+    let tip = previous_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
+    let final_sequence_digest = sequence_digest.finish();
+    slice_source
+        .verify_complete_sequence(ObservedCanonicalReplaySequence {
+            first_block,
+            tip,
+            block_count: counters.blocks,
+            sequence_digest: final_sequence_digest,
+        })
+        .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
+    let canonical_scan = scan_started.elapsed();
+
+    let phase_started = Instant::now();
+    let staged = parallel_sorter.flush_shards(shards)?;
+    let sorted_outpoints = parallel_sorter.finish(staged)?;
+    let outpoint_sort_evidence = sorted_outpoints.evidence();
+    let outpoint_sort_durations = sorted_outpoints.durations();
+    let outpoint_sort = phase_started.elapsed();
+
+    Ok(CompletedCanonicalScan {
+        first_block,
+        tip,
+        source_sequence_digest: final_sequence_digest,
+        retained_undo,
+        scanned_block_count: counters.blocks,
+        scanned_transaction_count: counters.transactions,
+        staged_output_count: counters.staged_outputs,
+        staged_spend_count: counters.staged_spends,
+        canonical_scan,
+        outpoint_sort,
+        sorted_outpoints,
+        outpoint_sort_evidence,
+        outpoint_sort_durations,
+    })
+}
+
+fn scan_unsettled_suffix(
+    config: WalletProjectionLoadConfig<'_>,
+    slice_source: &CanonicalReplaySliceSource<'_>,
+    settled: &mut ParallelSettledScan<'_>,
+    sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
+    retained_undo: &mut RetainedUndo,
+) -> Result<(), RocksDbWalletError> {
+    let visible_tip = slice_source.ready_evidence().visible_tip;
+    let Some(suffix_start) = config.settled_tip.height.next() else {
+        return Ok(());
+    };
+    if suffix_start > visible_tip.height {
+        return Ok(());
+    }
+    let suffix_shard = settled
+        .shards
+        .first_mut()
+        .ok_or(RocksDbWalletError::CanonicalScanWorkerStopped)?;
+    let suffix_scan = slice_source
+        .scan_slice(BlockHeightRange::inclusive(
+            suffix_start,
+            visible_tip.height,
+        ))
+        .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
+    for replay in suffix_scan {
+        let replay = replay.map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
+        let block = stage_serial_block(
+            config,
+            replay,
+            &mut settled.first_block,
+            settled.previous_block,
+            sequence_digest,
+            retained_undo,
+            suffix_shard,
+            &mut settled.counters,
+        )?;
+        settled.previous_block = Some(block);
+    }
+    Ok(())
+}
+
+fn run_parallel_settled_chunks<'sorter>(
+    parallel_sorter: &'sorter ParallelVariableValueSorter<OUTPOINT_EVENT_KEY_BYTES>,
+    slice_source: &CanonicalReplaySliceSource<'_>,
+    chunks: Vec<BlockHeightRange>,
+    first_retained_block: BlockId,
+    sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
+) -> Result<ParallelSettledScan<'sorter>, RocksDbWalletError> {
+    let initial_shards = parallel_sorter.open_shards();
+    let total_chunks = chunks.len();
+    let worker_threads = initial_shards.len();
+    let max_in_flight = worker_threads
+        .saturating_mul(4)
+        .clamp(worker_threads, MAX_IN_FLIGHT_SCAN_CHUNKS);
+    let window = ChunkWindow::new(chunks, max_in_flight);
+    let window_ref = &window;
+    let (completed_tx, completed_rx) = mpsc::sync_channel::<
+        Result<CompletedReplayChunk, RocksDbWalletError>,
+    >(max_in_flight.saturating_add(worker_threads));
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(initial_shards.len());
+        let mut start_failure = None;
+        for (worker_index, shard) in initial_shards.into_iter().enumerate() {
+            let sender = completed_tx.clone();
+            match spawn_canonical_scan_worker(scope, worker_index, move || {
+                scan_worker_chunks(slice_source, window_ref, shard, &sender)
+            }) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    window.stop();
+                    start_failure = Some(error);
+                    break;
+                }
+            }
+        }
+        drop(completed_tx);
+
+        let verify_outcome = if start_failure.is_none() {
+            verify_completed_chunks(
+                &window,
+                &completed_rx,
+                first_retained_block,
+                total_chunks,
+                sequence_digest,
+            )
+        } else {
+            Ok((None, None, ScanCounters::default()))
+        };
+        if verify_outcome.is_err() {
+            window.stop();
+        }
+
+        let mut returned_shards = Vec::with_capacity(workers.len());
+        let mut worker_stopped = false;
+        for worker in workers {
+            match worker.join() {
+                Ok(shard) => returned_shards.push(shard),
+                Err(_) => worker_stopped = true,
+            }
+        }
+        if let Some(error) = start_failure {
+            return Err(error);
+        }
+        let (first_block, previous_block, counters) = verify_outcome?;
+        if worker_stopped {
+            return Err(RocksDbWalletError::CanonicalScanWorkerStopped);
+        }
+        Ok(ParallelSettledScan {
+            shards: returned_shards,
+            first_block,
+            previous_block,
+            counters,
+        })
+    })
+}
+
+fn scan_worker_chunks<'sorter>(
+    slice_source: &CanonicalReplaySliceSource<'_>,
+    window: &ChunkWindow,
+    mut shard: VariableValueSortShard<'sorter, OUTPOINT_EVENT_KEY_BYTES>,
+    completed_tx: &SyncSender<Result<CompletedReplayChunk, RocksDbWalletError>>,
+) -> VariableValueSortShard<'sorter, OUTPOINT_EVENT_KEY_BYTES> {
+    while let Some((chunk_index, range)) = window.claim_next() {
+        let outcome = scan_one_settled_chunk(slice_source, window, chunk_index, range, &mut shard);
+        let failed = outcome.is_err();
+        if failed {
+            window.stop();
+        }
+        if completed_tx.send(outcome).is_err() || failed {
+            break;
+        }
+    }
+    shard
+}
+
+fn scan_one_settled_chunk(
+    slice_source: &CanonicalReplaySliceSource<'_>,
+    window: &ChunkWindow,
+    chunk_index: usize,
+    range: BlockHeightRange,
+    shard: &mut VariableValueSortShard<'_, OUTPOINT_EVENT_KEY_BYTES>,
+) -> Result<CompletedReplayChunk, RocksDbWalletError> {
+    let expected_blocks =
+        usize::try_from(u64::from(range.end.value() - range.start.value()) + 1).unwrap_or(0);
+    let mut digests = Vec::with_capacity(expected_blocks);
+    let mut first_block = None;
+    let mut first_parent_hash = None;
+    let mut last_block = None;
+    let mut counters = ScanCounters::default();
+    let scan = slice_source
+        .scan_slice(range)
+        .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
+    for replay in scan {
+        if window.is_stopped() {
+            return Err(RocksDbWalletError::CanonicalScanWorkerStopped);
+        }
+        let replay = replay.map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
+        let reference_digest = replay.reference_digest();
+        let facts = replay.into_facts();
+        let block = BlockId::new(facts.block_header.height, facts.block_header.block_hash);
+        if first_block.is_none() {
+            first_block = Some(block);
+            first_parent_hash = Some(facts.block_header.parent_hash);
+        }
+        last_block = Some(block);
+        digests.push(reference_digest);
+        counters.blocks = increment(counters.blocks)?;
+        stage_settled_block_transactions(&facts, block, shard, &mut counters)?;
+    }
+    let first_block = first_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
+    let first_parent_hash = first_parent_hash.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
+    let last_block = last_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
+    Ok(CompletedReplayChunk {
+        chunk_index,
+        first_block,
+        first_parent_hash,
+        last_block,
+        counters,
+        digests,
+    })
+}
+
+fn verify_completed_chunks(
+    window: &ChunkWindow,
+    completed_rx: &Receiver<Result<CompletedReplayChunk, RocksDbWalletError>>,
+    first_retained_block: BlockId,
+    total_chunks: usize,
+    sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
+) -> Result<(Option<BlockId>, Option<BlockId>, ScanCounters), RocksDbWalletError> {
+    let mut reorder = BTreeMap::new();
+    let mut next_to_verify = 0_usize;
+    let mut first_block = None;
+    let mut previous_block = None;
+    let mut counters = ScanCounters::default();
+    while next_to_verify < total_chunks {
+        let received = completed_rx
+            .recv()
+            .map_err(|_| RocksDbWalletError::CanonicalScanWorkerStopped)??;
+        reorder.insert(received.chunk_index, received);
+        while let Some(ready) = reorder.remove(&next_to_verify) {
+            validate_next_block(
+                first_retained_block,
+                previous_block,
+                ready.first_block,
+                ready.first_parent_hash,
+            )?;
+            first_block.get_or_insert(ready.first_block);
+            for digest in ready.digests {
+                sequence_digest.try_append(digest)?;
+            }
+            counters.combine(&ready.counters)?;
+            previous_block = Some(ready.last_block);
+            next_to_verify = next_to_verify.saturating_add(1);
+            window.mark_verified(next_to_verify);
+        }
+    }
+    Ok((first_block, previous_block, counters))
+}
+
+fn stage_settled_block_transactions(
+    facts: &CanonicalBlockFacts,
+    block: BlockId,
+    sink: &mut impl OutpointEventSink,
+    counters: &mut ScanCounters,
+) -> Result<(), RocksDbWalletError> {
+    for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
+        let tx_index_in_block = u32::try_from(transaction_index)
+            .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
+        counters.transactions = increment(counters.transactions)?;
+        let transaction_position = WalletTransactionPosition::new(
+            transaction.public_facts.transaction_id,
+            tx_index_in_block,
+            block,
+        );
+        for (input_position, input) in transaction.transparent_inputs.iter().enumerate() {
+            let expected_input_index = u32::try_from(input_position)
+                .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
+            if input.input_index != expected_input_index {
+                return Err(WalletProjectionContractError::FactIndexMismatch.into());
+            }
+            if input.spent_outpoint.is_coinbase_sentinel() {
+                continue;
+            }
+            let outpoint_key = WalletOutpointKey::new(input.spent_outpoint);
+            sink.push_event(
+                outpoint_event_key(outpoint_key, SPEND_EVENT_TAG),
+                &encode_spend_trailer(StagedSpend {
+                    spent_at: transaction_position,
+                    input_index: input.input_index,
+                }),
+            )?;
+            counters.staged_spends = increment(counters.staged_spends)?;
+        }
+        for (output_position, output) in transaction.transparent_outputs.iter().enumerate() {
+            let expected_output_index = u32::try_from(output_position)
+                .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
+            if output.output_index != expected_output_index {
+                return Err(WalletProjectionContractError::FactIndexMismatch.into());
+            }
+            let outpoint = zinder_core::TransparentOutPoint::new(
+                transaction.public_facts.transaction_id,
+                output.output_index,
+            );
+            let outpoint_key = WalletOutpointKey::new(outpoint);
+            let wallet_output = WalletUnspentOutput::new(
+                outpoint,
+                output.address_script_hash,
+                output.value_zat,
+                output.script_pub_key.clone(),
+                transaction_position,
+            )?;
+            sink.push_event(
+                outpoint_event_key(outpoint_key, OUTPUT_EVENT_TAG),
+                &wallet_output.encode_value()?,
+            )?;
+            counters.staged_outputs = increment(counters.staged_outputs)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "serial block staging updates sequence digest, retained undo, outpoint sink, and counters together"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "serial block staging keeps input/output validation and transient undo accounting in one loop"
+)]
+fn stage_serial_block(
+    config: WalletProjectionLoadConfig<'_>,
+    replay: ValidatedCanonicalBlockReplay,
+    first_block: &mut Option<BlockId>,
+    previous_block: Option<BlockId>,
+    sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
+    retained_undo: &mut RetainedUndo,
+    sink: &mut impl OutpointEventSink,
+    counters: &mut ScanCounters,
+) -> Result<BlockId, RocksDbWalletError> {
+    let reference_digest = replay.reference_digest();
+    let facts = replay.into_facts();
+    let block = BlockId::new(facts.block_header.height, facts.block_header.block_hash);
+    validate_next_block(
+        config.first_retained_block,
+        previous_block,
+        block,
+        facts.block_header.parent_hash,
+    )?;
+    first_block.get_or_insert(block);
+    let source_sequence_digest_before = sequence_digest.clone().finish();
+    sequence_digest.try_append(reference_digest)?;
+    let source_sequence_digest_after = sequence_digest.clone().finish();
+    counters.blocks = increment(counters.blocks)?;
+
+    retained_undo.begin_block(
+        block,
+        facts.block_header.parent_hash,
+        source_sequence_digest_before,
+        source_sequence_digest_after,
+    )?;
+    let mut block_created_outpoints = BTreeSet::new();
+    for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
+        let tx_index_in_block = u32::try_from(transaction_index)
+            .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
+        counters.transactions = increment(counters.transactions)?;
+        let transaction_position = WalletTransactionPosition::new(
+            transaction.public_facts.transaction_id,
+            tx_index_in_block,
+            block,
+        );
+        for (input_position, input) in transaction.transparent_inputs.iter().enumerate() {
+            let expected_input_index = u32::try_from(input_position)
+                .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
+            if input.input_index != expected_input_index {
+                return Err(WalletProjectionContractError::FactIndexMismatch.into());
+            }
+            if input.spent_outpoint.is_coinbase_sentinel() {
+                continue;
+            }
+            let outpoint_key = WalletOutpointKey::new(input.spent_outpoint);
+            sink.push_event(
+                outpoint_event_key(outpoint_key, SPEND_EVENT_TAG),
+                &encode_spend_trailer(StagedSpend {
+                    spent_at: transaction_position,
+                    input_index: input.input_index,
+                }),
+            )?;
+            counters.staged_spends = increment(counters.staged_spends)?;
+            if !block_created_outpoints.contains(&outpoint_key) {
+                retained_undo.add_spent_outpoint(outpoint_key)?;
+            }
+        }
+        for (output_position, output) in transaction.transparent_outputs.iter().enumerate() {
+            let expected_output_index = u32::try_from(output_position)
+                .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
+            if output.output_index != expected_output_index {
+                return Err(WalletProjectionContractError::FactIndexMismatch.into());
+            }
+            let outpoint = zinder_core::TransparentOutPoint::new(
+                transaction.public_facts.transaction_id,
+                output.output_index,
+            );
+            let outpoint_key = WalletOutpointKey::new(outpoint);
+            let wallet_output = WalletUnspentOutput::new(
+                outpoint,
+                output.address_script_hash,
+                output.value_zat,
+                output.script_pub_key.clone(),
+                transaction_position,
+            )?;
+            sink.push_event(
+                outpoint_event_key(outpoint_key, OUTPUT_EVENT_TAG),
+                &wallet_output.encode_value()?,
+            )?;
+            counters.staged_outputs = increment(counters.staged_outputs)?;
+            if config.supported_reorg_depth != 0 && !block_created_outpoints.contains(&outpoint_key)
+            {
+                retained_undo
+                    .reserve_transient(u64::try_from(size_of::<WalletOutpointKey>()).map_err(
+                        |_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow,
+                    )?)?;
+                block_created_outpoints.insert(outpoint_key);
+            }
+            retained_undo.add_created_outpoint(outpoint_key)?;
+        }
+    }
+    retained_undo.release_transient(
+        u64::try_from(block_created_outpoints.len())
+            .ok()
+            .and_then(|count| {
+                u64::try_from(size_of::<WalletOutpointKey>())
+                    .ok()
+                    .and_then(|bytes| count.checked_mul(bytes))
+            })
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?,
+    )?;
+    retained_undo.finish_block()?;
+    Ok(block)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the loader keeps the external drains and evidence fence in visible order"
+)]
+fn finish_projection_ssts(
+    config: WalletProjectionLoadConfig<'_>,
+    scanned: CompletedCanonicalScan,
+) -> Result<PreparedWalletProjectionLoad, RocksDbWalletError> {
+    let CompletedCanonicalScan {
+        first_block,
+        tip,
+        source_sequence_digest,
+        mut retained_undo,
+        scanned_block_count,
+        scanned_transaction_count,
+        staged_output_count,
+        staged_spend_count,
+        canonical_scan,
+        outpoint_sort,
+        mut sorted_outpoints,
+        outpoint_sort_evidence,
+        outpoint_sort_durations,
+    } = scanned;
 
     let phase_started = Instant::now();
     let mut address_index_sorter = VariableValueSorter::<ADDRESS_UNSPENT_KEY_BYTES>::new(
@@ -600,7 +1319,7 @@ pub(crate) fn write_projection_ssts(
         supported_reorg_depth: config.supported_reorg_depth,
         first_block,
         tip,
-        source_sequence_digest: sequence_digest.finish(),
+        source_sequence_digest,
         projection_digest,
         projection_accumulator,
         row_counts,
@@ -1062,8 +1781,12 @@ fn decode_spend_trailer(encoded: &[u8]) -> Result<StagedSpend, RocksDbWalletErro
 }
 
 fn increment(counter: u64) -> Result<u64, RocksDbWalletError> {
+    add_counter(counter, 1)
+}
+
+fn add_counter(counter: u64, delta: u64) -> Result<u64, RocksDbWalletError> {
     counter
-        .checked_add(1)
+        .checked_add(delta)
         .ok_or(RocksDbWalletError::BuildCounterOverflow)
 }
 
@@ -1704,6 +2427,7 @@ mod tests {
             sst_target_logical_bytes: TEST_SST_LOGICAL_BYTES,
             max_accounted_reorg_undo_bytes: TEST_REORG_UNDO_BYTES,
             accumulator_hashing_workers: NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
+            scan_chunk_blocks: DEFAULT_CANONICAL_SCAN_CHUNK_BLOCKS,
         }
     }
 
@@ -1815,5 +2539,367 @@ mod tests {
             transparent_inputs,
             transparent_outputs,
         }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "test fixture constructs a complete certified canonical store in one helper"
+    )]
+    fn build_ready_test_canonical_store(
+        path: &Path,
+        blocks: &[CanonicalBlockFacts],
+        settled_index: usize,
+        reorg_window: u32,
+    ) -> Result<zinder_store::RocksDbCanonicalStore, Box<dyn Error>> {
+        use zinder_core::{
+            ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
+            CompactBlockArtifact, CompactChainMetadata, ConsensusBranchId,
+            NetworkUpgradeActivation, NetworkUpgradeActivations, TransactionBlobArtifact,
+            TransactionLocation, UnixTimestampMillis,
+        };
+        use zinder_store::{
+            CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
+            CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention,
+            RocksDbCanonicalBuilder,
+        };
+        let activations_vec = [
+            "Overwinter",
+            "Sapling",
+            "Blossom",
+            "Heartwood",
+            "Canopy",
+            "NU5",
+            "NU6",
+            "NU6.1",
+            "NU6.2",
+            "NU6.3",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(u32::try_from(index).unwrap_or(u32::MAX) + 1),
+            activation_height: BlockHeight::new(100 + u32::try_from(index).unwrap_or(u32::MAX)),
+            name: name.to_owned(),
+        })
+        .collect();
+        let activations = NetworkUpgradeActivations::new(Network::ZcashRegtest, activations_vec)?;
+        let tip_facts = blocks.last().ok_or("test blocks must not be empty")?;
+        let tip = BlockId::new(
+            tip_facts.block_header.height,
+            tip_facts.block_header.block_hash,
+        );
+        let settled_facts = blocks
+            .get(settled_index)
+            .ok_or("settled index out of range")?;
+        let settled_tip = BlockId::new(
+            settled_facts.block_header.height,
+            settled_facts.block_header.block_hash,
+        );
+        let plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            tip,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(reorg_window)?,
+        )?;
+        let mut builder = RocksDbCanonicalBuilder::create_fresh(
+            path,
+            CanonicalStoreWorkload::Wallet,
+            plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let total = blocks.len();
+        let build_blocks = blocks.iter().enumerate().map(|(index, facts)| {
+            let height = facts.block_header.height;
+            let block_hash = facts.block_header.block_hash;
+            let parent_hash = facts.block_header.parent_hash;
+            let is_tip = index + 1 == total;
+            let compact_block = CompactBlockArtifact::empty(
+                BlockId::new(height, block_hash),
+                parent_hash,
+                u32::try_from(facts.block_header.block_time).unwrap_or(u32::MAX),
+                CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            );
+            let transaction_blobs = facts
+                .transactions
+                .iter()
+                .enumerate()
+                .map(|(tx_idx, transaction)| {
+                    TransactionBlobArtifact::new(
+                        TransactionLocation::new(
+                            transaction.public_facts.transaction_id,
+                            height,
+                            block_hash,
+                            u32::try_from(tx_idx).unwrap_or(u32::MAX),
+                        ),
+                        transaction.public_facts.transaction_id.as_bytes(),
+                    )
+                })
+                .collect();
+            let tree_state_checkpoint = is_tip.then(|| {
+                CommitmentTreeCheckpoint::new(
+                    BlockId::new(height, block_hash),
+                    u32::try_from(facts.block_header.block_time).unwrap_or(u32::MAX),
+                    CommitmentTreeFrontiers::default(),
+                )
+            });
+            let replay_envelope = encode_canonical_block_replay(
+                facts,
+                CanonicalBlockReplayFormatVersion::V1,
+                CanonicalBlockFactsDigestVersion::V1,
+            );
+            Ok::<_, std::io::Error>(CanonicalBuildBlock {
+                facts: facts.clone(),
+                replay_envelope,
+                compact_block,
+                tip_metadata: ChainTipMetadata::new(0, 0, 0),
+                tree_state_checkpoint,
+                block_final_note_commitment_roots: None,
+                transaction_blobs,
+                block_blob: None,
+            })
+        });
+        builder.bulk_load_blocks(&activations, build_blocks)?;
+        builder.load_subtree_roots(std::iter::empty())?;
+        let tip_checkpoint = CommitmentTreeCheckpoint::new(
+            tip,
+            u32::try_from(tip_facts.block_header.block_time).unwrap_or(u32::MAX),
+            CommitmentTreeFrontiers::default(),
+        );
+        builder.confirm_source_tip_checkpoint(&tip_checkpoint)?;
+        let validated = builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            settled_tip,
+            UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        Ok(validated.publish_baseline(publication)?)
+    }
+
+    fn multi_chunk_canonical_blocks() -> Vec<CanonicalBlockFacts> {
+        let mut blocks = Vec::new();
+        let mut parent_hash = Network::ZcashRegtest.genesis_hash().as_bytes();
+        let mut created_outpoints = Vec::new();
+        for height in 1_u32..=15 {
+            let mut block_hash = [0_u8; 32];
+            block_hash[0] = u8::try_from(height).unwrap_or(0);
+            block_hash[31] = 0xAA;
+            let mut tx_id_bytes = [0_u8; 32];
+            tx_id_bytes[0] = u8::try_from(height).unwrap_or(0);
+            tx_id_bytes[1] = 0x10;
+            let tx_id = TransactionId::from_bytes(tx_id_bytes);
+            let mut address_bytes = [0_u8; 32];
+            address_bytes[0] = u8::try_from(height % 4).unwrap_or(0);
+            let address = TransparentAddressScriptHash::from_bytes(address_bytes);
+            let mut coinbase = transaction_facts(
+                tx_id,
+                vec![TransparentInputFact::new(
+                    0,
+                    TransparentOutPoint::COINBASE_SENTINEL,
+                )],
+                vec![TransparentOutputFact::new(
+                    0,
+                    1_000 * u64::from(height),
+                    vec![0x76, 0xa9],
+                    address,
+                )],
+            );
+            coinbase.public_facts.is_coinbase = true;
+            created_outpoints.push(TransparentOutPoint::new(tx_id, 0));
+            let mut transactions = vec![coinbase];
+            // Spend an output from 3 blocks earlier (exercises cross-chunk and
+            // settled-to-unsettled spends) on every height >= 4.
+            if height >= 4 {
+                let mut spend_tx_bytes = [0_u8; 32];
+                spend_tx_bytes[0] = u8::try_from(height).unwrap_or(0);
+                spend_tx_bytes[1] = 0x20;
+                let spend_tx_id = TransactionId::from_bytes(spend_tx_bytes);
+                let spent = created_outpoints[usize::try_from(height - 4).unwrap_or(0)];
+                let spend_tx = transaction_facts(
+                    spend_tx_id,
+                    vec![TransparentInputFact::new(0, spent)],
+                    vec![TransparentOutputFact::new(
+                        0,
+                        500 * u64::from(height),
+                        vec![0x51],
+                        TransparentAddressScriptHash::from_bytes([0xbb; 32]),
+                    )],
+                );
+                transactions.push(spend_tx);
+            }
+            blocks.push(block_facts(height, parent_hash, block_hash, transactions));
+            parent_hash = block_hash;
+        }
+        blocks
+    }
+
+    #[test]
+    fn partition_settled_height_chunks_covers_every_height_once() -> Result<(), Box<dyn Error>> {
+        let empty = partition_settled_height_chunks(
+            BlockHeight::new(5),
+            BlockHeight::new(4),
+            NonZeroU32::new(4).ok_or("zero chunk")?,
+        );
+        assert_eq!(empty, Vec::new());
+
+        for span in [1_u32, 2, 3, 4, 7, 16] {
+            let chunks = partition_settled_height_chunks(
+                BlockHeight::new(1),
+                BlockHeight::new(15),
+                NonZeroU32::new(span).ok_or("zero chunk")?,
+            );
+            assert_eq!(
+                chunks.first().map(|chunk| chunk.start),
+                Some(BlockHeight::new(1))
+            );
+            assert_eq!(
+                chunks.last().map(|chunk| chunk.end),
+                Some(BlockHeight::new(15))
+            );
+            for pair in chunks.windows(2) {
+                assert_eq!(pair[0].end.next(), Some(pair[1].start));
+            }
+            for chunk in &chunks {
+                let len = u64::from(chunk.end.value() - chunk.start.value()) + 1;
+                assert!(len >= 1 && len <= u64::from(span));
+            }
+        }
+
+        // u32::MAX upper bound must not overflow.
+        let top_chunks = partition_settled_height_chunks(
+            BlockHeight::new(u32::MAX - 2),
+            BlockHeight::new(u32::MAX),
+            NonZeroU32::new(2).ok_or("zero chunk")?,
+        );
+        assert_eq!(
+            top_chunks,
+            vec![
+                BlockHeightRange::inclusive(
+                    BlockHeight::new(u32::MAX - 2),
+                    BlockHeight::new(u32::MAX - 1),
+                ),
+                BlockHeightRange::inclusive(BlockHeight::new(u32::MAX), BlockHeight::new(u32::MAX),),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_scan_worker_count_respects_chunks_workers_and_memory_floor()
+    -> Result<(), Box<dyn Error>> {
+        let four = NonZeroU32::new(4).ok_or("zero")?;
+        let eight = NonZeroU32::new(8).ok_or("zero")?;
+        assert_eq!(
+            parallel_scan_worker_count(four, 10, 4 * MIN_SHARD_OUTPOINT_SORT_MEMORY_BYTES).get(),
+            4
+        );
+        assert_eq!(
+            parallel_scan_worker_count(eight, 3, 16 * MIN_SHARD_OUTPOINT_SORT_MEMORY_BYTES).get(),
+            3
+        );
+        assert_eq!(
+            parallel_scan_worker_count(eight, 10, 2 * MIN_SHARD_OUTPOINT_SORT_MEMORY_BYTES).get(),
+            2
+        );
+        assert_eq!(
+            parallel_scan_worker_count(eight, 10, MIN_SHARD_OUTPOINT_SORT_MEMORY_BYTES - 1).get(),
+            1
+        );
+        assert_eq!(
+            parallel_scan_worker_count(eight, 0, 16 * MIN_SHARD_OUTPOINT_SORT_MEMORY_BYTES).get(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_canonical_scan_matches_serial_with_settled_and_unsettled_suffix()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let blocks = multi_chunk_canonical_blocks();
+        let canonical =
+            build_ready_test_canonical_store(&temporary.path().join("canonical"), &blocks, 11, 5)?;
+        let ready = canonical.ready_evidence();
+        let options = test_column_family_options();
+        let serial_staging = TempDir::new()?;
+        let mut serial_config = test_config_with_bounds(
+            serial_staging.path(),
+            &options,
+            TestByteLimits::default(),
+            ready.first_retained_block,
+            ready.sequence_checkpoint.through(),
+        );
+        serial_config.supported_reorg_depth = 5;
+        serial_config.accumulator_hashing_workers = NonZeroU32::MIN;
+        let serial = write_projection_ssts_from_source(serial_config, &canonical)?;
+
+        for workers in [2_u32, 4, 8] {
+            for chunk_blocks in [2_u32, 3, 5] {
+                let staging = TempDir::new()?;
+                let mut config = serial_config;
+                config.staging_path = staging.path();
+                config.accumulator_hashing_workers = NonZeroU32::new(workers).ok_or("zero")?;
+                config.scan_chunk_blocks = NonZeroU32::new(chunk_blocks).ok_or("zero")?;
+                let parallel = write_projection_ssts_from_source(config, &canonical)?;
+                assert_eq!(parallel.first_block, serial.first_block);
+                assert_eq!(parallel.tip, serial.tip);
+                assert_eq!(
+                    parallel.source_sequence_digest,
+                    serial.source_sequence_digest
+                );
+                assert_eq!(parallel.projection_digest, serial.projection_digest);
+                assert_eq!(
+                    parallel.projection_accumulator,
+                    serial.projection_accumulator
+                );
+                assert_eq!(parallel.row_counts, serial.row_counts);
+                assert_eq!(parallel.utxo_summary, serial.utxo_summary);
+                assert_eq!(parallel.counters, serial.counters);
+                assert_eq!(parallel.logical_row_bytes, serial.logical_row_bytes);
+                assert_eq!(
+                    parallel.row_counts.reorg_undo_count, 3,
+                    "workers={workers} chunk={chunk_blocks}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_canonical_scan_rejects_refused_worker_thread_with_typed_error()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let blocks = multi_chunk_canonical_blocks();
+        let canonical =
+            build_ready_test_canonical_store(&temporary.path().join("canonical"), &blocks, 11, 5)?;
+        let ready = canonical.ready_evidence();
+        let options = test_column_family_options();
+        for refused_index in [0_usize, 1, 3] {
+            let staging = TempDir::new()?;
+            let mut config = test_config_with_bounds(
+                staging.path(),
+                &options,
+                TestByteLimits::default(),
+                ready.first_retained_block,
+                ready.sequence_checkpoint.through(),
+            );
+            config.supported_reorg_depth = 5;
+            config.accumulator_hashing_workers = NonZeroU32::new(4).ok_or("zero")?;
+            config.scan_chunk_blocks = NonZeroU32::new(2).ok_or("zero")?;
+            REFUSED_CANONICAL_SCAN_THREAD.set(Some(refused_index));
+            let outcome = write_projection_ssts_from_source(config, &canonical);
+            REFUSED_CANONICAL_SCAN_THREAD.set(None);
+            assert!(
+                matches!(
+                    outcome,
+                    Err(RocksDbWalletError::CanonicalScanThreadUnavailable { .. })
+                ),
+                "refused index {refused_index}"
+            );
+        }
+        Ok(())
     }
 }

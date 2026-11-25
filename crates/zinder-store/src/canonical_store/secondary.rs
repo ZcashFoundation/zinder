@@ -575,6 +575,13 @@ impl RocksDbCanonicalSecondary {
         CanonicalReplayScan::new(&self.bounded_open.db, &self.ready_evidence)
     }
 
+    /// Returns a `Sync` slice source for concurrent height-bounded replay scans
+    /// against this secondary's admitted READY fence.
+    #[must_use]
+    pub const fn canonical_replay_slice_source(&self) -> super::CanonicalReplaySliceSource<'_> {
+        super::CanonicalReplaySliceSource::new(&self.bounded_open.db, &self.ready_evidence)
+    }
+
     /// Reads one bounded connected replay range from this admitted fence.
     ///
     /// This is the incremental-projector path. It authenticates each decoded
