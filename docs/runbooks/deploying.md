@@ -106,12 +106,16 @@ reader ceiling alone does not guarantee it.
 ### Optional Pasta assembly backend
 
 The shipped images compile the portable Pasta field-arithmetic backend, which
-runs on every supported CPU. To build images with the faster assembly backend
-instead, pass `--build-arg ZINDER_PASTA_ASM=1` to the Docker build, or pass
-`--features pasta_curves/asm` to a source build. On x86-64 the assembly backend
-needs BMI2 and ADX. The x86-64-v3 release already requires BMI2 and OS support
-for XMM and YMM state. The assembly build additionally checks for ADX before
-opening storage. Each binary logs the backend it compiled (`portable`,
+runs on every supported `x86-64-v3` (down to Haswell) and AArch64 CPU. Because
+`pasta_curves` selects its backend at compile time and its x86-64 assembly
+requires BMI2 and ADX, the portable default keeps ADX instructions out of
+release binaries. To build images with the faster assembly backend instead, pass
+`--build-arg ZINDER_PASTA_ASM=1` to the Docker build (including `zinder-bench`),
+set `ZINDER_PASTA_ASM=1` when building from source with Docker Compose, or pass
+`--features pasta_curves/asm` to a Cargo source build. The `x86-64-v3` release
+already requires BMI2 and OS support for XMM and YMM state. The assembly build
+additionally verifies ADX at startup and refuses to run on unsupported CPUs
+before opening storage. Each binary logs the backend it compiled (`portable`,
 `x86-64`, or `aarch64`) at startup.
 
 A paired comparison on two retained 2,000-block fixtures measured the x86-64

@@ -126,6 +126,14 @@ impl TreeHashers {
         self.pending.len() < self.max_pending && !self.pending.back().is_some_and(Result::is_err)
     }
 
+    /// Remaining pending-block slots available before reaching `max_pending`.
+    pub(super) fn remaining_pending(&self) -> usize {
+        if self.pending.back().is_some_and(Result::is_err) {
+            return 0;
+        }
+        self.max_pending.saturating_sub(self.pending.len())
+    }
+
     pub(super) fn is_idle(&self) -> bool {
         self.pending.is_empty()
     }

@@ -1911,8 +1911,9 @@ async fn build_explorer_every_block_store(
     activations: &Arc<NetworkUpgradeActivations>,
     store_path: &std::path::Path,
     tree_hashing_workers: u32,
+    tip_height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let tip = source.checkpoint_at(7)?;
+    let tip = source.checkpoint_at(tip_height)?;
     let genesis = source.checkpoint_at(0)?;
     let build_plan = CanonicalStoreBuildPlan::complete(
         activations,
@@ -1984,7 +1985,7 @@ async fn every_block_construction_with_dense_and_multi_pool_commitments_matches_
         assert_eq!(wallet_checkpoints.len(), 8);
 
         let explorer_path = temporary.path().join(format!("explorer-{workers}"));
-        build_explorer_every_block_store(&source, &activations, &explorer_path, workers).await?;
+        build_explorer_every_block_store(&source, &activations, &explorer_path, workers, 7).await?;
         let explorer_checkpoints = read_cf_entries(&explorer_path, "tree_state_checkpoint")?;
         let explorer_final_roots =
             read_cf_entries(&explorer_path, "block_final_note_commitment_roots")?;
@@ -2347,6 +2348,115 @@ async fn indexer_and_json_rpc_sources_construct_identical_canonical_stores()
     assert!(
         tip_polls <= 5,
         "expected O(1) tip polls during 10-block settled construction, observed {tip_polls}"
+    );
+    Ok(())
+}
+
+fn batched_multi_pool_source(
+    activations: &NetworkUpgradeActivations,
+) -> Result<MultiBlockConstructionSource, Box<dyn std::error::Error>> {
+    let sapling = fixture_sapling_source_block()?;
+    let orchard = fixture_orchard_source_block()?;
+    MultiBlockConstructionSource::build_with_transactions(72, activations, |height| {
+        if height == 15 || height == 65 {
+            let mut transactions = shielded_transactions_with_lock_time(&sapling, Some(height))?;
+            for offset in 0_u32..10 {
+                transactions.extend(shielded_transactions_with_lock_time(
+                    &orchard,
+                    Some(1_000 + height * 16 + offset),
+                )?);
+            }
+            return Ok(transactions);
+        }
+        match height % 5 {
+            1 => shielded_transactions_with_lock_time(&sapling, Some(height)),
+            2 => shielded_transactions_with_lock_time(&orchard, Some(height)),
+            3 => {
+                let mut transactions =
+                    shielded_transactions_with_lock_time(&sapling, Some(2_000 + height))?;
+                transactions.extend(shielded_transactions_with_lock_time(
+                    &orchard,
+                    Some(3_000 + height),
+                )?);
+                Ok(transactions)
+            }
+            _ => Ok(Vec::new()),
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_block_multi_batch_construction_matches_serial_across_workers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let recorded_metrics = install_metrics_recorder(&OpsServer {
+        service_name: "zinder-ingest",
+        service_version: "0.0.0",
+        network_name: "zcash-regtest",
+        advertised_capabilities: Arc::from([]),
+    })?;
+    let activations = regtest_activations();
+    let source = batched_multi_pool_source(&activations)?;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let temporary = TempDir::new()?;
+
+    let mut serial_checkpoints: Option<ColumnFamilyEntries> = None;
+    let mut serial_final_roots: Option<ColumnFamilyEntries> = None;
+    let mut serial_subtrees: Option<ColumnFamilyEntries> = None;
+
+    for workers in [1_u32, 2, 4, 8] {
+        let wallet_path = temporary.path().join(format!("wallet-batch-{workers}"));
+        let mut wallet_config =
+            multi_block_writer_config(wallet_path.clone(), Arc::clone(&activations), true);
+        wallet_config
+            .construction
+            .pipeline_limits
+            .tree_hashing_workers = NonZeroU32::new(workers).ok_or("workers must be non-zero")?;
+        let wallet_store = admit_canonical_store(
+            &source,
+            Arc::clone(&activations),
+            &wallet_config,
+            &readiness,
+            &CancellationToken::new(),
+        )
+        .await?;
+        for height in 0_u32..=71 {
+            assert_eq!(
+                wallet_store
+                    .tree_state_checkpoint_at(BlockHeight::new(height), &activations)?
+                    .as_ref(),
+                Some(source.checkpoint_at(height)?)
+            );
+        }
+        drop(wallet_store);
+        let wallet_checkpoints = read_cf_entries(&wallet_path, "tree_state_checkpoint")?;
+        assert_eq!(wallet_checkpoints.len(), 72);
+
+        let explorer_path = temporary.path().join(format!("explorer-batch-{workers}"));
+        build_explorer_every_block_store(&source, &activations, &explorer_path, workers, 71)
+            .await?;
+        let explorer_checkpoints = read_cf_entries(&explorer_path, "tree_state_checkpoint")?;
+        let explorer_final_roots =
+            read_cf_entries(&explorer_path, "block_final_note_commitment_roots")?;
+        let explorer_subtrees = read_cf_entries(&explorer_path, "subtree_root")?;
+        assert_eq!(explorer_checkpoints, wallet_checkpoints);
+        assert_eq!(explorer_final_roots.len(), 71);
+
+        if let Some(expected_checkpoints) = &serial_checkpoints {
+            assert_eq!(&wallet_checkpoints, expected_checkpoints);
+            assert_eq!(Some(&explorer_final_roots), serial_final_roots.as_ref());
+            assert_eq!(Some(&explorer_subtrees), serial_subtrees.as_ref());
+        } else {
+            serial_checkpoints = Some(wallet_checkpoints);
+            serial_final_roots = Some(explorer_final_roots);
+            serial_subtrees = Some(explorer_subtrees);
+        }
+    }
+
+    let rendered = recorded_metrics.render();
+    assert!(
+        rendered
+            .contains("zinder_ingest_canonical_block_load_stage_duration_seconds_count{stage=\"tree_hashing_append\"}"),
+        "expected tree_hashing_append stage histogram sample in rendered metrics"
     );
     Ok(())
 }

@@ -28,8 +28,9 @@ use tokio::sync::{
 };
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
-    CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
+    BatchAppendedBlock, BatchPoolAppendDurations, BlockCommitmentBatchInput, BlockHeight, BlockId,
+    ChainTipMetadata, CommitmentTreeAccumulator, CommitmentTreeAccumulatorError,
+    CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
@@ -75,6 +76,12 @@ const CONSTRUCTION_PHASE_DURATION_METRIC: &str =
     "zinder_ingest_canonical_construction_phase_duration_seconds";
 const BLOCK_LOAD_STAGE_DURATION_METRIC: &str =
     "zinder_ingest_canonical_block_load_stage_duration_seconds";
+const TREE_APPEND_POOL_DURATION_METRIC: &str =
+    "zinder_ingest_canonical_tree_append_duration_seconds";
+/// Most prepared blocks combined into one cross-block commitment-tree append.
+const MAX_COMMITMENT_BATCH_BLOCKS: usize = 64;
+/// Soft ceiling on total note commitments combined into one loader tree batch.
+const MAX_COMMITMENT_BATCH_COMMITMENTS: usize = 16_384;
 
 /// Records how long one completed construction phase took.
 pub(crate) fn record_construction_phase(phase: &'static str, started_at: Instant) {
@@ -1323,6 +1330,9 @@ struct BlockLoaderStageTimers {
     receive_wait: Histogram,
     commitment_extract: Histogram,
     tree_hashing_append: Histogram,
+    tree_append_sapling: Histogram,
+    tree_append_orchard: Histogram,
+    tree_append_ironwood: Histogram,
     position: Histogram,
     tree_hashing_checkpoint: Histogram,
     /// Present only for the explorer workload, the one that derives final roots.
@@ -1332,10 +1342,14 @@ struct BlockLoaderStageTimers {
 impl BlockLoaderStageTimers {
     fn register(workload: CanonicalStoreWorkload) -> Self {
         let stage = |stage: &'static str| metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => stage);
+        let pool_timer = |pool: &'static str| metrics::histogram!(TREE_APPEND_POOL_DURATION_METRIC, "pool" => pool);
         Self {
             receive_wait: stage("receive_wait"),
             commitment_extract: stage("commitment_extract"),
             tree_hashing_append: stage("tree_hashing_append"),
+            tree_append_sapling: pool_timer("sapling"),
+            tree_append_orchard: pool_timer("orchard"),
+            tree_append_ironwood: pool_timer("ironwood"),
             position: stage("position"),
             tree_hashing_checkpoint: stage("tree_hashing_checkpoint"),
             tree_hashing_final_roots: workload
@@ -1343,6 +1357,29 @@ impl BlockLoaderStageTimers {
                 .then(|| stage("tree_hashing_final_roots")),
         }
     }
+
+    fn record_pool_append_durations(&self, durations: BatchPoolAppendDurations) {
+        if let Some(sapling) = durations.sapling {
+            self.tree_append_sapling.record(sapling);
+        }
+        if let Some(orchard) = durations.orchard {
+            self.tree_append_orchard.record(orchard);
+        }
+        if let Some(ironwood) = durations.ironwood {
+            self.tree_append_ironwood.record(ironwood);
+        }
+    }
+}
+
+struct PreparedBatchEntry {
+    queued: QueuedPreparedBlock,
+    commitments: CompactBlockCommitments,
+}
+
+enum DrainedBatchTail {
+    ChannelIdleOrClosed,
+    BatchLimitReached,
+    Failed(CanonicalConstructionError),
 }
 
 impl Iterator for CanonicalBuildBlockReceiver {
@@ -1434,7 +1471,7 @@ impl CanonicalBuildBlockReceiver {
     }
 
     /// Hands the store the oldest appended block once its tree work is done,
-    /// after appending further blocks that are already prepared.
+    /// after appending prepared blocks in parallel batches when available.
     fn next_hashed_ahead(
         &mut self,
     ) -> Option<Result<CanonicalBuildBlock, CanonicalConstructionError>> {
@@ -1446,16 +1483,24 @@ impl CanonicalBuildBlockReceiver {
             .as_ref()
             .is_some_and(TreeHashers::wants_more)
         {
-            // Waiting for a new block while earlier blocks hold memory permits
-            // could stall a source pipeline that needs those permits back.
-            let idle = self.tree_hashers.as_ref().is_some_and(TreeHashers::is_idle);
-            let staged = match self.receive(idle) {
-                Received::Block(queued_block) => self.stage_block(*queued_block),
-                Received::Failed(source) => Err(source),
-                Received::Empty | Received::Closed => break,
-            };
-            if let Some(tree_hashers) = self.tree_hashers.as_mut() {
-                tree_hashers.push(staged);
+            let (batch, tail) = self.drain_prepared_batch();
+            if !batch.is_empty() {
+                self.stage_prepared_batch(batch);
+            }
+            match tail {
+                DrainedBatchTail::Failed(error) => {
+                    if self
+                        .tree_hashers
+                        .as_ref()
+                        .is_some_and(TreeHashers::wants_more)
+                        && let Some(tree_hashers) = self.tree_hashers.as_mut()
+                    {
+                        tree_hashers.push(Err(error));
+                    }
+                    break;
+                }
+                DrainedBatchTail::ChannelIdleOrClosed => break,
+                DrainedBatchTail::BatchLimitReached => {}
             }
         }
         let Some(pending) = self.tree_hashers.as_mut().and_then(TreeHashers::pop) else {
@@ -1471,21 +1516,178 @@ impl CanonicalBuildBlockReceiver {
         Some(built)
     }
 
-    /// Appends and positions one block, and starts deriving its checkpoint
-    /// and final roots on the hashing workers.
-    fn stage_block(
+    fn drain_prepared_batch(&mut self) -> (Vec<PreparedBatchEntry>, DrainedBatchTail) {
+        let remaining = self
+            .tree_hashers
+            .as_ref()
+            .map_or(0, TreeHashers::remaining_pending);
+        let block_limit = remaining.min(MAX_COMMITMENT_BATCH_BLOCKS);
+        let mut batch = Vec::new();
+        let mut total_commitments = 0_usize;
+        let mut tail = DrainedBatchTail::ChannelIdleOrClosed;
+
+        while batch.len() < block_limit {
+            // Waiting for a new block while earlier blocks hold memory permits
+            // could stall a source pipeline that needs those permits back.
+            let idle =
+                batch.is_empty() && self.tree_hashers.as_ref().is_some_and(TreeHashers::is_idle);
+            match self.receive(idle) {
+                Received::Block(queued_block) => {
+                    let started_at = Instant::now();
+                    let commitments = match compact_block_commitments(&queued_block.prepared) {
+                        Ok(commitments) => commitments,
+                        Err(error) => {
+                            tail = DrainedBatchTail::Failed(error);
+                            break;
+                        }
+                    };
+                    self.stage_timers
+                        .commitment_extract
+                        .record(started_at.elapsed());
+                    total_commitments = total_commitments.saturating_add(commitments.total_len());
+                    batch.push(PreparedBatchEntry {
+                        queued: *queued_block,
+                        commitments,
+                    });
+                    if total_commitments >= MAX_COMMITMENT_BATCH_COMMITMENTS {
+                        tail = DrainedBatchTail::BatchLimitReached;
+                        break;
+                    }
+                }
+                Received::Failed(error) => {
+                    tail = DrainedBatchTail::Failed(error);
+                    break;
+                }
+                Received::Empty | Received::Closed => break,
+            }
+        }
+        if batch.len() == block_limit && matches!(tail, DrainedBatchTail::ChannelIdleOrClosed) {
+            tail = DrainedBatchTail::BatchLimitReached;
+        }
+        (batch, tail)
+    }
+
+    fn stage_prepared_batch(&mut self, batch: Vec<PreparedBatchEntry>) {
+        let can_batch_in_parallel = batch.len() >= 2
+            && self
+                .tree_hashers
+                .as_ref()
+                .is_some_and(TreeHashers::has_append_workers);
+        if !can_batch_in_parallel {
+            self.stage_batch_sequentially(batch);
+            return;
+        }
+        let total_commitments: usize = batch
+            .iter()
+            .map(|entry| entry.commitments.total_len())
+            .sum();
+        let append_started_at = Instant::now();
+        let batch_outcome = {
+            let inputs: Vec<BlockCommitmentBatchInput<'_>> = batch
+                .iter()
+                .map(|entry| BlockCommitmentBatchInput {
+                    block_height: entry.queued.prepared.facts.block_header.height,
+                    sapling_cmus: &entry.commitments.sapling,
+                    orchard_cmxs: &entry.commitments.orchard,
+                    ironwood_cmxs: &entry.commitments.ironwood,
+                })
+                .collect();
+            let accumulator = &mut self.commitment_tree_accumulator;
+            match &self.tree_hashers {
+                Some(tree_hashers) if total_commitments > 0 => {
+                    tree_hashers.install(|| accumulator.append_block_batch_in_parallel(&inputs))
+                }
+                _ => accumulator.append_block_batch_in_parallel(&inputs),
+            }
+        };
+        let Ok(outcome) = batch_outcome else {
+            // Fall back block by block so valid prefix blocks still reach the
+            // store before the first failing block ends construction.
+            self.stage_batch_sequentially(batch);
+            return;
+        };
+        self.stage_timers
+            .tree_hashing_append
+            .record(append_started_at.elapsed());
+        self.stage_timers
+            .record_pool_append_durations(outcome.pool_durations);
+        self.commit_staged_batch(batch, outcome.blocks);
+    }
+
+    fn stage_batch_sequentially(&mut self, batch: Vec<PreparedBatchEntry>) {
+        for entry in batch {
+            let staged = self.stage_prepared_entry(entry);
+            let failed = staged.is_err();
+            if let Some(tree_hashers) = self.tree_hashers.as_mut() {
+                tree_hashers.push(staged);
+            } else {
+                drop(staged);
+            }
+            if failed {
+                break;
+            }
+        }
+    }
+
+    fn stage_prepared_entry(
         &mut self,
-        queued_block: QueuedPreparedBlock,
+        entry: PreparedBatchEntry,
     ) -> Result<PendingBuildBlock, CanonicalConstructionError> {
-        let QueuedPreparedBlock {
-            prepared,
-            memory_permit,
-        } = queued_block;
-        let height = prepared.facts.block_header.height;
-        let block = BlockId::new(height, prepared.facts.block_header.block_hash);
-        let block_time_seconds = prepared.partial_compact_block.time();
-        self.append_to_commitment_trees(&prepared)?;
-        let positioned = self.position_block(prepared)?;
+        let PreparedBatchEntry {
+            queued,
+            commitments,
+        } = entry;
+        let height = queued.prepared.facts.block_header.height;
+        self.append_commitments_to_accumulator(height, &commitments)?;
+        let positioned = self.position_block(queued.prepared)?;
+        let snapshot = self.commitment_tree_accumulator.snapshot();
+        Ok(self.enqueue_tree_work(positioned, queued.memory_permit, snapshot))
+    }
+
+    fn commit_staged_batch(
+        &mut self,
+        batch: Vec<PreparedBatchEntry>,
+        appended_blocks: Vec<BatchAppendedBlock>,
+    ) {
+        for (entry, appended) in batch.into_iter().zip(appended_blocks) {
+            let staged = self.finalize_staged_batch_block(entry.queued, appended);
+            let failed = staged.is_err();
+            if let Some(tree_hashers) = self.tree_hashers.as_mut() {
+                tree_hashers.push(staged);
+            } else {
+                drop(staged);
+            }
+            if failed {
+                break;
+            }
+        }
+    }
+
+    fn finalize_staged_batch_block(
+        &mut self,
+        queued: QueuedPreparedBlock,
+        appended: BatchAppendedBlock,
+    ) -> Result<PendingBuildBlock, CanonicalConstructionError> {
+        self.derived_subtree_roots.extend(
+            appended
+                .completed_subtree_roots
+                .into_iter()
+                .map(CanonicalBuildSubtreeRoot::from),
+        );
+        let accumulated = appended.snapshot.tip_metadata();
+        let positioned = self.position_block_against(queued.prepared, accumulated)?;
+        Ok(self.enqueue_tree_work(positioned, queued.memory_permit, appended.snapshot))
+    }
+
+    fn enqueue_tree_work(
+        &mut self,
+        positioned: PositionedCanonicalBlock,
+        memory_permit: OwnedSemaphorePermit,
+        snapshot: zinder_core::CommitmentTreeSnapshot,
+    ) -> PendingBuildBlock {
+        let height = positioned.facts.block_header.height;
+        let block = BlockId::new(height, positioned.facts.block_header.block_hash);
+        let block_time_seconds = positioned.compact_block.time();
         let work = TreeWork {
             checkpoint_required: self.select_checkpoint(height, positioned.tip_metadata),
             final_roots_required: self.workload.derives_final_roots(),
@@ -1493,22 +1695,17 @@ impl CanonicalBuildBlockReceiver {
         let tree_work = (work.checkpoint_required || work.final_roots_required)
             .then(|| {
                 self.tree_hashers.as_ref().map(|tree_hashers| {
-                    tree_hashers.spawn_tree_work(
-                        self.commitment_tree_accumulator.snapshot(),
-                        block,
-                        block_time_seconds,
-                        work,
-                    )
+                    tree_hashers.spawn_tree_work(snapshot, block, block_time_seconds, work)
                 })
             })
             .flatten();
-        Ok(PendingBuildBlock {
+        PendingBuildBlock {
             height,
             positioned,
             memory_permit,
             work,
             tree_work,
-        })
+        }
     }
 
     /// Waits for a staged block's tree work and builds the block the store
@@ -1548,11 +1745,20 @@ impl CanonicalBuildBlockReceiver {
         ))
     }
 
-    /// Positions an appended block and requires its tree sizes to match the
-    /// accumulated frontiers.
+    /// Positions an appended block against the accumulator's current tip sizes.
     fn position_block(
         &mut self,
         prepared: PreparedCanonicalBlock,
+    ) -> Result<PositionedCanonicalBlock, CanonicalConstructionError> {
+        let accumulated = self.commitment_tree_accumulator.tip_metadata();
+        self.position_block_against(prepared, accumulated)
+    }
+
+    /// Positions an appended block and requires its tree sizes to match `accumulated`.
+    fn position_block_against(
+        &mut self,
+        prepared: PreparedCanonicalBlock,
+        accumulated: ChainTipMetadata,
     ) -> Result<PositionedCanonicalBlock, CanonicalConstructionError> {
         let height = prepared.facts.block_header.height;
         let tree_appended_at = Instant::now();
@@ -1562,7 +1768,6 @@ impl CanonicalBuildBlockReceiver {
                     source: IngestError::from(source),
                 }
             })?;
-        let accumulated = self.commitment_tree_accumulator.tip_metadata();
         if positioned.tip_metadata != accumulated {
             return Err(CanonicalConstructionError::CommitmentTreePositionMismatch {
                 height,
@@ -1642,12 +1847,20 @@ impl CanonicalBuildBlockReceiver {
         let height = prepared.facts.block_header.height;
         let started_at = Instant::now();
         let commitments = compact_block_commitments(prepared)?;
-        let extracted_at = Instant::now();
         self.stage_timers
             .commitment_extract
-            .record(extracted_at.duration_since(started_at));
+            .record(started_at.elapsed());
+        self.append_commitments_to_accumulator(height, &commitments)
+    }
+
+    fn append_commitments_to_accumulator(
+        &mut self,
+        height: BlockHeight,
+        commitments: &CompactBlockCommitments,
+    ) -> Result<(), CanonicalConstructionError> {
+        let started_at = Instant::now();
         let accumulator = &mut self.commitment_tree_accumulator;
-        let parallel_append = should_parallelize_append(&commitments);
+        let parallel_append = should_parallelize_append(commitments);
         match &self.tree_hashers {
             Some(tree_hashers) if parallel_append && tree_hashers.has_append_workers() => {
                 tree_hashers.install(|| {
@@ -1676,7 +1889,7 @@ impl CanonicalBuildBlockReceiver {
         );
         self.stage_timers
             .tree_hashing_append
-            .record(extracted_at.elapsed());
+            .record(started_at.elapsed());
         Ok(())
     }
 
@@ -1720,6 +1933,12 @@ pub(crate) struct CompactBlockCommitments {
     pub(crate) sapling: Vec<[u8; 32]>,
     pub(crate) orchard: Vec<[u8; 32]>,
     pub(crate) ironwood: Vec<[u8; 32]>,
+}
+
+impl CompactBlockCommitments {
+    fn total_len(&self) -> usize {
+        self.sapling.len() + self.orchard.len() + self.ironwood.len()
+    }
 }
 
 pub(crate) fn compact_block_commitments(
