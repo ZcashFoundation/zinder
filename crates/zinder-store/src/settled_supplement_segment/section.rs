@@ -212,7 +212,13 @@ pub(super) fn transparent_supplement_from_compact(
         .transactions()
         .iter()
         .filter(|tx| {
-            !tx.data.transparent_inputs.is_empty() || !tx.data.transparent_outputs.is_empty()
+            let has_transparent =
+                !tx.data.transparent_inputs.is_empty() || !tx.data.transparent_outputs.is_empty();
+            let has_shielded = !tx.data.sapling_spends.is_empty()
+                || !tx.data.sapling_outputs.is_empty()
+                || !tx.data.orchard_actions.is_empty()
+                || !tx.data.ironwood_actions.is_empty();
+            has_transparent || tx.data.fee_zat.is_some() || !has_shielded
         })
         .map(|tx| CompactTransparentSupplementTx {
             index: tx.index,
@@ -448,11 +454,6 @@ fn encode_tag1_section(
                 "Tag 1 transactions must be strictly ascending by index".to_owned(),
             ));
         }
-        if tx.transparent_inputs.is_empty() && tx.transparent_outputs.is_empty() {
-            return Err(SettledSupplementSegmentError::InvalidFormat(
-                "Tag 1 transaction must carry transparent inputs or outputs".to_owned(),
-            ));
-        }
         prev_index = Some(tx.index);
         encode_tag1_tx(&mut out, tx)?;
     }
@@ -531,11 +532,6 @@ fn decode_tag1_tx(
     let fee_zat = read_optional_u64(cursor, "Tag 1 fee_zat")?;
     let transparent_inputs = decode_tag1_inputs(cursor)?;
     let transparent_outputs = decode_tag1_outputs(cursor)?;
-    if transparent_inputs.is_empty() && transparent_outputs.is_empty() {
-        return Err(SettledSupplementSegmentError::PayloadIntegrity(
-            "Tag 1 transaction carries no transparent components".to_owned(),
-        ));
-    }
     Ok(CompactTransparentSupplementTx {
         index,
         transaction_id,

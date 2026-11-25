@@ -73,19 +73,24 @@ impl SettledSupplementSegmentReader {
             return Err(SettledSupplementSegmentError::FsVerityRequired);
         }
 
-        let (chunks, rows, trailer) = read_indexes_and_trailer(&file, &header)?;
+        let decoded = read_indexes_and_trailer(&file, &header)?;
         let tables = SegmentTables {
-            chunks: &chunks,
-            rows: &rows,
+            chunks: &decoded.chunks,
+            rows: &decoded.rows,
         };
         let pin = PortablePin {
             expected,
-            trailer: &trailer,
+            trailer: &decoded.trailer,
         };
         if verity_verified {
             admit_protected(&header, tables, pin)?;
         } else {
-            admit_portable(&file, &header, tables, pin)?;
+            let raw_bytes = AdmittedHeaderAndIndexBytes {
+                header: &header_bytes,
+                raw_chunks: &decoded.raw_chunks,
+                raw_rows: &decoded.raw_rows,
+            };
+            admit_portable(&file, &header, tables, raw_bytes, pin)?;
         }
 
         Ok(Self {
@@ -93,8 +98,8 @@ impl SettledSupplementSegmentReader {
             identity: *expected,
             header,
             codec,
-            chunks,
-            rows,
+            chunks: decoded.chunks,
+            rows: decoded.rows,
             kernel_verified: verity_verified,
         })
     }
@@ -211,6 +216,7 @@ impl SettledSupplementSegmentReader {
     ) -> Result<EncodedBlock, SettledSupplementSegmentError> {
         let row_idx = self.row_index_for(height)?;
         self.ensure_row_not_invalid(row_idx)?;
+        let expected_envelope = Some(self.expected_envelope_identity(row_idx)?);
         let transparent = if splice_needs_tag1(selection, &self.rows[row_idx]) {
             self.read_block(height)?.transparent_transactions
         } else {
@@ -223,7 +229,7 @@ impl SettledSupplementSegmentReader {
             SpliceTarget {
                 transparent: &transparent,
                 selection,
-                expected_hash_wire: Some(self.rows[row_idx].block_hash_wire),
+                expected_envelope,
             },
             &mut frame,
             &mut scratch,
@@ -337,14 +343,52 @@ impl SettledSupplementSegmentReader {
         Ok(artifacts)
     }
 
+    fn expected_envelope_identity(
+        &self,
+        row_idx: usize,
+    ) -> Result<BlockEnvelopeIdentity, SettledSupplementSegmentError> {
+        let row = self.rows.get(row_idx).ok_or_else(|| {
+            SettledSupplementSegmentError::PayloadIntegrity(
+                "supplement row index out of range".to_owned(),
+            )
+        })?;
+        let offset_u32 = u32::try_from(row_idx).map_err(|_| {
+            SettledSupplementSegmentError::InvalidFormat("row index exceeds u32".to_owned())
+        })?;
+        let height_u32 = self
+            .header
+            .start_height
+            .checked_add(offset_u32)
+            .ok_or_else(|| {
+                SettledSupplementSegmentError::InvalidFormat("row height overflow".to_owned())
+            })?;
+        let prev_hash_wire = if row_idx == 0 {
+            self.header.first_prev_hash_wire
+        } else {
+            self.rows[row_idx - 1].block_hash_wire
+        };
+        Ok(BlockEnvelopeIdentity {
+            height: BlockHeight::new(height_u32),
+            block_hash_wire: row.block_hash_wire,
+            prev_hash_wire,
+            block_time: row.block_time,
+        })
+    }
+
     fn verify_reconstructed_identity(
         &self,
         row_idx: usize,
         expected_height: BlockHeight,
         reconstructed: &CompactBlockArtifact,
     ) -> Result<(), SettledSupplementSegmentError> {
-        let expected_hash = block_hash_wire_to_domain(&self.rows[row_idx].block_hash_wire)?;
-        if reconstructed.height() != expected_height || reconstructed.block_hash() != expected_hash
+        let expected = self.expected_envelope_identity(row_idx)?;
+        let expected_hash = block_hash_wire_to_domain(&expected.block_hash_wire)?;
+        let expected_prev_hash = block_hash_wire_to_domain(&expected.prev_hash_wire)?;
+        if expected.height != expected_height
+            || reconstructed.height() != expected.height
+            || reconstructed.block_hash() != expected_hash
+            || reconstructed.previous_block_hash() != expected_prev_hash
+            || reconstructed.time() != expected.block_time
         {
             return Err(SettledSupplementSegmentError::PayloadIntegrity(format!(
                 "shielded CompactBlock identity at height {} disagrees with ZSTSUP01 row index",
@@ -381,7 +425,7 @@ impl SettledSupplementSegmentReader {
     ) -> Result<EncodedBlock, SettledSupplementSegmentError> {
         let mut frame =
             Vec::with_capacity(EncodedBlock::PREFIX_LEN + input.shielded_payload.len() + 64);
-        let expected_hash_wire = Some(self.rows[input.row_idx].block_hash_wire);
+        let expected_envelope = Some(self.expected_envelope_identity(input.row_idx)?);
         match input.chunk_bytes {
             Some(bytes) if splice_needs_tag1(selection, &self.rows[input.row_idx]) => {
                 let record = self.decode_row_from_chunk(input.row_idx, bytes)?;
@@ -390,7 +434,7 @@ impl SettledSupplementSegmentReader {
                     SpliceTarget {
                         transparent: &record.transparent_transactions,
                         selection,
-                        expected_hash_wire,
+                        expected_envelope,
                     },
                     &mut frame,
                     scratch,
@@ -402,7 +446,7 @@ impl SettledSupplementSegmentReader {
                     SpliceTarget {
                         transparent: &[],
                         selection,
-                        expected_hash_wire,
+                        expected_envelope,
                     },
                     &mut frame,
                     scratch,
@@ -554,26 +598,10 @@ impl SettledSupplementSegmentReader {
             )));
         }
 
-        let offset_u32 = u32::try_from(row_idx).map_err(|_| {
-            row.mark_invalid();
-            SettledSupplementSegmentError::InvalidFormat("row index exceeds u32".to_owned())
-        })?;
-        let height = BlockHeight::new(self.header.start_height + offset_u32);
-        let prev_hash_wire = if row_idx == 0 {
-            self.header.first_prev_hash_wire
-        } else {
-            self.rows[row_idx - 1].block_hash_wire
-        };
-        let decoded = decode_block_record(
-            raw_row,
-            BlockEnvelopeIdentity {
-                height,
-                block_hash_wire: row.block_hash_wire,
-                prev_hash_wire,
-                block_time: row.block_time,
-            },
-            row.row_flags,
-        );
+        let envelope = self
+            .expected_envelope_identity(row_idx)
+            .inspect_err(|_| row.mark_invalid())?;
+        let decoded = decode_block_record(raw_row, envelope, row.row_flags);
         match decoded {
             Ok(record) => {
                 row.mark_valid();
@@ -655,16 +683,25 @@ fn decompress_exact_chunk(
     Ok(decompressed)
 }
 
-type DecodedIndexes = (
-    Vec<IndexedChunk>,
-    Vec<IndexedSupplementBlock>,
-    [u8; TRAILER_LEN],
-);
+pub(super) struct DecodedIndexData {
+    pub(super) chunks: Vec<IndexedChunk>,
+    pub(super) rows: Vec<IndexedSupplementBlock>,
+    pub(super) raw_chunks: Vec<u8>,
+    pub(super) raw_rows: Vec<u8>,
+    pub(super) trailer: [u8; TRAILER_LEN],
+}
 
-fn read_indexes_and_trailer(
+#[derive(Clone, Copy)]
+pub(super) struct AdmittedHeaderAndIndexBytes<'a> {
+    pub(super) header: &'a [u8; HEADER_LEN],
+    pub(super) raw_chunks: &'a [u8],
+    pub(super) raw_rows: &'a [u8],
+}
+
+pub(super) fn read_indexes_and_trailer(
     file: &File,
     header: &SegmentHeader,
-) -> Result<DecodedIndexes, SettledSupplementSegmentError> {
+) -> Result<DecodedIndexData, SettledSupplementSegmentError> {
     let chunk_count = usize::try_from(header.chunk_count()?).map_err(|_| {
         SettledSupplementSegmentError::InvalidFormat("chunk count exceeds usize".to_owned())
     })?;
@@ -722,7 +759,13 @@ fn read_indexes_and_trailer(
         })?;
     let mut trailer = [0_u8; TRAILER_LEN];
     read_exact_at(file, &mut trailer, trailer_offset)?;
-    Ok((chunks, rows, trailer))
+    Ok(DecodedIndexData {
+        chunks,
+        rows,
+        raw_chunks,
+        raw_rows,
+        trailer,
+    })
 }
 
 pub(super) fn admit_protected(
@@ -739,27 +782,32 @@ pub(super) fn admit_protected(
     validate_indices(header, codec, tables.chunks, tables.rows, None)
 }
 
-fn admit_portable(
+pub(super) fn admit_portable(
     file: &File,
     header: &SegmentHeader,
     tables: SegmentTables<'_>,
+    raw_bytes: AdmittedHeaderAndIndexBytes<'_>,
     pin: PortablePin<'_>,
 ) -> Result<(), SettledSupplementSegmentError> {
     let codec = header.codec()?;
     validate_indices(header, codec, tables.chunks, tables.rows, None)?;
+    let expected_end = u64::try_from(raw_bytes.raw_rows.len())
+        .ok()
+        .and_then(|rows_len| header.row_index_offset.checked_add(rows_len));
+    if header.data_offset != HEADER_LEN as u64
+        || raw_bytes.raw_chunks.len() != tables.chunks.len() * CHUNK_INDEX_ENTRY_LEN
+        || raw_bytes.raw_rows.len() != tables.rows.len() * ROW_INDEX_ENTRY_LEN
+        || expected_end != Some(expected_trailer_offset(header)?)
+    {
+        return Err(SettledSupplementSegmentError::InvalidFormat(
+            "admitted header or index slice sizes disagree with segment header".to_owned(),
+        ));
+    }
 
     let mut body_hasher = Sha256::new();
-    let mut scratch = vec![0_u8; STAGING_CHUNK];
-    hash_span_into(
-        file,
-        FileSpan {
-            start: 0,
-            len: header.data_offset,
-        },
-        &mut scratch,
-        &mut [&mut body_hasher],
-    )?;
+    body_hasher.update(raw_bytes.header);
 
+    let mut scratch = vec![0_u8; STAGING_CHUNK];
     let mut chunk_digests = Vec::with_capacity(tables.chunks.len());
     for chunk in tables.chunks {
         let abs_offset = header
@@ -783,21 +831,8 @@ fn admit_portable(
         chunk_digests.push(chunk_hasher.finalize().into());
     }
 
-    let trailer_offset = expected_trailer_offset(header)?;
-    let indexes_len = trailer_offset
-        .checked_sub(header.chunk_index_offset)
-        .ok_or_else(|| {
-            SettledSupplementSegmentError::InvalidFormat("index span underflow".to_owned())
-        })?;
-    hash_span_into(
-        file,
-        FileSpan {
-            start: header.chunk_index_offset,
-            len: indexes_len,
-        },
-        &mut scratch,
-        &mut [&mut body_hasher],
-    )?;
+    body_hasher.update(raw_bytes.raw_chunks);
+    body_hasher.update(raw_bytes.raw_rows);
 
     let computed_body: [u8; 32] = body_hasher.finalize().into();
     if computed_body != *pin.trailer || computed_body != pin.expected.sha256 {

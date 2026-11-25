@@ -4,10 +4,13 @@ use std::{error::Error, time::Instant};
 
 use tempfile::{NamedTempFile, TempDir};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockId, CompactBlockArtifact, CompactChainMetadata,
+    AuthDigest, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+    CanonicalBlockFacts, CanonicalTransactionFacts, CompactBlockArtifact, CompactChainMetadata,
     CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransaction,
-    CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, Network,
-    TransactionId,
+    CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, ConsensusBranchId,
+    LockTime, Network, PrivacyShape, SerializedBytesDigest, TransactionComponentCounts,
+    TransactionId, TransactionIntrinsicValueBalances, TransactionPublicFacts, TransactionVersion,
+    Wtxid,
 };
 use zinder_store::{
     CompactBlockSpliceSelection, HeightOrder, SettledShieldedSegmentOpenOptions,
@@ -23,6 +26,7 @@ const TOTAL_BLOCKS: u32 = 16_384;
 const SEGMENT_BLOCKS: u32 = 4_096;
 const FIRST_HEIGHT: u32 = 3_400_000;
 const UNARY_SAMPLES: u32 = 64;
+const DENSE_TAG2_TXS: u32 = 64;
 
 #[cfg(debug_assertions)]
 const MAX_SPLICE_RANGE_MS: u128 = 15_000;
@@ -119,12 +123,94 @@ fn build_perf_templates() -> (
     (orchard_tx, transparent_tx, mixed_tx, metadata)
 }
 
+fn build_dense_shielded_txs() -> Vec<CompactTransaction> {
+    (0..DENSE_TAG2_TXS)
+        .map(|idx| {
+            let seed = u8::try_from(idx % 251).unwrap_or(1);
+            CompactTransaction {
+                index: u64::from(idx),
+                transaction_id: det_txid(seed),
+                data: CompactTransactionData {
+                    fee_zat: (idx % 2 == 0).then_some(10_000),
+                    orchard_actions: vec![CompactShieldedAction {
+                        nullifier: [seed; 32],
+                        commitment: [seed.wrapping_add(1); 32],
+                        ephemeral_key: [seed.wrapping_add(2); 32],
+                        ciphertext: [seed.wrapping_add(3); 52],
+                    }],
+                    ..CompactTransactionData::default()
+                },
+            }
+        })
+        .collect()
+}
+
+fn build_dense_canonical_facts(block: &CompactBlockArtifact) -> CanonicalBlockFacts {
+    let header = BlockHeaderArtifact::new(
+        block.height(),
+        block.block_hash(),
+        block.previous_block_hash(),
+        [0xAA; 32],
+        [0xBB; 32],
+        i64::from(block.time()),
+        0x1d00_ffff,
+        [0xCC; 32],
+        5,
+        4_096,
+    );
+    let transactions = block
+        .transactions()
+        .iter()
+        .enumerate()
+        .map(|(pos, tx)| CanonicalTransactionFacts {
+            public_facts: TransactionPublicFacts {
+                transaction_id: tx.transaction_id,
+                auth_digest: Some(AuthDigest::from_bytes([0x11; 32])),
+                wtxid: Some(Wtxid::from_bytes([0x22; 64])),
+                version: TransactionVersion::V5,
+                consensus_branch_id: Some(ConsensusBranchId::new(0xC2D6_D0B4)),
+                lock_time: LockTime::Height(block.height()),
+                expiry_height: Some(BlockHeight::new(block.height().value() + 40)),
+                size_bytes: 512,
+                counts: TransactionComponentCounts {
+                    transparent_input_count: 0,
+                    transparent_output_count: 0,
+                    sapling_spend_count: 0,
+                    sapling_output_count: 0,
+                    orchard_action_count: 1,
+                    ironwood_action_count: 0,
+                    sprout_joinsplit_count: 0,
+                },
+                orchard_value_balance_zat: Some(-25_000),
+                orchard_anchor: Some([0x77; 32]),
+                ironwood_value_balance_zat: None,
+                privacy_shape: PrivacyShape::ShieldedOnly,
+                is_coinbase: pos == 0,
+                unsupported_sections: Vec::new(),
+            },
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[0x33; 16]),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::new(0, 0, 25_000, 0),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: Vec::new(),
+        })
+        .collect();
+    CanonicalBlockFacts {
+        block_header: header,
+        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[0x99; 8]),
+        transactions,
+    }
+}
+
 fn select_block_txs(
     abs: u32,
     orchard_tx: &CompactTransaction,
     transparent_tx: &CompactTransaction,
     mixed_tx: &CompactTransaction,
+    dense_shielded_txs: &[CompactTransaction],
 ) -> Vec<CompactTransaction> {
+    if abs.is_multiple_of(512) {
+        return dense_shielded_txs.to_vec();
+    }
     match abs % 8 {
         0 => vec![transparent_tx.clone(), orchard_tx.clone(), mixed_tx.clone()],
         1 | 2 => vec![transparent_tx.clone(), mixed_tx.clone()],
@@ -141,6 +227,7 @@ fn write_perf_pair(
     count: u32,
 ) -> TestOutcome<(SettledShieldedSegmentReader, SettledSupplementSegmentReader)> {
     let (orchard_tx, transparent_tx, mixed_tx, metadata) = build_perf_templates();
+    let dense_shielded_txs = build_dense_shielded_txs();
     let start = BlockHeight::new(FIRST_HEIGHT + offset);
     let end_height = BlockHeight::new(FIRST_HEIGHT + offset + count - 1);
     let end_block = BlockId::new(end_height, det_hash(end_height.value()));
@@ -161,7 +248,13 @@ fn write_perf_pair(
     for local in 0..count {
         let abs = offset + local;
         let height_val = FIRST_HEIGHT + abs;
-        let txs = select_block_txs(abs, &orchard_tx, &transparent_tx, &mixed_tx);
+        let txs = select_block_txs(
+            abs,
+            &orchard_tx,
+            &transparent_tx,
+            &mixed_tx,
+            &dense_shielded_txs,
+        );
         let block = CompactBlockArtifact::new(
             BlockId::new(BlockHeight::new(height_val), det_hash(height_val)),
             det_hash(height_val - 1),
@@ -170,7 +263,10 @@ fn write_perf_pair(
             metadata,
         )?;
         shielded_writer.push(&block, 256 + block.transactions().len() * 384)?;
-        sup_writer.push(&block, None)?;
+        let facts = abs
+            .is_multiple_of(512)
+            .then(|| build_dense_canonical_facts(&block));
+        sup_writer.push(&block, facts.as_ref())?;
     }
 
     let shielded_id = shielded_writer.finish()?;
@@ -227,6 +323,30 @@ fn run_range_splice(
     Ok((blocks_total, wire_bytes))
 }
 
+fn verify_dense_tag2_block(
+    shielded: &SettledShieldedSegmentReader,
+    supplement: &SettledSupplementSegmentReader,
+) -> TestOutcome {
+    let dense_height = BlockHeight::new(FIRST_HEIGHT);
+    let dense_meta = supplement.read_canonical_metadata(dense_height)?;
+    assert_eq!(
+        dense_meta.map(|meta| meta.transactions.len()),
+        Some(usize::try_from(DENSE_TAG2_TXS)?)
+    );
+    let dense_projected = shielded.read_projected_range(
+        BlockHeightRange::inclusive(dense_height, dense_height),
+        HeightOrder::Ascending,
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+    )?;
+    let dense_restored =
+        supplement.reconstruct_block(dense_height, &dense_projected[0].payload())?;
+    assert_eq!(
+        dense_restored.transactions().len(),
+        usize::try_from(DENSE_TAG2_TXS)?
+    );
+    Ok(())
+}
+
 #[test]
 fn zstsup01_lossless_splice_and_unary_lookup_stay_under_budget() -> TestOutcome {
     let corpus = build_corpus()?;
@@ -263,6 +383,8 @@ fn zstsup01_lossless_splice_and_unary_lookup_stay_under_budget() -> TestOutcome 
         unary_reconstructed += 1;
     }
     let unary_ms = start_unary.elapsed().as_millis();
+
+    verify_dense_tag2_block(first_shielded, first_supplement)?;
 
     assert_eq!(full_blocks, usize::try_from(TOTAL_BLOCKS)?);
     assert_eq!(shielded_blocks, usize::try_from(TOTAL_BLOCKS)?);

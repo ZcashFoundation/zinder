@@ -16,7 +16,10 @@ use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
 
 use super::{
     SettledSupplementSegmentError,
-    section::{BlockSupplementRecord, CanonicalBlockSupplement, CompactTransparentSupplementTx},
+    section::{
+        BlockEnvelopeIdentity, BlockSupplementRecord, CanonicalBlockSupplement,
+        CanonicalTransactionSupplement, CompactTransparentSupplementTx,
+    },
 };
 
 const FRAME_PREFIX_LEN: usize = EncodedBlock::PREFIX_LEN;
@@ -127,7 +130,7 @@ pub(super) struct SpliceScratch {
 pub(super) struct SpliceTarget<'a> {
     pub(super) transparent: &'a [CompactTransparentSupplementTx],
     pub(super) selection: CompactBlockSpliceSelection,
-    pub(super) expected_hash_wire: Option<[u8; 32]>,
+    pub(super) expected_envelope: Option<BlockEnvelopeIdentity>,
 }
 
 struct WireTxMeta<'a> {
@@ -187,7 +190,7 @@ pub fn splice_compact_block_wire(
         SpliceTarget {
             transparent: transparent_supplement,
             selection,
-            expected_hash_wire: None,
+            expected_envelope: None,
         },
         &mut out,
         &mut scratch,
@@ -213,7 +216,9 @@ pub(super) fn splice_compact_block_wire_into(
         transparent: target.transparent,
         sup_cursor: 0,
         selection: target.selection,
-        expected_hash_wire: target.expected_hash_wire,
+        expected_envelope: target.expected_envelope,
+        observed_height: 0,
+        observed_time: 0,
         presence: BlockHeaderPresence::empty(),
         out,
         scratch,
@@ -239,6 +244,7 @@ pub(super) fn splice_compact_block_wire_into(
             "shielded CompactBlock payload missing hash or prev_hash".to_owned(),
         ));
     }
+    verify_expected_wire_envelope(&ctx)?;
     if !ctx.presence.has(HEADER_SEEN_CHAIN_METADATA) {
         emit_remaining_transparent(&mut ctx)?;
         if ctx.selection.nullifiers_only {
@@ -246,6 +252,22 @@ pub(super) fn splice_compact_block_wire_into(
         }
     }
     patch_frame_prefix(ctx.out, frame_start)
+}
+
+fn verify_expected_wire_envelope(
+    ctx: &BlockSpliceContext<'_>,
+) -> Result<(), SettledSupplementSegmentError> {
+    let Some(expected) = ctx.expected_envelope else {
+        return Ok(());
+    };
+    if ctx.observed_height != u64::from(expected.height.value())
+        || ctx.observed_time != expected.block_time
+    {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "shielded CompactBlock height or time disagrees with ZSTSUP01 row index".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -259,7 +281,9 @@ struct BlockSpliceContext<'a> {
     transparent: &'a [CompactTransparentSupplementTx],
     sup_cursor: usize,
     selection: CompactBlockSpliceSelection,
-    expected_hash_wire: Option<[u8; 32]>,
+    expected_envelope: Option<BlockEnvelopeIdentity>,
+    observed_height: u64,
+    observed_time: u32,
     presence: BlockHeaderPresence,
     out: &'a mut Vec<u8>,
     scratch: &'a mut SpliceScratch,
@@ -272,7 +296,7 @@ fn process_block_field(
 ) -> Result<(), SettledSupplementSegmentError> {
     match field.tag {
         COMPACT_BLOCK_TAG_HEIGHT | COMPACT_BLOCK_TAG_TIME => {
-            process_scalar_block_field(field, cursor, &mut ctx.presence, ctx.out)
+            process_scalar_block_field(field, cursor, ctx)
         }
         COMPACT_BLOCK_TAG_HASH | COMPACT_BLOCK_TAG_PREV_HASH | COMPACT_BLOCK_TAG_HEADER => {
             process_bytes_block_field(field, cursor, ctx)
@@ -303,28 +327,37 @@ fn process_block_field(
 fn process_scalar_block_field(
     field: BlockFieldSlice<'_>,
     cursor: &mut &[u8],
-    presence: &mut BlockHeaderPresence,
-    out: &mut Vec<u8>,
+    ctx: &mut BlockSpliceContext<'_>,
 ) -> Result<(), SettledSupplementSegmentError> {
     expect_wire_type(field.wire_type, WireType::Varint, "CompactBlock scalar")?;
-    if presence.in_body() {
+    if ctx.presence.in_body() {
         return Err(SettledSupplementSegmentError::PayloadIntegrity(
             "CompactBlock header scalar appeared after vtx or chain_metadata".to_owned(),
         ));
     }
-    decode_varint(cursor).map_err(|err| wire_error(&err))?;
-    let mask = if field.tag == COMPACT_BLOCK_TAG_HEIGHT {
-        HEADER_SEEN_HEIGHT
+    let raw_num = decode_varint(cursor).map_err(|err| wire_error(&err))?;
+    if field.tag == COMPACT_BLOCK_TAG_HEIGHT {
+        if ctx.presence.has(HEADER_SEEN_HEIGHT) {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "duplicate CompactBlock scalar field".to_owned(),
+            ));
+        }
+        ctx.presence.set(HEADER_SEEN_HEIGHT);
+        ctx.observed_height = raw_num;
     } else {
-        HEADER_SEEN_TIME
-    };
-    if presence.has(mask) {
-        return Err(SettledSupplementSegmentError::PayloadIntegrity(
-            "duplicate CompactBlock scalar field".to_owned(),
-        ));
+        if ctx.presence.has(HEADER_SEEN_TIME) {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "duplicate CompactBlock scalar field".to_owned(),
+            ));
+        }
+        ctx.presence.set(HEADER_SEEN_TIME);
+        ctx.observed_time = u32::try_from(raw_num).map_err(|_| {
+            SettledSupplementSegmentError::PayloadIntegrity(
+                "CompactBlock.time exceeds u32".to_owned(),
+            )
+        })?;
     }
-    presence.set(mask);
-    copy_consumed(field.field_start, cursor, out);
+    copy_consumed(field.field_start, cursor, ctx.out);
     Ok(())
 }
 
@@ -347,8 +380,8 @@ fn process_bytes_block_field(
     match field.tag {
         COMPACT_BLOCK_TAG_HASH => {
             check_unique_32(&mut ctx.presence, HEADER_SEEN_HASH, bytes, "hash")?;
-            if let Some(expected_hash) = ctx.expected_hash_wire
-                && bytes != expected_hash
+            if let Some(expected) = ctx.expected_envelope
+                && bytes != expected.block_hash_wire
             {
                 return Err(SettledSupplementSegmentError::PayloadIntegrity(
                     "shielded CompactBlock hash disagrees with ZSTSUP01 row index".to_owned(),
@@ -357,6 +390,13 @@ fn process_bytes_block_field(
         }
         COMPACT_BLOCK_TAG_PREV_HASH => {
             check_unique_32(&mut ctx.presence, HEADER_SEEN_PREV_HASH, bytes, "prev_hash")?;
+            if let Some(expected) = ctx.expected_envelope
+                && bytes != expected.prev_hash_wire
+            {
+                return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                    "shielded CompactBlock prev_hash disagrees with ZSTSUP01 row index".to_owned(),
+                ));
+            }
         }
         _ => {
             if ctx.presence.has(HEADER_SEEN_HEADER) {
@@ -486,7 +526,9 @@ fn emit_mixed_tx(
         write_vtx_wrapper(&ctx.scratch.tx_buf, ctx.out);
         return Ok(());
     }
-    if !ctx.selection.include_transparent {
+    if !ctx.selection.include_transparent
+        || (sup_tx.transparent_inputs.is_empty() && sup_tx.transparent_outputs.is_empty())
+    {
         write_vtx_wrapper(tx_bytes, ctx.out);
         return Ok(());
     }
@@ -761,6 +803,7 @@ pub fn reconstruct_compact_block_artifact(
 ) -> Result<CompactBlockArtifact, SettledSupplementSegmentError> {
     validate_shielded_block_wire(shielded_payload)?;
     validate_transparent_supplement_order(&supplement.transparent_transactions)?;
+    validate_canonical_order(supplement.canonical_metadata.as_ref())?;
     let proto_block = lightwalletd::CompactBlock::decode(shielded_payload).map_err(|err| {
         SettledSupplementSegmentError::PayloadIntegrity(format!(
             "failed to decode CompactBlock payload: {err}"
@@ -805,13 +848,49 @@ pub fn reconstruct_compact_block_artifact(
     })
 }
 
+fn validate_canonical_order(
+    canonical: Option<&CanonicalBlockSupplement>,
+) -> Result<(), SettledSupplementSegmentError> {
+    let Some(meta) = canonical else {
+        return Ok(());
+    };
+    let mut prev: Option<u64> = None;
+    for tx in &meta.transactions {
+        if prev.is_some_and(|prior| tx.tx_index <= prior) {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "Tag 2 transactions are not strictly ascending by tx_index".to_owned(),
+            ));
+        }
+        prev = Some(tx.tx_index);
+    }
+    Ok(())
+}
+
+fn next_canonical_tx<'a>(
+    canonical_txs: &'a [CanonicalTransactionSupplement],
+    meta_cursor: &mut usize,
+    target_index: u64,
+) -> Option<&'a CanonicalTransactionSupplement> {
+    while *meta_cursor < canonical_txs.len() && canonical_txs[*meta_cursor].tx_index < target_index
+    {
+        *meta_cursor += 1;
+    }
+    let matched = canonical_txs
+        .get(*meta_cursor)
+        .filter(|entry| entry.tx_index == target_index)?;
+    *meta_cursor += 1;
+    Some(matched)
+}
+
 fn merge_reconstructed_transactions(
     shielded_vtx: &[lightwalletd::CompactTx],
     transparent: &[CompactTransparentSupplementTx],
     canonical: Option<&CanonicalBlockSupplement>,
 ) -> Result<Vec<CompactTransaction>, SettledSupplementSegmentError> {
+    let canonical_txs = canonical.map_or(&[][..], |meta| meta.transactions.as_slice());
     let mut merged = Vec::with_capacity(shielded_vtx.len() + transparent.len());
     let mut sup_idx = 0_usize;
+    let mut meta_cursor = 0_usize;
     let mut prev_shielded: Option<u64> = None;
     for proto_tx in shielded_vtx {
         if prev_shielded.is_some_and(|prev| proto_tx.index <= prev) {
@@ -821,7 +900,11 @@ fn merge_reconstructed_transactions(
         }
         prev_shielded = Some(proto_tx.index);
         while sup_idx < transparent.len() && transparent[sup_idx].index < proto_tx.index {
-            merged.push(transparent_only_compact_tx(&transparent[sup_idx]));
+            merged.push(reconstruct_non_shielded_tx(
+                &transparent[sup_idx],
+                canonical_txs,
+                &mut meta_cursor,
+            )?);
             sup_idx += 1;
         }
         let mixed_sup =
@@ -832,15 +915,42 @@ fn merge_reconstructed_transactions(
             } else {
                 None
             };
+        let meta_tx = next_canonical_tx(canonical_txs, &mut meta_cursor, proto_tx.index);
         merged.push(reconstruct_shielded_or_mixed_tx(
-            proto_tx, mixed_sup, canonical,
+            proto_tx, mixed_sup, meta_tx,
         )?);
     }
     while sup_idx < transparent.len() {
-        merged.push(transparent_only_compact_tx(&transparent[sup_idx]));
+        merged.push(reconstruct_non_shielded_tx(
+            &transparent[sup_idx],
+            canonical_txs,
+            &mut meta_cursor,
+        )?);
         sup_idx += 1;
     }
     Ok(merged)
+}
+
+fn reconstruct_non_shielded_tx(
+    sup_tx: &CompactTransparentSupplementTx,
+    canonical_txs: &[CanonicalTransactionSupplement],
+    meta_cursor: &mut usize,
+) -> Result<CompactTransaction, SettledSupplementSegmentError> {
+    if let Some(meta_tx) = next_canonical_tx(canonical_txs, meta_cursor, sup_tx.index) {
+        if meta_tx.public_facts.transaction_id != sup_tx.transaction_id {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "Tag 2 transaction_id disagrees with Tag 1 transaction".to_owned(),
+            ));
+        }
+        if let (Some(sup_fee), Some(tag2_fee)) = (sup_tx.fee_zat, meta_tx.fee_and_burn.fee_zat)
+            && tag2_fee != sup_fee
+        {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "Tag 2 fee disagrees with Tag 1 transaction".to_owned(),
+            ));
+        }
+    }
+    Ok(transparent_only_compact_tx(sup_tx))
 }
 
 fn transparent_only_compact_tx(sup_tx: &CompactTransparentSupplementTx) -> CompactTransaction {
@@ -859,12 +969,12 @@ fn transparent_only_compact_tx(sup_tx: &CompactTransparentSupplementTx) -> Compa
 fn reconstruct_shielded_or_mixed_tx(
     proto_tx: &lightwalletd::CompactTx,
     mixed_sup: Option<&CompactTransparentSupplementTx>,
-    canonical: Option<&CanonicalBlockSupplement>,
+    meta_tx: Option<&CanonicalTransactionSupplement>,
 ) -> Result<CompactTransaction, SettledSupplementSegmentError> {
     let transaction_id = decode_internal_transaction_id(&proto_tx.txid).map_err(|err| {
         SettledSupplementSegmentError::PayloadIntegrity(format!("invalid CompactTx.txid: {err}"))
     })?;
-    let fee_zat = resolve_reconstructed_fee(proto_tx, transaction_id, mixed_sup, canonical)?;
+    let fee_zat = resolve_reconstructed_fee(proto_tx, transaction_id, mixed_sup, meta_tx)?;
     let (transparent_inputs, transparent_outputs) = match mixed_sup {
         Some(sup) => {
             if sup.transaction_id != transaction_id {
@@ -898,35 +1008,40 @@ fn resolve_reconstructed_fee(
     proto_tx: &lightwalletd::CompactTx,
     transaction_id: zinder_core::TransactionId,
     mixed_sup: Option<&CompactTransparentSupplementTx>,
-    canonical: Option<&CanonicalBlockSupplement>,
+    meta_tx: Option<&CanonicalTransactionSupplement>,
 ) -> Result<Option<u64>, SettledSupplementSegmentError> {
+    if let Some(meta) = meta_tx
+        && meta.public_facts.transaction_id != transaction_id
+    {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "Tag 2 transaction_id disagrees with shielded CompactTx".to_owned(),
+        ));
+    }
     if let Some(sup) = mixed_sup {
         if fee_to_wire_u32(sup.fee_zat)? != proto_tx.fee {
             return Err(SettledSupplementSegmentError::PayloadIntegrity(
                 "mixed transaction fee disagrees on reconstruction".to_owned(),
             ));
         }
-        return Ok(sup.fee_zat);
-    }
-    if let Some(meta) = canonical
-        && let Some(meta_tx) = meta
-            .transactions
-            .iter()
-            .find(|entry| entry.tx_index == proto_tx.index)
-    {
-        if meta_tx.public_facts.transaction_id != transaction_id {
+        if let (Some(sup_fee), Some(meta)) = (sup.fee_zat, meta_tx)
+            && let Some(tag2_fee) = meta.fee_and_burn.fee_zat
+            && tag2_fee != sup_fee
+        {
             return Err(SettledSupplementSegmentError::PayloadIntegrity(
-                "Tag 2 transaction_id disagrees with shielded CompactTx".to_owned(),
+                "Tag 2 fee disagrees with Tag 1 transaction".to_owned(),
             ));
         }
-        if let Some(tag2_fee) = meta_tx.fee_and_burn.fee_zat {
-            if fee_to_wire_u32(Some(tag2_fee))? != proto_tx.fee {
-                return Err(SettledSupplementSegmentError::PayloadIntegrity(
-                    "Tag 2 fee disagrees with shielded CompactTx".to_owned(),
-                ));
-            }
-            return Ok(Some(tag2_fee));
+        return Ok(sup.fee_zat);
+    }
+    if let Some(meta) = meta_tx
+        && let Some(tag2_fee) = meta.fee_and_burn.fee_zat
+    {
+        if fee_to_wire_u32(Some(tag2_fee))? != proto_tx.fee {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "Tag 2 fee disagrees with shielded CompactTx".to_owned(),
+            ));
         }
+        return Ok(Some(tag2_fee));
     }
     Ok((proto_tx.fee != 0).then(|| u64::from(proto_tx.fee)))
 }
