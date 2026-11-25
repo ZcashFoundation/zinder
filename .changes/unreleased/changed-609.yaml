@@ -1,0 +1,6 @@
+kind: changed
+body: Batched shielded commitment-tree appends across Sapling, Orchard, and Ironwood pools during bulk canonical construction when `checkpoint_selection != every_block` and hashing workers exceed one, wired optional build-time `ZINDER_PASTA_ASM` support into Docker and Compose deployment targets with runtime CPU feature guards in `zinder-bench`, and added `zinder_ingest_canonical_tree_append_duration_seconds`.
+time: 2026-11-25T16:21:00Z
+custom:
+    Bump: patch
+    PR: "609"
