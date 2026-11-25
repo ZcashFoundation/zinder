@@ -667,3 +667,77 @@ fn startup_creates_nested_secondary_and_reports_missing_paths() -> eyre::Result<
     );
     Ok(())
 }
+
+fn run_print_config_with_env(extra_env: &[(&str, &str)]) -> eyre::Result<String> {
+    let mut command = projector_command();
+    command.env_clear();
+    for (env_name, env_value) in extra_env {
+        command.env(env_name, env_value);
+    }
+    let output = command
+        .args([
+            "--print-config",
+            "--network",
+            "zcash-regtest",
+            "--build-owner-hex",
+            "00112233445566778899aabbccddeeff",
+            "--lease-duration-seconds",
+            "14400",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+#[test]
+fn print_config_scales_build_defaults_from_container_budget_and_honors_overrides()
+-> eyre::Result<()> {
+    let rendered_default = run_print_config_with_env(&[])?;
+    for (key, expected) in [
+        (
+            "max_outpoint_sort_memory_bytes",
+            zinder_runtime::wallet_build_outpoint_sort_memory_bytes(),
+        ),
+        (
+            "max_secondary_sort_memory_bytes_per_sorter",
+            zinder_runtime::wallet_build_secondary_sort_memory_bytes_per_sorter(),
+        ),
+        (
+            "max_accounted_reorg_undo_bytes",
+            zinder_runtime::wallet_build_reorg_undo_memory_bytes(),
+        ),
+    ] {
+        assert!(
+            rendered_default.contains(&format!("{key} = {expected}")),
+            "{rendered_default}"
+        );
+    }
+
+    let overrides = [
+        (
+            "ZINDER_PROJECTOR__BUILD__MAX_OUTPOINT_SORT_MEMORY_BYTES",
+            "123456789",
+        ),
+        (
+            "ZINDER_PROJECTOR__BUILD__MAX_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER",
+            "23456789",
+        ),
+        (
+            "ZINDER_PROJECTOR__BUILD__MAX_ACCOUNTED_REORG_UNDO_BYTES",
+            "3456789",
+        ),
+    ];
+    let rendered_override = run_print_config_with_env(&overrides)?;
+    for expected in [
+        "max_outpoint_sort_memory_bytes = 123456789",
+        "max_secondary_sort_memory_bytes_per_sorter = 23456789",
+        "max_accounted_reorg_undo_bytes = 3456789",
+    ] {
+        assert!(rendered_override.contains(expected), "{rendered_override}");
+    }
+    Ok(())
+}

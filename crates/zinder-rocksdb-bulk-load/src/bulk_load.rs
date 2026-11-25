@@ -23,9 +23,10 @@ use thiserror::Error;
 mod variable_value_sort;
 
 pub use variable_value_sort::{
-    ParallelVariableValueSorter, SortedVariableValues, StagedParallelVariableRuns,
-    VariableValueRecord, VariableValueSortDurations, VariableValueSortEvidence,
-    VariableValueSortShard, VariableValueSorter,
+    MAX_KEY_PREFIX_SHARD_COUNT, ParallelVariableValueSorter, ShardedKeyPrefixSorter,
+    ShardedKeyPrefixWriter, ShardedSortBudget, ShardedSortedVariableValues, SortedVariableValues,
+    StagedParallelVariableRuns, VariableValueRecord, VariableValueSortDurations,
+    VariableValueSortEvidence, VariableValueSortShard, VariableValueSorter, key_prefix_shard_index,
 };
 
 pub(super) const MIN_MERGE_FAN_IN: usize = 2;
@@ -73,6 +74,13 @@ fn open_fd_count() -> Option<usize> {
         return Some(count);
     }
     None
+}
+
+/// Returns the active k-way merge fan-in bounded by `MAX_MERGE_FAN_IN` and the
+/// process file-descriptor headroom.
+#[must_use]
+pub fn active_merge_fan_in() -> usize {
+    effective_merge_fan_in()
 }
 
 /// Returns the active k-way merge fan-in bounded by `MAX_MERGE_FAN_IN` and the

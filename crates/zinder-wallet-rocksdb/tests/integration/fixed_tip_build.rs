@@ -2343,3 +2343,46 @@ fn transaction_facts(
         transparent_outputs,
     }
 }
+
+#[test]
+fn parallel_multi_shard_wallet_build_from_canonical_store_matches_serial_and_passes_cold_validation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let serial_options = RocksDbWalletBuildOptions::for_local_tests();
+    let serial = build_wallet_from_canonical(
+        &canonical_store,
+        temporary.path().join("wallet-serial"),
+        serial_options,
+    )?;
+
+    let mut multi_shard_options = RocksDbWalletBuildOptions::for_local_tests();
+    multi_shard_options.accumulator_hashing_workers =
+        NonZeroU32::new(4).ok_or("worker count must be non-zero")?;
+    multi_shard_options.max_outpoint_sort_memory_bytes = 512 * 1024 * 1024;
+    multi_shard_options.max_secondary_sort_memory_bytes_per_sorter = 512 * 1024 * 1024;
+    let parallel = build_wallet_from_canonical(
+        &canonical_store,
+        temporary.path().join("wallet-multi-shard"),
+        multi_shard_options,
+    )?;
+
+    assert_eq!(
+        parallel.report.projection_digest,
+        serial.report.projection_digest
+    );
+    assert_eq!(
+        parallel.report.projection_accumulator,
+        serial.report.projection_accumulator
+    );
+    assert_eq!(parallel.report.row_counts, serial.report.row_counts);
+    assert_eq!(parallel.report.utxo_summary, serial.report.utxo_summary);
+    assert_eq!(
+        parallel.report.logical_row_bytes,
+        serial.report.logical_row_bytes
+    );
+    assert_report(&parallel);
+    assert_store(&parallel, &fixture)?;
+    Ok(())
+}

@@ -35,11 +35,8 @@ const DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS: u64 = 30;
 /// must cover two complete hard-gate windows rather than relying on a periodic
 /// renewal that does not exist.
 const MINIMUM_LEASE_DURATION_SECONDS: u64 = 4 * 60 * 60;
-const DEFAULT_OUTPOINT_SORT_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const DEFAULT_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER: u64 = 1024 * 1024 * 1024;
 const DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 192 * 1024 * 1024 * 1024;
 const DEFAULT_SST_TARGET_LOGICAL_BYTES: u64 = 128 * 1024 * 1024;
-const DEFAULT_ACCOUNTED_REORG_UNDO_BYTES: u64 = 512 * 1024 * 1024;
 /// One following transition may account for at most this many logical bytes.
 ///
 /// Each distinct row the transition touches counts twice, as its key and final
@@ -427,11 +424,11 @@ fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {
         )?
         .with_default(
             "projector.build.max_outpoint_sort_memory_bytes",
-            DEFAULT_OUTPOINT_SORT_MEMORY_BYTES,
+            zinder_runtime::wallet_build_outpoint_sort_memory_bytes(),
         )?
         .with_default(
             "projector.build.max_secondary_sort_memory_bytes_per_sorter",
-            DEFAULT_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,
+            zinder_runtime::wallet_build_secondary_sort_memory_bytes_per_sorter(),
         )?
         .with_default(
             "projector.build.max_temporary_file_bytes_per_sorter",
@@ -443,7 +440,7 @@ fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {
         )?
         .with_default(
             "projector.build.max_accounted_reorg_undo_bytes",
-            DEFAULT_ACCOUNTED_REORG_UNDO_BYTES,
+            zinder_runtime::wallet_build_reorg_undo_memory_bytes(),
         )?
         .with_default(
             "projector.follow.max_transition_logical_bytes",

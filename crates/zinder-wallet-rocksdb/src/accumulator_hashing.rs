@@ -237,36 +237,85 @@ pub(crate) struct BranchHashingPool {
 
 impl BranchHashingPool {
     const BATCHES_HELD_PER_SLICE: usize = 2;
+    const MIN_BATCHES_PER_SLICE: usize = Self::BATCHES_HELD_PER_SLICE + 1;
 
     const fn global_batch_budget(worker_count: NonZeroU32) -> usize {
         max_pending_for_workers(worker_count).saturating_add(Self::BATCHES_HELD_PER_SLICE)
     }
 
+    fn config_with_total_batches(&self, allocated_total: usize) -> BranchHashingConfig {
+        BranchHashingConfig {
+            pool: Arc::clone(&self.pool),
+            worker_count: self.worker_count,
+            payload_capacity: self.payload_capacity,
+            max_pending: allocated_total
+                .saturating_sub(Self::BATCHES_HELD_PER_SLICE)
+                .max(1),
+        }
+    }
+
     /// Splits the build-wide batch budget across two concurrent branches while
     /// keeping total `pending + filling + spare` batches within
     /// `min(2 * workers, MAX_PENDING_BATCHES) + 2`.
+    #[cfg(test)]
     pub(crate) fn split_two(&self) -> (BranchHashingConfig, BranchHashingConfig) {
         let total_batches = Self::global_batch_budget(self.worker_count);
         let first_total = total_batches / 2;
         let second_total = total_batches.saturating_sub(first_total);
         (
-            BranchHashingConfig {
-                pool: Arc::clone(&self.pool),
-                worker_count: self.worker_count,
-                payload_capacity: self.payload_capacity,
-                max_pending: first_total
-                    .saturating_sub(Self::BATCHES_HELD_PER_SLICE)
-                    .max(1),
-            },
-            BranchHashingConfig {
-                pool: Arc::clone(&self.pool),
-                worker_count: self.worker_count,
-                payload_capacity: self.payload_capacity,
-                max_pending: second_total
-                    .saturating_sub(Self::BATCHES_HELD_PER_SLICE)
-                    .max(1),
-            },
+            self.config_with_total_batches(first_total),
+            self.config_with_total_batches(second_total),
         )
+    }
+
+    /// Splits the build-wide batch budget across up to `slice_count` concurrent
+    /// branches or shards while keeping total `pending + filling + spare`
+    /// batches within `min(2 * workers, MAX_PENDING_BATCHES) + 2`. Overflow
+    /// slices fall back to `None` (inline hashing on their own thread).
+    pub(crate) fn split_many(&self, slice_count: usize) -> Vec<Option<BranchHashingConfig>> {
+        if slice_count == 0 {
+            return Vec::new();
+        }
+        let total_batches = Self::global_batch_budget(self.worker_count);
+        let active_slices = (total_batches / Self::MIN_BATCHES_PER_SLICE).min(slice_count);
+        if active_slices == 0 {
+            return (0..slice_count).map(|_| None).collect();
+        }
+        let base = total_batches / active_slices;
+        let remainder = total_batches % active_slices;
+        let mut configs = Vec::with_capacity(slice_count);
+        for slice_index in 0..slice_count {
+            if slice_index < active_slices {
+                let extra = usize::from(slice_index < remainder);
+                configs.push(Some(self.config_with_total_batches(base + extra)));
+            } else {
+                configs.push(None);
+            }
+        }
+        configs
+    }
+
+    /// Splits the build-wide batch budget across the concurrent address-index
+    /// branch and `tx_shard_count` address-transaction shards while keeping
+    /// total `pending + filling + spare` batches within
+    /// `min(2 * workers, MAX_PENDING_BATCHES) + 2`. Overflow shards fall back
+    /// to `None` (inline hashing on their own shard thread).
+    pub(crate) fn split_secondary(
+        &self,
+        tx_shard_count: usize,
+    ) -> (
+        Option<BranchHashingConfig>,
+        Vec<Option<BranchHashingConfig>>,
+    ) {
+        let mut slices = self
+            .split_many(tx_shard_count.saturating_add(1))
+            .into_iter();
+        let index_config = slices.next().flatten();
+        let mut tx_configs: Vec<_> = slices.take(tx_shard_count).collect();
+        while tx_configs.len() < tx_shard_count {
+            tx_configs.push(None);
+        }
+        (index_config, tx_configs)
     }
 }
 
@@ -951,6 +1000,35 @@ mod tests {
 
             drop(index_config);
             drop(tx_config);
+            for tx_shard_count in [0, 1, 4, 8, 16] {
+                let (shard_idx_cfg, shard_tx_cfgs) = branch_pool.split_secondary(tx_shard_count);
+                assert_eq!(shard_tx_cfgs.len(), tx_shard_count);
+                let mut total_slice_batches = 0_usize;
+                for cfg in std::iter::once(&shard_idx_cfg)
+                    .chain(shard_tx_cfgs.iter())
+                    .flatten()
+                {
+                    assert!(Arc::ptr_eq(&cfg.pool, &primary_pool));
+                    total_slice_batches += cfg.max_pending + 2;
+                }
+                assert!(
+                    total_slice_batches <= expected_cap,
+                    "{worker_count} workers / {tx_shard_count} shards exceeded budget: {total_slice_batches} > {expected_cap}"
+                );
+            }
+            for slice_count in [0, 1, 2, 4, 8, 16] {
+                let slice_cfgs = branch_pool.split_many(slice_count);
+                assert_eq!(slice_cfgs.len(), slice_count);
+                let mut total_slice_batches = 0_usize;
+                for cfg in slice_cfgs.iter().flatten() {
+                    assert!(Arc::ptr_eq(&cfg.pool, &primary_pool));
+                    total_slice_batches += cfg.max_pending + 2;
+                }
+                assert!(
+                    total_slice_batches <= expected_cap,
+                    "{worker_count} workers / {slice_count} split_many slices exceeded budget: {total_slice_batches} > {expected_cap}"
+                );
+            }
             primary.restore_branch_hashing_pool(branch_pool);
             let restored = primary
                 .workers

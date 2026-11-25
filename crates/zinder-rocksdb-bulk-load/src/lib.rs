@@ -6,8 +6,11 @@
 mod bulk_load;
 
 pub use bulk_load::{
-    BulkLoadError, FixedRecordSorter, OrderedKeyValueEvidence, OrderedKeyValueEvidenceAccumulator,
-    OrderedSstWriter, ParallelVariableValueSorter, SortedVariableValues, SstFileEvidence,
-    SstFileSet, StagedParallelVariableRuns, VariableValueRecord, VariableValueSortDurations,
-    VariableValueSortEvidence, VariableValueSortShard, VariableValueSorter, fixed_record_capacity,
+    BulkLoadError, FixedRecordSorter, MAX_KEY_PREFIX_SHARD_COUNT, OrderedKeyValueEvidence,
+    OrderedKeyValueEvidenceAccumulator, OrderedSstWriter, ParallelVariableValueSorter,
+    ShardedKeyPrefixSorter, ShardedKeyPrefixWriter, ShardedSortBudget, ShardedSortedVariableValues,
+    SortedVariableValues, SstFileEvidence, SstFileSet, StagedParallelVariableRuns,
+    VariableValueRecord, VariableValueSortDurations, VariableValueSortEvidence,
+    VariableValueSortShard, VariableValueSorter, active_merge_fan_in, fixed_record_capacity,
+    key_prefix_shard_index,
 };

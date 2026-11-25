@@ -1678,8 +1678,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-projector"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Memory ceiling for the wallet builder's outpoint sorter. Defaults to \
-                      4294967296.",
+        description: "Memory ceiling for the wallet builder's outpoint sorter. Defaults to 40% of \
+                      the detected container memory limit clamped between 64 MiB (or half the limit \
+                      below 128 MiB) and 4294967296 (4 GiB), and to 4294967296 without a container \
+                      limit.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__BUILD__MAX_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER",
@@ -1690,7 +1692,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Memory ceiling for each wallet secondary-index sorter (the \
                       address-transaction sorter may also recycle up to half of \
                       `projector.build.max_outpoint_sort_memory_bytes` once the outpoint sorter \
-                      has flushed to disk). Defaults to 1073741824.",
+                      has flushed to disk). Defaults to 10% of the detected container memory limit \
+                      clamped between 32 MiB (or an eighth of the limit below 256 MiB) and \
+                      1073741824 (1 GiB), and to 1073741824 without a container limit.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER",
@@ -1717,7 +1721,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Maximum logical wallet undo bytes admitted during fixed-tip construction. \
-                      Defaults to 536870912.",
+                      Defaults to 5% of the detected container memory limit clamped between 16 MiB \
+                      (or a sixteenth of the limit below 256 MiB) and 536870912 (512 MiB), and to \
+                      536870912 without a container limit.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__BUILD__ACCUMULATOR_HASHING_WORKERS",
@@ -1725,31 +1731,32 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-projector"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Threads that scan settled canonical replay chunks, hash wallet rows into \
-                      the projection digest and the UTXO set commitment, parallelize SST \
-                      writing/digesting and secondary address derivation, and split cold \
-                      validation during a fresh wallet build. Defaults to the number of \
-                      logical CPUs the projector may use, at most 4, and to 1 when that count \
-                      cannot be detected. With 1, scanning, hashing, SST writing, and \
-                      secondary drains run synchronously. A higher value scans settled \
-                      canonical replay in 4,096-block height chunks across that many workers \
-                      (splitting max_outpoint_sort_memory_bytes across workers while sharing \
-                      max_temporary_file_bytes_per_sorter and verifying the ordered sequence \
-                      digest), hashes batches of rows on workers (split across concurrent \
-                      address-index and address-transaction branches so total hashing threads \
-                      never exceed the setting), and pipelines `SstFileWriter` compression and \
-                      dual SHA-256 hashing per bulk writer behind bounded queues capped at \
-                      `clamp(sst_target_logical_bytes / 8, 64 KiB, 4 MiB)` per open writer \
-                      (at most 12 MiB concurrently during secondary derivation). Each hashing \
-                      batch is allocated once and takes at most 512 KiB, and at most twice \
-                      that many batches, never more than 64, plus two on the build thread \
-                      exist at once: at most 5 MiB at 4 threads and 33 MiB at 64. A row \
-                      larger than a batch is hashed on the build thread. Cold validation also \
-                      reads the unspent and spent output families and the address-transaction \
-                      family back in up to that many hash-prefix key ranges at once, at most \
-                      one per 65,536 of each scan's rows. The published rows, digest, \
-                      commitment, and SST contents do not change. Must be between 1 and 64; \
-                      the projector refuses a larger value at startup.",
+        description: "Threads that scan settled canonical replay chunks, shard key-prefix outpoint \
+                      and address-transaction drains, hash wallet rows into the projection digest \
+                      and the UTXO set commitment, parallelize SST writing/digesting and \
+                      secondary address derivation, and split cold validation during a fresh wallet \
+                      build. Defaults to the number of logical CPUs the projector may use, at most \
+                      4, and to 1 when that count cannot be detected. With 1, scanning, hashing, \
+                      SST writing, and secondary drains run synchronously. A higher value \
+                      partitions outpoint events (`txid` prefix) and secondary address rows \
+                      (`address_script_hash` prefix) into disjoint ascending key-prefix shards \
+                      across up to that many workers (at most 8, clamped by a 256 MiB per-shard \
+                      drain sort-memory floor, 64 MiB per `address_index` push partition, and \
+                      active `MAX_MERGE_FAN_IN` headroom), drains outpoints and address \
+                      transactions concurrently across shards while overlapping address-index and \
+                      address-transaction derivation, hashes batches of rows on workers, and \
+                      pipelines `SstFileWriter` compression and dual SHA-256 hashing behind \
+                      per-writer queues whose cumulative budget across all open pipelined writers \
+                      in a phase never exceeds 16 MiB (falling back to synchronous SST writes if \
+                      below 64 KiB per writer). Each hashing batch is allocated once and takes at \
+                      most 512 KiB, and at most twice that many batches, never more than 64, plus \
+                      two on the build thread exist at once: at most 5 MiB at 4 threads and 33 MiB \
+                      at 64. A row larger than a batch is hashed on the build thread. Cold \
+                      validation also reads the unspent and spent output families and the \
+                      address-transaction family back in up to that many hash-prefix key ranges at \
+                      once, at most one per 65,536 of each scan's rows. The published rows, \
+                      digest, commitment, and SST contents do not change. Must be between 1 and \
+                      64; the projector refuses a larger value at startup.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES",

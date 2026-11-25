@@ -2,11 +2,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fs,
     mem::size_of,
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     time::{Duration, Instant},
@@ -20,9 +21,9 @@ use zinder_core::{
     TransactionId, ValidatedCanonicalBlockReplay,
 };
 use zinder_rocksdb_bulk_load::{
-    BulkLoadError, OrderedSstWriter, ParallelVariableValueSorter, SortedVariableValues, SstFileSet,
-    VariableValueSortDurations, VariableValueSortEvidence, VariableValueSortShard,
-    VariableValueSorter,
+    BulkLoadError, OrderedSstWriter, ShardedKeyPrefixSorter, ShardedKeyPrefixWriter,
+    ShardedSortBudget, ShardedSortedVariableValues, SortedVariableValues, SstFileSet,
+    VariableValueSortDurations, VariableValueSortEvidence, active_merge_fan_in,
 };
 use zinder_store::{
     CanonicalReplaySliceSource, CanonicalStoreError, ObservedCanonicalReplaySequence,
@@ -76,6 +77,27 @@ const MIN_PIPELINED_SST_QUEUE_BUDGET_BYTES: u64 = 64 * 1024;
 /// Maximum bounded pipeline queue budget per pipelined bulk SST writer.
 const MAX_PIPELINED_SST_QUEUE_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Maximum cumulative pipeline queue memory across all concurrently open SST writers.
+const PIPELINED_SST_TOTAL_QUEUE_CAP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Per-shard sort memory floor enforced on production key-prefix drain shards so
+/// external sorting avoids run explosion past `MAX_MERGE_FAN_IN`.
+const MIN_PRODUCTION_SHARD_SORT_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Per-partition push memory floor for `address_index` write-contention sharding.
+const MIN_ADDRESS_INDEX_PUSH_SHARD_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Minimum merge fan-in reserved per key-prefix drain shard under automatic
+/// production shard sizing.
+const MIN_PRODUCTION_SHARD_MERGE_FAN_IN: usize = 32;
+
+/// Minimum merge fan-in reserved per `address_index` push shard when overlapping
+/// secondary derivation with `address_transactions`.
+const MIN_ADDRESS_INDEX_SHARD_MERGE_FAN_IN: usize = 8;
+
+/// Upper cap on concurrent key-prefix drain shards in production builds.
+const MAX_KEY_PREFIX_DRAIN_SHARDS: u32 = 8;
+
 const fn pipelined_sst_queue_budget_bytes(sst_target_logical_bytes: u64) -> u64 {
     let scaled = sst_target_logical_bytes / 8;
     if scaled < MIN_PIPELINED_SST_QUEUE_BUDGET_BYTES {
@@ -85,6 +107,236 @@ const fn pipelined_sst_queue_budget_bytes(sst_target_logical_bytes: u64) -> u64 
     } else {
         scaled
     }
+}
+
+const fn scaled_pipelined_sst_queue_budget_bytes(
+    sst_target_logical_bytes: u64,
+    active_concurrent_writers: usize,
+) -> Option<u64> {
+    let single_writer = pipelined_sst_queue_budget_bytes(sst_target_logical_bytes);
+    let writers = if active_concurrent_writers == 0 {
+        1_u64
+    } else {
+        active_concurrent_writers as u64
+    };
+    let shared_cap = PIPELINED_SST_TOTAL_QUEUE_CAP_BYTES / writers;
+    let budget = if single_writer < shared_cap {
+        single_writer
+    } else {
+        shared_cap
+    };
+    if budget < MIN_PIPELINED_SST_QUEUE_BUDGET_BYTES {
+        None
+    } else {
+        Some(budget)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BuildShardPlan {
+    outpoint_shards: NonZeroU32,
+    address_index_push_shards: NonZeroU32,
+    address_index_per_shard_fan_in: usize,
+    address_transaction_shards: NonZeroU32,
+    address_transaction_per_shard_fan_in: usize,
+    overlap_secondary: bool,
+}
+
+fn resolve_key_prefix_shard_count(
+    requested_workers: NonZeroU32,
+    max_sort_memory_bytes: u64,
+    min_shard_sort_memory_bytes: u64,
+    total_merge_fan_in_budget: usize,
+    min_shard_merge_fan_in: usize,
+) -> NonZeroU32 {
+    if requested_workers.get() <= 1 {
+        return NonZeroU32::MIN;
+    }
+    let memory_shards = u32::try_from(max_sort_memory_bytes / min_shard_sort_memory_bytes.max(1))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let fan_in_shards = u32::try_from(total_merge_fan_in_budget / min_shard_merge_fan_in.max(2))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let count = requested_workers
+        .get()
+        .min(MAX_KEY_PREFIX_DRAIN_SHARDS)
+        .min(memory_shards)
+        .min(fan_in_shards)
+        .max(1);
+    NonZeroU32::new(count).unwrap_or(NonZeroU32::MIN)
+}
+
+fn resolve_override_shard_plan(
+    forced: NonZeroU32,
+    requested_workers: NonZeroU32,
+    safe_fan_in: usize,
+    max_fan_in_shards: u32,
+) -> BuildShardPlan {
+    let min_fan_in = 2_usize;
+    let overlap_secondary = (requested_workers.get() > 1 || forced.get() > 1) && safe_fan_in >= 4;
+    let outpoint_shards =
+        NonZeroU32::new(forced.get().min(max_fan_in_shards).max(1)).unwrap_or(NonZeroU32::MIN);
+    if !overlap_secondary {
+        let per_reader_fan_in =
+            (safe_fan_in / usize::try_from(outpoint_shards.get()).unwrap_or(1)).max(min_fan_in);
+        return BuildShardPlan {
+            outpoint_shards,
+            address_index_push_shards: outpoint_shards,
+            address_index_per_shard_fan_in: per_reader_fan_in,
+            address_transaction_shards: outpoint_shards,
+            address_transaction_per_shard_fan_in: per_reader_fan_in,
+            overlap_secondary: false,
+        };
+    }
+    // Concurrent secondary readers must stay bounded by:
+    // address_index_push_shards * idx_fan_in + address_transaction_shards * tx_fan_in <= safe_fan_in.
+    let max_pair_shards = (safe_fan_in / min_fan_in).max(2);
+    let idx_cap = u32::try_from(max_pair_shards / 2).unwrap_or(u32::MAX);
+    let address_index_push_shards =
+        NonZeroU32::new(forced.get().min(outpoint_shards.get()).min(idx_cap).max(1))
+            .unwrap_or(NonZeroU32::MIN);
+    let idx_shards_usize = usize::try_from(address_index_push_shards.get()).unwrap_or(1);
+    let tx_cap =
+        u32::try_from(max_pair_shards.saturating_sub(idx_shards_usize).max(1)).unwrap_or(u32::MAX);
+    let address_transaction_shards =
+        NonZeroU32::new(forced.get().min(tx_cap).max(1)).unwrap_or(NonZeroU32::MIN);
+    let total_secondary_shards = idx_shards_usize
+        .saturating_add(usize::try_from(address_transaction_shards.get()).unwrap_or(1));
+    let per_reader_fan_in = (safe_fan_in / total_secondary_shards.max(1)).max(min_fan_in);
+    BuildShardPlan {
+        outpoint_shards,
+        address_index_push_shards,
+        address_index_per_shard_fan_in: per_reader_fan_in,
+        address_transaction_shards,
+        address_transaction_per_shard_fan_in: per_reader_fan_in,
+        overlap_secondary: true,
+    }
+}
+
+fn clamp_address_index_push_shards(
+    outpoint_shards: NonZeroU32,
+    max_secondary_sort_memory_bytes_per_sorter: u64,
+    idx_fd_budget: usize,
+) -> NonZeroU32 {
+    if outpoint_shards.get() <= 1 {
+        return NonZeroU32::MIN;
+    }
+    let min_fan_in = 2_usize;
+    let mem_cap = u32::try_from(
+        max_secondary_sort_memory_bytes_per_sorter / MIN_ADDRESS_INDEX_PUSH_SHARD_MEMORY_BYTES,
+    )
+    .unwrap_or(u32::MAX)
+    .max(1);
+    let prod_fd_cap = u32::try_from(idx_fd_budget / MIN_ADDRESS_INDEX_SHARD_MERGE_FAN_IN)
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let hard_fd_cap = u32::try_from(idx_fd_budget / min_fan_in)
+        .unwrap_or(u32::MAX)
+        .max(1);
+    NonZeroU32::new(
+        outpoint_shards
+            .get()
+            .min(mem_cap)
+            .min(prod_fd_cap)
+            .min(hard_fd_cap)
+            .max(1),
+    )
+    .unwrap_or(NonZeroU32::MIN)
+}
+
+fn resolve_build_shard_plan_for(
+    requested_workers: NonZeroU32,
+    max_outpoint_sort_memory_bytes: u64,
+    max_secondary_sort_memory_bytes_per_sorter: u64,
+    active_fan_in: usize,
+    shard_override: Option<NonZeroU32>,
+) -> BuildShardPlan {
+    let min_fan_in = 2_usize;
+    let safe_fan_in = active_fan_in.max(min_fan_in);
+    let max_fan_in_shards = u32::try_from((safe_fan_in / min_fan_in).max(1)).unwrap_or(u32::MAX);
+    if let Some(forced) = shard_override {
+        return resolve_override_shard_plan(
+            forced,
+            requested_workers,
+            safe_fan_in,
+            max_fan_in_shards,
+        );
+    }
+
+    if requested_workers.get() <= 1 {
+        return BuildShardPlan {
+            outpoint_shards: NonZeroU32::MIN,
+            address_index_push_shards: NonZeroU32::MIN,
+            address_index_per_shard_fan_in: safe_fan_in,
+            address_transaction_shards: NonZeroU32::MIN,
+            address_transaction_per_shard_fan_in: safe_fan_in,
+            overlap_secondary: false,
+        };
+    }
+
+    let outpoint_shards = resolve_key_prefix_shard_count(
+        requested_workers,
+        max_outpoint_sort_memory_bytes,
+        MIN_PRODUCTION_SHARD_SORT_MEMORY_BYTES,
+        safe_fan_in,
+        MIN_PRODUCTION_SHARD_MERGE_FAN_IN,
+    );
+    let overlap_secondary = safe_fan_in >= 4;
+    let idx_fd_budget = if overlap_secondary {
+        (safe_fan_in / 4).max(min_fan_in)
+    } else {
+        safe_fan_in
+    };
+    let tx_fd_budget = if overlap_secondary {
+        safe_fan_in.saturating_sub(idx_fd_budget).max(min_fan_in)
+    } else {
+        safe_fan_in
+    };
+    let address_index_push_shards = clamp_address_index_push_shards(
+        outpoint_shards,
+        max_secondary_sort_memory_bytes_per_sorter,
+        idx_fd_budget,
+    );
+    let address_tx_memory = address_transaction_sort_memory_bytes(
+        max_outpoint_sort_memory_bytes,
+        max_secondary_sort_memory_bytes_per_sorter,
+    );
+    let tx_hard_cap = u32::try_from((tx_fd_budget / min_fan_in).max(1)).unwrap_or(u32::MAX);
+    let uncapped_tx_shards = resolve_key_prefix_shard_count(
+        requested_workers,
+        address_tx_memory,
+        MIN_PRODUCTION_SHARD_SORT_MEMORY_BYTES,
+        tx_fd_budget,
+        MIN_PRODUCTION_SHARD_MERGE_FAN_IN,
+    );
+    let address_transaction_shards =
+        NonZeroU32::new(uncapped_tx_shards.get().min(tx_hard_cap).max(1))
+            .unwrap_or(NonZeroU32::MIN);
+    let address_index_per_shard_fan_in = (idx_fd_budget
+        / usize::try_from(address_index_push_shards.get()).unwrap_or(1))
+    .max(min_fan_in);
+    let address_transaction_per_shard_fan_in = (tx_fd_budget
+        / usize::try_from(address_transaction_shards.get()).unwrap_or(1))
+    .max(min_fan_in);
+    BuildShardPlan {
+        outpoint_shards,
+        address_index_push_shards,
+        address_index_per_shard_fan_in,
+        address_transaction_shards,
+        address_transaction_per_shard_fan_in,
+        overlap_secondary,
+    }
+}
+
+fn resolve_build_shard_plan(config: WalletProjectionLoadConfig<'_>) -> BuildShardPlan {
+    resolve_build_shard_plan_for(
+        config.accumulator_hashing_workers,
+        config.max_outpoint_sort_memory_bytes,
+        config.max_secondary_sort_memory_bytes_per_sorter,
+        active_merge_fan_in(),
+        None,
+    )
 }
 
 /// Resource limits for one external projection construction.
@@ -324,25 +576,6 @@ impl RetainedUndo {
         Ok(())
     }
 
-    fn add_address_transaction(
-        &mut self,
-        key: WalletAddressTransactionKey,
-    ) -> Result<(), RocksDbWalletError> {
-        let Some(undo_index) = self
-            .records
-            .iter()
-            .position(|undo| undo.block.height == key.block_height())
-        else {
-            return Ok(());
-        };
-        self.reserve(
-            u64::try_from(size_of::<WalletAddressTransactionKey>())
-                .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?,
-        )?;
-        self.records[undo_index].address_transaction_keys.push(key);
-        Ok(())
-    }
-
     fn reserve(&mut self, additional_bytes: u64) -> Result<(), RocksDbWalletError> {
         let required_bytes = self
             .accounted_bytes
@@ -360,6 +593,184 @@ impl RetainedUndo {
     }
 }
 
+const UNDO_KEY_VEC_MIN_INITIAL_CAP: usize = 8;
+
+struct RetainedUndoCollector {
+    heights: Vec<BlockHeight>,
+    slots: Vec<Mutex<Vec<WalletAddressTransactionKey>>>,
+    accounted_bytes: AtomicU64,
+    peak_accounted_bytes: AtomicU64,
+    max_accounted_bytes: u64,
+}
+
+impl RetainedUndoCollector {
+    fn from_retained_undo(retained: &mut RetainedUndo) -> Self {
+        let mut heights = Vec::with_capacity(retained.records.len());
+        let mut slots = Vec::with_capacity(retained.records.len());
+        for undo in &mut retained.records {
+            heights.push(undo.block.height);
+            slots.push(Mutex::new(std::mem::take(
+                &mut undo.address_transaction_keys,
+            )));
+        }
+        Self {
+            heights,
+            slots,
+            accounted_bytes: AtomicU64::new(retained.accounted_bytes),
+            peak_accounted_bytes: AtomicU64::new(retained.peak_accounted_bytes),
+            max_accounted_bytes: retained.max_accounted_bytes,
+        }
+    }
+
+    fn reserve_accounted_elems(
+        &self,
+        desired_delta_elems: usize,
+        elem_bytes: u64,
+    ) -> Result<(usize, u64), RocksDbWalletError> {
+        let mut current = self.accounted_bytes.load(Ordering::SeqCst);
+        loop {
+            let headroom = self.max_accounted_bytes.saturating_sub(current);
+            let max_delta_elems = usize::try_from(headroom / elem_bytes).unwrap_or(usize::MAX);
+            if max_delta_elems == 0 {
+                let required_bytes = current
+                    .checked_add(elem_bytes)
+                    .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+                return Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit {
+                    limit_bytes: self.max_accounted_bytes,
+                    required_bytes,
+                });
+            }
+            let grant_elems = desired_delta_elems.min(max_delta_elems).max(1);
+            let charge_bytes = u64::try_from(grant_elems)
+                .ok()
+                .and_then(|elems| elems.checked_mul(elem_bytes))
+                .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+            let next = current
+                .checked_add(charge_bytes)
+                .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+            match self.accounted_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.peak_accounted_bytes.fetch_max(next, Ordering::AcqRel);
+                    return Ok((grant_elems, charge_bytes));
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn charge_overallocated_elems(
+        &self,
+        extra_elems: usize,
+        elem_bytes: u64,
+    ) -> Result<(), RocksDbWalletError> {
+        let extra_bytes = u64::try_from(extra_elems)
+            .ok()
+            .and_then(|elems| elems.checked_mul(elem_bytes))
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+        let max_bytes = self.max_accounted_bytes;
+        let updated =
+            self.accounted_bytes
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    let next = current.checked_add(extra_bytes)?;
+                    (next <= max_bytes).then_some(next)
+                });
+        match updated {
+            Ok(previous) => {
+                let next = previous.saturating_add(extra_bytes);
+                self.peak_accounted_bytes.fetch_max(next, Ordering::AcqRel);
+                Ok(())
+            }
+            Err(current) => {
+                let required_bytes = current
+                    .checked_add(extra_bytes)
+                    .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+                if required_bytes <= max_bytes {
+                    Err(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)
+                } else {
+                    Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit {
+                        limit_bytes: max_bytes,
+                        required_bytes,
+                    })
+                }
+            }
+        }
+    }
+
+    fn reserve_slot_capacity(
+        &self,
+        keys: &mut Vec<WalletAddressTransactionKey>,
+    ) -> Result<(), RocksDbWalletError> {
+        if keys.len() < keys.capacity() {
+            return Ok(());
+        }
+        let elem_size = size_of::<WalletAddressTransactionKey>();
+        const {
+            assert!(size_of::<WalletAddressTransactionKey>() > 0);
+        }
+        let elem_bytes = u64::try_from(elem_size)
+            .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+        let old_cap = keys.capacity();
+        let needed_cap = old_cap
+            .checked_add(1)
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+        let desired_cap = old_cap
+            .saturating_mul(2)
+            .max(UNDO_KEY_VEC_MIN_INITIAL_CAP)
+            .max(needed_cap);
+        let desired_delta = desired_cap.saturating_sub(old_cap);
+        let (grant_elems, charge_bytes) =
+            self.reserve_accounted_elems(desired_delta, elem_bytes)?;
+        let expected_cap = old_cap
+            .checked_add(grant_elems)
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+        let additional = expected_cap.saturating_sub(keys.len());
+        if let Err(source) = keys.try_reserve_exact(additional) {
+            self.accounted_bytes
+                .fetch_sub(charge_bytes, Ordering::SeqCst);
+            return Err(BulkLoadError::MemoryAllocation {
+                operation: "wallet reorg undo address transaction keys",
+                source,
+            }
+            .into());
+        }
+        let actual_cap = keys.capacity();
+        if actual_cap > expected_cap {
+            self.charge_overallocated_elems(actual_cap.saturating_sub(expected_cap), elem_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn try_collect(&self, key: WalletAddressTransactionKey) -> Result<(), RocksDbWalletError> {
+        let Ok(undo_index) = self.heights.binary_search(&key.block_height()) else {
+            return Ok(());
+        };
+        let mut keys = self.slots[undo_index].lock();
+        self.reserve_slot_capacity(&mut keys)?;
+        keys.push(key);
+        drop(keys);
+        Ok(())
+    }
+
+    fn apply_collected(self, retained: &mut RetainedUndo) -> Result<(), RocksDbWalletError> {
+        if self.slots.len() != retained.records.len() {
+            return Err(RocksDbWalletError::WalletProjectionLoadAccountingOverflow);
+        }
+        for (undo, slot) in retained.records.iter_mut().zip(self.slots) {
+            undo.address_transaction_keys = slot.into_inner();
+        }
+        retained.accounted_bytes = self.accounted_bytes.load(Ordering::Acquire);
+        retained.peak_accounted_bytes = retained
+            .peak_accounted_bytes
+            .max(self.peak_accounted_bytes.load(Ordering::Acquire));
+        Ok(())
+    }
+}
+
 trait OutpointEventSink {
     fn push_event(
         &mut self,
@@ -368,17 +779,7 @@ trait OutpointEventSink {
     ) -> Result<(), BulkLoadError>;
 }
 
-impl OutpointEventSink for VariableValueSorter<OUTPOINT_EVENT_KEY_BYTES> {
-    fn push_event(
-        &mut self,
-        key: [u8; OUTPOINT_EVENT_KEY_BYTES],
-        encoded_value: &[u8],
-    ) -> Result<(), BulkLoadError> {
-        self.push(key, encoded_value)
-    }
-}
-
-impl OutpointEventSink for VariableValueSortShard<'_, OUTPOINT_EVENT_KEY_BYTES> {
+impl OutpointEventSink for ShardedKeyPrefixWriter<'_, OUTPOINT_EVENT_KEY_BYTES> {
     fn push_event(
         &mut self,
         key: [u8; OUTPOINT_EVENT_KEY_BYTES],
@@ -399,7 +800,7 @@ struct CompletedCanonicalScan {
     staged_spend_count: u64,
     canonical_scan: Duration,
     outpoint_sort: Duration,
-    sorted_outpoints: SortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
+    sorted_outpoints: ShardedSortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
     outpoint_sort_evidence: VariableValueSortEvidence,
     outpoint_sort_durations: VariableValueSortDurations,
 }
@@ -644,6 +1045,7 @@ pub(crate) fn write_projection_ssts_from_source<Source>(
 where
     Source: WalletProjectionReplaySource + ?Sized,
 {
+    let shard_plan = resolve_build_shard_plan(config);
     if let Some(slice_source) = canonical_store.wallet_projection_slice_source() {
         let chunks = partition_settled_height_chunks(
             config.first_retained_block.height,
@@ -656,33 +1058,51 @@ where
             config.max_outpoint_sort_memory_bytes,
         );
         if workers.get() > 1 {
-            let scanned = scan_canonical_replay_parallel(config, &slice_source, chunks, workers)?;
-            return finish_projection_ssts(config, scanned);
+            let scanned = scan_canonical_replay_parallel(
+                config,
+                &slice_source,
+                chunks,
+                workers,
+                shard_plan.outpoint_shards,
+            )?;
+            return finish_projection_ssts_with_plan(config, scanned, shard_plan);
         }
     }
     let blocks = canonical_store
         .wallet_projection_scan()
         .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
-    write_projection_ssts(config, blocks)
+    write_projection_ssts_with_plan(config, blocks, shard_plan)
 }
 
 /// Writes all six wallet families from one authenticated canonical replay scan.
+#[cfg(test)]
 pub(crate) fn write_projection_ssts(
     config: WalletProjectionLoadConfig<'_>,
     blocks: impl IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
 ) -> Result<PreparedWalletProjectionLoad, RocksDbWalletError> {
-    let scanned = scan_canonical_replay_serial(config, blocks)?;
-    finish_projection_ssts(config, scanned)
+    let shard_plan = resolve_build_shard_plan(config);
+    write_projection_ssts_with_plan(config, blocks, shard_plan)
+}
+
+fn write_projection_ssts_with_plan(
+    config: WalletProjectionLoadConfig<'_>,
+    blocks: impl IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
+    shard_plan: BuildShardPlan,
+) -> Result<PreparedWalletProjectionLoad, RocksDbWalletError> {
+    let scanned = scan_canonical_replay_serial(config, blocks, shard_plan.outpoint_shards)?;
+    finish_projection_ssts_with_plan(config, scanned, shard_plan)
 }
 
 fn scan_canonical_replay_serial(
     config: WalletProjectionLoadConfig<'_>,
     blocks: impl IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
+    outpoint_shards: NonZeroU32,
 ) -> Result<CompletedCanonicalScan, RocksDbWalletError> {
     let scan_started = Instant::now();
-    let mut outpoint_sorter = VariableValueSorter::<OUTPOINT_EVENT_KEY_BYTES>::new(
+    let outpoint_sorter = ShardedKeyPrefixSorter::<OUTPOINT_EVENT_KEY_BYTES>::new(
         config.staging_path,
         "wallet-outpoint-events",
+        outpoint_shards,
         config.max_outpoint_sort_memory_bytes,
         config.max_temporary_file_bytes_per_sorter,
     )?;
@@ -696,6 +1116,7 @@ fn scan_canonical_replay_serial(
     let mut first_block = None;
     let mut previous_block = None;
     let mut counters = ScanCounters::default();
+    let mut outpoint_writer = outpoint_sorter.writer(NonZeroU32::MIN);
 
     for replay in blocks {
         let replay = replay.map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
@@ -706,11 +1127,12 @@ fn scan_canonical_replay_serial(
             previous_block,
             &mut sequence_digest,
             &mut retained_undo,
-            &mut outpoint_sorter,
+            &mut outpoint_writer,
             &mut counters,
         )?;
         previous_block = Some(block);
     }
+    outpoint_writer.flush()?;
     let first_block = first_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
     let tip = previous_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
     let canonical_scan = scan_started.elapsed();
@@ -738,8 +1160,7 @@ fn scan_canonical_replay_serial(
     })
 }
 
-struct ParallelSettledScan<'sorter> {
-    shards: Vec<VariableValueSortShard<'sorter, OUTPOINT_EVENT_KEY_BYTES>>,
+struct ParallelSettledScan {
     first_block: Option<BlockId>,
     previous_block: Option<BlockId>,
     counters: ScanCounters,
@@ -750,12 +1171,13 @@ fn scan_canonical_replay_parallel(
     slice_source: &CanonicalReplaySliceSource<'_>,
     chunks: Vec<BlockHeightRange>,
     worker_count: NonZeroU32,
+    outpoint_shards: NonZeroU32,
 ) -> Result<CompletedCanonicalScan, RocksDbWalletError> {
     let scan_started = Instant::now();
-    let parallel_sorter = ParallelVariableValueSorter::<OUTPOINT_EVENT_KEY_BYTES>::new(
+    let outpoint_sorter = ShardedKeyPrefixSorter::<OUTPOINT_EVENT_KEY_BYTES>::new(
         config.staging_path,
         "wallet-outpoint-events",
-        worker_count,
+        outpoint_shards,
         config.max_outpoint_sort_memory_bytes,
         config.max_temporary_file_bytes_per_sorter,
     )?;
@@ -767,9 +1189,10 @@ fn scan_canonical_replay_parallel(
     let mut sequence_digest =
         CanonicalBlockFactsSequenceDigestBuilder::new(CanonicalBlockFactsSequenceDigestVersion::V1);
     let mut settled = run_parallel_settled_chunks(
-        &parallel_sorter,
+        &outpoint_sorter,
         slice_source,
         chunks,
+        worker_count,
         config.first_retained_block,
         &mut sequence_digest,
     )?;
@@ -781,13 +1204,11 @@ fn scan_canonical_replay_parallel(
     scan_unsettled_suffix(
         config,
         slice_source,
-        &mut settled,
-        &mut sequence_digest,
-        &mut retained_undo,
+        &outpoint_sorter,
+        (&mut settled, &mut sequence_digest, &mut retained_undo),
     )?;
 
     let ParallelSettledScan {
-        shards,
         first_block,
         previous_block,
         counters,
@@ -806,8 +1227,7 @@ fn scan_canonical_replay_parallel(
     let canonical_scan = scan_started.elapsed();
 
     let phase_started = Instant::now();
-    let staged = parallel_sorter.flush_shards(shards)?;
-    let sorted_outpoints = parallel_sorter.finish(staged)?;
+    let sorted_outpoints = outpoint_sorter.finish()?;
     let outpoint_sort_evidence = sorted_outpoints.evidence();
     let outpoint_sort_durations = sorted_outpoints.durations();
     let outpoint_sort = phase_started.elapsed();
@@ -832,10 +1252,14 @@ fn scan_canonical_replay_parallel(
 fn scan_unsettled_suffix(
     config: WalletProjectionLoadConfig<'_>,
     slice_source: &CanonicalReplaySliceSource<'_>,
-    settled: &mut ParallelSettledScan<'_>,
-    sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
-    retained_undo: &mut RetainedUndo,
+    outpoint_sorter: &ShardedKeyPrefixSorter<OUTPOINT_EVENT_KEY_BYTES>,
+    suffix_state: (
+        &mut ParallelSettledScan,
+        &mut CanonicalBlockFactsSequenceDigestBuilder,
+        &mut RetainedUndo,
+    ),
 ) -> Result<(), RocksDbWalletError> {
+    let (settled, sequence_digest, retained_undo) = suffix_state;
     let visible_tip = slice_source.ready_evidence().visible_tip;
     let Some(suffix_start) = config.settled_tip.height.next() else {
         return Ok(());
@@ -843,10 +1267,7 @@ fn scan_unsettled_suffix(
     if suffix_start > visible_tip.height {
         return Ok(());
     }
-    let suffix_shard = settled
-        .shards
-        .first_mut()
-        .ok_or(RocksDbWalletError::CanonicalScanWorkerStopped)?;
+    let mut suffix_writer = outpoint_sorter.writer(NonZeroU32::MIN);
     let suffix_scan = slice_source
         .scan_slice(BlockHeightRange::inclusive(
             suffix_start,
@@ -862,24 +1283,29 @@ fn scan_unsettled_suffix(
             settled.previous_block,
             sequence_digest,
             retained_undo,
-            suffix_shard,
+            &mut suffix_writer,
             &mut settled.counters,
         )?;
         settled.previous_block = Some(block);
     }
+    suffix_writer.flush()?;
     Ok(())
 }
 
-fn run_parallel_settled_chunks<'sorter>(
-    parallel_sorter: &'sorter ParallelVariableValueSorter<OUTPOINT_EVENT_KEY_BYTES>,
+#[allow(
+    clippy::too_many_arguments,
+    reason = "coordinates scoped parallel scan workers and ordered sequence verification"
+)]
+fn run_parallel_settled_chunks(
+    outpoint_sorter: &ShardedKeyPrefixSorter<OUTPOINT_EVENT_KEY_BYTES>,
     slice_source: &CanonicalReplaySliceSource<'_>,
     chunks: Vec<BlockHeightRange>,
+    worker_count: NonZeroU32,
     first_retained_block: BlockId,
     sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
-) -> Result<ParallelSettledScan<'sorter>, RocksDbWalletError> {
-    let initial_shards = parallel_sorter.open_shards()?;
+) -> Result<ParallelSettledScan, RocksDbWalletError> {
     let total_chunks = chunks.len();
-    let worker_threads = initial_shards.len();
+    let worker_threads = usize::try_from(worker_count.get()).unwrap_or(1);
     let max_in_flight = worker_threads
         .saturating_mul(4)
         .clamp(worker_threads, MAX_IN_FLIGHT_SCAN_CHUNKS);
@@ -889,12 +1315,13 @@ fn run_parallel_settled_chunks<'sorter>(
         Result<CompletedReplayChunk, RocksDbWalletError>,
     >(max_in_flight.saturating_add(worker_threads));
     std::thread::scope(|scope| {
-        let mut workers = Vec::with_capacity(initial_shards.len());
+        let mut workers = Vec::with_capacity(worker_threads);
         let mut start_failure = None;
-        for (worker_index, shard) in initial_shards.into_iter().enumerate() {
+        for worker_index in 0..worker_threads {
             let sender = completed_tx.clone();
             match spawn_canonical_scan_worker(scope, worker_index, move || {
-                scan_worker_chunks(slice_source, window_ref, shard, &sender)
+                let writer = outpoint_sorter.writer(worker_count);
+                scan_worker_chunks(slice_source, window_ref, writer, &sender)
             }) {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
@@ -921,11 +1348,16 @@ fn run_parallel_settled_chunks<'sorter>(
             window.stop();
         }
 
-        let mut returned_shards = Vec::with_capacity(workers.len());
+        let mut worker_error = None;
         let mut worker_stopped = false;
         for worker in workers {
             match worker.join() {
-                Ok(shard) => returned_shards.push(shard),
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(error);
+                    }
+                }
                 Err(_) => worker_stopped = true,
             }
         }
@@ -933,11 +1365,13 @@ fn run_parallel_settled_chunks<'sorter>(
             return Err(error);
         }
         let (first_block, previous_block, counters) = verify_outcome?;
+        if let Some(error) = worker_error {
+            return Err(error);
+        }
         if worker_stopped {
             return Err(RocksDbWalletError::CanonicalScanWorkerStopped);
         }
         Ok(ParallelSettledScan {
-            shards: returned_shards,
             first_block,
             previous_block,
             counters,
@@ -945,17 +1379,17 @@ fn run_parallel_settled_chunks<'sorter>(
     })
 }
 
-fn scan_worker_chunks<'sorter>(
+fn scan_worker_chunks(
     slice_source: &CanonicalReplaySliceSource<'_>,
     window: &ChunkWindow,
-    mut shard: VariableValueSortShard<'sorter, OUTPOINT_EVENT_KEY_BYTES>,
+    mut writer: ShardedKeyPrefixWriter<'_, OUTPOINT_EVENT_KEY_BYTES>,
     completed_tx: &SyncSender<Result<CompletedReplayChunk, RocksDbWalletError>>,
-) -> VariableValueSortShard<'sorter, OUTPOINT_EVENT_KEY_BYTES> {
+) -> Result<(), RocksDbWalletError> {
     let _stop_on_unwind = StopWindowOnUnwind(window);
     while let Some((chunk_index, range)) = window.claim_next() {
         #[cfg(test)]
         window.maybe_inject_worker_unwind(chunk_index);
-        let outcome = scan_one_settled_chunk(slice_source, window, chunk_index, range, &mut shard);
+        let outcome = scan_one_settled_chunk(slice_source, window, chunk_index, range, &mut writer);
         let failed = outcome.is_err();
         if failed {
             window.stop();
@@ -964,7 +1398,7 @@ fn scan_worker_chunks<'sorter>(
             break;
         }
     }
-    shard
+    writer.flush().map_err(RocksDbWalletError::from)
 }
 
 fn scan_one_settled_chunk(
@@ -972,7 +1406,7 @@ fn scan_one_settled_chunk(
     window: &ChunkWindow,
     chunk_index: usize,
     range: BlockHeightRange,
-    shard: &mut VariableValueSortShard<'_, OUTPOINT_EVENT_KEY_BYTES>,
+    sink: &mut impl OutpointEventSink,
 ) -> Result<CompletedReplayChunk, RocksDbWalletError> {
     let expected_blocks =
         usize::try_from(u64::from(range.end.value() - range.start.value()) + 1).unwrap_or(0);
@@ -999,7 +1433,7 @@ fn scan_one_settled_chunk(
         last_block = Some(block);
         digests.push(reference_digest);
         counters.blocks = increment(counters.blocks)?;
-        stage_settled_block_transactions(&facts, block, shard, &mut counters)?;
+        stage_settled_block_transactions(&facts, block, sink, &mut counters)?;
     }
     let first_block = first_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
     let first_parent_hash = first_parent_hash.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
@@ -1232,13 +1666,87 @@ fn stage_serial_block(
     Ok(block)
 }
 
+#[derive(Default)]
+struct PreparedFamilyFiles {
+    paths: Vec<PathBuf>,
+    file_bytes: u64,
+}
+
+impl From<SstFileSet> for PreparedFamilyFiles {
+    fn from(file_set: SstFileSet) -> Self {
+        Self {
+            paths: file_set.paths,
+            file_bytes: file_set.file_bytes,
+        }
+    }
+}
+
+fn combine_sst_file_sets(
+    file_sets: impl IntoIterator<Item = SstFileSet>,
+) -> Result<PreparedFamilyFiles, RocksDbWalletError> {
+    let mut combined = PreparedFamilyFiles::default();
+    for file_set in file_sets {
+        combined.file_bytes = combined
+            .file_bytes
+            .checked_add(file_set.file_bytes)
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+        combined.paths.extend(file_set.paths);
+    }
+    Ok(combined)
+}
+
+fn shard_staging_path(
+    base_staging_path: &Path,
+    phase_tag: &str,
+    shard_index: usize,
+    shard_count: usize,
+) -> Result<PathBuf, RocksDbWalletError> {
+    if shard_count <= 1 {
+        return Ok(base_staging_path.to_path_buf());
+    }
+    let path = base_staging_path.join(format!("{phase_tag}-shard-{shard_index:03}"));
+    fs::create_dir_all(&path).map_err(|source| RocksDbWalletError::PathUnavailable {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
+}
+
+struct OutpointDrainShardOutput {
+    unspent_files: SstFileSet,
+    spent_files: SstFileSet,
+    unspent_write: Duration,
+    spent_write: Duration,
+    utxo_count: u64,
+    total_value_zat: u64,
+    accumulators: crate::accumulator_hashing::FinishedBranchAccumulators,
+    evidence: WalletProjectionSstEvidence,
+}
+
+enum OutpointShardOutcome {
+    Completed(Box<OutpointDrainShardOutput>),
+    SiblingAborted,
+    Failed(RocksDbWalletError),
+}
+
+struct OutpointDrainSummary {
+    unspent_files: PreparedFamilyFiles,
+    spent_files: PreparedFamilyFiles,
+    unspent_write: Duration,
+    spent_write: Duration,
+    utxo_count: u64,
+    total_value_zat: u64,
+    sst_evidence: WalletProjectionSstEvidence,
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the loader keeps the external drains and evidence fence in visible order"
 )]
-fn finish_projection_ssts(
+fn finish_projection_ssts_with_plan(
     config: WalletProjectionLoadConfig<'_>,
     scanned: CompletedCanonicalScan,
+    shard_plan: BuildShardPlan,
 ) -> Result<PreparedWalletProjectionLoad, RocksDbWalletError> {
     let CompletedCanonicalScan {
         first_block,
@@ -1251,7 +1759,7 @@ fn finish_projection_ssts(
         staged_spend_count,
         canonical_scan,
         outpoint_sort,
-        mut sorted_outpoints,
+        sorted_outpoints,
         outpoint_sort_evidence,
         outpoint_sort_durations,
     } = scanned;
@@ -1261,60 +1769,61 @@ fn finish_projection_ssts(
         config.max_outpoint_sort_memory_bytes,
         config.max_secondary_sort_memory_bytes_per_sorter,
     );
-    let mut address_index_sorter = VariableValueSorter::<ADDRESS_UNSPENT_KEY_BYTES>::new(
-        config.staging_path,
-        "wallet-address-unspent",
-        config.max_secondary_sort_memory_bytes_per_sorter,
-        config.max_temporary_file_bytes_per_sorter,
-    )?;
-    let mut address_transaction_sorter = VariableValueSorter::<ADDRESS_TRANSACTION_KEY_BYTES>::new(
-        config.staging_path,
-        "wallet-address-transactions",
-        address_transaction_sort_memory,
-        config.max_temporary_file_bytes_per_sorter,
-    )?;
-    let mut unspent_writer = projection_writer(
-        config,
-        WalletProjectionRowFamily::TransparentUnspentOutput,
-        "wallet-unspent-output",
-    )?;
-    let mut spent_writer = projection_writer(
-        config,
-        WalletProjectionRowFamily::TransparentSpentOutput,
-        "wallet-spent-output",
-    )?;
+    let address_index_sorter =
+        ShardedKeyPrefixSorter::<ADDRESS_UNSPENT_KEY_BYTES>::new_with_budget(
+            config.staging_path,
+            "wallet-address-unspent",
+            ShardedSortBudget {
+                shard_count: shard_plan.address_index_push_shards,
+                max_accounted_memory_bytes: config.max_secondary_sort_memory_bytes_per_sorter,
+                max_temporary_file_bytes: config.max_temporary_file_bytes_per_sorter,
+                // Descriptor fan-in is resolved at the start of secondary derivation once
+                // `sorted_outpoints` closes its open run readers.
+                per_shard_merge_fan_in_cap: None,
+            },
+        )?;
+    let address_transaction_sorter =
+        ShardedKeyPrefixSorter::<ADDRESS_TRANSACTION_KEY_BYTES>::new_with_budget(
+            config.staging_path,
+            "wallet-address-transactions",
+            ShardedSortBudget {
+                shard_count: shard_plan.address_transaction_shards,
+                max_accounted_memory_bytes: address_transaction_sort_memory,
+                max_temporary_file_bytes: config.max_temporary_file_bytes_per_sorter,
+                per_shard_merge_fan_in_cap: None,
+            },
+        )?;
     let mut accumulators =
         ConstructionAccumulators::start(config.network, config.accumulator_hashing_workers)?;
-    let mut sst_evidence = WalletProjectionSstEvidence::default();
-    let mut utxo_count = 0_u64;
-    let mut total_value_zat = 0_u64;
-    drain_outpoint_events(
-        &mut sorted_outpoints,
-        &mut unspent_writer,
-        &mut spent_writer,
-        &mut address_index_sorter,
-        &mut address_transaction_sorter,
+    let branch_pool = accumulators.take_branch_hashing_pool()?;
+    let outpoint_summary = drain_outpoint_shards(
+        config,
+        sorted_outpoints,
+        (&address_index_sorter, &address_transaction_sorter),
+        branch_pool.as_ref(),
         &mut accumulators,
-        &mut sst_evidence,
-        &mut utxo_count,
-        &mut total_value_zat,
     )?;
-    accumulators.settle()?;
-    let (unspent_files, unspent_write) = unspent_writer.finish()?;
-    let (spent_files, spent_write) = spent_writer.finish()?;
+    let mut sst_evidence = outpoint_summary.sst_evidence;
     let outpoint_merge = phase_started.elapsed();
 
     let phase_started = Instant::now();
     let secondary = derive_secondary_address_artifacts(
         config,
         SecondaryDerivationSorters {
+            shard_plan,
             address_index: address_index_sorter,
             address_transaction: address_transaction_sorter,
         },
         &mut retained_undo,
-        &mut accumulators,
-        &mut sst_evidence,
+        SecondaryAccumulators {
+            branch_pool: branch_pool.as_ref(),
+            accumulators: &mut accumulators,
+            sst_evidence: &mut sst_evidence,
+        },
     )?;
+    if let Some(pool) = branch_pool {
+        accumulators.restore_branch_hashing_pool(pool);
+    }
 
     let step_started = Instant::now();
     let mut reorg_undo_writer = ordered_writer(
@@ -1345,21 +1854,30 @@ fn finish_projection_ssts(
     let (projection_accumulator, projection_digest) = digest.finish_with_accumulator();
     let logical_evidence = phase_started.elapsed();
     let artifacts = [
-        (TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, unspent_files),
+        (
+            TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
+            outpoint_summary.unspent_files,
+        ),
         (
             TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
-            secondary.address_index_files,
+            PreparedFamilyFiles::from(secondary.address_index_files),
         ),
-        (TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY, spent_files),
+        (
+            TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
+            outpoint_summary.spent_files,
+        ),
         (
             TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
             secondary.address_transaction_files,
         ),
         (
             TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
-            secondary.address_balance_files,
+            PreparedFamilyFiles::from(secondary.address_balance_files),
         ),
-        (REORG_UNDO_COLUMN_FAMILY, reorg_undo_files),
+        (
+            REORG_UNDO_COLUMN_FAMILY,
+            PreparedFamilyFiles::from(reorg_undo_files),
+        ),
     ];
     let (families, sst_file_bytes, sst_file_count) = prepare_families(artifacts)?;
 
@@ -1373,8 +1891,8 @@ fn finish_projection_ssts(
         projection_accumulator,
         row_counts,
         utxo_summary: WalletUtxoSetSummary {
-            utxo_count,
-            total_value_zat,
+            utxo_count: outpoint_summary.utxo_count,
+            total_value_zat: outpoint_summary.total_value_zat,
             commitment,
         },
         counters: WalletProjectionLoadCounters {
@@ -1400,7 +1918,9 @@ fn finish_projection_ssts(
                 reorg_undo_write: reorg_undo_write_step,
             },
             sst_write: WalletSstWriteDurations {
-                primary_outputs: unspent_write.saturating_add(spent_write),
+                primary_outputs: outpoint_summary
+                    .unspent_write
+                    .saturating_add(outpoint_summary.spent_write),
                 address_index_and_balance: secondary
                     .address_index_write
                     .saturating_add(secondary.address_balance_write),
@@ -1422,9 +1942,269 @@ fn finish_projection_ssts(
     })
 }
 
+struct OutpointShardSpec {
+    shard_index: usize,
+    shard_count: usize,
+    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
+}
+
+fn drain_outpoint_shards(
+    config: WalletProjectionLoadConfig<'_>,
+    sorted_outpoints: ShardedSortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
+    secondary_sorters: (
+        &ShardedKeyPrefixSorter<ADDRESS_UNSPENT_KEY_BYTES>,
+        &ShardedKeyPrefixSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
+    ),
+    branch_pool: Option<&crate::accumulator_hashing::BranchHashingPool>,
+    accumulators: &mut ConstructionAccumulators,
+) -> Result<OutpointDrainSummary, RocksDbWalletError> {
+    let shards = sorted_outpoints.into_shards();
+    let shard_count = shards.len();
+    let aborted = AtomicBool::new(false);
+    if shard_count <= 1 {
+        let Some(stream) = shards.into_iter().next() else {
+            return Err(RocksDbWalletError::CanonicalScanWorkerStopped);
+        };
+        let branch_hashing = branch_pool.and_then(|pool| pool.split_many(1).pop().flatten());
+        let output = match drain_single_outpoint_shard(
+            config,
+            stream,
+            OutpointShardSpec {
+                shard_index: 0,
+                shard_count: 1,
+                branch_hashing,
+            },
+            secondary_sorters,
+            &aborted,
+        ) {
+            OutpointShardOutcome::Completed(completed) => *completed,
+            OutpointShardOutcome::Failed(error) => return Err(error),
+            OutpointShardOutcome::SiblingAborted => {
+                return Err(RocksDbWalletError::CanonicalScanWorkerStopped);
+            }
+        };
+        return combine_outpoint_shard_outputs(config, vec![output], accumulators);
+    }
+
+    let branch_hashing = branch_pool.map_or_else(
+        || (0..shard_count).map(|_| None).collect(),
+        |pool| pool.split_many(shard_count),
+    );
+    let outcomes =
+        run_parallel_outpoint_shards(config, shards, secondary_sorters, branch_hashing, &aborted)?;
+    combine_outpoint_shard_outputs(config, outcomes, accumulators)
+}
+
+fn run_parallel_outpoint_shards(
+    config: WalletProjectionLoadConfig<'_>,
+    shards: Vec<SortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>>,
+    secondary_sorters: (
+        &ShardedKeyPrefixSorter<ADDRESS_UNSPENT_KEY_BYTES>,
+        &ShardedKeyPrefixSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
+    ),
+    branch_hashing: Vec<Option<crate::accumulator_hashing::BranchHashingConfig>>,
+    aborted: &AtomicBool,
+) -> Result<Vec<OutpointDrainShardOutput>, RocksDbWalletError> {
+    let shard_count = shards.len();
+    let shard_configs = branch_hashing
+        .into_iter()
+        .chain(std::iter::repeat_with(|| None));
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(shard_count);
+        let mut start_error = None;
+        for (shard_index, (stream, shard_hashing)) in
+            shards.into_iter().zip(shard_configs).enumerate()
+        {
+            match std::thread::Builder::new()
+                .name(format!("zinder-outpoint-{shard_index}"))
+                .spawn_scoped(scope, move || {
+                    drain_single_outpoint_shard(
+                        config,
+                        stream,
+                        OutpointShardSpec {
+                            shard_index,
+                            shard_count,
+                            branch_hashing: shard_hashing,
+                        },
+                        secondary_sorters,
+                        aborted,
+                    )
+                }) {
+                Ok(handle) => handles.push(handle),
+                Err(source) => {
+                    aborted.store(true, Ordering::Release);
+                    start_error = Some(RocksDbWalletError::CanonicalScanThreadUnavailable {
+                        reason: source.to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+        let mut completed = Vec::with_capacity(shard_count);
+        let mut first_error = start_error;
+        let mut worker_stopped = false;
+        for handle in handles {
+            match handle.join() {
+                Ok(OutpointShardOutcome::Completed(output)) => completed.push(*output),
+                Ok(OutpointShardOutcome::Failed(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Ok(OutpointShardOutcome::SiblingAborted) | Err(_) => worker_stopped = true,
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if worker_stopped {
+            return Err(RocksDbWalletError::CanonicalScanWorkerStopped);
+        }
+        Ok(completed)
+    })
+}
+
+fn drain_single_outpoint_shard(
+    config: WalletProjectionLoadConfig<'_>,
+    stream: SortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
+    shard_spec: OutpointShardSpec,
+    secondary_sorters: (
+        &ShardedKeyPrefixSorter<ADDRESS_UNSPENT_KEY_BYTES>,
+        &ShardedKeyPrefixSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
+    ),
+    aborted: &AtomicBool,
+) -> OutpointShardOutcome {
+    let _abort_on_unwind = SetAbortOnUnwind(aborted);
+    if aborted.load(Ordering::Acquire) {
+        return OutpointShardOutcome::SiblingAborted;
+    }
+    match run_outpoint_shard_pipeline(config, stream, shard_spec, secondary_sorters, aborted) {
+        Ok(Some(completed)) => OutpointShardOutcome::Completed(Box::new(completed)),
+        Ok(None) => OutpointShardOutcome::SiblingAborted,
+        Err(error) => {
+            aborted.store(true, Ordering::Release);
+            OutpointShardOutcome::Failed(error)
+        }
+    }
+}
+
+fn run_outpoint_shard_pipeline(
+    config: WalletProjectionLoadConfig<'_>,
+    mut stream: SortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
+    shard_spec: OutpointShardSpec,
+    secondary_sorters: (
+        &ShardedKeyPrefixSorter<ADDRESS_UNSPENT_KEY_BYTES>,
+        &ShardedKeyPrefixSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
+    ),
+    aborted: &AtomicBool,
+) -> Result<Option<OutpointDrainShardOutput>, RocksDbWalletError> {
+    let OutpointShardSpec {
+        shard_index,
+        shard_count,
+        branch_hashing,
+    } = shard_spec;
+    let (address_index_sorter, address_transaction_sorter) = secondary_sorters;
+    let shard_staging =
+        shard_staging_path(config.staging_path, "outpoint", shard_index, shard_count)?;
+    let active_writers = shard_count.saturating_mul(2);
+    let mut unspent_writer = shard_projection_writer(
+        config,
+        &shard_staging,
+        WalletProjectionRowFamily::TransparentUnspentOutput,
+        "wallet-unspent-output",
+        active_writers,
+    )?;
+    let mut spent_writer = shard_projection_writer(
+        config,
+        &shard_staging,
+        WalletProjectionRowFamily::TransparentSpentOutput,
+        "wallet-spent-output",
+        active_writers,
+    )?;
+    let mut accumulators =
+        ConstructionAccumulators::start_optional_branch(config.network, branch_hashing);
+    let writer_count =
+        NonZeroU32::new(u32::try_from(shard_count).unwrap_or(1)).unwrap_or(NonZeroU32::MIN);
+    let mut address_index_writer = address_index_sorter.writer(writer_count);
+    let mut address_transaction_writer = address_transaction_sorter.writer(writer_count);
+    let mut evidence = WalletProjectionSstEvidence::default();
+    let mut utxo_count = 0_u64;
+    let mut total_value_zat = 0_u64;
+    let mut targets = OutpointDrainTargets {
+        unspent_writer: &mut unspent_writer,
+        spent_writer: &mut spent_writer,
+        address_index_writer: &mut address_index_writer,
+        address_transaction_writer: &mut address_transaction_writer,
+        accumulators: &mut accumulators,
+        sst_evidence: &mut evidence,
+        utxo_count: &mut utxo_count,
+        total_value_zat: &mut total_value_zat,
+        aborted,
+    };
+    if !drain_outpoint_events(&mut stream, &mut targets)? {
+        return Ok(None);
+    }
+    address_index_writer.flush()?;
+    address_transaction_writer.flush()?;
+    let finished_accumulators = accumulators.finish_branch()?;
+    let (unspent_files, unspent_write) = unspent_writer.finish()?;
+    let (spent_files, spent_write) = spent_writer.finish()?;
+    Ok(Some(OutpointDrainShardOutput {
+        unspent_files,
+        spent_files,
+        unspent_write,
+        spent_write,
+        utxo_count,
+        total_value_zat,
+        accumulators: finished_accumulators,
+        evidence,
+    }))
+}
+
+fn combine_outpoint_shard_outputs(
+    _config: WalletProjectionLoadConfig<'_>,
+    outputs: Vec<OutpointDrainShardOutput>,
+    accumulators: &mut ConstructionAccumulators,
+) -> Result<OutpointDrainSummary, RocksDbWalletError> {
+    let mut unspent_sets = Vec::with_capacity(outputs.len());
+    let mut spent_sets = Vec::with_capacity(outputs.len());
+    let mut unspent_write = Duration::ZERO;
+    let mut spent_write = Duration::ZERO;
+    let mut utxo_count = 0_u64;
+    let mut total_value_zat = 0_u64;
+    let mut sst_evidence = WalletProjectionSstEvidence::default();
+    for output in outputs {
+        unspent_sets.push(output.unspent_files);
+        spent_sets.push(output.spent_files);
+        if output.unspent_write.saturating_add(output.spent_write)
+            > unspent_write.saturating_add(spent_write)
+        {
+            unspent_write = output.unspent_write;
+            spent_write = output.spent_write;
+        }
+        utxo_count = add_counter(utxo_count, output.utxo_count)?;
+        total_value_zat = total_value_zat
+            .checked_add(output.total_value_zat)
+            .ok_or(WalletProjectionContractError::UtxoValueOverflow)?;
+        accumulators.combine_branch(&output.accumulators)?;
+        sst_evidence.merge(&output.evidence)?;
+    }
+    accumulators.settle()?;
+    Ok(OutpointDrainSummary {
+        unspent_files: combine_sst_file_sets(unspent_sets)?,
+        spent_files: combine_sst_file_sets(spent_sets)?,
+        unspent_write,
+        spent_write,
+        utxo_count,
+        total_value_zat,
+        sst_evidence,
+    })
+}
+
 struct SecondaryDerivationSorters {
-    address_index: VariableValueSorter<ADDRESS_UNSPENT_KEY_BYTES>,
-    address_transaction: VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
+    shard_plan: BuildShardPlan,
+    address_index: ShardedKeyPrefixSorter<ADDRESS_UNSPENT_KEY_BYTES>,
+    address_transaction: ShardedKeyPrefixSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
 }
 
 struct AddressIndexBranchOutput {
@@ -1445,6 +2225,13 @@ struct AddressTransactionBranchOutput {
     sort_durations: VariableValueSortDurations,
     sort_duration: Duration,
     drain_duration: Duration,
+    transaction_files: PreparedFamilyFiles,
+    transaction_write: Duration,
+    accumulators: crate::accumulator_hashing::FinishedBranchAccumulators,
+    evidence: WalletProjectionSstEvidence,
+}
+
+struct AddressTransactionShardOutput {
     transaction_files: SstFileSet,
     transaction_write: Duration,
     accumulators: crate::accumulator_hashing::FinishedBranchAccumulators,
@@ -1465,7 +2252,7 @@ struct SecondaryAddressDerivationArtifacts {
     address_transaction_drain: Duration,
     address_transaction_sort_evidence: VariableValueSortEvidence,
     address_transaction_sort_durations: VariableValueSortDurations,
-    address_transaction_files: SstFileSet,
+    address_transaction_files: PreparedFamilyFiles,
     address_transaction_write: Duration,
 }
 
@@ -1485,45 +2272,146 @@ impl Drop for SetAbortOnUnwind<'_> {
     }
 }
 
+struct SecondaryAccumulators<'a> {
+    branch_pool: Option<&'a crate::accumulator_hashing::BranchHashingPool>,
+    accumulators: &'a mut ConstructionAccumulators,
+    sst_evidence: &'a mut WalletProjectionSstEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecondaryPhaseFanIn {
+    overlap_secondary: bool,
+    address_index_per_shard_fan_in: usize,
+    address_transaction_per_shard_fan_in: usize,
+}
+
+fn invalid_secondary_fan_in(reason: &str) -> RocksDbWalletError {
+    BulkLoadError::InvalidInput {
+        reason: reason.to_owned(),
+    }
+    .into()
+}
+
+fn resolve_secondary_phase_fan_in(
+    address_index_push_shards: NonZeroU32,
+    address_transaction_shards: NonZeroU32,
+    overlap_requested: bool,
+    active_fan_in: usize,
+) -> Result<SecondaryPhaseFanIn, RocksDbWalletError> {
+    const MIN_FAN_IN: usize = 2;
+    let idx_shards = usize::try_from(address_index_push_shards.get())
+        .map_err(|_| invalid_secondary_fan_in("address index shard count exceeds usize::MAX"))?;
+    let tx_shards = usize::try_from(address_transaction_shards.get()).map_err(|_| {
+        invalid_secondary_fan_in("address transaction shard count exceeds usize::MAX")
+    })?;
+    let min_idx_total = idx_shards
+        .checked_mul(MIN_FAN_IN)
+        .ok_or_else(|| invalid_secondary_fan_in("address index fan-in overflows usize"))?;
+    let min_tx_total = tx_shards
+        .checked_mul(MIN_FAN_IN)
+        .ok_or_else(|| invalid_secondary_fan_in("address transaction fan-in overflows usize"))?;
+    if overlap_requested && min_idx_total.saturating_add(min_tx_total) <= active_fan_in {
+        let idx_budget = (active_fan_in / 4)
+            .max(min_idx_total)
+            .min(active_fan_in.saturating_sub(min_tx_total));
+        let tx_budget = active_fan_in.saturating_sub(idx_budget);
+        return Ok(SecondaryPhaseFanIn {
+            overlap_secondary: true,
+            address_index_per_shard_fan_in: (idx_budget / idx_shards).max(MIN_FAN_IN),
+            address_transaction_per_shard_fan_in: (tx_budget / tx_shards).max(MIN_FAN_IN),
+        });
+    }
+    let idx_per_shard = active_fan_in / idx_shards.max(1);
+    let tx_per_shard = active_fan_in / tx_shards.max(1);
+    if idx_per_shard < MIN_FAN_IN || tx_per_shard < MIN_FAN_IN {
+        return Err(invalid_secondary_fan_in(
+            "secondary sharded sort exceeds active merge file-descriptor fan-in",
+        ));
+    }
+    Ok(SecondaryPhaseFanIn {
+        overlap_secondary: false,
+        address_index_per_shard_fan_in: idx_per_shard,
+        address_transaction_per_shard_fan_in: tx_per_shard,
+    })
+}
+
+struct ConcurrentSecondaryHashing {
+    index: Option<crate::accumulator_hashing::BranchHashingConfig>,
+    tx: Vec<Option<crate::accumulator_hashing::BranchHashingConfig>>,
+    active_writers: usize,
+    fan_in: SecondaryPhaseFanIn,
+}
+
+struct AddressIndexBranchBudget {
+    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
+    active_writers: usize,
+    merge_fan_in: usize,
+}
+
+struct AddressTxHashingBudget {
+    configs: Vec<Option<crate::accumulator_hashing::BranchHashingConfig>>,
+    active_writers: usize,
+    merge_fan_in: usize,
+}
+
+struct AddressTxShardSpec {
+    shard_index: usize,
+    shard_count: usize,
+    active_writers: usize,
+    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
+}
+
 fn derive_secondary_address_artifacts(
     config: WalletProjectionLoadConfig<'_>,
     sorters: SecondaryDerivationSorters,
     retained_undo: &mut RetainedUndo,
-    accumulators: &mut ConstructionAccumulators,
-    sst_evidence: &mut WalletProjectionSstEvidence,
+    shared: SecondaryAccumulators<'_>,
 ) -> Result<SecondaryAddressDerivationArtifacts, RocksDbWalletError> {
+    let SecondaryAccumulators {
+        branch_pool,
+        accumulators,
+        sst_evidence,
+    } = shared;
     let step_started = Instant::now();
     let aborted = AtomicBool::new(false);
-    let branch_pool = accumulators.take_branch_hashing_pool()?;
-    let (index_branch, tx_branch) = if let Some(pool) = branch_pool.as_ref() {
-        run_concurrent_secondary_branches(config, sorters, retained_undo, pool, &aborted)?
-    } else {
-        let index_branch =
-            match run_address_index_branch(config, sorters.address_index, None, &aborted) {
-                SecondaryBranchOutcome::Completed(completed) => completed,
-                SecondaryBranchOutcome::Failed(error) => return Err(error),
-                SecondaryBranchOutcome::SiblingAborted => {
-                    return Err(RocksDbWalletError::SecondaryDerivationWorkerStopped);
-                }
-            };
-        let tx_branch = match run_address_transaction_branch(
+    let undo_collector = RetainedUndoCollector::from_retained_undo(retained_undo);
+    let tx_shards_usize = usize::try_from(sorters.shard_plan.address_transaction_shards.get())
+        .unwrap_or(1)
+        .max(1);
+    let secondary_fan_in = resolve_secondary_phase_fan_in(
+        sorters.shard_plan.address_index_push_shards,
+        sorters.shard_plan.address_transaction_shards,
+        sorters.shard_plan.overlap_secondary,
+        active_merge_fan_in(),
+    )?;
+    let (index_branch, tx_branch) = if secondary_fan_in.overlap_secondary {
+        let active_writers = 2_usize.saturating_add(tx_shards_usize);
+        let (index_hashing, tx_hashing) = branch_pool.map_or_else(
+            || (None, (0..tx_shards_usize).map(|_| None).collect()),
+            |pool| pool.split_secondary(tx_shards_usize),
+        );
+        run_concurrent_secondary_branches(
             config,
-            sorters.address_transaction,
-            retained_undo,
-            None,
+            sorters,
+            &undo_collector,
+            ConcurrentSecondaryHashing {
+                index: index_hashing,
+                tx: tx_hashing,
+                active_writers,
+                fan_in: secondary_fan_in,
+            },
             &aborted,
-        ) {
-            SecondaryBranchOutcome::Completed(completed) => completed,
-            SecondaryBranchOutcome::Failed(error) => return Err(error),
-            SecondaryBranchOutcome::SiblingAborted => {
-                return Err(RocksDbWalletError::SecondaryDerivationWorkerStopped);
-            }
-        };
-        (index_branch, tx_branch)
+        )?
+    } else {
+        run_sequential_secondary_branches(
+            config,
+            sorters,
+            &undo_collector,
+            (tx_shards_usize, secondary_fan_in),
+            &aborted,
+        )?
     };
-    if let Some(pool) = branch_pool {
-        accumulators.restore_branch_hashing_pool(pool);
-    }
+    undo_collector.apply_collected(retained_undo)?;
     accumulators.combine_branch(&index_branch.accumulators)?;
     accumulators.combine_branch(&tx_branch.accumulators)?;
     sst_evidence.merge(&index_branch.evidence)?;
@@ -1548,11 +2436,11 @@ fn derive_secondary_address_artifacts(
     })
 }
 
-fn run_concurrent_secondary_branches(
+fn run_sequential_secondary_branches(
     config: WalletProjectionLoadConfig<'_>,
     sorters: SecondaryDerivationSorters,
-    retained_undo: &mut RetainedUndo,
-    branch_pool: &crate::accumulator_hashing::BranchHashingPool,
+    undo_collector: &RetainedUndoCollector,
+    tx_budget: (usize, SecondaryPhaseFanIn),
     aborted: &AtomicBool,
 ) -> Result<
     (
@@ -1561,7 +2449,62 @@ fn run_concurrent_secondary_branches(
     ),
     RocksDbWalletError,
 > {
-    let (index_hashing, tx_hashing) = branch_pool.split_two();
+    let (tx_shards_usize, secondary_fan_in) = tx_budget;
+    let index_branch = match run_address_index_branch(
+        config,
+        sorters.address_index,
+        AddressIndexBranchBudget {
+            branch_hashing: None,
+            active_writers: 2,
+            merge_fan_in: secondary_fan_in.address_index_per_shard_fan_in,
+        },
+        aborted,
+    ) {
+        SecondaryBranchOutcome::Completed(completed) => completed,
+        SecondaryBranchOutcome::Failed(error) => return Err(error),
+        SecondaryBranchOutcome::SiblingAborted => {
+            return Err(RocksDbWalletError::SecondaryDerivationWorkerStopped);
+        }
+    };
+    let tx_branch = match run_address_transaction_branch(
+        config,
+        sorters.address_transaction,
+        undo_collector,
+        AddressTxHashingBudget {
+            configs: (0..tx_shards_usize).map(|_| None).collect(),
+            active_writers: tx_shards_usize,
+            merge_fan_in: secondary_fan_in.address_transaction_per_shard_fan_in,
+        },
+        aborted,
+    ) {
+        SecondaryBranchOutcome::Completed(completed) => completed,
+        SecondaryBranchOutcome::Failed(error) => return Err(error),
+        SecondaryBranchOutcome::SiblingAborted => {
+            return Err(RocksDbWalletError::SecondaryDerivationWorkerStopped);
+        }
+    };
+    Ok((index_branch, tx_branch))
+}
+
+fn run_concurrent_secondary_branches(
+    config: WalletProjectionLoadConfig<'_>,
+    sorters: SecondaryDerivationSorters,
+    undo_collector: &RetainedUndoCollector,
+    hashing: ConcurrentSecondaryHashing,
+    aborted: &AtomicBool,
+) -> Result<
+    (
+        Box<AddressIndexBranchOutput>,
+        Box<AddressTransactionBranchOutput>,
+    ),
+    RocksDbWalletError,
+> {
+    let ConcurrentSecondaryHashing {
+        index: index_hashing,
+        tx: tx_hashing,
+        active_writers,
+        fan_in,
+    } = hashing;
     std::thread::scope(|scope| {
         let tx_handle = std::thread::Builder::new()
             .name("zinder-addr-tx".to_owned())
@@ -1569,8 +2512,12 @@ fn run_concurrent_secondary_branches(
                 run_address_transaction_branch(
                     config,
                     sorters.address_transaction,
-                    retained_undo,
-                    Some(tx_hashing),
+                    undo_collector,
+                    AddressTxHashingBudget {
+                        configs: tx_hashing,
+                        active_writers,
+                        merge_fan_in: fan_in.address_transaction_per_shard_fan_in,
+                    },
                     aborted,
                 )
             })
@@ -1579,8 +2526,16 @@ fn run_concurrent_secondary_branches(
                     reason: source.to_string(),
                 },
             )?;
-        let index_outcome =
-            run_address_index_branch(config, sorters.address_index, Some(index_hashing), aborted);
+        let index_outcome = run_address_index_branch(
+            config,
+            sorters.address_index,
+            AddressIndexBranchBudget {
+                branch_hashing: index_hashing,
+                active_writers,
+                merge_fan_in: fan_in.address_index_per_shard_fan_in,
+            },
+            aborted,
+        );
         let tx_join = tx_handle.join();
         resolve_secondary_branch_outcomes(index_outcome, tx_join)
     })
@@ -1613,71 +2568,15 @@ fn resolve_secondary_branch_outcomes(
 
 fn run_address_index_branch(
     config: WalletProjectionLoadConfig<'_>,
-    sorter: VariableValueSorter<ADDRESS_UNSPENT_KEY_BYTES>,
-    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
+    sorter: ShardedKeyPrefixSorter<ADDRESS_UNSPENT_KEY_BYTES>,
+    budget: AddressIndexBranchBudget,
     aborted: &AtomicBool,
 ) -> SecondaryBranchOutcome<AddressIndexBranchOutput> {
     let _abort_on_unwind = SetAbortOnUnwind(aborted);
     if aborted.load(Ordering::Acquire) {
         return SecondaryBranchOutcome::SiblingAborted;
     }
-    let sort_started = Instant::now();
-    let mut sorted_rows = match sorter.finish() {
-        Ok(finished_rows) => finished_rows,
-        Err(error) => {
-            aborted.store(true, Ordering::Release);
-            return SecondaryBranchOutcome::Failed(error.into());
-        }
-    };
-    let sort_evidence = sorted_rows.evidence();
-    let sort_durations = sorted_rows.durations();
-    let sort_duration = sort_started.elapsed();
-    if aborted.load(Ordering::Acquire) {
-        return SecondaryBranchOutcome::SiblingAborted;
-    }
-    let drain_started = Instant::now();
-    let outcome = (|| -> Result<Option<AddressIndexBranchOutput>, RocksDbWalletError> {
-        let mut index_writer = projection_writer(
-            config,
-            WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
-            "wallet-address-unspent-index",
-        )?;
-        let mut balance_writer = projection_writer(
-            config,
-            WalletProjectionRowFamily::TransparentAddressBalance,
-            "wallet-address-balance",
-        )?;
-        let mut branch_accumulators =
-            ConstructionAccumulators::start_optional_branch(config.network, branch_hashing);
-        let mut branch_evidence = WalletProjectionSstEvidence::default();
-        let mut targets = AddressIndexTargets {
-            index_writer: &mut index_writer,
-            balance_writer: &mut balance_writer,
-            accumulators: &mut branch_accumulators,
-            evidence: &mut branch_evidence,
-            aborted,
-        };
-        if !drain_address_index(&mut sorted_rows, &mut targets)? {
-            return Ok(None);
-        }
-        let finished_accumulators = branch_accumulators.finish_branch()?;
-        let (index_files, index_write) = index_writer.finish()?;
-        let (balance_files, balance_write) = balance_writer.finish()?;
-        let drain_duration = drain_started.elapsed();
-        Ok(Some(AddressIndexBranchOutput {
-            sort_evidence,
-            sort_durations,
-            sort_duration,
-            drain_duration,
-            index_files,
-            index_write,
-            balance_files,
-            balance_write,
-            accumulators: finished_accumulators,
-            evidence: branch_evidence,
-        }))
-    })();
-    match outcome {
+    match run_address_index_branch_inner(config, sorter, budget, aborted) {
         Ok(Some(completed)) => SecondaryBranchOutcome::Completed(Box::new(completed)),
         Ok(None) => SecondaryBranchOutcome::SiblingAborted,
         Err(error) => {
@@ -1687,19 +2586,100 @@ fn run_address_index_branch(
     }
 }
 
+fn run_address_index_branch_inner(
+    config: WalletProjectionLoadConfig<'_>,
+    sorter: ShardedKeyPrefixSorter<ADDRESS_UNSPENT_KEY_BYTES>,
+    budget: AddressIndexBranchBudget,
+    aborted: &AtomicBool,
+) -> Result<Option<AddressIndexBranchOutput>, RocksDbWalletError> {
+    let AddressIndexBranchBudget {
+        branch_hashing,
+        active_writers,
+        merge_fan_in,
+    } = budget;
+    let sort_started = Instant::now();
+    let sorted_rows = sorter.finish_with_per_shard_merge_fan_in(merge_fan_in)?;
+    let sort_evidence = sorted_rows.evidence();
+    let sort_durations = sorted_rows.durations();
+    let sort_duration = sort_started.elapsed();
+    if aborted.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let drain_started = Instant::now();
+    let mut index_writer = shard_projection_writer(
+        config,
+        config.staging_path,
+        WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+        "wallet-address-unspent-index",
+        active_writers,
+    )?;
+    let mut balance_writer = shard_projection_writer(
+        config,
+        config.staging_path,
+        WalletProjectionRowFamily::TransparentAddressBalance,
+        "wallet-address-balance",
+        active_writers,
+    )?;
+    let mut branch_accumulators =
+        ConstructionAccumulators::start_optional_branch(config.network, branch_hashing);
+    let mut branch_evidence = WalletProjectionSstEvidence::default();
+    let mut targets = AddressIndexTargets {
+        index_writer: &mut index_writer,
+        balance_writer: &mut balance_writer,
+        accumulators: &mut branch_accumulators,
+        evidence: &mut branch_evidence,
+        aborted,
+    };
+    for mut shard_stream in sorted_rows.into_shards() {
+        if !drain_address_index(&mut shard_stream, &mut targets)? {
+            return Ok(None);
+        }
+    }
+    let finished_accumulators = branch_accumulators.finish_branch()?;
+    let (index_files, index_write) = index_writer.finish()?;
+    let (balance_files, balance_write) = balance_writer.finish()?;
+    let drain_duration = drain_started.elapsed();
+    Ok(Some(AddressIndexBranchOutput {
+        sort_evidence,
+        sort_durations,
+        sort_duration,
+        drain_duration,
+        index_files,
+        index_write,
+        balance_files,
+        balance_write,
+        accumulators: finished_accumulators,
+        evidence: branch_evidence,
+    }))
+}
+
+struct AddressTxShardRunMeta {
+    hashing_configs: Vec<Option<crate::accumulator_hashing::BranchHashingConfig>>,
+    active_writers: usize,
+    sort_evidence: VariableValueSortEvidence,
+    sort_durations: VariableValueSortDurations,
+    sort_duration: Duration,
+    drain_started: Instant,
+}
+
 fn run_address_transaction_branch(
     config: WalletProjectionLoadConfig<'_>,
-    sorter: VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
-    retained_undo: &mut RetainedUndo,
-    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
+    sorter: ShardedKeyPrefixSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
+    undo_collector: &RetainedUndoCollector,
+    hashing_budget: AddressTxHashingBudget,
     aborted: &AtomicBool,
 ) -> SecondaryBranchOutcome<AddressTransactionBranchOutput> {
     let _abort_on_unwind = SetAbortOnUnwind(aborted);
     if aborted.load(Ordering::Acquire) {
         return SecondaryBranchOutcome::SiblingAborted;
     }
+    let AddressTxHashingBudget {
+        configs: hashing_configs,
+        active_writers,
+        merge_fan_in,
+    } = hashing_budget;
     let sort_started = Instant::now();
-    let mut sorted_rows = match sorter.finish() {
+    let sorted_rows = match sorter.finish_with_per_shard_merge_fan_in(merge_fan_in) {
         Ok(finished_rows) => finished_rows,
         Err(error) => {
             aborted.store(true, Ordering::Release);
@@ -1713,33 +2693,195 @@ fn run_address_transaction_branch(
         return SecondaryBranchOutcome::SiblingAborted;
     }
     let drain_started = Instant::now();
-    let outcome = (|| -> Result<Option<AddressTransactionBranchOutput>, RocksDbWalletError> {
-        let mut writer = projection_writer(
+    let shards = sorted_rows.into_shards();
+    let shard_count = shards.len();
+    if shard_count <= 1 {
+        let Some(stream) = shards.into_iter().next() else {
+            return SecondaryBranchOutcome::Failed(
+                RocksDbWalletError::SecondaryDerivationWorkerStopped,
+            );
+        };
+        let branch_hashing = hashing_configs.into_iter().next().flatten();
+        return match drain_single_address_tx_shard(
             config,
+            stream,
+            undo_collector,
+            AddressTxShardSpec {
+                shard_index: 0,
+                shard_count: 1,
+                active_writers,
+                branch_hashing,
+            },
+            aborted,
+        ) {
+            SecondaryBranchOutcome::Completed(shard_out) => {
+                let drain_duration = drain_started.elapsed();
+                SecondaryBranchOutcome::Completed(Box::new(AddressTransactionBranchOutput {
+                    sort_evidence,
+                    sort_durations,
+                    sort_duration,
+                    drain_duration,
+                    transaction_files: PreparedFamilyFiles::from(shard_out.transaction_files),
+                    transaction_write: shard_out.transaction_write,
+                    accumulators: shard_out.accumulators,
+                    evidence: shard_out.evidence,
+                }))
+            }
+            SecondaryBranchOutcome::SiblingAborted => SecondaryBranchOutcome::SiblingAborted,
+            SecondaryBranchOutcome::Failed(error) => {
+                aborted.store(true, Ordering::Release);
+                SecondaryBranchOutcome::Failed(error)
+            }
+        };
+    }
+
+    run_parallel_address_tx_shards(
+        config,
+        shards,
+        undo_collector,
+        AddressTxShardRunMeta {
+            hashing_configs,
+            active_writers,
+            sort_evidence,
+            sort_durations,
+            sort_duration,
+            drain_started,
+        },
+        aborted,
+    )
+}
+
+fn run_parallel_address_tx_shards(
+    config: WalletProjectionLoadConfig<'_>,
+    shards: Vec<SortedVariableValues<ADDRESS_TRANSACTION_KEY_BYTES>>,
+    undo_collector: &RetainedUndoCollector,
+    meta: AddressTxShardRunMeta,
+    aborted: &AtomicBool,
+) -> SecondaryBranchOutcome<AddressTransactionBranchOutput> {
+    let shard_count = shards.len();
+    let active_writers = meta.active_writers;
+    let shard_configs = meta
+        .hashing_configs
+        .into_iter()
+        .chain(std::iter::repeat_with(|| None));
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(shard_count);
+        let mut start_error = None;
+        for (shard_index, (stream, branch_hashing)) in
+            shards.into_iter().zip(shard_configs).enumerate()
+        {
+            match std::thread::Builder::new()
+                .name(format!("zinder-addr-tx-{shard_index}"))
+                .spawn_scoped(scope, move || {
+                    drain_single_address_tx_shard(
+                        config,
+                        stream,
+                        undo_collector,
+                        AddressTxShardSpec {
+                            shard_index,
+                            shard_count,
+                            active_writers,
+                            branch_hashing,
+                        },
+                        aborted,
+                    )
+                }) {
+                Ok(handle) => handles.push(handle),
+                Err(source) => {
+                    aborted.store(true, Ordering::Release);
+                    start_error = Some(RocksDbWalletError::SecondaryDerivationThreadUnavailable {
+                        reason: source.to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+        let mut completed = Vec::with_capacity(shard_count);
+        let mut first_error = start_error;
+        let mut sibling_aborted = false;
+        for handle in handles {
+            match handle.join() {
+                Ok(SecondaryBranchOutcome::Completed(output)) => completed.push(*output),
+                Ok(SecondaryBranchOutcome::Failed(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Ok(SecondaryBranchOutcome::SiblingAborted) => sibling_aborted = true,
+                Err(_) => {
+                    aborted.store(true, Ordering::Release);
+                    if first_error.is_none() {
+                        first_error = Some(RocksDbWalletError::SecondaryDerivationWorkerStopped);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return SecondaryBranchOutcome::Failed(error);
+        }
+        if sibling_aborted {
+            return SecondaryBranchOutcome::SiblingAborted;
+        }
+        let drain_duration = meta.drain_started.elapsed();
+        match merge_address_tx_shard_outputs(
+            config,
+            completed,
+            meta.sort_evidence,
+            meta.sort_durations,
+            (meta.sort_duration, drain_duration),
+        ) {
+            Ok(merged) => SecondaryBranchOutcome::Completed(Box::new(merged)),
+            Err(error) => {
+                aborted.store(true, Ordering::Release);
+                SecondaryBranchOutcome::Failed(error)
+            }
+        }
+    })
+}
+
+fn drain_single_address_tx_shard(
+    config: WalletProjectionLoadConfig<'_>,
+    mut stream: SortedVariableValues<ADDRESS_TRANSACTION_KEY_BYTES>,
+    undo_collector: &RetainedUndoCollector,
+    shard_spec: AddressTxShardSpec,
+    aborted: &AtomicBool,
+) -> SecondaryBranchOutcome<AddressTransactionShardOutput> {
+    let _abort_on_unwind = SetAbortOnUnwind(aborted);
+    if aborted.load(Ordering::Acquire) {
+        return SecondaryBranchOutcome::SiblingAborted;
+    }
+    let AddressTxShardSpec {
+        shard_index,
+        shard_count,
+        active_writers,
+        branch_hashing,
+    } = shard_spec;
+    let outcome = (|| -> Result<Option<AddressTransactionShardOutput>, RocksDbWalletError> {
+        let shard_staging =
+            shard_staging_path(config.staging_path, "address-tx", shard_index, shard_count)?;
+        let mut writer = shard_projection_writer(
+            config,
+            &shard_staging,
             WalletProjectionRowFamily::TransparentAddressTransaction,
             "wallet-address-transaction",
+            active_writers,
         )?;
         let mut branch_accumulators =
             ConstructionAccumulators::start_optional_branch(config.network, branch_hashing);
         let mut branch_evidence = WalletProjectionSstEvidence::default();
         let mut targets = AddressTransactionTargets {
             writer: &mut writer,
-            retained_undo,
+            undo_collector,
             accumulators: &mut branch_accumulators,
             evidence: &mut branch_evidence,
             aborted,
         };
-        if !drain_address_transactions(&mut sorted_rows, &mut targets)? {
+        if !drain_address_transactions(&mut stream, &mut targets)? {
             return Ok(None);
         }
         let finished_accumulators = branch_accumulators.finish_branch()?;
         let (transaction_files, transaction_write) = writer.finish()?;
-        let drain_duration = drain_started.elapsed();
-        Ok(Some(AddressTransactionBranchOutput {
-            sort_evidence,
-            sort_durations,
-            sort_duration,
-            drain_duration,
+        Ok(Some(AddressTransactionShardOutput {
             transaction_files,
             transaction_write,
             accumulators: finished_accumulators,
@@ -1756,6 +2898,36 @@ fn run_address_transaction_branch(
     }
 }
 
+fn merge_address_tx_shard_outputs(
+    config: WalletProjectionLoadConfig<'_>,
+    outputs: Vec<AddressTransactionShardOutput>,
+    sort_evidence: VariableValueSortEvidence,
+    sort_durations: VariableValueSortDurations,
+    phase_durations: (Duration, Duration),
+) -> Result<AddressTransactionBranchOutput, RocksDbWalletError> {
+    let mut tx_sets = Vec::with_capacity(outputs.len());
+    let mut transaction_write = Duration::ZERO;
+    let mut accumulators = ConstructionAccumulators::start_optional_branch(config.network, None);
+    let mut evidence = WalletProjectionSstEvidence::default();
+    for output in outputs {
+        tx_sets.push(output.transaction_files);
+        transaction_write = transaction_write.max(output.transaction_write);
+        accumulators.combine_branch(&output.accumulators)?;
+        evidence.merge(&output.evidence)?;
+    }
+    let finished_accumulators = accumulators.finish_branch()?;
+    Ok(AddressTransactionBranchOutput {
+        sort_evidence,
+        sort_durations,
+        sort_duration: phase_durations.0,
+        drain_duration: phase_durations.1,
+        transaction_files: combine_sst_file_sets(tx_sets)?,
+        transaction_write,
+        accumulators: finished_accumulators,
+        evidence,
+    })
+}
+
 const fn address_transaction_sort_memory_bytes(
     max_outpoint_sort_memory_bytes: u64,
     max_secondary_sort_memory_bytes_per_sorter: u64,
@@ -1768,23 +2940,28 @@ const fn address_transaction_sort_memory_bytes(
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the streaming drain owns three output sinks and exact evidence accumulators"
-)]
+struct OutpointDrainTargets<'a, 'options, 'sorter> {
+    unspent_writer: &'a mut TimedSstWriter<'options>,
+    spent_writer: &'a mut TimedSstWriter<'options>,
+    address_index_writer: &'a mut ShardedKeyPrefixWriter<'sorter, ADDRESS_UNSPENT_KEY_BYTES>,
+    address_transaction_writer:
+        &'a mut ShardedKeyPrefixWriter<'sorter, ADDRESS_TRANSACTION_KEY_BYTES>,
+    accumulators: &'a mut ConstructionAccumulators,
+    sst_evidence: &'a mut WalletProjectionSstEvidence,
+    utxo_count: &'a mut u64,
+    total_value_zat: &'a mut u64,
+    aborted: &'a AtomicBool,
+}
+
 fn drain_outpoint_events(
     sorted: &mut SortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
-    unspent_writer: &mut TimedSstWriter<'_>,
-    spent_writer: &mut TimedSstWriter<'_>,
-    address_index_sorter: &mut VariableValueSorter<ADDRESS_UNSPENT_KEY_BYTES>,
-    address_transaction_sorter: &mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
-    accumulators: &mut ConstructionAccumulators,
-    sst_evidence: &mut WalletProjectionSstEvidence,
-    utxo_count: &mut u64,
-    total_value_zat: &mut u64,
-) -> Result<(), RocksDbWalletError> {
+    targets: &mut OutpointDrainTargets<'_, '_, '_>,
+) -> Result<bool, RocksDbWalletError> {
     let mut pending = sorted.next_record()?;
     while let Some(first) = pending.take() {
+        if targets.aborted.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         let outpoint_key = WalletOutpointKey::decode(&first.key[..36])?;
         let mut output = None;
         let mut spend = None;
@@ -1807,7 +2984,11 @@ fn drain_outpoint_events(
             )?;
         }
         let output = output.ok_or(WalletProjectionContractError::MissingTransparentPredecessor)?;
-        stage_address_transaction(&output, output.created_at, address_transaction_sorter)?;
+        stage_address_transaction(
+            &output,
+            output.created_at,
+            targets.address_transaction_writer,
+        )?;
         if let Some(spend) = spend {
             if !precedes(output.created_at, spend.spent_at) {
                 return Err(WalletProjectionContractError::MissingTransparentPredecessor.into());
@@ -1816,37 +2997,40 @@ fn drain_outpoint_events(
             stage_address_transaction(
                 &spent_output.output,
                 spent_output.spent_at,
-                address_transaction_sorter,
+                targets.address_transaction_writer,
             )?;
             let encoded_value = spent_output.encode_value()?;
             append_row(
-                spent_writer,
-                accumulators,
-                sst_evidence,
+                targets.spent_writer,
+                targets.accumulators,
+                targets.sst_evidence,
                 WalletProjectionRowFamily::TransparentSpentOutput,
                 outpoint_key.as_bytes(),
                 &encoded_value,
             )?;
         } else {
             let address_key = WalletAddressUnspentOutputKey::new(&output);
-            address_index_sorter.push(*address_key.as_bytes(), &output.value_zat.to_be_bytes())?;
-            *utxo_count = increment(*utxo_count)?;
-            *total_value_zat = total_value_zat
+            targets
+                .address_index_writer
+                .push(*address_key.as_bytes(), &output.value_zat.to_be_bytes())?;
+            *targets.utxo_count = increment(*targets.utxo_count)?;
+            *targets.total_value_zat = targets
+                .total_value_zat
                 .checked_add(output.value_zat)
                 .ok_or(WalletProjectionContractError::UtxoValueOverflow)?;
-            accumulators.insert_unspent_output(&output)?;
+            targets.accumulators.insert_unspent_output(&output)?;
             let encoded_value = output.encode_value()?;
             append_row(
-                unspent_writer,
-                accumulators,
-                sst_evidence,
+                targets.unspent_writer,
+                targets.accumulators,
+                targets.sst_evidence,
                 WalletProjectionRowFamily::TransparentUnspentOutput,
                 outpoint_key.as_bytes(),
                 &encoded_value,
             )?;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn accept_outpoint_event(
@@ -1891,7 +3075,7 @@ struct AddressIndexTargets<'a, 'options> {
 
 struct AddressTransactionTargets<'a, 'options> {
     writer: &'a mut TimedSstWriter<'options>,
-    retained_undo: &'a mut RetainedUndo,
+    undo_collector: &'a RetainedUndoCollector,
     accumulators: &'a mut ConstructionAccumulators,
     evidence: &'a mut WalletProjectionSstEvidence,
     aborted: &'a AtomicBool,
@@ -2010,7 +3194,7 @@ fn drain_address_transactions(
         }
         let key = WalletAddressTransactionKey::decode(&first.key)?;
         WalletAddressTransaction::decode_value(key, &canonical_value)?;
-        targets.retained_undo.add_address_transaction(key)?;
+        targets.undo_collector.try_collect(key)?;
         append_row(
             targets.writer,
             targets.accumulators,
@@ -2026,7 +3210,7 @@ fn drain_address_transactions(
 fn stage_address_transaction(
     output: &WalletUnspentOutput,
     position: WalletTransactionPosition,
-    sorter: &mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
+    tx_writer: &mut ShardedKeyPrefixWriter<'_, ADDRESS_TRANSACTION_KEY_BYTES>,
 ) -> Result<(), RocksDbWalletError> {
     let key = WalletAddressTransactionKey::new(
         output.address_script_hash,
@@ -2035,7 +3219,7 @@ fn stage_address_transaction(
     );
     let transaction =
         WalletAddressTransaction::new(key, position.transaction_id, position.block.hash);
-    sorter.push(*key.as_bytes(), &transaction.encode_value())?;
+    tx_writer.push(*key.as_bytes(), &transaction.encode_value())?;
     Ok(())
 }
 
@@ -2056,22 +3240,28 @@ fn append_row(
     evidence.add_row(key, encoded_value)
 }
 
-fn projection_writer<'options>(
+fn shard_projection_writer<'options>(
     config: WalletProjectionLoadConfig<'options>,
+    staging_path: &'options Path,
     family: WalletProjectionRowFamily,
     artifact_label: &'static str,
+    active_concurrent_writers: usize,
 ) -> Result<TimedSstWriter<'options>, RocksDbWalletError> {
-    let writer = if config.accumulator_hashing_workers.get() > 1 {
+    let writer = if config.accumulator_hashing_workers.get() > 1
+        && let Some(queue_budget) = scaled_pipelined_sst_queue_budget_bytes(
+            config.sst_target_logical_bytes,
+            active_concurrent_writers,
+        ) {
         OrderedSstWriter::new_pipelined(
-            config.staging_path,
+            staging_path,
             artifact_label,
             config.options.for_family(family),
             config.sst_target_logical_bytes,
-            pipelined_sst_queue_budget_bytes(config.sst_target_logical_bytes),
+            queue_budget,
         )?
     } else {
         OrderedSstWriter::new(
-            config.staging_path,
+            staging_path,
             artifact_label,
             config.options.for_family(family),
             config.sst_target_logical_bytes,
@@ -2124,7 +3314,7 @@ impl TimedSstWriter<'_> {
 }
 
 fn prepare_families(
-    artifacts: [(&'static str, SstFileSet); 6],
+    artifacts: [(&'static str, PreparedFamilyFiles); 6],
 ) -> Result<(Vec<PreparedWalletColumnFamily>, u64, u64), RocksDbWalletError> {
     let mut families = Vec::with_capacity(artifacts.len());
     let mut sst_file_bytes = 0_u64;
@@ -3643,5 +4833,538 @@ mod tests {
             tx_stopped,
             Err(RocksDbWalletError::SecondaryDerivationWorkerStopped)
         ));
+    }
+
+    fn sharded_parity_test_blocks() -> Vec<CanonicalBlockFacts> {
+        let addr_low = TransparentAddressScriptHash::from_bytes([0x05; 32]);
+        let addr_mid = TransparentAddressScriptHash::from_bytes([0x80; 32]);
+        let addr_high = TransparentAddressScriptHash::from_bytes([0xf8; 32]);
+        let tx_low = TransactionId::from_bytes([0x01; 32]);
+        let tx_mid = TransactionId::from_bytes([0x82; 32]);
+        let tx_high = TransactionId::from_bytes([0xfe; 32]);
+        let tx_unsettled = TransactionId::from_bytes([0x40; 32]);
+        let tx_spend_unsettled = TransactionId::from_bytes([0xc0; 32]);
+        vec![
+            block_facts(
+                1,
+                [0; 32],
+                [0xc1; 32],
+                vec![
+                    transaction_facts(
+                        tx_low,
+                        Vec::new(),
+                        vec![
+                            TransparentOutputFact::new(0, 100, [0x51], addr_low),
+                            TransparentOutputFact::new(1, 200, [0x52], addr_high),
+                        ],
+                    ),
+                    transaction_facts(
+                        tx_high,
+                        Vec::new(),
+                        vec![TransparentOutputFact::new(0, 300, [0x53], addr_mid)],
+                    ),
+                ],
+            ),
+            block_facts(
+                2,
+                [0xc1; 32],
+                [0xc2; 32],
+                vec![transaction_facts(
+                    tx_mid,
+                    vec![TransparentInputFact::new(
+                        0,
+                        TransparentOutPoint::new(tx_low, 0),
+                    )],
+                    vec![TransparentOutputFact::new(0, 90, [0x54], addr_mid)],
+                )],
+            ),
+            block_facts(
+                3,
+                [0xc2; 32],
+                [0xc3; 32],
+                vec![transaction_facts(
+                    tx_unsettled,
+                    Vec::new(),
+                    vec![TransparentOutputFact::new(0, 50, [0x55], addr_high)],
+                )],
+            ),
+            block_facts(
+                4,
+                [0xc3; 32],
+                [0xc4; 32],
+                vec![transaction_facts(
+                    tx_spend_unsettled,
+                    vec![TransparentInputFact::new(
+                        0,
+                        TransparentOutPoint::new(tx_high, 0),
+                    )],
+                    vec![TransparentOutputFact::new(0, 290, [0x56], addr_low)],
+                )],
+            ),
+        ]
+    }
+
+    fn assert_prepared_load_ingests_match_serial(
+        serial: &PreparedWalletProjectionLoad,
+        sharded: &PreparedWalletProjectionLoad,
+        shard_target: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        assert_eq!(sharded.projection_digest, serial.projection_digest);
+        assert_eq!(
+            sharded.projection_accumulator,
+            serial.projection_accumulator
+        );
+        assert_eq!(sharded.row_counts, serial.row_counts);
+        assert_eq!(sharded.utxo_summary, serial.utxo_summary);
+        assert_eq!(sharded.logical_row_bytes, serial.logical_row_bytes);
+        assert_eq!(
+            sharded.counters.peak_accounted_reorg_undo_bytes,
+            serial.counters.peak_accounted_reorg_undo_bytes
+        );
+        assert_eq!(sharded.families.len(), serial.families.len());
+        for (serial_family, sharded_family) in serial.families.iter().zip(sharded.families.iter()) {
+            assert_eq!(serial_family.name, sharded_family.name);
+            let mut db_options = rust_rocksdb::Options::default();
+            db_options.create_if_missing(true);
+            let ingest_opts = rust_rocksdb::IngestExternalFileOptions::default();
+            let serial_db_dir = TempDir::new()?;
+            let sharded_db_dir = TempDir::new()?;
+            let serial_db = rust_rocksdb::DB::open(&db_options, serial_db_dir.path())?;
+            let sharded_db = rust_rocksdb::DB::open(&db_options, sharded_db_dir.path())?;
+            if !serial_family.paths.is_empty() {
+                serial_db.ingest_external_file_opts(&ingest_opts, serial_family.paths.clone())?;
+            }
+            if !sharded_family.paths.is_empty() {
+                sharded_db.ingest_external_file_opts(&ingest_opts, sharded_family.paths.clone())?;
+            }
+            let serial_entries = serial_db
+                .iterator(rust_rocksdb::IteratorMode::Start)
+                .collect::<Result<Vec<_>, _>>()?;
+            let sharded_entries = sharded_db
+                .iterator(rust_rocksdb::IteratorMode::Start)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(
+                sharded_entries, serial_entries,
+                "family {} differed for {shard_target} shards",
+                serial_family.name
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_outpoint_and_address_tx_builds_match_serial_and_ingest_into_rocksdb()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let options = test_column_family_options();
+        let blocks = sharded_parity_test_blocks();
+        let first = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xc1; 32]));
+        let settled_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32]));
+        let mut serial_cfg = test_config_with_bounds(
+            temporary.path(),
+            &options,
+            TestByteLimits::default(),
+            first,
+            settled_tip,
+        );
+        serial_cfg.supported_reorg_depth = 5;
+        let serial = write_projection_ssts_with_plan(
+            serial_cfg,
+            canonical_scan(validated_replays(&blocks)?),
+            resolve_build_shard_plan_for(
+                NonZeroU32::MIN,
+                serial_cfg.max_outpoint_sort_memory_bytes,
+                serial_cfg.max_secondary_sort_memory_bytes_per_sorter,
+                active_merge_fan_in(),
+                Some(NonZeroU32::MIN),
+            ),
+        )?;
+
+        for shard_target in [2_u32, 3, 4, 8] {
+            let forced = NonZeroU32::new(shard_target).ok_or("nonzero")?;
+            let sharded_dir = temporary.path().join(format!("sharded-{shard_target}"));
+            fs::create_dir_all(&sharded_dir)?;
+            let mut sharded_cfg = test_config_with_bounds(
+                &sharded_dir,
+                &options,
+                TestByteLimits::default(),
+                first,
+                settled_tip,
+            );
+            sharded_cfg.supported_reorg_depth = 5;
+            sharded_cfg.accumulator_hashing_workers =
+                NonZeroU32::new(4).ok_or("nonzero workers")?;
+            let plan = resolve_build_shard_plan_for(
+                sharded_cfg.accumulator_hashing_workers,
+                sharded_cfg.max_outpoint_sort_memory_bytes,
+                sharded_cfg.max_secondary_sort_memory_bytes_per_sorter,
+                active_merge_fan_in(),
+                Some(forced),
+            );
+            let sharded = write_projection_ssts_with_plan(
+                sharded_cfg,
+                canonical_scan(validated_replays(&blocks)?),
+                plan,
+            )?;
+            assert_prepared_load_ingests_match_serial(&serial, &sharded, shard_target)?;
+        }
+        Ok(())
+    }
+
+    fn assert_total_secondary_fan_in(
+        plan: BuildShardPlan,
+        active_fan_in: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let idx_readers = usize::try_from(plan.address_index_push_shards.get())?;
+        let tx_readers = usize::try_from(plan.address_transaction_shards.get())?;
+        let total = if plan.overlap_secondary {
+            idx_readers * plan.address_index_per_shard_fan_in
+                + tx_readers * plan.address_transaction_per_shard_fan_in
+        } else {
+            (idx_readers * plan.address_index_per_shard_fan_in)
+                .max(tx_readers * plan.address_transaction_per_shard_fan_in)
+        };
+        assert!(
+            total <= active_fan_in,
+            "total concurrent secondary fan-in {total} exceeds active_fan_in {active_fan_in} for {plan:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_shard_plan_clamps_small_containers_and_bounds_fan_in_and_queues()
+    -> Result<(), Box<dyn Error>> {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        let workers_eight = NonZeroU32::new(8).ok_or("nonzero")?;
+        let workers_one = NonZeroU32::MIN;
+
+        let sync_plan = resolve_build_shard_plan_for(workers_one, 4 * GIB, GIB, 256, None);
+        assert_eq!(sync_plan.outpoint_shards.get(), 1);
+        assert_eq!(sync_plan.address_transaction_shards.get(), 1);
+        assert!(!sync_plan.overlap_secondary);
+
+        let scaled_budget = |limit: u64, percent: u64, min_floor: u64, default: u64| {
+            (limit.saturating_mul(percent) / 100).clamp(min_floor, default)
+        };
+
+        // 2 GiB container clamps shards safely below MIN_PRODUCTION_SHARD_SORT_MEMORY_BYTES.
+        let out_2g = scaled_budget(2 * GIB, 40, 64 * MIB, 4 * GIB);
+        let sec_2g = scaled_budget(2 * GIB, 10, 32 * MIB, GIB);
+        let plan_2g = resolve_build_shard_plan_for(workers_eight, out_2g, sec_2g, 256, None);
+        assert_eq!(plan_2g.outpoint_shards.get(), 3);
+        assert_eq!(plan_2g.address_transaction_shards.get(), 1);
+        assert!(plan_2g.overlap_secondary);
+        assert_total_secondary_fan_in(plan_2g, 256)?;
+
+        // 6 GiB and 10 GiB containers never exceed fan-in or 8-shard cap.
+        for container in [6 * GIB, 10 * GIB] {
+            let out_mem = scaled_budget(container, 40, 64 * MIB, 4 * GIB);
+            let sec_mem = scaled_budget(container, 10, 32 * MIB, GIB);
+            let plan = resolve_build_shard_plan_for(workers_eight, out_mem, sec_mem, 256, None);
+            assert!(plan.outpoint_shards.get() <= MAX_KEY_PREFIX_DRAIN_SHARDS);
+            assert!(plan.address_transaction_shards.get() <= MAX_KEY_PREFIX_DRAIN_SHARDS);
+            assert!(
+                out_mem / u64::from(plan.outpoint_shards.get())
+                    >= MIN_PRODUCTION_SHARD_SORT_MEMORY_BYTES
+            );
+            assert_total_secondary_fan_in(plan, 256)?;
+        }
+
+        // Low NOFILE budget and forced shard overrides bound concurrent readers strictly <= safe_fan_in.
+        let tight_nofile = resolve_build_shard_plan_for(workers_eight, 4 * GIB, GIB, 6, None);
+        assert_eq!(tight_nofile.outpoint_shards.get(), 1);
+        assert_eq!(tight_nofile.address_index_push_shards.get(), 1);
+        assert_eq!(tight_nofile.address_transaction_shards.get(), 1);
+        assert_total_secondary_fan_in(tight_nofile, 6)?;
+
+        let capped_override =
+            resolve_build_shard_plan_for(workers_eight, 4 * GIB, GIB, 16, Some(workers_eight));
+        assert_total_secondary_fan_in(capped_override, 16)?;
+
+        // Cumulative SST pipeline queue stays <= 16 MiB across any writer count.
+        for open_writers in [1_usize, 2, 4, 8, 16, 64] {
+            if let Some(budget) = scaled_pipelined_sst_queue_budget_bytes(128 * MIB, open_writers) {
+                assert!(budget >= MIN_PIPELINED_SST_QUEUE_BUDGET_BYTES);
+                assert!(
+                    budget * u64::try_from(open_writers)? <= PIPELINED_SST_TOTAL_QUEUE_CAP_BYTES
+                );
+            }
+        }
+        assert_eq!(
+            scaled_pipelined_sst_queue_budget_bytes(128 * MIB, 512),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_secondary_phase_fan_in_adapts_to_post_outpoint_headroom()
+    -> Result<(), Box<dyn Error>> {
+        let one = NonZeroU32::MIN;
+        let two = NonZeroU32::new(2).ok_or("nonzero")?;
+
+        let asymmetric = resolve_secondary_phase_fan_in(one, one, true, 48)?;
+        assert!(asymmetric.overlap_secondary);
+        assert_eq!(asymmetric.address_index_per_shard_fan_in, 12);
+        assert_eq!(asymmetric.address_transaction_per_shard_fan_in, 36);
+
+        let tight_overlap = resolve_secondary_phase_fan_in(one, two, true, 6)?;
+        assert!(tight_overlap.overlap_secondary);
+        assert_eq!(tight_overlap.address_index_per_shard_fan_in, 2);
+        assert_eq!(tight_overlap.address_transaction_per_shard_fan_in, 2);
+
+        let fallback_seq = resolve_secondary_phase_fan_in(two, two, true, 6)?;
+        assert!(!fallback_seq.overlap_secondary);
+        assert_eq!(fallback_seq.address_index_per_shard_fan_in, 3);
+        assert_eq!(fallback_seq.address_transaction_per_shard_fan_in, 3);
+
+        let too_small = resolve_secondary_phase_fan_in(two, two, true, 3);
+        assert!(matches!(
+            too_small,
+            Err(RocksDbWalletError::BulkLoad(
+                BulkLoadError::InvalidInput { .. }
+            ))
+        ));
+        Ok(())
+    }
+
+    fn low_nofile_blocks(output_count: usize) -> Result<Vec<CanonicalBlockFacts>, Box<dyn Error>> {
+        let mut txs = Vec::with_capacity(output_count);
+        for index in 0..output_count {
+            let low = u8::try_from(index)?;
+            let mut tx_bytes = [0_u8; 32];
+            tx_bytes[0] = low.wrapping_mul(7);
+            tx_bytes[1] = low;
+            let mut addr_bytes = [0_u8; 32];
+            addr_bytes[0] = low.wrapping_mul(11);
+            addr_bytes[1] = 0x50_u8.wrapping_add(low);
+            txs.push(transaction_facts(
+                TransactionId::from_bytes(tx_bytes),
+                Vec::new(),
+                vec![TransparentOutputFact::new(
+                    0,
+                    100 + u64::from(low),
+                    [0x51],
+                    TransparentAddressScriptHash::from_bytes(addr_bytes),
+                )],
+            ));
+        }
+        Ok(vec![
+            block_facts(1, [0; 32], [0xc1; 32], txs),
+            block_facts(2, [0xc1; 32], [0xc2; 32], Vec::new()),
+        ])
+    }
+
+    #[cfg(unix)]
+    fn run_low_nofile_child_builds() -> Result<(), Box<dyn Error>> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let initial_fan_in = active_merge_fan_in();
+        assert!(initial_fan_in >= 12);
+        assert!(initial_fan_in < 128);
+        let run_target = initial_fan_in.saturating_sub(6).clamp(16, 40);
+        let blocks = low_nofile_blocks(run_target)?;
+        let temporary = TempDir::new()?;
+        let options = test_column_family_options();
+        let limits = TestByteLimits {
+            outpoint_sort: 192,
+            secondary_sort_per_sorter: TEST_SORT_MEMORY_BYTES,
+            temporary_files_per_sorter: TEST_TEMPORARY_FILE_BYTES,
+        };
+        let first = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xc1; 32]));
+        let settled_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32]));
+
+        let run_with_plan = |subdir: &str, workers: NonZeroU32, plan: BuildShardPlan| {
+            let dir = temporary.path().join(subdir);
+            fs::create_dir_all(&dir)?;
+            let mut cfg = test_config_with_bounds(&dir, &options, limits, first, settled_tip);
+            cfg.accumulator_hashing_workers = workers;
+            write_projection_ssts_with_plan(cfg, canonical_scan(validated_replays(&blocks)?), plan)
+                .map_err(|err| Box::new(err) as Box<dyn Error>)
+        };
+
+        let serial_plan = resolve_build_shard_plan_for(
+            NonZeroU32::MIN,
+            4 * GIB,
+            GIB,
+            initial_fan_in,
+            Some(NonZeroU32::MIN),
+        );
+        let serial = run_with_plan("serial", NonZeroU32::MIN, serial_plan)?;
+        assert!(serial.outpoint_sort_evidence.initial_run_count >= 16);
+
+        let w_four = NonZeroU32::new(4).ok_or("nonzero workers")?;
+        let prod_plan = resolve_build_shard_plan_for(w_four, 4 * GIB, GIB, initial_fan_in, None);
+        let prod = run_with_plan("prod", w_four, prod_plan)?;
+        assert_eq!(prod.projection_digest, serial.projection_digest);
+
+        let three = NonZeroU32::new(3).ok_or("nonzero shards")?;
+        let sharded_plan =
+            resolve_build_shard_plan_for(w_four, 4 * GIB, GIB, initial_fan_in, Some(three));
+        let sharded = run_with_plan("sharded", w_four, sharded_plan)?;
+        assert_eq!(sharded.projection_digest, serial.projection_digest);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sharded_projection_build_succeeds_under_low_file_descriptor_limit()
+    -> Result<(), Box<dyn Error>> {
+        const CHILD_ENV: &str = "ZINDER_WALLET_TEST_LOW_NOFILE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            return run_low_nofile_child_builds();
+        }
+        let binary = std::env::current_exe()?;
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "cur=\"$(ulimit -n)\"; if [ \"$cur\" = \"unlimited\" ] || [ \"$cur\" -gt 112 ]; then ulimit -n 112; fi; exec \"$@\"",
+                "sh",
+            ])
+            .arg(&binary)
+            .args([
+                "--exact",
+                "projection_load::tests::sharded_projection_build_succeeds_under_low_file_descriptor_limit",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()?;
+        assert!(status.success(), "child process failed with {status}");
+        Ok(())
+    }
+
+    fn build_test_retained_undo_suffix(
+        settled_tip: BlockId,
+        limit_bytes: u64,
+    ) -> Result<RetainedUndo, Box<dyn Error>> {
+        let digest = CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+            1,
+            [2; 32],
+        );
+        let mut undo = RetainedUndo::new(4, settled_tip, limit_bytes);
+        for offset in 1..=4_u32 {
+            let height = BlockHeight::new(settled_tip.height.value() + offset);
+            let hash = BlockHash::from_bytes([u8::try_from(offset)?; 32]);
+            undo.begin_block(BlockId::new(height, hash), hash, digest, digest)?;
+            undo.finish_block()?;
+        }
+        Ok(undo)
+    }
+
+    fn assert_tight_undo_collector_budget_clamp_and_refusal(
+        settled_tip: BlockId,
+        key_bytes: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let base_only = 4 * u64::try_from(size_of::<WalletReorgUndo>())?;
+        let tight_limit = base_only + 3 * key_bytes;
+        let mut tight_retained = build_test_retained_undo_suffix(settled_tip, tight_limit)?;
+        let tight_collector = RetainedUndoCollector::from_retained_undo(&mut tight_retained);
+        let height = BlockHeight::new(settled_tip.height.value() + 1);
+        for seq in 0..3_u32 {
+            tight_collector.try_collect(WalletAddressTransactionKey::new(
+                TransparentAddressScriptHash::from_bytes([0x44; 32]),
+                height,
+                seq,
+            ))?;
+        }
+        {
+            let first_slot = tight_collector.slots[0].lock();
+            assert_eq!(first_slot.len(), 3);
+            assert_eq!(first_slot.capacity(), 3);
+        }
+        assert_eq!(
+            tight_collector.accounted_bytes.load(Ordering::Acquire),
+            tight_limit
+        );
+        let refused = tight_collector.try_collect(WalletAddressTransactionKey::new(
+            TransparentAddressScriptHash::from_bytes([0x44; 32]),
+            height,
+            3,
+        ));
+        assert!(matches!(
+            refused,
+            Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit {
+                limit_bytes,
+                required_bytes,
+            }) if limit_bytes == tight_limit && required_bytes == tight_limit + key_bytes
+        ));
+        let first_slot = tight_collector.slots[0].lock();
+        assert_eq!(first_slot.len(), 3);
+        assert_eq!(first_slot.capacity(), 3);
+        drop(first_slot);
+        tight_collector.apply_collected(&mut tight_retained)?;
+        assert_eq!(tight_retained.peak_accounted_bytes, tight_limit);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_undo_collector_accounts_capacity_with_zero_handoff_overlap()
+    -> Result<(), Box<dyn Error>> {
+        let settled_tip = BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([1; 32]));
+        let mut retained = build_test_retained_undo_suffix(settled_tip, 1024 * 1024)?;
+        let base_bytes = retained.accounted_bytes;
+        let collector = RetainedUndoCollector::from_retained_undo(&mut retained);
+        let key_bytes = u64::try_from(size_of::<WalletAddressTransactionKey>())?;
+
+        std::thread::scope(|scope| -> Result<(), Box<dyn Error>> {
+            let mut handles = Vec::new();
+            for worker_id in 0..4_u32 {
+                let collector_ref = &collector;
+                handles.push(scope.spawn(move || -> Result<(), RocksDbWalletError> {
+                    for offset in 1..=4_u32 {
+                        let height = BlockHeight::new(settled_tip.height.value() + offset);
+                        for seq in 0..10_u32 {
+                            let tx_index = worker_id * 10 + seq;
+                            let mut addr = [0_u8; 32];
+                            addr[0] = u8::try_from(offset).unwrap_or(0);
+                            addr[1] = u8::try_from(worker_id).unwrap_or(0);
+                            collector_ref.try_collect(WalletAddressTransactionKey::new(
+                                TransparentAddressScriptHash::from_bytes(addr),
+                                height,
+                                tx_index,
+                            ))?;
+                        }
+                    }
+                    collector_ref.try_collect(WalletAddressTransactionKey::new(
+                        TransparentAddressScriptHash::from_bytes([0xff; 32]),
+                        settled_tip.height,
+                        worker_id,
+                    ))
+                }));
+            }
+            for handle in handles {
+                handle.join().map_err(|_| "collector worker panicked")??;
+            }
+            Ok(())
+        })?;
+
+        let mut slot_cap_bytes = 0_u64;
+        let mut slot_layouts = Vec::with_capacity(collector.slots.len());
+        for slot_lock in &collector.slots {
+            let slot = slot_lock.lock();
+            slot_cap_bytes =
+                slot_cap_bytes.saturating_add(u64::try_from(slot.capacity())? * key_bytes);
+            slot_layouts.push((slot.as_ptr(), slot.len(), slot.capacity()));
+        }
+        assert_eq!(
+            collector.accounted_bytes.load(Ordering::Acquire),
+            base_bytes + slot_cap_bytes
+        );
+        let peak_before_apply = collector.peak_accounted_bytes.load(Ordering::Acquire);
+        assert_eq!(peak_before_apply, base_bytes + slot_cap_bytes);
+        assert!(peak_before_apply <= retained.max_accounted_bytes);
+
+        collector.apply_collected(&mut retained)?;
+        assert_eq!(retained.peak_accounted_bytes, peak_before_apply);
+        assert_eq!(retained.accounted_bytes, base_bytes + slot_cap_bytes);
+        for (undo, (ptr, len, cap)) in retained.records.iter().zip(slot_layouts) {
+            assert_eq!(undo.address_transaction_keys.as_ptr(), ptr);
+            assert_eq!(undo.address_transaction_keys.len(), len);
+            assert_eq!(undo.address_transaction_keys.capacity(), cap);
+            assert_eq!(len, 40);
+        }
+
+        assert_tight_undo_collector_budget_clamp_and_refusal(settled_tip, key_bytes)
     }
 }

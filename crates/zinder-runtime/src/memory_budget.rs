@@ -143,6 +143,249 @@ fn read_cgroup_u64(cgroup_dir: &Path, file_name: &str) -> Option<u64> {
 
 const MIB: u64 = 1024 * 1024;
 
+const DEFAULT_WALLET_OUTPOINT_SORT_MEMORY_BYTES: u64 = 4 * 1024 * MIB;
+const MIN_WALLET_OUTPOINT_SORT_MEMORY_BYTES: u64 = 64 * MIB;
+const DEFAULT_WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER: u64 = 1024 * MIB;
+const MIN_WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER: u64 = 32 * MIB;
+const DEFAULT_WALLET_REORG_UNDO_MEMORY_BYTES: u64 = 512 * MIB;
+const MIN_WALLET_REORG_UNDO_MEMORY_BYTES: u64 = 16 * MIB;
+
+#[derive(Clone, Copy)]
+struct WalletBudgetScale {
+    default_bytes: u64,
+    percent: u64,
+    min_floor_bytes: u64,
+    tiny_limit_divisor: u64,
+}
+
+fn scaled_wallet_budget_for(budget_bytes: Option<u64>, scale: WalletBudgetScale) -> u64 {
+    let Some(limit) = budget_bytes else {
+        return scale.default_bytes;
+    };
+    let bounded_limit = limit.max(1);
+    let scaled =
+        u64::try_from(u128::from(bounded_limit).saturating_mul(u128::from(scale.percent)) / 100)
+            .unwrap_or(scale.default_bytes);
+    let safe_floor = scale
+        .min_floor_bytes
+        .min((bounded_limit / scale.tiny_limit_divisor).max(1));
+    scaled.clamp(safe_floor, scale.default_bytes)
+}
+
+/// Returns the default wallet-builder outpoint sort memory budget scaled from a
+/// detected container memory limit, or the full ADR-0005 default without one.
+#[must_use]
+pub fn wallet_build_outpoint_sort_memory_bytes() -> u64 {
+    wallet_build_outpoint_sort_memory_bytes_for(container_memory_budget_bytes())
+}
+
+/// Pure testable scaling helper for [`wallet_build_outpoint_sort_memory_bytes`].
+#[must_use]
+pub fn wallet_build_outpoint_sort_memory_bytes_for(budget_bytes: Option<u64>) -> u64 {
+    scaled_wallet_budget_for(
+        budget_bytes,
+        WalletBudgetScale {
+            default_bytes: DEFAULT_WALLET_OUTPOINT_SORT_MEMORY_BYTES,
+            percent: 40,
+            min_floor_bytes: MIN_WALLET_OUTPOINT_SORT_MEMORY_BYTES,
+            tiny_limit_divisor: 2,
+        },
+    )
+}
+
+/// Returns the default wallet-builder secondary sort memory budget per sorter
+/// scaled from a detected container memory limit.
+#[must_use]
+pub fn wallet_build_secondary_sort_memory_bytes_per_sorter() -> u64 {
+    wallet_build_secondary_sort_memory_bytes_per_sorter_for(container_memory_budget_bytes())
+}
+
+/// Pure testable scaling helper for
+/// [`wallet_build_secondary_sort_memory_bytes_per_sorter`].
+#[must_use]
+pub fn wallet_build_secondary_sort_memory_bytes_per_sorter_for(budget_bytes: Option<u64>) -> u64 {
+    scaled_wallet_budget_for(
+        budget_bytes,
+        WalletBudgetScale {
+            default_bytes: DEFAULT_WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,
+            percent: 10,
+            min_floor_bytes: MIN_WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,
+            tiny_limit_divisor: 8,
+        },
+    )
+}
+
+/// Returns the default wallet-builder reorg-undo accounted memory budget scaled
+/// from a detected container memory limit.
+#[must_use]
+pub fn wallet_build_reorg_undo_memory_bytes() -> u64 {
+    wallet_build_reorg_undo_memory_bytes_for(container_memory_budget_bytes())
+}
+
+/// Pure testable scaling helper for [`wallet_build_reorg_undo_memory_bytes`].
+#[must_use]
+pub fn wallet_build_reorg_undo_memory_bytes_for(budget_bytes: Option<u64>) -> u64 {
+    scaled_wallet_budget_for(
+        budget_bytes,
+        WalletBudgetScale {
+            default_bytes: DEFAULT_WALLET_REORG_UNDO_MEMORY_BYTES,
+            percent: 5,
+            min_floor_bytes: MIN_WALLET_REORG_UNDO_MEMORY_BYTES,
+            tiny_limit_divisor: 16,
+        },
+    )
+}
+
+#[cfg(test)]
+mod wallet_build_budget_tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn unlimited_container_uses_full_adr_0005_wallet_build_defaults() {
+        assert_eq!(wallet_build_outpoint_sort_memory_bytes_for(None), 4 * GIB);
+        assert_eq!(
+            wallet_build_secondary_sort_memory_bytes_per_sorter_for(None),
+            GIB
+        );
+        assert_eq!(wallet_build_reorg_undo_memory_bytes_for(None), 512 * MIB);
+    }
+
+    #[test]
+    fn wallet_build_budgets_leave_container_headroom_for_two_six_and_ten_gib() {
+        for container in [2 * GIB, 6 * GIB, 10 * GIB, 64 * GIB] {
+            let outpoint = wallet_build_outpoint_sort_memory_bytes_for(Some(container));
+            let secondary =
+                wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(container));
+            let undo = wallet_build_reorg_undo_memory_bytes_for(Some(container));
+            let canonical_cache = canonical_reader_block_cache_bytes_for(Some(container));
+            let recycled_address_tx = secondary.max(outpoint / 2);
+
+            assert!(outpoint >= MIN_WALLET_OUTPOINT_SORT_MEMORY_BYTES);
+            assert!(outpoint <= DEFAULT_WALLET_OUTPOINT_SORT_MEMORY_BYTES);
+            assert!(secondary >= MIN_WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER);
+            assert!(secondary <= DEFAULT_WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER);
+            assert!(undo >= MIN_WALLET_REORG_UNDO_MEMORY_BYTES);
+            assert!(undo <= DEFAULT_WALLET_REORG_UNDO_MEMORY_BYTES);
+
+            // Phase 1 (scan+sort+undo) and Phase 2 (dual secondary sort+undo) must
+            // both leave headroom for canonical cache, wallet 256 MiB cache,
+            // hashing (<= 33 MiB), SST queues (<= 16 MiB), and RocksDB buffers.
+            let scan_working_set = outpoint + undo + canonical_cache;
+            let drain_working_set = secondary + recycled_address_tx + undo + canonical_cache;
+            assert!(
+                scan_working_set < container * 3 / 4,
+                "container={container}"
+            );
+            assert!(
+                drain_working_set < container * 3 / 4,
+                "container={container}"
+            );
+        }
+
+        // 10 GiB target matches historical ADR-0005 defaults exactly.
+        assert_eq!(
+            wallet_build_outpoint_sort_memory_bytes_for(Some(10 * GIB)),
+            4 * GIB
+        );
+        assert_eq!(
+            wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(10 * GIB)),
+            GIB
+        );
+        assert_eq!(
+            wallet_build_reorg_undo_memory_bytes_for(Some(10 * GIB)),
+            512 * MIB
+        );
+    }
+
+    #[test]
+    fn tiny_containers_clamp_safely_without_zero_or_overflow() {
+        for tiny in [0_u64, 1, 16 * MIB, 64 * MIB] {
+            let outpoint = wallet_build_outpoint_sort_memory_bytes_for(Some(tiny));
+            let secondary = wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(tiny));
+            let undo = wallet_build_reorg_undo_memory_bytes_for(Some(tiny));
+            assert!(outpoint >= 1);
+            assert!(secondary >= 1);
+            assert!(undo >= 1);
+            if tiny >= 16 * MIB {
+                assert!(outpoint + undo < tiny);
+                assert!(secondary + (outpoint / 2).max(secondary) + undo < tiny);
+            }
+        }
+
+        // Exact documented divisors around the 128 MiB / 256 MiB / 512 MiB thresholds.
+        assert_eq!(
+            wallet_build_outpoint_sort_memory_bytes_for(Some(64 * MIB)),
+            32 * MIB
+        );
+        assert_eq!(
+            wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(64 * MIB)),
+            8 * MIB
+        );
+        assert_eq!(
+            wallet_build_reorg_undo_memory_bytes_for(Some(64 * MIB)),
+            4 * MIB
+        );
+
+        assert_eq!(
+            wallet_build_outpoint_sort_memory_bytes_for(Some(128 * MIB)),
+            64 * MIB
+        );
+        assert_eq!(
+            wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(128 * MIB)),
+            16 * MIB
+        );
+        assert_eq!(
+            wallet_build_reorg_undo_memory_bytes_for(Some(128 * MIB)),
+            8 * MIB
+        );
+
+        assert_eq!(
+            wallet_build_outpoint_sort_memory_bytes_for(Some(160 * MIB)),
+            64 * MIB
+        );
+        assert_eq!(
+            wallet_build_outpoint_sort_memory_bytes_for(Some(256 * MIB)),
+            256 * MIB * 40 / 100
+        );
+        assert_eq!(
+            wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(256 * MIB)),
+            32 * MIB
+        );
+        assert_eq!(
+            wallet_build_reorg_undo_memory_bytes_for(Some(256 * MIB)),
+            16 * MIB
+        );
+
+        assert_eq!(
+            wallet_build_outpoint_sort_memory_bytes_for(Some(320 * MIB)),
+            128 * MIB
+        );
+        assert_eq!(
+            wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(320 * MIB)),
+            32 * MIB
+        );
+        assert_eq!(
+            wallet_build_reorg_undo_memory_bytes_for(Some(320 * MIB)),
+            16 * MIB
+        );
+
+        assert_eq!(
+            wallet_build_outpoint_sort_memory_bytes_for(Some(512 * MIB)),
+            512 * MIB * 40 / 100
+        );
+        assert_eq!(
+            wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(512 * MIB)),
+            512 * MIB * 10 / 100
+        );
+        assert_eq!(
+            wallet_build_reorg_undo_memory_bytes_for(Some(512 * MIB)),
+            512 * MIB * 5 / 100
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{error::Error, fs};
