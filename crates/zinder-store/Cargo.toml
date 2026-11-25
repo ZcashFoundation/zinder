@@ -35,6 +35,7 @@ tracing.workspace = true
 zinder-core = { workspace = true, features = ["commitment-tree-codec"] }
 zinder-proto.workspace = true
 zinder-rocksdb-bulk-load.workspace = true
+zstd.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 composefs-ioctls.workspace = true
