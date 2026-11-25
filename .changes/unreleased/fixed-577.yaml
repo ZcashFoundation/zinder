@@ -1,0 +1,6 @@
+kind: fixed
+body: Fixed a CPU regression on warm unary gRPC responses and `GetTreeState` by skipping HTTP/2 release-gate probing on small single-frame responses (at most 8 KiB) whose end is already ready, eliminating per-stream `CancellationToken` mutex work and headerless `GrpcDeadline` allocations, fast-pathing `TipWait` when the requested height is at or below the visible tip, and moving warm settled tree-state cache hits onto a shared read lock with zero per-call `height_band` string allocations.
+time: 2026-11-25T09:18:00Z
+custom:
+    Bump: patch
+    PR: "577"
