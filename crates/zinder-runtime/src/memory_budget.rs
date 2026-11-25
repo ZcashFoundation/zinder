@@ -11,6 +11,55 @@ use std::{
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 
+/// Point-in-time Linux cgroup v2 memory usage and page-cache snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CgroupMemorySnapshot {
+    /// Current memory charged to the cgroup (`memory.current`).
+    pub current_bytes: u64,
+    /// Tightest finite ancestor cgroup limit (`memory.high` or `memory.max`).
+    pub limit_bytes: u64,
+    /// File-backed page cache charged to the cgroup (`file` in `memory.stat`).
+    pub file_cache_bytes: Option<u64>,
+}
+
+/// Returns the current Linux cgroup v2 memory usage, limit, and file-cache
+/// charge when both a finite limit and `memory.current` are readable.
+///
+/// Returns `None` outside cgroup v2 or when no finite ancestor limit exists.
+#[must_use]
+pub fn container_memory_snapshot() -> Option<CgroupMemorySnapshot> {
+    cgroup_memory_snapshot_in(Path::new(CGROUP_ROOT), Path::new(PROC_SELF_CGROUP))
+}
+
+fn cgroup_memory_snapshot_in(
+    cgroup_root: &Path,
+    proc_cgroup: &Path,
+) -> Option<CgroupMemorySnapshot> {
+    let limit_bytes = cgroup_memory_budget_bytes_in(cgroup_root, proc_cgroup)?;
+    let cgroup_dir = cgroup_v2_dir(cgroup_root, proc_cgroup);
+    let current_bytes = read_cgroup_u64(&cgroup_dir, "memory.current")?;
+    let file_cache_bytes = read_cgroup_stat_u64(&cgroup_dir, "memory.stat", "file");
+    Some(CgroupMemorySnapshot {
+        current_bytes,
+        limit_bytes,
+        file_cache_bytes,
+    })
+}
+
+fn read_cgroup_stat_u64(dir: &Path, file_name: &str, key_name: &str) -> Option<u64> {
+    let contents = fs::read_to_string(dir.join(file_name)).ok()?;
+    for line in contents.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(field_key) = fields.next() else {
+            continue;
+        };
+        if field_key == key_name {
+            return fields.next()?.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
 /// Returns the container memory budget in bytes, derived from cgroup v2.
 ///
 /// Walks ancestors from the process's cgroup v2 directory up to
@@ -578,5 +627,28 @@ mod tests {
         );
         // 1 GiB budget => 128 MiB cache => 1 * 64 = 64, floored at 128
         assert_eq!(canonical_reader_max_open_files_for(Some(1024 * MIB)), 128);
+    }
+
+    #[test]
+    fn memory_snapshot_reads_current_limit_and_file_cache() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let cgroup_root = tempdir.path().join("cgroup");
+        let leaf = cgroup_root.join("system.slice").join("zinder.service");
+        fs::create_dir_all(&leaf)?;
+        fs::write(leaf.join("memory.max"), "4294967296\n")?;
+        fs::write(leaf.join("memory.current"), "3900000000\n")?;
+        fs::write(
+            leaf.join("memory.stat"),
+            "anon 400000000\nfile 3500000000\nkernel 50000000\n",
+        )?;
+        let proc_cgroup = tempdir.path().join("proc-cgroup");
+        fs::write(&proc_cgroup, "0::/system.slice/zinder.service\n")?;
+
+        let snapshot = cgroup_memory_snapshot_in(&cgroup_root, &proc_cgroup)
+            .ok_or("expected cgroup memory snapshot")?;
+        assert_eq!(snapshot.limit_bytes, 4_294_967_296);
+        assert_eq!(snapshot.current_bytes, 3_900_000_000);
+        assert_eq!(snapshot.file_cache_bytes, Some(3_500_000_000));
+        Ok(())
     }
 }
