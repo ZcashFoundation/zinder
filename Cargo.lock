@@ -6328,7 +6328,6 @@ dependencies = [
  "hex",
  "incrementalmerkletree",
  "orchard",
- "parking_lot 0.13.0",
  "pasta_curves",
  "prost",
  "rayon",
