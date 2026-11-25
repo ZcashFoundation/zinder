@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::atomic::Ordering,
 };
 
 use sha2::{Digest, Sha256};
@@ -13,8 +14,9 @@ use super::{
     SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES, SettledRawBlockSegmentError,
     SettledRawBlockSegmentOpenOptions, SettledRawBlockSegmentReader, SettledRawBlockSegmentWriter,
     format::{
-        DecodedRowIndexEntry, FRAME_PREFIX_U32, HEADER_LEN, ROW_INDEX_ENTRY_LEN, SegmentHeader,
-        TRAILER_LEN, TX_SLICE_ENTRY_LEN, TxSliceEntry,
+        DecodedRowIndexEntry, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock, ROW_INDEX_ENTRY_LEN,
+        SegmentHeader, TRAILER_LEN, TX_SLICE_ENTRY_LEN, TxSliceEntry, VALIDATION_INVALID,
+        VALIDATION_UNVALIDATED, VALIDATION_VALID,
     },
     reader::{PortableFrameDigest, validate_entries},
 };
@@ -716,4 +718,46 @@ fn tx_slice_entry_round_trips_and_overflow_slice_fails_admission() -> TestOutcom
         Err(SettledRawBlockSegmentError::InvalidFormat(_))
     ));
     Ok(())
+}
+
+#[test]
+fn indexed_block_mark_valid_preserves_invalid_state() {
+    let row = IndexedBlock::from_entry(&DecodedRowIndexEntry {
+        block_hash_wire: [0x11; 32],
+        payload_sha256: [0x22; 32],
+        uncompressed_sha256: [0x33; 32],
+        slab_rel_offset: 0,
+        uncompressed_len: 128,
+        tx_start_index: 0,
+        tx_count: 0,
+    });
+    assert_eq!(
+        row.validation_state.load(Ordering::Acquire),
+        VALIDATION_UNVALIDATED
+    );
+    row.mark_invalid();
+    assert_eq!(
+        row.validation_state.load(Ordering::Acquire),
+        VALIDATION_INVALID
+    );
+    row.mark_valid();
+    assert_eq!(
+        row.validation_state.load(Ordering::Acquire),
+        VALIDATION_INVALID
+    );
+
+    let valid_row = IndexedBlock::from_entry(&DecodedRowIndexEntry {
+        block_hash_wire: [0x44; 32],
+        payload_sha256: [0x55; 32],
+        uncompressed_sha256: [0x66; 32],
+        slab_rel_offset: 0,
+        uncompressed_len: 128,
+        tx_start_index: 0,
+        tx_count: 0,
+    });
+    valid_row.mark_valid();
+    assert_eq!(
+        valid_row.validation_state.load(Ordering::Acquire),
+        VALIDATION_VALID
+    );
 }
