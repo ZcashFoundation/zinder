@@ -7,10 +7,13 @@
 //! entries survive tip advances without rebuilding or re-reading storage.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fmt,
     mem::size_of,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use zinder_core::{
@@ -121,7 +124,7 @@ pub(super) enum LookupStep {
 struct CachedEntry {
     state: ServedTreeState,
     bytes: usize,
-    tick: u64,
+    last_used: AtomicU64,
 }
 
 /// Bounded LRU cache of settled replayed tree states.
@@ -130,11 +133,10 @@ pub(super) struct SettledStates {
     max_entries: usize,
     max_bytes: usize,
     total_bytes: usize,
-    next_tick: u64,
+    next_tick: AtomicU64,
     anchor: Option<SettledChainAnchor>,
     anchor_generations: Vec<Weak<dyn Send + Sync>>,
     entries: HashMap<BlockHeight, CachedEntry>,
-    lru: BTreeMap<u64, BlockHeight>,
 }
 
 impl Default for SettledStates {
@@ -149,11 +151,10 @@ impl SettledStates {
             max_entries,
             max_bytes,
             total_bytes: 0,
-            next_tick: 0,
+            next_tick: AtomicU64::new(0),
             anchor: None,
             anchor_generations: Vec::new(),
             entries: HashMap::new(),
-            lru: BTreeMap::new(),
         }
     }
 
@@ -178,27 +179,23 @@ impl SettledStates {
         }
     }
 
-    fn allocate_tick(&mut self) -> u64 {
-        let tick = self.next_tick;
-        self.next_tick = self.next_tick.wrapping_add(1);
-        tick
+    fn allocate_tick(&self) -> u64 {
+        self.next_tick.fetch_add(1, Ordering::Relaxed)
     }
 
     fn reset_to(&mut self, anchor: SettledChainAnchor, generation: &Weak<dyn Send + Sync>) {
         self.entries.clear();
-        self.lru.clear();
         self.total_bytes = 0;
         self.anchor = Some(anchor);
         self.anchor_generations.clear();
         self.adopt_generation(generation);
     }
 
-    fn get_touching(&mut self, height: BlockHeight) -> Option<ServedTreeState> {
-        let new_tick = self.allocate_tick();
-        let entry = self.entries.get_mut(&height)?;
-        self.lru.remove(&entry.tick);
-        entry.tick = new_tick;
-        self.lru.insert(new_tick, height);
+    fn get_touching(&self, height: BlockHeight) -> Option<ServedTreeState> {
+        let entry = self.entries.get(&height)?;
+        entry
+            .last_used
+            .store(self.allocate_tick(), Ordering::Relaxed);
         Some(entry.state.clone())
     }
 
@@ -297,8 +294,27 @@ impl SettledStates {
             .any(|generation| generation.as_ptr().addr() == addr)
     }
 
+    /// Fast read-only lookup for a live reader generation already adopted into
+    /// the current anchor.
+    ///
+    /// Because every adopted reader generation is immutable and
+    /// `anchor_generations` is cleared whenever `self.anchor` changes, a live
+    /// reader whose address is tracked is already guaranteed to match
+    /// `self.anchor`.
+    pub(super) fn cached_for_tracked_generation(
+        &self,
+        addr: usize,
+        height: BlockHeight,
+    ) -> Option<ServedTreeState> {
+        if !self.tracks_generation(addr) || !self.anchor.is_some_and(|anchor| anchor.covers(height))
+        {
+            return None;
+        }
+        self.get_touching(height)
+    }
+
     pub(super) fn cached_at_anchor(
-        &mut self,
+        &self,
         target: SettledChainAnchor,
         height: BlockHeight,
     ) -> Option<ServedTreeState> {
@@ -342,14 +358,17 @@ impl SettledStates {
             return;
         }
         if let Some(removed) = self.entries.remove(&height) {
-            self.lru.remove(&removed.tick);
             self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
         }
         while !self.entries.is_empty()
             && (self.entries.len() >= self.max_entries
                 || self.total_bytes.saturating_add(bytes) > self.max_bytes)
         {
-            let Some((_, oldest_height)) = self.lru.pop_first() else {
+            let Some((&oldest_height, _)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
+            else {
                 break;
             };
             if let Some(evicted) = self.entries.remove(&oldest_height) {
@@ -358,9 +377,14 @@ impl SettledStates {
         }
         let tick = self.allocate_tick();
         self.total_bytes = self.total_bytes.saturating_add(bytes);
-        self.lru.insert(tick, height);
-        self.entries
-            .insert(height, CachedEntry { state, bytes, tick });
+        self.entries.insert(
+            height,
+            CachedEntry {
+                state,
+                bytes,
+                last_used: AtomicU64::new(tick),
+            },
+        );
     }
 
     #[cfg(test)]

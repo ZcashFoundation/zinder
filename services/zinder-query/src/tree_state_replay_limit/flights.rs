@@ -10,7 +10,7 @@ use futures_util::{
     FutureExt as _,
     future::{BoxFuture, Shared},
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::{
     sync::{OwnedSemaphorePermit, watch},
     time::Instant,
@@ -54,6 +54,10 @@ impl ReplayKey {
         }
     }
 
+    pub(crate) const fn height(&self) -> BlockHeight {
+        self.height
+    }
+
     pub(super) fn settled_anchor(&self) -> SettledChainAnchor {
         SettledChainAnchor {
             network: self.epoch.network,
@@ -70,7 +74,6 @@ impl ReplayKey {
 #[derive(Default, Debug)]
 pub(super) struct Flights {
     running: HashMap<(ReplayKey, usize), Weak<Flight>>,
-    settled: SettledStates,
     active_verify: Option<ActiveAnchorVerify>,
 }
 
@@ -132,7 +135,7 @@ impl ReadyState {
 }
 
 fn spawn_anchor_verify_task(
-    flights: Arc<Mutex<Flights>>,
+    (flights, settled): (Arc<Mutex<Flights>>, Arc<RwLock<SettledStates>>),
     (prior, target): (SettledChainAnchor, SettledChainAnchor),
     task_generation: ReaderGeneration,
     reader: Arc<dyn CanonicalReader>,
@@ -157,7 +160,7 @@ fn spawn_anchor_verify_task(
             {
                 let mut state = flights.lock();
                 if let Ok(extends_prior) = outcome {
-                    state.settled.apply_extension_result(
+                    settled.write().apply_extension_result(
                         (prior, target),
                         &task_generation,
                         extends_prior,
@@ -211,7 +214,11 @@ impl TreeStateReplayLimit {
         use std::ops::ControlFlow;
 
         let mut state = self.flights.lock();
-        match state.settled.classify_lookup(target, generation, height) {
+        let step = self
+            .settled
+            .write()
+            .classify_lookup(target, generation, height);
+        match step {
             LookupStep::Hit(cached) => {
                 drop(state);
                 drop(held_permit);
@@ -247,7 +254,7 @@ impl TreeStateReplayLimit {
                     });
                     drop(state);
                     spawn_anchor_verify_task(
-                        Arc::clone(&self.flights),
+                        (Arc::clone(&self.flights), Arc::clone(&self.settled)),
                         (prior, target),
                         generation.clone(),
                         Arc::clone(reader),
@@ -330,9 +337,8 @@ impl TreeStateReplayLimit {
             Some(Err(err)) => Err(shared_read_error(err)),
             Some(Ok(false)) => Ok(None),
             Some(Ok(true)) => Ok(self
-                .flights
-                .lock()
                 .settled
+                .write()
                 .cached_after_extension(target, generation, key.height)),
             None => Err(QueryError::BlockingTaskFailed {
                 reason: "settled anchor verification ended early".to_owned(),
@@ -342,20 +348,16 @@ impl TreeStateReplayLimit {
 
     pub(crate) fn cached_for_reader<T>(
         &self,
-        key: &ReplayKey,
+        height: BlockHeight,
+        visible_tip_height: BlockHeight,
         reader: &Arc<T>,
     ) -> Option<ReadyState> {
-        let mut flights = self.flights.lock();
-        if key.height > key.epoch.visible_tip_height
-            || !flights
-                .settled
-                .tracks_generation(Arc::as_ptr(reader).addr())
-        {
+        if height > visible_tip_height {
             return None;
         }
-        flights
-            .settled
-            .cached_at_anchor(key.settled_anchor(), key.height)
+        self.settled
+            .read()
+            .cached_for_tracked_generation(Arc::as_ptr(reader).addr(), height)
             .map(ReadyState::Cached)
     }
 
@@ -402,10 +404,11 @@ impl TreeStateReplayLimit {
     ) -> Result<Selection, QueryError> {
         let id = (*key, generation.addr());
         let mut flights = self.flights.lock();
-        if let Some(state) = flights
+        let cached = self
             .settled
-            .cached_at_anchor(key.settled_anchor(), key.height)
-        {
+            .read()
+            .cached_at_anchor(key.settled_anchor(), key.height);
+        if let Some(state) = cached {
             return Ok(Selection::Ready(ReadyState::Cached(state)));
         }
         if let Some(flight) = flights.running.get(&id).and_then(Weak::upgrade)
@@ -418,7 +421,7 @@ impl TreeStateReplayLimit {
         let flight = Arc::new(Flight {
             key: *key,
             generation: generation.clone(),
-            registry: self.flights.clone(),
+            settled: Arc::clone(&self.settled),
             cancelled: Arc::default(),
             admission,
             state: Mutex::new(FlightState {
@@ -601,7 +604,7 @@ struct Flight {
     key: ReplayKey,
     // Keep the allocation address and ownership context without pinning its storage reader.
     generation: ReaderGeneration,
-    registry: Arc<Mutex<Flights>>,
+    settled: Arc<RwLock<SettledStates>>,
     cancelled: Arc<AtomicBool>,
     admission: Admission,
     state: Mutex<FlightState>,
@@ -759,7 +762,7 @@ impl Subscription {
         };
         super::record_tree_state_read(flight.key.height, source);
         if state.block_id().height == flight.key.height {
-            flight.registry.lock().settled.remember(
+            flight.settled.write().remember(
                 flight.key.settled_anchor(),
                 &flight.generation,
                 &state,

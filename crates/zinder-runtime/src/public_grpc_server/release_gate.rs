@@ -41,6 +41,7 @@
 //! window, so the gate sends no probe there.
 
 use std::{
+    cell::Cell,
     mem,
     pin::Pin,
     sync::{
@@ -59,14 +60,35 @@ use super::{
     RELEASE_PROBES_METRIC, stream_reset::TransportReset, wallet_rpc_metrics::RpcCompletion,
 };
 
+/// Largest single-frame response whose end is already ready that may bypass the
+/// HTTP/2 probe byte.
+///
+/// With [`super::MAX_CONCURRENT_STREAMS_PER_CONNECTION`] (128) concurrent
+/// streams, even a client that zeroes its stream window on every slot can pin
+/// at most `128 * 8 KiB = 1 MiB`, matching [`super::HTTP2_MAX_SEND_BUF_SIZE`]
+/// for a single stream. Larger responses, multi-frame streams, and any response
+/// whose producer pauses still send the probe byte so stalled streams reset and
+/// shutdown replaces terminal statuses held behind flow control.
+const UNGATED_UNARY_MAX_BYTES: usize = 8 * 1024;
+
 tokio::task_local! {
-    static LOOKING_AHEAD: ();
+    /// Present while the gate is looking ahead past a DATA frame; records
+    /// whether an inner [`super::call_termination`] body held terminal trailers
+    /// (or a shutdown termination) instead of returning them during look-ahead.
+    static LOOKING_AHEAD: Cell<bool>;
 }
 
 /// Terminal trailers must stay in the tracked call until preceding DATA
 /// departs. This also keeps them replaceable before gRPC-Web encodes them.
 pub(super) fn looking_ahead() -> bool {
-    LOOKING_AHEAD.try_with(|()| ()).is_ok()
+    LOOKING_AHEAD.try_with(|_| ()).is_ok()
+}
+
+/// Records that an inner tracked call saw terminal trailers (or shutdown
+/// termination) during a look-ahead poll, so the gate knows the producer did
+/// not merely yield.
+pub(super) fn note_held_end() {
+    let _ = LOOKING_AHEAD.try_with(|saw_held_end| saw_held_end.set(true));
 }
 
 /// How a listener gates the responses it sends.
@@ -136,6 +158,9 @@ struct ReleaseGatedBody {
     /// Whether the gate already waited one turn for the producer after the
     /// frame it holds in `ahead`.
     waited_for_producer: bool,
+    /// Whether the gate has already handed at least one DATA frame to the
+    /// transport.
+    sent_any_data: bool,
     gate: ReleaseGate,
     transport: TransportReset,
     /// Reports when h2 has encoded the probe last handed out.
@@ -214,6 +239,7 @@ impl ReleaseGatedBody {
             probe: None,
             next: Next::Unknown,
             waited_for_producer: false,
+            sent_any_data: false,
             gate,
             transport,
             departure: None,
@@ -240,6 +266,7 @@ impl ReleaseGatedBody {
     /// Hands `chunk` to the transport, which times how long it holds it.
     fn hand_out(&mut self, chunk: Bytes) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
         self.waited_for_producer = false;
+        self.sent_any_data = true;
         self.transport.took_piece();
         Poll::Ready(Some(Ok(Frame::data(chunk))))
     }
@@ -285,9 +312,18 @@ impl ReleaseGatedBody {
             },
         };
         // Look at what follows `current` before handing it out.
-        match LOOKING_AHEAD.sync_scope((), || self.poll_inner(cx)) {
+        let (lookahead, saw_held_end) = LOOKING_AHEAD.sync_scope(Cell::new(false), || {
+            let outcome = self.poll_inner(cx);
+            (outcome, LOOKING_AHEAD.with(Cell::get))
+        });
+        let small_single_frame = !self.sent_any_data && current.len() <= UNGATED_UNARY_MAX_BYTES;
+        match lookahead {
             Poll::Ready(Polled::Data(next)) => {
                 self.ahead = Some(next);
+                return self.hand_out(current);
+            }
+            Poll::Ready(Polled::End(trailers)) if small_single_frame => {
+                self.next = Next::End(trailers);
                 return self.hand_out(current);
             }
             Poll::Ready(Polled::End(trailers)) => self.next = Next::End(trailers),
@@ -298,6 +334,17 @@ impl ReleaseGatedBody {
                 self.next = Next::Failed(status);
                 return self.hand_out(current);
             }
+            // The inner tracked call already received terminal trailers (or a
+            // shutdown termination) and held them only because we were looking
+            // ahead. For a small single-frame response, hand out the data whole
+            // so the transport immediately polls and emits those trailers in
+            // the same turn without a probe split or task reschedule.
+            Poll::Pending if saw_held_end && small_single_frame => {
+                return self.hand_out(current);
+            }
+            // Terminal trailers are held behind a large or multi-frame payload:
+            // skip the producer-yield reschedule and probe the window at once.
+            Poll::Pending if saw_held_end => self.next = Next::Paused,
             // A producer that only yielded is ready on the next turn.
             Poll::Pending if !self.waited_for_producer => {
                 self.waited_for_producer = true;
@@ -451,6 +498,98 @@ mod tests {
         assert_eq!(data, Bytes::from_static(b"message"));
         let error = frames.1.ok_or("the body ended without its error")?.err();
         assert_eq!(error.map(|status| status.code()), Some(Code::Internal));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn small_single_frame_unary_response_skips_probe_and_keeps_whole_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = Bytes::from(vec![0xAB_u8; 1_653]);
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let inner = Body::new(StreamBody::new(tokio_stream::iter([
+            Ok::<_, Status>(Frame::data(payload.clone())),
+            Ok(Frame::trailers(trailers)),
+        ])));
+        let frames = resettable(
+            async move {
+                let mut body = ReleaseGate {
+                    probe_window: true,
+                    observer: GateObserver::default(),
+                }
+                .apply(http::Response::new(inner))
+                .into_body();
+                let mut collected = Vec::new();
+                while let Some(frame) = body.frame().await {
+                    collected.push(frame);
+                }
+                collected
+            },
+            Duration::from_secs(60),
+        )
+        .await
+        .ok_or("the transport was reset")?;
+        assert_eq!(frames.len(), 2, "expected 1 whole DATA frame + 1 trailers");
+        let first = frames[0]
+            .as_ref()
+            .map_err(ToString::to_string)?
+            .data_ref()
+            .ok_or("expected DATA frame first")?;
+        assert_eq!(first, &payload);
+        assert!(
+            frames[1]
+                .as_ref()
+                .map_err(ToString::to_string)?
+                .is_trailers()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn large_single_frame_unary_response_still_splits_probe_byte()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = Bytes::from(vec![0xCD_u8; UNGATED_UNARY_MAX_BYTES + 1]);
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let inner = Body::new(StreamBody::new(tokio_stream::iter([
+            Ok::<_, Status>(Frame::data(payload.clone())),
+            Ok(Frame::trailers(trailers)),
+        ])));
+        let (data_lengths, trailer_count) = resettable(
+            async move {
+                let mut body = ReleaseGate {
+                    probe_window: true,
+                    observer: GateObserver::default(),
+                }
+                .apply(http::Response::new(inner))
+                .into_body();
+                let mut data_lengths = Vec::new();
+                let mut trailer_count = 0_usize;
+                while let Some(frame) = body.frame().await {
+                    let Ok(frame) = frame else {
+                        return Err("unexpected error frame");
+                    };
+                    if let Some(chunk) = frame.data_ref() {
+                        data_lengths.push(chunk.len());
+                    } else if frame.is_trailers() {
+                        trailer_count += 1;
+                    }
+                    // Drop the frame before polling again so a held probe byte
+                    // departs as h2 would drop it after encoding.
+                    drop(frame);
+                }
+                Ok((data_lengths, trailer_count))
+            },
+            Duration::from_secs(60),
+        )
+        .await
+        .ok_or("the transport was reset")??;
+        assert_eq!(
+            data_lengths,
+            vec![payload.len() - 1, 1],
+            "expected DATA(len-1) + 1-byte probe"
+        );
+        assert_eq!(trailer_count, 1);
         Ok(())
     }
 }

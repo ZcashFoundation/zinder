@@ -50,6 +50,7 @@ impl Drop for CountedView {
 struct FakeReads {
     tip: Arc<AtomicU32>,
     publisher: Arc<watch::Sender<()>>,
+    subscriptions: Arc<AtomicUsize>,
     live_views: Arc<AtomicUsize>,
     fail_captures: Arc<AtomicBool>,
 }
@@ -59,9 +60,14 @@ impl FakeReads {
         Self {
             tip: Arc::new(AtomicU32::new(tip)),
             publisher: Arc::new(watch::channel(()).0),
+            subscriptions: Arc::new(AtomicUsize::new(0)),
             live_views: Arc::new(AtomicUsize::new(0)),
             fail_captures: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn subscriptions(&self) -> usize {
+        self.subscriptions.load(Ordering::SeqCst)
     }
 
     /// Moves the tip and publishes the new view.
@@ -108,6 +114,7 @@ impl CompactBlockReads for FakeReads {
     }
 
     fn subscribe_publications(&self) -> Option<watch::Receiver<()>> {
+        self.subscriptions.fetch_add(1, Ordering::SeqCst);
         Some(self.publisher.subscribe())
     }
 
@@ -664,5 +671,40 @@ async fn await_height_until_respects_enabled_state_and_deadline_cap() -> Result<
         waiting.await??,
         (TipWaitProgress::Reached, Duration::from_millis(400))
     );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn fast_path_at_or_below_tip_and_beyond_window_skips_publication_subscription() -> Result<()>
+{
+    let reads = FakeReads::at_tip(9);
+    let wait = tip_wait(2, 8)?;
+
+    assert_eq!(
+        wait.await_height_until(&reads, METHOD, BlockHeight::new(9), None)
+            .await?,
+        TipWaitProgress::Reached
+    );
+    assert_eq!(
+        wait.await_height_until(&reads, METHOD, BlockHeight::new(3), None)
+            .await?,
+        TipWaitProgress::Reached
+    );
+    assert_eq!(
+        wait.await_height_until(&reads, METHOD, BlockHeight::new(12), None)
+            .await?,
+        TipWaitProgress::NotReached
+    );
+    assert_eq!(
+        reads.subscriptions(),
+        0,
+        "heights at/below tip or outside the wait window must not subscribe to publications"
+    );
+
+    let waiting = spawn_wait(&wait, &reads, 10);
+    settle().await;
+    assert_eq!(reads.subscriptions(), 1);
+    reads.publish_tip(10);
+    waiting.await??;
     Ok(())
 }

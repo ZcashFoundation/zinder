@@ -171,8 +171,18 @@ impl TipWait {
         if self.max_wait.is_zero() {
             return Ok(TipWaitProgress::NotReached);
         }
-        // Subscribe before the tip is read, so a publication between the two
-        // still wakes the wait.
+        // Fast path: check the current tip before subscribing to publications.
+        // Nearly all requests target heights at or below the visible tip and
+        // never need a watch subscription.
+        let tip = visible_tip_height(reads).await?;
+        if requested <= tip {
+            return Ok(TipWaitProgress::Reached);
+        }
+        if self.blocks_ahead(requested, tip).is_none() {
+            return Ok(TipWaitProgress::NotReached);
+        }
+        // Slow path: subscribe before re-reading the tip, so a publication
+        // between the two still wakes the wait.
         let Some(mut publications) = reads.subscribe_publications() else {
             return Ok(TipWaitProgress::NotReached);
         };

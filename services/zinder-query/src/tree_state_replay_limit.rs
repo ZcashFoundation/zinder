@@ -4,10 +4,11 @@
 mod flights;
 mod settled_cache;
 pub(crate) use flights::ReadyState;
-pub(crate) use flights::{ReplayKey, Selection, read_missing_height};
+pub(crate) use flights::{ReplayKey, Selection, TakeReplayPermit, read_missing_height};
 pub(crate) use settled_cache::ReaderGeneration;
 
 use std::{
+    borrow::Cow,
     num::NonZeroU32,
     sync::{
         Arc,
@@ -16,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use parking_lot::RwLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zinder_core::{BlockHeight, ChainTipMetadata};
 use zinder_store::{ServedTreeState, TreeStateReplayOutcome};
@@ -89,7 +91,14 @@ pub const MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT: NonZeroU32 = NonZeroU32::MIN.s
 /// full. A waiter that is dropped gives up its place at once.
 #[derive(Clone, Debug)]
 pub(crate) struct TreeStateReplayLimit {
+    /// Active replay flights and anchor verification state.
+    ///
+    /// Lock order: whenever both `flights` and `settled` are locked, always
+    /// acquire `flights` before `settled`.
     flights: Arc<parking_lot::Mutex<flights::Flights>>,
+    /// Bounded LRU cache of settled replayed tree states; read-locked on warm
+    /// cache hits without contending on `flights`.
+    settled: Arc<RwLock<settled_cache::SettledStates>>,
     anchor_verify_slot: Arc<Semaphore>,
     slots: Arc<Semaphore>,
     max_replays: NonZeroU32,
@@ -118,6 +127,7 @@ impl TreeStateReplayLimit {
             .min(Semaphore::MAX_PERMITS);
         Self {
             flights: Arc::default(),
+            settled: Arc::default(),
             anchor_verify_slot: Arc::new(Semaphore::new(1)),
             slots: Arc::new(Semaphore::new(permits)),
             max_replays,
@@ -342,10 +352,27 @@ fn record_replay_duration(height: BlockHeight, replay_duration: Duration) {
         .record(replay_duration.as_secs_f64());
 }
 
+/// Pre-formatted labels for height bands `0` through `10_000_000` in
+/// [`HEIGHT_BAND_BLOCKS`]-block steps, avoiding per-request heap allocation on
+/// the `GetTreeState` metric hot path.
+const STATIC_HEIGHT_BANDS: [&str; 41] = [
+    "0", "250000", "500000", "750000", "1000000", "1250000", "1500000", "1750000", "2000000",
+    "2250000", "2500000", "2750000", "3000000", "3250000", "3500000", "3750000", "4000000",
+    "4250000", "4500000", "4750000", "5000000", "5250000", "5500000", "5750000", "6000000",
+    "6250000", "6500000", "6750000", "7000000", "7250000", "7500000", "7750000", "8000000",
+    "8250000", "8500000", "8750000", "9000000", "9250000", "9500000", "9750000", "10000000",
+];
+
 /// The `height_band` label of `height`: the first height of its
 /// [`HEIGHT_BAND_BLOCKS`]-block band.
-fn height_band(height: BlockHeight) -> String {
-    (height.value() - height.value() % HEIGHT_BAND_BLOCKS).to_string()
+fn height_band(height: BlockHeight) -> Cow<'static, str> {
+    let band_index = height.value() / HEIGHT_BAND_BLOCKS;
+    if let Ok(index) = usize::try_from(band_index)
+        && let Some(&label) = STATIC_HEIGHT_BANDS.get(index)
+    {
+        return Cow::Borrowed(label);
+    }
+    Cow::Owned((band_index * HEIGHT_BAND_BLOCKS).to_string())
 }
 
 /// Note commitments appended to each pool to grow `seed_trees` into

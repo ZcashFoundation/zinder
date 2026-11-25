@@ -47,7 +47,9 @@ use tonic::{Status, body::Body};
 use tower::{Layer, Service};
 
 use super::{
-    CLIENT_STREAMING_METHOD_PATHS, release_gate::looking_ahead, wallet_rpc_metrics::RpcCompletion,
+    CLIENT_STREAMING_METHOD_PATHS,
+    release_gate::{looking_ahead, note_held_end},
+    wallet_rpc_metrics::RpcCompletion,
 };
 use crate::{ReadinessCause, not_ready_status};
 
@@ -526,6 +528,7 @@ impl<F: Send> CallBody for OpenCall<F> {
                     if frame.is_trailers() {
                         if looking_ahead() {
                             *state = CallState::HeldTrailers(frame);
+                            note_held_end();
                             return Poll::Pending;
                         }
                         *state = CallState::Finished;
@@ -537,7 +540,10 @@ impl<F: Send> CallBody for OpenCall<F> {
                     ended
                 }
             },
-            CallState::HeldTrailers(_) | CallState::Terminated if looking_ahead() => Poll::Pending,
+            CallState::HeldTrailers(_) | CallState::Terminated if looking_ahead() => {
+                note_held_end();
+                Poll::Pending
+            }
             CallState::HeldTrailers(trailers) => {
                 let trailers = mem::replace(trailers, Frame::trailers(http::HeaderMap::new()));
                 *state = CallState::Finished;

@@ -85,12 +85,14 @@ impl LightwalletdGrpcAdapter<NodeBackedLightWallet> {
         reads: ForwardedReadLimit,
     ) -> Self {
         let readers = slot.clone();
+        let current_check = slot.clone();
         let query = LightWalletNodeQuery::new(
             move || readers.capture(),
             node,
             replay_wait,
             replay_waiters_per_slot,
-        );
+        )
+        .with_current_reader_check(move |reader| current_check.is_current(reader));
         Self::new(NodeBackedLightWallet { slot, query, reads })
     }
 
@@ -1313,12 +1315,16 @@ impl compact_tx_streamer_server::CompactTxStreamer
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
-        if let RequestedBlock::Height(height) = block {
+        let mut reader = self.query_api.slot.capture();
+        if let RequestedBlock::Height(height) = block
+            && height > reader.chain_epoch().visible_tip_height
+        {
+            drop(reader);
             self.block_methods
                 .await_tip(&self.query_api.slot, "get_tree_state", height)
                 .await?;
+            reader = self.query_api.slot.capture();
         }
-        let reader = self.query_api.slot.capture();
         reject_genesis_tree_state(block, reader.network())?;
         let height = match block {
             RequestedBlock::Height(height) => height,

@@ -60,6 +60,21 @@ impl CanonicalReaderSlot {
         self.current.load_full()
     }
 
+    /// Returns whether `reader` is still the generation currently published in
+    /// this slot, without cloning or dropping its reference count.
+    #[must_use]
+    pub fn is_current(&self, reader: &Arc<RocksDbCanonicalReader>) -> bool {
+        let current = self.current.load();
+        Arc::ptr_eq(&current, reader)
+    }
+
+    /// Returns the visible tip height of the currently published reader without
+    /// cloning or dropping its reference count.
+    #[must_use]
+    pub fn peek_visible_tip_height(&self) -> zinder_core::BlockHeight {
+        self.current.load().chain_epoch().visible_tip_height
+    }
+
     /// Serves `reader` from now on and returns the reader it replaces, which
     /// requests that captured it may still hold.
     #[must_use]
@@ -83,6 +98,12 @@ impl CompactBlockReads for CanonicalReaderSlot {
 
     fn subscribe_publications(&self) -> Option<watch::Receiver<()>> {
         Some(self.publication.subscribe())
+    }
+
+    fn peek_visible_tip_height(
+        &self,
+    ) -> impl Future<Output = Result<zinder_core::BlockHeight, Status>> + Send {
+        std::future::ready(Ok(Self::peek_visible_tip_height(self)))
     }
 
     fn range_fence(

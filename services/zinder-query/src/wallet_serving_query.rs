@@ -1444,24 +1444,27 @@ where
             let mut deadline = None;
             let mut carried = None;
             loop {
-                let request_deadline =
-                    *deadline.get_or_insert_with(|| self.tree_state_replays.deadline());
+                let existing = deadline;
                 let selected = serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
                     let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                    let key = ReplayKey::new(height, pair.canonical());
-                    if let Some(ready) = self.tree_state_replays.cached_for_reader(&key, &pair) {
+                    if let Some(ready) = self.tree_state_replays.cached_for_reader(
+                        height,
+                        epoch.visible_tip_height,
+                        &pair,
+                    ) {
                         return Ok(ControlFlow::Break((epoch, ready)));
                     }
+                    let req_deadline =
+                        existing.unwrap_or_else(|| self.tree_state_replays.deadline());
+                    let key = ReplayKey::new(height, pair.canonical());
                     let generation = Arc::downgrade(&pair);
                     let slot = self.serving_pair_slot.clone();
-                    let weak_for_check = generation.clone();
-                    let cache_generation = ReaderGeneration::live(&generation, move || {
-                        slot.is_current_weak(&weak_for_check)
-                    });
-                    let reader = pair.canonical_arc();
+                    let weak = generation.clone();
+                    let cache_gen =
+                        ReaderGeneration::live(&generation, move || slot.is_current_weak(&weak));
                     if let Some(ready) = self
                         .tree_state_replays
-                        .ready_state(&key, &cache_generation, &reader, request_deadline)
+                        .ready_state(&key, &cache_gen, &pair.canonical_arc(), req_deadline)
                         .await?
                     {
                         return Ok(ControlFlow::Break((epoch, ready)));
@@ -1470,20 +1473,22 @@ where
                         epoch,
                         key,
                         generation,
-                        cache_generation,
+                        cache_gen,
+                        req_deadline,
                     )))
                 })
                 .await?;
-                let (epoch, key, generation, cache_generation) = match selected {
+                let (epoch, key, generation, cache_gen, req_deadline) = match selected {
                     ControlFlow::Break((epoch, ready)) => {
                         return Ok(tree_state_response(epoch, ready.serve()));
                     }
                     ControlFlow::Continue(missing) => missing,
                 };
+                let req_deadline = *deadline.get_or_insert(req_deadline);
                 let subscription = match self.tree_state_replays.select(
                     &key,
-                    &cache_generation,
-                    request_deadline,
+                    &cache_gen,
+                    req_deadline,
                     carried.take(),
                 )? {
                     Selection::Ready(state) => {

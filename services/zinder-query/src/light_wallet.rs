@@ -38,11 +38,15 @@ impl VerifiedNodeTarget {
     }
 }
 
+type ReaderCapture = Arc<dyn Fn() -> Arc<RocksDbCanonicalReader> + Send + Sync>;
+type CurrentReaderCheck = Arc<dyn Fn(&Arc<RocksDbCanonicalReader>) -> bool + Send + Sync>;
+
 /// Reads for a node-backed lightwalletd server with one canonical store and one node.
 #[derive(Clone)]
 pub struct LightWalletNodeQuery {
     source: ZebraJsonRpcSource,
-    capture: Arc<dyn Fn() -> Arc<RocksDbCanonicalReader> + Send + Sync>,
+    capture: ReaderCapture,
+    is_current: Option<CurrentReaderCheck>,
     replays: TreeStateReplayLimit,
     verification: Arc<crate::node_broadcast::LightWalletNodeVerification>,
 }
@@ -58,11 +62,24 @@ impl LightWalletNodeQuery {
     ) -> Self {
         Self {
             capture: Arc::new(capture),
+            is_current: None,
             source,
             verification: Arc::default(),
             replays: TreeStateReplayLimit::for_available_parallelism(wait)
                 .with_waiters_per_slot(waiters_per_slot),
         }
+    }
+
+    /// Uses a lightweight current-generation predicate (such as an `ArcSwap`
+    /// guard pointer check) to avoid cloning and dropping the current reader on
+    /// settled tree-state cache hits.
+    #[must_use]
+    pub fn with_current_reader_check(
+        mut self,
+        is_current: impl Fn(&Arc<RocksDbCanonicalReader>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.is_current = Some(Arc::new(is_current));
+        self
     }
 
     /// Verifies the configured node against the schedule and tip of `target`,
@@ -234,12 +251,52 @@ impl LightWalletNodeQuery {
 
     fn cached_on_current_reader(
         &self,
-        key: &ReplayKey,
+        height: BlockHeight,
+        visible_tip_height: BlockHeight,
         reader: &Arc<RocksDbCanonicalReader>,
     ) -> Option<ReadyState> {
         self.replays
-            .cached_for_reader(key, reader)
-            .filter(|_| Arc::ptr_eq(reader, &(self.capture)()))
+            .cached_for_reader(height, visible_tip_height, reader)
+            .filter(|_| {
+                self.is_current.as_ref().map_or_else(
+                    || Arc::ptr_eq(reader, &(self.capture)()),
+                    |check| check(reader),
+                )
+            })
+    }
+
+    async fn ready_or_select(
+        &self,
+        reader: &Arc<RocksDbCanonicalReader>,
+        (key, cache_generation): (&ReplayKey, &ReaderGeneration),
+        request_deadline: tokio::time::Instant,
+        carried: &mut Option<crate::tree_state_replay_limit::TakeReplayPermit>,
+    ) -> Result<Result<ReadyState, (Selection, BlockId)>, QueryError> {
+        let canonical = Arc::clone(reader) as Arc<dyn CanonicalReader>;
+        let ready = self
+            .replays
+            .ready_state(key, cache_generation, &canonical, request_deadline)
+            .await?;
+        drop(canonical);
+        match ready {
+            Some(ready @ ReadyState::Stored(_)) => Ok(Ok(ready)),
+            Some(ReadyState::Cached(state)) => {
+                let block = state.block_id();
+                Ok(Err((Selection::Ready(ReadyState::Cached(state)), block)))
+            }
+            None => {
+                let height = key.height();
+                let block = reader
+                    .block_header_at(height)
+                    .await
+                    .map_err(QueryError::canonical_read)?
+                    .ok_or(QueryError::BlockNotInBestChain)?;
+                let selected =
+                    self.replays
+                        .select(key, cache_generation, request_deadline, carried.take())?;
+                Ok(Err((selected, BlockId::new(height, block.block_hash))))
+            }
+        }
     }
 
     /// Reads a stored or reconstructed frontier at a height, or the latest checkpoint when unset.
@@ -254,41 +311,26 @@ impl LightWalletNodeQuery {
         let mut deadline = None;
         let mut carried = None;
         loop {
-            let request_deadline = *deadline.get_or_insert_with(|| self.replays.deadline());
             let epoch = reader.chain_epoch();
-            let key = ReplayKey::new(height, reader.as_ref());
-            if let Some(ready) = self.cached_on_current_reader(&key, &reader) {
+            if let Some(ready) =
+                self.cached_on_current_reader(height, epoch.visible_tip_height, &reader)
+            {
                 return Ok(tree_state_response(epoch, ready.serve()));
             }
+            let request_deadline = *deadline.get_or_insert_with(|| self.replays.deadline());
+            let key = ReplayKey::new(height, reader.as_ref());
             let (generation, cache_generation) = self.live_generation(&reader);
-            let ready = {
-                let canonical_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;
-                self.replays
-                    .ready_state(&key, &cache_generation, &canonical_reader, request_deadline)
-                    .await?
-            };
-            let (selected, expected) = match ready {
-                Some(ready @ ReadyState::Stored(_)) => {
-                    return Ok(tree_state_response(epoch, ready.serve()));
-                }
-                Some(ReadyState::Cached(state)) => {
-                    let block = state.block_id();
-                    (Selection::Ready(ReadyState::Cached(state)), block)
-                }
-                None => {
-                    let block = reader
-                        .block_header_at(height)
-                        .await
-                        .map_err(QueryError::canonical_read)?
-                        .ok_or(QueryError::BlockNotInBestChain)?;
-                    let selected = self.replays.select(
-                        &key,
-                        &cache_generation,
-                        request_deadline,
-                        carried.take(),
-                    )?;
-                    (selected, BlockId::new(height, block.block_hash))
-                }
+            let (selected, expected) = match self
+                .ready_or_select(
+                    &reader,
+                    (&key, &cache_generation),
+                    request_deadline,
+                    &mut carried,
+                )
+                .await?
+            {
+                Ok(ready) => return Ok(tree_state_response(epoch, ready.serve())),
+                Err(pending) => pending,
             };
             let subscription = match selected {
                 Selection::Ready(state) => {
@@ -309,20 +351,19 @@ impl LightWalletNodeQuery {
             reader = (self.capture)();
             if !generation.ptr_eq(&Arc::downgrade(&reader)) {
                 carried = subscription.carry(&slot);
-                drop(subscription);
-                drop(slot);
+                drop((subscription, slot));
                 if !retains_block(&reader, epoch, expected).await? {
                     return Err(QueryError::BlockNotInBestChain);
                 }
                 continue;
             }
-            let captured = reader.clone();
-            if let Some(state) = subscription
+            let captured = Arc::clone(&reader);
+            let replayed = subscription
                 .replay(slot, |cancelled| async move {
                     read_missing_height(captured.as_ref(), height, cancelled).await
                 })
-                .await?
-            {
+                .await?;
+            if let Some(state) = replayed {
                 return Ok(tree_state_response(epoch, state));
             }
         }

@@ -745,7 +745,7 @@ struct Receiving {
     /// client stream is reset. A handler that keeps polling the request, such
     /// as gRPC reflection, then sees it fail and drops it, which lets h2
     /// finish the stream's reset.
-    transport_reset: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
+    transport_reset: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     boundaries: MessageBoundaries,
 }
 
@@ -758,7 +758,7 @@ impl Receiving {
         Self {
             deadline: Box::pin(tokio::time::sleep(receive_timeout)),
             evicted: Box::pin(slot.evicted()),
-            transport_reset: transport_reset.map(|reset| Box::pin(reset.wait_for_reset())),
+            transport_reset: transport_reset.map(|reset| reset.wait_for_reset()),
             _slot: slot,
             boundaries: MessageBoundaries::default(),
         }
