@@ -156,10 +156,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. \
-                      Falls back to JSON-RPC mempool polling when unset or empty. An `https://` \
-                      URL negotiates TLS, configured by the `ZINDER_NODE__INDEXER_TLS__*` \
-                      variables; without them the node is verified against the system roots.",
+        description: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source \
+                      and required when `ingest.source = \"zebra-indexer-grpc\"` for binary \
+                      `GetBlock` block reads. Falls back to JSON-RPC mempool polling when unset \
+                      or empty. An `https://` URL negotiates TLS, configured by the \
+                      `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified \
+                      against the system roots.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
@@ -1529,10 +1531,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Required,
         sensitive: false,
-        description: "Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the \
-                      choice is a writer-private implementation decision: `[node]` describes the \
-                      upstream node itself, `[ingest].source` describes which adapter ingest \
-                      uses to talk to it. See [ADR-0006](../adrs/0006-node-source-boundary.md).",
+        description: "Source-adapter selector (`\"zebra-json-rpc\"` or `\"zebra-indexer-grpc\"`; \
+                      default `\"zebra-json-rpc\"`). Lives on `[ingest]` (not `[node]`) because \
+                      the choice is a writer-private implementation decision: `[node]` describes \
+                      the upstream node itself, `[ingest].source` describes which adapter ingest \
+                      uses to talk to it. Selecting `\"zebra-indexer-grpc\"` requires \
+                      `indexer_grpc_addr` on `[node]` and every `[node_fallbacks.N]`. See \
+                      [ADR-0006](../adrs/0006-node-source-boundary.md).",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__EXPLORER_VIEWS",

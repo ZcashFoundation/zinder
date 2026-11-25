@@ -6,14 +6,18 @@ mod tree_hashing;
 pub(crate) mod watermark;
 
 use std::{
+    collections::BTreeMap,
     num::{NonZeroU32, NonZeroU64},
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use futures_util::{
     Stream, StreamExt,
-    stream::{self, BoxStream},
+    future::BoxFuture,
+    stream::{self, BoxStream, FuturesUnordered},
 };
 use metrics::Histogram;
 use parking_lot::Mutex;
@@ -873,41 +877,277 @@ where
             .unwrap_or(usize::MAX)
             .max(1);
     let activations = Arc::clone(&config.network_upgrade_activations);
-    admit_source_blocks(
+    let admitted_blocks = admit_source_blocks(
         source_chunks,
         prepare_memory,
         prepare_memory_permits,
         build_plan.network(),
-    )
-    .map(move |admitted_source_block| {
-        let activations = Arc::clone(&activations);
-        async move {
-            let AdmittedSourceBlock {
-                source_block,
-                memory_permit,
-            } = admitted_source_block?;
-            let prepared = tokio::task::spawn_blocking(move || {
-                prepare_canonical_block_for_retention(
-                    &source_block,
-                    &activations,
-                    raw_blob_retention,
-                )
-                .map_err(IngestError::from)
-            })
-            .await
-            .map_err(|join_error| CanonicalConstructionError::Source {
-                source: IngestError::BlockingTaskFailed {
-                    reason: join_error.to_string(),
-                },
-            })?
-            .map_err(|source| CanonicalConstructionError::Source { source })?;
-            Ok(QueuedPreparedBlock {
-                prepared,
-                memory_permit,
-            })
-        }
+    );
+    UnorderedPreparedBlockStream::new(admitted_blocks, prepare_concurrency, move |admitted| {
+        prepare_admitted_source_block(admitted, Arc::clone(&activations), raw_blob_retention)
     })
-    .buffered(prepare_concurrency)
+}
+
+const BLOCK_PREPARE_STAGE_LABEL: &str = "block_prepare";
+
+async fn prepare_admitted_source_block(
+    admitted: AdmittedSourceBlock,
+    activations: Arc<NetworkUpgradeActivations>,
+    raw_blob_retention: RawBlobRetention,
+) -> Result<QueuedPreparedBlock, CanonicalConstructionError> {
+    let AdmittedSourceBlock {
+        source_block,
+        memory_permit,
+    } = admitted;
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_canonical_block_for_retention(&source_block, &activations, raw_blob_retention)
+            .map_err(IngestError::from)
+    })
+    .await
+    .map_err(|join_error| CanonicalConstructionError::Source {
+        source: IngestError::BlockingTaskFailed {
+            reason: join_error.to_string(),
+        },
+    })?
+    .map_err(|source| CanonicalConstructionError::Source { source })?;
+    Ok(QueuedPreparedBlock {
+        prepared,
+        memory_permit,
+    })
+}
+
+type PreparedBlockFuture = BoxFuture<
+    'static,
+    (
+        u64,
+        u64,
+        Result<QueuedPreparedBlock, CanonicalConstructionError>,
+    ),
+>;
+
+struct BufferedPreparedBlock {
+    outcome: Result<QueuedPreparedBlock, CanonicalConstructionError>,
+    retained_bytes: u64,
+}
+
+struct UnorderedPreparedBlockStream<Admitted, Preparer> {
+    admitted_blocks: Pin<Box<Admitted>>,
+    prepare_concurrency: usize,
+    preparer: Preparer,
+    in_flight: FuturesUnordered<PreparedBlockFuture>,
+    reorder_buffer: BTreeMap<u64, BufferedPreparedBlock>,
+    reorder_buffer_bytes: u64,
+    next_admit_seq: u64,
+    next_emit_seq: u64,
+    upstream_done: bool,
+    earliest_stop_seq: Option<u64>,
+    head_of_line_wait_started_at: Option<Instant>,
+    terminated: bool,
+}
+
+impl<Admitted, Preparer, Fut> UnorderedPreparedBlockStream<Admitted, Preparer>
+where
+    Admitted: Stream<Item = Result<AdmittedSourceBlock, CanonicalConstructionError>>,
+    Preparer: FnMut(AdmittedSourceBlock) -> Fut,
+    Fut: std::future::Future<Output = Result<QueuedPreparedBlock, CanonicalConstructionError>>
+        + Send
+        + 'static,
+{
+    fn new(admitted_blocks: Admitted, prepare_concurrency: usize, preparer: Preparer) -> Self {
+        Self {
+            admitted_blocks: Box::pin(admitted_blocks),
+            prepare_concurrency: prepare_concurrency.max(1),
+            preparer,
+            in_flight: FuturesUnordered::new(),
+            reorder_buffer: BTreeMap::new(),
+            reorder_buffer_bytes: 0,
+            next_admit_seq: 0,
+            next_emit_seq: 0,
+            upstream_done: false,
+            earliest_stop_seq: None,
+            head_of_line_wait_started_at: None,
+            terminated: false,
+        }
+    }
+
+    fn drain_ready_in_flight(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut progressed = false;
+        while let Poll::Ready(Some((seq, retained_bytes, outcome))) =
+            self.in_flight.poll_next_unpin(cx)
+        {
+            progressed = true;
+            if self.earliest_stop_seq.is_some_and(|stop| seq > stop) {
+                continue;
+            }
+            if outcome.is_err() {
+                self.record_stop_seq(seq);
+            }
+            let retained_bytes = if outcome.is_ok() { retained_bytes } else { 0 };
+            self.insert_buffered_outcome(seq, retained_bytes, outcome);
+        }
+        progressed
+    }
+
+    fn fill_in_flight(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut progressed = false;
+        while !self.upstream_done && self.in_flight.len() < self.prepare_concurrency {
+            match self.admitted_blocks.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(admitted))) => {
+                    progressed = true;
+                    let seq = self.next_admit_seq;
+                    self.next_admit_seq = self.next_admit_seq.saturating_add(1);
+                    let retained_bytes =
+                        u64::try_from(admitted.source_block.raw_block_bytes.capacity())
+                            .unwrap_or(u64::MAX);
+                    let prepare_future = (self.preparer)(admitted);
+                    self.in_flight.push(Box::pin(async move {
+                        let outcome = prepare_future.await;
+                        (seq, retained_bytes, outcome)
+                    }));
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    progressed = true;
+                    let seq = self.next_admit_seq;
+                    self.next_admit_seq = self.next_admit_seq.saturating_add(1);
+                    self.record_stop_seq(seq);
+                    self.insert_buffered_outcome(seq, 0, Err(error));
+                    break;
+                }
+                Poll::Ready(None) => {
+                    progressed = true;
+                    self.upstream_done = true;
+                    break;
+                }
+                Poll::Pending => break,
+            }
+        }
+        progressed
+    }
+
+    fn record_stop_seq(&mut self, seq: u64) {
+        self.upstream_done = true;
+        let next_stop = self
+            .earliest_stop_seq
+            .map_or(seq, |current| current.min(seq));
+        self.earliest_stop_seq = Some(next_stop);
+        let discarded = self.reorder_buffer.split_off(&next_stop.saturating_add(1));
+        for entry in discarded.into_values() {
+            self.reorder_buffer_bytes = self
+                .reorder_buffer_bytes
+                .saturating_sub(entry.retained_bytes);
+        }
+    }
+
+    fn insert_buffered_outcome(
+        &mut self,
+        seq: u64,
+        retained_bytes: u64,
+        outcome: Result<QueuedPreparedBlock, CanonicalConstructionError>,
+    ) {
+        self.reorder_buffer_bytes = self.reorder_buffer_bytes.saturating_add(retained_bytes);
+        self.reorder_buffer.insert(
+            seq,
+            BufferedPreparedBlock {
+                outcome,
+                retained_bytes,
+            },
+        );
+    }
+
+    fn take_next_ordered_outcome(
+        &mut self,
+    ) -> Option<Result<QueuedPreparedBlock, CanonicalConstructionError>> {
+        let buffered = self.reorder_buffer.remove(&self.next_emit_seq)?;
+        self.next_emit_seq = self.next_emit_seq.saturating_add(1);
+        self.reorder_buffer_bytes = self
+            .reorder_buffer_bytes
+            .saturating_sub(buffered.retained_bytes);
+        if let Some(started_at) = self.head_of_line_wait_started_at.take() {
+            metrics::histogram!(
+                "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds",
+                "stage" => BLOCK_PREPARE_STAGE_LABEL
+            )
+            .record(started_at.elapsed());
+        }
+        if buffered.outcome.is_err() {
+            self.terminate_and_clear();
+        }
+        Some(buffered.outcome)
+    }
+
+    fn terminate_and_clear(&mut self) {
+        self.terminated = true;
+        self.upstream_done = true;
+        self.reorder_buffer.clear();
+        self.reorder_buffer_bytes = 0;
+        self.in_flight = FuturesUnordered::new();
+        self.head_of_line_wait_started_at = None;
+    }
+
+    fn record_metrics(&mut self) {
+        if !self.reorder_buffer.is_empty() && !self.reorder_buffer.contains_key(&self.next_emit_seq)
+        {
+            self.head_of_line_wait_started_at
+                .get_or_insert_with(Instant::now);
+        }
+        watermark::record_queue_depth(
+            BLOCK_PREPARE_STAGE_LABEL,
+            self.in_flight
+                .len()
+                .saturating_add(self.reorder_buffer.len()),
+        );
+        watermark::record_reorder_buffer(
+            BLOCK_PREPARE_STAGE_LABEL,
+            self.reorder_buffer.len(),
+            self.reorder_buffer_bytes,
+        );
+    }
+}
+
+impl<Admitted, Preparer> Drop for UnorderedPreparedBlockStream<Admitted, Preparer> {
+    fn drop(&mut self) {
+        watermark::record_queue_depth(BLOCK_PREPARE_STAGE_LABEL, 0);
+        watermark::record_reorder_buffer(BLOCK_PREPARE_STAGE_LABEL, 0, 0);
+    }
+}
+
+impl<Admitted, Preparer, Fut> Stream for UnorderedPreparedBlockStream<Admitted, Preparer>
+where
+    Admitted: Stream<Item = Result<AdmittedSourceBlock, CanonicalConstructionError>>,
+    Preparer: FnMut(AdmittedSourceBlock) -> Fut + Unpin,
+    Fut: std::future::Future<Output = Result<QueuedPreparedBlock, CanonicalConstructionError>>
+        + Send
+        + 'static,
+{
+    type Item = Result<QueuedPreparedBlock, CanonicalConstructionError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+        loop {
+            let mut progressed = self.drain_ready_in_flight(cx);
+            if let Some(outcome) = self.take_next_ordered_outcome() {
+                if !self.terminated && self.fill_in_flight(cx) {
+                    let _ = self.drain_ready_in_flight(cx);
+                }
+                self.record_metrics();
+                return Poll::Ready(Some(outcome));
+            }
+            if self.fill_in_flight(cx) {
+                progressed = true;
+            }
+            if self.upstream_done && self.in_flight.is_empty() && self.reorder_buffer.is_empty() {
+                self.terminated = true;
+                self.record_metrics();
+                return Poll::Ready(None);
+            }
+            if !progressed {
+                self.record_metrics();
+                return Poll::Pending;
+            }
+        }
+    }
 }
 
 struct QueuedPreparedBlock {
@@ -1686,5 +1926,363 @@ mod tests {
                 }
             )
         );
+    }
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn test_source_block_with_capacity(height: u32, capacity: usize) -> zinder_source::SourceBlock {
+        let mut raw_bytes = Vec::with_capacity(capacity);
+        raw_bytes.push(1);
+        zinder_source::SourceBlock::new(
+            zinder_source::SourceBlockHeader {
+                network: zinder_core::Network::ZcashRegtest,
+                height: zinder_core::BlockHeight::new(height),
+                hash: zinder_core::BlockHash::from_bytes(
+                    [u8::try_from(height).unwrap_or(u8::MAX); 32],
+                ),
+                parent_hash: zinder_core::BlockHash::from_bytes([0_u8; 32]),
+                block_time_seconds: 1_700_000_000_u32.saturating_add(height),
+            },
+            raw_bytes,
+        )
+    }
+
+    fn test_prepared_block_at_height(
+        height: zinder_core::BlockHeight,
+    ) -> Result<super::PreparedCanonicalBlock, Box<dyn std::error::Error>> {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/z3-regtest-block-1.json"))?;
+        let raw_hex = fixture
+            .get("raw_block_hex")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("fixture missing raw_block_hex")?;
+        let raw_bytes = hex::decode(raw_hex)?;
+        let source_block = zinder_source::SourceBlock::from_raw_block_bytes(
+            zinder_core::Network::ZcashRegtest,
+            zinder_core::BlockHeight::new(1),
+            raw_bytes,
+        )?;
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let mut prepared = super::prepare_canonical_block_for_retention(
+            &source_block,
+            &activations,
+            super::RawBlobRetention::None,
+        )?;
+        prepared.facts.block_header.height = height;
+        Ok(prepared)
+    }
+
+    fn test_chunk_stream(
+        heights: &[u32],
+        raw_capacity: usize,
+    ) -> futures_util::stream::BoxStream<
+        'static,
+        Result<super::source_fetch::SourceBlockChunk, super::IngestError>,
+    > {
+        use futures_util::StreamExt;
+
+        let watermark = super::watermark::ByteWatermark::new(
+            "test_source_fetch",
+            NonZeroU64::new(1_024 * 1_024).unwrap_or(NonZeroU64::MIN),
+        );
+        let blocks = heights
+            .iter()
+            .map(|height| test_source_block_with_capacity(*height, raw_capacity))
+            .collect::<Vec<_>>();
+        let reservation = watermark.try_reserve(1);
+        let chunk = reservation.map(|reservation| {
+            super::source_fetch::SourceBlockChunk::from_test_blocks(blocks, reservation)
+        });
+        futures_util::stream::iter(chunk.into_iter().map(Ok)).boxed()
+    }
+
+    fn map_prepare_test_error(error: &dyn std::error::Error) -> super::CanonicalConstructionError {
+        super::CanonicalConstructionError::Source {
+            source: super::IngestError::BlockingTaskFailed {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    async fn poll_stream_while_pending<S>(
+        stream: &mut S,
+        recorder: &metrics_exporter_prometheus::PrometheusRecorder,
+        stop_when: impl Fn() -> bool + Send,
+    ) where
+        S: futures_util::Stream<
+                Item = Result<super::QueuedPreparedBlock, super::CanonicalConstructionError>,
+            > + Unpin
+            + Send,
+    {
+        for _ in 0..32 {
+            let is_pending = {
+                let waker = futures_util::task::noop_waker();
+                let mut cx = std::task::Context::from_waker(&waker);
+                metrics::with_local_recorder(recorder, || {
+                    std::pin::Pin::new(&mut *stream).poll_next(&mut cx)
+                })
+                .is_pending()
+            };
+            assert!(is_pending, "stream must not emit out of order");
+            if stop_when() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unordered_prepared_block_stream_buffers_faster_blocks_behind_slow_head_and_emits_in_order()
+    -> TestResult {
+        use futures_util::StreamExt;
+        use parking_lot::Mutex;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::sync::{Notify, Semaphore};
+
+        let prepare_memory_permits = super::memory_permit_count(16 * MIB);
+        let prepare_memory = Arc::new(Semaphore::new(usize::try_from(prepare_memory_permits)?));
+        let admitted = super::admit_source_blocks(
+            test_chunk_stream(&[1, 2, 3, 4], 64),
+            Arc::clone(&prepare_memory),
+            prepare_memory_permits,
+            zinder_core::Network::ZcashRegtest,
+        );
+        let head_gate = Arc::new(Notify::new());
+        let in_flight_now = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let finished_heights = Arc::new(Mutex::new(Vec::new()));
+
+        let mut prepared_stream =
+            super::UnorderedPreparedBlockStream::new(admitted, 2, |admitted_block| {
+                let head_gate = Arc::clone(&head_gate);
+                let in_flight_now = Arc::clone(&in_flight_now);
+                let max_in_flight = Arc::clone(&max_in_flight);
+                let finished_heights = Arc::clone(&finished_heights);
+                async move {
+                    let active = in_flight_now.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(active, Ordering::SeqCst);
+                    let height = admitted_block.source_block.height;
+                    if height.value() == 1 {
+                        head_gate.notified().await;
+                    }
+                    let prepared = test_prepared_block_at_height(height)
+                        .map_err(|error| map_prepare_test_error(error.as_ref()))?;
+                    finished_heights.lock().push(height.value());
+                    in_flight_now.fetch_sub(1, Ordering::SeqCst);
+                    Ok(super::QueuedPreparedBlock {
+                        prepared,
+                        memory_permit: admitted_block.memory_permit,
+                    })
+                }
+            });
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        poll_stream_while_pending(&mut prepared_stream, &recorder, || {
+            finished_heights.lock().len() == 3
+        })
+        .await;
+
+        assert_eq!(*finished_heights.lock(), vec![2, 3, 4]);
+        assert!(max_in_flight.load(Ordering::SeqCst) <= 2);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "zinder_ingest_bulk_pipeline_reorder_buffer_blocks{stage=\"block_prepare\"} 3"
+            ),
+            "expected 3 buffered blocks behind slow head, got:\n{rendered}"
+        );
+
+        head_gate.notify_one();
+        let mut emitted_heights = Vec::new();
+        loop {
+            let Some(outcome) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), prepared_stream.next())
+                    .await?
+            else {
+                break;
+            };
+            emitted_heights.push(outcome?.prepared.facts.block_header.height.value());
+        }
+        assert_eq!(emitted_heights, vec![1, 2, 3, 4]);
+        assert_eq!(
+            prepare_memory.available_permits(),
+            usize::try_from(prepare_memory_permits)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unordered_prepared_block_stream_enforces_byte_watermark_across_reorder_buffer()
+    -> TestResult {
+        use futures_util::StreamExt;
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use tokio::sync::{Notify, Semaphore};
+
+        let one_block_permits =
+            super::memory_permit_count(16 * MIB).min(super::memory_permits_for_block(64, u32::MAX));
+        let prepare_memory_permits = one_block_permits.saturating_mul(2);
+        let prepare_memory = Arc::new(Semaphore::new(usize::try_from(prepare_memory_permits)?));
+        let admitted = super::admit_source_blocks(
+            test_chunk_stream(&[1, 2, 3], 64),
+            Arc::clone(&prepare_memory),
+            prepare_memory_permits,
+            zinder_core::Network::ZcashRegtest,
+        );
+        let head_gate = Arc::new(Notify::new());
+        let started_heights = Arc::new(Mutex::new(Vec::new()));
+        let mut prepared_stream =
+            super::UnorderedPreparedBlockStream::new(admitted, 4, |admitted_block| {
+                let head_gate = Arc::clone(&head_gate);
+                let started_heights = Arc::clone(&started_heights);
+                async move {
+                    let height = admitted_block.source_block.height;
+                    started_heights.lock().push(height.value());
+                    if height.value() == 1 {
+                        head_gate.notified().await;
+                    }
+                    let prepared = test_prepared_block_at_height(height)
+                        .map_err(|error| map_prepare_test_error(error.as_ref()))?;
+                    Ok(super::QueuedPreparedBlock {
+                        prepared,
+                        memory_permit: admitted_block.memory_permit,
+                    })
+                }
+            });
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        poll_stream_while_pending(&mut prepared_stream, &recorder, || false).await;
+        assert_eq!(
+            *started_heights.lock(),
+            vec![1, 2],
+            "block 3 must wait for byte watermark even with prepare_concurrency = 4"
+        );
+
+        head_gate.notify_one();
+        let first_block =
+            tokio::time::timeout(std::time::Duration::from_secs(2), prepared_stream.next())
+                .await?
+                .ok_or("expected first prepared block")??;
+        assert_eq!(first_block.prepared.facts.block_header.height.value(), 1);
+        drop(first_block);
+
+        let mut remaining = Vec::new();
+        loop {
+            let Some(outcome) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), prepared_stream.next())
+                    .await?
+            else {
+                break;
+            };
+            remaining.push(outcome?.prepared.facts.block_header.height.value());
+        }
+        assert_eq!(remaining, vec![2, 3]);
+        assert_eq!(
+            prepare_memory.available_permits(),
+            usize::try_from(prepare_memory_permits)?
+        );
+        Ok(())
+    }
+
+    fn unordered_source_error_reason(
+        outcome: Result<super::QueuedPreparedBlock, super::CanonicalConstructionError>,
+    ) -> String {
+        match outcome {
+            Err(super::CanonicalConstructionError::Source { source }) => source.to_string(),
+            Err(other) => other.to_string(),
+            Ok(_) => String::new(),
+        }
+    }
+
+    async fn run_unordered_error_precedence_case(head_fails: bool) -> TestResult {
+        use futures_util::StreamExt;
+        use std::sync::Arc;
+        use tokio::sync::{Notify, Semaphore};
+
+        let prepare_memory_permits = super::memory_permit_count(16 * MIB);
+        let prepare_memory = Arc::new(Semaphore::new(usize::try_from(prepare_memory_permits)?));
+        let admitted = super::admit_source_blocks(
+            test_chunk_stream(&[1, 2, 3], 64),
+            Arc::clone(&prepare_memory),
+            prepare_memory_permits,
+            zinder_core::Network::ZcashRegtest,
+        );
+        let head_gate = Arc::new(Notify::new());
+        let mut prepared_stream =
+            super::UnorderedPreparedBlockStream::new(admitted, 4, |admitted_block| {
+                let head_gate = Arc::clone(&head_gate);
+                async move {
+                    let height = admitted_block.source_block.height;
+                    if height.value() == 1 {
+                        head_gate.notified().await;
+                        if head_fails {
+                            return Err(super::CanonicalConstructionError::Source {
+                                source: super::IngestError::BlockingTaskFailed {
+                                    reason: "head failure".to_owned(),
+                                },
+                            });
+                        }
+                    } else if height.value() == 2 {
+                        return Err(super::CanonicalConstructionError::Source {
+                            source: super::IngestError::BlockingTaskFailed {
+                                reason: "second failure".to_owned(),
+                            },
+                        });
+                    }
+                    let prepared = test_prepared_block_at_height(height)
+                        .map_err(|error| map_prepare_test_error(error.as_ref()))?;
+                    Ok(super::QueuedPreparedBlock {
+                        prepared,
+                        memory_permit: admitted_block.memory_permit,
+                    })
+                }
+            });
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        poll_stream_while_pending(&mut prepared_stream, &recorder, || false).await;
+        head_gate.notify_one();
+
+        if head_fails {
+            let reason = unordered_source_error_reason(
+                prepared_stream.next().await.ok_or("expected first item")?,
+            );
+            assert!(reason.contains("head failure"), "{reason}");
+        } else {
+            let height = prepared_stream
+                .next()
+                .await
+                .ok_or("expected first item")??
+                .prepared
+                .facts
+                .block_header
+                .height
+                .value();
+            assert_eq!(height, 1);
+            let reason = unordered_source_error_reason(
+                prepared_stream
+                    .next()
+                    .await
+                    .ok_or("expected second failure")?,
+            );
+            assert!(reason.contains("second failure"), "{reason}");
+        }
+        assert!(prepared_stream.next().await.is_none());
+        assert_eq!(
+            prepare_memory.available_permits(),
+            usize::try_from(prepare_memory_permits)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unordered_prepared_block_stream_emits_prefix_and_earliest_error_on_failure()
+    -> TestResult {
+        run_unordered_error_precedence_case(false).await?;
+        run_unordered_error_precedence_case(true).await?;
+        Ok(())
     }
 }

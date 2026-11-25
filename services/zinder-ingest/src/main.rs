@@ -46,9 +46,11 @@ use zinder_runtime::{
     section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{
-    MempoolSource, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSet, NodeSetSwitch,
-    NodeSource, NodeTarget, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
-    validate_zebra_indexer_endpoint,
+    MempoolSource, MempoolSourceAdmissionLimits, MempoolSourceFactory, NodeCapabilities,
+    NodeCapability, NodeHealthConfig, NodeSet, NodeSetSwitch, NodeSource, NodeStorageMode,
+    NodeTarget, SourceBlock, SourceChainSegment, SourceChainSegmentLimits, SourceError,
+    SourceSubtreeRoots, UpstreamHealthSnapshot, ZebraIndexerBlockSource, ZebraIndexerSourceTarget,
+    ZebraJsonRpcSource, validate_zebra_indexer_endpoint,
 };
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreWorkload, MempoolEventRetentionConfig,
@@ -94,7 +96,7 @@ struct Cli {
     /// Network name, such as zcash-regtest.
     #[arg(long, global = true)]
     network: Option<String>,
-    /// Upstream node source, currently zebra-json-rpc.
+    /// Upstream node source, `zebra-json-rpc` or `zebra-indexer-grpc`.
     #[arg(long = "node-source", global = true)]
     node_source: Option<String>,
     /// Zebra JSON-RPC address.
@@ -214,8 +216,8 @@ async fn run_probe(
 ) -> Result<(), IngestConfigError> {
     let command_config = config::load_ingest_config(config_path, overrides)?;
     let runtime_config = command_config.runtime_config;
-    let source =
-        zebra_json_rpc_source_for_target(runtime_config.node_source, &runtime_config.node)?;
+    validate_indexer_endpoint(runtime_config.node_source, "node", &runtime_config.node)?;
+    let source = ingest_node_endpoint_for_target(runtime_config.node_source, &runtime_config.node)?;
     let activations =
         zinder_source::discover_network_upgrade_activations(&source, "zinder-ingest-probe")
             .await
@@ -516,7 +518,7 @@ impl CanonicalControlTasks {
 
 fn spawn_canonical_control_tasks(
     command_config: &IngestCommandConfig,
-    nodes: &NodeSet<ZebraJsonRpcSource>,
+    nodes: &NodeSet<IngestNodeEndpoint>,
     (writer_readiness, store_damage): (&ComposedReadiness, &CanonicalStoreDamageSignal),
     server_cancel: &CancellationToken,
     writer_config: &mut CanonicalWriterConfig,
@@ -1409,25 +1411,28 @@ fn connect_node_set(
     runtime_config: &zinder_ingest::IngestRuntimeConfig,
 ) -> Result<
     (
-        NodeSet<ZebraJsonRpcSource>,
-        NodeSetSwitch<ZebraJsonRpcSource>,
+        NodeSet<IngestNodeEndpoint>,
+        NodeSetSwitch<IngestNodeEndpoint>,
     ),
     IngestConfigError,
 > {
-    match runtime_config.node_source {
-        NodeSourceKind::ZebraJsonRpc => {}
+    validate_indexer_endpoint(runtime_config.node_source, "node", &runtime_config.node)?;
+    let primary =
+        ingest_node_endpoint_for_target(runtime_config.node_source, &runtime_config.node)?;
+    let mut fallbacks = Vec::with_capacity(runtime_config.node_fallbacks.len());
+    for (index, fallback) in runtime_config.node_fallbacks.iter().enumerate() {
+        let section = format!("node_fallbacks.{}", index + 1);
+        validate_indexer_endpoint(runtime_config.node_source, &section, fallback)?;
+        fallbacks.push(ingest_node_endpoint_for_target(
+            runtime_config.node_source,
+            fallback,
+        )?);
     }
-    validate_indexer_endpoint(&runtime_config.node)?;
-    for fallback in &runtime_config.node_fallbacks {
-        validate_indexer_endpoint(fallback)?;
-    }
-    NodeSet::connect(&runtime_config.node, &runtime_config.node_fallbacks)
-        .map_err(IngestError::from)
-        .map_err(IngestConfigError::from)
+    Ok(NodeSet::new(primary, fallbacks))
 }
 
 /// Endpoint failover handles, present only with `[node_fallbacks.N]`.
-type AdmittedNodeFailover = Option<(NodeFailover, NodeEndpointMonitor<ZebraJsonRpcSource>)>;
+type AdmittedNodeFailover = Option<(NodeFailover, NodeEndpointMonitor<IngestNodeEndpoint>)>;
 
 /// Admits the endpoint ingest reads from first and returns the activation
 /// table the writer opens the store with.
@@ -1441,8 +1446,8 @@ type AdmittedNodeFailover = Option<(NodeFailover, NodeEndpointMonitor<ZebraJsonR
 /// later read.
 async fn admit_node_endpoints(
     command_config: &IngestCommandConfig,
-    nodes: NodeSet<ZebraJsonRpcSource>,
-    node_switch: NodeSetSwitch<ZebraJsonRpcSource>,
+    nodes: NodeSet<IngestNodeEndpoint>,
+    node_switch: NodeSetSwitch<IngestNodeEndpoint>,
     readiness: &ComposedReadiness,
 ) -> Result<(Arc<NetworkUpgradeActivations>, AdmittedNodeFailover), IngestConfigError> {
     let node = &command_config.runtime_config.node;
@@ -1577,29 +1582,214 @@ fn log_endpoint_admissions(admissions: &NodeEndpointAdmissions) {
     }
 }
 
-fn zebra_json_rpc_source_for_target(
+#[derive(Clone)]
+enum IngestNodeEndpoint {
+    ZebraJsonRpc(ZebraJsonRpcSource),
+    ZebraIndexerGrpc(ZebraIndexerBlockSource),
+}
+
+impl MempoolSourceFactory for IngestNodeEndpoint {
+    fn mempool_source(
+        &self,
+        admission_limits: MempoolSourceAdmissionLimits,
+    ) -> Arc<dyn MempoolSource> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.mempool_source(admission_limits),
+            Self::ZebraIndexerGrpc(source) => source.mempool_source(admission_limits),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl NodeSource for IngestNodeEndpoint {
+    fn capabilities(&self) -> NodeCapabilities {
+        match self {
+            Self::ZebraJsonRpc(source) => source.capabilities(),
+            Self::ZebraIndexerGrpc(source) => source.capabilities(),
+        }
+    }
+
+    async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.probe_capabilities().await,
+            Self::ZebraIndexerGrpc(source) => source.probe_capabilities().await,
+        }
+    }
+
+    async fn fetch_network_upgrade_activations(
+        &self,
+    ) -> Result<NetworkUpgradeActivations, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.fetch_network_upgrade_activations().await,
+            Self::ZebraIndexerGrpc(source) => source.fetch_network_upgrade_activations().await,
+        }
+    }
+
+    async fn fetch_storage_mode(&self) -> Result<NodeStorageMode, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.fetch_storage_mode().await,
+            Self::ZebraIndexerGrpc(source) => source.fetch_storage_mode().await,
+        }
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.fetch_block_at(height).await,
+            Self::ZebraIndexerGrpc(source) => source.fetch_block_at(height).await,
+        }
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.fetch_chain_segment(limits).await,
+            Self::ZebraIndexerGrpc(source) => source.fetch_chain_segment(limits).await,
+        }
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<zinder_core::CommitmentTreeCheckpoint, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.fetch_chain_checkpoint(height, activations).await,
+            Self::ZebraIndexerGrpc(source) => {
+                source.fetch_chain_checkpoint(height, activations).await
+            }
+        }
+    }
+
+    async fn fetch_chain_checkpoint_for_block(
+        &self,
+        block_id: zinder_core::BlockId,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<zinder_core::CommitmentTreeCheckpoint, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => {
+                source
+                    .fetch_chain_checkpoint_for_block(block_id, activations)
+                    .await
+            }
+            Self::ZebraIndexerGrpc(source) => {
+                source
+                    .fetch_chain_checkpoint_for_block(block_id, activations)
+                    .await
+            }
+        }
+    }
+
+    async fn tip_id(&self) -> Result<zinder_core::BlockId, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.tip_id().await,
+            Self::ZebraIndexerGrpc(source) => source.tip_id().await,
+        }
+    }
+
+    async fn probe_tip_id(&self) -> Result<zinder_core::BlockId, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.probe_tip_id().await,
+            Self::ZebraIndexerGrpc(source) => source.probe_tip_id().await,
+        }
+    }
+
+    async fn fetch_subtree_roots(
+        &self,
+        protocol: zinder_core::ShieldedProtocol,
+        start_index: zinder_core::SubtreeRootIndex,
+        max_entries: std::num::NonZeroU32,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => {
+                source
+                    .fetch_subtree_roots(protocol, start_index, max_entries)
+                    .await
+            }
+            Self::ZebraIndexerGrpc(source) => {
+                source
+                    .fetch_subtree_roots(protocol, start_index, max_entries)
+                    .await
+            }
+        }
+    }
+
+    async fn fetch_subtree_root_range(
+        &self,
+        range: zinder_core::SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.fetch_subtree_root_range(range).await,
+            Self::ZebraIndexerGrpc(source) => source.fetch_subtree_root_range(range).await,
+        }
+    }
+
+    async fn fetch_chain_value_pools_at_tip(
+        &self,
+    ) -> Result<zinder_core::ChainValuePools, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.fetch_chain_value_pools_at_tip().await,
+            Self::ZebraIndexerGrpc(source) => source.fetch_chain_value_pools_at_tip().await,
+        }
+    }
+
+    async fn fetch_block_value_pool_balances(
+        &self,
+        block_id: zinder_core::BlockId,
+    ) -> Result<zinder_core::BlockValuePoolBalances, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.fetch_block_value_pool_balances(block_id).await,
+            Self::ZebraIndexerGrpc(source) => {
+                source.fetch_block_value_pool_balances(block_id).await
+            }
+        }
+    }
+
+    async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
+        match self {
+            Self::ZebraJsonRpc(source) => source.poll_upstream_health().await,
+            Self::ZebraIndexerGrpc(source) => source.poll_upstream_health().await,
+        }
+    }
+}
+
+fn ingest_node_endpoint_for_target(
     node_source: NodeSourceKind,
     target: &NodeTarget,
-) -> Result<ZebraJsonRpcSource, IngestConfigError> {
+) -> Result<IngestNodeEndpoint, IngestConfigError> {
     match node_source {
         NodeSourceKind::ZebraJsonRpc => ZebraJsonRpcSource::from_node_target(target)
+            .map(IngestNodeEndpoint::ZebraJsonRpc)
+            .map_err(IngestError::from)
+            .map_err(IngestConfigError::from),
+        NodeSourceKind::ZebraIndexerGrpc => ZebraIndexerBlockSource::from_node_target_lazy(target)
+            .map(IngestNodeEndpoint::ZebraIndexerGrpc)
             .map_err(IngestError::from)
             .map_err(IngestConfigError::from),
     }
 }
 
 /// Fails startup when the configured indexer endpoint or its TLS files are
-/// unusable, so the streaming mempool source does not retry a channel that can
-/// never be built.
-fn validate_indexer_endpoint(node_target: &NodeTarget) -> Result<(), IngestConfigError> {
-    let Some(indexer_target) = ZebraIndexerSourceTarget::from_node_target(node_target) else {
-        return Ok(());
-    };
-    validate_zebra_indexer_endpoint(&indexer_target).map_err(|error| {
-        IngestConfigError::from(ConfigError::invalid(format!(
-            "node.indexer_grpc_addr or node.indexer_tls: {error}"
-        )))
-    })
+/// unusable, or when `zebra-indexer-grpc` is selected without `indexer_grpc_addr`.
+fn validate_indexer_endpoint(
+    node_source: NodeSourceKind,
+    section: &str,
+    node_target: &NodeTarget,
+) -> Result<(), IngestConfigError> {
+    if let Some(indexer_target) = ZebraIndexerSourceTarget::from_node_target(node_target) {
+        return validate_zebra_indexer_endpoint(&indexer_target).map_err(|error| {
+            IngestConfigError::from(ConfigError::invalid(format!(
+                "{section}.indexer_grpc_addr or {section}.indexer_tls: {error}"
+            )))
+        });
+    }
+    match node_source {
+        NodeSourceKind::ZebraJsonRpc => Ok(()),
+        NodeSourceKind::ZebraIndexerGrpc => Err(IngestConfigError::from(ConfigError::invalid(
+            format!("ingest.source = \"zebra-indexer-grpc\" requires {section}.indexer_grpc_addr"),
+        ))),
+    }
 }
 
 /// The configured target at `position` of the ordered node list: `[node]`
@@ -1617,7 +1807,7 @@ fn writer_probe_config(health: Option<&NodeHealthConfig>) -> Option<&NodeHealthC
 
 fn spawn_upstream_health_probe_for(
     command_config: &IngestCommandConfig,
-    nodes: &NodeSet<ZebraJsonRpcSource>,
+    nodes: &NodeSet<IngestNodeEndpoint>,
     readiness: ComposedReadiness,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
@@ -2511,6 +2701,60 @@ source = "zebra-json-rpc"
         assert!(control_tasks.mempool_retention.is_some());
         stop_test_control_tasks(&mut control_tasks).await;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_node_endpoint_builds_zebra_indexer_grpc_lazily_and_requires_indexer_addr()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_ingest::NodeSourceKind;
+        use zinder_source::{NodeSet, NodeTarget};
+
+        use super::{
+            IngestNodeEndpoint, ingest_node_endpoint_for_target, validate_indexer_endpoint,
+        };
+
+        let rpc_only_section: zinder_source::NodeSection =
+            toml::from_str("json_rpc_addr = \"http://127.0.0.1:8232\"")?;
+        let rpc_only_target =
+            NodeTarget::resolve(zinder_core::Network::ZcashRegtest, rpc_only_section)?;
+        assert!(
+            validate_indexer_endpoint(NodeSourceKind::ZebraJsonRpc, "node", &rpc_only_target)
+                .is_ok()
+        );
+        let missing_error = validate_indexer_endpoint(
+            NodeSourceKind::ZebraIndexerGrpc,
+            "node_fallbacks.1",
+            &rpc_only_target,
+        )
+        .err()
+        .map_or_default(|error| error.to_string());
+        assert!(
+            missing_error.contains("node_fallbacks.1.indexer_grpc_addr"),
+            "{missing_error}"
+        );
+
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let dead_addr = closed_listener.local_addr()?;
+        drop(closed_listener);
+        let indexer_section: zinder_source::NodeSection = toml::from_str(&format!(
+            "json_rpc_addr = \"http://127.0.0.1:8232\"\n\
+             indexer_grpc_addr = \"http://{dead_addr}\""
+        ))?;
+        let indexer_target =
+            NodeTarget::resolve(zinder_core::Network::ZcashRegtest, indexer_section)?;
+        validate_indexer_endpoint(NodeSourceKind::ZebraIndexerGrpc, "node", &indexer_target)?;
+
+        let primary =
+            ingest_node_endpoint_for_target(NodeSourceKind::ZebraIndexerGrpc, &indexer_target)?;
+        let fallback =
+            ingest_node_endpoint_for_target(NodeSourceKind::ZebraIndexerGrpc, &indexer_target)?;
+        let (nodes, _switch) = NodeSet::new(primary, vec![fallback]);
+        assert_eq!(nodes.endpoint_count(), 2);
+        assert!(matches!(
+            nodes.active(),
+            IngestNodeEndpoint::ZebraIndexerGrpc(_)
+        ));
         Ok(())
     }
 }

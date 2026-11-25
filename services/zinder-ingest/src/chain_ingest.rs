@@ -30,6 +30,8 @@ const FETCH_RETRY_FAILURE_BUDGET: u32 = 100;
 pub enum NodeSourceKind {
     /// Zebra JSON-RPC source.
     ZebraJsonRpc,
+    /// Zebra binary indexer gRPC block source paired with a JSON-RPC control plane.
+    ZebraIndexerGrpc,
 }
 
 /// Error returned by ingestion operations.

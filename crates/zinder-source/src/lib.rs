@@ -75,8 +75,8 @@ pub use transparent_address::{
 };
 pub use transport::{
     ResilientClient, ZEBRA_REBUILD_THRESHOLD, ZebraIndexerChannelOptions, ZebraTransportError,
-    build_zebra_json_rpc_client, connect_zebra_indexer_channel, is_transport_failure,
-    validate_zebra_indexer_endpoint,
+    build_zebra_json_rpc_client, connect_zebra_indexer_channel, connect_zebra_indexer_channel_lazy,
+    is_transport_failure, validate_zebra_indexer_endpoint,
 };
 pub use upstream_health::{
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR, UPSTREAM_HEALTH_REASON_INSUFFICIENT_PEERS,

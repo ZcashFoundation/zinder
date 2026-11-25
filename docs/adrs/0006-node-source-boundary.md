@@ -22,7 +22,7 @@ Fresh construction also needs more than one block per call. A round trip per blo
    - enforce both limits; and
    - return typed errors for unavailable blocks, incoherent observations, protocol mismatches, and oversized responses.
 7. **The JSON-RPC adapter fetches a segment as one batch.** It sends one height-keyed `getblock` request per block in a single batch and skips a separate hash lookup, because the decoded block carries its own hash and parent hash. Zakura refuses batches above 1,000 entries, so ingest refuses a segment size above 1,000 at configuration load. The writer adapts the segment size below that limit from observed response sizes.
-8. **A source kind is supported only when a runtime wires it.** Ingest constructs the chain only through the JSON-RPC adapter. An indexer gRPC block adapter exists as a library, but it is not a configuration option. When configured, the indexer gRPC endpoint carries streaming mempool updates.
+8. **A source kind is supported only when a runtime wires it.** Ingest selects `zebra-json-rpc` (default) or `zebra-indexer-grpc` (`ZebraIndexerBlockSource`, paired with the JSON-RPC control plane and requiring `node.indexer_grpc_addr` plus any configured `node_fallbacks.<N>.indexer_grpc_addr`). When configured, the indexer gRPC endpoint also carries streaming mempool updates.
 
 Continuous following uses one block update at a time rather than treating a historical segment as a live stream ([ADR-0009](0009-ingest-lifecycle-and-construction.md)). [Node source boundary](../architecture/node-source-boundary.md) describes the adapters, the capability model, and node authentication.
 
@@ -52,8 +52,8 @@ Verified snapshot bootstrap uses the configured `NodeSource` to attest the chain
 
 ## Revision history
 
-- 2026-11-24. Linked ADR-0024 for validator attestation before snapshot publication.
+- 2026-11-25. Clarified Decision 8 to wire `zebra-indexer-grpc` (`ZebraIndexerBlockSource`) alongside `zebra-json-rpc` (`ZebraJsonRpcSource`).
 - 2026-11-25. Clarified Decision 6 to allow adapters to skip per-segment `tip_id()` polls strictly below caller-authenticated `tip_height - reorg_window_blocks` while preserving parent-hash linkage checks and in-window or discontinuity tip observation.
-
+- 2026-11-24. Linked ADR-0024 for validator attestation before snapshot publication.
 - 2026-11-23. Decision 5 adds the light-wallet composition's node-backed reads to the reasons a reader calls the node.
 - 2026-11-23. Evidence records what decision 5 rests on.
