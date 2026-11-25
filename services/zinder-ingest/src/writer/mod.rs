@@ -475,7 +475,11 @@ where
         record_construction_cancelled("construction_range");
         return Err(CanonicalWriterError::Cancelled);
     };
-    let (build_plan, build_tip) = construction_range?;
+    let ResolvedConstructionRange {
+        build_plan,
+        build_tip,
+        source_tip,
+    } = construction_range?;
     record_construction_phase("construction_range", range_started_at);
     let progress = ConstructionProgress::start(&build_plan, Some(readiness.clone()));
     let builder = create_fresh_canonical_builder(staging_path, build_plan, config)?;
@@ -492,8 +496,11 @@ where
         builder,
         source,
         &config.construction,
-        cancel,
-        Some(progress),
+        construction::FreshCanonicalLoadOptions {
+            cancel,
+            progress: Some(progress),
+            known_source_tip_height: Some(source_tip.height),
+        },
     )
     .await
     .map_err(|error| {
@@ -613,6 +620,12 @@ fn validate_first_available_height(
     Ok(())
 }
 
+struct ResolvedConstructionRange {
+    build_plan: CanonicalStoreBuildPlan,
+    build_tip: BlockId,
+    source_tip: BlockId,
+}
+
 /// Fixes the build tip and returns the build plan with that tip.
 ///
 /// The build tip is also the baseline's settled tip, so without a lower run
@@ -622,7 +635,7 @@ async fn resolve_construction_range<Source>(
     source: &Source,
     network_upgrade_activations: &NetworkUpgradeActivations,
     config: &CanonicalWriterConfig,
-) -> Result<(CanonicalStoreBuildPlan, BlockId), CanonicalWriterError>
+) -> Result<ResolvedConstructionRange, CanonicalWriterError>
 where
     Source: NodeSource,
 {
@@ -641,7 +654,11 @@ where
     };
     let build_plan =
         resolve_build_plan(source, network_upgrade_activations, config, build_tip).await?;
-    Ok((build_plan, build_tip))
+    Ok(ResolvedConstructionRange {
+        build_plan,
+        build_tip,
+        source_tip,
+    })
 }
 
 /// Returns the height construction builds to: one reorg window below the
@@ -1586,12 +1603,19 @@ mod tests {
         config.reorg_window_blocks = 1_000;
         let source = LinearSource { tip_height: 1_500 };
 
-        let (plan, settled_tip) =
-            resolve_construction_range(&source, &activations, &config).await?;
+        let super::ResolvedConstructionRange {
+            build_plan: plan,
+            build_tip: settled_tip,
+            source_tip,
+        } = resolve_construction_range(&source, &activations, &config).await?;
 
         let expected_build_tip = BlockId::new(BlockHeight::new(500), linear_block_hash(500));
         assert_eq!(plan.build_tip(), expected_build_tip);
         assert_eq!(settled_tip, expected_build_tip);
+        assert_eq!(
+            source_tip,
+            BlockId::new(BlockHeight::new(1_500), linear_block_hash(1_500))
+        );
         Ok(())
     }
 

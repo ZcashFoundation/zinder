@@ -44,6 +44,7 @@ clap = "4.6.8"
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
 composefs-ioctls = "0.10.0"
 config = { version = "0.15.27", default-features = false, features = ["toml"] }
+const-hex = "1.19.3"
 eyre = "0.6.14"
 fs-verity = "0.2.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }

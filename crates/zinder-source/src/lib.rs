@@ -56,7 +56,7 @@ pub use source_block::{
 };
 pub use source_chain_update::{
     SourceChainCursor, SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats,
-    SourceChainUpdate,
+    SourceChainUpdate, SourceKnownTip,
 };
 pub use source_error::{SourceError, SourceFailureClass};
 pub use source_subtree_root::{SourceSubtreeRoot, SourceSubtreeRoots};

@@ -17,7 +17,7 @@ use jsonrpsee::http_client::{HeaderMap, HeaderValue};
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
-use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -933,50 +933,30 @@ impl ZebraJsonRpcSource {
 
         let batch_method = JsonRpcMethod::BatchGetblock.as_str();
         let slot = self.admit(NodeCallLane::Shared, batch_method).await?;
-        let batch_result = self.request_client()?.batch_request::<Value>(batch).await;
+        let batch_result = self
+            .request_client()?
+            .batch_request::<BatchGetblockEntry>(batch)
+            .await;
         drop(slot);
         self.client.record_outcome(&jsonrpsee_transport_signal(
             &batch_result,
             batch_method,
             self.max_response_bytes,
         ));
-        let batch_response = match batch_result {
-            Ok(response) => response,
-            Err(error) => {
-                return Err(map_transport_error(
-                    &error,
-                    batch_method,
-                    self.max_response_bytes,
-                ));
-            }
-        };
+        let batch_response: Vec<Result<BatchGetblockEntry, ErrorObjectOwned>> = batch_result
+            .map_err(|error| map_transport_error(&error, batch_method, self.max_response_bytes))?
+            .into_iter()
+            .map(|entry| entry.map_err(ErrorObject::into_owned))
+            .collect();
 
-        let mut blocks = Vec::with_capacity(heights.len());
-        let mut response_payload_bytes = 0_u64;
-        for (height, response) in heights.into_iter().zip(batch_response) {
-            let raw_block_value = response.map_err(|error| batch_block_error(height, &error))?;
-            let raw_block_hex = raw_block_value.as_str().ok_or({
-                SourceError::SourceProtocolMismatch {
-                    reason: "batched getblock response is not a hex string",
-                }
-            })?;
-            response_payload_bytes =
-                response_payload_bytes.saturating_add(usize_to_u64_saturating(raw_block_hex.len()));
-            let decode_started_at = Instant::now();
-            let raw_block_bytes_outcome = hex::decode(raw_block_hex)
-                .map_err(|source| SourceError::InvalidRawBlockHex { source })?;
-            record_block_decode_stage("hex_decode", decode_started_at);
-            let header_started_at = Instant::now();
-            let source_block =
-                SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes_outcome)?;
-            record_block_decode_stage("block_header", header_started_at);
-            blocks.push(source_block);
-        }
-
-        Ok(BatchedSourceBlocks {
-            blocks,
-            stats: SourceChainSegmentStats::from_response_payload_bytes(response_payload_bytes),
+        let network = self.network;
+        tokio::task::spawn_blocking(move || {
+            decode_batch_block_entries(network, heights, batch_response)
         })
+        .await
+        .map_err(|join_error| SourceError::NodeUnavailable {
+            reason: format!("source block decode task failed: {join_error}"),
+        })?
     }
 
     /// Fetches the upstream node's current mempool transaction identifiers.
@@ -1669,51 +1649,10 @@ impl NodeSource for ZebraJsonRpcSource {
         &self,
         limits: SourceChainSegmentLimits,
     ) -> Result<SourceChainSegment, SourceError> {
-        let observed_tip_id = self.tip_id().await?;
-        let (start_height, expected_parent_id) = match limits.cursor.position() {
-            SourceChainCursorPosition::BeforeHeight(height) => (height, None),
-            SourceChainCursorPosition::AtBlock(block_id) => {
-                if observed_tip_id.height < block_id.height
-                    || (observed_tip_id.height == block_id.height
-                        && observed_tip_id.hash != block_id.hash)
-                {
-                    return Ok(SourceChainSegment::new([
-                        SourceChainUpdate::reverted_block(block_id),
-                    ]));
-                }
-                if observed_tip_id.height == block_id.height {
-                    return Ok(SourceChainSegment::default());
-                }
-                let Some(next_height) = block_id.height.next() else {
-                    return Ok(SourceChainSegment::default());
-                };
-                (next_height, Some(block_id))
-            }
-        };
-        if observed_tip_id.height < start_height {
-            return Ok(SourceChainSegment::default());
+        if let Some(range) = settled_segment_bounds_without_tip_poll(limits) {
+            return fetch_settled_chain_segment_without_tip_poll(self, limits, range).await;
         }
-
-        let end_height = bounded_segment_end_height(
-            start_height,
-            observed_tip_id.height,
-            limits.max_connected_blocks,
-        );
-        let batched_blocks = self.fetch_blocks_at_batch(start_height, end_height).await?;
-        if let (Some(expected_parent_id), Some(first_block)) =
-            (expected_parent_id, batched_blocks.blocks.first())
-            && first_block.parent_hash != expected_parent_id.hash
-        {
-            return Ok(SourceChainSegment::new([
-                SourceChainUpdate::reverted_block(expected_parent_id),
-            ]));
-        }
-        validate_source_block_links(&batched_blocks.blocks)?;
-
-        Ok(SourceChainSegment::connected_blocks_with_stats(
-            batched_blocks.blocks,
-            batched_blocks.stats,
-        ))
+        fetch_chain_segment_observing_tip(self, limits).await
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
@@ -1725,8 +1664,7 @@ impl NodeSource for ZebraJsonRpcSource {
             )
             .await?;
 
-        let raw_block_bytes = hex::decode(raw_block_hex)
-            .map_err(|source| SourceError::InvalidRawBlockHex { source })?;
+        let raw_block_bytes = decode_raw_block_hex(&raw_block_hex)?;
 
         SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes)
     }
@@ -2350,6 +2288,281 @@ fn is_answer_size_refusal(error: &SourceError) -> bool {
 struct BatchedSourceBlocks {
     blocks: Vec<SourceBlock>,
     stats: SourceChainSegmentStats,
+}
+
+#[derive(Debug)]
+enum BatchGetblockEntry {
+    Hex(String),
+    NonString,
+}
+
+impl<'de> Deserialize<'de> for BatchGetblockEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BatchGetblockEntryVisitor)
+    }
+}
+
+struct BatchGetblockEntryVisitor;
+
+impl<'de> Visitor<'de> for BatchGetblockEntryVisitor {
+    type Value = BatchGetblockEntry;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a raw block hex string")
+    }
+
+    fn visit_str<E>(self, raw: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(BatchGetblockEntry::Hex(raw.to_owned()))
+    }
+
+    fn visit_string<E>(self, raw: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(BatchGetblockEntry::Hex(raw))
+    }
+
+    fn visit_bool<E>(self, _raw: bool) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_i64<E>(self, _raw: i64) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_i128<E>(self, _raw: i128) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_u64<E>(self, _raw: u64) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_u128<E>(self, _raw: u128) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_f64<E>(self, _raw: f64) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_bytes<E>(self, _raw: &[u8]) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        BatchGetblockEntry::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(BatchGetblockEntry::NonString)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(BatchGetblockEntry::NonString)
+    }
+}
+
+fn decode_raw_block_hex(raw_block_hex: &str) -> Result<Vec<u8>, SourceError> {
+    let raw_bytes = raw_block_hex.as_bytes();
+    // `const-hex` strips leading `0x`/`0X` before decoding; route prefixed
+    // strings and any error path through `hex::decode` for exact error parity.
+    if raw_bytes.starts_with(b"0x") || raw_bytes.starts_with(b"0X") {
+        return hex::decode(raw_bytes).map_err(|source| SourceError::InvalidRawBlockHex { source });
+    }
+    const_hex::decode(raw_bytes).or_else(|_| {
+        hex::decode(raw_bytes).map_err(|source| SourceError::InvalidRawBlockHex { source })
+    })
+}
+
+fn decode_batch_block_entries(
+    network: Network,
+    heights: Vec<BlockHeight>,
+    batch_response: Vec<Result<BatchGetblockEntry, ErrorObjectOwned>>,
+) -> Result<BatchedSourceBlocks, SourceError> {
+    let mut blocks = Vec::with_capacity(heights.len());
+    let mut response_payload_bytes = 0_u64;
+    for (height, response) in heights.into_iter().zip(batch_response) {
+        let entry = response.map_err(|error| batch_block_error(height, &error))?;
+        let BatchGetblockEntry::Hex(raw_block_hex) = entry else {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "batched getblock response is not a hex string",
+            });
+        };
+        response_payload_bytes =
+            response_payload_bytes.saturating_add(usize_to_u64_saturating(raw_block_hex.len()));
+        let decode_started_at = Instant::now();
+        let raw_block_bytes = decode_raw_block_hex(&raw_block_hex)?;
+        record_block_decode_stage("hex_decode", decode_started_at);
+        let header_started_at = Instant::now();
+        let source_block = SourceBlock::from_raw_block_bytes(network, height, raw_block_bytes)?;
+        record_block_decode_stage("block_header", header_started_at);
+        blocks.push(source_block);
+    }
+    Ok(BatchedSourceBlocks {
+        blocks,
+        stats: SourceChainSegmentStats::from_response_payload_bytes(response_payload_bytes),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct SettledSegmentRange {
+    start_height: BlockHeight,
+    expected_parent_id: Option<BlockId>,
+    end_height: BlockHeight,
+}
+
+fn settled_segment_bounds_without_tip_poll(
+    limits: SourceChainSegmentLimits,
+) -> Option<SettledSegmentRange> {
+    let known_tip = limits.known_tip?;
+    let (start_height, expected_parent_id) = match limits.cursor.position() {
+        SourceChainCursorPosition::BeforeHeight(height) => (height, None),
+        SourceChainCursorPosition::AtBlock(block_id) => (block_id.height.next()?, Some(block_id)),
+    };
+    let settled_upper_bound =
+        known_tip.settled_upper_bound_below_window(start_height, limits.max_connected_blocks)?;
+    let end_height = bounded_segment_end_height(
+        start_height,
+        settled_upper_bound,
+        limits.max_connected_blocks,
+    );
+    Some(SettledSegmentRange {
+        start_height,
+        expected_parent_id,
+        end_height,
+    })
+}
+
+async fn fetch_settled_chain_segment_without_tip_poll(
+    source: &ZebraJsonRpcSource,
+    limits: SourceChainSegmentLimits,
+    range: SettledSegmentRange,
+) -> Result<SourceChainSegment, SourceError> {
+    let batched_blocks = match source
+        .fetch_blocks_at_batch(range.start_height, range.end_height)
+        .await
+    {
+        Ok(batched_blocks) => batched_blocks,
+        Err(error)
+            if matches!(
+                error,
+                SourceError::BlockUnavailable { .. }
+                    | SourceError::HistoricalBlockBodyUnavailable { .. }
+            ) =>
+        {
+            let observed_tip_id = source.tip_id().await?;
+            if observed_tip_id.height < range.end_height {
+                return fetch_chain_segment_from_observed_tip(source, limits, observed_tip_id)
+                    .await;
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    if let (Some(expected_parent_id), Some(first_block)) =
+        (range.expected_parent_id, batched_blocks.blocks.first())
+        && first_block.parent_hash != expected_parent_id.hash
+    {
+        let _observed_tip_id = source.tip_id().await?;
+        return Ok(SourceChainSegment::new([
+            SourceChainUpdate::reverted_block(expected_parent_id),
+        ]));
+    }
+    if let Err(error) = validate_source_block_links(&batched_blocks.blocks) {
+        let _observed_tip_id = source.tip_id().await?;
+        return Err(error);
+    }
+    Ok(SourceChainSegment::connected_blocks_with_stats(
+        batched_blocks.blocks,
+        batched_blocks.stats,
+    ))
+}
+
+async fn fetch_chain_segment_observing_tip(
+    source: &ZebraJsonRpcSource,
+    limits: SourceChainSegmentLimits,
+) -> Result<SourceChainSegment, SourceError> {
+    let observed_tip_id = source.tip_id().await?;
+    fetch_chain_segment_from_observed_tip(source, limits, observed_tip_id).await
+}
+
+async fn fetch_chain_segment_from_observed_tip(
+    source: &ZebraJsonRpcSource,
+    limits: SourceChainSegmentLimits,
+    observed_tip_id: BlockId,
+) -> Result<SourceChainSegment, SourceError> {
+    let (start_height, expected_parent_id) = match limits.cursor.position() {
+        SourceChainCursorPosition::BeforeHeight(height) => (height, None),
+        SourceChainCursorPosition::AtBlock(block_id) => {
+            if observed_tip_id.height < block_id.height
+                || (observed_tip_id.height == block_id.height
+                    && observed_tip_id.hash != block_id.hash)
+            {
+                return Ok(SourceChainSegment::new([
+                    SourceChainUpdate::reverted_block(block_id),
+                ]));
+            }
+            if observed_tip_id.height == block_id.height {
+                return Ok(SourceChainSegment::default());
+            }
+            let Some(next_height) = block_id.height.next() else {
+                return Ok(SourceChainSegment::default());
+            };
+            (next_height, Some(block_id))
+        }
+    };
+    if observed_tip_id.height < start_height {
+        return Ok(SourceChainSegment::default());
+    }
+
+    let end_height = bounded_segment_end_height(
+        start_height,
+        observed_tip_id.height,
+        limits.max_connected_blocks,
+    );
+    let batched_blocks = source
+        .fetch_blocks_at_batch(start_height, end_height)
+        .await?;
+    if let (Some(expected_parent_id), Some(first_block)) =
+        (expected_parent_id, batched_blocks.blocks.first())
+        && first_block.parent_hash != expected_parent_id.hash
+    {
+        return Ok(SourceChainSegment::new([
+            SourceChainUpdate::reverted_block(expected_parent_id),
+        ]));
+    }
+    validate_source_block_links(&batched_blocks.blocks)?;
+
+    Ok(SourceChainSegment::connected_blocks_with_stats(
+        batched_blocks.blocks,
+        batched_blocks.stats,
+    ))
 }
 
 fn bounded_segment_end_height(
@@ -3871,5 +4084,70 @@ mod tests {
         })?;
         assert_node_rate_limited_preregistered(&rendered_with_options);
         Ok(())
+    }
+
+    #[test]
+    fn batch_getblock_entry_visitor_separates_hex_strings_from_non_strings()
+    -> Result<(), eyre::Report> {
+        let hex_entry: BatchGetblockEntry = serde_json::from_str("\"0400abcd\"")?;
+        assert!(matches!(hex_entry, BatchGetblockEntry::Hex(ref raw) if raw == "0400abcd"));
+
+        for non_string_json in [
+            "null",
+            "true",
+            "42",
+            "-7",
+            "1.5",
+            "[1, {\"a\": [2]}]",
+            "{\"h\":1}",
+        ] {
+            let parsed: BatchGetblockEntry = serde_json::from_str(non_string_json)?;
+            assert!(
+                matches!(parsed, BatchGetblockEntry::NonString),
+                "expected NonString for {non_string_json}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn decode_raw_block_hex_matches_hex_decode_across_valid_prefixes_and_errors() {
+        for sample in [
+            "",
+            "04000000",
+            "deadbeefCAFE",
+            "0x",
+            "0x00",
+            "0X00",
+            "0x1",
+            "0xdeadbeef",
+            "abc",
+            "00zz",
+            "01020g",
+        ] {
+            let expected =
+                hex::decode(sample).map_err(|source| SourceError::InvalidRawBlockHex { source });
+            let actual = decode_raw_block_hex(sample);
+            match (actual, expected) {
+                (Ok(actual_bytes), Ok(expected_bytes)) => {
+                    assert_eq!(actual_bytes, expected_bytes, "mismatch on {sample}");
+                }
+                (
+                    Err(SourceError::InvalidRawBlockHex { source: actual_err }),
+                    Err(SourceError::InvalidRawBlockHex {
+                        source: expected_err,
+                    }),
+                ) => {
+                    assert_eq!(actual_err, expected_err, "error mismatch on {sample}");
+                }
+                (actual_other, expected_other) => {
+                    assert_eq!(
+                        actual_other.is_ok(),
+                        expected_other.is_ok(),
+                        "outcome variant mismatch on {sample}: actual={actual_other:?}, expected={expected_other:?}"
+                    );
+                }
+            }
+        }
     }
 }

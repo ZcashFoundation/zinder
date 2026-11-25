@@ -24,6 +24,67 @@ pub(crate) enum SourceChainCursorPosition {
     AtBlock(BlockId),
 }
 
+/// Caller-authenticated upstream best-chain tip context for bounded historical
+/// segment fetches.
+///
+/// Segments strictly below `tip_height - reorg_window_blocks` lie in settled
+/// non-reorgable history, so adapters may resolve their range directly from
+/// this bound while preserving parent-hash linkage verification and reorg
+/// tip checks at or inside the reorg window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceKnownTip {
+    /// Upstream best-chain height already authenticated by the caller.
+    pub tip_height: BlockHeight,
+    /// Reorg window depth protecting unsettled blocks at and above
+    /// `tip_height - reorg_window_blocks`.
+    pub reorg_window_blocks: u32,
+}
+
+impl SourceKnownTip {
+    /// Creates an upstream best-chain tip context.
+    #[must_use]
+    pub const fn new(tip_height: BlockHeight, reorg_window_blocks: u32) -> Self {
+        Self {
+            tip_height,
+            reorg_window_blocks,
+        }
+    }
+
+    /// Returns the exclusive settled upper height strictly below
+    /// `tip_height - reorg_window_blocks` when the entire requested range
+    /// `[start_height, start_height + max_connected_blocks - 1]` stays strictly
+    /// below that cutoff.
+    ///
+    /// Returns `None` on short chains (`tip_height <= reorg_window_blocks`) or
+    /// when the range touches or enters the reorg window, forcing the adapter
+    /// to observe the upstream tip explicitly.
+    #[must_use]
+    pub const fn settled_upper_bound_below_window(
+        self,
+        start_height: BlockHeight,
+        max_connected_blocks: NonZeroU32,
+    ) -> Option<BlockHeight> {
+        let Some(settled_cutoff) = self
+            .tip_height
+            .value()
+            .checked_sub(self.reorg_window_blocks)
+        else {
+            return None;
+        };
+        let Some(settled_upper_bound) = settled_cutoff.checked_sub(1) else {
+            return None;
+        };
+        let requested_end = start_height
+            .value()
+            .saturating_add(max_connected_blocks.get().saturating_sub(1));
+        if requested_end <= settled_upper_bound {
+            Some(BlockHeight::new(settled_upper_bound))
+        } else {
+            None
+        }
+    }
+}
+
 /// Resource limits for one bounded source-chain segment request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceChainSegmentLimits {
@@ -35,6 +96,8 @@ pub struct SourceChainSegmentLimits {
     pub target_response_bytes: u64,
     /// Hard response payload limit for the source adapter.
     pub max_response_bytes: u64,
+    /// Optional caller-authenticated upstream tip bound for settled history.
+    pub known_tip: Option<SourceKnownTip>,
 }
 
 impl SourceChainSegmentLimits {
@@ -51,7 +114,23 @@ impl SourceChainSegmentLimits {
             max_connected_blocks,
             target_response_bytes,
             max_response_bytes,
+            known_tip: None,
         }
+    }
+
+    /// Attaches caller-authenticated upstream tip context for skipping
+    /// redundant settled-history tip polls.
+    #[must_use]
+    pub const fn with_known_tip(mut self, known_tip: SourceKnownTip) -> Self {
+        self.known_tip = Some(known_tip);
+        self
+    }
+
+    /// Attaches optional caller-authenticated upstream tip context.
+    #[must_use]
+    pub const fn with_optional_known_tip(mut self, known_tip: Option<SourceKnownTip>) -> Self {
+        self.known_tip = known_tip;
+        self
     }
 }
 

@@ -18,7 +18,7 @@ use tokio_util::task::AbortOnDropHandle;
 use zinder_core::{BlockHeight, BlockId, ConsensusBranchId, NetworkUpgradeActivations};
 use zinder_source::{
     NodeSource, SourceBlock, SourceChainCursor, SourceChainSegment, SourceChainSegmentLimits,
-    SourceChainSegmentStats, SourceChainUpdate, SourceError,
+    SourceChainSegmentStats, SourceChainUpdate, SourceError, SourceKnownTip,
 };
 
 use super::watermark::{ByteReservation, ByteWatermark, record_queue_depth, record_reorder_buffer};
@@ -42,6 +42,7 @@ pub(crate) struct CanonicalSourceFetchConfig {
     pub(crate) source_fetch_max_in_flight_requests: NonZeroU32,
     pub(crate) source_fetch_max_in_flight_bytes: NonZeroU64,
     pub(crate) source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
+    pub(crate) known_source_tip: Option<SourceKnownTip>,
 }
 
 struct SourceBlockStreamState<'a, Source> {
@@ -51,6 +52,7 @@ struct SourceBlockStreamState<'a, Source> {
     from_height: BlockHeight,
     to_height: BlockHeight,
     source_segment_sizer: Arc<Mutex<SourceSegmentSizer>>,
+    known_source_tip: Option<SourceKnownTip>,
     max_response_bytes: NonZeroU64,
     target_response_payload_bytes: NonZeroU64,
     source_fetch_max_in_flight_requests: NonZeroU32,
@@ -80,6 +82,7 @@ where
         from_height: config.from_height,
         to_height: config.to_height,
         source_segment_sizer: config.source_segment_sizer,
+        known_source_tip: config.known_source_tip,
         max_response_bytes: config.max_response_bytes,
         target_response_payload_bytes: config.target_response_payload_bytes,
         source_fetch_max_in_flight_requests: config.source_fetch_max_in_flight_requests,
@@ -209,6 +212,7 @@ where
                 max_connected_blocks: source_segment_max_blocks,
                 target_response_bytes: state.target_response_payload_bytes,
                 max_response_bytes: state.max_response_bytes,
+                known_source_tip: state.known_source_tip,
                 reserved_response_bytes: reserved_response_bytes.get(),
                 reservation,
             }));
@@ -226,6 +230,7 @@ struct SourceFetchRequest<Source> {
     max_connected_blocks: NonZeroU32,
     target_response_bytes: NonZeroU64,
     max_response_bytes: NonZeroU64,
+    known_source_tip: Option<SourceKnownTip>,
     reserved_response_bytes: u64,
     reservation: ByteReservation,
 }
@@ -252,6 +257,7 @@ where
     let max_connected_blocks = request.max_connected_blocks;
     let target_response_bytes = request.target_response_bytes;
     let max_response_bytes = request.max_response_bytes;
+    let known_source_tip = request.known_source_tip;
     let reserved_response_bytes = request.reserved_response_bytes;
     let reservation = request.reservation;
 
@@ -264,7 +270,8 @@ where
             max_connected_blocks,
             target_response_bytes.get(),
             max_response_bytes.get(),
-        );
+        )
+        .with_optional_known_tip(known_source_tip);
         let segment =
             fetch_chain_segment_with_retry(request_timeout, &source, limits, &mut retry_state)
                 .await?;
@@ -724,31 +731,22 @@ impl SourceSegmentSizer {
         if self.activations.consensus_branch_id_at(start_height) != self.active_branch_id {
             return None;
         }
-        self.initial_probe_in_flight = false;
-        metrics::gauge!("zinder_ingest_source_segment_initial_probe_in_flight").set(0.0);
+        self.reset_probe_in_flight();
         self.record_density_sample(stats);
         self.record_overshoot_memory(stats);
         let previous_blocks = self.current_blocks;
-        let next_blocks = if stats.split_count() > 0 {
-            self.shrunk_blocks_after_overshoot()
+        self.current_blocks = if stats.split_count() > 0 {
+            self.shrunk_blocks_after_overshoot(stats)
         } else {
-            self.blocks_after_success()
+            self.blocks_after_success(stats)
         };
-        self.current_blocks = next_blocks;
         record_source_segment_sizer_state(
             self.current_blocks,
             self.max_blocks,
             self.target_response_payload_bytes,
         );
-        let feedback_action = if self.current_blocks < previous_blocks {
-            if stats.split_count() > 0 {
-                Some(SourceSegmentFeedbackAction::ResponseTooLarge)
-            } else {
-                Some(SourceSegmentFeedbackAction::DensityShrink)
-            }
-        } else {
-            None
-        };
+        let feedback_action =
+            classify_segment_feedback_action(previous_blocks, self.current_blocks, stats);
         if previous_blocks != self.current_blocks {
             let reason =
                 feedback_action.map_or("success", |feedback_action| feedback_action.metric_label());
@@ -770,24 +768,35 @@ impl SourceSegmentSizer {
         }
     }
 
-    fn shrunk_blocks_after_overshoot(&mut self) -> NonZeroU32 {
+    fn shrunk_blocks_after_overshoot(&mut self, stats: SourceChainSegmentStats) -> NonZeroU32 {
         self.success_count = 0;
         self.overshoot_clear_success_count = 0;
-        let halved = self.current_blocks.get().saturating_div(2).max(1);
+        let split_divisor = stats.split_count().saturating_add(1).clamp(2, 8);
+        let split_scaled = self
+            .current_blocks
+            .get()
+            .saturating_div(split_divisor)
+            .max(1);
         nonzero_u32(
             self.blocks_allowed_by_density()
-                .map_or(halved, |blocks| halved.min(blocks.get()))
+                .map_or(split_scaled, |blocks| split_scaled.min(blocks.get()))
                 .max(1),
         )
     }
 
-    fn blocks_after_success(&mut self) -> NonZeroU32 {
+    fn blocks_after_success(&mut self, stats: SourceChainSegmentStats) -> NonZeroU32 {
         let density_blocks = self.blocks_allowed_by_density();
         if let Some(density_blocks) = density_blocks
             && density_blocks < self.current_blocks
         {
             self.success_count = 0;
             return density_blocks;
+        }
+        if stats.response_payload_bytes() > self.target_response_payload_bytes.get() {
+            self.success_count = 0;
+            return density_blocks.map_or(self.current_blocks, |blocks| {
+                self.current_blocks.min(blocks)
+            });
         }
 
         self.success_count = self.success_count.saturating_add(1);
@@ -855,7 +864,8 @@ impl SourceSegmentSizer {
     }
 
     fn record_overshoot_memory(&mut self, stats: SourceChainSegmentStats) {
-        if stats.split_count() > 0 {
+        let over_target = stats.response_payload_bytes() > self.target_response_payload_bytes.get();
+        if stats.split_count() > 0 || over_target {
             let Some(bytes_per_block) = response_payload_bytes_per_block(stats) else {
                 return;
             };
@@ -863,11 +873,6 @@ impl SourceSegmentSizer {
                 self.overshoot_bytes_per_block
                     .map_or(bytes_per_block, |current| current.max(bytes_per_block)),
             );
-            self.overshoot_clear_success_count = 0;
-            return;
-        }
-
-        if stats.response_payload_bytes() > self.target_response_payload_bytes.get() {
             self.overshoot_clear_success_count = 0;
             return;
         }
@@ -885,10 +890,12 @@ impl SourceSegmentSizer {
         }
         let previous_blocks = self.current_blocks;
         self.active_branch_id = active_branch_id;
-        self.current_blocks = self.max_blocks;
+        // Carry dense overshoot floor across upgrade boundaries instead of
+        // jumping straight to max_blocks into oversized retries; clean
+        // post-upgrade segments clear overshoot and ramp back up smoothly.
+        self.current_blocks = self.blocks_allowed_by_density().unwrap_or(self.max_blocks);
         self.success_count = 0;
         self.overshoot_clear_success_count = 0;
-        self.overshoot_bytes_per_block = None;
         self.initial_probe_in_flight = false;
         self.density_samples.clear();
         metrics::gauge!("zinder_ingest_source_segment_initial_probe_in_flight").set(0.0);
@@ -902,6 +909,21 @@ impl SourceSegmentSizer {
             previous_blocks,
             self.current_blocks,
         );
+    }
+}
+
+fn classify_segment_feedback_action(
+    previous_blocks: NonZeroU32,
+    current_blocks: NonZeroU32,
+    stats: SourceChainSegmentStats,
+) -> Option<SourceSegmentFeedbackAction> {
+    if current_blocks >= previous_blocks {
+        return None;
+    }
+    if stats.split_count() > 0 {
+        Some(SourceSegmentFeedbackAction::ResponseTooLarge)
+    } else {
+        Some(SourceSegmentFeedbackAction::DensityShrink)
     }
 }
 
@@ -1060,6 +1082,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn segment_sizer_clamps_first_dense_segment_after_low_density_streak_and_decays_up() {
+        let mut sizer = SourceSegmentSizer::new(
+            NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+            NonZeroU64::new(32_768).unwrap_or(NonZeroU64::MIN),
+            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+            BlockHeight::new(1),
+        );
+        let low_density =
+            SourceChainSegmentStats::from_response_payload_bytes(512).with_connected_blocks(64);
+        for offset in 0..24 {
+            assert_eq!(
+                sizer.record_segment(BlockHeight::new(1 + offset * 64), low_density),
+                None
+            );
+            assert_eq!(sizer.current_blocks.get(), 64);
+        }
+
+        // The first segment exceeding target_response_bytes (without a split)
+        // must clamp immediately instead of waiting for p95 to shift.
+        let first_dense =
+            SourceChainSegmentStats::from_response_payload_bytes(65_536).with_connected_blocks(64);
+        assert_eq!(
+            sizer.record_segment(BlockHeight::new(1 + 24 * 64), first_dense),
+            Some(SourceSegmentFeedbackAction::DensityShrink)
+        );
+        assert_eq!(sizer.current_blocks.get(), 32);
+
+        // Eight clean low-density segments clear the overshoot floor and decay
+        // the segment size smoothly back up toward max_blocks.
+        for step in 0..8 {
+            let height = BlockHeight::new(2_000 + step * 32);
+            let _ = sizer.record_segment(height, low_density);
+        }
+        assert!(
+            sizer.current_blocks.get() > 32,
+            "expected decay back up after clean segments, got {}",
+            sizer.current_blocks.get()
+        );
+        for step in 8..40 {
+            let height = BlockHeight::new(2_000 + step * 32);
+            let _ = sizer.record_segment(height, low_density);
+        }
+        assert_eq!(sizer.current_blocks.get(), 64);
+    }
+
+    #[test]
+    fn segment_sizer_scales_down_aggressively_on_multi_split_overshoot() {
+        let mut sizer = SourceSegmentSizer::new(
+            NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+            NonZeroU64::new(32_768).unwrap_or(NonZeroU64::MIN),
+            Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
+            BlockHeight::new(1),
+        );
+        let split_stats = SourceChainSegmentStats::from_response_payload_bytes(16_384)
+            .with_connected_blocks(64)
+            .with_added_splits(3);
+        assert_eq!(
+            sizer.record_segment(BlockHeight::new(1), split_stats),
+            Some(SourceSegmentFeedbackAction::ResponseTooLarge)
+        );
+        assert!(
+            sizer.current_blocks.get() <= 16,
+            "expected multi-split backoff <= 16 blocks, got {}",
+            sizer.current_blocks.get()
+        );
+    }
+
     fn test_source_prefetch_state()
     -> Result<SourceBlockStreamState<'static, ()>, Box<dyn std::error::Error>> {
         static SOURCE: () = ();
@@ -1119,6 +1209,7 @@ mod tests {
                 Arc::new(NetworkUpgradeActivations::empty(Network::ZcashRegtest)),
                 BlockHeight::new(1),
             ))),
+            known_source_tip: None,
             max_response_bytes: NonZeroU64::new(64).unwrap_or(NonZeroU64::MIN),
             target_response_payload_bytes: NonZeroU64::new(32).unwrap_or(NonZeroU64::MIN),
             source_fetch_max_in_flight_requests: NonZeroU32::new(4).unwrap_or(NonZeroU32::MIN),

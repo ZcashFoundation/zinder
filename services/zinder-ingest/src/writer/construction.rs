@@ -29,7 +29,7 @@ use zinder_core::{
     NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
-use zinder_source::{NodeSource, SourceBlock};
+use zinder_source::{NodeSource, SourceBlock, SourceKnownTip};
 use zinder_store::{
     CanonicalBlockLoadEvidence, CanonicalBuildBlock, CanonicalBuildSubtreeRoot,
     CanonicalStoreBuildError, CanonicalStoreError, CanonicalStoreWorkload,
@@ -432,6 +432,12 @@ pub struct CanonicalSourceLoadOutcome {
     pub subtree_root_evidence: CanonicalSubtreeRootLoadEvidence,
 }
 
+pub(crate) struct FreshCanonicalLoadOptions<'a> {
+    pub(crate) cancel: &'a CancellationToken,
+    pub(crate) progress: Option<ConstructionProgress>,
+    pub(crate) known_source_tip_height: Option<BlockHeight>,
+}
+
 /// Loads every block-local canonical family from one ordered source pass.
 ///
 /// Parallel preparation parses each source block exactly once. The blocking
@@ -447,12 +453,16 @@ pub async fn load_fresh_canonical_blocks<Source>(
 where
     Source: NodeSource + Clone,
 {
+    let cancel = CancellationToken::new();
     Box::pin(load_fresh_canonical_blocks_until_cancelled(
         builder,
         source,
         config,
-        &CancellationToken::new(),
-        None,
+        FreshCanonicalLoadOptions {
+            cancel: &cancel,
+            progress: None,
+            known_source_tip_height: None,
+        },
     ))
     .await
 }
@@ -461,8 +471,7 @@ async fn load_fresh_canonical_blocks_until_cancelled<Source>(
     builder: RocksDbCanonicalBuilder,
     source: &Source,
     config: &CanonicalConstructionConfig,
-    cancel: &CancellationToken,
-    progress: Option<ConstructionProgress>,
+    options: FreshCanonicalLoadOptions<'_>,
 ) -> Result<CanonicalBlockLoadOutcome, CanonicalConstructionError>
 where
     Source: NodeSource + Clone,
@@ -471,13 +480,20 @@ where
     register_prohibited_read_metrics();
     let build_plan = builder.build_plan().clone();
     validate_construction_identity(&build_plan, config)?;
-    let progress = progress.unwrap_or_else(|| ConstructionProgress::start(&build_plan, None));
+    let progress = options
+        .progress
+        .unwrap_or_else(|| ConstructionProgress::start(&build_plan, None));
     let block_queue_capacity =
         usize::try_from(config.pipeline_limits.block_prepare_concurrency.get())
             .unwrap_or(usize::MAX)
             .max(1);
-    let prepared_blocks =
-        build_prepared_block_stream(source, &build_plan, config, builder.raw_blob_retention());
+    let prepared_blocks = build_prepared_block_stream(
+        source,
+        &build_plan,
+        config,
+        builder.raw_blob_retention(),
+        options.known_source_tip_height,
+    );
     let checkpoint_selection = builder.tree_state_checkpoint_selection();
     let outcome = drive_block_loader(
         builder,
@@ -487,7 +503,7 @@ where
             network_upgrade_activations: Arc::clone(&config.network_upgrade_activations),
             checkpoint_selection,
             tree_hashing_workers: config.pipeline_limits.tree_hashing_workers,
-            cancel: cancel.clone(),
+            cancel: options.cancel.clone(),
             progress,
         },
     )
@@ -611,17 +627,21 @@ pub async fn load_fresh_canonical<Source>(
 where
     Source: NodeSource + Clone,
 {
+    let cancel = CancellationToken::new();
     Box::pin(load_fresh_canonical_until_cancelled(
         builder,
         source,
         config,
-        &CancellationToken::new(),
-        None,
+        FreshCanonicalLoadOptions {
+            cancel: &cancel,
+            progress: None,
+            known_source_tip_height: None,
+        },
     ))
     .await
 }
 
-/// Loads every source family until `cancel` fires.
+/// Loads every source family until `options.cancel` fires.
 ///
 /// Cancellation during the block stream stops the blocking loader at its next
 /// block boundary. Once every block is queued, the loader finalizes SST files,
@@ -630,15 +650,14 @@ pub(crate) async fn load_fresh_canonical_until_cancelled<Source>(
     builder: RocksDbCanonicalBuilder,
     source: &Source,
     config: &CanonicalConstructionConfig,
-    cancel: &CancellationToken,
-    progress: Option<ConstructionProgress>,
+    options: FreshCanonicalLoadOptions<'_>,
 ) -> Result<CanonicalSourceLoadOutcome, CanonicalConstructionError>
 where
     Source: NodeSource + Clone,
 {
+    let cancel = options.cancel;
     let block_outcome =
-        load_fresh_canonical_blocks_until_cancelled(builder, source, config, cancel, progress)
-            .await?;
+        load_fresh_canonical_blocks_until_cancelled(builder, source, config, options).await?;
     cancel
         .run_until_cancelled(load_fresh_canonical_source_families(
             block_outcome,
@@ -791,17 +810,11 @@ fn admit_source_blocks(
     })
 }
 
-fn build_prepared_block_stream<'source, Source>(
-    source: &'source Source,
+fn canonical_source_fetch_config(
     build_plan: &zinder_store::CanonicalStoreBuildPlan,
     config: &CanonicalConstructionConfig,
-    raw_blob_retention: RawBlobRetention,
-) -> impl Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>>
-+ Send
-+ use<'source, Source>
-where
-    Source: NodeSource + Clone,
-{
+    known_source_tip_height: Option<BlockHeight>,
+) -> CanonicalSourceFetchConfig {
     let first_height = build_plan.history_bounds().first_available_height();
     let source_segment_sizer = Arc::new(Mutex::new(SourceSegmentSizer::new(
         config.pipeline_limits.source_segment_max_blocks,
@@ -809,25 +822,40 @@ where
         Arc::clone(&config.network_upgrade_activations),
         first_height,
     )));
+    let known_source_tip = known_source_tip_height.map(|tip_height| {
+        SourceKnownTip::new(tip_height, build_plan.reorg_policy().reorg_window_blocks())
+    });
+    CanonicalSourceFetchConfig {
+        request_timeout: config.request_timeout,
+        history_predecessor: Some(build_plan.history_predecessor().block_id),
+        from_height: first_height,
+        to_height: build_plan.build_tip().height,
+        max_response_bytes: config.pipeline_limits.max_response_bytes,
+        target_response_payload_bytes: config.pipeline_limits.source_segment_target_response_bytes,
+        source_fetch_max_in_flight_requests: config
+            .pipeline_limits
+            .source_fetch_max_in_flight_requests,
+        source_fetch_max_in_flight_bytes: config.pipeline_limits.source_fetch_max_in_flight_bytes,
+        source_segment_sizer,
+        known_source_tip,
+    }
+}
+
+fn build_prepared_block_stream<'source, Source>(
+    source: &'source Source,
+    build_plan: &zinder_store::CanonicalStoreBuildPlan,
+    config: &CanonicalConstructionConfig,
+    raw_blob_retention: RawBlobRetention,
+    known_source_tip_height: Option<BlockHeight>,
+) -> impl Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>>
++ Send
++ use<'source, Source>
+where
+    Source: NodeSource + Clone,
+{
     let source_chunks = build_source_block_stream(
         source,
-        CanonicalSourceFetchConfig {
-            request_timeout: config.request_timeout,
-            history_predecessor: Some(build_plan.history_predecessor().block_id),
-            from_height: first_height,
-            to_height: build_plan.build_tip().height,
-            max_response_bytes: config.pipeline_limits.max_response_bytes,
-            target_response_payload_bytes: config
-                .pipeline_limits
-                .source_segment_target_response_bytes,
-            source_fetch_max_in_flight_requests: config
-                .pipeline_limits
-                .source_fetch_max_in_flight_requests,
-            source_fetch_max_in_flight_bytes: config
-                .pipeline_limits
-                .source_fetch_max_in_flight_bytes,
-            source_segment_sizer,
-        },
+        canonical_source_fetch_config(build_plan, config, known_source_tip_height),
     )
     .boxed();
 
