@@ -1718,20 +1718,26 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-projector"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Threads that hash wallet rows into the projection digest and the UTXO \
-                      set commitment during a fresh wallet build. Defaults to the number of \
+        description: "Threads that scan settled canonical replay chunks, hash wallet rows into \
+                      the projection digest and the UTXO set commitment, and split cold \
+                      validation during a fresh wallet build. Defaults to the number of \
                       logical CPUs the projector may use, at most 4, and to 1 when that count \
-                      cannot be detected. With 1, hashing runs on the build thread. A higher \
-                      value hashes batches of rows on that many threads while the build thread \
-                      drains its sorters and writes SST files. Each batch is allocated once and \
-                      takes at most 512 KiB, and at most twice that many batches, never more \
-                      than 64, plus two on the build thread exist at once: at most 5 MiB at 4 \
-                      threads and 33 MiB at 64. A row larger than a batch is hashed on the \
-                      build thread. Cold validation also reads the unspent and spent output \
-                      families and the address-transaction family back in up to that many \
-                      hash-prefix key ranges at once, at most one per 65,536 of each scan's \
-                      rows. The published rows, digest, and commitment do not change. Must be \
-                      between 1 and 64; the projector refuses a larger value at startup.",
+                      cannot be detected. With 1, scanning and hashing run on the build \
+                      thread. A higher value scans settled canonical replay in 4,096-block \
+                      height chunks across that many workers (splitting \
+                      max_outpoint_sort_memory_bytes across workers while sharing \
+                      max_temporary_file_bytes_per_sorter and verifying the ordered sequence \
+                      digest), and hashes batches of rows on that many threads while the build \
+                      thread drains its sorters and writes SST files. Each batch is allocated \
+                      once and takes at most 512 KiB, and at most twice that many batches, \
+                      never more than 64, plus two on the build thread exist at once: at most \
+                      5 MiB at 4 threads and 33 MiB at 64. A row larger than a batch is \
+                      hashed on the build thread. Cold validation also reads the unspent and \
+                      spent output families and the address-transaction family back in up to \
+                      that many hash-prefix key ranges at once, at most one per 65,536 of \
+                      each scan's rows. The published rows, digest, and commitment do not \
+                      change. Must be between 1 and 64; the projector refuses a larger value at \
+                      startup.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES",

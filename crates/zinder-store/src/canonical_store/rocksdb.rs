@@ -1012,6 +1012,13 @@ impl RocksDbCanonicalStore {
         CanonicalReplayScan::new(&self.bounded_open.db, &self.ready_evidence)
     }
 
+    /// Returns a `Sync` slice source for concurrent height-bounded replay scans
+    /// against this admitted READY fence.
+    #[must_use]
+    pub const fn canonical_replay_slice_source(&self) -> super::CanonicalReplaySliceSource<'_> {
+        super::CanonicalReplaySliceSource::new(&self.bounded_open.db, &self.ready_evidence)
+    }
+
     /// Publishes throttled resource gauges for the canonical writer.
     pub fn record_resource_gauges(&self) {
         self.bounded_open.record_resource_gauges(

@@ -7,7 +7,7 @@ mod bulk_load;
 
 pub use bulk_load::{
     BulkLoadError, FixedRecordSorter, OrderedKeyValueEvidence, OrderedKeyValueEvidenceAccumulator,
-    OrderedSstWriter, SortedVariableValues, SstFileEvidence, SstFileSet, VariableValueRecord,
-    VariableValueSortDurations, VariableValueSortEvidence, VariableValueSorter,
-    fixed_record_capacity,
+    OrderedSstWriter, ParallelVariableValueSorter, SortedVariableValues, SstFileEvidence,
+    SstFileSet, StagedParallelVariableRuns, VariableValueRecord, VariableValueSortDurations,
+    VariableValueSortEvidence, VariableValueSortShard, VariableValueSorter, fixed_record_capacity,
 };

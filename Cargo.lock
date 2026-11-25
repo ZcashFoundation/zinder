@@ -6543,6 +6543,7 @@ dependencies = [
 name = "zinder-rocksdb-bulk-load"
 version = "0.25.0"
 dependencies = [
+ "parking_lot 0.13.0",
  "rust-rocksdb",
  "sha2 0.11.1",
  "tempfile",

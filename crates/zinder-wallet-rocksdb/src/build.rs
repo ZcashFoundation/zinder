@@ -14,8 +14,9 @@ use zinder_core::{
 };
 use zinder_rocksdb_bulk_load::{VariableValueSortDurations, VariableValueSortEvidence};
 use zinder_store::{
-    CanonicalReplayScan, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReplayScan, CanonicalReplaySliceSource, CanonicalStoreError,
+    CanonicalStoreReadyEvidence, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionAccumulator, WalletProjectionBuildLease,
@@ -28,7 +29,8 @@ use crate::{
     RocksDbWalletBuildStore, RocksDbWalletError, RocksDbWalletStore,
     build_lock::WalletBuildLock,
     projection_load::{
-        PreparedWalletProjectionLoad, WalletProjectionLoadConfig, write_projection_ssts,
+        DEFAULT_CANONICAL_SCAN_CHUNK_BLOCKS, PreparedWalletProjectionLoad,
+        WalletProjectionLoadConfig, write_projection_ssts_from_source,
     },
     store::{MIN_ROWS_PER_SCAN_RANGE, RocksDbWalletBuilder, WalletColdValidationConfig},
 };
@@ -59,6 +61,12 @@ pub trait WalletProjectionReplaySource {
 
     /// Opens the canonical replay scan used for the fixed-tip projection build.
     fn wallet_projection_scan(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError>;
+
+    /// Returns a `Sync` slice source for concurrent height-chunk canonical
+    /// replay scanning, or `None` to fall back to [`Self::wallet_projection_scan`].
+    fn wallet_projection_slice_source(&self) -> Option<CanonicalReplaySliceSource<'_>> {
+        None
+    }
 }
 
 /// Observable boundary at which a long-running fixed-tip build may renew its lease.
@@ -182,6 +190,10 @@ impl WalletProjectionReplaySource for RocksDbCanonicalStore {
     fn wallet_projection_scan(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
         self.scan_canonical_replay()
     }
+
+    fn wallet_projection_slice_source(&self) -> Option<CanonicalReplaySliceSource<'_>> {
+        Some(self.canonical_replay_slice_source())
+    }
 }
 
 impl WalletProjectionReplaySource for RocksDbCanonicalSecondary {
@@ -195,6 +207,10 @@ impl WalletProjectionReplaySource for RocksDbCanonicalSecondary {
 
     fn wallet_projection_scan(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
         self.scan_canonical_replay()
+    }
+
+    fn wallet_projection_slice_source(&self) -> Option<CanonicalReplaySliceSource<'_>> {
+        Some(self.canonical_replay_slice_source())
     }
 }
 
@@ -245,15 +261,20 @@ pub struct RocksDbWalletBuildOptions {
     /// Number of exact tip undo records retained for reorg handling.
     pub supported_reorg_depth: u32,
     /// Threads that hash wallet rows into the projection accumulator and the
-    /// UTXO set commitment.
+    /// UTXO set commitment, scan the settled canonical replay in height chunks,
+    /// and read output and address-transaction families back during cold
+    /// validation.
     ///
-    /// One hashes on the build's own thread. More hash bounded batches of rows
-    /// on that many threads while the build thread drains the sorters and
-    /// writes SST files. Cold validation also reads the unspent and spent
-    /// output families and the address-transaction family back in up to this
-    /// many hash-prefix key ranges at once.
-    /// The accumulators do not depend on the row order, so the published
-    /// evidence does not change. At most [`MAX_ACCUMULATOR_HASHING_WORKERS`].
+    /// One runs all work on the build's own thread. More scan settled canonical
+    /// replay chunks in parallel into sharded outpoint sorters (splitting
+    /// `max_outpoint_sort_memory_bytes` across workers while sharing
+    /// `max_temporary_file_bytes_per_sorter`), hash bounded batches of rows on
+    /// that many threads while the build thread drains the sorters and writes
+    /// SST files, and read the unspent and spent output families and the
+    /// address-transaction family back in up to this many hash-prefix key
+    /// ranges at once.
+    /// The published rows, sequence digest, and accumulators do not change. At
+    /// most [`MAX_ACCUMULATOR_HASHING_WORKERS`].
     pub accumulator_hashing_workers: NonZeroU32,
 }
 
@@ -806,7 +827,7 @@ where
         lease_cleanup.arm(builder.lease(), initialized_heartbeat.now());
 
         let column_family_options = builder.column_family_options();
-        let mut prepared = write_projection_ssts(
+        let mut prepared = write_projection_ssts_from_source(
             WalletProjectionLoadConfig {
                 staging_path: staging.path(),
                 options: &column_family_options,
@@ -821,10 +842,9 @@ where
                 sst_target_logical_bytes: options.sst_target_logical_bytes,
                 max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
                 accumulator_hashing_workers: options.accumulator_hashing_workers,
+                scan_chunk_blocks: DEFAULT_CANONICAL_SCAN_CHUNK_BLOCKS,
             },
-            canonical_store
-                .wallet_projection_scan()
-                .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?,
+            canonical_store,
         )?;
         let replay_heartbeat = heartbeat(
             WalletBuildLeasePhase::CanonicalReplayComplete,

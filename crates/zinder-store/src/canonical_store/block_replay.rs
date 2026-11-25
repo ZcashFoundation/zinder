@@ -43,6 +43,301 @@ pub struct CanonicalReplayScan<'a> {
     finished: bool,
 }
 
+/// Summary of a complete canonical replay reconstructed from disjoint slices.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservedCanonicalReplaySequence {
+    /// First block observed across the stitched slices.
+    pub first_block: BlockId,
+    /// Last block observed across the stitched slices.
+    pub tip: BlockId,
+    /// Total blocks observed across the stitched slices.
+    pub block_count: u64,
+    /// Ordered sequence digest computed across every block in height order.
+    pub sequence_digest: CanonicalBlockFactsSequenceDigest,
+}
+
+/// Read-only `Sync` handle for scanning disjoint height slices of one READY
+/// canonical replay fence concurrently.
+///
+/// Each [`CanonicalReplaySliceScan`] decodes and verifies its slice's internal
+/// contiguity and parent links without populating the block cache. Callers
+/// that reconstruct a full history across multiple slices must verify the
+/// stitched boundaries and call [`Self::verify_complete_sequence`] before
+/// trusting the scan as a complete READY replay.
+#[derive(Clone, Copy)]
+pub struct CanonicalReplaySliceSource<'a> {
+    db: &'a DB,
+    ready_evidence: CanonicalStoreReadyEvidence,
+}
+
+impl<'a> CanonicalReplaySliceSource<'a> {
+    pub(super) const fn new(db: &'a DB, ready_evidence: &CanonicalStoreReadyEvidence) -> Self {
+        Self {
+            db,
+            ready_evidence: *ready_evidence,
+        }
+    }
+
+    /// Returns the admitted READY evidence pinned by this slice source.
+    #[must_use]
+    pub const fn ready_evidence(&self) -> CanonicalStoreReadyEvidence {
+        self.ready_evidence
+    }
+
+    /// Opens one cache-bypassing forward scan over `range`.
+    ///
+    /// `range` must be non-empty and lie within the admitted retained range.
+    pub fn scan_slice(
+        &self,
+        range: BlockHeightRange,
+    ) -> Result<CanonicalReplaySliceScan<'a>, CanonicalStoreError> {
+        CanonicalReplaySliceScan::new(self.db, &self.ready_evidence, range)
+    }
+
+    /// Verifies that a stitched set of slices matches the complete READY fence
+    /// and that no replay rows exist past the visible tip.
+    pub fn verify_complete_sequence(
+        &self,
+        observed: ObservedCanonicalReplaySequence,
+    ) -> Result<(), CanonicalStoreError> {
+        let expected_block_count = expected_visible_block_count(&self.ready_evidence)?;
+        if observed.first_block != self.ready_evidence.first_retained_block {
+            return Err(CanonicalStoreError::block_replay_sequence(
+                "replay scan first block does not match READY",
+            ));
+        }
+        if self.ready_evidence.visible_block_count != expected_block_count
+            || observed.block_count != expected_block_count
+        {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "READY visible range contains {expected_block_count} blocks but replay scan observed {}",
+                observed.block_count
+            )));
+        }
+        if observed.tip != self.ready_evidence.visible_tip {
+            return Err(CanonicalStoreError::block_replay_sequence(
+                "replay scan tip does not match READY",
+            ));
+        }
+        if observed.sequence_digest.as_bytes() != self.ready_evidence.visible_sequence_digest {
+            return Err(CanonicalStoreError::block_replay_sequence(
+                "replay scan sequence digest does not match READY",
+            ));
+        }
+        if let Some(after_tip) = self.ready_evidence.visible_tip.height.next() {
+            let block_replay = block_replay_column_family(self.db)?;
+            let mut read_options = ReadOptions::default();
+            read_options.fill_cache(false);
+            let mut iterator = self.db.raw_iterator_cf_opt(&block_replay, read_options);
+            iterator.seek(encode_height_key_ascending(after_tip));
+            iterator
+                .status()
+                .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                    operation: "canonical replay fence check",
+                    source,
+                })?;
+            if iterator.valid() {
+                return Err(CanonicalStoreError::block_replay_sequence(
+                    "replay scan contains rows beyond the visible fence",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One cache-bypassing forward scan over a height-bounded slice of `block_replay`.
+///
+/// Every yielded row is decoded, version-checked, height-checked, and linked to
+/// its immediate predecessor within the slice. Reaching `None` verifies that
+/// every height in the requested slice was present with no gaps or trailing
+/// rows.
+pub struct CanonicalReplaySliceScan<'a> {
+    iterator: DBRawIteratorWithThreadMode<'a, DB>,
+    ready_evidence: CanonicalStoreReadyEvidence,
+    range: BlockHeightRange,
+    expected_block_count: u64,
+    previous_block: Option<(BlockHeight, BlockHash)>,
+    observed_block_count: u64,
+    finished: bool,
+}
+
+impl<'a> CanonicalReplaySliceScan<'a> {
+    fn new(
+        db: &'a DB,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+        range: BlockHeightRange,
+    ) -> Result<Self, CanonicalStoreError> {
+        if range.start > range.end {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "requested replay slice {}..={} must not be empty",
+                range.start.value(),
+                range.end.value(),
+            )));
+        }
+        if range.start < ready_evidence.first_retained_block.height
+            || range.end > ready_evidence.visible_tip.height
+        {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "requested replay slice {}..={} is outside admitted canonical range {}..={}",
+                range.start.value(),
+                range.end.value(),
+                ready_evidence.first_retained_block.height.value(),
+                ready_evidence.visible_tip.height.value(),
+            )));
+        }
+        let expected_block_count = u64::from(range.end.value() - range.start.value()) + 1;
+        let block_replay = block_replay_column_family(db)?;
+        let mut read_options = ReadOptions::default();
+        read_options.fill_cache(false);
+        read_options.set_readahead_size(2 * 1024 * 1024);
+        if let Some(upper_height) = range.end.next() {
+            read_options.set_iterate_upper_bound(encode_height_key_ascending(upper_height));
+        }
+        let mut iterator = db.raw_iterator_cf_opt(&block_replay, read_options);
+        iterator.seek(encode_height_key_ascending(range.start));
+        Ok(Self {
+            iterator,
+            ready_evidence: *ready_evidence,
+            range,
+            expected_block_count,
+            previous_block: None,
+            observed_block_count: 0,
+            finished: false,
+        })
+    }
+
+    fn finish_slice(&self) -> Result<(), CanonicalStoreError> {
+        self.iterator
+            .status()
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "canonical replay slice scan",
+                source,
+            })?;
+        if self.observed_block_count != self.expected_block_count {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "replay slice {}..={} contains {} blocks but observed {}",
+                self.range.start.value(),
+                self.range.end.value(),
+                self.expected_block_count,
+                self.observed_block_count,
+            )));
+        }
+        let Some((last_height, last_hash)) = self.previous_block else {
+            return Err(CanonicalStoreError::block_replay_sequence(
+                "replay slice observed no blocks",
+            ));
+        };
+        if last_height != self.range.end {
+            return Err(CanonicalStoreError::block_replay_sequence(format!(
+                "replay slice ended at height {} instead of {}",
+                last_height.value(),
+                self.range.end.value(),
+            )));
+        }
+        if self.range.end == self.ready_evidence.visible_tip.height
+            && last_hash != self.ready_evidence.visible_tip.hash
+        {
+            return Err(CanonicalStoreError::block_replay_sequence(
+                "replay scan tip does not match READY",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_slice_position(
+        &self,
+        height: BlockHeight,
+        block_hash: BlockHash,
+        parent_hash: BlockHash,
+    ) -> Result<(), CanonicalStoreError> {
+        match self.previous_block {
+            None if height == self.range.start
+                && (height != self.ready_evidence.first_retained_block.height
+                    || block_hash == self.ready_evidence.first_retained_block.hash) =>
+            {
+                Ok(())
+            }
+            Some((previous_height, previous_hash))
+                if previous_height.next() == Some(height)
+                    && height <= self.range.end
+                    && parent_hash == previous_hash =>
+            {
+                Ok(())
+            }
+            None | Some(_) => Err(CanonicalStoreError::block_replay_sequence(format!(
+                "replay slice observed an unexpected block at height {}",
+                height.value()
+            ))),
+        }
+    }
+}
+
+impl Iterator for CanonicalReplaySliceScan<'_> {
+    type Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        if !self.iterator.valid() {
+            self.finished = true;
+            return self.finish_slice().err().map(Err);
+        }
+        let decoded_replay = self.iterator.item().map_or_else(
+            || {
+                Err(CanonicalStoreError::block_replay_sequence(
+                    "canonical replay slice iterator was valid without a row",
+                ))
+            },
+            |(key, encoded_replay)| decode_persisted_replay(key, encoded_replay),
+        );
+        let replay = (|| {
+            let (height, replay) = decoded_replay?;
+            let facts = replay.facts();
+            self.validate_slice_position(
+                height,
+                facts.block_header.block_hash,
+                facts.block_header.parent_hash,
+            )?;
+            self.observed_block_count =
+                self.observed_block_count.checked_add(1).ok_or_else(|| {
+                    CanonicalStoreError::block_replay_sequence(
+                        "replay slice count exceeds u64::MAX",
+                    )
+                })?;
+            if self.observed_block_count > self.expected_block_count {
+                return Err(CanonicalStoreError::block_replay_sequence(
+                    "replay slice contains rows beyond its upper bound",
+                ));
+            }
+            self.previous_block = Some((height, facts.block_header.block_hash));
+            Ok(replay)
+        })();
+        self.iterator.next();
+        if replay.is_err() {
+            self.finished = true;
+        }
+        Some(replay)
+    }
+}
+
+fn expected_visible_block_count(
+    ready_evidence: &CanonicalStoreReadyEvidence,
+) -> Result<u64, CanonicalStoreError> {
+    let distance = ready_evidence
+        .visible_tip
+        .height
+        .value()
+        .checked_sub(ready_evidence.first_retained_block.height.value())
+        .ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence(
+                "READY visible range cannot produce a block count",
+            )
+        })?;
+    Ok(u64::from(distance) + 1)
+}
+
 /// Bounded, connected replay rows inside one admitted canonical fence.
 ///
 /// Unlike [`CanonicalReplayScan`], this iterator does not authenticate the
@@ -750,7 +1045,10 @@ fn validate_replay_versions(
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::canonical_store::live_replacement_tests::{canonical_block, published_store};
 
     #[test]
     fn incremental_replay_range_enforces_the_exact_span_limit() {
@@ -775,5 +1073,259 @@ mod tests {
             ),))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn replay_slice_source_reconstructs_and_verifies_the_complete_sequence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store = published_store(
+            &temporary.path().join("canonical"),
+            2,
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+        )?;
+        let ready = store.ready_evidence();
+        let slice_source = store.canonical_replay_slice_source();
+
+        // Empty or out-of-bounds slices must be refused immediately.
+        assert!(
+            slice_source
+                .scan_slice(BlockHeightRange::empty_at(BlockHeight::new(2)))
+                .is_err()
+        );
+        assert!(
+            slice_source
+                .scan_slice(BlockHeightRange::inclusive(
+                    BlockHeight::new(1),
+                    BlockHeight::new(9),
+                ))
+                .is_err()
+        );
+
+        let slices = [
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3)),
+            BlockHeightRange::inclusive(BlockHeight::new(4), BlockHeight::new(6)),
+            BlockHeightRange::inclusive(BlockHeight::new(7), BlockHeight::new(8)),
+        ];
+        let mut sequence_digest = CanonicalBlockFactsSequenceDigestBuilder::new(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+        );
+        let mut observed_blocks = Vec::new();
+        for range in slices {
+            for replay in slice_source.scan_slice(range)? {
+                let replay = replay?;
+                sequence_digest.try_append(replay.reference_digest())?;
+                let header = &replay.facts().block_header;
+                observed_blocks.push(BlockId::new(header.height, header.block_hash));
+            }
+        }
+        let serial_blocks = store
+            .scan_canonical_replay()?
+            .map(|replay| {
+                replay.map(|validated| {
+                    let header = &validated.facts().block_header;
+                    BlockId::new(header.height, header.block_hash)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(observed_blocks, serial_blocks);
+
+        let observed = ObservedCanonicalReplaySequence {
+            first_block: *observed_blocks.first().ok_or("missing first block")?,
+            tip: *observed_blocks.last().ok_or("missing tip block")?,
+            block_count: u64::try_from(observed_blocks.len())?,
+            sequence_digest: sequence_digest.finish(),
+        };
+        slice_source.verify_complete_sequence(observed)?;
+
+        // Mismatched count, tip, or sequence digest must be rejected.
+        let mut bad_count = observed;
+        bad_count.block_count -= 1;
+        assert!(slice_source.verify_complete_sequence(bad_count).is_err());
+
+        let mut bad_first = observed;
+        bad_first.first_block = BlockId::new(
+            ready.first_retained_block.height,
+            BlockHash::from_bytes([0xff; 32]),
+        );
+        assert!(slice_source.verify_complete_sequence(bad_first).is_err());
+
+        let mut bad_tip = observed;
+        bad_tip.tip = BlockId::new(ready.visible_tip.height, BlockHash::from_bytes([0xee; 32]));
+        assert!(slice_source.verify_complete_sequence(bad_tip).is_err());
+
+        let mut bad_digest = observed;
+        bad_digest.sequence_digest =
+            CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                CanonicalBlockFactsSequenceDigestVersion::V1,
+                observed.block_count,
+                [0xdd; 32],
+            );
+        assert!(slice_source.verify_complete_sequence(bad_digest).is_err());
+        Ok(())
+    }
+
+    fn exhaust_slice(
+        slice_source: &CanonicalReplaySliceSource<'_>,
+        range: BlockHeightRange,
+    ) -> Result<usize, CanonicalStoreError> {
+        let mut observed = 0usize;
+        for replay in slice_source.scan_slice(range)? {
+            replay?;
+            observed += 1;
+        }
+        Ok(observed)
+    }
+
+    fn collect_slices(
+        slice_source: &CanonicalReplaySliceSource<'_>,
+        slices: &[BlockHeightRange],
+    ) -> Result<ObservedCanonicalReplaySequence, Box<dyn std::error::Error>> {
+        let mut sequence_digest = CanonicalBlockFactsSequenceDigestBuilder::new(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+        );
+        let mut first_block = None;
+        let mut tip = None;
+        let mut block_count = 0u64;
+        for &range in slices {
+            for replay in slice_source.scan_slice(range)? {
+                let replay = replay?;
+                sequence_digest.try_append(replay.reference_digest())?;
+                let header = &replay.facts().block_header;
+                let block_id = BlockId::new(header.height, header.block_hash);
+                if first_block.is_none() {
+                    first_block = Some(block_id);
+                }
+                tip = Some(block_id);
+                block_count += 1;
+            }
+        }
+        Ok(ObservedCanonicalReplaySequence {
+            first_block: first_block.ok_or("missing first block")?,
+            tip: tip.ok_or("missing tip block")?,
+            block_count,
+            sequence_digest: sequence_digest.finish(),
+        })
+    }
+
+    #[test]
+    fn replay_slice_source_rejects_deleted_and_detached_stored_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let slice_1_3 = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
+
+        let missing_internal = published_store(
+            &temporary.path().join("missing-internal"),
+            2,
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+        )?;
+        let internal_cf = missing_internal
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+            .ok_or("missing block_replay column family")?;
+        missing_internal.bounded_open.db.delete_cf(
+            &internal_cf,
+            encode_height_key_ascending(BlockHeight::new(2)),
+        )?;
+        assert!(matches!(
+            exhaust_slice(&missing_internal.canonical_replay_slice_source(), slice_1_3),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+
+        let missing_final = published_store(
+            &temporary.path().join("missing-final"),
+            2,
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+        )?;
+        let final_cf = missing_final
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+            .ok_or("missing block_replay column family")?;
+        missing_final
+            .bounded_open
+            .db
+            .delete_cf(&final_cf, encode_height_key_ascending(BlockHeight::new(3)))?;
+        assert!(matches!(
+            exhaust_slice(&missing_final.canonical_replay_slice_source(), slice_1_3),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+
+        let detached = published_store(
+            &temporary.path().join("detached-parent"),
+            2,
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+        )?;
+        let mut wrong_parent = detached
+            .ready_evidence()
+            .first_retained_block
+            .hash
+            .as_bytes();
+        wrong_parent[0] ^= 0xff;
+        let replacement = canonical_block(BlockHeight::new(2), [0x22; 32], wrong_parent, 2);
+        let detached_cf = detached
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+            .ok_or("missing block_replay column family")?;
+        detached.bounded_open.db.put_cf(
+            &detached_cf,
+            encode_height_key_ascending(BlockHeight::new(2)),
+            replacement.replay_envelope.as_bytes(),
+        )?;
+        assert!(matches!(
+            exhaust_slice(&detached.canonical_replay_slice_source(), slice_1_3),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_slice_source_rejects_trailing_row_beyond_ready_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store = published_store(
+            &temporary.path().join("trailing-fence"),
+            2,
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+        )?;
+        let ready = store.ready_evidence();
+        let trailing = canonical_block(
+            BlockHeight::new(9),
+            [0x99; 32],
+            ready.visible_tip.hash.as_bytes(),
+            9,
+        );
+        let replay_cf = store
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+            .ok_or("missing block_replay column family")?;
+        store.bounded_open.db.put_cf(
+            &replay_cf,
+            encode_height_key_ascending(BlockHeight::new(9)),
+            trailing.replay_envelope.as_bytes(),
+        )?;
+
+        let slices = [
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3)),
+            BlockHeightRange::inclusive(BlockHeight::new(4), BlockHeight::new(6)),
+            BlockHeightRange::inclusive(BlockHeight::new(7), BlockHeight::new(8)),
+        ];
+        let slice_source = store.canonical_replay_slice_source();
+        let observed = collect_slices(&slice_source, &slices)?;
+        let outcome = slice_source.verify_complete_sequence(observed);
+        assert!(matches!(
+            outcome,
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { ref reason })
+                if reason.contains("beyond the visible fence")
+        ));
+        Ok(())
     }
 }

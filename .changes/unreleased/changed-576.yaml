@@ -1,0 +1,6 @@
+kind: changed
+body: Fresh wallet projection construction now scans the settled canonical replay prefix in parallel 4,096-block height chunks across up to `projector.build.accumulator_hashing_workers` workers into sharded outpoint sorters (splitting `projector.build.max_outpoint_sort_memory_bytes` across workers while enforcing a single shared `projector.build.max_temporary_file_bytes_per_sorter` ceiling), flushing the final sharded runs in parallel during `outpoint_sort` while verifying every chunk boundary, the ordered canonical sequence digest, and the unsettled suffix identically.
+time: 2026-11-25T08:33:00Z
+custom:
+    Bump: patch
+    PR: "576"

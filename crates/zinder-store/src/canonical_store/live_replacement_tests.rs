@@ -2428,7 +2428,7 @@ fn replacement_suffix(
     Ok(blocks)
 }
 
-fn canonical_block(
+pub(super) fn canonical_block(
     height: BlockHeight,
     block_hash: [u8; 32],
     parent_hash: [u8; 32],

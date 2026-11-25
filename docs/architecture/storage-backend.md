@@ -176,9 +176,16 @@ another schema version. The projector refuses to open it, and the wallet must
 be rebuilt.
 
 The row digest and the UTXO set commitment are sums of per-row hashes, so they
-do not depend on the order rows are hashed in. Construction hashes rows on
-`projector.build.accumulator_hashing_workers` threads, in batches, while the
-build thread drains its sorters and writes SST files. Each batch is allocated
+do not depend on the order rows are hashed in. Construction also scans the
+settled canonical replay prefix in 4,096-block height chunks across
+`projector.build.accumulator_hashing_workers` threads into sharded outpoint
+sorters that split `projector.build.max_outpoint_sort_memory_bytes` evenly
+while sharing `projector.build.max_temporary_file_bytes_per_sorter`, bounding
+in-flight chunk digests to at most `min(4W, 64)` chunks while verifying every
+chunk boundary and the ordered sequence digest against the READY fence (and
+scanning the unsettled suffix serially for `reorg_undo`). Construction hashes
+rows on `projector.build.accumulator_hashing_workers` threads, in batches,
+while the build thread drains its sorters and writes SST files. Each batch is allocated
 once with room for 256 KiB of keys, values, and scripts, 4,096 rows, and 2,048
 unspent outputs, and is handed to a worker before an entry would overflow it.
 A batch takes 512 KiB on 64-bit targets and less on 32-bit ones, whose row and

@@ -78,7 +78,9 @@ pub use stored_set::{CanonicalStoreRequirements, CanonicalStoredData, CanonicalS
 
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use block_replay::{
-    CanonicalReplayRangeScan, CanonicalReplayScan, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+    CanonicalReplayRangeScan, CanonicalReplayScan, CanonicalReplaySliceScan,
+    CanonicalReplaySliceSource, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+    ObservedCanonicalReplaySequence,
 };
 pub use builder::RocksDbCanonicalBuilder;
 pub use construction_manifest::{

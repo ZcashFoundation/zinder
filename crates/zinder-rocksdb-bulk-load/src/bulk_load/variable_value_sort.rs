@@ -1,12 +1,15 @@
 //! Bounded external sorting for fixed-width keys with variable encoded values.
 
+use parking_lot::Mutex;
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
     mem::size_of,
+    num::NonZeroU32,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use tempfile::{Builder as TemporaryDirectoryBuilder, TempDir};
@@ -450,42 +453,660 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
         input_runs: Vec<RunFile>,
         output_path: PathBuf,
     ) -> Result<RunFile, BulkLoadError> {
-        let input_file_bytes = input_runs.iter().try_fold(0_u64, |total, run| {
+        merge_group_with_budget::<KEY_LEN>(&mut self.temporary_files, input_runs, output_path)
+    }
+}
+
+#[derive(Debug)]
+struct SharedRunBudget {
+    temporary_files: TemporaryFileBudget,
+    next_run_index: u64,
+    reserved_run_count: u64,
+    shards_opened: bool,
+}
+
+impl SharedRunBudget {
+    fn reserve_initial_run(&mut self, run_file_bytes: u64) -> Result<u64, BulkLoadError> {
+        if self.reserved_run_count == 0 {
+            self.temporary_files.reserve(run_file_bytes)?;
+        } else {
+            self.temporary_files.reserve_merged_run(run_file_bytes)?;
+        }
+        let run_index = self.next_run_index;
+        self.next_run_index = self
+            .next_run_index
+            .checked_add(1)
+            .ok_or_else(|| BulkLoadError::invalid("variable run count exceeds u64::MAX"))?;
+        self.reserved_run_count = self
+            .reserved_run_count
+            .checked_add(1)
+            .ok_or_else(|| BulkLoadError::invalid("variable run count exceeds u64::MAX"))?;
+        Ok(run_index)
+    }
+
+    fn discard_reserved_run(
+        &mut self,
+        path: &Path,
+        run_file_bytes: u64,
+    ) -> Result<(), BulkLoadError> {
+        discard_reserved_file(path, &mut self.temporary_files, run_file_bytes)?;
+        self.reserved_run_count = self
+            .reserved_run_count
+            .checked_sub(1)
+            .ok_or_else(|| BulkLoadError::invalid("variable run count underflow"))?;
+        Ok(())
+    }
+}
+
+static NEXT_PARALLEL_SORTER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Shared workspace and temporary-file budget for concurrent variable-value
+/// sort shards that merge into one [`SortedVariableValues`].
+///
+/// The accounted memory ceiling is split evenly across `shard_count` shards so
+/// the sum of every shard's peak accounted memory never exceeds
+/// `max_accounted_memory_bytes`. `open_shards` is single-use per sorter so
+/// outstanding shards cannot duplicate that allowance. Every shard shares one
+/// temporary-file budget enforcing `max_temporary_file_bytes` across all
+/// spilled and merged runs.
+pub struct ParallelVariableValueSorter<const KEY_LEN: usize> {
+    sorter_id: u64,
+    workspace: TempDir,
+    shard_count: NonZeroU32,
+    max_accounted_memory_bytes: u64,
+    shard_memory_limit_bytes: u64,
+    shared_budget: Mutex<SharedRunBudget>,
+}
+
+/// One independent shard writer owned by a worker thread of a
+/// [`ParallelVariableValueSorter`].
+pub struct VariableValueSortShard<'a, const KEY_LEN: usize> {
+    workspace_path: &'a Path,
+    shared_budget: &'a Mutex<SharedRunBudget>,
+    max_accounted_memory_bytes: u64,
+    global_max_accounted_memory_bytes: u64,
+    staged_records: Vec<StagedVariableValue<KEY_LEN>>,
+    encoded_values: Vec<u8>,
+    runs: Vec<RunFile>,
+    record_count: u64,
+    initial_run_count: u64,
+    peak_accounted_memory_bytes: u64,
+    peak_oversized_record_bytes: u64,
+    initial_run_spill: Duration,
+}
+
+/// Flushed runs collected from all shards of a [`ParallelVariableValueSorter`].
+///
+/// Bound to both the key width (`KEY_LEN`) and originating sorter instance so
+/// staged runs cannot be finished against an unrelated sorter's run budget.
+#[derive(Debug)]
+pub struct StagedParallelVariableRuns<const KEY_LEN: usize> {
+    sorter_id: u64,
+    runs: Vec<RunFile>,
+    record_count: u64,
+    initial_run_count: u64,
+    peak_accounted_memory_bytes: u64,
+    durations: VariableValueSortDurations,
+}
+
+impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
+    /// Creates a shared workspace and temporary-file budget for `shard_count`
+    /// concurrent sort shards.
+    pub fn new(
+        staging_path: &Path,
+        artifact_label: &'static str,
+        shard_count: NonZeroU32,
+        max_accounted_memory_bytes: u64,
+        max_temporary_file_bytes: u64,
+    ) -> Result<Self, BulkLoadError> {
+        if KEY_LEN == 0 {
+            return Err(BulkLoadError::invalid(
+                "variable-value keys must contain at least one byte",
+            ));
+        }
+        validate_artifact_label(artifact_label)?;
+        let minimum_record_bytes = u64::try_from(size_of::<StagedVariableValue<KEY_LEN>>())
+            .map_err(|_| BulkLoadError::invalid("record metadata bytes exceed u64::MAX"))?;
+        let shard_memory_limit_bytes = max_accounted_memory_bytes / u64::from(shard_count.get());
+        if shard_memory_limit_bytes < minimum_record_bytes {
+            return Err(BulkLoadError::AccountedMemoryLimit {
+                limit_bytes: max_accounted_memory_bytes,
+                required_bytes: minimum_record_bytes.saturating_mul(u64::from(shard_count.get())),
+            });
+        }
+        if max_temporary_file_bytes == 0 {
+            return Err(BulkLoadError::TemporaryFileLimit {
+                limit_bytes: 0,
+                required_bytes: 1,
+            });
+        }
+        let workspace_prefix = format!("{artifact_label}-variable-sort-");
+        let workspace = TemporaryDirectoryBuilder::new()
+            .prefix(&workspace_prefix)
+            .tempdir_in(staging_path)
+            .map_err(|source| path_unavailable(staging_path, source))?;
+        Ok(Self {
+            sorter_id: NEXT_PARALLEL_SORTER_ID.fetch_add(1, Ordering::Relaxed),
+            workspace,
+            shard_count,
+            max_accounted_memory_bytes,
+            shard_memory_limit_bytes,
+            shared_budget: Mutex::new(SharedRunBudget {
+                temporary_files: TemporaryFileBudget::new(max_temporary_file_bytes),
+                next_run_index: 0,
+                reserved_run_count: 0,
+                shards_opened: false,
+            }),
+        })
+    }
+
+    /// Opens one shard writer per configured worker.
+    ///
+    /// Shards may be opened only once per sorter so outstanding shard buffers
+    /// cannot exceed `max_accounted_memory_bytes`.
+    pub fn open_shards(&self) -> Result<Vec<VariableValueSortShard<'_, KEY_LEN>>, BulkLoadError> {
+        {
+            let mut budget = self.shared_budget.lock();
+            if budget.shards_opened {
+                return Err(BulkLoadError::invalid(
+                    "parallel variable-value sorter shards were already opened",
+                ));
+            }
+            budget.shards_opened = true;
+        }
+        let count = usize::try_from(self.shard_count.get()).unwrap_or(usize::MAX);
+        Ok((0..count)
+            .map(|_| VariableValueSortShard {
+                workspace_path: self.workspace.path(),
+                shared_budget: &self.shared_budget,
+                max_accounted_memory_bytes: self.shard_memory_limit_bytes,
+                global_max_accounted_memory_bytes: self.max_accounted_memory_bytes,
+                staged_records: Vec::new(),
+                encoded_values: Vec::new(),
+                runs: Vec::new(),
+                record_count: 0,
+                initial_run_count: 0,
+                peak_accounted_memory_bytes: 0,
+                peak_oversized_record_bytes: 0,
+                initial_run_spill: Duration::ZERO,
+            })
+            .collect())
+    }
+
+    fn verify_owned_shards(
+        &self,
+        shards: &[VariableValueSortShard<'_, KEY_LEN>],
+    ) -> Result<(), BulkLoadError> {
+        let expected_count = usize::try_from(self.shard_count.get()).unwrap_or(usize::MAX);
+        if shards.len() != expected_count {
+            return Err(BulkLoadError::invalid(format!(
+                "expected {expected_count} variable-value sort shards, got {}",
+                shards.len()
+            )));
+        }
+        if shards
+            .iter()
+            .any(|shard| !std::ptr::eq(shard.shared_budget, &raw const self.shared_budget))
+        {
+            return Err(BulkLoadError::invalid(
+                "cannot flush variable-value sort shards opened by another sorter",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Flushes all remaining staged records across `shards` in parallel.
+    pub fn flush_shards<'a>(
+        &'a self,
+        mut shards: Vec<VariableValueSortShard<'a, KEY_LEN>>,
+    ) -> Result<StagedParallelVariableRuns<KEY_LEN>, BulkLoadError> {
+        self.verify_owned_shards(&shards)?;
+        let flush_started = Instant::now();
+        let outcomes = if let Some((first, rest)) = shards.split_first_mut() {
+            let slots = rest
+                .iter_mut()
+                .map(|shard| Mutex::new(Some(shard)))
+                .collect::<Vec<_>>();
+            std::thread::scope(|scope| {
+                let mut workers = Vec::with_capacity(slots.len());
+                let mut outcomes = Vec::with_capacity(slots.len().saturating_add(1));
+                for (index, slot) in slots.iter().enumerate() {
+                    if let Ok(worker) = std::thread::Builder::new()
+                        .name(format!("zinder-sort-flush-{index}"))
+                        .spawn_scoped(scope, move || {
+                            let taken = slot.lock().take();
+                            taken.map_or(Ok(()), VariableValueSortShard::flush_run)
+                        })
+                    {
+                        workers.push(worker);
+                    } else {
+                        let taken = slot.lock().take();
+                        if let Some(shard) = taken {
+                            outcomes.push(shard.flush_run());
+                        }
+                    }
+                }
+                outcomes.push(first.flush_run());
+                for worker in workers {
+                    outcomes.push(
+                        worker
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                    );
+                }
+                outcomes
+            })
+        } else {
+            Vec::new()
+        };
+        let final_run_flush = flush_started.elapsed();
+        for outcome in outcomes {
+            outcome?;
+        }
+        self.collect_staged_runs(shards, final_run_flush)
+    }
+
+    fn collect_staged_runs(
+        &self,
+        shards: Vec<VariableValueSortShard<'_, KEY_LEN>>,
+        final_run_flush: Duration,
+    ) -> Result<StagedParallelVariableRuns<KEY_LEN>, BulkLoadError> {
+        let mut runs = Vec::new();
+        let mut record_count = 0_u64;
+        let mut initial_run_count = 0_u64;
+        let mut buffered_peak_bytes = 0_u64;
+        let mut oversized_peak_bytes = 0_u64;
+        let mut initial_run_spill = Duration::ZERO;
+        for shard in shards {
+            runs.extend(shard.runs);
+            record_count = record_count
+                .checked_add(shard.record_count)
+                .ok_or_else(|| {
+                    BulkLoadError::invalid("variable-value record count exceeds u64::MAX")
+                })?;
+            initial_run_count = initial_run_count
+                .checked_add(shard.initial_run_count)
+                .ok_or_else(|| BulkLoadError::invalid("initial run count exceeds u64::MAX"))?;
+            buffered_peak_bytes = buffered_peak_bytes
+                .checked_add(shard.peak_accounted_memory_bytes)
+                .ok_or_else(|| BulkLoadError::invalid("accounted memory bytes exceed u64::MAX"))?;
+            oversized_peak_bytes = oversized_peak_bytes.max(shard.peak_oversized_record_bytes);
+            initial_run_spill = initial_run_spill.max(shard.initial_run_spill);
+        }
+        let peak_accounted_memory_bytes = buffered_peak_bytes.max(oversized_peak_bytes);
+        Ok(StagedParallelVariableRuns {
+            sorter_id: self.sorter_id,
+            runs,
+            record_count,
+            initial_run_count,
+            peak_accounted_memory_bytes,
+            durations: VariableValueSortDurations {
+                initial_run_spill,
+                final_run_flush,
+                merge: Duration::ZERO,
+            },
+        })
+    }
+
+    /// Merges any runs beyond `MAX_MERGE_FAN_IN` and opens the streaming reader.
+    pub fn finish(
+        self,
+        mut staged: StagedParallelVariableRuns<KEY_LEN>,
+    ) -> Result<SortedVariableValues<KEY_LEN>, BulkLoadError> {
+        if staged.sorter_id != self.sorter_id {
+            return Err(BulkLoadError::invalid(
+                "cannot finish variable-value runs staged by another sorter",
+            ));
+        }
+        let mut temporary_files = self.shared_budget.into_inner().temporary_files;
+        let mut runs = staged.runs;
+        let mut merge_pass_count = 0_u64;
+        if runs.len() > MAX_MERGE_FAN_IN {
+            let merge_started = Instant::now();
+            while runs.len() > MAX_MERGE_FAN_IN {
+                runs = merge_pass_with_budget::<KEY_LEN>(
+                    self.workspace.path(),
+                    &mut temporary_files,
+                    merge_pass_count,
+                    runs,
+                )?;
+                merge_pass_count = merge_pass_count
+                    .checked_add(1)
+                    .ok_or_else(|| BulkLoadError::invalid("merge pass count exceeds u64::MAX"))?;
+            }
+            staged.durations.merge = merge_started.elapsed();
+        }
+        let final_run_file_bytes = runs.iter().try_fold(0_u64, |total, run| {
             total
                 .checked_add(run.file_bytes)
-                .ok_or_else(|| BulkLoadError::invalid("merged run bytes exceed u64::MAX"))
+                .ok_or_else(|| BulkLoadError::invalid("final run bytes exceed u64::MAX"))
         })?;
-        let output_file_bytes = input_file_bytes;
-        self.temporary_files.reserve(output_file_bytes)?;
-        let merge_result = merge_run_group::<KEY_LEN>(&input_runs, &output_path);
-        if let Err(source) = merge_result {
-            discard_reserved_file(&output_path, &mut self.temporary_files, output_file_bytes)?;
+        let source = SortedRunSource::open(runs)?;
+        let evidence = VariableValueSortEvidence {
+            record_count: staged.record_count,
+            initial_run_count: staged.initial_run_count,
+            merge_pass_count,
+            peak_accounted_memory_bytes: staged.peak_accounted_memory_bytes,
+            max_accounted_memory_bytes: self.max_accounted_memory_bytes,
+            peak_temporary_file_bytes: temporary_files.peak_bytes_in_use,
+            max_temporary_file_bytes: temporary_files.byte_limit,
+            final_run_file_bytes,
+        };
+        Ok(SortedVariableValues {
+            source,
+            evidence,
+            durations: staged.durations,
+            max_accounted_memory_bytes: self.max_accounted_memory_bytes,
+            previous_key: None,
+            emitted_record_count: 0,
+            workspace: Some(self.workspace),
+            finished: false,
+        })
+    }
+}
+
+impl<const KEY_LEN: usize> VariableValueSortShard<'_, KEY_LEN> {
+    /// Stages one record on this shard, spilling a sorted run before crossing
+    /// its per-shard accounted memory limit.
+    ///
+    /// A single record larger than one shard's staging limit but within the
+    /// sorter's global accounted memory limit flushes the shard's buffer and
+    /// streams directly to a single-record run file, preserving full serial
+    /// record admission without enlarging per-shard buffers.
+    pub fn push(&mut self, key: [u8; KEY_LEN], encoded_value: &[u8]) -> Result<(), BulkLoadError> {
+        let record_bytes = accounted_record_bytes::<KEY_LEN>(encoded_value.len())?;
+        if record_bytes > self.global_max_accounted_memory_bytes {
+            return Err(BulkLoadError::AccountedMemoryLimit {
+                limit_bytes: self.global_max_accounted_memory_bytes,
+                required_bytes: record_bytes,
+            });
+        }
+        if record_bytes > self.max_accounted_memory_bytes {
+            let spill_started = Instant::now();
+            self.flush_run()
+                .map_err(BulkLoadError::temporary_file_limit_before_finish)?;
+            self.flush_single_record_run(key, encoded_value)
+                .map_err(BulkLoadError::temporary_file_limit_before_finish)?;
+            self.initial_run_spill = self
+                .initial_run_spill
+                .saturating_add(spill_started.elapsed());
+            self.record_count = self.record_count.checked_add(1).ok_or_else(|| {
+                BulkLoadError::invalid("variable-value record count exceeds u64::MAX")
+            })?;
+            self.peak_oversized_record_bytes = self.peak_oversized_record_bytes.max(record_bytes);
+            return Ok(());
+        }
+        let current_bytes =
+            staged_accounted_memory_bytes(&self.staged_records, self.encoded_values.len())?;
+        let required_bytes = current_bytes
+            .checked_add(record_bytes)
+            .ok_or_else(|| BulkLoadError::invalid("accounted record bytes exceed u64::MAX"))?;
+        if required_bytes > self.max_accounted_memory_bytes {
+            let spill_started = Instant::now();
+            self.flush_run()
+                .map_err(BulkLoadError::temporary_file_limit_before_finish)?;
+            self.initial_run_spill = self
+                .initial_run_spill
+                .saturating_add(spill_started.elapsed());
+        }
+        self.staged_records.try_reserve_exact(1).map_err(|source| {
+            BulkLoadError::MemoryAllocation {
+                operation: "variable-value record index",
+                source,
+            }
+        })?;
+        self.encoded_values
+            .try_reserve_exact(encoded_value.len())
+            .map_err(|source| BulkLoadError::MemoryAllocation {
+                operation: "variable-value record bytes",
+                source,
+            })?;
+        let value_start = self.encoded_values.len();
+        self.encoded_values.extend_from_slice(encoded_value);
+        let value_end = self.encoded_values.len();
+        self.staged_records.push(StagedVariableValue {
+            key,
+            value_start,
+            value_end,
+        });
+        self.record_count = self.record_count.checked_add(1).ok_or_else(|| {
+            BulkLoadError::invalid("variable-value record count exceeds u64::MAX")
+        })?;
+        let current_bytes =
+            staged_accounted_memory_bytes(&self.staged_records, self.encoded_values.len())?;
+        self.peak_accounted_memory_bytes = self.peak_accounted_memory_bytes.max(current_bytes);
+        Ok(())
+    }
+
+    fn flush_single_record_run(
+        &mut self,
+        key: [u8; KEY_LEN],
+        encoded_value: &[u8],
+    ) -> Result<(), BulkLoadError> {
+        let run_file_bytes = encoded_run_record_bytes::<KEY_LEN>(encoded_value.len())?;
+        let run_index = self
+            .shared_budget
+            .lock()
+            .reserve_initial_run(run_file_bytes)?;
+        let path = self.workspace_path.join(format!("run-{run_index:08}.bin"));
+        let single_record = [StagedVariableValue {
+            key,
+            value_start: 0,
+            value_end: encoded_value.len(),
+        }];
+        if let Err(source) = write_staged_records_run(&single_record, encoded_value, &path) {
+            self.shared_budget
+                .lock()
+                .discard_reserved_run(&path, run_file_bytes)?;
             return Err(source);
         }
-        let observed_file_bytes = match fs::metadata(&output_path) {
+        let observed_file_bytes = match fs::metadata(&path) {
             Ok(metadata) => metadata.len(),
             Err(source) => {
-                let error = path_unavailable(&output_path, source);
-                discard_reserved_file(&output_path, &mut self.temporary_files, output_file_bytes)?;
+                let error = path_unavailable(&path, source);
+                self.shared_budget
+                    .lock()
+                    .discard_reserved_run(&path, run_file_bytes)?;
                 return Err(error);
             }
         };
-        if observed_file_bytes != output_file_bytes {
-            discard_reserved_file(&output_path, &mut self.temporary_files, output_file_bytes)?;
+        if observed_file_bytes != run_file_bytes {
+            self.shared_budget
+                .lock()
+                .discard_reserved_run(&path, run_file_bytes)?;
             return Err(BulkLoadError::invalid(
-                "merged run file size differs from its admitted bytes",
+                "variable run file size differs from its admitted bytes",
             ));
         }
-        for input_run in &input_runs {
-            remove_temporary_file(&input_run.path)?;
-        }
-        drop(input_runs);
-        self.temporary_files.release(input_file_bytes)?;
-        Ok(RunFile {
-            path: output_path,
-            file_bytes: output_file_bytes,
-        })
+        self.runs.push(RunFile {
+            path,
+            file_bytes: run_file_bytes,
+        });
+        self.initial_run_count = self
+            .initial_run_count
+            .checked_add(1)
+            .ok_or_else(|| BulkLoadError::invalid("initial run count exceeds u64::MAX"))?;
+        Ok(())
     }
+
+    fn flush_run(&mut self) -> Result<(), BulkLoadError> {
+        if self.staged_records.is_empty() {
+            return Ok(());
+        }
+        self.staged_records
+            .sort_unstable_by_key(|record| record.key);
+        let run_file_bytes = staged_run_file_bytes(&self.staged_records)?;
+        let run_index = self
+            .shared_budget
+            .lock()
+            .reserve_initial_run(run_file_bytes)?;
+        let path = self.workspace_path.join(format!("run-{run_index:08}.bin"));
+        if let Err(source) =
+            write_staged_records_run(&self.staged_records, &self.encoded_values, &path)
+        {
+            self.shared_budget
+                .lock()
+                .discard_reserved_run(&path, run_file_bytes)?;
+            return Err(source);
+        }
+        let observed_file_bytes = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(source) => {
+                let error = path_unavailable(&path, source);
+                self.shared_budget
+                    .lock()
+                    .discard_reserved_run(&path, run_file_bytes)?;
+                return Err(error);
+            }
+        };
+        if observed_file_bytes != run_file_bytes {
+            self.shared_budget
+                .lock()
+                .discard_reserved_run(&path, run_file_bytes)?;
+            return Err(BulkLoadError::invalid(
+                "variable run file size differs from its admitted bytes",
+            ));
+        }
+        self.runs.push(RunFile {
+            path,
+            file_bytes: run_file_bytes,
+        });
+        self.initial_run_count = self
+            .initial_run_count
+            .checked_add(1)
+            .ok_or_else(|| BulkLoadError::invalid("initial run count exceeds u64::MAX"))?;
+        self.staged_records = Vec::new();
+        self.encoded_values = Vec::new();
+        Ok(())
+    }
+}
+
+fn staged_accounted_memory_bytes<const KEY_LEN: usize>(
+    staged_records: &[StagedVariableValue<KEY_LEN>],
+    encoded_values_len: usize,
+) -> Result<u64, BulkLoadError> {
+    let index_bytes = staged_records
+        .len()
+        .checked_mul(size_of::<StagedVariableValue<KEY_LEN>>())
+        .ok_or_else(|| BulkLoadError::invalid("record index bytes exceed usize::MAX"))?;
+    let total_bytes = index_bytes
+        .checked_add(encoded_values_len)
+        .ok_or_else(|| BulkLoadError::invalid("record bytes exceed usize::MAX"))?;
+    u64::try_from(total_bytes).map_err(|_| BulkLoadError::invalid("record bytes exceed u64::MAX"))
+}
+
+fn staged_run_file_bytes<const KEY_LEN: usize>(
+    staged_records: &[StagedVariableValue<KEY_LEN>],
+) -> Result<u64, BulkLoadError> {
+    staged_records.iter().try_fold(0_u64, |total, record| {
+        let value_bytes = record
+            .value_end
+            .checked_sub(record.value_start)
+            .ok_or_else(|| BulkLoadError::invalid("staged value range is reversed"))?;
+        total
+            .checked_add(encoded_run_record_bytes::<KEY_LEN>(value_bytes)?)
+            .ok_or_else(|| BulkLoadError::invalid("run file bytes exceed u64::MAX"))
+    })
+}
+
+fn write_staged_records_run<const KEY_LEN: usize>(
+    staged_records: &[StagedVariableValue<KEY_LEN>],
+    encoded_values: &[u8],
+    path: &Path,
+) -> Result<(), BulkLoadError> {
+    let file = File::create(path).map_err(|source| path_unavailable(path, source))?;
+    let mut writer = BufWriter::new(file);
+    for record in staged_records {
+        let encoded_value = encoded_values
+            .get(record.value_start..record.value_end)
+            .ok_or_else(|| BulkLoadError::invalid("staged value range is unavailable"))?;
+        writer
+            .write_all(&record.key)
+            .and_then(|()| {
+                let value_len = u64::try_from(encoded_value.len())
+                    .map_err(|_| std::io::Error::other("encoded value length exceeds u64::MAX"))?;
+                writer.write_all(&value_len.to_be_bytes())
+            })
+            .and_then(|()| writer.write_all(encoded_value))
+            .map_err(|source| path_unavailable(path, source))?;
+    }
+    writer
+        .flush()
+        .map_err(|source| path_unavailable(path, source))
+}
+
+fn merge_pass_with_budget<const KEY_LEN: usize>(
+    workspace_path: &Path,
+    temporary_files: &mut TemporaryFileBudget,
+    merge_pass_count: u64,
+    runs: Vec<RunFile>,
+) -> Result<Vec<RunFile>, BulkLoadError> {
+    let mut pending = runs.into_iter();
+    let mut merged = Vec::new();
+    let mut group_index = 0_u64;
+    loop {
+        let group = pending.by_ref().take(MAX_MERGE_FAN_IN).collect::<Vec<_>>();
+        if group.is_empty() {
+            break;
+        }
+        if group.len() == 1 {
+            merged.extend(group);
+        } else {
+            let output_path =
+                workspace_path.join(format!("merge-{merge_pass_count:04}-{group_index:08}.bin"));
+            merged.push(merge_group_with_budget::<KEY_LEN>(
+                temporary_files,
+                group,
+                output_path,
+            )?);
+        }
+        group_index = group_index
+            .checked_add(1)
+            .ok_or_else(|| BulkLoadError::invalid("merge group count exceeds u64::MAX"))?;
+    }
+    Ok(merged)
+}
+
+fn merge_group_with_budget<const KEY_LEN: usize>(
+    temporary_files: &mut TemporaryFileBudget,
+    input_runs: Vec<RunFile>,
+    output_path: PathBuf,
+) -> Result<RunFile, BulkLoadError> {
+    let input_file_bytes = input_runs.iter().try_fold(0_u64, |total, run| {
+        total
+            .checked_add(run.file_bytes)
+            .ok_or_else(|| BulkLoadError::invalid("merged run bytes exceed u64::MAX"))
+    })?;
+    let output_file_bytes = input_file_bytes;
+    temporary_files.reserve(output_file_bytes)?;
+    let merge_result = merge_run_group::<KEY_LEN>(&input_runs, &output_path);
+    if let Err(source) = merge_result {
+        discard_reserved_file(&output_path, temporary_files, output_file_bytes)?;
+        return Err(source);
+    }
+    let observed_file_bytes = match fs::metadata(&output_path) {
+        Ok(metadata) => metadata.len(),
+        Err(source) => {
+            let error = path_unavailable(&output_path, source);
+            discard_reserved_file(&output_path, temporary_files, output_file_bytes)?;
+            return Err(error);
+        }
+    };
+    if observed_file_bytes != output_file_bytes {
+        discard_reserved_file(&output_path, temporary_files, output_file_bytes)?;
+        return Err(BulkLoadError::invalid(
+            "merged run file size differs from its admitted bytes",
+        ));
+    }
+    for input_run in &input_runs {
+        remove_temporary_file(&input_run.path)?;
+    }
+    drop(input_runs);
+    temporary_files.release(input_file_bytes)?;
+    Ok(RunFile {
+        path: output_path,
+        file_bytes: output_file_bytes,
+    })
 }
 
 /// Streaming reader for a completed variable-value sort.
@@ -1463,6 +2084,279 @@ mod tests {
         assert!(sorted_records.next_record()?.is_some());
         assert!(matches!(
             sorted_records.next_record(),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+        Ok(())
+    }
+
+    fn collect_sorted<const KEY_LEN: usize>(
+        sorted: &mut SortedVariableValues<KEY_LEN>,
+    ) -> Result<Vec<VariableValueRecord<KEY_LEN>>, BulkLoadError> {
+        let mut collected = Vec::new();
+        while let Some(record) = sorted.next_record()? {
+            collected.push(record);
+        }
+        Ok(collected)
+    }
+
+    #[test]
+    fn parallel_sorter_matches_serial_output_across_spills_and_merges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let records = (0_u16..320)
+            .map(|index| {
+                let key = ((index.wrapping_mul(173)) ^ 0x5A3C).to_be_bytes();
+                let payload =
+                    vec![u8::try_from(index % 251).unwrap_or(0); usize::from(index % 9) + 1];
+                (key, payload)
+            })
+            .collect::<Vec<_>>();
+        let serial_dir = TempDir::new()?;
+        let mut serial =
+            VariableValueSorter::<2>::new(serial_dir.path(), "serial-ref", 2_048, 1024 * 1024)?;
+        for (key, payload) in &records {
+            serial.push(*key, payload)?;
+        }
+        let mut serial_sorted = serial.finish()?;
+        let expected = collect_sorted(&mut serial_sorted)?;
+
+        for shards in [1_u32, 2, 4, 8] {
+            let shard_count = NonZeroU32::new(shards).ok_or("zero shards")?;
+            let parallel_dir = TempDir::new()?;
+            let max_memory = u64::from(shards) * 512;
+            let max_temp = 1024 * 1024;
+            let parallel = ParallelVariableValueSorter::<2>::new(
+                parallel_dir.path(),
+                "parallel-check",
+                shard_count,
+                max_memory,
+                max_temp,
+            )?;
+            let open_shards = parallel.open_shards()?;
+            let chunk_size = records.len().div_ceil(open_shards.len());
+            let returned_shards = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(open_shards.len());
+                for (shard_index, mut shard) in open_shards.into_iter().enumerate() {
+                    let start = shard_index * chunk_size;
+                    let end = (start + chunk_size).min(records.len());
+                    let slice = &records[start..end];
+                    handles.push(scope.spawn(move || -> Result<_, BulkLoadError> {
+                        for (key, payload) in slice {
+                            shard.push(*key, payload)?;
+                        }
+                        Ok(shard)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            let staged = parallel.flush_shards(returned_shards)?;
+            let mut sorted = parallel.finish(staged)?;
+            let evidence = sorted.evidence();
+            assert_eq!(evidence.record_count, u64::try_from(records.len())?);
+            assert!(evidence.peak_accounted_memory_bytes <= evidence.max_accounted_memory_bytes);
+            assert!(evidence.peak_temporary_file_bytes <= evidence.max_temporary_file_bytes);
+            let observed = collect_sorted(&mut sorted)?;
+            assert_eq!(observed, expected, "{shards} shards");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_sorter_triggers_merge_pass_when_combined_runs_exceed_fan_in()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(4).ok_or("zero shards")?;
+        let one_record = accounted_record_bytes::<2>(4)?;
+        let parallel = ParallelVariableValueSorter::<2>::new(
+            dir.path(),
+            "parallel-merge-pass",
+            shard_count,
+            one_record * 4,
+            1024 * 1024,
+        )?;
+        let mut shards = parallel.open_shards()?;
+        for index in 0_u16..80 {
+            let shard_idx = usize::from(index) % shards.len();
+            shards[shard_idx].push((80 - index).to_be_bytes(), &[0xAB; 4])?;
+        }
+        let staged = parallel.flush_shards(shards)?;
+        let mut sorted = parallel.finish(staged)?;
+        let evidence = sorted.evidence();
+        assert_eq!(evidence.record_count, 80);
+        assert!(evidence.initial_run_count > u64::try_from(MAX_MERGE_FAN_IN)?);
+        assert!(evidence.merge_pass_count >= 1);
+        let drained = collect_sorted(&mut sorted)?;
+        assert_eq!(drained.len(), 80);
+        assert!(drained.windows(2).all(|pair| pair[0].key <= pair[1].key));
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_sorter_enforces_shared_temporary_file_ceiling_across_shards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(2).ok_or("zero shards")?;
+        let one_record = accounted_record_bytes::<2>(16)?;
+        let encoded_bytes = encoded_run_record_bytes::<2>(16)?;
+        // Enough for one single run (encoded_bytes), but NOT enough for two
+        // runs (which require 2 * (encoded_bytes + encoded_bytes) = 4 * encoded_bytes).
+        let tight_temp_limit = encoded_bytes * 3;
+        let parallel = ParallelVariableValueSorter::<2>::new(
+            dir.path(),
+            "shared-temp-cap",
+            shard_count,
+            one_record * 2,
+            tight_temp_limit,
+        )?;
+        let mut shards = parallel.open_shards()?;
+        shards[0].push([0, 1], &[1_u8; 16])?;
+        shards[1].push([0, 2], &[2_u8; 16])?;
+        let flushed = parallel.flush_shards(shards);
+        assert!(
+            matches!(flushed, Err(BulkLoadError::TemporaryFileLimit { .. })),
+            "expected shared temporary-file limit error, got {flushed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_sorter_rejects_under_minimum_shard_memory_and_zero_temp_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let four = NonZeroU32::new(4).ok_or("zero shards")?;
+        let min_record = u64::try_from(size_of::<StagedVariableValue<2>>())?;
+        assert!(matches!(
+            ParallelVariableValueSorter::<2>::new(
+                dir.path(),
+                "too-small",
+                four,
+                min_record * 4 - 1,
+                1024
+            ),
+            Err(BulkLoadError::AccountedMemoryLimit { .. })
+        ));
+        assert!(matches!(
+            ParallelVariableValueSorter::<2>::new(dir.path(), "zero-temp", four, min_record * 8, 0),
+            Err(BulkLoadError::TemporaryFileLimit { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_sorter_admits_record_larger_than_shard_within_global_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let four = NonZeroU32::new(4).ok_or("zero shards")?;
+        let global_budget = 256 * 1024_u64;
+        let oversized_payload = vec![0x5A_u8; 100 * 1024];
+        let parallel = ParallelVariableValueSorter::<2>::new(
+            dir.path(),
+            "oversized-record",
+            four,
+            global_budget,
+            4 * 1024 * 1024,
+        )?;
+        let mut shards = parallel.open_shards()?;
+        shards[0].push([0, 3], &[0x11; 16])?;
+        shards[0].push([0, 1], &oversized_payload)?;
+        shards[1].push([0, 2], &[0x22; 16])?;
+        let too_large = vec![0xFF_u8; usize::try_from(global_budget)? + 1];
+        assert!(matches!(
+            shards[2].push([0, 4], &too_large),
+            Err(BulkLoadError::AccountedMemoryLimit { limit_bytes, .. })
+                if limit_bytes == global_budget
+        ));
+        let staged = parallel.flush_shards(shards)?;
+        let mut sorted = parallel.finish(staged)?;
+        let evidence = sorted.evidence();
+        assert_eq!(evidence.record_count, 3);
+        assert!(evidence.peak_accounted_memory_bytes <= global_budget);
+        let drained = collect_sorted(&mut sorted)?;
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0].key, [0, 1]);
+        assert_eq!(drained[0].encoded_value, oversized_payload);
+        assert_eq!(drained[1].key, [0, 2]);
+        assert_eq!(drained[2].key, [0, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_sorter_rejects_second_open_shards_and_foreign_shards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let two = NonZeroU32::new(2).ok_or("zero shards")?;
+        let min_record = u64::try_from(size_of::<StagedVariableValue<2>>())?;
+        let parallel_a = ParallelVariableValueSorter::<2>::new(
+            dir.path(),
+            "sorter-a",
+            two,
+            min_record * 4,
+            1024,
+        )?;
+        let parallel_b = ParallelVariableValueSorter::<2>::new(
+            dir.path(),
+            "sorter-b",
+            two,
+            min_record * 4,
+            1024,
+        )?;
+
+        let shards_a = parallel_a.open_shards()?;
+        assert!(matches!(
+            parallel_a.open_shards(),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+
+        let shards_b = parallel_b.open_shards()?;
+        assert!(matches!(
+            parallel_a.flush_shards(shards_b),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            parallel_a.flush_shards(Vec::new()),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+
+        let staged_a = parallel_a.flush_shards(shards_a)?;
+        assert!(matches!(
+            parallel_a.open_shards(),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+        let mut sorted = parallel_a.finish(staged_a)?;
+        assert_eq!(collect_sorted(&mut sorted)?, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_sorter_rejects_foreign_staged_runs_and_incomplete_shard_flush()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let two = NonZeroU32::new(2).ok_or("zero shards")?;
+        let parallel_a =
+            ParallelVariableValueSorter::<2>::new(dir.path(), "staged-a", two, 1_024, 4_096)?;
+        let parallel_b =
+            ParallelVariableValueSorter::<2>::new(dir.path(), "staged-b", two, 1_024, 4_096)?;
+
+        let mut shards_a = parallel_a.open_shards()?;
+        shards_a[0].push([0, 1], &[0x11; 8])?;
+        let staged_a = parallel_a.flush_shards(shards_a)?;
+        assert!(matches!(
+            parallel_b.finish(staged_a),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+
+        let parallel_c =
+            ParallelVariableValueSorter::<2>::new(dir.path(), "incomplete-c", two, 1_024, 4_096)?;
+        let mut shards_c = parallel_c.open_shards()?;
+        shards_c.pop();
+        assert!(matches!(
+            parallel_c.flush_shards(shards_c),
             Err(BulkLoadError::InvalidInput { .. })
         ));
         Ok(())

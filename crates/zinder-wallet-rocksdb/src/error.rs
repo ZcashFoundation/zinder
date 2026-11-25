@@ -233,6 +233,15 @@ pub enum RocksDbWalletError {
         /// Thread-start failure reported by the operating system.
         reason: String,
     },
+    /// Parallel canonical replay could not start one of its scan threads.
+    #[error("could not start a wallet canonical-scan thread: {reason}")]
+    CanonicalScanThreadUnavailable {
+        /// Thread-start failure reported by the operating system.
+        reason: String,
+    },
+    /// A canonical-scan worker thread stopped before finishing its chunks.
+    #[error("a wallet canonical-scan worker thread stopped before finishing its chunks")]
+    CanonicalScanWorkerStopped,
     /// An accumulator hashing thread stopped before returning its batch.
     #[error("a wallet accumulator hashing thread stopped before finishing its rows")]
     AccumulatorHashingWorkerStopped,
