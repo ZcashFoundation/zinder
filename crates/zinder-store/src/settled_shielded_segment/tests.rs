@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::Path,
+    sync::atomic::Ordering,
 };
 
 use prost::{
@@ -28,7 +29,8 @@ use super::{
     ShieldedProjectionSelection, ShieldedSegmentIdentity,
     format::{
         DecodedRowIndexEntry, FRAME_PREFIX_LEN, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock,
-        ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN, encode_frame_prefix,
+        ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN, VALIDATION_INVALID,
+        VALIDATION_UNVALIDATED, VALIDATION_VALID, encode_frame_prefix,
     },
     project_shielded_block_wire,
     reader::validate_entries,
@@ -1222,5 +1224,103 @@ fn nested_wire_type_validators_preserve_skip_wire_field_for_unknown_tags() -> Te
             .len(),
         1
     );
+    Ok(())
+}
+
+fn row_slab_offset(bytes: &[u8], index_offset: usize, row_idx: usize) -> TestOutcome<usize> {
+    let offset_start = index_offset + row_idx * ROW_INDEX_ENTRY_LEN + 68;
+    let raw: [u8; 4] = bytes[offset_start..offset_start + 4].try_into()?;
+    Ok(usize::try_from(u32::from_be_bytes(raw))?)
+}
+
+#[test]
+fn indexed_block_mark_valid_preserves_invalid_state() {
+    let entry = DecodedRowIndexEntry {
+        block_hash_wire: encode_internal_block_hash(block_hash(1)),
+        payload_sha256: [0x22; 32],
+        block_time: 1_700_000_001,
+        slab_rel_offset: 0,
+        native_bytes: 64,
+        pool_presence: PoolPresenceMask::EMPTY,
+    };
+
+    let valid_row = IndexedBlock::from_entry(&entry);
+    assert_eq!(
+        valid_row.validation_state.load(Ordering::Acquire),
+        VALIDATION_UNVALIDATED
+    );
+    valid_row.mark_valid();
+    assert_eq!(
+        valid_row.validation_state.load(Ordering::Acquire),
+        VALIDATION_VALID
+    );
+
+    let invalid_row = IndexedBlock::from_entry(&entry);
+    invalid_row.mark_invalid();
+    invalid_row.mark_valid();
+    assert_eq!(
+        invalid_row.validation_state.load(Ordering::Acquire),
+        VALIDATION_INVALID
+    );
+}
+
+#[test]
+fn post_admission_frame_and_digest_failures_latch_invalid_state() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = mixed_fixture_blocks()?;
+    let (path, identity) = write_segment(dir.path(), "portable-latch", &blocks)?;
+    let original = fs::read(&path)?;
+    let index_offset = usize::try_from(u64::from_be_bytes(original[96..104].try_into()?))?;
+    let portable_path = dir.path().join("portable_latch_tamper");
+    fs::write(&portable_path, &original)?;
+    let portable_identity = ShieldedSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+    let reader = SettledShieldedSegmentReader::open(
+        &portable_path,
+        &portable_identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+
+    let range_3 = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(3));
+    assert_eq!(
+        reader
+            .read_default_range(range_3, HeightOrder::Ascending)?
+            .len(),
+        1
+    );
+
+    let row3_payload_pos =
+        HEADER_LEN + row_slab_offset(&original, index_offset, 2)? + FRAME_PREFIX_LEN;
+    let row4_prefix_pos = HEADER_LEN + row_slab_offset(&original, index_offset, 3)?;
+    let mut writer_file = OpenOptions::new().write(true).open(&portable_path)?;
+    writer_file.seek(SeekFrom::Start(u64::try_from(row3_payload_pos)?))?;
+    writer_file.write_all(&[original[row3_payload_pos] ^ 0x55])?;
+    writer_file.seek(SeekFrom::Start(u64::try_from(row4_prefix_pos)?))?;
+    writer_file.write_all(&[1_u8])?;
+    writer_file.sync_all()?;
+    drop(writer_file);
+
+    assert!(matches!(
+        reader.read_default_range(range_3, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    let non_matching_ironwood = ShieldedProjectionSelection::new(false, false, true, true);
+    assert!(matches!(
+        reader.read_projected_range(range_3, HeightOrder::Ascending, non_matching_ironwood),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+
+    let range_4 = BlockHeightRange::inclusive(BlockHeight::new(4), BlockHeight::new(4));
+    assert!(matches!(
+        reader.read_default_range(range_4, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::InvalidFormat(_))
+    ));
+    let non_matching_orchard = ShieldedProjectionSelection::new(false, true, false, true);
+    assert!(matches!(
+        reader.read_projected_range(range_4, HeightOrder::Ascending, non_matching_orchard),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
     Ok(())
 }

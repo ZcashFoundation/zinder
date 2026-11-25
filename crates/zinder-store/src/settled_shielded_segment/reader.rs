@@ -332,6 +332,26 @@ impl SettledShieldedSegmentReader {
         row_idx: usize,
         frame: &[u8],
     ) -> Result<(), SettledShieldedSegmentError> {
+        let row = &self.rows[row_idx];
+        let state = row.validation_state.load(Ordering::Acquire);
+        if state == VALIDATION_INVALID {
+            return Err(SettledShieldedSegmentError::PayloadIntegrity(
+                "shielded segment frame previously failed validation".to_owned(),
+            ));
+        }
+        let verdict = self.verify_frame_inner(row_idx, frame, state);
+        if verdict.is_err() {
+            row.mark_invalid();
+        }
+        verdict
+    }
+
+    fn verify_frame_inner(
+        &self,
+        row_idx: usize,
+        frame: &[u8],
+        state: u8,
+    ) -> Result<(), SettledShieldedSegmentError> {
         let payload_len = decode_frame_prefix(frame)?;
         if FRAME_PREFIX_LEN + payload_len != frame.len() {
             return Err(SettledShieldedSegmentError::InvalidFormat(
@@ -346,22 +366,11 @@ impl SettledShieldedSegmentReader {
                 "portable segment payload SHA-256 mismatch on read".to_owned(),
             ));
         }
-        let row = &self.rows[row_idx];
-        let state = row.validation_state.load(Ordering::Acquire);
-        if state == VALIDATION_INVALID {
-            return Err(SettledShieldedSegmentError::PayloadIntegrity(
-                "shielded segment frame previously failed validation".to_owned(),
-            ));
-        }
         if state != VALIDATION_VALID {
+            let row = &self.rows[row_idx];
             let height = self.height_at(row_idx)?;
             let prev_hash_wire = self.prev_hash_wire_at(row_idx);
-            let verdict =
-                validate_shielded_block_wire(payload, height, &row.block_hash_wire, prev_hash_wire);
-            if verdict.is_err() {
-                row.mark_invalid();
-                return verdict;
-            }
+            validate_shielded_block_wire(payload, height, &row.block_hash_wire, prev_hash_wire)?;
             row.mark_valid();
         }
         Ok(())
