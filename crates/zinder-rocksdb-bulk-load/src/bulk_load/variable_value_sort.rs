@@ -1599,8 +1599,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn one_record_memory_limit<const KEY_LEN: usize>(value_len: usize) -> u64 {
-        u64::try_from(size_of::<StagedVariableValue<KEY_LEN>>().saturating_add(value_len))
-            .unwrap_or(u64::MAX)
+        one_record_memory_limit_bytes::<KEY_LEN>(value_len)
     }
 
     #[test]

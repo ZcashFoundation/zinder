@@ -550,16 +550,17 @@ async fn publisher_rejects_oversized_and_non_regular_signing_keys() -> Result<()
     let key_directory = files.path().join("key-directory");
     fs::create_dir(&key_directory)?;
 
-    let mut invalid_keys = vec![oversized_key, key_directory];
     #[cfg(unix)]
-    {
+    let invalid_keys = {
         let fifo_key = files.path().join("signing-key.fifo");
         let mkfifo_status = std::process::Command::new("mkfifo")
             .arg(&fifo_key)
             .status()?;
         assert!(mkfifo_status.success(), "mkfifo failed: {mkfifo_status}");
-        invalid_keys.push(fifo_key);
-    }
+        vec![oversized_key, key_directory, fifo_key]
+    };
+    #[cfg(not(unix))]
+    let invalid_keys = vec![oversized_key, key_directory];
 
     for invalid_key in invalid_keys {
         let output = tokio::time::timeout(

@@ -24,17 +24,17 @@ pub(super) const MIN_MERGE_FAN_IN: usize = 2;
 #[cfg(not(unix))]
 const FALLBACK_MERGE_FAN_IN: usize = 64;
 pub(super) const MAX_MERGE_FAN_IN: usize = 256;
+#[cfg(any(unix, test))]
 const MERGE_FD_HEADROOM_RESERVE: u64 = 64;
+#[cfg(any(unix, test))]
 const MERGE_FD_MIN_RESERVE: u64 = 8;
 
 /// Computes the active k-way merge fan-in from descriptor limits.
 ///
 /// Reserves file-descriptor headroom for the merge output, open `RocksDB`
 /// handles, and standard process I/O.
-pub(super) fn effective_merge_fan_in_for_limits(
-    soft_limit: Option<u64>,
-    open_fds: Option<usize>,
-) -> usize {
+#[cfg(any(unix, test))]
+fn effective_merge_fan_in_for_limits(soft_limit: Option<u64>, open_fds: Option<usize>) -> usize {
     let Some(limit) = soft_limit else {
         return MAX_MERGE_FAN_IN;
     };
