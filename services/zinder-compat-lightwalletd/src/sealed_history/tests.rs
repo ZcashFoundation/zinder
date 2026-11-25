@@ -223,7 +223,7 @@ fn admitted_reader_checks_copied_bytes_per_slab_and_keeps_its_original_file() ->
     )?;
     assert_eq!(rows.len(), 3);
     let shielded_rel = &opened.shielded_rel;
-    let last_frame_len = frame_len(shielded_rel, 2)?;
+    let last_frame_len = frame_len(shielded_rel, opened.shielded_slab_len, 2)?;
     let payload_end = HEADER_LEN as u64 + u64::from(shielded_rel[2]) + last_frame_len as u64 - 1;
     let mut file = fs::OpenOptions::new().write(true).open(&original)?;
     file.seek(SeekFrom::Start(payload_end - 1))?;
@@ -438,8 +438,8 @@ fn admission_reads_each_portable_byte_once_and_skips_protected_payloads() -> eyr
             reads: 0,
             seeks: Vec::new(),
         };
-        let rows = index::admit(&mut meter, identity, len as u64, protected)?;
-        assert_eq!(rows.rows.len(), 7);
+        let admitted = index::admit(&mut meter, identity, len as u64, protected)?;
+        assert_eq!(admitted.block_hashes.len(), 7);
         if protected {
             assert_eq!(meter.bytes, HEADER_LEN + tables + 7 * ROW_META_LEN);
             assert_eq!(meter.seeks, [index as u64]);
@@ -777,7 +777,6 @@ fn reseal_body(
 }
 
 /// Corrupts one byte of the last row's shielded metadata digest.
-#[cfg(target_os = "linux")]
 fn tampered_digest(path: &Path) -> eyre::Result<SegmentIdentity> {
     let identity = publish(path, 1, 2)?;
     let bytes = fs::read(path)?;
@@ -787,7 +786,6 @@ fn tampered_digest(path: &Path) -> eyre::Result<SegmentIdentity> {
 }
 
 /// Corrupts one byte of the last row's shielded lengths prefix.
-#[cfg(target_os = "linux")]
 fn tampered_lengths(path: &Path) -> eyre::Result<SegmentIdentity> {
     let identity = publish(path, 1, 2)?;
     let bytes = fs::read(path)?;
@@ -1021,5 +1019,264 @@ fn positional_reads_fill_a_slab_exactly_and_report_a_short_final_frame() -> eyre
         .err()
         .ok_or_else(|| invalid("served a truncated frame"))?;
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    Ok(())
+}
+
+fn open_protected(path: &Path, identity: SegmentIdentity) -> io::Result<SealedHistory> {
+    SealedHistory::open_with_verity(path, identity, |_| Ok(identity.verity))
+}
+
+fn open_portable(path: &Path, identity: SegmentIdentity) -> io::Result<SealedHistory> {
+    SealedHistory::open_with_verity(path, identity, |_| Ok(None))
+}
+
+fn assert_segment_reads_match(
+    protected: &SealedHistory,
+    portable: &SealedHistory,
+    bounds: BlockHeightRange,
+) -> eyre::Result<()> {
+    assert_eq!(protected.first_parent(), portable.first_parent());
+    for slab in [SealedSlab::Shielded, SealedSlab::Nullifier] {
+        for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+            let left = protected.read_chunk(slab, bounds, order, usize::MAX)?;
+            let right = portable.read_chunk(slab, bounds, order, usize::MAX)?;
+            assert_eq!(left.len(), right.len());
+            for (lhs, rhs) in left.iter().zip(&right) {
+                assert_eq!(lhs.id, rhs.id);
+                assert_eq!(lhs.parent, rhs.parent);
+                assert_eq!(lhs.native_bytes, rhs.native_bytes);
+                assert_eq!(lhs.message, rhs.message);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn protected_segments_compact_heap_metadata_and_drop_digests() -> eyre::Result<()> {
+    const SEGMENT_BLOCKS: u32 = 4_096;
+    const SEGMENTS: u32 = 2;
+    let dir = tempfile::tempdir()?;
+    let mut protected_heap_total = 0_usize;
+    let mut portable_heap_total = 0_usize;
+
+    for seg in 0..SEGMENTS {
+        let start = seg * SEGMENT_BLOCKS + 1;
+        let end = start + SEGMENT_BLOCKS - 1;
+        let path = dir.path().join(format!("seg-{seg}"));
+        let identity = publish(&path, start, end)?;
+        let protected = open_protected(&path, identity)?;
+        let portable = open_portable(&path, identity)?;
+
+        assert!(protected.kernel_verified);
+        assert!(protected.portable_digests.is_none());
+        assert_eq!(protected.heap_metadata_bytes(), 4_096 * 45);
+        assert!(!portable.kernel_verified);
+        assert!(portable.portable_digests.is_some());
+        assert_eq!(portable.heap_metadata_bytes(), 4_096 * 109);
+
+        protected_heap_total += protected.heap_metadata_bytes();
+        portable_heap_total += portable.heap_metadata_bytes();
+
+        for probe in [
+            range(start, start + 3),
+            range(start + 2_047, start + 2_050),
+            range(end - 3, end),
+        ] {
+            assert_segment_reads_match(&protected, &portable, probe)?;
+        }
+    }
+
+    assert_eq!(
+        protected_heap_total,
+        usize::try_from(SEGMENTS * SEGMENT_BLOCKS)? * 45
+    );
+    assert_eq!(
+        portable_heap_total,
+        usize::try_from(SEGMENTS * SEGMENT_BLOCKS)? * 109
+    );
+    Ok(())
+}
+
+#[test]
+fn protected_lazy_validation_rejects_tampered_digest_protobuf_identity_and_lengths()
+-> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let digest_path = dir.path().join("digest");
+    let digest_id = tampered_digest(&digest_path)?;
+    let digest_history = open_protected(&digest_path, digest_id)?;
+    assert_second_payload_fails(
+        &digest_history,
+        SealedSlab::Shielded,
+        &PayloadError::Digest.to_string(),
+    )?;
+
+    let proto_path = dir.path().join("protobuf");
+    let proto_id = rewrite_last_frame(&proto_path, malformed_metadata)?;
+    let proto_history = open_protected(&proto_path, proto_id)?;
+    assert_second_payload_fails(
+        &proto_history,
+        SealedSlab::Shielded,
+        &PayloadError::Protobuf.to_string(),
+    )?;
+
+    let identity_path = dir.path().join("identity");
+    let bad_id = rewrite_last_frame(&identity_path, |payload, _metadata| {
+        let mut message = lightwalletd::CompactBlock::decode(&*payload)?;
+        message.height = 1;
+        payload.copy_from_slice(&message.encode_to_vec());
+        Ok(())
+    })?;
+    let identity_history = open_protected(&identity_path, bad_id)?;
+    assert_second_payload_fails(
+        &identity_history,
+        SealedSlab::Shielded,
+        &PayloadError::Identity.to_string(),
+    )?;
+
+    let len_path = dir.path().join("lengths");
+    let len_id = tampered_lengths(&len_path)?;
+    let len_history = open_protected(&len_path, len_id)?;
+    assert_second_payload_fails(
+        &len_history,
+        SealedSlab::Shielded,
+        "shielded segment frame lengths differ from its index",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn protected_partial_and_warm_reads_validate_unvalidated_subspans_correctly() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("partial");
+    let identity = publish(&path, 1, 4)?;
+    let history = open_protected(&path, identity)?;
+
+    // Validate rows 0 and 3 first so rows 1..=2 sit between validated neighbors.
+    assert_eq!(
+        history
+            .read_chunk(
+                SealedSlab::Shielded,
+                range(1, 1),
+                HeightOrder::Ascending,
+                usize::MAX
+            )?
+            .len(),
+        1
+    );
+    assert_eq!(
+        history
+            .read_chunk(
+                SealedSlab::Shielded,
+                range(4, 4),
+                HeightOrder::Ascending,
+                usize::MAX
+            )?
+            .len(),
+        1
+    );
+    let spanned = history.read_chunk(
+        SealedSlab::Shielded,
+        range(1, 4),
+        HeightOrder::Ascending,
+        usize::MAX,
+    )?;
+    assert_eq!(spanned.len(), 4);
+    assert!(
+        history
+            .load_unvalidated_meta(SealedSlab::Shielded, 0..4)?
+            .is_none()
+    );
+    let warm = history.read_chunk(
+        SealedSlab::Shielded,
+        range(1, 4),
+        HeightOrder::Descending,
+        usize::MAX,
+    )?;
+    assert_eq!(warm.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn slab_validation_nibbles_update_independently_and_preserve_errors() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let clean_path = dir.path().join("clean");
+    let clean_id = publish(&clean_path, 1, 2)?;
+    let clean = open_protected(&clean_path, clean_id)?;
+    assert!(clean.validation[0].load(SealedSlab::Shielded).is_none());
+    assert!(clean.validation[0].load(SealedSlab::Nullifier).is_none());
+
+    assert_eq!(
+        clean
+            .read_chunk(
+                SealedSlab::Shielded,
+                range(1, 1),
+                HeightOrder::Ascending,
+                usize::MAX
+            )?
+            .len(),
+        1
+    );
+    assert!(matches!(
+        clean.validation[0].load(SealedSlab::Shielded),
+        Some(Ok(()))
+    ));
+    assert!(clean.validation[0].load(SealedSlab::Nullifier).is_none());
+
+    assert_eq!(
+        clean
+            .read_chunk(
+                SealedSlab::Nullifier,
+                range(1, 1),
+                HeightOrder::Ascending,
+                usize::MAX
+            )?
+            .len(),
+        1
+    );
+    assert!(matches!(
+        clean.validation[0].load(SealedSlab::Shielded),
+        Some(Ok(()))
+    ));
+    assert!(matches!(
+        clean.validation[0].load(SealedSlab::Nullifier),
+        Some(Ok(()))
+    ));
+
+    let bad_path = dir.path().join("bad-shielded");
+    let bad_id = tampered_digest(&bad_path)?;
+    let bad = open_protected(&bad_path, bad_id)?;
+    assert!(
+        bad.read_chunk(
+            SealedSlab::Shielded,
+            range(2, 2),
+            HeightOrder::Ascending,
+            usize::MAX
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        bad.validation[1].load(SealedSlab::Shielded),
+        Some(Err(PayloadError::Digest))
+    ));
+    assert!(bad.validation[1].load(SealedSlab::Nullifier).is_none());
+    assert_eq!(
+        bad.read_chunk(
+            SealedSlab::Nullifier,
+            range(2, 2),
+            HeightOrder::Ascending,
+            usize::MAX
+        )?
+        .len(),
+        1
+    );
+    assert!(matches!(
+        bad.validation[1].load(SealedSlab::Shielded),
+        Some(Err(PayloadError::Digest))
+    ));
+    assert!(matches!(
+        bad.validation[1].load(SealedSlab::Nullifier),
+        Some(Ok(()))
+    ));
     Ok(())
 }
