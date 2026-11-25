@@ -178,6 +178,37 @@ impl Departure {
     }
 }
 
+/// Maximum frame size sent whole as a single departure probe instead of
+/// splitting off its final byte.
+///
+/// Small unary responses (such as `GetTreeState`, `GetLatestBlock`, and
+/// `GetLightdInfo`) sit well below HTTP/2's 16 KiB `max_frame_size`, so h2
+/// encodes and copies the entire frame into its write buffer in one turn and
+/// drops the `Bytes` owner immediately once flow-control window covers it.
+/// Probing the frame whole avoids splitting it into two DATA frames and saves
+/// an extra `poll_frame` turn and `h2::send_data` call while keeping every
+/// send-stall reset and shutdown-replacement guarantee intact.
+const WHOLE_FRAME_PROBE_MAX_BYTES: usize = 4 * 1024;
+
+/// A small data chunk handed out whole as its own departure probe.
+struct ProbeChunk {
+    chunk: Bytes,
+    departure: Arc<Departure>,
+}
+
+impl AsRef<[u8]> for ProbeChunk {
+    fn as_ref(&self) -> &[u8] {
+        &self.chunk
+    }
+}
+
+impl Drop for ProbeChunk {
+    fn drop(&mut self) {
+        self.departure.departed.store(true, Ordering::Release);
+        self.departure.waker.wake();
+    }
+}
+
 /// The one byte of a probe, which reports when h2 drops it.
 struct ProbeByte {
     byte: [u8; 1],
@@ -255,6 +286,19 @@ impl ReleaseGatedBody {
         Poll::Ready(Some(Ok(Frame::data(chunk))))
     }
 
+    /// Wraps a small chunk whole as a single departure probe without splitting
+    /// off its last byte.
+    fn probe_whole_chunk(&mut self, chunk: Bytes) -> Bytes {
+        metrics::counter!(RELEASE_PROBES_METRIC).increment(1);
+        let departure = Arc::new(Departure::default());
+        let probed = Bytes::from_owner(ProbeChunk {
+            chunk,
+            departure: Arc::clone(&departure),
+        });
+        self.departure = Some(departure);
+        probed
+    }
+
     /// Splits off the last byte of `chunk` as the probe and returns the rest,
     /// which is empty for a one-byte chunk.
     fn hold_back_probe(&mut self, mut chunk: Bytes) -> Bytes {
@@ -326,6 +370,10 @@ impl ReleaseGatedBody {
                 return Poll::Pending;
             }
             Poll::Pending => self.next = Next::Paused,
+        }
+        if current.len() <= WHOLE_FRAME_PROBE_MAX_BYTES {
+            let probed = self.probe_whole_chunk(current);
+            return self.hand_out(probed);
         }
         let rest = self.hold_back_probe(current);
         match self.probe.take() {
@@ -550,11 +598,11 @@ mod tests {
         )
         .await
         .ok_or("the transport was reset")??;
-        assert_eq!(data_lengths, vec![payload.len() - 1, 1]);
+        assert_eq!(data_lengths, vec![payload.len()]);
         assert_eq!(trailer_count, 1);
         assert_eq!(
-            outer_polls, 4,
-            "expected DATA(len-1), 1-byte probe, trailers, None without Pending reschedule"
+            outer_polls, 3,
+            "expected whole-frame probed DATA(len), trailers, None without Pending reschedule"
         );
         assert_eq!(inner_polls.load(Ordering::Relaxed), 3);
         Ok(())
