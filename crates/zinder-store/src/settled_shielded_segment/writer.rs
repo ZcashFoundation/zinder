@@ -14,12 +14,12 @@ use super::{
     SettledShieldedSegmentError, SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader,
     ShieldedSegmentIdentity,
     format::{
-        DecodedRowIndexEntry, FRAME_PREFIX_LEN, HEADER_LEN, MAX_SLAB_BYTES, ROW_INDEX_ENTRY_LEN,
-        STAGING_CHUNK, SegmentHeader, check_contiguous_block, encode_frame_prefix,
-        validate_payload_limit,
+        DecodedRowIndexEntry, FRAME_PREFIX_LEN, HEADER_LEN, MAX_SLAB_BYTES,
+        ROW_FLAG_UNREPRESENTABLE_WIRE_FEE, ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader,
+        check_contiguous_block, encode_frame_prefix, validate_payload_limit,
     },
     parent_directory, verity,
-    wire_projection::encode_default_shielded_block,
+    wire_projection::encode_default_shielded_block_with_options,
 };
 
 /// Single-pass staged writer for one immutable `ZSHRNG02` segment.
@@ -60,6 +60,27 @@ impl SettledShieldedSegmentWriter {
         block: &CompactBlockArtifact,
         native_bytes: usize,
     ) -> Result<(), SettledShieldedSegmentError> {
+        self.push_inner(block, native_bytes, false)
+    }
+
+    /// Encodes and writes one contiguous canonical compact block when paired with a
+    /// `ZSTSUP01` supplement segment, zeroing shielded wire fees above `u32::MAX`
+    /// in `Slab 0` and marking the row flag so direct wire reads fail closed while
+    /// canonical reconstruction reads recover full `Option<u64>` fees from `ZSTSUP01`.
+    pub fn push_with_supplement(
+        &mut self,
+        block: &CompactBlockArtifact,
+        native_bytes: usize,
+    ) -> Result<(), SettledShieldedSegmentError> {
+        self.push_inner(block, native_bytes, true)
+    }
+
+    fn push_inner(
+        &mut self,
+        block: &CompactBlockArtifact,
+        native_bytes: usize,
+        allow_wide_fee_in_supplement: bool,
+    ) -> Result<(), SettledShieldedSegmentError> {
         let block_id = BlockId::new(block.height(), block.block_hash());
         if let Some(prev) = self.prior {
             if block.previous_block_hash() != prev.hash {
@@ -74,16 +95,17 @@ impl SettledShieldedSegmentWriter {
             self.first_prev_hash = Some(block.previous_block_hash());
         }
         check_contiguous_block(&self.identity, block_id, self.prior)?;
-        let (payload, pool_presence) = encode_default_shielded_block(block)?;
-        validate_payload_limit(block.height(), payload.len())?;
+        let encoded =
+            encode_default_shielded_block_with_options(block, allow_wide_fee_in_supplement)?;
+        validate_payload_limit(block.height(), encoded.payload.len())?;
         let native_u32 = u32::try_from(native_bytes).map_err(|_| {
             SettledShieldedSegmentError::InvalidFormat(
                 "shielded segment native byte length exceeds u32".to_owned(),
             )
         })?;
-        let prefix = encode_frame_prefix(payload.len())?;
+        let prefix = encode_frame_prefix(encoded.payload.len())?;
         let rel_offset = self.slab_len;
-        let frame_len = u32::try_from(FRAME_PREFIX_LEN + payload.len()).map_err(|_| {
+        let frame_len = u32::try_from(FRAME_PREFIX_LEN + encoded.payload.len()).map_err(|_| {
             SettledShieldedSegmentError::InvalidFormat("shielded frame exceeds u32".to_owned())
         })?;
         let next_slab_len = u64::from(rel_offset) + u64::from(frame_len);
@@ -96,14 +118,20 @@ impl SettledShieldedSegmentWriter {
             SettledShieldedSegmentError::Io(io::Error::other("staged segment writer poisoned"))
         })?;
         staged.write_all(&prefix)?;
-        staged.write_all(&payload)?;
+        staged.write_all(&encoded.payload)?;
+        let row_flags = if encoded.has_unrepresentable_wire_fee {
+            ROW_FLAG_UNREPRESENTABLE_WIRE_FEE
+        } else {
+            0
+        };
         let entry = DecodedRowIndexEntry {
             block_hash_wire: encode_internal_block_hash(block_id.hash),
-            payload_sha256: Sha256::digest(&payload).into(),
+            payload_sha256: Sha256::digest(&encoded.payload).into(),
             block_time: block.time(),
             slab_rel_offset: rel_offset,
             native_bytes: native_u32,
-            pool_presence,
+            pool_presence: encoded.pool_presence,
+            row_flags,
         };
         self.rows.push(entry.encode());
         self.slab_len = u32::try_from(next_slab_len).map_err(|_| {

@@ -721,6 +721,20 @@ fn reader_fails_closed_on_tampered_header_and_index() -> TestOutcome {
         SettledShieldedSegmentError::InvalidFormat(_)
     ));
 
+    let mut bad_row_flags = original.clone();
+    bad_row_flags[index_offset + 77] = 0x02;
+    let bad_row_flags_sha = recompute_portable_sha256(&bad_row_flags);
+    assert!(matches!(
+        corrupt_and_open(
+            dir.path(),
+            &original,
+            identity,
+            &|buf| buf[index_offset + 77] = 0x02,
+            bad_row_flags_sha
+        ),
+        SettledShieldedSegmentError::InvalidFormat(_)
+    ));
+
     let mut bad_pool_bits = original.clone();
     bad_pool_bits[index_offset + 76] = 0x80;
     let bad_pool_sha = recompute_portable_sha256(&bad_pool_bits);
@@ -964,6 +978,7 @@ fn validate_entries_rejects_oversized_frame_on_protected_path() -> TestOutcome {
         slab_rel_offset: 0,
         native_bytes: 128,
         pool_presence: PoolPresenceMask::EMPTY,
+        row_flags: 0,
     };
 
     let exact_max_rows = validate_entries(&[entry], max_frame, &header, None)?;
@@ -1063,6 +1078,7 @@ fn open_raw_portable_segment_with_presence(
         slab_rel_offset: 0,
         native_bytes: 128,
         pool_presence,
+        row_flags: 0,
     };
     let mut segment_bytes = Vec::with_capacity(
         HEADER_LEN + FRAME_PREFIX_LEN + payload.len() + ROW_INDEX_ENTRY_LEN + TRAILER_LEN,
@@ -1270,6 +1286,7 @@ fn indexed_block_mark_valid_preserves_invalid_state() {
         slab_rel_offset: 0,
         native_bytes: 64,
         pool_presence: PoolPresenceMask::EMPTY,
+        row_flags: 0,
     };
 
     let valid_row = IndexedBlock::from_entry(&entry);
@@ -1640,5 +1657,77 @@ fn passthrough_wire_check_matches_full_projection_and_rejects_corrupt_tags() -> 
         is_passthrough_shielded_block_wire(&[0x10, 0x80], orchard_nf),
         Err(SettledShieldedSegmentError::PayloadIntegrity(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn writer_push_with_supplement_marks_wide_fees_for_reconstruction_only() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let wide_block = CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(10), block_hash(10)),
+        block_hash(9),
+        1_700_000_010,
+        vec![make_tx(
+            0,
+            10,
+            CompactTransactionData {
+                fee_zat: Some(u64::from(u32::MAX) + 42),
+                orchard_actions: vec![shielded_action(0x41)],
+                ..CompactTransactionData::default()
+            },
+        )],
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 10,
+            orchard_commitment_tree_size: 20,
+            ironwood_commitment_tree_size: 30,
+        },
+    )?;
+    let span = ShieldedSegmentIdentity::span(
+        TEST_NETWORK,
+        TEST_SCHEMA,
+        wide_block.height(),
+        BlockId::new(wide_block.height(), wide_block.block_hash()),
+    );
+    let reject_path = dir.path().join("reject-wide.zshrng02");
+    let mut strict_writer = SettledShieldedSegmentWriter::create(
+        &reject_path,
+        NamedTempFile::new_in(dir.path())?,
+        span,
+    )?;
+    assert!(matches!(
+        strict_writer.push(&wide_block, 512),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+
+    let sup_path = dir.path().join("wide-sup.zshrng02");
+    let mut sup_writer =
+        SettledShieldedSegmentWriter::create(&sup_path, NamedTempFile::new_in(dir.path())?, span)?;
+    sup_writer.push_with_supplement(&wide_block, 512)?;
+    let identity = sup_writer.finish()?;
+
+    let reader = SettledShieldedSegmentReader::open(
+        &sup_path,
+        &identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let range = BlockHeightRange::inclusive(wide_block.height(), wide_block.height());
+    assert!(matches!(
+        reader.read_default_range(range, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader.read_projected_range(
+            range,
+            HeightOrder::Ascending,
+            ShieldedProjectionSelection::DEFAULT_NULLIFIERS
+        ),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    let reconstructed_frames =
+        reader.read_default_range_for_reconstruction(range, HeightOrder::Ascending)?;
+    assert_eq!(reconstructed_frames.len(), 1);
+    let decoded = lightwalletd::CompactBlock::decode(reconstructed_frames[0].payload().as_ref())?;
+    assert_eq!(decoded.vtx.len(), 1);
+    assert_eq!(decoded.vtx[0].fee, 0);
     Ok(())
 }

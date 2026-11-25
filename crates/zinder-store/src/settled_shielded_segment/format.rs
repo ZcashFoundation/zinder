@@ -26,6 +26,9 @@ pub(super) const VALIDATION_UNVALIDATED: u8 = 0;
 pub(super) const VALIDATION_VALID: u8 = 1;
 pub(super) const VALIDATION_INVALID: u8 = 2;
 
+pub(super) const ROW_FLAG_UNREPRESENTABLE_WIRE_FEE: u8 = 0x01;
+pub(super) const ROW_KNOWN_FLAGS: u8 = ROW_FLAG_UNREPRESENTABLE_WIRE_FEE;
+
 /// Fixed 128-byte header of one `ZSHRNG02` segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SegmentHeader {
@@ -171,6 +174,7 @@ pub(super) struct DecodedRowIndexEntry {
     pub(super) slab_rel_offset: u32,
     pub(super) native_bytes: u32,
     pub(super) pool_presence: PoolPresenceMask,
+    pub(super) row_flags: u8,
 }
 
 impl DecodedRowIndexEntry {
@@ -182,16 +186,23 @@ impl DecodedRowIndexEntry {
         encoded[68..72].copy_from_slice(&self.slab_rel_offset.to_be_bytes());
         encoded[72..76].copy_from_slice(&self.native_bytes.to_be_bytes());
         encoded[76] = self.pool_presence.bits();
+        encoded[77] = self.row_flags;
         encoded
     }
 
     pub(super) fn decode(
         raw: &[u8; ROW_INDEX_ENTRY_LEN],
     ) -> Result<Self, SettledShieldedSegmentError> {
-        if raw[77..80] != [0_u8; 3] {
+        if raw[78..80] != [0_u8; 2] {
             return Err(SettledShieldedSegmentError::InvalidFormat(
                 "row index entry reserved bytes are non-zero".to_owned(),
             ));
+        }
+        let row_flags = raw[77];
+        if (row_flags & !ROW_KNOWN_FLAGS) != 0 {
+            return Err(SettledShieldedSegmentError::InvalidFormat(format!(
+                "row index entry has unsupported flags {row_flags:#04x}"
+            )));
         }
         let pool_presence = PoolPresenceMask::from_bits(raw[76]).ok_or_else(|| {
             SettledShieldedSegmentError::InvalidFormat(format!(
@@ -206,6 +217,7 @@ impl DecodedRowIndexEntry {
             slab_rel_offset: read_u32_be(&raw[68..72])?,
             native_bytes: read_u32_be(&raw[72..76])?,
             pool_presence,
+            row_flags,
         })
     }
 }
@@ -217,6 +229,7 @@ pub(super) struct IndexedBlock {
     pub(super) slab_rel_offset: u32,
     pub(super) native_bytes: u32,
     pub(super) pool_presence: PoolPresenceMask,
+    pub(super) row_flags: u8,
     pub(super) validation_state: AtomicU8,
 }
 
@@ -228,8 +241,13 @@ impl IndexedBlock {
             slab_rel_offset: entry.slab_rel_offset,
             native_bytes: entry.native_bytes,
             pool_presence: entry.pool_presence,
+            row_flags: entry.row_flags,
             validation_state: AtomicU8::new(VALIDATION_UNVALIDATED),
         }
+    }
+
+    pub(super) const fn has_unrepresentable_wire_fee(&self) -> bool {
+        (self.row_flags & ROW_FLAG_UNREPRESENTABLE_WIRE_FEE) != 0
     }
 
     pub(super) fn mark_valid(&self) {

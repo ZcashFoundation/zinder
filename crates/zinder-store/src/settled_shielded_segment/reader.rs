@@ -134,6 +134,22 @@ impl SettledShieldedSegmentReader {
         self.read_projected_range(range, order, ShieldedProjectionSelection::DEFAULT_SHIELDED)
     }
 
+    /// Reads the default shielded `CompactBlock` frames across `range` for canonical
+    /// artifact reconstruction alongside `ZSTSUP01`, allowing rows marked with
+    /// wide fees above `u32::MAX` (whose `Slab 0` fee is zeroed).
+    pub fn read_default_range_for_reconstruction(
+        &self,
+        range: BlockHeightRange,
+        order: HeightOrder,
+    ) -> Result<Vec<EncodedBlock>, SettledShieldedSegmentError> {
+        self.read_projected_range_inner(
+            range,
+            order,
+            ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            false,
+        )
+    }
+
     /// Reads and projects `CompactBlock` frames across `range` for `selection`.
     pub fn read_projected_range(
         &self,
@@ -141,7 +157,27 @@ impl SettledShieldedSegmentReader {
         order: HeightOrder,
         selection: ShieldedProjectionSelection,
     ) -> Result<Vec<EncodedBlock>, SettledShieldedSegmentError> {
+        self.read_projected_range_inner(range, order, selection, true)
+    }
+
+    fn read_projected_range_inner(
+        &self,
+        range: BlockHeightRange,
+        order: HeightOrder,
+        selection: ShieldedProjectionSelection,
+        enforce_wire_fee_limit: bool,
+    ) -> Result<Vec<EncodedBlock>, SettledShieldedSegmentError> {
         let index_range = self.resolve_index_range(range)?;
+        if enforce_wire_fee_limit {
+            for idx in index_range.clone() {
+                if self.rows[idx].has_unrepresentable_wire_fee() {
+                    return Err(SettledShieldedSegmentError::PayloadIntegrity(
+                        "shielded block contains transaction fee exceeding u32 wire limit"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
         let mut out = Vec::with_capacity(index_range.len());
         let mut packed_out = Vec::new();
         let mut tx_scratch = Vec::new();

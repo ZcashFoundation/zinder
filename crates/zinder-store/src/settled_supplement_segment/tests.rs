@@ -2633,75 +2633,6 @@ fn wire_validator_enforces_crypto_field_presence_lengths_and_nullifier_mode() ->
     Ok(())
 }
 
-fn encode_shielded_wire_with_wide_fee_zero(block: &CompactBlockArtifact) -> Vec<u8> {
-    let vtx = block
-        .transactions()
-        .iter()
-        .filter(|tx| {
-            !tx.data.sapling_spends.is_empty()
-                || !tx.data.sapling_outputs.is_empty()
-                || !tx.data.orchard_actions.is_empty()
-                || !tx.data.ironwood_actions.is_empty()
-        })
-        .map(|tx| lightwalletd::CompactTx {
-            index: tx.index,
-            txid: encode_internal_transaction_id(tx.transaction_id).to_vec(),
-            fee: tx
-                .data
-                .fee_zat
-                .and_then(|fee| u32::try_from(fee).ok())
-                .unwrap_or(0),
-            spends: tx
-                .data
-                .sapling_spends
-                .iter()
-                .map(|spend| lightwalletd::CompactSaplingSpend {
-                    nf: spend.nullifier.to_vec(),
-                })
-                .collect(),
-            outputs: tx
-                .data
-                .sapling_outputs
-                .iter()
-                .map(|output| lightwalletd::CompactSaplingOutput {
-                    cmu: output.commitment.to_vec(),
-                    ephemeral_key: output.ephemeral_key.to_vec(),
-                    ciphertext: output.ciphertext.to_vec(),
-                })
-                .collect(),
-            actions: tx
-                .data
-                .orchard_actions
-                .iter()
-                .map(|act| prost_action(act, false))
-                .collect(),
-            ironwood_actions: tx
-                .data
-                .ironwood_actions
-                .iter()
-                .map(|act| prost_action(act, false))
-                .collect(),
-            vin: Vec::new(),
-            vout: Vec::new(),
-        })
-        .collect();
-    let meta = block.chain_metadata();
-    lightwalletd::CompactBlock {
-        height: u64::from(block.height().value()),
-        hash: encode_internal_block_hash(block.block_hash()).to_vec(),
-        prev_hash: encode_internal_block_hash(block.previous_block_hash()).to_vec(),
-        time: block.time(),
-        header: Vec::new(),
-        vtx,
-        chain_metadata: Some(lightwalletd::ChainMetadata {
-            sapling_commitment_tree_size: meta.sapling_commitment_tree_size,
-            orchard_commitment_tree_size: meta.orchard_commitment_tree_size,
-            ironwood_commitment_tree_size: meta.ironwood_commitment_tree_size,
-        }),
-    }
-    .encode_to_vec()
-}
-
 #[test]
 fn push_record_rejects_conflicting_tag1_and_tag2_txids() -> TestOutcome {
     let temp = TempDir::new()?;
@@ -2912,36 +2843,80 @@ fn wide_fee_corpus() -> TestOutcome<Vec<CompactBlockArtifact>> {
 fn reconstruct_preserves_shielded_and_transparent_wide_fees_while_splice_rejects() -> TestOutcome {
     let blocks = wide_fee_corpus()?;
     let temp = TempDir::new()?;
+    let shielded_path = temp.path().join("wide-fees.zshrng02");
     let sup_path = temp.path().join("wide-fees.zstsup01");
-    let sup_id_req = SupplementSegmentIdentity::span(
-        Network::ZcashMainnet,
-        1,
-        blocks[0].height(),
-        BlockId::new(blocks[2].height(), blocks[2].block_hash()),
-    );
-    let mut writer = SettledSupplementSegmentWriter::create(
+    let end_id = BlockId::new(blocks[2].height(), blocks[2].block_hash());
+    let shielded_req =
+        ShieldedSegmentIdentity::span(Network::ZcashMainnet, 1, blocks[0].height(), end_id);
+    let sup_id_req =
+        SupplementSegmentIdentity::span(Network::ZcashMainnet, 1, blocks[0].height(), end_id);
+    let mut shielded_writer = SettledShieldedSegmentWriter::create(
+        &shielded_path,
+        NamedTempFile::new_in(temp.path())?,
+        shielded_req,
+    )?;
+    let mut sup_writer = SettledSupplementSegmentWriter::create(
         &sup_path,
         sup_id_req,
         SettledSupplementSegmentWriteOptions::default(),
     )?;
     for block in &blocks {
-        writer.push(block, Some(&make_canonical_facts(block)))?;
+        let native_bytes = 512 + block.transactions().len() * 256;
+        shielded_writer.push_with_supplement(block, native_bytes)?;
+        sup_writer.push(block, Some(&make_canonical_facts(block)))?;
     }
-    let sup_id = writer.finish()?;
-    let reader = SettledSupplementSegmentReader::open(
+    let shielded_id = shielded_writer.finish()?;
+    let sup_id = sup_writer.finish()?;
+
+    let shielded_reader = SettledShieldedSegmentReader::open(
+        &shielded_path,
+        &shielded_id,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let sup_reader = SettledSupplementSegmentReader::open(
         &sup_path,
         &sup_id,
         SettledSupplementSegmentOpenOptions::default(),
     )?;
-    let wires: Vec<Vec<u8>> = blocks
-        .iter()
-        .map(encode_shielded_wire_with_wide_fee_zero)
-        .collect();
+    assert_wide_fee_shielded_and_splice_behavior(&shielded_reader, &sup_reader, &blocks)
+}
+
+fn assert_wide_fee_shielded_and_splice_behavior(
+    shielded_reader: &SettledShieldedSegmentReader,
+    sup_reader: &SettledSupplementSegmentReader,
+    blocks: &[CompactBlockArtifact],
+) -> TestOutcome {
+    let range = BlockHeightRange::inclusive(BlockHeight::new(530), BlockHeight::new(532));
+    assert!(
+        shielded_reader
+            .read_default_range(range, HeightOrder::Ascending)
+            .is_err()
+    );
+    assert!(
+        shielded_reader
+            .read_projected_range(
+                range,
+                HeightOrder::Ascending,
+                crate::settled_shielded_segment::ShieldedProjectionSelection::DEFAULT_NULLIFIERS
+            )
+            .is_err()
+    );
+    let range_530 = BlockHeightRange::inclusive(BlockHeight::new(530), BlockHeight::new(530));
+    assert_eq!(
+        shielded_reader
+            .read_default_range(range_530, HeightOrder::Ascending)?
+            .len(),
+        1
+    );
+
+    let frames =
+        shielded_reader.read_default_range_for_reconstruction(range, HeightOrder::Ascending)?;
+    let wires: Vec<bytes::Bytes> = frames.iter().map(EncodedBlock::payload).collect();
     for (block, wire) in blocks.iter().zip(wires.iter()) {
-        assert_eq!(reader.reconstruct_block(block.height(), wire)?, *block);
+        assert_eq!(sup_reader.reconstruct_block(block.height(), wire)?, *block);
     }
     assert_eq!(
-        reader.reconstruct_range(BlockHeight::new(530), &wires)?,
+        sup_reader.reconstruct_range(BlockHeight::new(530), &wires)?,
         blocks
     );
 
@@ -2954,13 +2929,13 @@ fn reconstruct_preserves_shielded_and_transparent_wide_fees_while_splice_rejects
     ];
     for mode in all_modes {
         for (block, wire) in blocks.iter().zip(wires.iter()) {
-            let single_err = reader.splice_block_wire(block.height(), wire, mode);
+            let single_err = sup_reader.splice_block_wire(block.height(), wire, mode);
             assert!(matches!(
                 single_err,
                 Err(SettledSupplementSegmentError::PayloadIntegrity(_))
             ));
         }
-        let range_err = reader.splice_range_wire(BlockHeight::new(530), &wires, mode);
+        let range_err = sup_reader.splice_range_wire(BlockHeight::new(530), &wires, mode);
         assert!(matches!(
             range_err,
             Err(SettledSupplementSegmentError::PayloadIntegrity(_))
