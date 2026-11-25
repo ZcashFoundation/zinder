@@ -306,8 +306,12 @@ impl IndexedBlock {
     }
 
     pub(super) fn mark_valid(&self) {
-        self.validation_state
-            .store(VALIDATION_VALID, Ordering::Release);
+        let _ = self.validation_state.compare_exchange(
+            VALIDATION_UNVALIDATED,
+            VALIDATION_VALID,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     pub(super) fn mark_invalid(&self) {

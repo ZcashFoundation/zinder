@@ -137,7 +137,9 @@ impl SettledRawBlockSegmentReader {
             )
         })?;
         let block_bytes = self.read_verified_block(row_idx)?;
-        slice_and_verify_tx(row, &block_bytes, tx_entry)
+        slice_and_verify_tx(&block_bytes, tx_entry).inspect_err(|_| {
+            row.mark_invalid();
+        })
     }
 
     fn resolve_row_index(&self, height: BlockHeight) -> Result<usize, SettledRawBlockSegmentError> {
@@ -220,32 +222,24 @@ impl SettledRawBlockSegmentReader {
 }
 
 fn slice_and_verify_tx(
-    row: &IndexedBlock,
     block_bytes: &[u8],
     tx_entry: &TxSliceEntry,
 ) -> Result<Vec<u8>, SettledRawBlockSegmentError> {
     let start = usize::try_from(tx_entry.offset).map_err(|_| {
-        row.mark_invalid();
         SettledRawBlockSegmentError::InvalidFormat("tx offset exceeds usize".to_owned())
     })?;
     let len = usize::try_from(tx_entry.len).map_err(|_| {
-        row.mark_invalid();
         SettledRawBlockSegmentError::InvalidFormat("tx length exceeds usize".to_owned())
     })?;
-    let Some(end) = start.checked_add(len) else {
-        row.mark_invalid();
-        return Err(SettledRawBlockSegmentError::InvalidFormat(
-            "tx slice end overflows usize".to_owned(),
-        ));
-    };
-    let Some(tx_bytes) = block_bytes.get(start..end) else {
-        row.mark_invalid();
-        return Err(SettledRawBlockSegmentError::InvalidFormat(
+    let end = start.checked_add(len).ok_or_else(|| {
+        SettledRawBlockSegmentError::InvalidFormat("tx slice end overflows usize".to_owned())
+    })?;
+    let tx_bytes = block_bytes.get(start..end).ok_or_else(|| {
+        SettledRawBlockSegmentError::InvalidFormat(
             "tx slice falls outside decompressed block bytes".to_owned(),
-        ));
-    };
+        )
+    })?;
     if <[u8; 32]>::from(Sha256::digest(tx_bytes)) != tx_entry.sha256 {
-        row.mark_invalid();
         return Err(SettledRawBlockSegmentError::PayloadIntegrity(
             "raw transaction SHA-256 mismatch on read".to_owned(),
         ));
