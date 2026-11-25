@@ -761,7 +761,11 @@ existing directory outside the primary. `--report` writes a new JSON file
 outside the primary. Omit it to print JSON to stdout. Set `--workload`
 (`wallet` or `explorer`), `--raw-blob-retention` (`none`, `transactions`, or
 `all`), and `--supported-reorg-depth` to the values persisted in the store.
-The defaults are `wallet`, `transactions`, and 1,000 blocks.
+The defaults are `wallet`, `transactions`, and 1,000 blocks. Pass
+`--canonical-io-mode direct|buffered` (default `direct`) to compare direct
+and buffered canonical reads, and `--evict-page-cache` on Linux to drop
+cached pages of `--canonical-store` with `posix_fadvise(POSIX_FADV_DONTNEED)`
+before each cold secondary open.
 
 The compact-block report (version 4) retains the 128-, 512-, and 1,024-block
 unbounded calls in `cases`. Each entry in `bounded_cases` measures one

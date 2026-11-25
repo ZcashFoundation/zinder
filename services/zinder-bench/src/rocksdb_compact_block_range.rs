@@ -472,6 +472,7 @@ mod tests {
             workload: zinder_store::CanonicalStoreWorkload::Wallet,
             raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
             budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
+            evict_page_cache: false,
         };
         let (direct, _) = store.open("direct", None)?;
         let ready = direct.ready_evidence();
@@ -506,6 +507,7 @@ mod tests {
             workload: zinder_store::CanonicalStoreWorkload::Wallet,
             raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
             budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
+            evict_page_cache: false,
         };
         for (level, order, block_count) in [
             (RocksDbStatisticsLevel::Full, HeightOrder::Descending, 3),
@@ -574,6 +576,7 @@ mod tests {
             workload: zinder_store::CanonicalStoreWorkload::Wallet,
             raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
             budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
+            evict_page_cache: false,
         };
 
         let blocks = chain.compact_block_artifacts();

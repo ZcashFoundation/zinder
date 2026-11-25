@@ -225,6 +225,7 @@ mod tests {
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: writer.canonical_primary()?.reorg_policy(),
             budget: RocksDbResourceBudget::for_local_tests(),
+            evict_page_cache: false,
         };
         let page = measure_page(&store, ShieldedProtocol::Sapling, None, 4).await?;
         assert_eq!(page.start_index, 1);
