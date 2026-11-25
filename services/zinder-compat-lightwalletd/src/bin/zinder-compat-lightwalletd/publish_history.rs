@@ -1,5 +1,5 @@
 use std::{
-    fmt, fs, io,
+    fmt, io,
     num::NonZeroU32,
     path::{Path, PathBuf},
     time::Duration,
@@ -104,7 +104,6 @@ impl PublishHistory {
             || reader.secondary().history_bounds().first_available_height(),
             BlockHeight::new,
         );
-        validate_signing_key_readable(&self.signing_key)?;
         ShieldedCatalogPublisher::open(
             &self.directory,
             &self.signing_key,
@@ -125,14 +124,12 @@ impl PublishHistory {
 }
 
 fn validate_signing_key_readable(signing_key: &Path) -> io::Result<()> {
-    fs::read(signing_key).map_err(|error| {
-        path_io_error("could not read publisher signing key", signing_key, &error)
-    })?;
-    Ok(())
+    ShieldedCatalogPublisher::validate_signing_key(signing_key)
+        .map_err(|error| path_io_error("could not read publisher signing key", signing_key, &error))
 }
 
 fn validate_catalog_destination(directory: &Path) -> io::Result<()> {
-    match directory.symlink_metadata() {
+    match directory.metadata() {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(io::Error::other(format!(
             "shielded history directory {} is not a directory",
@@ -240,6 +237,8 @@ fn reader_invalidated(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]

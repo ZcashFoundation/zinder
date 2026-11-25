@@ -532,6 +532,117 @@ async fn publisher_reports_exact_paths_and_os_errors_for_missing_inputs() -> Res
     Ok(())
 }
 
+#[tokio::test]
+async fn publisher_rejects_oversized_and_non_regular_signing_keys() -> Result<()> {
+    let files = tempfile::tempdir()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .with_raw_blob_retention(RawBlobRetention::Transactions);
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let catalog = files.path().join("catalog");
+    let scratch = files.path().join("secondary");
+
+    let oversized_key = files.path().join("oversized.key");
+    fs::write(&oversized_key, vec![0xab; 512])?;
+    let key_directory = files.path().join("key-directory");
+    fs::create_dir(&key_directory)?;
+
+    let mut invalid_keys = vec![oversized_key, key_directory];
+    #[cfg(unix)]
+    {
+        let fifo_key = files.path().join("signing-key.fifo");
+        let mkfifo_status = std::process::Command::new("mkfifo")
+            .arg(&fifo_key)
+            .status()?;
+        assert!(mkfifo_status.success(), "mkfifo failed: {mkfifo_status}");
+        invalid_keys.push(fifo_key);
+    }
+
+    for invalid_key in invalid_keys {
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            publication_command(
+                writer.canonical_primary_path(),
+                &scratch,
+                &catalog,
+                &invalid_key,
+            )
+            .output(),
+        )
+        .await??;
+        assert!(!output.status.success(), "{invalid_key:?}: {output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains(&invalid_key.display().to_string()),
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn publisher_accepts_symlinked_catalog_directory() -> Result<()> {
+    let files = tempfile::tempdir()?;
+    let (private, public) = shielded_catalog_keys(files.path())?;
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .with_raw_blob_retention(RawBlobRetention::Transactions);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+
+    let target_catalog = files.path().join("real-catalog");
+    fs::create_dir(&target_catalog)?;
+    let linked_catalog = files.path().join("linked-catalog");
+    std::os::unix::fs::symlink(&target_catalog, &linked_catalog)?;
+    let scratch = files.path().join("secondary");
+
+    let output = publication_command(
+        writer.canonical_primary_path(),
+        &scratch,
+        &linked_catalog,
+        &private,
+    )
+    .output()
+    .await?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(target_catalog.join("current.json").is_file());
+    let mut store = writer.serving_store_fixture()?;
+    let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
+    PublishedShieldedHistory::open(
+        &linked_catalog.join("current.json"),
+        &public,
+        false,
+        &reader,
+    )
+    .await?;
+
+    let plain_file = files.path().join("plain-file");
+    fs::write(&plain_file, b"not-a-directory")?;
+    let linked_file = files.path().join("linked-file");
+    std::os::unix::fs::symlink(&plain_file, &linked_file)?;
+    let rejected = publication_command(
+        writer.canonical_primary_path(),
+        &scratch,
+        &linked_file,
+        &private,
+    )
+    .output()
+    .await?;
+    assert!(!rejected.status.success(), "{rejected:?}");
+    let stderr = String::from_utf8(rejected.stderr)?;
+    assert!(
+        stderr.contains(&linked_file.display().to_string()),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 async fn wait_for_change(path: &Path, previous: &[u8]) -> Result<Vec<u8>> {
     Ok(tokio::time::timeout(Duration::from_secs(20), async {
         loop {
