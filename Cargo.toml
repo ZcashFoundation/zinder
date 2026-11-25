@@ -123,6 +123,7 @@ zcash_protocol = { version = "0.11.0", default-features = false }
 zcash_transparent = { version = "0.11.1", default-features = false }
 zebra-chain = "16.0.0"
 zip32 = "0.3.0"
+zstd = "0.13"
 zinder-core = { version = "0.25.0", path = "crates/zinder-core" }
 zinder-rocksdb-bulk-load = { path = "crates/zinder-rocksdb-bulk-load" }
 zinder-client = { version = "0.25.0", path = "crates/zinder-client" }
