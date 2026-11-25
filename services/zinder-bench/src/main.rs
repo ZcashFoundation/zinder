@@ -252,6 +252,12 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .try_init();
     let cli = Cli::parse();
+    if !zinder_runtime::host_cpu_meets_compiled_baseline() {
+        return ExitCode::FAILURE;
+    }
+    if !zinder_runtime::host_cpu_meets_pasta_backend_baseline() {
+        return ExitCode::FAILURE;
+    }
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

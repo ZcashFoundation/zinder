@@ -70,9 +70,10 @@ pub use chain_value_pools::{
 };
 #[cfg(feature = "commitment-tree-codec")]
 pub use commitment_tree_codec::{
-    CommitmentTreeAccumulator, CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
-    CommitmentTreeFrontiersError, CommitmentTreeSnapshot,
+    BatchAppendBlocksOutcome, BatchAppendedBlock, BatchPoolAppendDurations,
+    BlockCommitmentBatchInput, CommitmentTreeAccumulator, CommitmentTreeAccumulatorError,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
+    CommitmentTreeFrontiers, CommitmentTreeFrontiersError, CommitmentTreeSnapshot,
     MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
 };
 pub use displaced_block::{

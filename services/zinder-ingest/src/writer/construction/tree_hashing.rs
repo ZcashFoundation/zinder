@@ -120,10 +120,28 @@ impl TreeHashers {
         }
     }
 
+    pub(super) fn has_pending_error(&self) -> bool {
+        self.pending.back().is_some_and(Result::is_err)
+    }
+
+    /// Whether pending tree work has drained to the low-water mark so the next
+    /// refill takes a multi-block batch rather than single-slot trickle appends.
+    pub(super) fn wants_batch_refill(&self) -> bool {
+        !self.has_pending_error() && self.pending.len() <= self.max_pending / 2
+    }
+
     /// Whether the loader should take another block before handing one to
     /// the store.
     pub(super) fn wants_more(&self) -> bool {
-        self.pending.len() < self.max_pending && !self.pending.back().is_some_and(Result::is_err)
+        self.pending.len() < self.max_pending && !self.has_pending_error()
+    }
+
+    /// Remaining pending-block slots available before reaching `max_pending`.
+    pub(super) fn remaining_pending(&self) -> usize {
+        if self.has_pending_error() {
+            return 0;
+        }
+        self.max_pending.saturating_sub(self.pending.len())
     }
 
     pub(super) fn is_idle(&self) -> bool {

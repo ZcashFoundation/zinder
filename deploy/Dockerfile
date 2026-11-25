@@ -142,14 +142,20 @@ ARG RUST_VERSION
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG RELEASE_CACHE_SCOPE=shared
+ARG ZINDER_PASTA_ASM=0
 
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/workspace/target,sharing=locked \
     find . -path ./target -prune -o -type f -exec touch {} + \
     && rust_target="$(case "$TARGETARCH" in amd64) printf '%s' x86_64-unknown-linux-gnu ;; arm64) printf '%s' aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac)" \
+    && case "${ZINDER_PASTA_ASM}" in \
+        0|1) ;; \
+        *) printf '%s\n' "ZINDER_PASTA_ASM must be 0 or 1, got '${ZINDER_PASTA_ASM}'" >&2; exit 1 ;; \
+    esac \
+    && pasta_asm_flag="$(if [ "${ZINDER_PASTA_ASM}" = "1" ]; then printf '%s' '--features pasta_curves/asm'; else printf '%s' ''; fi)" \
     && rustup target add "$rust_target" \
-    && cargo auditable build --locked --release --target "$rust_target" --bin zinder-bench \
+    && cargo auditable build --locked --release --target "$rust_target" $pasta_asm_flag --bin zinder-bench \
     && mkdir -p /zinder-bench \
     && cp "/workspace/target/${rust_target}/release/zinder-bench" /zinder-bench/zinder-bench
 
