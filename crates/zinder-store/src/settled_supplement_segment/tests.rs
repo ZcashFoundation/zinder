@@ -2681,6 +2681,76 @@ fn push_record_rejects_conflicting_tag1_and_tag2_txids() -> TestOutcome {
 }
 
 #[test]
+fn push_record_rejects_conflicting_tag1_and_tag2_fees() -> TestOutcome {
+    let temp = TempDir::new()?;
+    let seg_path = temp.path().join("conflict-fee.zstsup01");
+    let first = empty_block(500);
+    let second = transparent_only_block(501)?;
+    let identity = SupplementSegmentIdentity::span(
+        Network::ZcashMainnet,
+        1,
+        first.height(),
+        BlockId::new(second.height(), second.block_hash()),
+    );
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &seg_path,
+        identity,
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    writer.push(&first, Some(&make_canonical_facts(&first)))?;
+
+    let mut bad_meta = CanonicalBlockSupplement::from_canonical_facts(
+        &make_canonical_facts(&second),
+        Some(&second),
+    )?;
+    bad_meta.transactions[1].fee_and_burn.fee_zat = Some(20_000);
+    let bad_record = BlockSupplementRecord {
+        transparent_transactions: transparent_supplement_from_compact(&second),
+        canonical_metadata: Some(bad_meta),
+    };
+    let push_outcome = writer.push_record(
+        BlockId::new(second.height(), second.block_hash()),
+        second.previous_block_hash(),
+        second.time(),
+        &bad_record,
+    );
+    assert!(matches!(
+        push_outcome,
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+    let finish_outcome = writer.finish();
+    assert!(matches!(
+        finish_outcome,
+        Err(SettledSupplementSegmentError::ChainLinkage(_))
+    ));
+    assert!(!seg_path.exists());
+
+    let ok_path = temp.path().join("unknown-tag2-fee.zstsup01");
+    let mut ok_writer = SettledSupplementSegmentWriter::create(
+        &ok_path,
+        identity,
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    ok_writer.push(&first, Some(&make_canonical_facts(&first)))?;
+    let unknown_fee_meta =
+        CanonicalBlockSupplement::from_canonical_facts(&make_canonical_facts(&second), None)?;
+    assert_eq!(unknown_fee_meta.transactions[1].fee_and_burn.fee_zat, None);
+    let ok_record = BlockSupplementRecord {
+        transparent_transactions: transparent_supplement_from_compact(&second),
+        canonical_metadata: Some(unknown_fee_meta),
+    };
+    ok_writer.push_record(
+        BlockId::new(second.height(), second.block_hash()),
+        second.previous_block_hash(),
+        second.time(),
+        &ok_record,
+    )?;
+    let _committed = ok_writer.finish()?;
+    assert!(ok_path.exists());
+    Ok(())
+}
+
+#[test]
 fn partial_write_failure_poisons_writer_and_prevents_finish_publication() -> TestOutcome {
     let temp = TempDir::new()?;
     let seg_path = temp.path().join("poisoned.zstsup01");

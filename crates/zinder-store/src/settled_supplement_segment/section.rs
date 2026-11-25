@@ -445,13 +445,20 @@ fn verify_decoded_record_consistency(
         while meta_idx < metas.len() && metas[meta_idx].tx_index < sup_tx.index {
             meta_idx += 1;
         }
-        if meta_idx < metas.len()
-            && metas[meta_idx].tx_index == sup_tx.index
-            && metas[meta_idx].public_facts.transaction_id != sup_tx.transaction_id
-        {
-            return Err(SettledSupplementSegmentError::PayloadIntegrity(
-                "Tag 1 and Tag 2 disagree on transaction_id".to_owned(),
-            ));
+        if meta_idx < metas.len() && metas[meta_idx].tx_index == sup_tx.index {
+            if metas[meta_idx].public_facts.transaction_id != sup_tx.transaction_id {
+                return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                    "Tag 1 and Tag 2 disagree on transaction_id".to_owned(),
+                ));
+            }
+            if let (Some(sup_fee), Some(tag2_fee)) =
+                (sup_tx.fee_zat, metas[meta_idx].fee_and_burn.fee_zat)
+                && tag2_fee != sup_fee
+            {
+                return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                    "Tag 1 and Tag 2 disagree on fee_zat".to_owned(),
+                ));
+            }
         }
     }
     Ok(())
