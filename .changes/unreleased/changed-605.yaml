@@ -1,0 +1,6 @@
+kind: changed
+body: Streamed `ZebraJsonRpc` batched `getblock` responses without `serde_json::Value` DOM allocation, offloaded hex decoding (`const-hex`) and block-header parsing onto blocking worker threads, skipped redundant `tip_id()` polls strictly below `tip_height - reorg_window_blocks` during fixed-tip construction (clarified in ADR-0006 Decision 6), and tightened proactive `SourceSegmentSizer` backoff on dense epochs.
+time: 2026-11-25T15:22:08Z
+custom:
+    Bump: patch
+    PR: "605"
