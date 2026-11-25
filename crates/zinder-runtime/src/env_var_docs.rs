@@ -1727,12 +1727,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       takes at most 512 KiB, and at most twice that many batches, never more \
                       than 64, plus two on the build thread exist at once: at most 5 MiB at 4 \
                       threads and 33 MiB at 64. A row larger than a batch is hashed on the \
-                      build thread. Cold \
-                      validation also reads the unspent and spent output families back in up \
-                      to that many outpoint key ranges at once, at most one per 65,536 of \
-                      their rows. The published rows, digest, and commitment do not change. \
-                      Must be between 1 and 64; the projector refuses a larger value at \
-                      startup.",
+                      build thread. Cold validation also reads the unspent and spent output \
+                      families and the address-transaction family back in up to that many \
+                      hash-prefix key ranges at once, at most one per 65,536 of each scan's \
+                      rows. The published rows, digest, and commitment do not change. Must be \
+                      between 1 and 64; the projector refuses a larger value at startup.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES",
