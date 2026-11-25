@@ -7,10 +7,16 @@ use std::{
 use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use tempfile::{Builder, NamedTempFile, TempPath};
-use zinder_core::BlockHeightRange;
+use zinder_core::{BlockHash, BlockHeightRange};
 use zinder_query::RocksDbCanonicalReader;
 
-use super::PublishedShieldedRange;
+use super::{PublishedShieldedRange, ShieldedRangeIdentity};
+
+#[derive(Clone, Copy)]
+pub(super) struct BuiltSegment {
+    pub(super) identity: ShieldedRangeIdentity,
+    pub(super) first_parent: BlockHash,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,18 +29,38 @@ const STAGED_WRITE: &str = ".publisher-write.tmp";
 const STAGED_SEGMENT: &str = ".publisher-segment.tmp";
 const STAGED_NULLIFIERS: &str = ".publisher-nullifiers.tmp";
 
-fn staged_write(directory: &Path) -> io::Result<NamedTempFile> {
+fn staging_name(prefix: &str, slot: Option<usize>) -> String {
+    slot.map_or_else(|| prefix.to_owned(), |worker| format!("{prefix}.{worker}"))
+}
+
+fn is_publisher_staging_name(name: &str) -> bool {
+    [STAGED_WRITE, STAGED_SEGMENT, STAGED_NULLIFIERS]
+        .iter()
+        .any(|prefix| {
+            name == *prefix
+                || name
+                    .strip_prefix(prefix)
+                    .and_then(|suffix| suffix.strip_prefix('.'))
+                    .is_some_and(|slot| {
+                        !slot.is_empty() && slot.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        })
+}
+
+fn staged_temp_file(
+    directory: &Path,
+    prefix: &str,
+    slot: Option<usize>,
+) -> io::Result<NamedTempFile> {
+    let label = staging_name(prefix, slot);
     Builder::new()
-        .prefix(STAGED_WRITE)
+        .prefix(&label)
         .rand_bytes(0)
         .tempfile_in(directory)
 }
 
-fn staged_nullifiers(directory: &Path) -> io::Result<NamedTempFile> {
-    Builder::new()
-        .prefix(STAGED_NULLIFIERS)
-        .rand_bytes(0)
-        .tempfile_in(directory)
+fn staged_write(directory: &Path) -> io::Result<NamedTempFile> {
+    staged_temp_file(directory, STAGED_WRITE, None)
 }
 
 pub(super) fn lock_directory(directory: &Path) -> io::Result<File> {
@@ -59,9 +85,12 @@ pub(super) fn lock_directory(directory: &Path) -> io::Result<File> {
         .truncate(false)
         .open(directory.join(".publisher.lock"))?;
     file.try_lock()?;
-    // A killed publisher can leave either name before the next atomic installation.
-    for name in [STAGED_WRITE, STAGED_SEGMENT, STAGED_NULLIFIERS] {
-        if let Err(error) = fs::remove_file(directory.join(name))
+    // A killed publisher can leave legacy or worker-slot staging files before its next run.
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if file_name.to_str().is_some_and(is_publisher_staging_name)
+            && let Err(error) = fs::remove_file(entry.path())
             && error.kind() != io::ErrorKind::NotFound
         {
             return Err(error);
@@ -75,9 +104,43 @@ pub(super) fn publish_segment(
     directory: &Path,
     range: BlockHeightRange,
 ) -> io::Result<PublishedShieldedRange> {
-    let segment = TempPath::try_from_path(directory.join(STAGED_SEGMENT))?;
-    let staged = (staged_write(directory)?, staged_nullifiers(directory)?);
-    let history = PublishedShieldedRange::build(reader, &segment, staged, range)?;
+    publish_segment_in_slot(reader, directory, range, None, true)
+}
+
+pub(super) fn stage_segment(
+    reader: &RocksDbCanonicalReader,
+    directory: &Path,
+    range: BlockHeightRange,
+    slot: usize,
+) -> io::Result<BuiltSegment> {
+    let published = publish_segment_in_slot(reader, directory, range, Some(slot), false)?;
+    Ok(BuiltSegment {
+        identity: published.identity(),
+        first_parent: published.segment.first_parent(),
+    })
+}
+
+pub(super) fn sync_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
+fn publish_segment_in_slot(
+    reader: &RocksDbCanonicalReader,
+    directory: &Path,
+    range: BlockHeightRange,
+    slot: Option<usize>,
+    sync_dir: bool,
+) -> io::Result<PublishedShieldedRange> {
+    let segment = TempPath::try_from_path(directory.join(staging_name(STAGED_SEGMENT, slot)))?;
+    let staged = (
+        staged_temp_file(directory, STAGED_WRITE, slot)?,
+        staged_temp_file(directory, STAGED_NULLIFIERS, slot)?,
+    );
+    let history = if sync_dir {
+        PublishedShieldedRange::build(reader, &segment, staged, range)?
+    } else {
+        PublishedShieldedRange::build_staged(reader, &segment, staged, range)?
+    };
     let destination = segment_path(directory, history.identity.sha256);
     let published = match fs::hard_link(&segment, &destination) {
         Ok(()) => history,
@@ -93,7 +156,9 @@ pub(super) fn publish_segment(
         }
         Err(error) => return Err(error),
     };
-    File::open(directory)?.sync_all()?;
+    if sync_dir {
+        sync_directory(directory)?;
+    }
     Ok(published)
 }
 

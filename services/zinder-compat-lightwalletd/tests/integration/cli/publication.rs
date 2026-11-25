@@ -658,3 +658,154 @@ async fn wait_for_change(path: &Path, previous: &[u8]) -> Result<Vec<u8>> {
     })
     .await??)
 }
+
+#[tokio::test]
+async fn publisher_rejects_out_of_range_workers_argument() -> Result<()> {
+    let files = tempfile::tempdir()?;
+    let (private, _) = shielded_catalog_keys(files.path())?;
+    let catalog = files.path().join("catalog");
+    let scratch = files.path().join("secondary");
+    for (bad_workers, expected_error) in [
+        ("0", "worker count must be between 1 and 16"),
+        ("17", "worker count 17 exceeds maximum 16"),
+    ] {
+        let rejected =
+            publication_command(&files.path().join("primary"), &scratch, &catalog, &private)
+                .args(["--workers", bad_workers])
+                .output()
+                .await?;
+        assert!(!rejected.status.success(), "{bad_workers}: {rejected:?}");
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(stderr.contains(expected_error), "{bad_workers}: {stderr}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn publisher_workers_4_produces_identical_catalog_to_workers_1() -> Result<()> {
+    let files = tempfile::tempdir()?;
+    let (private, public) = shielded_catalog_keys(files.path())?;
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(12)
+        .with_raw_blob_retention(RawBlobRetention::Transactions);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+
+    let seq_catalog = files.path().join("catalog-seq");
+    let par_catalog = files.path().join("catalog-par");
+    let seq_output = publication_command(
+        writer.canonical_primary_path(),
+        &files.path().join("secondary-seq"),
+        &seq_catalog,
+        &private,
+    )
+    .args(["--workers", "1"])
+    .output()
+    .await?;
+    assert!(seq_output.status.success(), "{seq_output:?}");
+
+    let par_output = publication_command(
+        writer.canonical_primary_path(),
+        &files.path().join("secondary-par"),
+        &par_catalog,
+        &private,
+    )
+    .args(["--workers", "4"])
+    .output()
+    .await?;
+    assert!(par_output.status.success(), "{par_output:?}");
+
+    assert_eq!(
+        fs::read(seq_catalog.join("current.json"))?,
+        fs::read(par_catalog.join("current.json"))?
+    );
+    assert_eq!(
+        fs::read(seq_catalog.join(".publisher-head.json"))?,
+        fs::read(par_catalog.join(".publisher-head.json"))?
+    );
+    let mut store = writer.serving_store_fixture()?;
+    let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
+    PublishedShieldedHistory::open(&par_catalog.join("current.json"), &public, false, &reader)
+        .await?;
+    let key = fs::read(&public)?;
+    let entries = signed_segments(&par_catalog.join("current.json"), &key)?;
+    assert_eq!(entries.len(), 6);
+    assert_eq!(
+        entries.last().and_then(|entry| entry["last"].as_u64()),
+        Some(12)
+    );
+    let mut segment_count = 0_usize;
+    for entry in fs::read_dir(&seq_catalog)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name.starts_with("segment-") && name.ends_with(".bin") {
+            segment_count += 1;
+            assert_eq!(
+                fs::read(entry.path())?,
+                fs::read(par_catalog.join(&file_name))?
+            );
+        }
+    }
+    assert_eq!(segment_count, 6);
+    Ok(())
+}
+
+#[tokio::test]
+async fn publisher_workers_follow_mode_publishes_initial_and_incremental() -> Result<()> {
+    let files = tempfile::tempdir()?;
+    let (private, public) = shielded_catalog_keys(files.path())?;
+    let key = fs::read(&public)?;
+    let catalog = files.path().join("catalog");
+    let scratch = files.path().join("secondary");
+    let manifest = catalog.join("current.json");
+    let mut chain = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(6)
+        .with_raw_blob_retention(RawBlobRetention::Transactions);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+
+    let mut command = follow_command(
+        writer.canonical_primary_path(),
+        &scratch,
+        &catalog,
+        &private,
+    );
+    command.args(["--workers", "4"]);
+    let mut process = command.spawn()?;
+
+    let initial_manifest = wait_for_change(&manifest, &[]).await?;
+    let mut store = writer.serving_store_fixture()?;
+    let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
+    let admitted = PublishedShieldedHistory::open(&manifest, &public, false, &reader).await?;
+    let initial_entries = signed_segments(&manifest, &key)?;
+    assert_eq!(initial_entries.len(), 3);
+    assert_eq!(
+        initial_entries
+            .last()
+            .and_then(|entry| entry["last"].as_u64()),
+        Some(6)
+    );
+
+    chain = chain.extend_blocks(2);
+    writer.append_settled_blocks(&chain)?;
+    wait_for_change(&manifest, &initial_manifest).await?;
+
+    let mut refreshed_store = writer.serving_store_fixture()?;
+    let refreshed_reader = RocksDbCanonicalReader::new(refreshed_store.take_readers()?.0)?;
+    assert!(admitted.refresh(&refreshed_reader).await?);
+    let updated_entries = signed_segments(&manifest, &key)?;
+    assert_eq!(updated_entries.len(), 4);
+    assert_eq!(
+        updated_entries
+            .last()
+            .and_then(|entry| entry["last"].as_u64()),
+        Some(8)
+    );
+    process.kill().await?;
+    Ok(())
+}

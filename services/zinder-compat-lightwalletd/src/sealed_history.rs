@@ -456,7 +456,15 @@ impl SegmentWriter {
         })
     }
 
-    pub(crate) fn finish(mut self) -> io::Result<SegmentIdentity> {
+    pub(crate) fn finish(self) -> io::Result<SegmentIdentity> {
+        self.finish_with_dir_sync(true)
+    }
+
+    pub(crate) fn finish_staged(self) -> io::Result<SegmentIdentity> {
+        self.finish_with_dir_sync(false)
+    }
+
+    fn finish_with_dir_sync(mut self, sync_directory: bool) -> io::Result<SegmentIdentity> {
         if self.prior != Some(self.identity.end) {
             return Err(invalid("incomplete shielded segment"));
         }
@@ -522,7 +530,9 @@ impl SegmentWriter {
             SealedHistory::open(&self.target, identity)?;
             failure.file.persist(&self.target)?;
         }
-        File::open(parent_directory(&self.target))?.sync_all()?;
+        if sync_directory {
+            File::open(parent_directory(&self.target))?.sync_all()?;
+        }
         Ok(identity)
     }
 }

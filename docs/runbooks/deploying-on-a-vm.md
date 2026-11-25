@@ -285,8 +285,11 @@ each indexer reconnect, so you can replace them without a restart.
 
 ## Publish signed wallet history
 
-The Compose publisher opens the canonical store read-only. Every 60 seconds it
-checks for newly settled blocks and publishes complete 4,096-block segments.
+The Compose publisher opens the canonical store read-only. By default it builds
+initial settled segments in parallel across `min(available CPUs, 4)` `--workers`
+(pass `--workers 1` in custom Compose overrides for sequential shared-disk I/O),
+then checks every 60 seconds for newly settled blocks and commits complete
+4,096-block segments incrementally.
 The installed generation contains a private signing key, a separate trusted
 public key, and a `catalog/` directory. Compose gives only the publisher
 access to the private key. The wallet reader mounts the public key and

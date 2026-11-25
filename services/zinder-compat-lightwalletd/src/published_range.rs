@@ -7,7 +7,7 @@ mod read;
 mod tail;
 
 pub(crate) use catalog::PublishedShieldedCatalog;
-pub use catalog::ShieldedCatalogPublisher;
+pub use catalog::{PublicationConcurrency, ShieldedCatalogPublisher};
 pub use history::PublishedShieldedHistory;
 pub(crate) use read::PublishedRangeRead;
 pub(crate) use tail::ShieldedTailBuffer;
@@ -64,6 +64,27 @@ impl PublishedShieldedRange {
         staged: (tempfile::NamedTempFile, tempfile::NamedTempFile),
         range: BlockHeightRange,
     ) -> io::Result<Self> {
+        Self::build_with_sync(reader, path, staged, range, true)
+    }
+
+    /// Builds a staged shielded segment without syncing the staging directory entry.
+    /// The caller must sync the final catalog directory before committing manifests.
+    fn build_staged(
+        reader: &RocksDbCanonicalReader,
+        path: &Path,
+        staged: (tempfile::NamedTempFile, tempfile::NamedTempFile),
+        range: BlockHeightRange,
+    ) -> io::Result<Self> {
+        Self::build_with_sync(reader, path, staged, range, false)
+    }
+
+    fn build_with_sync(
+        reader: &RocksDbCanonicalReader,
+        path: &Path,
+        staged: (tempfile::NamedTempFile, tempfile::NamedTempFile),
+        range: BlockHeightRange,
+        sync_directory: bool,
+    ) -> io::Result<Self> {
         let view = reader.chain_epoch();
         let network = view.network;
         if !(range.start..=view.settled_tip_height).contains(&range.end) {
@@ -91,32 +112,12 @@ impl PublishedShieldedRange {
                 BlockId::new(range.end, end.block_hash),
             ),
         )?;
-        let mut first = range.start;
-        loop {
-            let last = BlockHeight::new(first.value().saturating_add(999)).min(range.end);
-            let rows = canonical
-                .compact_block_rows_with_lengths(
-                    BlockHeightRange::inclusive(first, last),
-                    crate::BLOCK_RANGE_CHUNK_MAX_BYTES,
-                )
-                .map_err(io::Error::other)?;
-            let kept = rows
-                .last()
-                .map(|(block, _)| block.height())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "empty canonical range")
-                })?;
-            for (row, native_bytes) in rows {
-                writer.push(row, native_bytes)?;
-            }
-            if kept == range.end {
-                break;
-            }
-            first = kept
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "height overflow"))?;
-        }
-        let segment = writer.finish()?;
+        write_range_blocks(&mut writer, reader, range)?;
+        let segment = if sync_directory {
+            writer.finish()?
+        } else {
+            writer.finish_staged()?
+        };
         #[cfg(target_os = "linux")]
         crate::sealed_history::verity::protect_new_segment(&fresh_file, segment.verity)?;
         Self::open(
@@ -276,4 +277,36 @@ impl PublishedShieldedRange {
         self.record_verified_settled_tip(settled);
         Ok(())
     }
+}
+
+fn write_range_blocks(
+    writer: &mut SegmentWriter,
+    reader: &RocksDbCanonicalReader,
+    range: BlockHeightRange,
+) -> io::Result<()> {
+    let canonical = reader.secondary();
+    let mut first = range.start;
+    loop {
+        let last = BlockHeight::new(first.value().saturating_add(999)).min(range.end);
+        let rows = canonical
+            .compact_block_rows_with_lengths(
+                BlockHeightRange::inclusive(first, last),
+                crate::BLOCK_RANGE_CHUNK_MAX_BYTES,
+            )
+            .map_err(io::Error::other)?;
+        let kept = rows
+            .last()
+            .map(|(block, _)| block.height())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty canonical range"))?;
+        for (row, native_bytes) in rows {
+            writer.push(row, native_bytes)?;
+        }
+        if kept == range.end {
+            break;
+        }
+        first = kept
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "height overflow"))?;
+    }
+    Ok(())
 }
