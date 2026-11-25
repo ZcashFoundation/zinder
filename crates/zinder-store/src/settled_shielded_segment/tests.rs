@@ -4,7 +4,10 @@ use std::{
     path::Path,
 };
 
-use prost::Message;
+use prost::{
+    Message,
+    encoding::{WireType, encode_key, encode_varint},
+};
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 use zinder_core::{
@@ -19,11 +22,16 @@ use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
 use crate::HeightOrder;
 
 use super::{
-    SEGMENT_FLAG_RESERVED_SHIFTED_EPK, SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
-    SettledShieldedSegmentError, SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader,
-    SettledShieldedSegmentWriter, ShieldedProjectionSelection, ShieldedSegmentIdentity,
-    format::{HEADER_LEN, IndexedBlock, ROW_INDEX_ENTRY_LEN, TRAILER_LEN},
+    PoolPresenceMask, SEGMENT_FLAG_RESERVED_SHIFTED_EPK,
+    SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES, SettledShieldedSegmentError,
+    SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader, SettledShieldedSegmentWriter,
+    ShieldedProjectionSelection, ShieldedSegmentIdentity,
+    format::{
+        DecodedRowIndexEntry, FRAME_PREFIX_LEN, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock,
+        ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN, encode_frame_prefix,
+    },
     project_shielded_block_wire,
+    reader::validate_entries,
     wire_projection::synthesize_empty_nullifier_block,
 };
 
@@ -794,7 +802,8 @@ fn reader_rejects_mismatched_interior_row_hash_on_read_and_caches_invalid_state(
     let (path, identity) = write_segment(dir.path(), "bad-interior", &blocks)?;
     let mut mutated = fs::read(&path)?;
     let index_offset = usize::try_from(u64::from_be_bytes(mutated[96..104].try_into()?))?;
-    mutated[index_offset + ROW_INDEX_ENTRY_LEN] ^= 0x01;
+    // Corrupt Orchard-only block height = 3 (row index 2), which has no Sapling bits.
+    mutated[index_offset + 2 * ROW_INDEX_ENTRY_LEN] ^= 0x01;
     let forged_sha = recompute_portable_sha256(&mutated);
     let body_end = mutated.len() - TRAILER_LEN;
     mutated[body_end..].copy_from_slice(&forged_sha);
@@ -810,14 +819,20 @@ fn reader_rejects_mismatched_interior_row_hash_on_read_and_caches_invalid_state(
         &forged_identity,
         SettledShieldedSegmentOpenOptions::default(),
     )?;
-    let range = BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(2));
+    let range = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(3));
     assert!(matches!(
         reader.read_default_range(range, HeightOrder::Ascending),
         Err(SettledShieldedSegmentError::PayloadIntegrity(_))
     ));
-    // Subsequent read hits sticky VALIDATION_INVALID state and still fails closed.
+    // Subsequent full read hits sticky VALIDATION_INVALID state and still fails closed.
     assert!(matches!(
         reader.read_default_range(range, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    // Non-matching nullifier projection must also fail closed instead of synthesizing from index.
+    let sapling_nullifiers_only = ShieldedProjectionSelection::new(true, false, false, true);
+    assert!(matches!(
+        reader.read_projected_range(range, HeightOrder::Ascending, sapling_nullifiers_only),
         Err(SettledShieldedSegmentError::PayloadIntegrity(_))
     ));
     Ok(())
@@ -903,5 +918,309 @@ fn reader_detects_post_admission_tamper_verity_guard_and_transparent_wire() -> T
         ),
         Err(SettledShieldedSegmentError::PayloadIntegrity(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn validate_entries_rejects_oversized_frame_on_protected_path() -> TestOutcome {
+    let max_payload = u32::try_from(SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES)?;
+    let max_frame = FRAME_PREFIX_U32 + max_payload;
+    let last_hash_wire = encode_internal_block_hash(block_hash(1));
+    let header_len_u64 = u64::try_from(HEADER_LEN)?;
+    let header = SegmentHeader {
+        network_tag: TEST_NETWORK.id(),
+        artifact_schema_version: TEST_SCHEMA,
+        segment_flags: 0,
+        start_height: 1,
+        block_count: 1,
+        first_prev_hash_wire: encode_internal_block_hash(block_hash(0)),
+        last_block_hash_wire: last_hash_wire,
+        slab_offset: header_len_u64,
+        index_offset: header_len_u64 + u64::from(max_frame),
+    };
+    let entry = DecodedRowIndexEntry {
+        block_hash_wire: last_hash_wire,
+        payload_sha256: [0x11; 32],
+        block_time: 1_700_000_001,
+        slab_rel_offset: 0,
+        native_bytes: 128,
+        pool_presence: PoolPresenceMask::EMPTY,
+    };
+
+    let exact_max_rows = validate_entries(&[entry], max_frame, &header, None)?;
+    assert_eq!(exact_max_rows.len(), 1);
+
+    assert!(matches!(
+        validate_entries(&[entry], max_frame + 1, &header, None),
+        Err(SettledShieldedSegmentError::InvalidFormat(_))
+    ));
+    assert!(matches!(
+        validate_entries(&[entry], u32::MAX, &header, None),
+        Err(SettledShieldedSegmentError::InvalidFormat(_))
+    ));
+    Ok(())
+}
+
+fn encode_length_delimited_field(tag: u32, payload: &[u8], out: &mut Vec<u8>) -> TestOutcome {
+    encode_key(tag, WireType::LengthDelimited, out);
+    encode_varint(u64::try_from(payload.len())?, out);
+    out.extend_from_slice(payload);
+    Ok(())
+}
+
+fn build_raw_block_header_fields(out: &mut Vec<u8>) -> TestOutcome {
+    encode_key(2, WireType::Varint, out);
+    encode_varint(1, out);
+    let hash_wire = encode_internal_block_hash(block_hash(1));
+    let prev_wire = encode_internal_block_hash(block_hash(0));
+    encode_length_delimited_field(3, &hash_wire, out)?;
+    encode_length_delimited_field(4, &prev_wire, out)?;
+    Ok(())
+}
+
+fn build_raw_block_with_tx_field(tx_tag: u32, nested_bytes: &[u8]) -> TestOutcome<Vec<u8>> {
+    let mut tx_wire = Vec::new();
+    encode_key(1, WireType::Varint, &mut tx_wire);
+    encode_varint(0, &mut tx_wire);
+    encode_length_delimited_field(2, &encode_internal_transaction_id(txid(1)), &mut tx_wire)?;
+    encode_length_delimited_field(tx_tag, nested_bytes, &mut tx_wire)?;
+
+    let mut block_wire = Vec::new();
+    build_raw_block_header_fields(&mut block_wire)?;
+    encode_length_delimited_field(7, &tx_wire, &mut block_wire)?;
+    encode_length_delimited_field(8, &[], &mut block_wire)?;
+    Ok(block_wire)
+}
+
+fn build_raw_block_with_chain_metadata(meta_bytes: &[u8]) -> TestOutcome<Vec<u8>> {
+    let mut block_wire = Vec::new();
+    build_raw_block_header_fields(&mut block_wire)?;
+    encode_length_delimited_field(8, meta_bytes, &mut block_wire)?;
+    Ok(block_wire)
+}
+
+fn open_raw_portable_segment(
+    dir: &Path,
+    name: &str,
+    payload: &[u8],
+) -> TestOutcome<SettledShieldedSegmentReader> {
+    let prefix = encode_frame_prefix(payload.len())?;
+    let frame_len = u64::try_from(FRAME_PREFIX_LEN + payload.len())?;
+    let header_len_u64 = u64::try_from(HEADER_LEN)?;
+    let index_offset = header_len_u64 + frame_len;
+    let first_prev_hash_wire = encode_internal_block_hash(block_hash(0));
+    let end_id = BlockId::new(BlockHeight::new(1), block_hash(1));
+    let last_block_hash_wire = encode_internal_block_hash(end_id.hash);
+    let header = SegmentHeader {
+        network_tag: TEST_NETWORK.id(),
+        artifact_schema_version: TEST_SCHEMA,
+        segment_flags: 0,
+        start_height: 1,
+        block_count: 1,
+        first_prev_hash_wire,
+        last_block_hash_wire,
+        slab_offset: header_len_u64,
+        index_offset,
+    };
+    let all_pools = PoolPresenceMask::SAPLING_SPEND
+        .union(PoolPresenceMask::SAPLING_OUTPUT)
+        .union(PoolPresenceMask::ORCHARD)
+        .union(PoolPresenceMask::IRONWOOD);
+    let entry = DecodedRowIndexEntry {
+        block_hash_wire: last_block_hash_wire,
+        payload_sha256: Sha256::digest(payload).into(),
+        block_time: 1_700_000_001,
+        slab_rel_offset: 0,
+        native_bytes: 128,
+        pool_presence: all_pools,
+    };
+    let mut segment_bytes = Vec::with_capacity(
+        HEADER_LEN + FRAME_PREFIX_LEN + payload.len() + ROW_INDEX_ENTRY_LEN + TRAILER_LEN,
+    );
+    segment_bytes.extend_from_slice(&header.encode());
+    segment_bytes.extend_from_slice(&prefix);
+    segment_bytes.extend_from_slice(payload);
+    segment_bytes.extend_from_slice(&entry.encode());
+    let trailer: [u8; TRAILER_LEN] = Sha256::digest(&segment_bytes).into();
+    segment_bytes.extend_from_slice(&trailer);
+
+    let file_path = dir.join(name);
+    fs::write(&file_path, &segment_bytes)?;
+    let identity = ShieldedSegmentIdentity {
+        sha256: trailer,
+        ..ShieldedSegmentIdentity::span(TEST_NETWORK, TEST_SCHEMA, BlockHeight::new(1), end_id)
+    };
+    Ok(SettledShieldedSegmentReader::open(
+        &file_path,
+        &identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?)
+}
+
+fn assert_malformed_nested_wire_rejected(dir: &Path, label: &str, payload: &[u8]) -> TestOutcome {
+    let mut projected = Vec::new();
+    let selections = [
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+        ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+        ShieldedProjectionSelection::new(false, false, false, false),
+    ];
+    for selection in selections {
+        assert!(
+            matches!(
+                project_shielded_block_wire(payload, selection, &mut projected),
+                Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+            ),
+            "projection accepted malformed {label} for {selection:?}"
+        );
+    }
+    let reader = open_raw_portable_segment(dir, label, payload)?;
+    let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1));
+    assert!(
+        matches!(
+            reader.read_default_range(range, HeightOrder::Ascending),
+            Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+        ),
+        "reader validation accepted malformed {label}"
+    );
+    Ok(())
+}
+
+#[test]
+fn nested_wire_type_validators_reject_malformed_wire_types() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let malformed_cases = [
+        (
+            "spend_tag1_varint",
+            build_raw_block_with_tx_field(4, &[0x08, 0x01])?,
+        ),
+        (
+            "output_tag1_varint",
+            build_raw_block_with_tx_field(5, &[0x08, 0x01])?,
+        ),
+        (
+            "output_tag2_varint",
+            build_raw_block_with_tx_field(5, &[0x10, 0x01])?,
+        ),
+        (
+            "output_tag3_varint",
+            build_raw_block_with_tx_field(5, &[0x18, 0x01])?,
+        ),
+        (
+            "orchard_tag1_varint",
+            build_raw_block_with_tx_field(6, &[0x08, 0x01])?,
+        ),
+        (
+            "orchard_tag2_varint",
+            build_raw_block_with_tx_field(6, &[0x10, 0x01])?,
+        ),
+        (
+            "orchard_tag3_varint",
+            build_raw_block_with_tx_field(6, &[0x18, 0x01])?,
+        ),
+        (
+            "orchard_tag4_varint",
+            build_raw_block_with_tx_field(6, &[0x20, 0x01])?,
+        ),
+        (
+            "ironwood_tag1_varint",
+            build_raw_block_with_tx_field(9, &[0x08, 0x01])?,
+        ),
+        (
+            "ironwood_tag2_varint",
+            build_raw_block_with_tx_field(9, &[0x10, 0x01])?,
+        ),
+        (
+            "ironwood_tag3_varint",
+            build_raw_block_with_tx_field(9, &[0x18, 0x01])?,
+        ),
+        (
+            "ironwood_tag4_varint",
+            build_raw_block_with_tx_field(9, &[0x20, 0x01])?,
+        ),
+        (
+            "meta_tag1_bytes",
+            build_raw_block_with_chain_metadata(&[0x0a, 0x01, 0x01])?,
+        ),
+        (
+            "meta_tag2_bytes",
+            build_raw_block_with_chain_metadata(&[0x12, 0x01, 0x01])?,
+        ),
+        (
+            "meta_tag3_bytes",
+            build_raw_block_with_chain_metadata(&[0x1a, 0x01, 0x01])?,
+        ),
+    ];
+    for (label, payload) in &malformed_cases {
+        assert_malformed_nested_wire_rejected(dir.path(), label, payload)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn nested_wire_type_validators_preserve_skip_wire_field_for_unknown_tags() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let mut unknown_suffix = Vec::new();
+    encode_key(99, WireType::Varint, &mut unknown_suffix);
+    encode_varint(7, &mut unknown_suffix);
+
+    let mut spend_wire = lightwalletd::CompactSaplingSpend { nf: vec![0x11; 32] }.encode_to_vec();
+    spend_wire.extend_from_slice(&unknown_suffix);
+
+    let mut output_wire = lightwalletd::CompactSaplingOutput {
+        cmu: vec![0x21; 32],
+        ephemeral_key: vec![0x22; 32],
+        ciphertext: vec![0x23; 52],
+    }
+    .encode_to_vec();
+    output_wire.extend_from_slice(&unknown_suffix);
+
+    let mut action_wire = lightwalletd::CompactOrchardAction {
+        nullifier: vec![0x31; 32],
+        cmx: vec![0x32; 32],
+        ephemeral_key: vec![0x33; 32],
+        ciphertext: vec![0x34; 52],
+    }
+    .encode_to_vec();
+    action_wire.extend_from_slice(&unknown_suffix);
+
+    let mut meta_wire = lightwalletd::ChainMetadata {
+        sapling_commitment_tree_size: 1,
+        orchard_commitment_tree_size: 2,
+        ironwood_commitment_tree_size: 3,
+    }
+    .encode_to_vec();
+    meta_wire.extend_from_slice(&unknown_suffix);
+
+    let mut tx_wire = Vec::new();
+    encode_key(1, WireType::Varint, &mut tx_wire);
+    encode_varint(0, &mut tx_wire);
+    encode_length_delimited_field(2, &encode_internal_transaction_id(txid(2)), &mut tx_wire)?;
+    encode_length_delimited_field(4, &spend_wire, &mut tx_wire)?;
+    encode_length_delimited_field(5, &output_wire, &mut tx_wire)?;
+    encode_length_delimited_field(6, &action_wire, &mut tx_wire)?;
+    encode_length_delimited_field(9, &action_wire, &mut tx_wire)?;
+
+    let mut payload = Vec::new();
+    build_raw_block_header_fields(&mut payload)?;
+    encode_length_delimited_field(7, &tx_wire, &mut payload)?;
+    encode_length_delimited_field(8, &meta_wire, &mut payload)?;
+
+    let mut projected = Vec::new();
+    for selection in [
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+        ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+        ShieldedProjectionSelection::new(false, false, false, false),
+    ] {
+        project_shielded_block_wire(&payload, selection, &mut projected)?;
+        assert_ne!(projected, [] as [u8; 0]);
+    }
+    let reader = open_raw_portable_segment(dir.path(), "unknown-nested-tags", &payload)?;
+    let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1));
+    assert_eq!(
+        reader
+            .read_default_range(range, HeightOrder::Ascending)?
+            .len(),
+        1
+    );
     Ok(())
 }

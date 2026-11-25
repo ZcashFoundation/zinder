@@ -15,8 +15,8 @@ use zinder_proto::compat::lightwalletd::EncodedBlock;
 use crate::HeightOrder;
 
 use super::{
-    PoolPresenceMask, SettledShieldedSegmentError, ShieldedProjectionSelection,
-    ShieldedSegmentIdentity,
+    PoolPresenceMask, SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES, SettledShieldedSegmentError,
+    ShieldedProjectionSelection, ShieldedSegmentIdentity,
     format::{
         DecodedRowIndexEntry, FRAME_PREFIX_LEN, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock,
         ROW_INDEX_ENTRY_LEN, SLAB_TARGET_BYTES, SegmentHeader, TRAILER_LEN, VALIDATION_INVALID,
@@ -49,7 +49,7 @@ pub struct SettledShieldedSegmentReader {
     portable_payload_sha256: Option<Vec<[u8; 32]>>,
 }
 
-struct PortableFrameDigest {
+pub(super) struct PortableFrameDigest {
     rel_offset: u32,
     frame_len: u32,
     payload_sha256: [u8; 32],
@@ -153,6 +153,11 @@ impl SettledShieldedSegmentReader {
         let mut idx = index_range.start;
         while idx < index_range.end {
             let row = &self.rows[idx];
+            if row.validation_state.load(Ordering::Acquire) == VALIDATION_INVALID {
+                return Err(SettledShieldedSegmentError::PayloadIntegrity(
+                    "shielded segment frame previously failed validation".to_owned(),
+                ));
+            }
             if can_skip_slab(row.pool_presence, selection) {
                 emit_synthesized_block(self, idx, buffers.packed_out)?;
                 if buffers.packed_out.len() >= SLAB_TARGET_BYTES {
@@ -701,7 +706,7 @@ fn hash_index_entries(
     Ok(entries)
 }
 
-fn validate_entries(
+pub(super) fn validate_entries(
     entries: &[DecodedRowIndexEntry],
     slab_len: u32,
     header: &SegmentHeader,
@@ -722,6 +727,17 @@ fn validate_entries(
             "last row hash disagrees with header last_block_hash".to_owned(),
         ));
     }
+    let max_payload = u32::try_from(SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES).map_err(|_| {
+        SettledShieldedSegmentError::InvalidFormat(
+            "maximum shielded payload limit exceeds u32".to_owned(),
+        )
+    })?;
+    let max_frame = FRAME_PREFIX_U32.checked_add(max_payload).ok_or_else(|| {
+        SettledShieldedSegmentError::InvalidFormat(
+            "maximum shielded frame limit exceeds u32".to_owned(),
+        )
+    })?;
+    let min_frame = FRAME_PREFIX_U32 + 1;
     let mut rows = Vec::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
         let next_rel = entries
@@ -730,10 +746,14 @@ fn validate_entries(
         let frame_len = next_rel.checked_sub(entry.slab_rel_offset).ok_or_else(|| {
             SettledShieldedSegmentError::InvalidFormat("non-ascending row slab offsets".to_owned())
         })?;
-        let min_frame = FRAME_PREFIX_U32 + 1;
         if frame_len < min_frame {
             return Err(SettledShieldedSegmentError::InvalidFormat(
                 "row index frame span is smaller than minimum frame".to_owned(),
+            ));
+        }
+        if frame_len > max_frame {
+            return Err(SettledShieldedSegmentError::InvalidFormat(
+                "row index frame span exceeds maximum frame".to_owned(),
             ));
         }
         if let Some(frames) = streamed {

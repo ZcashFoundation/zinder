@@ -39,6 +39,16 @@ const ACTION_TAG_CMX: u32 = 2;
 const ACTION_TAG_EPHEMERAL_KEY: u32 = 3;
 const ACTION_TAG_CIPHERTEXT: u32 = 4;
 
+const SAPLING_SPEND_TAG_NF: u32 = 1;
+
+const SAPLING_OUTPUT_TAG_CMU: u32 = 1;
+const SAPLING_OUTPUT_TAG_EPHEMERAL_KEY: u32 = 2;
+const SAPLING_OUTPUT_TAG_CIPHERTEXT: u32 = 3;
+
+const CHAIN_METADATA_TAG_SAPLING_TREE_SIZE: u32 = 1;
+const CHAIN_METADATA_TAG_ORCHARD_TREE_SIZE: u32 = 2;
+const CHAIN_METADATA_TAG_IRONWOOD_TREE_SIZE: u32 = 3;
+
 const EMPTY_CHAIN_METADATA_WIRE: [u8; 2] = [0x42, 0x00];
 
 /// Encodes one canonical [`CompactBlockArtifact`] into the `Slab 0`
@@ -177,7 +187,7 @@ pub(super) fn project_shielded_block_wire_into(
             COMPACT_BLOCK_TAG_CHAIN_METADATA => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "chain_metadata")?;
                 let meta_bytes = take_length_delimited(&mut cursor)?;
-                validate_wire_message(meta_bytes)?;
+                validate_chain_metadata_wire(meta_bytes)?;
                 if !selection.nullifiers_only {
                     copy_consumed(field_start, cursor, out);
                 }
@@ -240,7 +250,7 @@ pub(super) fn validate_shielded_block_wire(
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock bytes")?;
                 let nested = take_length_delimited(&mut cursor)?;
                 if tag == COMPACT_BLOCK_TAG_CHAIN_METADATA {
-                    validate_wire_message(nested)?;
+                    validate_chain_metadata_wire(nested)?;
                 }
             }
             COMPACT_BLOCK_TAG_VTX => {
@@ -292,13 +302,20 @@ fn validate_compact_tx_wire(tx_bytes: &[u8]) -> Result<(), SettledShieldedSegmen
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx.txid")?;
                 let _bytes = take_length_delimited(&mut cursor)?;
             }
-            COMPACT_TX_TAG_SPENDS
-            | COMPACT_TX_TAG_OUTPUTS
-            | COMPACT_TX_TAG_ACTIONS
-            | COMPACT_TX_TAG_IRONWOOD_ACTIONS => {
-                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx shielded")?;
+            COMPACT_TX_TAG_SPENDS => {
+                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx.spends")?;
                 let nested = take_length_delimited(&mut cursor)?;
-                validate_wire_message(nested)?;
+                validate_sapling_spend_wire(nested)?;
+            }
+            COMPACT_TX_TAG_OUTPUTS => {
+                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx.outputs")?;
+                let nested = take_length_delimited(&mut cursor)?;
+                validate_sapling_output_wire(nested)?;
+            }
+            COMPACT_TX_TAG_ACTIONS | COMPACT_TX_TAG_IRONWOOD_ACTIONS => {
+                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx.actions")?;
+                let nested = take_length_delimited(&mut cursor)?;
+                validate_action_wire(nested)?;
             }
             COMPACT_TX_TAG_VIN | COMPACT_TX_TAG_VOUT => {
                 return Err(SettledShieldedSegmentError::PayloadIntegrity(
@@ -392,7 +409,7 @@ fn project_tx_field(
                 "CompactTx.spends",
             )?;
             let nested = take_length_delimited(cursor)?;
-            validate_wire_message(nested)?;
+            validate_sapling_spend_wire(nested)?;
             flags.has_sapling = true;
             if selection.sapling {
                 copy_consumed(head.field_start, cursor, tx_scratch);
@@ -405,7 +422,7 @@ fn project_tx_field(
                 "CompactTx.outputs",
             )?;
             let nested = take_length_delimited(cursor)?;
-            validate_wire_message(nested)?;
+            validate_sapling_output_wire(nested)?;
             flags.has_sapling = true;
             if selection.sapling && !selection.nullifiers_only {
                 copy_consumed(head.field_start, cursor, tx_scratch);
@@ -460,11 +477,11 @@ fn emit_projected_action(
     tx_scratch: &mut Vec<u8>,
 ) -> Result<(), SettledShieldedSegmentError> {
     if !include_pool {
-        validate_wire_message(action.action_bytes)?;
+        validate_action_wire(action.action_bytes)?;
         return Ok(());
     }
     if !nullifiers_only {
-        validate_wire_message(action.action_bytes)?;
+        validate_action_wire(action.action_bytes)?;
         copy_consumed(action.field_start, action.cursor_after, tx_scratch);
         return Ok(());
     }
@@ -551,10 +568,68 @@ fn take_slice<'a>(
     Ok(slice)
 }
 
-fn validate_wire_message(bytes: &[u8]) -> Result<(), SettledShieldedSegmentError> {
+fn validate_sapling_spend_wire(bytes: &[u8]) -> Result<(), SettledShieldedSegmentError> {
+    validate_uniform_wire_fields(
+        bytes,
+        &[SAPLING_SPEND_TAG_NF],
+        WireType::LengthDelimited,
+        "CompactSaplingSpend",
+    )
+}
+
+fn validate_sapling_output_wire(bytes: &[u8]) -> Result<(), SettledShieldedSegmentError> {
+    validate_uniform_wire_fields(
+        bytes,
+        &[
+            SAPLING_OUTPUT_TAG_CMU,
+            SAPLING_OUTPUT_TAG_EPHEMERAL_KEY,
+            SAPLING_OUTPUT_TAG_CIPHERTEXT,
+        ],
+        WireType::LengthDelimited,
+        "CompactSaplingOutput",
+    )
+}
+
+fn validate_action_wire(bytes: &[u8]) -> Result<(), SettledShieldedSegmentError> {
+    validate_uniform_wire_fields(
+        bytes,
+        &[
+            ACTION_TAG_NULLIFIER,
+            ACTION_TAG_CMX,
+            ACTION_TAG_EPHEMERAL_KEY,
+            ACTION_TAG_CIPHERTEXT,
+        ],
+        WireType::LengthDelimited,
+        "CompactOrchardAction",
+    )
+}
+
+fn validate_chain_metadata_wire(bytes: &[u8]) -> Result<(), SettledShieldedSegmentError> {
+    validate_uniform_wire_fields(
+        bytes,
+        &[
+            CHAIN_METADATA_TAG_SAPLING_TREE_SIZE,
+            CHAIN_METADATA_TAG_ORCHARD_TREE_SIZE,
+            CHAIN_METADATA_TAG_IRONWOOD_TREE_SIZE,
+        ],
+        WireType::Varint,
+        "ChainMetadata",
+    )
+}
+
+#[inline]
+fn validate_uniform_wire_fields(
+    bytes: &[u8],
+    known_tags: &[u32],
+    expected_wire_type: WireType,
+    field: &str,
+) -> Result<(), SettledShieldedSegmentError> {
     let mut cursor = bytes;
     while !cursor.is_empty() {
-        let (_tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
+        let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
+        if known_tags.contains(&tag) {
+            expect_wire_type(wire_type, expected_wire_type, field)?;
+        }
         skip_wire_field(wire_type, &mut cursor)?;
     }
     Ok(())
