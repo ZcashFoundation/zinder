@@ -41,7 +41,8 @@ use super::{
     section::{
         BlockEnvelopeIdentity, BlockSupplementRecord, CanonicalBlockSupplement,
         CanonicalTransactionSupplement, CompactTransparentSupplementTx, SupplementShieldedAnchors,
-        SupplementTxFeeAndBurn, encode_block_record, transparent_supplement_from_compact,
+        SupplementTxFeeAndBurn, decode_block_record, encode_block_record,
+        transparent_supplement_from_compact,
     },
     wire_splice::{
         CompactBlockSpliceSelection, reconstruct_compact_block_artifact, splice_compact_block_wire,
@@ -2747,6 +2748,49 @@ fn push_record_rejects_conflicting_tag1_and_tag2_fees() -> TestOutcome {
     )?;
     let _committed = ok_writer.finish()?;
     assert!(ok_path.exists());
+    Ok(())
+}
+
+#[test]
+fn decoded_record_rejects_conflicting_tag1_and_tag2_fees() -> TestOutcome {
+    let block = transparent_only_block(501)?;
+    let original_fee = 0x0123_4567_u64;
+    let conflicting_fee = 0x0123_4568_u64;
+    let mut txs = transparent_supplement_from_compact(&block);
+    txs[1].fee_zat = Some(original_fee);
+    let mut canonical_meta = CanonicalBlockSupplement::from_canonical_facts(
+        &make_canonical_facts(&block),
+        Some(&block),
+    )?;
+    canonical_meta.transactions[1].fee_and_burn.fee_zat = Some(original_fee);
+    let matching_record = BlockSupplementRecord {
+        transparent_transactions: txs,
+        canonical_metadata: Some(canonical_meta),
+    };
+    let env = BlockEnvelopeIdentity {
+        height: block.height(),
+        block_hash_wire: encode_internal_block_hash(block.block_hash()),
+        prev_hash_wire: encode_internal_block_hash(block.previous_block_hash()),
+        block_time: block.time(),
+    };
+    let (mut tampered, row_flags) = encode_block_record(env, &matching_record)?;
+    assert_eq!(
+        decode_block_record(&tampered, env, row_flags)?,
+        matching_record
+    );
+
+    let needle = original_fee.to_be_bytes();
+    let positions: Vec<usize> = tampered
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == needle).then_some(offset))
+        .collect();
+    assert_eq!(positions.len(), 2);
+    tampered[positions[1]..positions[1] + 8].copy_from_slice(&conflicting_fee.to_be_bytes());
+    assert!(matches!(
+        decode_block_record(&tampered, env, row_flags),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
     Ok(())
 }
 
