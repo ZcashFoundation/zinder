@@ -37,7 +37,10 @@ use std::{
 };
 
 use bytes::{Buf as _, Bytes};
-use futures_util::{FutureExt as _, TryFutureExt as _, future::BoxFuture};
+use futures_util::{
+    FutureExt as _, TryFutureExt as _,
+    future::{BoxFuture, Either, Map},
+};
 use http_body::{Frame, SizeHint};
 use parking_lot::Mutex;
 use tokio::time::Instant;
@@ -125,6 +128,15 @@ pub struct GrpcSendStall<S> {
     send_stall_timeout: Duration,
 }
 
+fn wrap_chunked_response<E>(
+    outcome: Result<http::Response<Body>, E>,
+) -> Result<http::Response<Body>, E> {
+    outcome.map(|response| {
+        let pieces = Pieces::for_response(&response);
+        response.map(|body| Body::new(ChunkedBody::new(body, pieces)))
+    })
+}
+
 impl<S> Service<http::Request<Body>> for GrpcSendStall<S>
 where
     S: Service<http::Request<Body>, Response = http::Response<Body>>,
@@ -133,33 +145,131 @@ where
 {
     type Response = http::Response<Body>;
     type Error = S::Error;
-    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+    type Future = Either<
+        Map<
+            S::Future,
+            fn(Result<Self::Response, Self::Error>) -> Result<Self::Response, Self::Error>,
+        >,
+        BoxFuture<'static, Result<Self::Response, Self::Error>>,
+    >;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
-        let send_stall_timeout = self.send_stall_timeout;
         let cancellation = request.extensions().get::<ResponseCancellation>().cloned();
-        self.inner
-            .call(request)
-            .map_ok(move |response| {
-                // The response future resolves inside the task that carries
-                // the response, where a resettable transport is in scope.
-                let watch_stalls = TransportReset::current().is_none();
-                let pieces = Pieces::for_response(&response);
-                response.map(|body| {
-                    Body::new(SendStallBoundBody::new(
-                        body,
-                        send_stall_timeout,
-                        cancellation,
-                        watch_stalls,
-                        pieces,
-                    ))
+        // Public listeners run every request inside a resettable transport
+        // task, so unary and server-streaming responses without a client-stream
+        // cancellation never start a watchdog and only need bounded piece
+        // chunking without mutex or timer overhead.
+        if cancellation.is_none() && TransportReset::current().is_some() {
+            return Either::Left(
+                self.inner
+                    .call(request)
+                    .map(wrap_chunked_response::<S::Error>),
+            );
+        }
+        let send_stall_timeout = self.send_stall_timeout;
+        Either::Right(
+            self.inner
+                .call(request)
+                .map_ok(move |response| {
+                    // The response future resolves inside the task that carries
+                    // the response, where a resettable transport is in scope.
+                    let watch_stalls = TransportReset::current().is_none();
+                    let pieces = Pieces::for_response(&response);
+                    if !watch_stalls && cancellation.is_none() {
+                        return response.map(|body| Body::new(ChunkedBody::new(body, pieces)));
+                    }
+                    response.map(|body| {
+                        Body::new(SendStallBoundBody::new(
+                            body,
+                            send_stall_timeout,
+                            cancellation,
+                            watch_stalls,
+                            pieces,
+                        ))
+                    })
                 })
-            })
-            .boxed()
+                .boxed(),
+        )
+    }
+}
+
+/// Lock-free response body chunker used when the transport itself owns stall
+/// resets and no request-side cancellation is attached.
+struct ChunkedBody {
+    source: Body,
+    pieces: Pieces,
+    slice_unsent: bool,
+    unsent: Bytes,
+}
+
+impl ChunkedBody {
+    const fn new(source: Body, pieces: Pieces) -> Self {
+        Self {
+            source,
+            pieces,
+            slice_unsent: false,
+            unsent: Bytes::new(),
+        }
+    }
+
+    fn take_chunk(&mut self, chunk: Bytes) {
+        self.slice_unsent = self.pieces == Pieces::Sliced
+            && chunk.len() <= BoundedChunkRetention::MAX_ALLOCATION_BYTES;
+        self.unsent = chunk;
+    }
+
+    fn hand_out_piece(&mut self) -> Bytes {
+        let piece_len = self.unsent.len().min(RESPONSE_PIECE_BYTES);
+        if self.slice_unsent {
+            return self.unsent.split_to(piece_len);
+        }
+        let piece = Bytes::copy_from_slice(self.unsent.get(..piece_len).unwrap_or_default());
+        self.unsent.advance(piece_len);
+        if self.unsent.is_empty() {
+            self.unsent = Bytes::new();
+        }
+        piece
+    }
+}
+
+impl http_body::Body for ChunkedBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if !this.unsent.is_empty() {
+            return Poll::Ready(Some(Ok(Frame::data(this.hand_out_piece()))));
+        }
+        match Pin::new(&mut this.source).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(chunk) => {
+                    this.take_chunk(chunk);
+                    Poll::Ready(Some(Ok(Frame::data(this.hand_out_piece()))))
+                }
+                Err(frame) => Poll::Ready(Some(Ok(frame))),
+            },
+            other @ (Poll::Ready(None | Some(Err(_))) | Poll::Pending) => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.unsent.is_empty() && self.source.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.unsent.is_empty() {
+            self.source.size_hint()
+        } else {
+            SizeHint::default()
+        }
     }
 }
 

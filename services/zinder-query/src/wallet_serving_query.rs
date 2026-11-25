@@ -654,6 +654,150 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
         serving_read::SlotPin::new(&self.serving_pair_slot, at_epoch_id)
     }
 
+    async fn resolve_tree_state_at<Ready, ReadyFuture>(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+        ready_step: Ready,
+    ) -> Result<TreeState, QueryError>
+    where
+        Broadcaster: Send + Sync,
+        NativeIngest: Send + Sync,
+        Ready: Fn(
+                TreeStateReplayLimit,
+                ReplayKey,
+                ReaderGeneration,
+                Arc<dyn crate::CanonicalReader>,
+                tokio::time::Instant,
+            ) -> ReadyFuture
+            + Clone
+            + Send
+            + Sync,
+        ReadyFuture: Future<Output = Result<Option<crate::tree_state_replay_limit::ReadyState>, QueryError>>
+            + Send,
+    {
+        use std::ops::ControlFlow;
+
+        serving_read::record("tree_state_at", None, async {
+            let deadline = std::sync::OnceLock::new();
+            let mut carried = None;
+            loop {
+                let deadline_ref = &deadline;
+                let step = ready_step.clone();
+                let selected =
+                    serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
+                        let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                        if let Some(ready) = self.tree_state_replays.cached_for_reader(
+                            height,
+                            epoch.visible_tip_height,
+                            &pair,
+                        ) {
+                            return Ok(ControlFlow::Break((epoch, ready)));
+                        }
+                        let req_deadline =
+                            *deadline_ref.get_or_init(|| self.tree_state_replays.deadline());
+                        let key = ReplayKey::new(height, pair.canonical());
+                        let generation = Arc::downgrade(&pair);
+                        let slot = self.serving_pair_slot.clone();
+                        let weak = generation.clone();
+                        let cache_gen = ReaderGeneration::live(&generation, move || {
+                            slot.is_current_weak(&weak)
+                        });
+                        if let Some(ready) = step(
+                            self.tree_state_replays.clone(),
+                            key,
+                            cache_gen.clone(),
+                            pair.canonical_arc(),
+                            req_deadline,
+                        )
+                        .await?
+                        {
+                            return Ok(ControlFlow::Break((epoch, ready)));
+                        }
+                        Ok(ControlFlow::Continue((
+                            epoch,
+                            key,
+                            generation,
+                            cache_gen,
+                            req_deadline,
+                        )))
+                    })
+                    .await?;
+                let (epoch, key, generation, cache_gen, req_deadline) = match selected {
+                    ControlFlow::Break((epoch, ready)) => {
+                        return Ok(tree_state_response(epoch, ready.serve()));
+                    }
+                    ControlFlow::Continue(missing) => missing,
+                };
+                match self
+                    .replay_missing_tree_state(
+                        (height, at_epoch_id, epoch),
+                        (&key, &generation, &cache_gen),
+                        req_deadline,
+                        carried.take(),
+                    )
+                    .await?
+                {
+                    ControlFlow::Break(state) => return Ok(state),
+                    ControlFlow::Continue(slot) => carried = slot,
+                }
+            }
+        })
+        .await
+    }
+
+    async fn replay_missing_tree_state(
+        &self,
+        (height, at_epoch_id, epoch): (BlockHeight, Option<ChainEpochId>, ChainEpoch),
+        (key, generation, cache_gen): (
+            &ReplayKey,
+            &std::sync::Weak<WalletServingReadPair>,
+            &ReaderGeneration,
+        ),
+        req_deadline: tokio::time::Instant,
+        carried: Option<crate::tree_state_replay_limit::TakeReplayPermit>,
+    ) -> Result<
+        std::ops::ControlFlow<TreeState, Option<crate::tree_state_replay_limit::TakeReplayPermit>>,
+        QueryError,
+    >
+    where
+        Broadcaster: Send + Sync,
+        NativeIngest: Send + Sync,
+    {
+        use std::ops::ControlFlow;
+
+        let subscription =
+            match self
+                .tree_state_replays
+                .select(key, cache_gen, req_deadline, carried)?
+            {
+                Selection::Ready(state) => {
+                    return Ok(ControlFlow::Break(tree_state_response(
+                        epoch,
+                        state.serve(),
+                    )));
+                }
+                Selection::Waiting(subscription) => subscription,
+            };
+        let slot = subscription.admit(&self.tree_state_replays).await?;
+        let generation = generation.clone();
+        serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
+            let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            if !generation.ptr_eq(&Arc::downgrade(&pair)) {
+                return Ok(ControlFlow::Continue(subscription.carry(&slot)));
+            }
+            let state = subscription
+                .replay(slot, |cancelled| async move {
+                    read_missing_height(pair.canonical(), height, cancelled).await
+                })
+                .await?;
+            Ok(state.map_or(ControlFlow::Continue(None), |state| {
+                ControlFlow::Break(tree_state_response(epoch, state))
+            }))
+        })
+        .await
+    }
+
     /// Returns the canonical raw-blob retention authenticated by this query's
     /// currently admitted serving pair.
     ///
@@ -1438,86 +1582,15 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
-        use std::ops::ControlFlow;
-
-        serving_read::record("tree_state_at", None, async {
-            let mut deadline = None;
-            let mut carried = None;
-            loop {
-                let existing = deadline;
-                let selected = serving_read::read_at(self.pin(at_epoch_id), |pair| async move {
-                    let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                    if let Some(ready) = self.tree_state_replays.cached_for_reader(
-                        height,
-                        epoch.visible_tip_height,
-                        &pair,
-                    ) {
-                        return Ok(ControlFlow::Break((epoch, ready)));
-                    }
-                    let req_deadline =
-                        existing.unwrap_or_else(|| self.tree_state_replays.deadline());
-                    let key = ReplayKey::new(height, pair.canonical());
-                    let generation = Arc::downgrade(&pair);
-                    let slot = self.serving_pair_slot.clone();
-                    let weak = generation.clone();
-                    let cache_gen =
-                        ReaderGeneration::live(&generation, move || slot.is_current_weak(&weak));
-                    if let Some(ready) = self
-                        .tree_state_replays
-                        .ready_state(&key, &cache_gen, &pair.canonical_arc(), req_deadline)
-                        .await?
-                    {
-                        return Ok(ControlFlow::Break((epoch, ready)));
-                    }
-                    Ok(ControlFlow::Continue((
-                        epoch,
-                        key,
-                        generation,
-                        cache_gen,
-                        req_deadline,
-                    )))
-                })
-                .await?;
-                let (epoch, key, generation, cache_gen, req_deadline) = match selected {
-                    ControlFlow::Break((epoch, ready)) => {
-                        return Ok(tree_state_response(epoch, ready.serve()));
-                    }
-                    ControlFlow::Continue(missing) => missing,
-                };
-                let req_deadline = *deadline.get_or_insert(req_deadline);
-                let subscription = match self.tree_state_replays.select(
-                    &key,
-                    &cache_gen,
-                    req_deadline,
-                    carried.take(),
-                )? {
-                    Selection::Ready(state) => {
-                        return Ok(tree_state_response(epoch, state.serve()));
-                    }
-                    Selection::Waiting(subscription) => subscription,
-                };
-                let slot = subscription.admit(&self.tree_state_replays).await?;
-                let answer = serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
-                    let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                    if !generation.ptr_eq(&Arc::downgrade(&pair)) {
-                        return Ok(ControlFlow::Continue(subscription.carry(&slot)));
-                    }
-                    let state = subscription
-                        .replay(slot, |cancelled| async move {
-                            read_missing_height(pair.canonical(), height, cancelled).await
-                        })
-                        .await?;
-                    Ok(state.map_or(ControlFlow::Continue(None), |state| {
-                        ControlFlow::Break(tree_state_response(epoch, state))
-                    }))
-                })
-                .await?;
-                match answer {
-                    ControlFlow::Break(state) => return Ok(state),
-                    ControlFlow::Continue(slot) => carried = slot,
-                }
-            }
-        })
+        self.resolve_tree_state_at(
+            height,
+            at_epoch_id,
+            |replays, key, cache_gen, reader, req_deadline| async move {
+                replays
+                    .ready_state(&key, &cache_gen, &reader, req_deadline)
+                    .await
+            },
+        )
         .await
     }
 
@@ -2662,6 +2735,77 @@ mod tree_state_replay_limit_tests {
             report.lines().any(|line| line
                 == "zinder_query_tree_state_reads_total{source=\"replayed\",height_band=\"0\"} 2"),
             "expected initial replay plus one post-fork rebuild:\n{report}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tree_state_at_preserves_deadline_across_reader_invalidation_retry()
+    -> Result<(), Box<dyn Error>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+        let (_s1, initial) = build_serving_pair(&chain, 4, 2)?;
+        let (_s2, replacement) = build_serving_pair(&chain, 4, 2)?;
+        let slot = WalletServingPairSlot::new(initial);
+        let mut query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        let wait_budget = Duration::from_millis(200);
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN, wait_budget);
+
+        // Hold the only replay slot so the replacement attempt hits `admit()`
+        // and must time out at the original request deadline, not a reset one.
+        let held_slot = query.tree_state_replays.admit().await?;
+        let started = tokio::time::Instant::now();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_deadlines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let outcome = query
+            .resolve_tree_state_at(BlockHeight::new(2), None, {
+                let slot = slot.clone();
+                let replacement = Arc::clone(&replacement);
+                let attempts = Arc::clone(&attempts);
+                let observed_deadlines = Arc::clone(&observed_deadlines);
+                move |replays, key, cache_gen, reader, req_deadline| {
+                    let slot = slot.clone();
+                    let replacement = Arc::clone(&replacement);
+                    let attempts = Arc::clone(&attempts);
+                    let observed_deadlines = Arc::clone(&observed_deadlines);
+                    async move {
+                        observed_deadlines.lock().push(req_deadline);
+                        if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            slot.publish_for_test(replacement);
+                            return Err(QueryError::canonical_read(
+                                crate::StorageReadError::ReaderInvalidated {
+                                    source: Box::new(std::io::Error::other(
+                                        "simulated missing table file",
+                                    )),
+                                },
+                            ));
+                        }
+                        replays
+                            .ready_state(&key, &cache_gen, &reader, req_deadline)
+                            .await
+                    }
+                }
+            })
+            .await;
+
+        let elapsed = started.elapsed();
+        drop(held_slot);
+        assert!(
+            matches!(outcome, Err(QueryError::TreeStateReplayLimitReached { .. })),
+            "expected replay wait expiry, got {outcome:?}"
+        );
+        let deadlines = observed_deadlines.lock().clone();
+        assert_eq!(deadlines.len(), 2, "expected initial attempt + retry");
+        assert_eq!(
+            deadlines[0], deadlines[1],
+            "reader invalidation retry must reuse the initial replay deadline"
+        );
+        assert_eq!(
+            elapsed, wait_budget,
+            "reader invalidation must not extend the request's wait budget"
         );
         Ok(())
     }

@@ -94,7 +94,9 @@ use tower::{
 use zinder_proto::compat::lightwalletd::compact_tx_streamer_server;
 
 pub(crate) use self::call_termination::OpenGrpcCalls;
-pub use self::call_termination::{GrpcCallTermination, GrpcCallTerminationLayer};
+pub use self::call_termination::{
+    GrpcCallTermination, GrpcCallTerminationFuture, GrpcCallTerminationLayer,
+};
 pub use self::grpc_timeout::GrpcDeadline;
 use self::send_stall::ResponseCancellation;
 pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
@@ -566,11 +568,11 @@ where
         let request = request.map(|body| {
             Body::new(ReceiveBoundBody {
                 inner: body,
-                state: ReceiveState::Receiving(Box::new(Receiving::new(
+                state: ReceiveState::Receiving(Receiving::new(
                     admission.slot,
                     receive_timeout,
                     transport_reset,
-                ))),
+                )),
                 pool,
                 receive_timeout,
                 response_cancellation,
@@ -731,16 +733,22 @@ struct ReceiveBoundBody {
 }
 
 enum ReceiveState {
-    Receiving(Box<Receiving>),
+    Receiving(Receiving),
     Received,
     /// The request timed out or lost its slot, and the body reported it.
     Cancelled,
 }
 
 struct Receiving {
-    _slot: ReceiveSlot,
-    deadline: Pin<Box<Sleep>>,
-    evicted: Pin<Box<WaitForCancellationFutureOwned>>,
+    slot: ReceiveSlot,
+    deadline_at: Instant,
+    /// Lazily allocated only if `inner.poll_frame` returns `Poll::Pending`,
+    /// avoiding a timer allocation and wheel registration for unary requests
+    /// whose body is already buffered.
+    deadline: Option<Pin<Box<Sleep>>>,
+    /// Lazily allocated only if `inner.poll_frame` returns `Poll::Pending`;
+    /// ready polls check [`ReceiveSlot::is_evicted`] directly.
+    evicted: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
     /// Completes once the HTTP/2 stream or HTTP/1.1 connection that carries a
     /// client stream is reset. A handler that keeps polling the request, such
     /// as gRPC reflection, then sees it fail and drops it, which lets h2
@@ -756,10 +764,11 @@ impl Receiving {
         transport_reset: Option<TransportReset>,
     ) -> Self {
         Self {
-            deadline: Box::pin(tokio::time::sleep(receive_timeout)),
-            evicted: Box::pin(slot.evicted()),
+            slot,
+            deadline_at: Instant::now() + receive_timeout,
+            deadline: None,
+            evicted: None,
             transport_reset: transport_reset.map(|reset| reset.wait_for_reset()),
-            _slot: slot,
             boundaries: MessageBoundaries::default(),
         }
     }
@@ -789,7 +798,7 @@ impl http_body::Body for ReceiveBoundBody {
             ReceiveState::Received => return Pin::new(&mut this.inner).poll_frame(cx),
             ReceiveState::Cancelled => return Poll::Ready(None),
         };
-        if receiving.evicted.as_mut().poll(cx).is_ready() {
+        if receiving.slot.is_evicted() {
             this.state = ReceiveState::Cancelled;
             return Poll::Ready(Some(Err(this.report(too_many_requests()))));
         }
@@ -810,10 +819,11 @@ impl http_body::Body for ReceiveBoundBody {
                         .data_ref()
                         .is_some_and(|chunk| receiving.boundaries.completed_messages(chunk) > 0)
                 {
-                    receiving
-                        .deadline
-                        .as_mut()
-                        .reset(Instant::now() + this.receive_timeout);
+                    let next_deadline = Instant::now() + this.receive_timeout;
+                    receiving.deadline_at = next_deadline;
+                    if let Some(deadline) = &mut receiving.deadline {
+                        deadline.as_mut().reset(next_deadline);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -822,7 +832,17 @@ impl http_body::Body for ReceiveBoundBody {
                 Poll::Ready(ended_or_failed)
             }
             Poll::Pending => {
-                if receiving.deadline.as_mut().poll(cx).is_pending() {
+                let evicted = receiving
+                    .evicted
+                    .get_or_insert_with(|| Box::pin(receiving.slot.evicted()));
+                if evicted.as_mut().poll(cx).is_ready() {
+                    this.state = ReceiveState::Cancelled;
+                    return Poll::Ready(Some(Err(this.report(too_many_requests()))));
+                }
+                let deadline = receiving.deadline.get_or_insert_with(|| {
+                    Box::pin(tokio::time::sleep_until(receiving.deadline_at))
+                });
+                if deadline.as_mut().poll(cx).is_pending() {
                     return Poll::Pending;
                 }
                 this.state = ReceiveState::Cancelled;

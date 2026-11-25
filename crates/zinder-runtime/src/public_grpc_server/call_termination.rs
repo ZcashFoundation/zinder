@@ -39,7 +39,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_util::future::{BoxFuture, ready};
+use futures_util::future::{Either, Ready, ready};
 use http_body::{Body as _, Frame, SizeHint};
 use parking_lot::Mutex;
 use slab::Slab;
@@ -191,6 +191,22 @@ pub struct GrpcCallTermination<S> {
     calls: Arc<OpenGrpcCalls>,
 }
 
+/// Response future returned by [`GrpcCallTermination`].
+pub struct GrpcCallTerminationFuture<F, E>(
+    Either<Ready<Result<http::Response<Body>, E>>, TerminableCall<F>>,
+);
+
+impl<F, E> Future for GrpcCallTerminationFuture<F, E>
+where
+    F: Future<Output = Result<http::Response<Body>, E>> + Send + 'static,
+{
+    type Output = Result<http::Response<Body>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
 impl<S> Service<http::Request<Body>> for GrpcCallTermination<S>
 where
     S: Service<http::Request<Body>, Response = http::Response<Body>>,
@@ -199,7 +215,7 @@ where
 {
     type Response = http::Response<Body>;
     type Error = S::Error;
-    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+    type Future = GrpcCallTerminationFuture<S::Future, S::Error>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -217,15 +233,15 @@ where
         if !call.start(|| self.inner.call(request)) {
             return refused();
         }
-        Box::pin(TerminableCall {
+        GrpcCallTerminationFuture(Either::Right(TerminableCall {
             call,
             responded: false,
-        })
+        }))
     }
 }
 
-fn refused<E: Send + 'static>() -> BoxFuture<'static, Result<http::Response<Body>, E>> {
-    Box::pin(ready(Ok(server_stopped().into_http())))
+fn refused<F, E>() -> GrpcCallTerminationFuture<F, E> {
+    GrpcCallTerminationFuture(Either::Left(ready(Ok(server_stopped().into_http()))))
 }
 
 fn server_stopped() -> Status {

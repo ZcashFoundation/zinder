@@ -10,7 +10,8 @@ use zinder_source::{SourceError, TransactionBroadcaster, ZebraJsonRpcSource};
 use zinder_store::{ArtifactFamily, BlockHashLookup};
 
 use crate::{
-    ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, SubtreeRoots, TreeState,
+    ArtifactKey, CanonicalReader, QueryError, RocksDbCanonicalReader, ServedTreeStateHex,
+    SubtreeRoots, TreeState,
     broadcast_byte_budget::BroadcastByteBudget,
     tree_state_replay_limit::{
         ReaderGeneration, ReadyState, ReplayKey, Selection, TreeStateReplayLimit,
@@ -281,7 +282,7 @@ impl LightWalletNodeQuery {
         match ready {
             Some(ready @ ReadyState::Stored(_)) => Ok(Ok(ready)),
             Some(ReadyState::Cached(state)) => {
-                let block = state.block_id();
+                let block = state.state().block_id();
                 Ok(Err((Selection::Ready(ReadyState::Cached(state)), block)))
             }
             None => {
@@ -297,6 +298,25 @@ impl LightWalletNodeQuery {
                 Ok(Err((selected, BlockId::new(height, block.block_hash))))
             }
         }
+    }
+
+    /// Reads a stored or reconstructed frontier formatted for lightwalletd
+    /// `GetTreeState`, reusing pre-encoded hex strings on settled cache hits.
+    pub async fn tree_state_hex(
+        &self,
+        reader: Arc<RocksDbCanonicalReader>,
+        height: Option<BlockHeight>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        if let Some(height) = height {
+            let epoch = reader.chain_epoch();
+            if let Some(ready) =
+                self.cached_on_current_reader(height, epoch.visible_tip_height, &reader)
+            {
+                return Ok(ready.serve_hex(epoch.network));
+            }
+        }
+        let state = self.tree_state(reader, height).await?;
+        Ok(ServedTreeStateHex::from_tree_state(&state))
     }
 
     /// Reads a stored or reconstructed frontier at a height, or the latest checkpoint when unset.

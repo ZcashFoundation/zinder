@@ -2034,6 +2034,23 @@ fn lightwalletd_tree_state(tree_state: &TreeState) -> lightwalletd::TreeState {
     }
 }
 
+fn lightwalletd_tree_state_from_hex(
+    tree_state: zinder_query::ServedTreeStateHex,
+) -> Result<lightwalletd::TreeState, Status> {
+    if !tree_state.has_sapling {
+        return Err(pre_sapling_tree_state());
+    }
+    Ok(lightwalletd::TreeState {
+        network: encode_bip70_chain_name(tree_state.network).to_owned(),
+        height: u64::from(tree_state.height.value()),
+        hash: tree_state.hash,
+        time: tree_state.block_time_seconds,
+        sapling_tree: tree_state.sapling_tree,
+        orchard_tree: tree_state.orchard_tree,
+        ironwood_tree: tree_state.ironwood_tree,
+    })
+}
+
 fn lightwalletd_subtree_roots(subtree_roots: &SubtreeRoots) -> Vec<lightwalletd::SubtreeRoot> {
     subtree_roots
         .subtree_roots

@@ -209,6 +209,11 @@ impl SlotTable {
 }
 
 impl ReceiveSlot {
+    /// Returns whether another client's request has already taken this slot.
+    pub(super) fn is_evicted(&self) -> bool {
+        self.eviction.is_cancelled()
+    }
+
     /// Completes once another client's request has taken this slot.
     pub(super) fn evicted(&self) -> WaitForCancellationFutureOwned {
         self.eviction.clone().cancelled_owned()

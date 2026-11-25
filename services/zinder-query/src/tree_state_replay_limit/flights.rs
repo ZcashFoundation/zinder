@@ -18,13 +18,16 @@ use tokio::{
 use tracing::Instrument as _;
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest, CanonicalHistoryBounds, ChainEpoch,
-    NetworkUpgradeActivationsFingerprint,
+    Network, NetworkUpgradeActivationsFingerprint,
 };
 use zinder_store::{ServedTreeState, TreeStateLookup, TreeStateReplayOutcome};
 
 use super::{
     ReplayRefusal, TreeStateReplayLimit, WaitingPlace, replay_holding_slot,
-    settled_cache::{LookupStep, ReaderGeneration, SettledChainAnchor, SettledStates},
+    settled_cache::{
+        CachedTreeState, LookupStep, ReaderGeneration, ServedTreeStateHex, SettledChainAnchor,
+        SettledStates,
+    },
 };
 use crate::{CanonicalReader, QueryError, StorageReadError};
 
@@ -110,7 +113,7 @@ impl Drop for ActiveAnchorVerifyGuard {
 }
 
 enum AnchorVerifyStep {
-    Ready(Option<ServedTreeState>),
+    Ready(Option<Arc<CachedTreeState>>),
     Wait {
         rx: watch::Receiver<Option<AnchorVerifyOutcome>>,
         is_leader: bool,
@@ -119,18 +122,31 @@ enum AnchorVerifyStep {
 }
 
 pub(crate) enum ReadyState {
-    Cached(ServedTreeState),
+    Cached(Arc<CachedTreeState>),
     Stored(ServedTreeState),
 }
 
 impl ReadyState {
     pub(crate) fn serve(self) -> ServedTreeState {
         let (source, state) = match self {
-            Self::Cached(state) => ("cached", state),
+            Self::Cached(cached) => ("cached", cached.state().clone()),
             Self::Stored(state) => ("stored", state),
         };
         super::record_tree_state_read(state.block_id().height, source);
         state
+    }
+
+    pub(crate) fn serve_hex(self, network: Network) -> ServedTreeStateHex {
+        match self {
+            Self::Cached(cached) => {
+                super::record_tree_state_read(cached.state().block_id().height, "cached");
+                cached.to_hex(network)
+            }
+            Self::Stored(state) => {
+                super::record_tree_state_read(state.block_id().height, "stored");
+                ServedTreeStateHex::from_served(network, &state)
+            }
+        }
     }
 }
 
@@ -316,7 +332,7 @@ impl TreeStateReplayLimit {
         generation: &ReaderGeneration,
         reader: &Arc<dyn CanonicalReader>,
         deadline: Instant,
-    ) -> Result<Option<ServedTreeState>, QueryError> {
+    ) -> Result<Option<Arc<CachedTreeState>>, QueryError> {
         let target = key.settled_anchor();
         let (mut rx, is_leader, waited) = match self
             .acquire_or_join_verify((target, key.height), generation, reader, deadline)

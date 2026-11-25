@@ -6,6 +6,7 @@ mod settled_cache;
 pub(crate) use flights::ReadyState;
 pub(crate) use flights::{ReplayKey, Selection, TakeReplayPermit, read_missing_height};
 pub(crate) use settled_cache::ReaderGeneration;
+pub use settled_cache::ServedTreeStateHex;
 
 use std::{
     borrow::Cow,
