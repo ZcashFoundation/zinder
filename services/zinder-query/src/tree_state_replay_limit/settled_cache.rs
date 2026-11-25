@@ -7,17 +7,22 @@
 //! entries survive tip advances without rebuilding or re-reading storage.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fmt,
     mem::size_of,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use zinder_core::{
     ArtifactSchemaVersion, BlockHeight, BlockId, CanonicalHistoryBounds, Network,
-    NetworkUpgradeActivationsFingerprint, ShieldedProtocol,
+    NetworkUpgradeActivationsFingerprint, ShieldedProtocol, wire::encode_rpc_block_hash_hex,
 };
 use zinder_store::ServedTreeState;
+
+use crate::TreeState;
 
 /// Default maximum entry count for one query's settled tree-state cache.
 pub(super) const SETTLED_MAX_ENTRIES: usize = 1_024;
@@ -109,19 +114,147 @@ impl SettledChainAnchor {
     }
 }
 
+/// Pre-encoded hexadecimal tree state for lightwalletd `GetTreeState` replies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedTreeStateHex {
+    /// Network of the served chain epoch.
+    pub network: Network,
+    /// Block height of the tree state.
+    pub height: BlockHeight,
+    /// RPC-order lowercase hexadecimal block hash.
+    pub hash: String,
+    /// Block header timestamp in seconds.
+    pub block_time_seconds: u32,
+    /// Whether a Sapling frontier is present at this height.
+    pub has_sapling: bool,
+    /// Lowercase hexadecimal Sapling final state, or empty when absent.
+    pub sapling_tree: String,
+    /// Lowercase hexadecimal Orchard final state, or empty when absent.
+    pub orchard_tree: String,
+    /// Lowercase hexadecimal Ironwood final state, or empty when absent.
+    pub ironwood_tree: String,
+}
+
+impl ServedTreeStateHex {
+    /// Encodes a [`ServedTreeState`] for lightwalletd serving.
+    #[must_use]
+    pub fn from_served(network: Network, state: &ServedTreeState) -> Self {
+        let encoded = EncodedTreeStateHex::from_served(state);
+        Self::from_parts(network, state, &encoded)
+    }
+
+    /// Encodes a [`TreeState`] for lightwalletd serving.
+    #[must_use]
+    pub fn from_tree_state(state: &TreeState) -> Self {
+        Self {
+            network: state.chain_epoch.network,
+            height: state.height,
+            hash: encode_rpc_block_hash_hex(state.block_hash),
+            block_time_seconds: state.block_time_seconds,
+            has_sapling: state.frontiers.sapling_final_state.is_some(),
+            sapling_tree: state
+                .frontiers
+                .sapling_final_state
+                .as_deref()
+                .map_or_default(hex::encode),
+            orchard_tree: state
+                .frontiers
+                .orchard_final_state
+                .as_deref()
+                .map_or_default(hex::encode),
+            ironwood_tree: state
+                .frontiers
+                .ironwood_final_state
+                .as_deref()
+                .map_or_default(hex::encode),
+        }
+    }
+
+    fn from_parts(
+        network: Network,
+        state: &ServedTreeState,
+        encoded: &EncodedTreeStateHex,
+    ) -> Self {
+        Self {
+            network,
+            height: state.block_id().height,
+            hash: encoded.hash.clone(),
+            block_time_seconds: state.block_time_seconds(),
+            has_sapling: state.final_state_bytes(ShieldedProtocol::Sapling).is_some(),
+            sapling_tree: encoded.sapling_tree.clone(),
+            orchard_tree: encoded.orchard_tree.clone(),
+            ironwood_tree: encoded.ironwood_tree.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EncodedTreeStateHex {
+    hash: String,
+    sapling_tree: String,
+    orchard_tree: String,
+    ironwood_tree: String,
+}
+
+impl EncodedTreeStateHex {
+    fn from_served(state: &ServedTreeState) -> Self {
+        Self {
+            hash: encode_rpc_block_hash_hex(state.block_id().hash),
+            sapling_tree: state
+                .final_state_bytes(ShieldedProtocol::Sapling)
+                .map_or_default(hex::encode),
+            orchard_tree: state
+                .final_state_bytes(ShieldedProtocol::Orchard)
+                .map_or_default(hex::encode),
+            ironwood_tree: state
+                .final_state_bytes(ShieldedProtocol::Ironwood)
+                .map_or_default(hex::encode),
+        }
+    }
+}
+
+/// Settled [`ServedTreeState`] paired with lazily computed hexadecimal wire
+/// fields so repeated warm `GetTreeState` hits avoid cloning raw frontier
+/// buffers and repeating hex encoding.
+#[derive(Debug)]
+pub(crate) struct CachedTreeState {
+    state: ServedTreeState,
+    hex: OnceLock<EncodedTreeStateHex>,
+}
+
+impl CachedTreeState {
+    fn new(state: ServedTreeState) -> Self {
+        Self {
+            state,
+            hex: OnceLock::new(),
+        }
+    }
+
+    pub(crate) const fn state(&self) -> &ServedTreeState {
+        &self.state
+    }
+
+    pub(crate) fn to_hex(&self, network: Network) -> ServedTreeStateHex {
+        let encoded = self
+            .hex
+            .get_or_init(|| EncodedTreeStateHex::from_served(&self.state));
+        ServedTreeStateHex::from_parts(network, &self.state, encoded)
+    }
+}
+
 /// Outcome of classifying a settled-cache lookup before async header verification.
 #[derive(Debug)]
 pub(super) enum LookupStep {
-    Hit(ServedTreeState),
+    Hit(Arc<CachedTreeState>),
     Miss,
     VerifyExtension(SettledChainAnchor),
 }
 
 #[derive(Debug)]
 struct CachedEntry {
-    state: ServedTreeState,
+    state: Arc<CachedTreeState>,
     bytes: usize,
-    tick: u64,
+    last_used: AtomicU64,
 }
 
 /// Bounded LRU cache of settled replayed tree states.
@@ -130,11 +263,10 @@ pub(super) struct SettledStates {
     max_entries: usize,
     max_bytes: usize,
     total_bytes: usize,
-    next_tick: u64,
+    next_tick: AtomicU64,
     anchor: Option<SettledChainAnchor>,
     anchor_generations: Vec<Weak<dyn Send + Sync>>,
     entries: HashMap<BlockHeight, CachedEntry>,
-    lru: BTreeMap<u64, BlockHeight>,
 }
 
 impl Default for SettledStates {
@@ -149,11 +281,10 @@ impl SettledStates {
             max_entries,
             max_bytes,
             total_bytes: 0,
-            next_tick: 0,
+            next_tick: AtomicU64::new(0),
             anchor: None,
             anchor_generations: Vec::new(),
             entries: HashMap::new(),
-            lru: BTreeMap::new(),
         }
     }
 
@@ -178,28 +309,24 @@ impl SettledStates {
         }
     }
 
-    fn allocate_tick(&mut self) -> u64 {
-        let tick = self.next_tick;
-        self.next_tick = self.next_tick.wrapping_add(1);
-        tick
+    fn allocate_tick(&self) -> u64 {
+        self.next_tick.fetch_add(1, Ordering::Relaxed)
     }
 
     fn reset_to(&mut self, anchor: SettledChainAnchor, generation: &Weak<dyn Send + Sync>) {
         self.entries.clear();
-        self.lru.clear();
         self.total_bytes = 0;
         self.anchor = Some(anchor);
         self.anchor_generations.clear();
         self.adopt_generation(generation);
     }
 
-    fn get_touching(&mut self, height: BlockHeight) -> Option<ServedTreeState> {
-        let new_tick = self.allocate_tick();
-        let entry = self.entries.get_mut(&height)?;
-        self.lru.remove(&entry.tick);
-        entry.tick = new_tick;
-        self.lru.insert(new_tick, height);
-        Some(entry.state.clone())
+    fn get_touching(&self, height: BlockHeight) -> Option<Arc<CachedTreeState>> {
+        let entry = self.entries.get(&height)?;
+        entry
+            .last_used
+            .store(self.allocate_tick(), Ordering::Relaxed);
+        Some(Arc::clone(&entry.state))
     }
 
     pub(super) fn classify_lookup(
@@ -281,7 +408,7 @@ impl SettledStates {
         target: SettledChainAnchor,
         generation: &ReaderGeneration,
         height: BlockHeight,
-    ) -> Option<ServedTreeState> {
+    ) -> Option<Arc<CachedTreeState>> {
         if !target.covers(height) || self.anchor != Some(target) {
             return None;
         }
@@ -297,11 +424,30 @@ impl SettledStates {
             .any(|generation| generation.as_ptr().addr() == addr)
     }
 
+    /// Fast read-only lookup for a live reader generation already adopted into
+    /// the current anchor.
+    ///
+    /// Because every adopted reader generation is immutable and
+    /// `anchor_generations` is cleared whenever `self.anchor` changes, a live
+    /// reader whose address is tracked is already guaranteed to match
+    /// `self.anchor`.
+    pub(super) fn cached_for_tracked_generation(
+        &self,
+        addr: usize,
+        height: BlockHeight,
+    ) -> Option<Arc<CachedTreeState>> {
+        if !self.tracks_generation(addr) || !self.anchor.is_some_and(|anchor| anchor.covers(height))
+        {
+            return None;
+        }
+        self.get_touching(height)
+    }
+
     pub(super) fn cached_at_anchor(
-        &mut self,
+        &self,
         target: SettledChainAnchor,
         height: BlockHeight,
-    ) -> Option<ServedTreeState> {
+    ) -> Option<Arc<CachedTreeState>> {
         if !target.covers(height) || self.anchor != Some(target) {
             return None;
         }
@@ -342,14 +488,17 @@ impl SettledStates {
             return;
         }
         if let Some(removed) = self.entries.remove(&height) {
-            self.lru.remove(&removed.tick);
             self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
         }
         while !self.entries.is_empty()
             && (self.entries.len() >= self.max_entries
                 || self.total_bytes.saturating_add(bytes) > self.max_bytes)
         {
-            let Some((_, oldest_height)) = self.lru.pop_first() else {
+            let Some((&oldest_height, _)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
+            else {
                 break;
             };
             if let Some(evicted) = self.entries.remove(&oldest_height) {
@@ -358,9 +507,14 @@ impl SettledStates {
         }
         let tick = self.allocate_tick();
         self.total_bytes = self.total_bytes.saturating_add(bytes);
-        self.lru.insert(tick, height);
-        self.entries
-            .insert(height, CachedEntry { state, bytes, tick });
+        self.entries.insert(
+            height,
+            CachedEntry {
+                state: Arc::new(CachedTreeState::new(state)),
+                bytes,
+                last_used: AtomicU64::new(tick),
+            },
+        );
     }
 
     #[cfg(test)]
@@ -380,10 +534,14 @@ pub(super) fn tree_state_byte_footprint(tree_state: &ServedTreeState) -> usize {
             .final_state_bytes(protocol)
             .map_or(0, <[u8]>::len)
     };
-    size_of::<ServedTreeState>()
-        .saturating_add(pool_bytes(ShieldedProtocol::Sapling))
+    let frontier_bytes = pool_bytes(ShieldedProtocol::Sapling)
         .saturating_add(pool_bytes(ShieldedProtocol::Orchard))
-        .saturating_add(pool_bytes(ShieldedProtocol::Ironwood))
+        .saturating_add(pool_bytes(ShieldedProtocol::Ironwood));
+    // Account for both the raw frontier buffers and the lazily populated
+    // lowercase-hex lightwalletd strings (64-byte block hash + 2x frontiers).
+    size_of::<CachedTreeState>()
+        .saturating_add(64)
+        .saturating_add(frontier_bytes.saturating_mul(3))
 }
 
 #[cfg(test)]
@@ -459,7 +617,9 @@ mod tests {
         by_count.remember(settled, &generation, &first);
         by_count.remember(settled, &generation, &second);
         assert_eq!(
-            by_count.cached_at_anchor(settled, BlockHeight::new(10)),
+            by_count
+                .cached_at_anchor(settled, BlockHeight::new(10))
+                .map(|entry| entry.state().clone()),
             Some(first.clone())
         );
         by_count.remember(settled, &generation, &third);
@@ -470,11 +630,15 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            by_count.cached_at_anchor(settled, BlockHeight::new(10)),
+            by_count
+                .cached_at_anchor(settled, BlockHeight::new(10))
+                .map(|entry| entry.state().clone()),
             Some(first.clone())
         );
         assert_eq!(
-            by_count.cached_at_anchor(settled, BlockHeight::new(30)),
+            by_count
+                .cached_at_anchor(settled, BlockHeight::new(30))
+                .map(|entry| entry.state().clone()),
             Some(third.clone())
         );
 
@@ -514,7 +678,9 @@ mod tests {
         cache.remember(settled, &generation, &oversized);
         assert_eq!(cache.len(), 1);
         assert_eq!(
-            cache.cached_at_anchor(settled, BlockHeight::new(10)),
+            cache
+                .cached_at_anchor(settled, BlockHeight::new(10))
+                .map(|entry| entry.state().clone()),
             Some(small)
         );
         assert!(
@@ -615,7 +781,9 @@ mod tests {
             LookupStep::Miss
         ));
         assert_eq!(
-            cache.cached_at_anchor(settled, BlockHeight::new(10)),
+            cache
+                .cached_at_anchor(settled, BlockHeight::new(10))
+                .map(|entry| entry.state().clone()),
             Some(state)
         );
         Ok(())
@@ -651,7 +819,7 @@ mod tests {
             cache.remember(mismatch, &gen_pinned, &pinned_state);
             assert!(matches!(
                 cache.classify_lookup(current, &gen_current, BlockHeight::new(10)),
-                LookupStep::Hit(ref state) if state == &expected
+                LookupStep::Hit(ref state) if state.state() == &expected
             ));
         }
         Ok(())
@@ -685,7 +853,9 @@ mod tests {
         let replacement_state = served_at(12)?;
         empty_replacement.remember(replacement, &new_current, &replacement_state);
         assert_eq!(
-            empty_replacement.cached_at_anchor(replacement, BlockHeight::new(12)),
+            empty_replacement
+                .cached_at_anchor(replacement, BlockHeight::new(12))
+                .map(|entry| entry.state().clone()),
             Some(replacement_state.clone())
         );
 
@@ -695,7 +865,9 @@ mod tests {
         populated_replacement.remember(prior, &old_captured_current, &served_at(10)?);
         assert_eq!(populated_replacement.len(), 1);
         assert_eq!(
-            populated_replacement.cached_at_anchor(replacement, BlockHeight::new(12)),
+            populated_replacement
+                .cached_at_anchor(replacement, BlockHeight::new(12))
+                .map(|entry| entry.state().clone()),
             Some(replacement_state)
         );
         Ok(())
@@ -750,7 +922,7 @@ mod tests {
             cache.apply_extension_result((anchor(90, 0x99), anchor(100, 0xaa)), &gen_a, true);
             assert!(matches!(
                 cache.classify_lookup(replacement_anchor, &gen_b, BlockHeight::new(10)),
-                LookupStep::Hit(ref state) if state == &replacement_state
+                LookupStep::Hit(ref state) if state.state() == &replacement_state
             ));
         }
 
@@ -773,6 +945,28 @@ mod tests {
                 .cached_at_anchor(stale_ext, BlockHeight::new(10))
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cached_tree_state_hex_matches_direct_encoding() -> Result<(), Box<dyn Error>> {
+        let state = ServedTreeState::from(CommitmentTreeCheckpoint::new(
+            BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([0x5a; 32])),
+            1_700_000_042,
+            CommitmentTreeFrontiers::from_validated_parts(
+                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+                Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Orchard)),
+                None,
+            )?,
+        ));
+        let cached = super::CachedTreeState::new(state.clone());
+        let expected = super::ServedTreeStateHex::from_served(Network::ZcashMainnet, &state);
+        assert_eq!(cached.to_hex(Network::ZcashMainnet), expected);
+        assert_eq!(cached.to_hex(Network::ZcashMainnet), expected);
+        assert!(expected.has_sapling);
+        assert_ne!(expected.sapling_tree, "");
+        assert_ne!(expected.orchard_tree, "");
+        assert_eq!(expected.ironwood_tree, "");
         Ok(())
     }
 }

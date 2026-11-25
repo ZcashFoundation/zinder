@@ -8,7 +8,7 @@
 
 use std::{
     future::Future,
-    pin::{Pin, pin},
+    pin::pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -18,6 +18,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_util::future::{BoxFuture, Either, FutureExt as _, Map};
 use tonic::{Status, body::Body};
 use tower::Service;
 
@@ -79,6 +80,14 @@ impl<S> GrpcDeadline<S> {
     }
 }
 
+fn map_body<B, E>(outcome: Result<http::Response<B>, E>) -> Result<http::Response<Body>, E>
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<axum::BoxError>,
+{
+    outcome.map(|response| response.map(Body::new))
+}
+
 impl<S, B> Service<http::Request<Body>> for GrpcDeadline<S>
 where
     S: Service<http::Request<Body>, Response = http::Response<B>>,
@@ -89,24 +98,31 @@ where
 {
     type Response = http::Response<Body>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = Either<
+        Map<S::Future, fn(Result<http::Response<B>, S::Error>) -> Result<Self::Response, S::Error>>,
+        BoxFuture<'static, Result<Self::Response, Self::Error>>,
+    >;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, mut request: http::Request<Body>) -> Self::Future {
-        let deadline = client_deadline(request.headers());
+        let Some(deadline) = client_deadline(request.headers()) else {
+            return Either::Left(self.inner.call(request).map(map_body::<B, S::Error>));
+        };
         let expiry = DeadlineExpiry::default();
-        if deadline.is_some() {
-            request.extensions_mut().insert(expiry.clone());
-        }
-        Box::pin(respond_within(deadline, expiry, self.inner.call(request)))
+        request.extensions_mut().insert(expiry.clone());
+        Either::Right(Box::pin(respond_within(
+            deadline,
+            expiry,
+            self.inner.call(request),
+        )))
     }
 }
 
 async fn respond_within<B, E>(
-    deadline: Option<Duration>,
+    deadline: Duration,
     expiry: DeadlineExpiry,
     response: impl Future<Output = Result<http::Response<B>, E>>,
 ) -> Result<http::Response<Body>, E>
@@ -114,15 +130,12 @@ where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<axum::BoxError>,
 {
-    let Some(deadline) = deadline else {
-        return response.await.map(|response| response.map(Body::new));
-    };
     // The call stays pinned here until this function returns, so the
     // expiry is marked before the abandoned call is dropped.
     let mut response = pin!(response);
     tokio::select! {
         biased;
-        outcome = &mut response => outcome.map(|response| response.map(Body::new)),
+        outcome = &mut response => map_body(outcome),
         () = tokio::time::sleep(deadline) => {
             expiry.mark();
             Ok(Status::deadline_exceeded("Timeout expired").into_http())
@@ -188,7 +201,7 @@ mod tests {
     async fn a_response_that_misses_the_deadline_exceeds_it() -> Result<(), std::convert::Infallible>
     {
         let response = respond_within(
-            Some(Duration::from_millis(10)),
+            Duration::from_millis(10),
             super::DeadlineExpiry::default(),
             future::pending::<Result<http::Response<Body>, std::convert::Infallible>>(),
         )

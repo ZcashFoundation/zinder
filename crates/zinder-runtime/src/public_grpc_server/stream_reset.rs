@@ -31,14 +31,17 @@ use std::{
     pin::{Pin, pin},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
 };
 
-use tokio::time::{Instant, Sleep};
-use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+use futures_util::task::AtomicWaker;
+use tokio::{
+    sync::Notify,
+    time::{Instant, Sleep},
+};
 
 use super::SEND_STALLS_METRIC;
 
@@ -52,7 +55,12 @@ pub(super) struct TransportReset(Arc<Transport>);
 
 #[derive(Debug, Default)]
 struct Transport {
-    reset: CancellationToken,
+    reset: AtomicBool,
+    /// Wakes the single transport task executing [`resettable`].
+    task_waker: AtomicWaker,
+    /// Wakes external observers waiting on [`TransportReset::wait_for_reset`],
+    /// used only by client-streaming receive bodies.
+    waiters: Notify,
     /// Counts each piece the transport takes and each time it asks for the
     /// next, so the count is odd while the transport holds a piece.
     handoffs: AtomicU64,
@@ -68,12 +76,26 @@ impl TransportReset {
     /// Ends the transport. Its task drops everything it holds the next time
     /// it runs.
     pub(super) fn reset(&self) {
-        self.0.reset.cancel();
+        if !self.0.reset.swap(true, Ordering::AcqRel) {
+            self.0.task_waker.wake();
+            self.0.waiters.notify_waiters();
+        }
     }
 
     /// Completes once the transport is reset.
-    pub(super) fn wait_for_reset(&self) -> WaitForCancellationFutureOwned {
-        self.0.reset.clone().cancelled_owned()
+    pub(super) fn wait_for_reset(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let transport = Arc::clone(&self.0);
+        Box::pin(async move {
+            let notified = transport.waiters.notified();
+            let mut notified = pin!(notified);
+            // Register before re-checking `reset` so a concurrent reset can
+            // never slip between the check and parking.
+            notified.as_mut().enable();
+            if transport.reset.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        })
     }
 
     /// Records that the transport took a piece of the response.
@@ -105,7 +127,7 @@ impl TransportReset {
 
     #[cfg(test)]
     pub(super) fn is_reset(&self) -> bool {
-        self.0.reset.is_cancelled()
+        self.0.reset.load(Ordering::Acquire)
     }
 }
 
@@ -170,14 +192,17 @@ pub(super) async fn resettable<F: Future>(
     CURRENT_TRANSPORT_RESET
         .scope(transport.clone(), async move {
             let mut task = pin!(task);
-            let mut requested = pin!(transport.0.reset.cancelled());
             let mut stalls = StallWatch::new(send_stall_timeout);
             poll_fn(|cx| {
-                if requested.as_mut().poll(cx).is_ready() {
+                if transport.0.reset.load(Ordering::Acquire) {
                     return Poll::Ready(None);
                 }
                 if let Poll::Ready(output) = task.as_mut().poll(cx) {
                     return Poll::Ready(Some(output));
+                }
+                transport.0.task_waker.register(cx.waker());
+                if transport.0.reset.load(Ordering::Acquire) {
+                    return Poll::Ready(None);
                 }
                 if stalls.poll_stalled(&transport, cx) {
                     metrics::counter!(SEND_STALLS_METRIC).increment(1);

@@ -120,14 +120,66 @@ impl WalletRpcMetricsLayer {
     }
 
     fn method(self, path: &str) -> Option<(&'static str, RpcShape)> {
+        use RpcShape::{BlockRange, CompactRangeWithHeader, Stream, Unary, Upload};
         let (service, method) = path.strip_prefix('/')?.split_once('/')?;
         if service != self.service_name() {
             return None;
         }
-        self.methods()
-            .iter()
-            .copied()
-            .find(|(name, _)| *name == method)
+        match self {
+            Self::WalletQuery => match method {
+                "VisibleTipBlock" => Some(("VisibleTipBlock", Unary)),
+                "SettledTipBlock" => Some(("SettledTipBlock", Unary)),
+                "BlockIdBySelector" => Some(("BlockIdBySelector", Unary)),
+                "BlockHeaderBySelector" => Some(("BlockHeaderBySelector", Unary)),
+                "CompactBlock" => Some(("CompactBlock", Unary)),
+                "CompactBlocksInRange" => Some(("CompactBlocksInRange", CompactRangeWithHeader)),
+                "FullBlock" => Some(("FullBlock", Unary)),
+                "FullBlocksInRange" => Some(("FullBlocksInRange", BlockRange)),
+                "Transaction" => Some(("Transaction", Unary)),
+                "TreeStateAtHeight" => Some(("TreeStateAtHeight", Unary)),
+                "LatestTreeStateCheckpoint" => Some(("LatestTreeStateCheckpoint", Unary)),
+                "SubtreeRoots" => Some(("SubtreeRoots", Unary)),
+                "BroadcastTransaction" => Some(("BroadcastTransaction", Unary)),
+                "ChainEvents" => Some(("ChainEvents", Stream)),
+                "MempoolSnapshot" => Some(("MempoolSnapshot", Unary)),
+                "MempoolEvents" => Some(("MempoolEvents", Stream)),
+                "TransparentAddressUnspentOutputs" => {
+                    Some(("TransparentAddressUnspentOutputs", Stream))
+                }
+                "TransparentAddressTxIdsInRange" => {
+                    Some(("TransparentAddressTxIdsInRange", Stream))
+                }
+                "TransparentOutpointSpendStatus" => Some(("TransparentOutpointSpendStatus", Unary)),
+                "ChainValuePoolsAtTip" => Some(("ChainValuePoolsAtTip", Unary)),
+                "ServerInfo" => Some(("ServerInfo", Unary)),
+                "NetworkUpgradeActivations" => Some(("NetworkUpgradeActivations", Unary)),
+                _ => None,
+            },
+            Self::Lightwalletd => match method {
+                "GetLatestBlock" => Some(("GetLatestBlock", Unary)),
+                "GetBlock" => Some(("GetBlock", Unary)),
+                "GetBlockNullifiers" => Some(("GetBlockNullifiers", Unary)),
+                "GetBlockRange" => Some(("GetBlockRange", BlockRange)),
+                "GetBlockRangeNullifiers" => Some(("GetBlockRangeNullifiers", BlockRange)),
+                "GetTransaction" => Some(("GetTransaction", Unary)),
+                "SendTransaction" => Some(("SendTransaction", Unary)),
+                "GetTaddressTxids" => Some(("GetTaddressTxids", Stream)),
+                "GetTaddressTransactions" => Some(("GetTaddressTransactions", Stream)),
+                "GetTaddressBalance" => Some(("GetTaddressBalance", Unary)),
+                "GetTaddressBalanceStream" => Some(("GetTaddressBalanceStream", Upload)),
+                "GetMempoolTx" => Some(("GetMempoolTx", Stream)),
+                "GetMempoolStream" => Some(("GetMempoolStream", Stream)),
+                "GetTreeState" => Some(("GetTreeState", Unary)),
+                "GetLatestTreeState" => Some(("GetLatestTreeState", Unary)),
+                "GetSubtreeRoots" => Some(("GetSubtreeRoots", Stream)),
+                "GetAddressUtxos" => Some(("GetAddressUtxos", Unary)),
+                "GetAddressUtxosStream" => Some(("GetAddressUtxosStream", Stream)),
+                "GetLightdInfo" => Some(("GetLightdInfo", Unary)),
+                "GetStandardFee" => Some(("GetStandardFee", Unary)),
+                "Ping" => Some(("Ping", Unary)),
+                _ => None,
+            },
+        }
     }
 }
 
@@ -326,6 +378,7 @@ impl WalletRpcMethod {
 struct ObservedRpc {
     method: WalletRpcMethod,
     shape: RpcShape,
+    in_flight: metrics::Gauge,
     started: Instant,
     stream_opened: Option<Instant>,
     range_messages: f64,
@@ -338,11 +391,13 @@ struct ObservedRpc {
 
 impl ObservedRpc {
     fn start(method: WalletRpcMethod, shape: RpcShape) -> Self {
-        metrics::gauge!(IN_FLIGHT, "surface" => method.surface, "method" => method.name)
-            .increment(1);
+        let in_flight =
+            metrics::gauge!(IN_FLIGHT, "surface" => method.surface, "method" => method.name);
+        in_flight.increment(1);
         Self {
             method,
             shape,
+            in_flight,
             started: Instant::now(),
             stream_opened: None,
             range_messages: 0.0,
@@ -395,8 +450,7 @@ impl Drop for ObservedRpc {
             ("grpc_code", code_label(self.outcome.code)),
             ("error_class", self.outcome.class),
         ];
-        metrics::gauge!(IN_FLIGHT, "surface" => self.method.surface, "method" => self.method.name)
-            .decrement(1);
+        self.in_flight.decrement(1);
         metrics::counter!(REQUESTS, &labels).increment(1);
         metrics::histogram!(DURATION, &labels).record(self.started.elapsed());
         if let Some(opened) = self.stream_opened {

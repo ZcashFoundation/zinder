@@ -41,6 +41,7 @@
 //! window, so the gate sends no probe there.
 
 use std::{
+    cell::Cell,
     mem,
     pin::Pin,
     sync::{
@@ -60,13 +61,23 @@ use super::{
 };
 
 tokio::task_local! {
-    static LOOKING_AHEAD: ();
+    /// Present while the gate is looking ahead past a DATA frame; records
+    /// whether an inner [`super::call_termination`] body held terminal trailers
+    /// (or a shutdown termination) instead of returning them during look-ahead.
+    static LOOKING_AHEAD: Cell<bool>;
 }
 
 /// Terminal trailers must stay in the tracked call until preceding DATA
 /// departs. This also keeps them replaceable before gRPC-Web encodes them.
 pub(super) fn looking_ahead() -> bool {
-    LOOKING_AHEAD.try_with(|()| ()).is_ok()
+    LOOKING_AHEAD.try_with(|_| ()).is_ok()
+}
+
+/// Records that an inner tracked call saw terminal trailers (or shutdown
+/// termination) during a look-ahead poll, so the gate knows the producer did
+/// not merely yield.
+pub(super) fn note_held_end() {
+    let _ = LOOKING_AHEAD.try_with(|saw_held_end| saw_held_end.set(true));
 }
 
 /// How a listener gates the responses it sends.
@@ -285,7 +296,11 @@ impl ReleaseGatedBody {
             },
         };
         // Look at what follows `current` before handing it out.
-        match LOOKING_AHEAD.sync_scope((), || self.poll_inner(cx)) {
+        let (lookahead, saw_held_end) = LOOKING_AHEAD.sync_scope(Cell::new(false), || {
+            let outcome = self.poll_inner(cx);
+            (outcome, LOOKING_AHEAD.with(Cell::get))
+        });
+        match lookahead {
             Poll::Ready(Polled::Data(next)) => {
                 self.ahead = Some(next);
                 return self.hand_out(current);
@@ -298,6 +313,11 @@ impl ReleaseGatedBody {
                 self.next = Next::Failed(status);
                 return self.hand_out(current);
             }
+            // The inner tracked call already received terminal trailers (or a
+            // shutdown termination) and held them only because we were looking
+            // ahead. Skip the producer-yield reschedule and probe the window
+            // immediately.
+            Poll::Pending if saw_held_end => self.next = Next::Paused,
             // A producer that only yielded is ready on the next turn.
             Poll::Pending if !self.waited_for_producer => {
                 self.waited_for_producer = true;
@@ -451,6 +471,92 @@ mod tests {
         assert_eq!(data, Bytes::from_static(b"message"));
         let error = frames.1.ok_or("the body ended without its error")?.err();
         assert_eq!(error.map(|status| status.code()), Some(Code::Internal));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn held_terminal_trailers_probe_without_producer_yield_reschedule()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct HeldTrailersBody {
+            payload: Option<Bytes>,
+            trailers: Option<http::HeaderMap>,
+            polls: Arc<AtomicUsize>,
+        }
+
+        impl http_body::Body for HeldTrailersBody {
+            type Data = Bytes;
+            type Error = Status;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                let this = self.get_mut();
+                this.polls.fetch_add(1, Ordering::Relaxed);
+                if let Some(payload) = this.payload.take() {
+                    return Poll::Ready(Some(Ok(Frame::data(payload))));
+                }
+                if looking_ahead() {
+                    note_held_end();
+                    return Poll::Pending;
+                }
+                Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))))
+            }
+        }
+
+        let payload = Bytes::from(vec![0xAB_u8; 1_653]);
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let inner_polls = Arc::new(AtomicUsize::new(0));
+        let inner = Body::new(HeldTrailersBody {
+            payload: Some(payload.clone()),
+            trailers: Some(trailers),
+            polls: Arc::clone(&inner_polls),
+        });
+        let (data_lengths, trailer_count, outer_polls) = resettable(
+            async move {
+                let mut body = ReleaseGate {
+                    probe_window: true,
+                    observer: GateObserver::default(),
+                }
+                .apply(http::Response::new(inner))
+                .into_body();
+                let mut data_lengths = Vec::new();
+                let mut trailer_count = 0_usize;
+                let mut outer_polls = 0_usize;
+                let waker = futures_util::task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                loop {
+                    outer_polls += 1;
+                    match Pin::new(&mut body).poll_frame(&mut cx) {
+                        Poll::Ready(Some(Ok(frame))) => {
+                            if let Some(chunk) = frame.data_ref() {
+                                data_lengths.push(chunk.len());
+                            } else if frame.is_trailers() {
+                                trailer_count += 1;
+                            }
+                            drop(frame);
+                        }
+                        Poll::Ready(Some(Err(_))) => return Err("unexpected error frame"),
+                        Poll::Ready(None) => break,
+                        Poll::Pending => return Err("unexpected pending poll on held trailers"),
+                    }
+                }
+                Ok((data_lengths, trailer_count, outer_polls))
+            },
+            Duration::from_secs(60),
+        )
+        .await
+        .ok_or("the transport was reset")??;
+        assert_eq!(data_lengths, vec![payload.len() - 1, 1]);
+        assert_eq!(trailer_count, 1);
+        assert_eq!(
+            outer_polls, 4,
+            "expected DATA(len-1), 1-byte probe, trailers, None without Pending reschedule"
+        );
+        assert_eq!(inner_polls.load(Ordering::Relaxed), 3);
         Ok(())
     }
 }

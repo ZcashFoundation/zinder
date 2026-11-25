@@ -95,7 +95,7 @@ pub use transparent_unspent_output_stream::{
 };
 pub use tree_state_replay_limit::{
     DEFAULT_TREE_STATE_REPLAY_WAIT, DEFAULT_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
-    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT,
+    MAX_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT, ServedTreeStateHex,
 };
 pub use wallet_serving_pair::{WalletServingAdmissionError, WalletServingReadPair};
 pub use wallet_serving_pair_publisher::{

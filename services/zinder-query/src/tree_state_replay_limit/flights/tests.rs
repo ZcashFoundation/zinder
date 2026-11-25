@@ -565,13 +565,24 @@ async fn settled_cache_promotes_anchor_across_settled_tip_advance_with_one_heade
     let height = BlockHeight::new(1);
     let expected = replay_and_cache(&limit, &first, height).await?;
 
-    let old_key = ReplayKey::new(height, first.as_ref());
+    let first_tip = first.chain_epoch().visible_tip_height;
+    let extended_tip = extended.chain_epoch().visible_tip_height;
     assert!(
-        matches!(limit.cached_for_reader(&old_key, &first), Some(ReadyState::Cached(ref state)) if *state == expected)
+        matches!(limit.cached_for_reader(height, first_tip, &first), Some(ReadyState::Cached(ref state)) if state.state() == &expected)
     );
-    assert!(limit.cached_for_reader(&old_key, &extended).is_none());
+    assert!(
+        limit
+            .cached_for_reader(height, extended_tip, &extended)
+            .is_none()
+    );
     let key = ReplayKey::new(height, extended.as_ref());
-    assert!(limit.cached_for_reader(&key, &first).is_none());
+    assert!(
+        limit
+            .settled
+            .read()
+            .cached_at_anchor(key.settled_anchor(), height)
+            .is_none()
+    );
     let gen_ext = ReaderGeneration::static_for_test(&Arc::downgrade(&extended), true);
     let dyn_extended = Arc::clone(&extended) as Arc<dyn CanonicalReader>;
     let mut joins = Vec::new();
@@ -585,19 +596,19 @@ async fn settled_cache_promotes_anchor_across_settled_tip_advance_with_one_heade
         }));
     }
     for task in joins {
-        assert!(matches!(task.await??, Some(ReadyState::Cached(ref s)) if *s == expected));
+        assert!(matches!(task.await??, Some(ReadyState::Cached(ref s)) if s.state() == &expected));
     }
     assert_eq!(extended.reads(), 1);
     assert!(matches!(
         limit
             .ready_state(&key, &gen_ext, &dyn_extended, limit.deadline())
             .await?,
-        Some(ReadyState::Cached(ref s)) if *s == expected
+        Some(ReadyState::Cached(ref s)) if s.state() == &expected
     ));
     assert_eq!(extended.reads(), 1);
-    assert!(limit.cached_for_reader(&old_key, &first).is_none());
+    assert!(limit.cached_for_reader(height, first_tip, &first).is_none());
     assert!(
-        matches!(limit.cached_for_reader(&key, &extended), Some(ReadyState::Cached(ref state)) if *state == expected)
+        matches!(limit.cached_for_reader(height, extended_tip, &extended), Some(ReadyState::Cached(ref state)) if state.state() == &expected)
     );
     Ok(())
 }
@@ -621,7 +632,7 @@ async fn settled_cache_clears_when_settled_tip_extension_is_on_a_fork() -> eyre:
             .await?
             .is_none()
     );
-    assert_eq!(limit.flights.lock().settled.len(), 0);
+    assert_eq!(limit.settled.read().len(), 0);
     Ok(())
 }
 
@@ -652,7 +663,7 @@ async fn lagging_reader_at_prior_settled_tip_does_not_wipe_promoted_cache() -> e
         limit
             .ready_state(&newer_key, &newer_gen, &dyn_newer, limit.deadline())
             .await?,
-        Some(ReadyState::Cached(ref s)) if *s == expected
+        Some(ReadyState::Cached(ref s)) if s.state() == &expected
     ));
     assert_eq!(newer.reads(), baseline_reads);
     Ok(())
@@ -683,7 +694,7 @@ async fn replacement_store_with_shorter_settled_tip_resets_cache_after_old_reade
         limit
             .ready_state(&shorter_key, &shorter_gen, &dyn_shorter, limit.deadline())
             .await?,
-        Some(ReadyState::Cached(ref s)) if *s == rebuilt
+        Some(ReadyState::Cached(ref s)) if s.state() == &rebuilt
     ));
     Ok(())
 }
@@ -1124,7 +1135,7 @@ async fn zero_wait_refuses_contended_extension_check_immediately_without_queuein
     stalled.release_gate();
     assert!(matches!(
         leader.await??,
-        Some(ReadyState::Cached(ref state)) if *state == expected
+        Some(ReadyState::Cached(ref state)) if state.state() == &expected
     ));
     assert_eq!(stalled.header_reads(), 1);
     assert_eq!(extended_inner.reads(), 2);
@@ -1222,7 +1233,7 @@ async fn predecessor_frontier_mismatch_isolates_replacement_store_on_same_anchor
             .await?
             .is_none()
     );
-    assert_eq!(limit_same.flights.lock().settled.len(), 0);
+    assert_eq!(limit_same.settled.read().len(), 0);
     let state_b_same = replay_and_cache(&limit_same, &reader_b_same, height).await?;
     assert_ne!(state_a, state_b_same);
 
@@ -1237,7 +1248,7 @@ async fn predecessor_frontier_mismatch_isolates_replacement_store_on_same_anchor
             .await?
             .is_none()
     );
-    assert_eq!(limit_ext.flights.lock().settled.len(), 0);
+    assert_eq!(limit_ext.settled.read().len(), 0);
     let state_b_ext = replay_and_cache(&limit_ext, &reader_b_ext, height).await?;
     assert_ne!(state_a, state_b_ext);
     Ok(())
@@ -1346,7 +1357,7 @@ async fn already_dispatched_blocking_header_read_stays_single_flight_across_time
             tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await?;
-    assert!(matches!(promoted, Some(ReadyState::Cached(ref state)) if *state == expected));
+    assert!(matches!(promoted, Some(ReadyState::Cached(ref state)) if state.state() == &expected));
     assert_eq!(blocking.blocking_dispatches(), 1);
     assert_eq!(limit.waiter_count(), 0);
     Ok(())

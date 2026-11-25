@@ -1,0 +1,6 @@
+kind: fixed
+body: Fixed a CPU regression on warm unary gRPC responses and `GetTreeState` by eliminating spurious HTTP/2 release-gate reschedules on held terminal trailers while preserving full probe gating across all response sizes, removing per-request middleware boxing, mutex, and timer allocations on public gRPC listeners, fast-pathing `TipWait` when the requested height is at or below the visible tip, and moving warm settled tree-state cache hits onto a shared read lock with cached hexadecimal fields and zero per-call `height_band` string allocations.
+time: 2026-11-25T09:18:00Z
+custom:
+    Bump: patch
+    PR: "577"

@@ -260,20 +260,29 @@ async fn take_window_back(withheld: &WithheldEnd) -> Result<()> {
 
 #[tokio::test]
 async fn shutdown_replaces_a_status_held_behind_flow_control() -> Result<()> {
-    shutdown_while_sending("application/grpc", false).await
+    shutdown_while_sending("application/grpc", false, PAYLOAD).await
+}
+
+#[tokio::test]
+async fn shutdown_replaces_a_small_unary_status_held_behind_flow_control() -> Result<()> {
+    shutdown_while_sending("application/grpc", false, 1_653).await
 }
 
 #[tokio::test]
 async fn shutdown_replaces_a_status_before_grpc_web_encodes_it() -> Result<()> {
-    shutdown_while_sending("application/grpc-web+proto", false).await?;
-    shutdown_while_sending("application/grpc-web-text+proto", true).await
+    shutdown_while_sending("application/grpc-web+proto", false, PAYLOAD).await?;
+    shutdown_while_sending("application/grpc-web-text+proto", true, PAYLOAD).await
 }
 
 #[expect(
     clippy::future_not_send,
     reason = "the recorder guard stays on the current-thread test runtime"
 )]
-async fn shutdown_while_sending(content_type: &'static str, text: bool) -> Result<()> {
+async fn shutdown_while_sending(
+    content_type: &'static str,
+    text: bool,
+    payload: usize,
+) -> Result<()> {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let metrics = recorder.handle();
     let _recorder = metrics::set_default_local_recorder(&recorder);
@@ -284,7 +293,7 @@ async fn shutdown_while_sending(content_type: &'static str, text: bool) -> Resul
         shutdown: Some((Arc::clone(&calls), shutdown.clone())),
         ..Bounds::default()
     })?;
-    let message = message_frame(PAYLOAD, 0);
+    let message = message_frame(payload, 0);
     let (message, request_frame) = if text {
         (
             STANDARD.encode(message).into_bytes(),
@@ -298,7 +307,7 @@ async fn shutdown_while_sending(content_type: &'static str, text: bool) -> Resul
     let mut body = client.open_stream_as(content_type, request_frame).await?;
     let mut script = server.next_script().await?;
     let producer = script.frames.clone();
-    script.send_message(PAYLOAD).await?;
+    script.send_message(payload).await?;
     script.finish().await?;
     within_wait_limit(producer.closed()).await?;
 
@@ -455,6 +464,87 @@ async fn a_window_taken_back_before_the_end_resets_the_stream() -> Result<()> {
 
     // The reset stream's slot is free again: the connection carries a full
     // set of new streams at once.
+    let streams = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)?;
+    let opened = within_wait_limit(futures_util::future::try_join_all(
+        (0..streams).map(|_| client.open_stream()),
+    ))
+    .await??;
+    for _ in 0..streams {
+        server.next_script().await?;
+    }
+    assert_eq!(opened.len(), streams);
+    drop(proxy);
+    Ok(())
+}
+
+/// A small unary response on a backpressured connection stays probe-gated.
+///
+/// Withdrawing window with `SETTINGS` then resets the stream and frees its slot
+/// instead of stranding queued data in h2.
+#[tokio::test]
+async fn a_window_taken_back_on_a_backpressured_connection_resets_a_small_unary_stream()
+-> Result<()> {
+    let mut server = serve(Bounds {
+        send_stall: WINDOW_CHANGE_STALL,
+        send_buffer: Some(4096),
+        ..Bounds::default()
+    })?;
+    let proxy = spawn_pausable_proxy(server.address).await?;
+    let client = H2Client::connect(proxy.address, 1024 * 1024).await?;
+    let mut body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    let mut small_body = client.open_stream().await?;
+    let mut small_script = server.next_script().await?;
+
+    proxy.flowing.send(false)?;
+    let body_dropped = script.frames.clone();
+    let small_dropped = small_script.frames.clone();
+    script.send_message(380 * 1024).await?;
+    script.finish().await?;
+    small_script.send_message(1_653).await?;
+    small_script.finish().await?;
+
+    let mut departure_waits = server.departure_waits.clone();
+    let ended_early = within_wait_limit(async {
+        tokio::select! {
+            waited = departure_waits.wait_for(|waits| *waits >= 2) => waited.map(|_| false),
+            () = body_dropped.closed() => Ok(true),
+            () = small_dropped.closed() => Ok(true),
+        }
+    })
+    .await??;
+    ensure!(
+        !ended_early,
+        "a response bypassed probe gating on a backpressured connection"
+    );
+
+    ensure!(
+        client.set_stream_window(0).await?,
+        "the window change was refused"
+    );
+    proxy.flowing.send(true)?;
+    wait_until_async("the server acknowledges the window change", || {
+        client.set_stream_window(0)
+    })
+    .await?;
+
+    within_wait_limit(body_dropped.closed()).await?;
+    within_wait_limit(small_dropped.closed()).await?;
+    wait_until("both stranded streams' data is freed", || {
+        server.all_freed(2)
+    })
+    .await?;
+    for stream in [&mut body, &mut small_body] {
+        let ended_with = loop {
+            match within_wait_limit(stream.data()).await? {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => break error.reason(),
+                None => break None,
+            }
+        };
+        assert_eq!(ended_with, Some(h2::Reason::CANCEL));
+    }
+
     let streams = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)?;
     let opened = within_wait_limit(futures_util::future::try_join_all(
         (0..streams).map(|_| client.open_stream()),
