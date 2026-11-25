@@ -59,46 +59,56 @@ const CHAIN_METADATA_TAG_IRONWOOD: u32 = 3;
 const EMPTY_CHAIN_METADATA_WIRE: [u8; 2] = [0x42, 0x00];
 
 /// Selection flags controlling how [`splice_compact_block_wire`] merges
-/// `ZSTSUP01` Tag-1 transparent supplements onto a `ZSHRNG02` `CompactBlock`.
+/// `ZSTSUP01` Tag-1 supplements onto a `ZSHRNG02` `CompactBlock`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompactBlockSpliceSelection {
     /// Merge transparent inputs (`vin`), outputs (`vout`), and transparent-only transactions.
     pub include_transparent: bool,
     /// Emit nullifier-only form (strip outputs/ciphertexts/metadata and omit `vin`/`vout`).
     pub nullifiers_only: bool,
-    /// When `nullifiers_only` is `true`, retain transparent-only transactions as
-    /// `{index, txid, fee}` shells matching `GetBlockNullifiers`.
-    pub include_nullifier_tx_shells: bool,
+    /// Retain componentless transactions and `{index, txid, fee}` shells for
+    /// transactions omitted by shielded or transparent pool filtering (`GetBlock` /
+    /// `GetBlockNullifiers`), instead of dropping unmatched Tag-1 entries.
+    pub retain_all_transactions: bool,
 }
 
 impl CompactBlockSpliceSelection {
-    /// Full compact block (`GetBlock` / shielded + transparent `GetBlockRange`).
+    /// Full unary compact block (`GetBlock`), retaining all transactions.
     pub const FULL_BLOCK: Self = Self {
         include_transparent: true,
         nullifiers_only: false,
-        include_nullifier_tx_shells: false,
+        retain_all_transactions: true,
+    };
+
+    /// Filtered range splice (`GetBlockRange` with transparent pool enabled),
+    /// emitting transparent-only and matched transparent bundles without leaking
+    /// excluded pool shells or componentless transactions.
+    pub const RANGE_WITH_TRANSPARENT: Self = Self {
+        include_transparent: true,
+        nullifiers_only: false,
+        retain_all_transactions: false,
     };
 
     /// Default shielded range (`GetBlockRange` without transparent pool).
     pub const DEFAULT_SHIELDED: Self = Self {
         include_transparent: false,
         nullifiers_only: false,
-        include_nullifier_tx_shells: false,
+        retain_all_transactions: false,
     };
 
     /// Default nullifier range (`GetBlockRangeNullifiers`).
     pub const DEFAULT_NULLIFIERS: Self = Self {
         include_transparent: false,
         nullifiers_only: true,
-        include_nullifier_tx_shells: false,
+        retain_all_transactions: false,
     };
 
-    /// Unary nullifier block (`GetBlockNullifiers`), retaining transparent-only
+    /// Unary nullifier block (`GetBlockNullifiers`), retaining non-shielded
     /// transactions as `{index, txid, fee}` shells.
     pub const BLOCK_NULLIFIERS: Self = Self {
         include_transparent: false,
         nullifiers_only: true,
-        include_nullifier_tx_shells: true,
+        retain_all_transactions: true,
     };
 
     /// Constructs a range splice selection from `include_transparent` and `nullifiers_only`.
@@ -107,15 +117,15 @@ impl CompactBlockSpliceSelection {
         Self {
             include_transparent,
             nullifiers_only,
-            include_nullifier_tx_shells: false,
+            retain_all_transactions: false,
         }
     }
 
-    /// Enables retaining transparent-only `{index, txid, fee}` shells when
-    /// `nullifiers_only` is set.
+    /// Enables retaining `{index, txid, fee}` shells for unmatched Tag-1 entries
+    /// (unary `GetBlock` / `GetBlockNullifiers` semantics).
     #[must_use]
-    pub const fn with_nullifier_tx_shells(mut self, include_shells: bool) -> Self {
-        self.include_nullifier_tx_shells = include_shells;
+    pub const fn with_retain_all_transactions(mut self, retain_all: bool) -> Self {
+        self.retain_all_transactions = retain_all;
         self
     }
 }
@@ -149,6 +159,7 @@ const HEADER_SEEN_CHAIN_METADATA: u8 = 1 << 6;
 
 struct BlockHeaderPresence {
     flags: u8,
+    prev_tag: u32,
     last_tx_index: Option<u64>,
 }
 
@@ -156,6 +167,7 @@ impl BlockHeaderPresence {
     const fn empty() -> Self {
         Self {
             flags: 0,
+            prev_tag: 0,
             last_tx_index: None,
         }
     }
@@ -294,6 +306,7 @@ fn process_block_field(
     cursor: &mut &[u8],
     ctx: &mut BlockSpliceContext<'_>,
 ) -> Result<(), SettledSupplementSegmentError> {
+    check_ascending_tag(&mut ctx.presence.prev_tag, field.tag, "CompactBlock")?;
     match field.tag {
         COMPACT_BLOCK_TAG_HEIGHT | COMPACT_BLOCK_TAG_TIME => {
             process_scalar_block_field(field, cursor, ctx)
@@ -448,7 +461,7 @@ fn process_vtx_field(
     }
     ctx.presence.set(HEADER_SEEN_VTX);
     let tx_bytes = take_length_delimited(cursor)?;
-    let tx_meta = inspect_and_validate_shielded_tx(tx_bytes)?;
+    let tx_meta = inspect_and_validate_shielded_tx(tx_bytes, ctx.selection.nullifiers_only)?;
     if ctx
         .presence
         .last_tx_index
@@ -503,15 +516,19 @@ fn emit_transparent_only_if_selected(
     selection: CompactBlockSpliceSelection,
     out: &mut Vec<u8>,
 ) -> Result<(), SettledSupplementSegmentError> {
+    let has_transparent =
+        !sup_tx.transparent_inputs.is_empty() || !sup_tx.transparent_outputs.is_empty();
     let fee = fee_to_wire_u32(sup_tx.fee_zat)?;
     if selection.nullifiers_only {
-        if selection.include_nullifier_tx_shells {
+        if selection.retain_all_transactions {
             encode_shell_compact_tx(sup_tx.index, sup_tx.transaction_id, fee, out);
         }
         return Ok(());
     }
-    if selection.include_transparent {
+    if selection.include_transparent && has_transparent {
         encode_full_transparent_compact_tx(sup_tx, fee, out);
+    } else if selection.retain_all_transactions {
+        encode_shell_compact_tx(sup_tx.index, sup_tx.transaction_id, fee, out);
     }
     Ok(())
 }
@@ -640,6 +657,11 @@ fn extract_action_nullifier_wire<'a>(
             }
             _ => skip_wire_field(wire_type, &mut cursor)?,
         }
+    }
+    if nullifier_wire.is_empty() {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "CompactOrchardAction missing nullifier".to_owned(),
+        ));
     }
     Ok(nullifier_wire)
 }
@@ -1093,25 +1115,114 @@ fn decode_shielded_actions(
         .collect()
 }
 
+fn check_ascending_tag(
+    prev_tag: &mut u32,
+    tag: u32,
+    msg_name: &str,
+) -> Result<(), SettledSupplementSegmentError> {
+    if tag == 0 || tag < *prev_tag {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(format!(
+            "{msg_name} wire fields are not in ascending tag order"
+        )));
+    }
+    *prev_tag = tag;
+    Ok(())
+}
+
+fn check_unique_tag(
+    seen: &mut bool,
+    field_name: &str,
+) -> Result<(), SettledSupplementSegmentError> {
+    if *seen {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(format!(
+            "duplicate {field_name} in wire message"
+        )));
+    }
+    *seen = true;
+    Ok(())
+}
+
+fn check_unique_presence_mask(
+    flags: &mut u8,
+    mask: u8,
+    field_name: &str,
+) -> Result<(), SettledSupplementSegmentError> {
+    if (*flags & mask) != 0 {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(format!(
+            "duplicate {field_name} in wire message"
+        )));
+    }
+    *flags |= mask;
+    Ok(())
+}
+
 fn validate_shielded_block_wire(raw_payload: &[u8]) -> Result<(), SettledSupplementSegmentError> {
     let mut cursor = raw_payload;
+    let mut presence = BlockHeaderPresence::empty();
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
+        check_ascending_tag(&mut presence.prev_tag, tag, "CompactBlock")?;
         match tag {
-            COMPACT_BLOCK_TAG_HEIGHT | COMPACT_BLOCK_TAG_TIME => {
-                expect_wire_type(wire_type, WireType::Varint, "CompactBlock scalar")?;
+            COMPACT_BLOCK_TAG_HEIGHT => {
+                check_unique_presence_mask(
+                    &mut presence.flags,
+                    HEADER_SEEN_HEIGHT,
+                    "CompactBlock.height",
+                )?;
+                expect_wire_type(wire_type, WireType::Varint, "CompactBlock.height")?;
                 decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
             }
-            COMPACT_BLOCK_TAG_HASH | COMPACT_BLOCK_TAG_PREV_HASH | COMPACT_BLOCK_TAG_HEADER => {
-                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock bytes")?;
+            COMPACT_BLOCK_TAG_TIME => {
+                check_unique_presence_mask(
+                    &mut presence.flags,
+                    HEADER_SEEN_TIME,
+                    "CompactBlock.time",
+                )?;
+                expect_wire_type(wire_type, WireType::Varint, "CompactBlock.time")?;
+                decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
+            }
+            COMPACT_BLOCK_TAG_HASH => {
+                check_unique_presence_mask(
+                    &mut presence.flags,
+                    HEADER_SEEN_HASH,
+                    "CompactBlock.hash",
+                )?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.hash")?;
+                let _bytes = take_length_delimited(&mut cursor)?;
+            }
+            COMPACT_BLOCK_TAG_PREV_HASH => {
+                check_unique_presence_mask(
+                    &mut presence.flags,
+                    HEADER_SEEN_PREV_HASH,
+                    "CompactBlock.prev_hash",
+                )?;
+                expect_wire_type(
+                    wire_type,
+                    WireType::LengthDelimited,
+                    "CompactBlock.prev_hash",
+                )?;
+                let _bytes = take_length_delimited(&mut cursor)?;
+            }
+            COMPACT_BLOCK_TAG_HEADER => {
+                check_unique_presence_mask(
+                    &mut presence.flags,
+                    HEADER_SEEN_HEADER,
+                    "CompactBlock.header",
+                )?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.header")?;
                 let _bytes = take_length_delimited(&mut cursor)?;
             }
             COMPACT_BLOCK_TAG_VTX => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.vtx")?;
                 let tx_bytes = take_length_delimited(&mut cursor)?;
-                inspect_and_validate_shielded_tx(tx_bytes)?;
+                inspect_and_validate_shielded_tx(tx_bytes, false)?;
             }
             COMPACT_BLOCK_TAG_CHAIN_METADATA => {
+                check_unique_presence_mask(
+                    &mut presence.flags,
+                    HEADER_SEEN_CHAIN_METADATA,
+                    "CompactBlock.chain_metadata",
+                )?;
                 expect_wire_type(wire_type, WireType::LengthDelimited, "chain_metadata")?;
                 let meta_bytes = take_length_delimited(&mut cursor)?;
                 validate_chain_metadata_wire(meta_bytes)?;
@@ -1124,20 +1235,27 @@ fn validate_shielded_block_wire(raw_payload: &[u8]) -> Result<(), SettledSupplem
 
 fn inspect_and_validate_shielded_tx(
     tx_bytes: &[u8],
+    allow_nullifier_only_actions: bool,
 ) -> Result<WireTxMeta<'_>, SettledSupplementSegmentError> {
     let mut cursor = tx_bytes;
+    let mut prev_tag = 0_u32;
     let mut index = 0_u64;
     let mut fee = 0_u32;
     let mut txid_bytes: &[u8] = &[];
+    let mut seen_index = false;
     let mut seen_txid = false;
+    let mut seen_fee = false;
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
+        check_ascending_tag(&mut prev_tag, tag, "CompactTx")?;
         match tag {
             COMPACT_TX_TAG_INDEX => {
+                check_unique_tag(&mut seen_index, "CompactTx.index")?;
                 expect_wire_type(wire_type, WireType::Varint, "CompactTx.index")?;
                 index = decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
             }
             COMPACT_TX_TAG_FEE => {
+                check_unique_tag(&mut seen_fee, "CompactTx.fee")?;
                 expect_wire_type(wire_type, WireType::Varint, "CompactTx.fee")?;
                 let raw_fee = decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
                 fee = u32::try_from(raw_fee).map_err(|_| {
@@ -1147,6 +1265,7 @@ fn inspect_and_validate_shielded_tx(
                 })?;
             }
             COMPACT_TX_TAG_TXID => {
+                check_unique_tag(&mut seen_txid, "CompactTx.txid")?;
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx.txid")?;
                 txid_bytes = take_length_delimited(&mut cursor)?;
                 decode_internal_transaction_id(txid_bytes).map_err(|err| {
@@ -1154,7 +1273,6 @@ fn inspect_and_validate_shielded_tx(
                         "invalid CompactTx.txid: {err}"
                     ))
                 })?;
-                seen_txid = true;
             }
             COMPACT_TX_TAG_SPENDS => {
                 validate_nested_field(wire_type, &mut cursor, validate_sapling_spend_wire)?;
@@ -1163,7 +1281,9 @@ fn inspect_and_validate_shielded_tx(
                 validate_nested_field(wire_type, &mut cursor, validate_sapling_output_wire)?;
             }
             COMPACT_TX_TAG_ACTIONS | COMPACT_TX_TAG_IRONWOOD_ACTIONS => {
-                validate_nested_field(wire_type, &mut cursor, validate_action_wire)?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx nested")?;
+                let nested = take_length_delimited(&mut cursor)?;
+                validate_action_wire(nested, allow_nullifier_only_actions)?;
             }
             COMPACT_TX_TAG_VIN | COMPACT_TX_TAG_VOUT => {
                 return Err(SettledSupplementSegmentError::PayloadIntegrity(
@@ -1197,60 +1317,145 @@ fn validate_nested_field(
 
 fn validate_sapling_spend_wire(bytes: &[u8]) -> Result<(), SettledSupplementSegmentError> {
     let mut cursor = bytes;
+    let mut prev_tag = 0_u32;
+    let mut seen_nf = false;
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
+        check_ascending_tag(&mut prev_tag, tag, "CompactSaplingSpend")?;
         match tag {
             SAPLING_SPEND_TAG_NF => {
+                check_unique_tag(&mut seen_nf, "CompactSaplingSpend.nf")?;
                 expect_wire_type(wire_type, WireType::LengthDelimited, "spend.nf")?;
-                let _nf = take_length_delimited(&mut cursor)?;
+                let nf = take_length_delimited(&mut cursor)?;
+                fixed_32(nf, "CompactSaplingSpend.nf")?;
             }
             _ => skip_wire_field(wire_type, &mut cursor)?,
         }
+    }
+    if !seen_nf {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "CompactSaplingSpend missing nf".to_owned(),
+        ));
     }
     Ok(())
 }
 
 fn validate_sapling_output_wire(bytes: &[u8]) -> Result<(), SettledSupplementSegmentError> {
     let mut cursor = bytes;
+    let mut prev_tag = 0_u32;
+    let mut seen_cmu = false;
+    let mut seen_epk = false;
+    let mut seen_ct = false;
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
+        check_ascending_tag(&mut prev_tag, tag, "CompactSaplingOutput")?;
         match tag {
-            SAPLING_OUTPUT_TAG_CMU | SAPLING_OUTPUT_TAG_EPK | SAPLING_OUTPUT_TAG_CIPHERTEXT => {
-                expect_wire_type(wire_type, WireType::LengthDelimited, "sapling output field")?;
-                let _bytes = take_length_delimited(&mut cursor)?;
+            SAPLING_OUTPUT_TAG_CMU => {
+                check_unique_tag(&mut seen_cmu, "CompactSaplingOutput.cmu")?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "output.cmu")?;
+                let field_bytes = take_length_delimited(&mut cursor)?;
+                fixed_32(field_bytes, "CompactSaplingOutput.cmu")?;
+            }
+            SAPLING_OUTPUT_TAG_EPK => {
+                check_unique_tag(&mut seen_epk, "CompactSaplingOutput.ephemeralKey")?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "output.ephemeralKey")?;
+                let field_bytes = take_length_delimited(&mut cursor)?;
+                fixed_32(field_bytes, "CompactSaplingOutput.ephemeralKey")?;
+            }
+            SAPLING_OUTPUT_TAG_CIPHERTEXT => {
+                check_unique_tag(&mut seen_ct, "CompactSaplingOutput.ciphertext")?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "output.ciphertext")?;
+                let field_bytes = take_length_delimited(&mut cursor)?;
+                fixed_52(field_bytes, "CompactSaplingOutput.ciphertext")?;
             }
             _ => skip_wire_field(wire_type, &mut cursor)?,
         }
+    }
+    if !(seen_cmu && seen_epk && seen_ct) {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "CompactSaplingOutput missing cmu, ephemeralKey, or ciphertext".to_owned(),
+        ));
     }
     Ok(())
 }
 
-fn validate_action_wire(bytes: &[u8]) -> Result<(), SettledSupplementSegmentError> {
+fn validate_action_wire(
+    bytes: &[u8],
+    allow_nullifier_only: bool,
+) -> Result<(), SettledSupplementSegmentError> {
     let mut cursor = bytes;
+    let mut prev_tag = 0_u32;
+    let mut seen_nf = false;
+    let mut seen_cmx = false;
+    let mut seen_epk = false;
+    let mut seen_ct = false;
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
+        check_ascending_tag(&mut prev_tag, tag, "CompactOrchardAction")?;
         match tag {
-            ACTION_TAG_NULLIFIER
-            | ACTION_TAG_CMX
-            | ACTION_TAG_EPHEMERAL_KEY
-            | ACTION_TAG_CIPHERTEXT => {
-                expect_wire_type(wire_type, WireType::LengthDelimited, "action field")?;
-                let _bytes = take_length_delimited(&mut cursor)?;
+            ACTION_TAG_NULLIFIER => {
+                check_unique_tag(&mut seen_nf, "action.nullifier")?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "action.nullifier")?;
+                let field_bytes = take_length_delimited(&mut cursor)?;
+                fixed_32(field_bytes, "action.nullifier")?;
+            }
+            ACTION_TAG_CMX => {
+                check_unique_tag(&mut seen_cmx, "action.cmx")?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "action.cmx")?;
+                let field_bytes = take_length_delimited(&mut cursor)?;
+                fixed_32(field_bytes, "action.cmx")?;
+            }
+            ACTION_TAG_EPHEMERAL_KEY => {
+                check_unique_tag(&mut seen_epk, "action.ephemeralKey")?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "action.ephemeralKey")?;
+                let field_bytes = take_length_delimited(&mut cursor)?;
+                fixed_32(field_bytes, "action.ephemeralKey")?;
+            }
+            ACTION_TAG_CIPHERTEXT => {
+                check_unique_tag(&mut seen_ct, "action.ciphertext")?;
+                expect_wire_type(wire_type, WireType::LengthDelimited, "action.ciphertext")?;
+                let field_bytes = take_length_delimited(&mut cursor)?;
+                fixed_52(field_bytes, "action.ciphertext")?;
             }
             _ => skip_wire_field(wire_type, &mut cursor)?,
         }
     }
-    Ok(())
+    if !seen_nf {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "CompactOrchardAction missing nullifier".to_owned(),
+        ));
+    }
+    match (seen_cmx, seen_epk, seen_ct) {
+        (true, true, true) => Ok(()),
+        (false, false, false) if allow_nullifier_only => Ok(()),
+        _ => Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "CompactOrchardAction missing commitment, ephemeralKey, or ciphertext".to_owned(),
+        )),
+    }
 }
 
 fn validate_chain_metadata_wire(bytes: &[u8]) -> Result<(), SettledSupplementSegmentError> {
     let mut cursor = bytes;
+    let mut prev_tag = 0_u32;
+    let mut seen_sapling = false;
+    let mut seen_orchard = false;
+    let mut seen_ironwood = false;
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
+        check_ascending_tag(&mut prev_tag, tag, "ChainMetadata")?;
         match tag {
-            CHAIN_METADATA_TAG_SAPLING
-            | CHAIN_METADATA_TAG_ORCHARD
-            | CHAIN_METADATA_TAG_IRONWOOD => {
+            CHAIN_METADATA_TAG_SAPLING => {
+                check_unique_tag(&mut seen_sapling, "ChainMetadata.sapling")?;
+                expect_wire_type(wire_type, WireType::Varint, "ChainMetadata size")?;
+                decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
+            }
+            CHAIN_METADATA_TAG_ORCHARD => {
+                check_unique_tag(&mut seen_orchard, "ChainMetadata.orchard")?;
+                expect_wire_type(wire_type, WireType::Varint, "ChainMetadata size")?;
+                decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
+            }
+            CHAIN_METADATA_TAG_IRONWOOD => {
+                check_unique_tag(&mut seen_ironwood, "ChainMetadata.ironwood")?;
                 expect_wire_type(wire_type, WireType::Varint, "ChainMetadata size")?;
                 decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
             }

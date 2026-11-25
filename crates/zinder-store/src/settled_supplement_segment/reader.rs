@@ -644,9 +644,7 @@ const fn splice_needs_tag1(
     selection: CompactBlockSpliceSelection,
     row: &IndexedSupplementBlock,
 ) -> bool {
-    row.has_transparent()
-        && (selection.include_transparent
-            || (selection.nullifiers_only && selection.include_nullifier_tx_shells))
+    row.has_transparent() && (selection.include_transparent || selection.retain_all_transactions)
 }
 
 fn finish_encoded_frame(frame: Vec<u8>) -> Result<EncodedBlock, SettledSupplementSegmentError> {

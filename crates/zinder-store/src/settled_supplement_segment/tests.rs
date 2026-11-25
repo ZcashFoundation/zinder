@@ -6,7 +6,10 @@ use std::{
     sync::atomic::Ordering,
 };
 
-use prost::Message as _;
+use prost::{
+    Message as _,
+    encoding::{WireType, encode_key, encode_varint},
+};
 use sha2::{Digest as _, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 use zinder_core::{
@@ -535,9 +538,11 @@ fn prost_transparent_only_tx(
     txid: Vec<u8>,
     selection: CompactBlockSpliceSelection,
 ) -> Option<lightwalletd::CompactTx> {
+    let has_transparent =
+        !tx.data.transparent_inputs.is_empty() || !tx.data.transparent_outputs.is_empty();
     if selection.nullifiers_only {
         return selection
-            .include_nullifier_tx_shells
+            .retain_all_transactions
             .then_some(lightwalletd::CompactTx {
                 index: tx.index,
                 txid,
@@ -550,21 +555,33 @@ fn prost_transparent_only_tx(
                 vout: Vec::new(),
             });
     }
-    if !selection.include_transparent {
-        return None;
+    if selection.include_transparent && has_transparent {
+        let (vin, vout) = prost_transparent_parts(tx);
+        return Some(lightwalletd::CompactTx {
+            index: tx.index,
+            txid,
+            fee,
+            spends: Vec::new(),
+            outputs: Vec::new(),
+            actions: Vec::new(),
+            ironwood_actions: Vec::new(),
+            vin,
+            vout,
+        });
     }
-    let (vin, vout) = prost_transparent_parts(tx);
-    Some(lightwalletd::CompactTx {
-        index: tx.index,
-        txid,
-        fee,
-        spends: Vec::new(),
-        outputs: Vec::new(),
-        actions: Vec::new(),
-        ironwood_actions: Vec::new(),
-        vin,
-        vout,
-    })
+    selection
+        .retain_all_transactions
+        .then_some(lightwalletd::CompactTx {
+            index: tx.index,
+            txid,
+            fee,
+            spends: Vec::new(),
+            outputs: Vec::new(),
+            actions: Vec::new(),
+            ironwood_actions: Vec::new(),
+            vin: Vec::new(),
+            vout: Vec::new(),
+        })
 }
 
 fn prost_action(
@@ -786,6 +803,7 @@ fn splice_wire_matches_prost_across_all_block_shapes_and_modes() -> TestOutcome 
 
     let selections = [
         CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
         CompactBlockSpliceSelection::DEFAULT_SHIELDED,
         CompactBlockSpliceSelection::DEFAULT_NULLIFIERS,
         CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
@@ -2063,6 +2081,7 @@ fn preserves_shielded_zero_fee_without_tag2_and_componentless_txs() -> TestOutco
     ];
     let selections = [
         CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
         CompactBlockSpliceSelection::DEFAULT_SHIELDED,
         CompactBlockSpliceSelection::DEFAULT_NULLIFIERS,
         CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
@@ -2136,5 +2155,480 @@ fn reconstruct_rejects_non_ascending_tag2_tx_index() -> TestOutcome {
         reconstruct_compact_block_artifact(&shielded.payload(), &bad_record),
         Err(SettledSupplementSegmentError::PayloadIntegrity(_))
     ));
+    Ok(())
+}
+
+fn sapling_plus_transparent_mix_block(height: u32) -> TestOutcome<CompactBlockArtifact> {
+    let txs = vec![
+        CompactTransaction {
+            index: 0,
+            transaction_id: det_txid(70),
+            data: CompactTransactionData {
+                fee_zat: Some(0),
+                transparent_outputs: vec![t_out(100_000, 0x71)],
+                ..CompactTransactionData::default()
+            },
+        },
+        CompactTransaction {
+            index: 1,
+            transaction_id: det_txid(71),
+            data: CompactTransactionData {
+                fee_zat: Some(5_000),
+                sapling_spends: vec![sapling_spend(0x72)],
+                sapling_outputs: vec![sapling_output(0x73)],
+                ..CompactTransactionData::default()
+            },
+        },
+        CompactTransaction {
+            index: 2,
+            transaction_id: det_txid(72),
+            data: CompactTransactionData {
+                fee_zat: Some(0),
+                orchard_actions: vec![shielded_action(0x74)],
+                ..CompactTransactionData::default()
+            },
+        },
+        CompactTransaction {
+            index: 3,
+            transaction_id: det_txid(73),
+            data: CompactTransactionData {
+                fee_zat: None,
+                ..CompactTransactionData::default()
+            },
+        },
+        CompactTransaction {
+            index: 4,
+            transaction_id: det_txid(74),
+            data: CompactTransactionData {
+                fee_zat: Some(7_000),
+                sapling_outputs: vec![sapling_output(0x75)],
+                transparent_inputs: vec![t_in(76, 1)],
+                transparent_outputs: vec![t_out(25_000, 0x77)],
+                ..CompactTransactionData::default()
+            },
+        },
+        CompactTransaction {
+            index: 5,
+            transaction_id: det_txid(75),
+            data: CompactTransactionData {
+                fee_zat: Some(9_000),
+                orchard_actions: vec![shielded_action(0x78)],
+                transparent_inputs: vec![t_in(79, 0)],
+                transparent_outputs: vec![t_out(10_000, 0x7A)],
+                ..CompactTransactionData::default()
+            },
+        },
+    ];
+    Ok(CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(height), det_block_hash(height)),
+        det_block_hash(height - 1),
+        1_735_000_000 + height,
+        txs,
+        make_meta(height),
+    )?)
+}
+
+fn prost_sapling_plus_transparent_oracle(
+    block: &CompactBlockArtifact,
+) -> TestOutcome<EncodedBlock> {
+    let mut vtx = Vec::new();
+    for tx in block.transactions() {
+        let has_sapling = !tx.data.sapling_spends.is_empty() || !tx.data.sapling_outputs.is_empty();
+        let has_transparent =
+            !tx.data.transparent_inputs.is_empty() || !tx.data.transparent_outputs.is_empty();
+        if !has_sapling && !has_transparent {
+            continue;
+        }
+        let filtered_tx = CompactTransaction {
+            index: tx.index,
+            transaction_id: tx.transaction_id,
+            data: CompactTransactionData {
+                fee_zat: tx.data.fee_zat,
+                sapling_spends: tx.data.sapling_spends.clone(),
+                sapling_outputs: tx.data.sapling_outputs.clone(),
+                orchard_actions: Vec::new(),
+                ironwood_actions: Vec::new(),
+                transparent_inputs: tx.data.transparent_inputs.clone(),
+                transparent_outputs: tx.data.transparent_outputs.clone(),
+            },
+        };
+        let (vin, vout) = prost_transparent_parts(&filtered_tx);
+        let spends = filtered_tx
+            .data
+            .sapling_spends
+            .iter()
+            .map(|spend| lightwalletd::CompactSaplingSpend {
+                nf: spend.nullifier.to_vec(),
+            })
+            .collect();
+        let outputs = filtered_tx
+            .data
+            .sapling_outputs
+            .iter()
+            .map(|output| lightwalletd::CompactSaplingOutput {
+                cmu: output.commitment.to_vec(),
+                ephemeral_key: output.ephemeral_key.to_vec(),
+                ciphertext: output.ciphertext.to_vec(),
+            })
+            .collect();
+        vtx.push(lightwalletd::CompactTx {
+            index: filtered_tx.index,
+            txid: encode_internal_transaction_id(filtered_tx.transaction_id).to_vec(),
+            fee: filtered_tx
+                .data
+                .fee_zat
+                .map(u32::try_from)
+                .transpose()?
+                .unwrap_or(0),
+            spends,
+            outputs,
+            actions: Vec::new(),
+            ironwood_actions: Vec::new(),
+            vin,
+            vout,
+        });
+    }
+    let meta = block.chain_metadata();
+    let proto_block = lightwalletd::CompactBlock {
+        height: u64::from(block.height().value()),
+        hash: encode_internal_block_hash(block.block_hash()).to_vec(),
+        prev_hash: encode_internal_block_hash(block.previous_block_hash()).to_vec(),
+        time: block.time(),
+        header: Vec::new(),
+        vtx,
+        chain_metadata: Some(lightwalletd::ChainMetadata {
+            sapling_commitment_tree_size: meta.sapling_commitment_tree_size,
+            orchard_commitment_tree_size: meta.orchard_commitment_tree_size,
+            ironwood_commitment_tree_size: meta.ironwood_commitment_tree_size,
+        }),
+    };
+    Ok(EncodedBlock::encode(&proto_block)?)
+}
+
+#[test]
+fn sapling_plus_transparent_range_omits_orchard_fee_and_componentless_shells() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let block = sapling_plus_transparent_mix_block(560)?;
+    let (_p, shielded_reader, _id, sup_reader) = write_paired_segments(
+        dir.path(),
+        std::slice::from_ref(&block),
+        false,
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    let range = BlockHeightRange::inclusive(block.height(), block.height());
+    let sapling_frames = shielded_reader.read_projected_range(
+        range,
+        HeightOrder::Ascending,
+        ShieldedProjectionSelection::new(true, false, false, false),
+    )?;
+    let spliced = sup_reader.splice_encoded_range_wire(
+        block.height(),
+        &sapling_frames,
+        CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
+    )?;
+    let oracle = prost_sapling_plus_transparent_oracle(&block)?;
+    assert_eq!(spliced[0].as_length_prefixed(), oracle.as_length_prefixed());
+    let unary_range_mode = sup_reader.splice_block_wire(
+        block.height(),
+        &sapling_frames[0].payload(),
+        CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
+    )?;
+    assert_eq!(
+        unary_range_mode.as_length_prefixed(),
+        oracle.as_length_prefixed()
+    );
+    let decoded = lightwalletd::CompactBlock::decode(spliced[0].payload().as_ref())?;
+    let emitted_indices: Vec<u64> = decoded.vtx.iter().map(|tx| tx.index).collect();
+    assert_eq!(emitted_indices, vec![0, 1, 4, 5]);
+
+    let default_frames = shielded_reader.read_projected_range(
+        range,
+        HeightOrder::Ascending,
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+    )?;
+    let unary_full = sup_reader.splice_block_wire(
+        block.height(),
+        &default_frames[0].payload(),
+        CompactBlockSpliceSelection::FULL_BLOCK,
+    )?;
+    let full_oracle = prost_compact_block(&block, CompactBlockSpliceSelection::FULL_BLOCK)?;
+    assert_eq!(
+        unary_full.as_length_prefixed(),
+        full_oracle.as_length_prefixed()
+    );
+    let restored = sup_reader.reconstruct_block(block.height(), &default_frames[0].payload())?;
+    assert_eq!(restored, block);
+    assert_eq!(restored.transactions()[2].data.fee_zat, Some(0));
+    Ok(())
+}
+
+fn wire_varint_field(tag: u32, num: u64, out: &mut Vec<u8>) {
+    encode_key(tag, WireType::Varint, out);
+    encode_varint(num, out);
+}
+
+fn wire_bytes_field(tag: u32, payload: &[u8], out: &mut Vec<u8>) {
+    encode_key(tag, WireType::LengthDelimited, out);
+    encode_varint(u64::try_from(payload.len()).unwrap_or(u64::MAX), out);
+    out.extend_from_slice(payload);
+}
+
+fn empty_supplement_record() -> BlockSupplementRecord {
+    BlockSupplementRecord {
+        transparent_transactions: Vec::new(),
+        canonical_metadata: None,
+    }
+}
+
+fn wrap_tx_in_block_wire(height: u32, tx_wire: &[u8]) -> Vec<u8> {
+    let mut blk = Vec::new();
+    wire_varint_field(2, u64::from(height), &mut blk);
+    let hash_wire = encode_internal_block_hash(det_block_hash(height));
+    let prev_wire = encode_internal_block_hash(det_block_hash(height - 1));
+    wire_bytes_field(3, &hash_wire, &mut blk);
+    wire_bytes_field(4, &prev_wire, &mut blk);
+    wire_varint_field(5, u64::from(1_735_000_000 + height), &mut blk);
+    wire_bytes_field(7, tx_wire, &mut blk);
+    let mut meta = Vec::new();
+    wire_varint_field(1, 100, &mut meta);
+    wire_bytes_field(8, &meta, &mut blk);
+    blk
+}
+
+fn encode_valid_spend_bytes(seed: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    wire_bytes_field(1, &[seed; 32], &mut out);
+    out
+}
+
+fn encode_valid_output_bytes(seed: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    wire_bytes_field(1, &[seed; 32], &mut out);
+    wire_bytes_field(2, &[seed.wrapping_add(1); 32], &mut out);
+    wire_bytes_field(3, &[seed.wrapping_add(2); 52], &mut out);
+    out
+}
+
+fn encode_valid_action_bytes(seed: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    wire_bytes_field(1, &[seed; 32], &mut out);
+    wire_bytes_field(2, &[seed.wrapping_add(1); 32], &mut out);
+    wire_bytes_field(3, &[seed.wrapping_add(2); 32], &mut out);
+    wire_bytes_field(4, &[seed.wrapping_add(3); 52], &mut out);
+    out
+}
+
+fn assert_wire_rejected_everywhere(block_wire: &[u8], selections: &[CompactBlockSpliceSelection]) {
+    let record = empty_supplement_record();
+    for selection in selections {
+        assert!(matches!(
+            splice_compact_block_wire(block_wire, &[], *selection),
+            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+        ));
+    }
+    assert!(matches!(
+        reconstruct_compact_block_artifact(block_wire, &record),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+}
+
+#[test]
+fn wire_validator_rejects_descending_tags_and_duplicate_singular_fields() -> TestOutcome {
+    let txid = encode_internal_transaction_id(det_txid(80));
+    let spend = encode_valid_spend_bytes(0x81);
+    let output = encode_valid_output_bytes(0x82);
+    let action = encode_valid_action_bytes(0x83);
+
+    let mut desc_tx = Vec::new();
+    wire_bytes_field(2, &txid, &mut desc_tx);
+    wire_bytes_field(9, &action, &mut desc_tx);
+    wire_bytes_field(4, &spend, &mut desc_tx);
+
+    let mut dup_idx_tx = Vec::new();
+    wire_varint_field(1, 0, &mut dup_idx_tx);
+    wire_varint_field(1, 1, &mut dup_idx_tx);
+    wire_bytes_field(2, &txid, &mut dup_idx_tx);
+
+    let mut dup_txid_tx = Vec::new();
+    wire_varint_field(1, 0, &mut dup_txid_tx);
+    wire_bytes_field(2, &txid, &mut dup_txid_tx);
+    wire_bytes_field(2, &txid, &mut dup_txid_tx);
+
+    let mut dup_fee_tx = Vec::new();
+    wire_varint_field(1, 0, &mut dup_fee_tx);
+    wire_bytes_field(2, &txid, &mut dup_fee_tx);
+    wire_varint_field(3, 1_000, &mut dup_fee_tx);
+    wire_varint_field(3, 1_000, &mut dup_fee_tx);
+
+    let all_modes = [
+        CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::DEFAULT_SHIELDED,
+        CompactBlockSpliceSelection::DEFAULT_NULLIFIERS,
+        CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+    ];
+    for bad_tx in [desc_tx, dup_idx_tx, dup_txid_tx, dup_fee_tx] {
+        let bad_block = wrap_tx_in_block_wire(570, &bad_tx);
+        assert_wire_rejected_everywhere(&bad_block, &all_modes);
+    }
+
+    let mut repeated_pools_tx = Vec::new();
+    wire_varint_field(1, 1, &mut repeated_pools_tx);
+    wire_bytes_field(2, &txid, &mut repeated_pools_tx);
+    wire_bytes_field(4, &spend, &mut repeated_pools_tx);
+    wire_bytes_field(4, &spend, &mut repeated_pools_tx);
+    wire_bytes_field(5, &output, &mut repeated_pools_tx);
+    wire_bytes_field(5, &output, &mut repeated_pools_tx);
+    wire_bytes_field(6, &action, &mut repeated_pools_tx);
+    wire_bytes_field(6, &action, &mut repeated_pools_tx);
+    wire_bytes_field(9, &action, &mut repeated_pools_tx);
+    wire_bytes_field(9, &action, &mut repeated_pools_tx);
+    let ok_block = wrap_tx_in_block_wire(571, &repeated_pools_tx);
+    for selection in all_modes {
+        splice_compact_block_wire(&ok_block, &[], selection)?;
+    }
+    reconstruct_compact_block_artifact(&ok_block, &empty_supplement_record())?;
+    Ok(())
+}
+
+#[test]
+fn wire_validator_rejects_block_and_metadata_tag_anomalies() {
+    let txid = encode_internal_transaction_id(det_txid(84));
+    let mut tx_bytes = Vec::new();
+    wire_bytes_field(2, &txid, &mut tx_bytes);
+    let mut bad_hash_first = Vec::new();
+    let hash_wire = encode_internal_block_hash(det_block_hash(572));
+    let prev_wire = encode_internal_block_hash(det_block_hash(571));
+    wire_bytes_field(3, &hash_wire, &mut bad_hash_first);
+    wire_varint_field(2, 572, &mut bad_hash_first);
+    wire_bytes_field(4, &prev_wire, &mut bad_hash_first);
+
+    let mut bad_meta_desc = Vec::new();
+    wire_varint_field(2, 10, &mut bad_meta_desc);
+    wire_varint_field(1, 20, &mut bad_meta_desc);
+    let mut bad_meta_blk = Vec::new();
+    wire_varint_field(2, 573, &mut bad_meta_blk);
+    wire_bytes_field(3, &hash_wire, &mut bad_meta_blk);
+    wire_bytes_field(4, &prev_wire, &mut bad_meta_blk);
+    wire_bytes_field(7, &tx_bytes, &mut bad_meta_blk);
+    wire_bytes_field(8, &bad_meta_desc, &mut bad_meta_blk);
+
+    let mut dup_meta_entry = Vec::new();
+    wire_varint_field(1, 10, &mut dup_meta_entry);
+    wire_varint_field(1, 10, &mut dup_meta_entry);
+    let mut dup_meta_blk = Vec::new();
+    wire_varint_field(2, 574, &mut dup_meta_blk);
+    wire_bytes_field(3, &hash_wire, &mut dup_meta_blk);
+    wire_bytes_field(4, &prev_wire, &mut dup_meta_blk);
+    wire_bytes_field(7, &tx_bytes, &mut dup_meta_blk);
+    wire_bytes_field(8, &dup_meta_entry, &mut dup_meta_blk);
+
+    let all_modes = [
+        CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::DEFAULT_SHIELDED,
+        CompactBlockSpliceSelection::DEFAULT_NULLIFIERS,
+        CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+    ];
+    for bad_blk in [bad_hash_first, bad_meta_blk, dup_meta_blk] {
+        assert_wire_rejected_everywhere(&bad_blk, &all_modes);
+    }
+}
+
+fn malformed_crypto_cases(txid: &[u8]) -> Vec<Vec<u8>> {
+    let mut short_nf = Vec::new();
+    wire_bytes_field(1, &[0x11; 31], &mut short_nf);
+    let mut long_nf = Vec::new();
+    wire_bytes_field(1, &[0x11; 33], &mut long_nf);
+    let bad_spends = [Vec::new(), short_nf, long_nf];
+
+    let mut missing_cmu = Vec::new();
+    wire_bytes_field(2, &[0x22; 32], &mut missing_cmu);
+    wire_bytes_field(3, &[0x23; 52], &mut missing_cmu);
+    let mut bad_epk = Vec::new();
+    wire_bytes_field(1, &[0x21; 32], &mut bad_epk);
+    wire_bytes_field(2, &[0x22; 31], &mut bad_epk);
+    wire_bytes_field(3, &[0x23; 52], &mut bad_epk);
+    let mut bad_ct = Vec::new();
+    wire_bytes_field(1, &[0x21; 32], &mut bad_ct);
+    wire_bytes_field(2, &[0x22; 32], &mut bad_ct);
+    wire_bytes_field(3, &[0x23; 53], &mut bad_ct);
+    let bad_outputs = [missing_cmu, bad_epk, bad_ct];
+
+    let mut missing_nf = Vec::new();
+    wire_bytes_field(2, &[0x32; 32], &mut missing_nf);
+    wire_bytes_field(3, &[0x33; 32], &mut missing_nf);
+    wire_bytes_field(4, &[0x34; 52], &mut missing_nf);
+    let mut bad_cmx = Vec::new();
+    wire_bytes_field(1, &[0x31; 32], &mut bad_cmx);
+    wire_bytes_field(2, &[0x32; 33], &mut bad_cmx);
+    wire_bytes_field(3, &[0x33; 32], &mut bad_cmx);
+    wire_bytes_field(4, &[0x34; 52], &mut bad_cmx);
+    let mut partial_triplet = Vec::new();
+    wire_bytes_field(1, &[0x31; 32], &mut partial_triplet);
+    wire_bytes_field(2, &[0x32; 32], &mut partial_triplet);
+    let bad_actions = [missing_nf, bad_cmx, partial_triplet];
+
+    let mut bad_txs = Vec::new();
+    for spend in bad_spends {
+        let mut tx = Vec::new();
+        wire_bytes_field(2, txid, &mut tx);
+        wire_bytes_field(4, &spend, &mut tx);
+        bad_txs.push(tx);
+    }
+    for output in bad_outputs {
+        let mut tx = Vec::new();
+        wire_bytes_field(2, txid, &mut tx);
+        wire_bytes_field(5, &output, &mut tx);
+        bad_txs.push(tx);
+    }
+    for action in bad_actions {
+        for tag in [6_u32, 9_u32] {
+            let mut tx = Vec::new();
+            wire_bytes_field(2, txid, &mut tx);
+            wire_bytes_field(tag, &action, &mut tx);
+            bad_txs.push(tx);
+        }
+    }
+    bad_txs
+}
+
+#[test]
+fn wire_validator_enforces_crypto_field_presence_lengths_and_nullifier_mode() -> TestOutcome {
+    let txid = encode_internal_transaction_id(det_txid(85));
+    let all_modes = [
+        CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
+        CompactBlockSpliceSelection::DEFAULT_SHIELDED,
+        CompactBlockSpliceSelection::DEFAULT_NULLIFIERS,
+        CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+    ];
+    for bad_tx in malformed_crypto_cases(&txid) {
+        let bad_block = wrap_tx_in_block_wire(580, &bad_tx);
+        assert_wire_rejected_everywhere(&bad_block, &all_modes);
+    }
+
+    let mut nf_only_action = Vec::new();
+    wire_bytes_field(1, &[0x44; 32], &mut nf_only_action);
+    let mut nf_only_tx = Vec::new();
+    wire_varint_field(1, 0, &mut nf_only_tx);
+    wire_bytes_field(2, &txid, &mut nf_only_tx);
+    wire_bytes_field(6, &nf_only_action, &mut nf_only_tx);
+    let nf_only_block = wrap_tx_in_block_wire(581, &nf_only_tx);
+
+    let full_modes = [
+        CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
+        CompactBlockSpliceSelection::DEFAULT_SHIELDED,
+    ];
+    assert_wire_rejected_everywhere(&nf_only_block, &full_modes);
+    splice_compact_block_wire(
+        &nf_only_block,
+        &[],
+        CompactBlockSpliceSelection::DEFAULT_NULLIFIERS,
+    )?;
+    splice_compact_block_wire(
+        &nf_only_block,
+        &[],
+        CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+    )?;
     Ok(())
 }
