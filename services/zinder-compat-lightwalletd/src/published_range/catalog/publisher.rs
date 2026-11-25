@@ -427,7 +427,20 @@ impl ShieldedCatalogPublisher {
                 scope.spawn(move || {
                     let _panic_guard = PanicStopOnDrop(queue_ref);
                     while let Some(index) = queue_ref.take_next(stopping) {
-                        let built = stage(&worker_reader, worker_dir, ranges[index], slot);
+                        let built =
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                stage(&worker_reader, worker_dir, ranges[index], slot)
+                            })) {
+                                Ok(outcome) => outcome,
+                                Err(_panic_payload) => {
+                                    queue_ref.stop();
+                                    let _sent = worker_sender.send((
+                                        index,
+                                        Err(io::Error::other("range builder worker panicked")),
+                                    ));
+                                    break;
+                                }
+                            };
                         let failed = built.is_err();
                         if worker_sender.send((index, built)).is_err() || failed {
                             break;

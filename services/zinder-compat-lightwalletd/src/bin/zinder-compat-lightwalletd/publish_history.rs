@@ -32,7 +32,7 @@ fn parse_publish_workers(raw: &str) -> Result<NonZeroUsize, String> {
         .parse()
         .map_err(|err| format!("invalid worker count {raw:?}: {err}"))?;
     let workers = NonZeroUsize::new(parsed)
-        .ok_or_else(|| "worker count must be between 1 and 16".to_owned())?;
+        .ok_or_else(|| format!("worker count must be between 1 and {MAX_PUBLISH_WORKERS}"))?;
     if workers.get() > MAX_PUBLISH_WORKERS {
         return Err(format!(
             "worker count {parsed} exceeds maximum {MAX_PUBLISH_WORKERS}"

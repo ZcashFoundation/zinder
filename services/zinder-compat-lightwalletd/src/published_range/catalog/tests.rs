@@ -2413,3 +2413,31 @@ fn parallel_publication_wakes_full_window_waiters_on_cancel() -> Result<()> {
     assert_eq!(full.bounds().end, BlockHeight::new(20));
     Ok(())
 }
+
+#[test]
+fn parallel_publication_converts_worker_panic_into_io_error() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(20);
+    let (_files, canonical) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    let concurrency = concurrency_for_test(3, 1)?;
+    let stopping = tokio_util::sync::CancellationToken::new();
+    let build_segment = |canonical_reader: &RocksDbCanonicalReader,
+                         dir: &std::path::Path,
+                         range: BlockHeightRange,
+                         slot: usize| {
+        if range.start == BlockHeight::new(3) {
+            std::panic::resume_unwind(Box::new("simulated stage panic"));
+        }
+        manifest::stage_segment(canonical_reader, dir, range, slot)
+    };
+    let err = publisher
+        .publish_available_with(&canonical, concurrency, &stopping, &build_segment)
+        .err()
+        .ok_or_else(|| eyre!("expected worker panic to fail publication"))?;
+    assert!(
+        err.to_string().contains("range builder worker panicked"),
+        "{err}"
+    );
+    Ok(())
+}
