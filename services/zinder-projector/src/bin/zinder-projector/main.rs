@@ -1825,6 +1825,12 @@ fn open_canonical_secondary(
     if cancel.is_cancelled() {
         return Ok(None);
     }
+    std::fs::create_dir_all(&config.canonical_secondary_path).map_err(|source| {
+        ProjectorError::CanonicalSecondaryDirectoryCreate {
+            path: config.canonical_secondary_path.clone(),
+            source,
+        }
+    })?;
     let canonical = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
         &config.canonical_path,
         &config.canonical_secondary_path,
@@ -1839,7 +1845,12 @@ fn open_canonical_secondary(
         ),
         reorg_policy,
         config.canonical_rocksdb_budget,
-    )?;
+    )
+    .map_err(|source| ProjectorError::CanonicalSecondaryOpen {
+        primary_path: config.canonical_path.clone(),
+        secondary_path: config.canonical_secondary_path.clone(),
+        source,
+    })?;
     Ok(Some(canonical))
 }
 
@@ -2566,7 +2577,12 @@ fn emit_error(error: &ProjectorError) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU32, path::PathBuf, str::FromStr as _, time::Duration};
+    use std::{
+        num::NonZeroU32,
+        path::{Path, PathBuf},
+        str::FromStr as _,
+        time::Duration,
+    };
 
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -3768,5 +3784,143 @@ mod tests {
             BlockHeight::new(height),
             BlockHash::from_bytes([hash_byte; 32]),
         )
+    }
+
+    fn publish_test_canonical_store(
+        canonical_path: &Path,
+        reorg_policy: CanonicalReorgPolicy,
+    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let block_one =
+            empty_canonical_block(1, test_network().genesis_hash().as_bytes(), [0x11; 32])?;
+        let block_one_id = BlockId::new(
+            block_one.facts.block_header.height,
+            block_one.facts.block_header.block_hash,
+        );
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            block_one_id,
+            RawBlobRetention::Transactions,
+            reorg_policy,
+        )?;
+        let mut builder = RocksDbCanonicalBuilder::create_fresh(
+            canonical_path,
+            CanonicalStoreWorkload::Wallet,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        builder.bulk_load_blocks(&activations, [Ok::<_, std::convert::Infallible>(block_one)])?;
+        builder.load_subtree_roots(std::iter::empty())?;
+        builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+            block_one_id,
+            1,
+            regtest_checkpoint_frontiers_at(BlockHeight::new(1))?,
+        ))?;
+        let validated = builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            block_one_id,
+            UnixTimestampMillis::new(1),
+        ))?;
+        Ok(validated.publish_baseline(publication)?)
+    }
+
+    fn test_projector_config(
+        canonical_path: PathBuf,
+        canonical_secondary_path: PathBuf,
+        wallet_path: PathBuf,
+    ) -> Result<super::config::ProjectorConfig, Box<dyn std::error::Error>> {
+        Ok(super::config::load_projector_config_with_env(
+            None,
+            super::config::ProjectorConfigOverrides {
+                network: Some("zcash-regtest".to_owned()),
+                canonical_path: Some(canonical_path),
+                canonical_secondary_path: Some(canonical_secondary_path),
+                wallet_path: Some(wallet_path),
+                reorg_window_blocks: Some(3),
+                build_owner_hex: Some("00112233445566778899aabbccddeeff".to_owned()),
+                lease_duration_seconds: Some(14_400),
+                ..Default::default()
+            },
+            std::iter::empty(),
+        )?)
+    }
+
+    #[test]
+    fn open_canonical_secondary_creates_missing_nested_parent_directories()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let canonical_path = temporary.path().join("canonical");
+        let reorg_policy = CanonicalReorgPolicy::new(3)?;
+        let _canonical = publish_test_canonical_store(&canonical_path, reorg_policy)?;
+        let secondary_path = temporary.path().join("missing/nested/canonical-secondary");
+        let cfg = test_projector_config(
+            canonical_path,
+            secondary_path.clone(),
+            temporary.path().join("wallet"),
+        )?;
+
+        let opened =
+            super::open_canonical_secondary(&cfg, reorg_policy, &CancellationToken::new())?;
+        assert!(opened.is_some());
+        assert!(secondary_path.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn open_canonical_secondary_reports_exact_paths_on_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let reorg_policy = CanonicalReorgPolicy::new(3)?;
+        let blocker = temporary.path().join("blocker");
+        std::fs::write(&blocker, b"not-a-directory")?;
+        let blocked_secondary = blocker.join("canonical-secondary");
+        let blocked_cfg = test_projector_config(
+            temporary.path().join("canonical"),
+            blocked_secondary.clone(),
+            temporary.path().join("wallet"),
+        )?;
+        let Err(blocked_err) =
+            super::open_canonical_secondary(&blocked_cfg, reorg_policy, &CancellationToken::new())
+        else {
+            return Err("blocked secondary path should fail".into());
+        };
+        assert!(matches!(
+            blocked_err,
+            ProjectorError::CanonicalSecondaryDirectoryCreate { .. }
+        ));
+        assert!(
+            blocked_err
+                .to_string()
+                .contains(&blocked_secondary.display().to_string()),
+            "{blocked_err}"
+        );
+
+        let missing_primary = temporary.path().join("missing/canonical");
+        let created_secondary = temporary.path().join("created/nested/canonical-secondary");
+        let missing_cfg = test_projector_config(
+            missing_primary.clone(),
+            created_secondary.clone(),
+            temporary.path().join("wallet-missing"),
+        )?;
+        let Err(open_err) =
+            super::open_canonical_secondary(&missing_cfg, reorg_policy, &CancellationToken::new())
+        else {
+            return Err("missing primary path should fail".into());
+        };
+        assert!(matches!(
+            open_err,
+            ProjectorError::CanonicalSecondaryOpen { .. }
+        ));
+        let message = open_err.to_string();
+        assert!(
+            message.contains(&created_secondary.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&missing_primary.display().to_string()),
+            "{message}"
+        );
+        Ok(())
     }
 }

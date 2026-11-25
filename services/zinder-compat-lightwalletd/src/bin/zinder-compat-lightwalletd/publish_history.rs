@@ -1,4 +1,9 @@
-use std::{io, num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{
+    fmt, fs, io,
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use clap::Args;
 use tempfile::TempDir;
@@ -13,7 +18,7 @@ use zinder_store::{
 use super::config::{HistoryPublisherConfig, LightwalletdConfigError};
 
 mod scratch;
-use scratch::PublicationScratch;
+use scratch::{PublicationScratch, path_io_error};
 
 #[derive(Args)]
 pub(super) struct PublishHistory {
@@ -39,6 +44,8 @@ impl PublishHistory {
         &self,
         config: &HistoryPublisherConfig,
     ) -> Result<(), LightwalletdConfigError> {
+        validate_signing_key_readable(&self.signing_key)?;
+        validate_catalog_destination(&self.directory)?;
         let stopping = CancellationToken::new();
         let _signal = self
             .follow_interval_secs
@@ -88,6 +95,7 @@ impl PublishHistory {
             }
         }
     }
+
     fn open_publisher(
         &self,
         reader: &RocksDbCanonicalReader,
@@ -96,12 +104,71 @@ impl PublishHistory {
             || reader.secondary().history_bounds().first_available_height(),
             BlockHeight::new,
         );
+        validate_signing_key_readable(&self.signing_key)?;
         ShieldedCatalogPublisher::open(
             &self.directory,
             &self.signing_key,
             first,
             self.segment_blocks,
         )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not open shielded history directory {} with signing key {}: {error}",
+                    self.directory.display(),
+                    self.signing_key.display()
+                ),
+            )
+        })
+    }
+}
+
+fn validate_signing_key_readable(signing_key: &Path) -> io::Result<()> {
+    fs::read(signing_key).map_err(|error| {
+        path_io_error("could not read publisher signing key", signing_key, &error)
+    })?;
+    Ok(())
+}
+
+fn validate_catalog_destination(directory: &Path) -> io::Result<()> {
+    match directory.symlink_metadata() {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::other(format!(
+            "shielded history directory {} is not a directory",
+            directory.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(path_io_error(
+            "could not inspect shielded history directory",
+            directory,
+            &error,
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct SecondaryOpenError {
+    primary_path: PathBuf,
+    secondary_path: PathBuf,
+    source: CanonicalStoreError,
+}
+
+impl fmt::Display for SecondaryOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "could not open canonical secondary {} against canonical primary {}: {}",
+            self.secondary_path.display(),
+            self.primary_path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for SecondaryOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -125,7 +192,13 @@ impl PublicationReader {
             config.canonical_reorg_policy,
             config.canonical_rocksdb_budget,
         )
-        .map_err(io::Error::other)?;
+        .map_err(|source| {
+            io::Error::other(SecondaryOpenError {
+                primary_path: config.primary_path.clone(),
+                secondary_path: scratch.path().to_path_buf(),
+                source,
+            })
+        })?;
         if let Some(expected) = admitted_stored_set {
             secondary
                 .require_stored_set(expected)
@@ -155,6 +228,9 @@ fn reader_invalidated(error: &io::Error) -> bool {
         source
             .downcast_ref::<CanonicalStoreError>()
             .is_some_and(CanonicalStoreError::is_missing_table_file)
+            || source
+                .downcast_ref::<SecondaryOpenError>()
+                .is_some_and(|open| open.source.is_missing_table_file())
             || matches!(
                 source.downcast_ref::<StorageReadError>(),
                 Some(StorageReadError::ReaderInvalidated { .. })
@@ -178,5 +254,85 @@ mod tests {
             source: "retired canonical table".into(),
         });
         assert!(reader_invalidated(&retired));
+    }
+
+    #[test]
+    fn wrapped_secondary_open_error_preserves_missing_table_classification() {
+        let wrapped = io::Error::other(SecondaryOpenError {
+            primary_path: PathBuf::from("/canonical"),
+            secondary_path: PathBuf::from("/secondary"),
+            source: CanonicalStoreError::PathUnavailable {
+                path: PathBuf::from("/canonical"),
+                source: io::Error::from(io::ErrorKind::NotFound),
+            },
+        });
+        assert!(!reader_invalidated(&wrapped));
+        let message = wrapped.to_string();
+        assert!(message.contains("/secondary"), "{message}");
+        assert!(message.contains("/canonical"), "{message}");
+    }
+
+    #[test]
+    fn missing_key_and_blocked_parents_report_exact_paths_and_errors() -> io::Result<()> {
+        let files = tempfile::tempdir()?;
+        let missing_key = files.path().join("missing/nested/publisher.key");
+        let key_error = validate_signing_key_readable(&missing_key)
+            .err()
+            .ok_or_else(|| io::Error::other("missing key should fail"))?;
+        assert_eq!(key_error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            key_error
+                .to_string()
+                .contains(&missing_key.display().to_string()),
+            "{key_error}"
+        );
+
+        let blocker = files.path().join("blocker");
+        fs::write(&blocker, b"not-a-directory")?;
+        let blocked_catalog = blocker.join("nested/catalog");
+        let missing_primary = files.path().join("missing/canonical");
+        let secondary_root = files.path().join("nested/secondary");
+
+        let catalog_error =
+            PublicationScratch::reserve(&secondary_root, &blocked_catalog, &missing_primary)
+                .err()
+                .ok_or_else(|| io::Error::other("blocked catalog parent should fail"))?;
+        assert!(
+            catalog_error
+                .to_string()
+                .contains(&blocker.display().to_string()),
+            "{catalog_error}"
+        );
+
+        let valid_catalog = files.path().join("nested/catalog");
+        let primary_error =
+            PublicationScratch::reserve(&secondary_root, &valid_catalog, &missing_primary)
+                .err()
+                .ok_or_else(|| io::Error::other("missing primary should fail"))?;
+        assert_eq!(primary_error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            primary_error
+                .to_string()
+                .contains(&missing_primary.display().to_string()),
+            "{primary_error}"
+        );
+
+        let primary_dir = files.path().join("primary");
+        fs::create_dir(&primary_dir)?;
+        let blocked_secondary = blocker.join("nested/secondary");
+        let secondary_error =
+            PublicationScratch::reserve(&blocked_secondary, &valid_catalog, &primary_dir)
+                .err()
+                .ok_or_else(|| io::Error::other("blocked secondary root should fail"))?;
+        assert!(
+            secondary_error
+                .to_string()
+                .contains(&blocked_secondary.display().to_string()),
+            "{secondary_error}"
+        );
+
+        PublicationScratch::reserve(&secondary_root, &valid_catalog, &primary_dir)?;
+        assert!(secondary_root.is_dir());
+        Ok(())
     }
 }

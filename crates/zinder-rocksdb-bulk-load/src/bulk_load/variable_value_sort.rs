@@ -61,7 +61,7 @@ pub struct VariableValueSortDurations {
     pub initial_run_spill: Duration,
     /// Sorting and writing the records still staged when `finish` began.
     pub final_run_flush: Duration,
-    /// Merge passes that wrote merged runs; zero for at most 64 runs, which
+    /// Merge passes that wrote merged runs; zero for at most 256 runs, which
     /// the reader merges as it is read.
     pub merge: Duration,
 }
@@ -1645,9 +1645,9 @@ mod tests {
             temporary.path(),
             "multiple-groups",
             memory_limit,
-            10_000,
+            50_000,
         )?;
-        for number in (0_u16..65).rev() {
+        for number in (0_u16..257).rev() {
             staged_sort.push(number.to_be_bytes(), &[number.to_be_bytes()[1]])?;
         }
         let mut sorted_records = staged_sort.finish()?;
@@ -1656,16 +1656,16 @@ mod tests {
         while let Some(record) = sorted_records.next_record()? {
             observed_keys.push(record.key);
         }
-        let expected_keys = (0_u16..65).map(u16::to_be_bytes).collect::<Vec<_>>();
+        let expected_keys = (0_u16..257).map(u16::to_be_bytes).collect::<Vec<_>>();
 
         assert_eq!(observed_keys, expected_keys);
-        assert_eq!(evidence.initial_run_count, 65);
-        // One pass merges 64 runs into one; the reader streams the last two.
+        assert_eq!(evidence.initial_run_count, 257);
+        // One pass merges 256 runs into one; the reader streams the last two.
         assert_eq!(evidence.merge_pass_count, 1);
         assert!(sorted_records.durations().merge > Duration::ZERO);
         let one_run_bytes = encoded_run_record_bytes::<2>(1)?;
-        assert_eq!(evidence.final_run_file_bytes, one_run_bytes * 65);
-        assert_eq!(evidence.peak_temporary_file_bytes, one_run_bytes * 129);
+        assert_eq!(evidence.final_run_file_bytes, one_run_bytes * 257);
+        assert_eq!(evidence.peak_temporary_file_bytes, one_run_bytes * 513);
         Ok(())
     }
 
@@ -1897,15 +1897,27 @@ mod tests {
     fn exactly_the_fan_in_streams_without_a_written_merge() -> Result<(), Box<dyn std::error::Error>>
     {
         let temporary = TempDir::new()?;
-        let fan_in = u8::try_from(MAX_MERGE_FAN_IN)?;
-        let mut sorted_records = one_record_runs(temporary.path(), "fan-in", (0..fan_in).rev())?;
+        let fan_in = u16::try_from(MAX_MERGE_FAN_IN)?;
+        let max_temporary_bytes = u64::from(fan_in)
+            .saturating_mul(encoded_run_record_bytes::<2>(1)?)
+            .saturating_mul(2);
+        let mut staged_sort = VariableValueSorter::<2>::new(
+            temporary.path(),
+            "fan-in",
+            one_record_memory_limit::<2>(1),
+            max_temporary_bytes,
+        )?;
+        for number in (0..fan_in).rev() {
+            staged_sort.push(number.to_be_bytes(), &[number.to_be_bytes()[1]])?;
+        }
+        let mut sorted_records = staged_sort.finish()?;
         assert_eq!(sorted_records.run_paths().len(), MAX_MERGE_FAN_IN);
         assert_eq!(sorted_records.evidence().merge_pass_count, 0);
         let mut keys = Vec::new();
         while let Some(record) = sorted_records.next_record()? {
-            keys.push(record.key[0]);
+            keys.push(record.key);
         }
-        assert_eq!(keys, (0..fan_in).collect::<Vec<_>>());
+        assert_eq!(keys, (0..fan_in).map(u16::to_be_bytes).collect::<Vec<_>>());
         Ok(())
     }
 
@@ -2181,18 +2193,18 @@ mod tests {
             1024 * 1024,
         )?;
         let mut shards = parallel.open_shards()?;
-        for index in 0_u16..80 {
+        for index in 0_u16..1_024 {
             let shard_idx = usize::from(index) % shards.len();
-            shards[shard_idx].push((80 - index).to_be_bytes(), &[0xAB; 4])?;
+            shards[shard_idx].push((1_024 - index).to_be_bytes(), &[0xAB; 4])?;
         }
         let staged = parallel.flush_shards(shards)?;
         let mut sorted = parallel.finish(staged)?;
         let evidence = sorted.evidence();
-        assert_eq!(evidence.record_count, 80);
+        assert_eq!(evidence.record_count, 1_024);
         assert!(evidence.initial_run_count > u64::try_from(MAX_MERGE_FAN_IN)?);
         assert!(evidence.merge_pass_count >= 1);
         let drained = collect_sorted(&mut sorted)?;
-        assert_eq!(drained.len(), 80);
+        assert_eq!(drained.len(), 1_024);
         assert!(drained.windows(2).all(|pair| pair[0].key <= pair[1].key));
         Ok(())
     }

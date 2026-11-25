@@ -121,6 +121,28 @@ pub(crate) enum ProjectorError {
     #[error(transparent)]
     OpsServer(#[from] OpsServerError),
 
+    #[error("could not create canonical secondary directory {path:?}: {source}")]
+    CanonicalSecondaryDirectoryCreate {
+        /// Configured `storage.canonical_secondary_path` directory.
+        path: PathBuf,
+        /// Underlying filesystem creation failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "could not open canonical secondary at {secondary_path:?} against canonical primary {primary_path:?}: {source}"
+    )]
+    CanonicalSecondaryOpen {
+        /// Configured `storage.canonical_path` directory.
+        primary_path: PathBuf,
+        /// Configured `storage.canonical_secondary_path` directory.
+        secondary_path: PathBuf,
+        /// Underlying canonical-store admission or open failure.
+        #[source]
+        source: zinder_store::CanonicalStoreError,
+    },
+
     #[error(transparent)]
     CanonicalStore(#[from] zinder_store::CanonicalStoreError),
 
@@ -292,6 +314,19 @@ pub(crate) fn load_projector_config(
         config_path,
         overrides,
         std::env::vars(),
+    )?)
+}
+
+#[cfg(test)]
+pub(crate) fn load_projector_config_with_env(
+    config_path: Option<PathBuf>,
+    overrides: ProjectorConfigOverrides,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> Result<ProjectorConfig, ProjectorError> {
+    resolve_projector_config(load_raw_projector_config(
+        config_path,
+        overrides,
+        environment,
     )?)
 }
 

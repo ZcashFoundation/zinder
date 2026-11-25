@@ -435,6 +435,103 @@ fn publication_command(primary: &Path, scratch: &Path, catalog: &Path, private: 
     command
 }
 
+#[tokio::test]
+async fn publisher_creates_nested_missing_directory_and_secondary_root() -> Result<()> {
+    let files = tempfile::tempdir()?;
+    let (private, public) = shielded_catalog_keys(files.path())?;
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .with_raw_blob_retention(RawBlobRetention::Transactions);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+
+    let nested_catalog = files.path().join("nested/catalog/dir");
+    let nested_scratch = files.path().join("nested/secondary/root");
+    let success = publication_command(
+        writer.canonical_primary_path(),
+        &nested_scratch,
+        &nested_catalog,
+        &private,
+    )
+    .output()
+    .await?;
+    assert!(success.status.success(), "{success:?}");
+    assert!(nested_catalog.join("current.json").is_file());
+    assert!(nested_scratch.is_dir());
+    let mut store = writer.serving_store_fixture()?;
+    let reader = RocksDbCanonicalReader::new(store.take_readers()?.0)?;
+    PublishedShieldedHistory::open(
+        &nested_catalog.join("current.json"),
+        &public,
+        false,
+        &reader,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn publisher_reports_exact_paths_and_os_errors_for_missing_inputs() -> Result<()> {
+    let files = tempfile::tempdir()?;
+    let (private, _) = shielded_catalog_keys(files.path())?;
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .with_raw_blob_retention(RawBlobRetention::Transactions);
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let catalog = files.path().join("catalog");
+    let scratch = files.path().join("secondary");
+    let missing_key = files.path().join("missing/nested/publisher.key");
+    let missing_primary = files.path().join("missing/canonical/primary");
+    let blocker = files.path().join("blocker");
+    fs::write(&blocker, b"not-a-directory")?;
+
+    let cases = [
+        (
+            writer.canonical_primary_path().to_path_buf(),
+            scratch.clone(),
+            catalog.clone(),
+            missing_key.clone(),
+            missing_key.display().to_string(),
+        ),
+        (
+            missing_primary.clone(),
+            scratch.clone(),
+            catalog.clone(),
+            private.clone(),
+            missing_primary.display().to_string(),
+        ),
+        (
+            writer.canonical_primary_path().to_path_buf(),
+            scratch,
+            blocker.join("catalog"),
+            private.clone(),
+            blocker.display().to_string(),
+        ),
+        (
+            writer.canonical_primary_path().to_path_buf(),
+            blocker.join("secondary"),
+            catalog,
+            private,
+            blocker.join("secondary").display().to_string(),
+        ),
+    ];
+
+    for (primary_path, scratch_path, catalog_path, key_path, expected_path) in cases {
+        let output = publication_command(&primary_path, &scratch_path, &catalog_path, &key_path)
+            .output()
+            .await?;
+        assert!(!output.status.success(), "{expected_path}: {output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains(&expected_path), "{stderr}");
+    }
+    Ok(())
+}
+
 async fn wait_for_change(path: &Path, previous: &[u8]) -> Result<Vec<u8>> {
     Ok(tokio::time::timeout(Duration::from_secs(20), async {
         loop {

@@ -20,7 +20,7 @@ pub use variable_value_sort::{
     VariableValueSortShard, VariableValueSorter,
 };
 
-pub(super) const MAX_MERGE_FAN_IN: usize = 64;
+pub(super) const MAX_MERGE_FAN_IN: usize = 256;
 
 /// Failure while staging opaque ordered records for `RocksDB` ingestion.
 #[derive(Debug, Error)]
