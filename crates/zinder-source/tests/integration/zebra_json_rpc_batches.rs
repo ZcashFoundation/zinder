@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use zinder_core::{BlockHash, BlockHeight, BlockId, Network};
 use zinder_source::{
     NodeAuth, NodeSource, SourceChainCursor, SourceChainSegment, SourceChainSegmentLimits,
-    SourceChainUpdate, SourceError, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+    SourceChainUpdate, SourceError, SourceKnownTip, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
     block_header_from_raw_block_bytes,
 };
 use zinder_testkit::{BatchResponseShape, JsonRpcTestServer, RpcReply, method};
@@ -654,6 +654,162 @@ async fn fetch_chain_segment_maps_a_batch_slower_than_the_request_timeout_to_nod
             Err(SourceError::NodeUnavailable { reason }) if reason == "Request timeout"
         ),
         "unexpected outcome: {outcome:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_segment_skips_tip_polls_strictly_below_known_settled_window()
+-> eyre::Result<()> {
+    let blocks = linked_chain(10)?;
+    let tip = tip_of(&blocks)?;
+    let server = chain_server(&blocks)?;
+    let source = regtest_source(&server)?;
+    let known_tip = SourceKnownTip::new(tip.height, 4);
+
+    let first_settled = source
+        .fetch_chain_segment(
+            segment_limits(SourceChainCursor::before_first_block(), 2)?.with_known_tip(known_tip),
+        )
+        .await?;
+    let second_settled = source
+        .fetch_chain_segment(
+            segment_limits(SourceChainCursor::at_block(block_at(&blocks, 2)?.id), 3)?
+                .with_known_tip(known_tip),
+        )
+        .await?;
+    assert_eq!(server.requests_for("getbestblockheightandhash")?.len(), 0);
+    assert_eq!(
+        connected_block_ids(&first_settled)?,
+        vec![block_at(&blocks, 1)?.id, block_at(&blocks, 2)?.id]
+    );
+    assert_eq!(
+        connected_block_ids(&second_settled)?,
+        vec![
+            block_at(&blocks, 3)?.id,
+            block_at(&blocks, 4)?.id,
+            block_at(&blocks, 5)?.id,
+        ]
+    );
+
+    // Crossing into `tip_height - reorg_window` (height 6) must still poll `tip_id`.
+    let crossing_boundary = source
+        .fetch_chain_segment(
+            segment_limits(SourceChainCursor::at_block(block_at(&blocks, 5)?.id), 2)?
+                .with_known_tip(known_tip),
+        )
+        .await?;
+    assert_eq!(server.requests_for("getbestblockheightandhash")?.len(), 1);
+    assert_eq!(
+        connected_block_ids(&crossing_boundary)?,
+        vec![block_at(&blocks, 6)?.id, block_at(&blocks, 7)?.id]
+    );
+
+    // Short chains (tip <= reorg_window) must never skip `tip_id`.
+    let short_chain_tip = SourceKnownTip::new(tip.height, 10);
+    let _ = source
+        .fetch_chain_segment(
+            segment_limits(SourceChainCursor::before_first_block(), 2)?
+                .with_known_tip(short_chain_tip),
+        )
+        .await?;
+    assert_eq!(server.requests_for("getbestblockheightandhash")?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_segment_observes_tip_and_reverts_on_settled_parent_mismatch()
+-> eyre::Result<()> {
+    let fixture_bytes = fixture_raw_block_bytes()?;
+    let block_1 = chain_block(&fixture_bytes, 1, None)?;
+    let block_2 = chain_block(
+        &fixture_bytes,
+        2,
+        Some(BlockHash::from_bytes(UNRELATED_PARENT_HASH)),
+    )?;
+    let mut blocks = vec![block_1.clone(), block_2];
+    for height in 3..=10 {
+        let parent = blocks
+            .last()
+            .ok_or_else(|| eyre!("chain should stay non-empty"))?
+            .id
+            .hash;
+        blocks.push(chain_block(&fixture_bytes, height, Some(parent))?);
+    }
+    let server = chain_server(&blocks)?;
+    let source = regtest_source(&server)?;
+    let known_tip = SourceKnownTip::new(BlockHeight::new(10), 4);
+
+    let segment = source
+        .fetch_chain_segment(
+            segment_limits(SourceChainCursor::at_block(block_1.id), 2)?.with_known_tip(known_tip),
+        )
+        .await?;
+    assert_eq!(server.requests_for("getbestblockheightandhash")?.len(), 1);
+    assert_eq!(
+        segment.updates(),
+        &[SourceChainUpdate::reverted_block(block_1.id)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_segment_falls_back_to_tip_when_settled_assumption_is_stale() -> eyre::Result<()>
+{
+    let blocks = linked_chain(3)?;
+    let server = chain_server(&blocks)?;
+    let source = regtest_source(&server)?;
+    let stale_known_tip = SourceKnownTip::new(BlockHeight::new(10), 4);
+
+    let segment = source
+        .fetch_chain_segment(
+            segment_limits(SourceChainCursor::at_block(block_at(&blocks, 1)?.id), 4)?
+                .with_known_tip(stale_known_tip),
+        )
+        .await?;
+    assert_eq!(server.requests_for("getbestblockheightandhash")?.len(), 1);
+    assert_eq!(
+        connected_block_ids(&segment)?,
+        vec![block_at(&blocks, 2)?.id, block_at(&blocks, 3)?.id]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_chain_segment_streaming_visitor_preserves_non_string_and_error_mapping()
+-> eyre::Result<()> {
+    let blocks = linked_chain(2)?;
+    let tip = tip_of(&blocks)?;
+    let non_string_server = JsonRpcTestServer::start([
+        tip_stub(tip),
+        method("getblock").reply(RpcReply::result(json!({ "unexpected": true }))),
+    ])?;
+    let non_string_source = regtest_source(&non_string_server)?;
+    let non_string_outcome = fetch_from_first_block(&non_string_source, 2).await?;
+    assert!(
+        matches!(
+            non_string_outcome,
+            Err(SourceError::SourceProtocolMismatch {
+                reason: "batched getblock response is not a hex string"
+            })
+        ),
+        "unexpected non-string outcome: {non_string_outcome:?}"
+    );
+
+    let invalid_hex_server = JsonRpcTestServer::start([
+        tip_stub(tip),
+        method("getblock").reply(RpcReply::result(json!("0x0011"))),
+    ])?;
+    let invalid_hex_source = regtest_source(&invalid_hex_server)?;
+    let invalid_hex_outcome = fetch_from_first_block(&invalid_hex_source, 1).await?;
+    assert!(
+        matches!(
+            invalid_hex_outcome,
+            Err(SourceError::InvalidRawBlockHex {
+                source: hex::FromHexError::InvalidHexCharacter { c: 'x', index: 1 }
+            })
+        ),
+        "unexpected invalid hex outcome: {invalid_hex_outcome:?}"
     );
     Ok(())
 }
