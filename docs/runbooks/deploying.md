@@ -82,15 +82,19 @@ readiness it had read 1.30 GiB, used 0.66 CPU-seconds, and reached 537 MiB
 peak RSS and 1,218 open descriptors. These figures describe startup on a
 12,000-IOPS disk. Catalog growth and concurrent wallet traffic affect sizing.
 
-Under cgroup v2, `zinder-compat-lightwalletd` (and only
-`zinder-compat-lightwalletd` — `zinder-query` uses `O_DIRECT` RocksDB reads and
-does not mount the catalog) charges OS page cache for `ZSHRNG01` segments
-(~20–21 GiB on Mainnet and growing) against `ZINDER_COMPAT_MEMORY_LIMIT`. Keep
-`4 GiB` as an OOM guardrail on 16–32 GiB self-hosted VMs; on 64+ GiB public
-Mainnet endpoints serving high-concurrency range syncs, raise
+Under cgroup v2, `ZSHRNG01` catalog page cache (~20–21 GiB on Mainnet
+and growing) is charged to the cgroup that first populates each page, which
+can be the publisher or `zinder-compat-lightwalletd`. Raising
+`ZINDER_COMPAT_MEMORY_LIMIT` does not transfer publisher-owned charges;
+publisher memory pressure can still reclaim those pages. `zinder-query`
+does not mount the catalog.
+
+Keep `4 GiB` as an OOM guardrail on 16–32 GiB self-hosted VMs. On 64+ GiB
+public Mainnet endpoints serving high-concurrency range syncs, raise
 `ZINDER_COMPAT_MEMORY_LIMIT` (for example `32g` or higher) above the catalog
-size plus working set so segments remain warm in page cache and concurrent
-streams do not hit `wait_timeout` refusals.
+size plus working set to reduce cache thrashing and related `wait_timeout`
+refusals. Validate cache residency with publisher activity included; a larger
+reader ceiling alone does not guarantee it.
 
 ### Optional Pasta assembly backend
 
