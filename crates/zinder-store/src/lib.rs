@@ -18,6 +18,7 @@ mod raw_blob_retention;
 mod rocksdb_resource_budget;
 mod settled_raw_block_segment;
 mod settled_shielded_segment;
+mod settled_supplement_segment;
 mod store_error;
 
 pub use block_hash_index::BlockHashLookup;
@@ -105,5 +106,16 @@ pub use settled_shielded_segment::{
     SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader, SettledShieldedSegmentWriter,
     ShieldedProjectionSelection, ShieldedSegmentIdentity, is_passthrough_shielded_block_wire,
     project_shielded_block_wire, project_shielded_block_wire_with_scratch,
+};
+pub use settled_supplement_segment::{
+    BlockSupplementRecord, CanonicalBlockSupplement, CanonicalTransactionSupplement,
+    CompactBlockSpliceSelection, CompactTransparentSupplementTx,
+    SETTLED_SUPPLEMENT_DEFAULT_CHUNK_BLOCKS, SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS,
+    SETTLED_SUPPLEMENT_SEGMENT_MAGIC, SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+    SettledSupplementSegmentError, SettledSupplementSegmentOpenOptions,
+    SettledSupplementSegmentReader, SettledSupplementSegmentWriteOptions,
+    SettledSupplementSegmentWriter, SupplementCompressionCodec, SupplementSegmentIdentity,
+    SupplementShieldedAnchors, SupplementTxFeeAndBurn, reconstruct_compact_block_artifact,
+    splice_compact_block_wire,
 };
 pub use store_error::{ArtifactFamily, StorageKey, StoreError};
