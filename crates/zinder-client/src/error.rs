@@ -483,6 +483,7 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::BlockingTaskFailed
         | ErrorReason::NodeUnavailable
         | ErrorReason::NodeRateLimited
+        | ErrorReason::ServedTipMismatch
         | ErrorReason::StorageUnavailable
         | ErrorReason::UnsupportedWalletEncoding
         | ErrorReason::NoVisibleChainEpoch
@@ -742,6 +743,24 @@ mod tests {
         let error = IndexerError::from_status(status);
 
         assert_eq!(error.reason(), Some(ErrorReason::NodeRateLimited));
+        assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
+    }
+
+    #[test]
+    fn served_tip_mismatch_refusal_is_retried_with_backoff() {
+        let status = tonic::Status::with_error_details(
+            Code::Unavailable,
+            "node answered at another tip than the served tip; retry shortly",
+            ErrorDetails::with_error_info(
+                ErrorReason::ServedTipMismatch.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+
+        let error = IndexerError::from_status(status);
+
+        assert_eq!(error.reason(), Some(ErrorReason::ServedTipMismatch));
         assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
     }
 

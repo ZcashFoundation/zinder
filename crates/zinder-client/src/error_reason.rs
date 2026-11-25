@@ -95,6 +95,7 @@ define_error_reasons! {
     CompactBlockStreamLimitReached => "COMPACT_BLOCK_STREAM_LIMIT_REACHED",
     NodeRateLimited => "NODE_RATE_LIMITED",
     ForwardedReadLimitReached => "FORWARDED_READ_LIMIT_REACHED",
+    ServedTipMismatch => "SERVED_TIP_MISMATCH",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -161,6 +162,7 @@ mod tests {
             WireErrorReason::CompactBlockStreamLimitReached,
             WireErrorReason::NodeRateLimited,
             WireErrorReason::ForwardedReadLimitReached,
+            WireErrorReason::ServedTipMismatch,
         ];
 
         for generated in generated_reasons {

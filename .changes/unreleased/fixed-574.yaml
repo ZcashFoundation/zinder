@@ -1,0 +1,6 @@
+kind: fixed
+body: 'Classify forwarded transparent UTXO and balance served-tip mismatches in `zinder-compat-lightwalletd` as `SERVED_TIP_MISMATCH` (`Code::Unavailable`) with `grpc-retry-pushback-ms: 1000` metadata instead of `NODE_UNAVAILABLE`, and allow one bounded `TipWait` catch-up retry when the backing node is ahead of the served view.'
+time: 2026-11-25T07:48:30.000000000Z
+custom:
+    Bump: minor
+    PR: "574"
