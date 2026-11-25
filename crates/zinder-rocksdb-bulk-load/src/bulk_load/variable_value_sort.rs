@@ -1698,32 +1698,44 @@ mod tests {
     fn more_than_one_merge_group_finishes_in_global_order() -> Result<(), Box<dyn std::error::Error>>
     {
         let temporary = TempDir::new()?;
+        let active_fan_in = effective_merge_fan_in();
+        let run_count = active_fan_in
+            .checked_add(1)
+            .ok_or("active fan-in plus one overflows usize")?;
+        let run_limit = u16::try_from(run_count)?;
+        let run_count_u64 = u64::try_from(run_count)?;
+        let active_fan_in_u64 = u64::try_from(active_fan_in)?;
+        let one_run_bytes = encoded_run_record_bytes::<2>(1)?;
+        let max_temporary_bytes = one_run_bytes.saturating_mul(run_count_u64.saturating_mul(2));
         let memory_limit = one_record_memory_limit::<2>(1);
         let mut staged_sort = VariableValueSorter::<2>::new(
             temporary.path(),
             "multiple-groups",
             memory_limit,
-            50_000,
+            max_temporary_bytes.max(50_000),
         )?;
-        for number in (0_u16..257).rev() {
+        for number in (0_u16..run_limit).rev() {
             staged_sort.push(number.to_be_bytes(), &[number.to_be_bytes()[1]])?;
         }
-        let mut sorted_records = staged_sort.finish()?;
+        let mut sorted_records = staged_sort.finish_with_fan_in(active_fan_in)?;
         let evidence = sorted_records.evidence();
         let mut observed_keys = Vec::new();
         while let Some(record) = sorted_records.next_record()? {
             observed_keys.push(record.key);
         }
-        let expected_keys = (0_u16..257).map(u16::to_be_bytes).collect::<Vec<_>>();
+        let expected_keys = (0_u16..run_limit).map(u16::to_be_bytes).collect::<Vec<_>>();
 
         assert_eq!(observed_keys, expected_keys);
-        assert_eq!(evidence.initial_run_count, 257);
-        // One pass merges 256 runs into one; the reader streams the last two.
+        assert_eq!(evidence.initial_run_count, run_count_u64);
+        // One pass merges `active_fan_in` runs into one; the reader streams the last two.
         assert_eq!(evidence.merge_pass_count, 1);
         assert!(sorted_records.durations().merge > Duration::ZERO);
-        let one_run_bytes = encoded_run_record_bytes::<2>(1)?;
-        assert_eq!(evidence.final_run_file_bytes, one_run_bytes * 257);
-        assert_eq!(evidence.peak_temporary_file_bytes, one_run_bytes * 513);
+        assert_eq!(evidence.final_run_file_bytes, one_run_bytes * run_count_u64);
+        let expected_peak_runs = active_fan_in_u64.saturating_mul(2).saturating_add(1);
+        assert_eq!(
+            evidence.peak_temporary_file_bytes,
+            one_run_bytes * expected_peak_runs
+        );
         Ok(())
     }
 
@@ -1969,7 +1981,7 @@ mod tests {
         for number in (0..fan_in).rev() {
             staged_sort.push(number.to_be_bytes(), &[number.to_be_bytes()[1]])?;
         }
-        let mut sorted_records = staged_sort.finish()?;
+        let mut sorted_records = staged_sort.finish_with_fan_in(active_fan_in)?;
         assert_eq!(sorted_records.run_paths().len(), active_fan_in);
         assert_eq!(sorted_records.evidence().merge_pass_count, 0);
         let mut keys = Vec::new();
