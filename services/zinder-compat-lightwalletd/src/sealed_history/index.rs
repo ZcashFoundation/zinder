@@ -10,8 +10,8 @@ use std::io::{BufRead, BufReader};
 
 use super::{
     BlockHash, BlockHeight, BlockId, Digest as _, HEADER_LEN, LENGTHS_LEN, MAX_PAYLOAD_BYTES,
-    ROW_META_LEN, Read, SealedRow, SegmentHeader, SegmentIdentity, Sha256, TRAILER_LEN,
-    decode_hash, decode_lengths, encode_internal_block_hash, encode_len, invalid, io,
+    ROW_META_LEN, Read, RowValidation, SegmentHeader, SegmentIdentity, Sha256, SlabDigests,
+    TRAILER_LEN, decode_hash, decode_lengths, encode_internal_block_hash, encode_len, invalid, io,
 };
 
 /// Bytes of the two `[u32; block_count + 1]` relative offset tables.
@@ -71,6 +71,12 @@ impl StreamedSlab {
     }
 }
 
+/// One slab's `[u32; count]` frame-start offsets plus the trailing slab length.
+struct OffsetTable {
+    starts: Vec<u32>,
+    slab_len: u32,
+}
+
 /// Validates both slabs' relative offset tables against the header's
 /// offsets, before any span arithmetic or row decoding runs.
 ///
@@ -78,7 +84,7 @@ impl StreamedSlab {
 /// ascending, and its last entry must be the slab's exact byte length.
 fn validate_tables(
     header: &SegmentHeader,
-    (shielded_table, nullifier_table): (&[u32], &[u32]),
+    (shielded_table, nullifier_table): (&OffsetTable, &OffsetTable),
     count: usize,
 ) -> io::Result<()> {
     let shielded_len = header
@@ -95,24 +101,29 @@ fn validate_tables(
 }
 
 /// Validates one slab's `[u32; count + 1]` relative offset table.
-fn validate_offset_table(table: &[u32], count: usize, slab_len: u64) -> io::Result<()> {
-    if table.len() != count + 1 {
+fn validate_offset_table(table: &OffsetTable, count: usize, slab_len: u64) -> io::Result<()> {
+    if table.starts.len() != count || count == 0 {
         return Err(invalid("shielded segment offset table is short"));
     }
-    if u64::from(table[0]) != 0 {
+    if u64::from(table.starts[0]) != 0 {
         return Err(invalid(
             "shielded segment offset table does not start at its slab",
         ));
     }
     if table
+        .starts
         .windows(2)
         .any(|pair| u64::from(pair[1]) <= u64::from(pair[0]))
+        || table
+            .starts
+            .last()
+            .is_some_and(|last| u64::from(table.slab_len) <= u64::from(*last))
     {
         return Err(invalid(
             "shielded segment offset table spans are not ascending",
         ));
     }
-    if u64::from(table[count]) != slab_len {
+    if u64::from(table.slab_len) != slab_len {
         return Err(invalid(
             "shielded segment offset table ends away from its slab",
         ));
@@ -122,11 +133,31 @@ fn validate_offset_table(table: &[u32], count: usize, slab_len: u64) -> io::Resu
 
 /// The segment state admission hands to the serving history.
 pub(super) struct AdmittedSegment {
-    pub(super) rows: Vec<SealedRow>,
+    pub(super) first_parent: BlockHash,
     /// Absolute file offset of the nullifier slab's base.
     pub(super) nullifier_base: u64,
+    /// Absolute file offset of the per-block metadata rows.
+    pub(super) row_meta_base: u64,
+    pub(super) shielded_slab_len: u32,
+    pub(super) nullifier_slab_len: u32,
+    pub(super) block_hashes: Vec<BlockHash>,
+    pub(super) native_bytes: Vec<u32>,
     pub(super) shielded_rel: Vec<u32>,
     pub(super) nullifier_rel: Vec<u32>,
+    pub(super) validation: Vec<RowValidation>,
+    pub(super) portable_digests: Option<Vec<SlabDigests>>,
+}
+
+struct DecodedRows {
+    first_parent: BlockHash,
+    shielded_slab_len: u32,
+    nullifier_slab_len: u32,
+    block_hashes: Vec<BlockHash>,
+    native_bytes: Vec<u32>,
+    shielded_rel: Vec<u32>,
+    nullifier_rel: Vec<u32>,
+    validation: Vec<RowValidation>,
+    portable_digests: Option<Vec<SlabDigests>>,
 }
 
 /// The header, interval, and file-size checks every admission starts with.
@@ -179,7 +210,8 @@ fn admit_protected(
     let nullifier_table = read_offset_table(&mut *input, count)?;
     let metadata = read_metadata(&mut *input, count)?;
     validate_tables(header, (&shielded_table, &nullifier_table), count)?;
-    Ok(admitted(
+    admitted(
+        expected,
         header,
         decode_rows(
             expected,
@@ -188,7 +220,7 @@ fn admit_protected(
             metadata,
             None,
         )?,
-    ))
+    )
 }
 
 /// Admits a portable segment by streaming it exactly once.
@@ -227,7 +259,8 @@ fn admit_portable(
     if !input.fill_buf()?.is_empty() || body_digest != expected.sha256 || trailer != body_digest {
         return Err(invalid("shielded segment length or SHA-256 mismatch"));
     }
-    Ok(admitted(
+    admitted(
+        expected,
         header,
         decode_rows(
             expected,
@@ -236,7 +269,7 @@ fn admit_portable(
             metadata,
             Some((&shielded, &nullifiers)),
         )?,
-    ))
+    )
 }
 
 pub(super) fn admit(
@@ -255,17 +288,29 @@ pub(super) fn admit(
     }
 }
 
-/// Wraps decoded rows with their slab bases from the header.
+/// Wraps decoded rows with their slab and metadata bases from the header.
 fn admitted(
+    expected: SegmentIdentity,
     header: &SegmentHeader,
-    (rows, shielded_rel, nullifier_rel): (Vec<SealedRow>, Vec<u32>, Vec<u32>),
-) -> AdmittedSegment {
-    AdmittedSegment {
+    decoded: DecodedRows,
+) -> io::Result<AdmittedSegment> {
+    let row_meta_base = header
+        .index_offset
+        .checked_add(offset_tables_len(expected.block_count()?))
+        .ok_or_else(|| invalid("shielded segment index exceeds address space"))?;
+    Ok(AdmittedSegment {
+        first_parent: decoded.first_parent,
         nullifier_base: header.nullifier_slab_offset,
-        rows,
-        shielded_rel,
-        nullifier_rel,
-    }
+        row_meta_base,
+        shielded_slab_len: decoded.shielded_slab_len,
+        nullifier_slab_len: decoded.nullifier_slab_len,
+        block_hashes: decoded.block_hashes,
+        native_bytes: decoded.native_bytes,
+        shielded_rel: decoded.shielded_rel,
+        nullifier_rel: decoded.nullifier_rel,
+        validation: decoded.validation,
+        portable_digests: decoded.portable_digests,
+    })
 }
 
 /// Streams `count` frames of one slab, hashing each into `digest` and
@@ -312,15 +357,25 @@ fn hash_frames(
 }
 
 /// Reads one `[u32; count + 1]` relative offset table, hashing it on the way.
-fn hash_table(input: &mut impl BufRead, count: usize, digest: &mut Sha256) -> io::Result<Vec<u32>> {
-    let mut table = Vec::with_capacity(count + 1);
-    for _ in 0..=count {
+fn hash_table(
+    input: &mut impl BufRead,
+    count: usize,
+    digest: &mut Sha256,
+) -> io::Result<OffsetTable> {
+    let mut starts = Vec::with_capacity(count);
+    for _ in 0..count {
         let mut raw = [0; 4];
         input.read_exact(&mut raw)?;
         digest.update(raw);
-        table.push(u32::from_be_bytes(raw));
+        starts.push(u32::from_be_bytes(raw));
     }
-    Ok(table)
+    let mut end_raw = [0; 4];
+    input.read_exact(&mut end_raw)?;
+    digest.update(end_raw);
+    Ok(OffsetTable {
+        starts,
+        slab_len: u32::from_be_bytes(end_raw),
+    })
 }
 
 /// Reads the per-block metadata rows, hashing them on the way.
@@ -340,14 +395,19 @@ fn hash_metadata(
 }
 
 /// Reads one `[u32; count + 1]` relative offset table from a protected file.
-fn read_offset_table(input: &mut impl Read, count: usize) -> io::Result<Vec<u32>> {
-    let mut table = Vec::with_capacity(count + 1);
-    for _ in 0..=count {
+fn read_offset_table(input: &mut impl Read, count: usize) -> io::Result<OffsetTable> {
+    let mut starts = Vec::with_capacity(count);
+    for _ in 0..count {
         let mut raw = [0; 4];
         input.read_exact(&mut raw)?;
-        table.push(u32::from_be_bytes(raw));
+        starts.push(u32::from_be_bytes(raw));
     }
-    Ok(table)
+    let mut end_raw = [0; 4];
+    input.read_exact(&mut end_raw)?;
+    Ok(OffsetTable {
+        starts,
+        slab_len: u32::from_be_bytes(end_raw),
+    })
 }
 
 /// Reads the per-block metadata rows from a protected file.
@@ -363,14 +423,14 @@ fn read_metadata(input: &mut impl Read, count: usize) -> io::Result<Vec<[u8; ROW
 
 /// Validates the offset tables and metadata against the segment identity, and
 /// against the streamed frames of a portable admission, and decodes the
-/// serving rows.
+/// compact serving columns.
 fn decode_rows(
     expected: SegmentIdentity,
     header: &SegmentHeader,
-    (shielded_table, nullifier_table): (Vec<u32>, Vec<u32>),
+    (shielded_table, nullifier_table): (OffsetTable, OffsetTable),
     metadata: Vec<[u8; ROW_META_LEN]>,
     streamed: Option<(&StreamedSlab, &StreamedSlab)>,
-) -> io::Result<(Vec<SealedRow>, Vec<u32>, Vec<u32>)> {
+) -> io::Result<DecodedRows> {
     let count = metadata.len();
     let check = RowCheck {
         shielded_table: &shielded_table,
@@ -378,57 +438,70 @@ fn decode_rows(
         streamed,
     };
     let mut prior = None;
-    let mut rows = Vec::with_capacity(count);
+    let mut first_parent = None;
+    let mut block_hashes = Vec::with_capacity(count);
+    let mut native_bytes = Vec::with_capacity(count);
+    let mut validation = Vec::with_capacity(count);
+    let mut portable_digests = streamed.map(|_| Vec::with_capacity(count));
     for (i, entry) in metadata.into_iter().enumerate() {
         let native = check.lengths(i, &entry)?;
-        let id = BlockId::new(
-            BlockHeight::new(
-                expected
-                    .start
-                    .value()
-                    .checked_add(
-                        u32::try_from(i).map_err(|_| {
-                            invalid("shielded segment height exceeds address space")
-                        })?,
-                    )
-                    .ok_or_else(|| invalid("shielded segment interval exceeds its height type"))?,
-            ),
-            decode_hash(&entry[..32])?,
-        );
+        let native_u32 =
+            u32::try_from(native).map_err(|_| invalid("shielded segment row length overflow"))?;
+        let height_offset = u32::try_from(i)
+            .map_err(|_| invalid("shielded segment height exceeds address space"))?;
+        let height = expected
+            .start
+            .value()
+            .checked_add(height_offset)
+            .map(BlockHeight::new)
+            .ok_or_else(|| invalid("shielded segment interval exceeds its height type"))?;
+        let id = BlockId::new(height, decode_hash(&entry[..32])?);
         let parent = decode_hash(&entry[32..64])?;
-        if i == 0 && parent.as_bytes() != header.first_prev_hash {
-            return Err(invalid(
-                "shielded segment does not start at its claimed parent",
-            ));
+        if i == 0 {
+            if parent.as_bytes() != header.first_prev_hash {
+                return Err(invalid(
+                    "shielded segment does not start at its claimed parent",
+                ));
+            }
+            first_parent = Some(parent);
         }
         expected.check_block(id, parent, prior)?;
         prior = Some(id);
-        rows.push(SealedRow {
-            id,
-            parent,
-            native_bytes: native,
-            shielded_sha256: digest_field(&entry, 72)?,
-            nullifier_sha256: digest_field(&entry, 104)?,
-            shielded_validation: std::sync::OnceLock::new(),
-            nullifier_validation: std::sync::OnceLock::new(),
-        });
+        block_hashes.push(id.hash);
+        native_bytes.push(native_u32);
+        validation.push(RowValidation::new());
+        if let Some(digests) = portable_digests.as_mut() {
+            digests.push(SlabDigests {
+                shielded: digest_field(&entry, 72)?,
+                nullifier: digest_field(&entry, 104)?,
+            });
+        }
     }
-    let last_row = rows
-        .last()
-        .ok_or_else(|| invalid("empty shielded segment interval"))?;
-    if last_row.id != expected.end {
+    let first_parent = first_parent.ok_or_else(|| invalid("empty shielded segment interval"))?;
+    let last_id = prior.ok_or_else(|| invalid("empty shielded segment interval"))?;
+    if last_id != expected.end {
         return Err(invalid(
             "shielded segment ends away from its terminal block",
         ));
     }
-    Ok((rows, shielded_table, nullifier_table))
+    Ok(DecodedRows {
+        first_parent,
+        shielded_slab_len: shielded_table.slab_len,
+        nullifier_slab_len: nullifier_table.slab_len,
+        block_hashes,
+        native_bytes,
+        shielded_rel: shielded_table.starts,
+        nullifier_rel: nullifier_table.starts,
+        validation,
+        portable_digests,
+    })
 }
 
 /// One metadata row's framing check against its offset tables and, for a
 /// portable admission, the frames that were streamed.
 struct RowCheck<'a> {
-    shielded_table: &'a [u32],
-    nullifier_table: &'a [u32],
+    shielded_table: &'a OffsetTable,
+    nullifier_table: &'a OffsetTable,
     streamed: Option<(&'a StreamedSlab, &'a StreamedSlab)>,
 }
 
@@ -450,11 +523,11 @@ impl RowCheck<'_> {
         if let Some((shielded, nullifiers)) = self.streamed {
             let shielded_digest = digest_field(entry, 72)?;
             let nullifier_digest = digest_field(entry, 104)?;
-            if shielded.rel[i] != self.shielded_table[i]
+            if shielded.rel[i] != self.shielded_table.starts[i]
                 || shielded.wire[i] != shielded_wire
                 || shielded.native[i] != native
                 || shielded.digests[i] != shielded_digest
-                || nullifiers.rel[i] != self.nullifier_table[i]
+                || nullifiers.rel[i] != self.nullifier_table.starts[i]
                 || nullifiers.wire[i] != nullifier_wire
                 || nullifiers.native[i] != native
                 || nullifiers.digests[i] != nullifier_digest
@@ -477,15 +550,21 @@ fn digest_field(entry: &[u8; ROW_META_LEN], offset: usize) -> io::Result<[u8; 32
 }
 
 /// A row's payload length in one slab, from its offset table span.
-fn wire_for(table: &[u32], i: usize) -> io::Result<usize> {
+fn wire_for(table: &OffsetTable, i: usize) -> io::Result<usize> {
     let offset = table
+        .starts
         .get(i)
         .copied()
         .ok_or_else(|| invalid("shielded segment offset table is short"))?;
-    let next = table
-        .get(i + 1)
-        .copied()
-        .ok_or_else(|| invalid("shielded segment offset table is short"))?;
+    let next = if i + 1 == table.starts.len() {
+        table.slab_len
+    } else {
+        table
+            .starts
+            .get(i + 1)
+            .copied()
+            .ok_or_else(|| invalid("shielded segment offset table is short"))?
+    };
     let span = u64::from(next)
         .checked_sub(u64::from(offset))
         .ok_or_else(|| invalid("shielded segment frame offsets are not ascending"))?;

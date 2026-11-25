@@ -25,7 +25,7 @@ use std::{
     fs::File,
     io::{self, BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 use prost::{Message, bytes::Bytes};
@@ -190,68 +190,102 @@ impl SegmentIdentity {
     }
 }
 
-/// One block's segment-wide authentication data, shared by both slabs.
-pub(crate) struct SealedRow {
-    id: BlockId,
-    parent: BlockHash,
-    /// Stored compact-block bytes the row budgets, before pool filtering.
-    native_bytes: usize,
-    shielded_sha256: [u8; 32],
-    nullifier_sha256: [u8; 32],
-    shielded_validation: OnceLock<Result<(), PayloadError>>,
-    nullifier_validation: OnceLock<Result<(), PayloadError>>,
+/// Expected payload SHA-256 digests for both slabs of one block.
+pub(super) struct SlabDigests {
+    pub(super) shielded: [u8; 32],
+    pub(super) nullifier: [u8; 32],
 }
 
-impl SealedRow {
-    fn sha256(&self, slab: SealedSlab) -> &[u8; 32] {
+impl SlabDigests {
+    fn for_slab(&self, slab: SealedSlab) -> &[u8; 32] {
         match slab {
-            SealedSlab::Shielded => &self.shielded_sha256,
-            SealedSlab::Nullifier => &self.nullifier_sha256,
+            SealedSlab::Shielded => &self.shielded,
+            SealedSlab::Nullifier => &self.nullifier,
         }
     }
+}
 
-    fn validation(&self, slab: SealedSlab) -> &OnceLock<Result<(), PayloadError>> {
+/// Two 4-bit first-read validation verdicts packed into one byte per block:
+/// low nibble for [`SealedSlab::Shielded`], high nibble for [`SealedSlab::Nullifier`].
+pub(super) struct RowValidation(AtomicU8);
+
+impl RowValidation {
+    const UNVALIDATED: u8 = 0;
+    const VALID: u8 = 1;
+    const INVALID_DIGEST: u8 = 2;
+    const INVALID_PROTOBUF: u8 = 3;
+    const INVALID_IDENTITY: u8 = 4;
+
+    pub(super) const fn new() -> Self {
+        Self(AtomicU8::new(Self::UNVALIDATED))
+    }
+
+    const fn shift(slab: SealedSlab) -> u8 {
         match slab {
-            SealedSlab::Shielded => &self.shielded_validation,
-            SealedSlab::Nullifier => &self.nullifier_validation,
+            SealedSlab::Shielded => 0,
+            SealedSlab::Nullifier => 4,
         }
     }
 
-    fn check_digest(&self, slab: SealedSlab, payload: &[u8]) -> Result<(), PayloadError> {
-        if <[u8; 32]>::from(Sha256::digest(payload)) != *self.sha256(slab) {
-            return Err(PayloadError::Digest);
+    const fn encode(verdict: Result<(), PayloadError>) -> u8 {
+        match verdict {
+            Ok(()) => Self::VALID,
+            Err(PayloadError::Digest) => Self::INVALID_DIGEST,
+            Err(PayloadError::Protobuf) => Self::INVALID_PROTOBUF,
+            Err(PayloadError::Identity) => Self::INVALID_IDENTITY,
         }
-        Ok(())
     }
 
-    fn verify_payload(
+    const fn decode(code: u8) -> Option<Result<(), PayloadError>> {
+        match code {
+            Self::VALID => Some(Ok(())),
+            Self::INVALID_DIGEST => Some(Err(PayloadError::Digest)),
+            Self::INVALID_PROTOBUF => Some(Err(PayloadError::Protobuf)),
+            Self::INVALID_IDENTITY => Some(Err(PayloadError::Identity)),
+            _ => None,
+        }
+    }
+
+    fn load(&self, slab: SealedSlab) -> Option<Result<(), PayloadError>> {
+        let nibble = (self.0.load(Ordering::Acquire) >> Self::shift(slab)) & 0x0f;
+        Self::decode(nibble)
+    }
+
+    fn store_if_unvalidated(
         &self,
         slab: SealedSlab,
-        payload: &Bytes,
-        kernel_verified: bool,
+        verdict: Result<(), PayloadError>,
     ) -> Result<(), PayloadError> {
-        // Portable files can change between reads. Only authenticated bytes share a verdict.
-        if !kernel_verified {
-            self.check_digest(slab, payload)?;
+        let shift = Self::shift(slab);
+        let encoded = Self::encode(verdict);
+        match self
+            .0
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |bits| {
+                let current = (bits >> shift) & 0x0f;
+                if Self::decode(current).is_some() {
+                    None
+                } else {
+                    Some((bits & !(0x0f << shift)) | (encoded << shift))
+                }
+            }) {
+            Ok(_) => verdict,
+            Err(existing) => Self::decode((existing >> shift) & 0x0f).unwrap_or(verdict),
         }
-        *self.validation(slab).get_or_init(|| {
-            if kernel_verified {
-                self.check_digest(slab, payload)?;
-            }
-            let block = lightwalletd::CompactBlock::decode(payload.clone())
-                .map_err(|_| PayloadError::Protobuf)?;
-            if block.height != u64::from(self.id.height.value())
-                || block.hash != encode_internal_block_hash(self.id.hash)
-                || block.prev_hash != encode_internal_block_hash(self.parent)
-            {
-                return Err(PayloadError::Identity);
-            }
-            Ok(())
-        })
     }
 }
 
-#[derive(Clone, Copy, Debug, thiserror::Error)]
+const _: () = assert!(std::mem::size_of::<BlockHash>() == 32);
+const _: () = assert!(std::mem::size_of::<RowValidation>() == 1);
+const _: () = assert!(std::mem::size_of::<SlabDigests>() == 64);
+
+fn check_digest(expected: &[u8; 32], payload: &[u8]) -> Result<(), PayloadError> {
+    if <[u8; 32]>::from(Sha256::digest(payload)) != *expected {
+        return Err(PayloadError::Digest);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 enum PayloadError {
     #[error("shielded segment payload SHA-256 mismatch")]
     Digest,
@@ -569,13 +603,23 @@ fn parent_directory(path: &Path) -> &Path {
 pub(crate) struct SealedHistory {
     pub(crate) kernel_verified: bool,
     identity: SegmentIdentity,
+    first_parent: BlockHash,
     file: File,
-    rows: Vec<SealedRow>,
     nullifier_base: u64,
-    /// Frame-start offsets of the shielded slab, relative to its base, plus
-    /// the slab's total length.
+    row_meta_base: u64,
+    shielded_slab_len: u32,
+    nullifier_slab_len: u32,
+    block_hashes: Vec<BlockHash>,
+    /// Stored compact-block bytes each row budgets, before pool filtering.
+    native_bytes: Vec<u32>,
+    /// Frame-start offsets of the shielded slab, relative to its base
+    /// (`len == block_count`).
     shielded_rel: Vec<u32>,
     nullifier_rel: Vec<u32>,
+    validation: Vec<RowValidation>,
+    /// Retained only when `!kernel_verified` so portable reads re-verify
+    /// payload SHA-256 on every read.
+    portable_digests: Option<Vec<SlabDigests>>,
 }
 
 #[derive(Clone)]
@@ -606,33 +650,98 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
 
 impl SealedHistory {
     pub(crate) fn open(path: &Path, expected: SegmentIdentity) -> io::Result<Self> {
+        Self::open_with_verity(path, expected, verity::measure)
+    }
+
+    fn open_with_verity(
+        path: &Path,
+        expected: SegmentIdentity,
+        measure: impl FnOnce(&File) -> io::Result<Option<[u8; 32]>>,
+    ) -> io::Result<Self> {
         let file = open_regular_file(path)?;
         let file_len = file.metadata()?.len();
-        let protected = index::pinned_verity(expected.verity, || verity::measure(&file))?;
+        let protected = index::pinned_verity(expected.verity, || measure(&file))?;
         let index::AdmittedSegment {
-            rows,
+            first_parent,
             nullifier_base,
+            row_meta_base,
+            shielded_slab_len,
+            nullifier_slab_len,
+            block_hashes,
+            native_bytes,
             shielded_rel,
             nullifier_rel,
+            validation,
+            portable_digests,
         } = index::admit(&mut &file, expected, file_len, protected)?;
         Ok(Self {
             kernel_verified: protected,
             identity: expected,
+            first_parent,
             file,
-            rows,
             // The shielded slab always starts right after the fixed header.
             nullifier_base,
+            row_meta_base,
+            shielded_slab_len,
+            nullifier_slab_len,
+            block_hashes,
+            native_bytes,
             shielded_rel,
             nullifier_rel,
+            validation,
+            portable_digests,
         })
     }
 
-    pub(crate) fn first_parent(&self) -> BlockHash {
-        self.rows[0].parent
+    #[cfg(test)]
+    fn heap_metadata_bytes(&self) -> usize {
+        self.block_hashes.capacity() * std::mem::size_of::<BlockHash>()
+            + self.native_bytes.capacity() * std::mem::size_of::<u32>()
+            + self.shielded_rel.capacity() * std::mem::size_of::<u32>()
+            + self.nullifier_rel.capacity() * std::mem::size_of::<u32>()
+            + self.validation.capacity() * std::mem::size_of::<RowValidation>()
+            + self.portable_digests.as_ref().map_or(0, |digests| {
+                digests.capacity() * std::mem::size_of::<SlabDigests>()
+            })
+    }
+
+    pub(crate) const fn first_parent(&self) -> BlockHash {
+        self.first_parent
     }
 
     pub(crate) const fn identity(&self) -> SegmentIdentity {
         self.identity
+    }
+
+    fn height_at(&self, index: usize) -> io::Result<BlockHeight> {
+        let offset = u32::try_from(index)
+            .map_err(|_| invalid("shielded segment height exceeds address space"))?;
+        self.identity
+            .start
+            .value()
+            .checked_add(offset)
+            .map(BlockHeight::new)
+            .ok_or_else(|| invalid("shielded segment interval exceeds its height type"))
+    }
+
+    fn block_id(&self, index: usize) -> io::Result<BlockId> {
+        Ok(BlockId::new(
+            self.height_at(index)?,
+            self.block_hashes[index],
+        ))
+    }
+
+    fn parent_at(&self, index: usize) -> BlockHash {
+        if index == 0 {
+            self.first_parent
+        } else {
+            self.block_hashes[index - 1]
+        }
+    }
+
+    fn native_bytes_at(&self, index: usize) -> io::Result<usize> {
+        usize::try_from(self.native_bytes[index])
+            .map_err(|_| invalid("shielded segment row exceeds address space"))
     }
 
     #[cfg(test)]
@@ -675,16 +784,18 @@ impl SealedHistory {
         let last = index(range.end)?;
         let mut remaining = max_bytes;
         let mut count = 0;
-        let mut iter = self.rows[first..=last].iter();
-        while let Some(row) = match order {
+        let mut iter = self.native_bytes[first..=last].iter();
+        while let Some(&native) = match order {
             HeightOrder::Ascending => iter.next(),
             HeightOrder::Descending => iter.next_back(),
         } {
-            if (count != 0 || !allow_oversized) && row.native_bytes > remaining {
+            let row_bytes = usize::try_from(native)
+                .map_err(|_| invalid("shielded segment row exceeds address space"))?;
+            if (count != 0 || !allow_oversized) && row_bytes > remaining {
                 break;
             }
             count += 1;
-            remaining = remaining.saturating_sub(row.native_bytes);
+            remaining = remaining.saturating_sub(row_bytes);
         }
         let selected = match order {
             HeightOrder::Ascending => first..first + count,
@@ -703,7 +814,14 @@ impl SealedHistory {
         }
     }
 
-    fn slab_base(&self, slab: SealedSlab) -> u64 {
+    const fn slab_len(&self, slab: SealedSlab) -> u32 {
+        match slab {
+            SealedSlab::Shielded => self.shielded_slab_len,
+            SealedSlab::Nullifier => self.nullifier_slab_len,
+        }
+    }
+
+    const fn slab_base(&self, slab: SealedSlab) -> u64 {
         match slab {
             SealedSlab::Shielded => HEADER_LEN as u64,
             SealedSlab::Nullifier => self.nullifier_base,
@@ -716,10 +834,12 @@ impl SealedHistory {
         selected: std::ops::Range<usize>,
     ) -> io::Result<Vec<SealedBlock>> {
         let rel = self.slab_rel(slab);
+        let slab_len = self.slab_len(slab);
         let first = selected.start;
         let last = selected.end - 1;
         let first_frame = self.slab_base(slab) + u64::from(rel[first]);
-        let len = usize::try_from(u64::from(rel[last + 1]) - u64::from(rel[first]))
+        let end_rel = rel_end(rel, slab_len, last)?;
+        let len = usize::try_from(u64::from(end_rel) - u64::from(rel[first]))
             .map_err(|_| invalid("shielded chunk exceeds address space"))?;
         let mut plan = Vec::new();
         if selected.len() == 1 || len <= SLAB_TARGET_BYTES {
@@ -728,7 +848,7 @@ impl SealedHistory {
             let mut start = first;
             let mut bytes = 0;
             for index in selected.clone() {
-                let frame_len = frame_len(rel, index)?;
+                let frame_len = frame_len(rel, slab_len, index)?;
                 if bytes != 0 && bytes + frame_len > SLAB_TARGET_BYTES {
                     plan.push((start..index, bytes));
                     start = index;
@@ -759,6 +879,7 @@ impl SealedHistory {
         mut slab_bytes: Vec<u8>,
     ) -> io::Result<()> {
         let rel = self.slab_rel(slab);
+        let slab_len = self.slab_len(slab);
         let first_rel = rel[rows.start];
         let mut starts = Vec::with_capacity(rows.len());
         for index in rows.clone() {
@@ -773,25 +894,114 @@ impl SealedHistory {
         }
         let slab_allocation = slab_bytes.capacity();
         let packed = Bytes::from(slab_bytes);
+        let lazy_meta = self.load_unvalidated_meta(slab, rows.clone())?;
         for (index, payload_start) in rows.zip(starts) {
-            let payload_len = frame_len(rel, index)? - LENGTHS_LEN;
+            let payload_len = frame_len(rel, slab_len, index)? - LENGTHS_LEN;
             // Every row of the slab keeps the whole slab alive.
             let message = EncodedBlock::from_length_prefixed_in(
                 packed.slice(payload_start - EncodedBlock::PREFIX_LEN..payload_start + payload_len),
                 slab_allocation,
             )
             .map_err(|_| invalid("shielded segment frame is not a gRPC message"))?;
-            let row = &self.rows[index];
-            row.verify_payload(slab, &message.payload(), self.kernel_verified)
+            let lazy_digest = if self.kernel_verified && self.validation[index].load(slab).is_none()
+            {
+                digest_from_meta(lazy_meta.as_ref(), slab, index)?
+            } else {
+                None
+            };
+            self.verify_payload(slab, index, &message.payload(), lazy_digest.as_ref())
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             out.push(SealedBlock {
-                id: row.id,
-                parent: row.parent,
-                native_bytes: row.native_bytes,
+                id: self.block_id(index)?,
+                parent: self.parent_at(index),
+                native_bytes: self.native_bytes_at(index)?,
                 message,
             });
         }
         Ok(())
+    }
+
+    /// Reads the contiguous slice of on-disk row metadata covering any
+    /// unvalidated rows in `rows` on `kernel_verified` segments.
+    fn load_unvalidated_meta(
+        &self,
+        slab: SealedSlab,
+        rows: std::ops::Range<usize>,
+    ) -> io::Result<Option<(usize, Vec<u8>)>> {
+        if !self.kernel_verified {
+            return Ok(None);
+        }
+        let mut bounds: Option<(usize, usize)> = None;
+        for index in rows {
+            if self.validation[index].load(slab).is_none() {
+                bounds = Some(match bounds {
+                    Some((first, _)) => (first, index),
+                    None => (index, index),
+                });
+            }
+        }
+        let Some((first, last)) = bounds else {
+            return Ok(None);
+        };
+        let row_offset = u64::try_from(first)
+            .map_err(|_| invalid("shielded segment row exceeds address space"))?
+            .checked_mul(ROW_META_LEN as u64)
+            .ok_or_else(|| invalid("shielded segment metadata exceeds address space"))?;
+        let offset = self
+            .row_meta_base
+            .checked_add(row_offset)
+            .ok_or_else(|| invalid("shielded segment metadata exceeds address space"))?;
+        let len = (last - first + 1)
+            .checked_mul(ROW_META_LEN)
+            .ok_or_else(|| invalid("shielded segment metadata exceeds address space"))?;
+        let meta_bytes = read_slab_at(&self.file, len, offset)?;
+        Ok(Some((first, meta_bytes)))
+    }
+
+    fn verify_payload(
+        &self,
+        slab: SealedSlab,
+        index: usize,
+        payload: &Bytes,
+        lazy_digest: Option<&[u8; 32]>,
+    ) -> Result<(), PayloadError> {
+        // Portable files can change between reads. Only authenticated bytes share a verdict.
+        if !self.kernel_verified {
+            let Some(digest) = self
+                .portable_digests
+                .as_ref()
+                .and_then(|digests| digests.get(index))
+                .map(|entry| entry.for_slab(slab))
+            else {
+                return Err(PayloadError::Digest);
+            };
+            check_digest(digest, payload)?;
+        }
+        if let Some(cached) = self.validation[index].load(slab) {
+            return cached;
+        }
+        let verdict = (|| {
+            if self.kernel_verified {
+                let Some(digest) = lazy_digest else {
+                    return Err(PayloadError::Digest);
+                };
+                check_digest(digest, payload)?;
+            }
+            let Ok(id) = self.block_id(index) else {
+                return Err(PayloadError::Identity);
+            };
+            let parent = self.parent_at(index);
+            let block = lightwalletd::CompactBlock::decode(payload.clone())
+                .map_err(|_| PayloadError::Protobuf)?;
+            if block.height != u64::from(id.height.value())
+                || block.hash != encode_internal_block_hash(id.hash)
+                || block.prev_hash != encode_internal_block_hash(parent)
+            {
+                return Err(PayloadError::Identity);
+            }
+            Ok(())
+        })();
+        self.validation[index].store_if_unvalidated(slab, verdict)
     }
 
     fn verified_row_start(
@@ -805,10 +1015,9 @@ impl SealedHistory {
             .get(frame_start..frame_start + LENGTHS_LEN)
             .and_then(|field| field.try_into().ok())
             .ok_or_else(|| invalid("missing shielded segment frame lengths"))?;
-        let row = &self.rows[index];
-        let frame_len = frame_len(self.slab_rel(slab), index)?;
+        let frame_len = frame_len(self.slab_rel(slab), self.slab_len(slab), index)?;
         let (native, wire) = decode_lengths(lengths)?;
-        if native != row.native_bytes || wire != frame_len - LENGTHS_LEN {
+        if native != self.native_bytes_at(index)? || wire != frame_len - LENGTHS_LEN {
             return Err(invalid(
                 "shielded segment frame lengths differ from its index",
             ));
@@ -817,16 +1026,50 @@ impl SealedHistory {
     }
 }
 
+fn digest_from_meta(
+    meta: Option<&(usize, Vec<u8>)>,
+    slab: SealedSlab,
+    index: usize,
+) -> io::Result<Option<[u8; 32]>> {
+    let Some((first, bytes)) = meta else {
+        return Ok(None);
+    };
+    let row_offset = index
+        .checked_sub(*first)
+        .and_then(|delta| delta.checked_mul(ROW_META_LEN))
+        .ok_or_else(|| invalid("short shielded segment metadata row"))?;
+    let digest_offset = row_offset
+        + match slab {
+            SealedSlab::Shielded => 72,
+            SealedSlab::Nullifier => 104,
+        };
+    let digest = bytes
+        .get(digest_offset..digest_offset + 32)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| invalid("short shielded segment metadata row"))?;
+    Ok(Some(digest))
+}
+
+fn rel_end(rel: &[u32], slab_len: u32, index: usize) -> io::Result<u32> {
+    if index + 1 == rel.len() {
+        Ok(slab_len)
+    } else {
+        rel.get(index + 1)
+            .copied()
+            .ok_or_else(|| invalid("shielded segment offset table is short"))
+    }
+}
+
 /// A row's whole frame length: its lengths field plus its payload.
-fn frame_len(rel: &[u32], index: usize) -> io::Result<usize> {
-    let next = rel
-        .get(index + 1)
-        .ok_or_else(|| invalid("shielded segment offset table is short"))?;
+fn frame_len(rel: &[u32], slab_len: u32, index: usize) -> io::Result<usize> {
     let offset = rel
         .get(index)
         .ok_or_else(|| invalid("shielded segment offset table is short"))?;
-    usize::try_from(u64::from(*next) - u64::from(*offset))
-        .map_err(|_| invalid("shielded segment frame offsets are not ascending"))
+    let next = rel_end(rel, slab_len, index)?;
+    let span = u64::from(next)
+        .checked_sub(u64::from(*offset))
+        .ok_or_else(|| invalid("shielded segment frame offsets are not ascending"))?;
+    usize::try_from(span).map_err(|_| invalid("shielded segment frame offsets are not ascending"))
 }
 
 /// Reads `len` bytes at `offset` into a new slab.

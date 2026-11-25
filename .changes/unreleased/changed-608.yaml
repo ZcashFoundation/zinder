@@ -1,0 +1,6 @@
+kind: changed
+body: Compacted `zinder-compat-lightwalletd`'s in-memory `SealedHistory` index from `168` B/block to `45` B/block on Linux `fs-verity` segments and `109` B/block on portable filesystems by packing per-slab validation state into 1 byte per block, omitting redundant per-row parent and height metadata, and lazily reading per-row SHA-256 digests from `fs-verity`-verified segment files on first validation while preserving per-read digest verification on portable filesystems and leaving `ZSHRNG01` wire bytes unchanged.
+time: 2026-11-25T16:07:30Z
+custom:
+    Bump: patch
+    PR: "608"
