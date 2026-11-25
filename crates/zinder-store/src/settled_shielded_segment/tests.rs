@@ -417,6 +417,26 @@ fn indexed_block_row_stays_within_48_bytes() {
     assert!(std::mem::size_of::<IndexedBlock>() <= 48);
 }
 
+fn assert_blocks_match_expected(
+    actual: &[EncodedBlock],
+    expected: &[EncodedBlock],
+    selection: ShieldedProjectionSelection,
+    order: HeightOrder,
+) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "length mismatch for {selection:?} {order:?}"
+    );
+    for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            got.as_length_prefixed(),
+            want.as_length_prefixed(),
+            "wire mismatch at idx={idx} for {selection:?} {order:?}"
+        );
+    }
+}
+
 #[test]
 fn all_sixteen_pool_and_nullifier_projections_match_reference_prost_bytes() -> TestOutcome {
     let dir = TempDir::new()?;
@@ -455,7 +475,13 @@ fn all_sixteen_pool_and_nullifier_projections_match_reference_prost_bytes() -> T
                         nullifiers_only,
                     );
                     for order in [HeightOrder::Ascending, HeightOrder::Descending] {
-                        let actual = reader.read_projected_range(range, order, selection)?;
+                        let fresh_reader = SettledShieldedSegmentReader::open(
+                            &path,
+                            &identity,
+                            SettledShieldedSegmentOpenOptions::default(),
+                        )?;
+                        let first = fresh_reader.read_projected_range(range, order, selection)?;
+                        let second = fresh_reader.read_projected_range(range, order, selection)?;
                         let mut expected: Vec<EncodedBlock> = blocks
                             .iter()
                             .map(|block| reference_encode_block(block, selection))
@@ -463,18 +489,8 @@ fn all_sixteen_pool_and_nullifier_projections_match_reference_prost_bytes() -> T
                         if order == HeightOrder::Descending {
                             expected.reverse();
                         }
-                        assert_eq!(
-                            actual.len(),
-                            expected.len(),
-                            "length mismatch for {selection:?} {order:?}"
-                        );
-                        for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
-                            assert_eq!(
-                                got.as_length_prefixed(),
-                                want.as_length_prefixed(),
-                                "wire mismatch at idx={idx} for {selection:?} {order:?}"
-                            );
-                        }
+                        assert_blocks_match_expected(&first, &expected, selection, order);
+                        assert_blocks_match_expected(&second, &expected, selection, order);
                     }
                 }
             }
@@ -1320,6 +1336,158 @@ fn post_admission_frame_and_digest_failures_latch_invalid_state() -> TestOutcome
     let non_matching_orchard = ShieldedProjectionSelection::new(false, true, false, true);
     assert!(matches!(
         reader.read_projected_range(range_4, HeightOrder::Ascending, non_matching_orchard),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+fn open_forged_pool_presence_segment(
+    dir: &Path,
+    name: &str,
+    blocks: &[CompactBlockArtifact],
+    row_idx: usize,
+    forged_mask: PoolPresenceMask,
+) -> TestOutcome<SettledShieldedSegmentReader> {
+    let (src_path, identity) = write_segment(dir, &format!("{name}-src"), blocks)?;
+    let mut mutated = fs::read(&src_path)?;
+    let index_offset = usize::try_from(u64::from_be_bytes(mutated[96..104].try_into()?))?;
+    mutated[index_offset + row_idx * ROW_INDEX_ENTRY_LEN + 76] = forged_mask.bits();
+    let forged_sha = recompute_portable_sha256(&mutated);
+    let body_end = mutated.len() - TRAILER_LEN;
+    mutated[body_end..].copy_from_slice(&forged_sha);
+    let forged_path = dir.join(name);
+    fs::write(&forged_path, &mutated)?;
+    let forged_identity = ShieldedSegmentIdentity {
+        sha256: forged_sha,
+        fs_verity_sha256: None,
+        ..identity
+    };
+    Ok(SettledShieldedSegmentReader::open(
+        &forged_path,
+        &forged_identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?)
+}
+
+#[test]
+fn reader_rejects_empty_pool_presence_mask_for_orchard_block() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = mixed_fixture_blocks()?;
+    let range_3 = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(3));
+
+    let reader_first = open_forged_pool_presence_segment(
+        dir.path(),
+        "empty-mask-first",
+        &blocks,
+        2,
+        PoolPresenceMask::EMPTY,
+    )?;
+    assert!(matches!(
+        reader_first.read_projected_range(
+            range_3,
+            HeightOrder::Ascending,
+            ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+        ),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader_first.read_default_range(range_3, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+
+    let reader_second = open_forged_pool_presence_segment(
+        dir.path(),
+        "empty-mask-second",
+        &blocks,
+        2,
+        PoolPresenceMask::EMPTY,
+    )?;
+    assert!(matches!(
+        reader_second.read_default_range(range_3, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader_second.read_projected_range(
+            range_3,
+            HeightOrder::Ascending,
+            ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+        ),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_understated_pool_presence_mask_on_zero_copy_projection() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = mixed_fixture_blocks()?;
+    let sapling_only_mask = PoolPresenceMask::SAPLING_SPEND.union(PoolPresenceMask::SAPLING_OUTPUT);
+    let reader = open_forged_pool_presence_segment(
+        dir.path(),
+        "sapling-only-mask",
+        &blocks,
+        1,
+        sapling_only_mask,
+    )?;
+    let range_2 = BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(2));
+    let sapling_full = ShieldedProjectionSelection::new(true, false, false, false);
+    assert!(matches!(
+        reader.read_projected_range(range_2, HeightOrder::Ascending, sapling_full),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader.read_default_range(range_2, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    let ironwood_nullifiers = ShieldedProjectionSelection::new(false, false, true, true);
+    assert!(matches!(
+        reader.read_projected_range(range_2, HeightOrder::Ascending, ironwood_nullifiers),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn reader_latches_invalid_state_on_slab_read_truncation() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = mixed_fixture_blocks()?;
+    let (path, identity) = write_segment(dir.path(), "trunc-src", &blocks)?;
+    let original = fs::read(&path)?;
+    let index_offset = usize::try_from(u64::from_be_bytes(original[96..104].try_into()?))?;
+    let portable_path = dir.path().join("trunc_portable");
+    fs::write(&portable_path, &original)?;
+    let portable_identity = ShieldedSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+    let reader = SettledShieldedSegmentReader::open(
+        &portable_path,
+        &portable_identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+
+    let range_3 = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(3));
+    assert_eq!(
+        reader
+            .read_default_range(range_3, HeightOrder::Ascending)?
+            .len(),
+        1
+    );
+
+    let truncate_offset = HEADER_LEN + row_slab_offset(&original, index_offset, 2)? + 1;
+    let truncate_len = u64::try_from(truncate_offset)?;
+    OpenOptions::new()
+        .write(true)
+        .open(&portable_path)?
+        .set_len(truncate_len)?;
+
+    assert!(matches!(
+        reader.read_default_range(range_3, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::Io(_))
+    ));
+    let sapling_nullifiers = ShieldedProjectionSelection::new(true, false, false, true);
+    assert!(matches!(
+        reader.read_projected_range(range_3, HeightOrder::Ascending, sapling_nullifiers),
         Err(SettledShieldedSegmentError::PayloadIntegrity(_))
     ));
     Ok(())

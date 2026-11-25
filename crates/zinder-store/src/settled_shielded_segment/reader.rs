@@ -158,7 +158,7 @@ impl SettledShieldedSegmentReader {
                     "shielded segment frame previously failed validation".to_owned(),
                 ));
             }
-            if can_skip_slab(row.pool_presence, selection) {
+            if can_skip_slab(row, selection) {
                 emit_synthesized_block(self, idx, buffers.packed_out)?;
                 if buffers.packed_out.len() >= SLAB_TARGET_BYTES {
                     flush_packed_blocks(buffers.packed_out, buffers.out)?;
@@ -272,6 +272,13 @@ impl SettledShieldedSegmentReader {
         selection: ShieldedProjectionSelection,
         buffers: &mut ProjectedReadBuffers<'_>,
     ) -> Result<(), SettledShieldedSegmentError> {
+        for idx in chunk.clone() {
+            if self.rows[idx].validation_state.load(Ordering::Acquire) == VALIDATION_INVALID {
+                return Err(SettledShieldedSegmentError::PayloadIntegrity(
+                    "shielded segment frame previously failed validation".to_owned(),
+                ));
+            }
+        }
         let first_rel = self.rows[chunk.start].slab_rel_offset;
         let (last_rel, last_len) = frame_span(&self.rows, self.slab_len, chunk.end - 1)?;
         let total_len = usize::try_from((last_rel + last_len) - first_rel).map_err(|_| {
@@ -281,7 +288,12 @@ impl SettledShieldedSegmentReader {
             &self.file,
             total_len,
             self.slab_offset + u64::from(first_rel),
-        )?;
+        )
+        .inspect_err(|_| {
+            for idx in chunk.clone() {
+                self.rows[idx].mark_invalid();
+            }
+        })?;
 
         let all_zero_copy = chunk
             .clone()
@@ -370,15 +382,25 @@ impl SettledShieldedSegmentReader {
             let row = &self.rows[row_idx];
             let height = self.height_at(row_idx)?;
             let prev_hash_wire = self.prev_hash_wire_at(row_idx);
-            validate_shielded_block_wire(payload, height, &row.block_hash_wire, prev_hash_wire)?;
+            validate_shielded_block_wire(
+                payload,
+                height,
+                &row.block_hash_wire,
+                prev_hash_wire,
+                row.pool_presence,
+            )?;
             row.mark_valid();
         }
         Ok(())
     }
 }
 
-fn can_skip_slab(presence: PoolPresenceMask, selection: ShieldedProjectionSelection) -> bool {
-    selection.nullifiers_only && !presence.intersects(selection.requested_pool_mask())
+fn can_skip_slab(row: &IndexedBlock, selection: ShieldedProjectionSelection) -> bool {
+    selection.nullifiers_only
+        && row.validation_state.load(Ordering::Acquire) == VALIDATION_VALID
+        && !row
+            .pool_presence
+            .intersects(selection.requested_pool_mask())
 }
 
 fn can_pass_through_zero_copy(
@@ -396,7 +418,7 @@ fn find_slab_span_end(
     selection: ShieldedProjectionSelection,
 ) -> usize {
     let mut end = start;
-    while end < limit && !can_skip_slab(rows[end].pool_presence, selection) {
+    while end < limit && !can_skip_slab(&rows[end], selection) {
         end += 1;
     }
     end

@@ -207,11 +207,13 @@ pub(super) fn validate_shielded_block_wire(
     expected_height: BlockHeight,
     expected_hash_wire: &[u8; 32],
     expected_prev_hash_wire: &[u8; 32],
+    expected_pool_presence: PoolPresenceMask,
 ) -> Result<(), SettledShieldedSegmentError> {
     let mut cursor = raw_payload;
     let mut seen_height = None;
     let mut seen_hash = false;
     let mut seen_prev_hash = false;
+    let mut observed_presence = PoolPresenceMask::EMPTY;
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
         match tag {
@@ -256,7 +258,7 @@ pub(super) fn validate_shielded_block_wire(
             COMPACT_BLOCK_TAG_VTX => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.vtx")?;
                 let tx_bytes = take_length_delimited(&mut cursor)?;
-                validate_compact_tx_wire(tx_bytes)?;
+                observed_presence = observed_presence.union(validate_compact_tx_wire(tx_bytes)?);
             }
             _ => skip_wire_field(wire_type, &mut cursor)?,
         }
@@ -267,6 +269,11 @@ pub(super) fn validate_shielded_block_wire(
     {
         return Err(SettledShieldedSegmentError::PayloadIntegrity(
             "shielded segment payload height, hash, or prev_hash mismatches index".to_owned(),
+        ));
+    }
+    if observed_presence != expected_pool_presence {
+        return Err(SettledShieldedSegmentError::PayloadIntegrity(
+            "shielded segment payload pool_presence disagrees with row index".to_owned(),
         ));
     }
     Ok(())
@@ -289,8 +296,11 @@ fn check_header_hash_field(
     Ok(true)
 }
 
-fn validate_compact_tx_wire(tx_bytes: &[u8]) -> Result<(), SettledShieldedSegmentError> {
+fn validate_compact_tx_wire(
+    tx_bytes: &[u8],
+) -> Result<PoolPresenceMask, SettledShieldedSegmentError> {
     let mut cursor = tx_bytes;
+    let mut presence = PoolPresenceMask::EMPTY;
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
         match tag {
@@ -306,16 +316,24 @@ fn validate_compact_tx_wire(tx_bytes: &[u8]) -> Result<(), SettledShieldedSegmen
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx.spends")?;
                 let nested = take_length_delimited(&mut cursor)?;
                 validate_sapling_spend_wire(nested)?;
+                presence = presence.union(PoolPresenceMask::SAPLING_SPEND);
             }
             COMPACT_TX_TAG_OUTPUTS => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx.outputs")?;
                 let nested = take_length_delimited(&mut cursor)?;
                 validate_sapling_output_wire(nested)?;
+                presence = presence.union(PoolPresenceMask::SAPLING_OUTPUT);
             }
             COMPACT_TX_TAG_ACTIONS | COMPACT_TX_TAG_IRONWOOD_ACTIONS => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactTx.actions")?;
                 let nested = take_length_delimited(&mut cursor)?;
                 validate_action_wire(nested)?;
+                let pool = if tag == COMPACT_TX_TAG_ACTIONS {
+                    PoolPresenceMask::ORCHARD
+                } else {
+                    PoolPresenceMask::IRONWOOD
+                };
+                presence = presence.union(pool);
             }
             COMPACT_TX_TAG_VIN | COMPACT_TX_TAG_VOUT => {
                 return Err(SettledShieldedSegmentError::PayloadIntegrity(
@@ -325,7 +343,7 @@ fn validate_compact_tx_wire(tx_bytes: &[u8]) -> Result<(), SettledShieldedSegmen
             _ => skip_wire_field(wire_type, &mut cursor)?,
         }
     }
-    Ok(())
+    Ok(presence)
 }
 
 #[derive(Clone, Copy)]
