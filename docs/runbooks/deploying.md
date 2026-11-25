@@ -74,12 +74,14 @@ the same bytes, so stores and backups move freely between hosts.
 Reserve additional disk for signed history. In a single-host trial at Mainnet
 height 3,593,347, the 877 settled segments occupied 17.28 GiB on ext4 with
 fs-verity. Fresh sequential publication (`--workers 1`) took 8 min 40 s and
-140 CPU-seconds. By default `publish-shielded-history` builds segments across
-`min(available CPUs, 4)` `--workers` (up to `16`) and batches manifest commits
-during initial bulk catchup; pass `--workers 1` on shared-disk hosts that need
-sequential disk I/O. Both settings produce byte-identical segments and manifests
-and stay within the publisher's 4 GiB cgroup limit, including file cache, with
-no OOM kills.
+140 CPU-seconds, reaching the publisher's 4 GiB cgroup limit, including file
+cache, with no OOM kills. By default `publish-shielded-history` builds segments
+across `min(available CPUs, 4)` `--workers` (up to `16`), bounding concurrent
+in-flight segment buffers and sharing the RocksDB secondary block cache while
+batching manifest commits during initial bulk catchup; both modes produce
+byte-identical segments and manifests. On memory-constrained or shared-disk
+hosts, verify parallel runs against your target cgroup limit or pass
+`--workers 1`.
 
 After a host page-cache reset, the wallet reader admitted all 877 segments and
 reached READY in 9.75 s, compared with 5.72 s for the canonical reader. At

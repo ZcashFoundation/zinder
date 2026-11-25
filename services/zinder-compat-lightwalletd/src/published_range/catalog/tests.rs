@@ -2347,3 +2347,69 @@ fn parallel_publication_commits_up_to_segment_limit_and_rejects_overflow() -> Re
     PublisherHead::read(fixture.directory.path(), &key)?.verify(&publisher.entries)?;
     Ok(())
 }
+
+#[test]
+fn parallel_publication_wakes_full_window_waiters_on_cancel() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(20);
+    let (_files, canonical) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    let concurrency = concurrency_for_test(3, 1)?;
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+    let handle = std::thread::spawn(move || {
+        let stopping = tokio_util::sync::CancellationToken::new();
+        let window_completed = std::sync::atomic::AtomicUsize::new(0);
+        let build_segment = |canonical_reader: &RocksDbCanonicalReader,
+                             dir: &std::path::Path,
+                             range: BlockHeightRange,
+                             slot: usize| {
+            let segment_index = usize::try_from((range.start.value() - 1) / 2)
+                .map_err(|_| io::Error::other("height conversion"))?;
+            if segment_index == 0 {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while window_completed.load(std::sync::atomic::Ordering::Acquire) < 5 {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "sibling workers did not fill dispatch window",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                // Let sibling workers finish sending and block on the full window.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                stopping.cancel();
+                return manifest::stage_segment(canonical_reader, dir, range, slot);
+            }
+            let built = manifest::stage_segment(canonical_reader, dir, range, slot)?;
+            window_completed.fetch_add(1, std::sync::atomic::Ordering::Release);
+            Ok(built)
+        };
+        let committed =
+            publisher.publish_available_with(&canonical, concurrency, &stopping, &build_segment)?;
+        let _ = done_tx.send((publisher, canonical, committed));
+        Ok::<_, eyre::Report>(())
+    });
+
+    let (mut publisher, canonical, partial) = done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| eyre!("parallel publication deadlocked on full dispatch window"))?;
+    handle
+        .join()
+        .map_err(|_| eyre!("parallel publication thread panicked"))??;
+    assert!((1..=6).contains(&partial), "partial={partial}");
+    let committed = fixture.catalog(None)?;
+    assert_eq!(committed.segments().len(), partial);
+
+    let resume = publisher.publish_available(
+        &canonical,
+        concurrency,
+        &tokio_util::sync::CancellationToken::new(),
+    )?;
+    assert_eq!(partial + resume, 10);
+    let full = fixture.catalog(Some(&committed))?;
+    assert_eq!(full.segments().len(), 10);
+    assert_eq!(full.bounds().end, BlockHeight::new(20));
+    Ok(())
+}

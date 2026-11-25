@@ -496,8 +496,12 @@ impl JobQueue {
         let mut guard = self.state.lock();
         loop {
             if stopping.is_cancelled() || guard.stopped {
+                let transitioned = !guard.stopped;
                 guard.stopped = true;
                 drop(guard);
+                if transitioned {
+                    self.changed.notify_all();
+                }
                 return None;
             }
             if guard.aborted_from.is_some_and(|limit| guard.next >= limit)
@@ -536,11 +540,9 @@ impl JobQueue {
 
     fn stop(&self) {
         let mut guard = self.state.lock();
-        if !guard.stopped {
-            guard.stopped = true;
-            drop(guard);
-            self.changed.notify_all();
-        }
+        guard.stopped = true;
+        drop(guard);
+        self.changed.notify_all();
     }
 }
 
@@ -656,5 +658,55 @@ impl<'a> BatchCommitter<'a> {
             return Err(error);
         }
         Ok(self.committed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::JobQueue;
+
+    #[test]
+    fn job_queue_wakes_window_waiters_when_stopping_transitions() -> io::Result<()> {
+        let queue = Arc::new(JobQueue::new(4, 2));
+        let stopping = CancellationToken::new();
+        assert_eq!(queue.take_next(&stopping), Some(0));
+        assert_eq!(queue.take_next(&stopping), Some(1));
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter_queue = Arc::clone(&queue);
+        let waiter_stopping = stopping.clone();
+        let waiter = std::thread::spawn(move || {
+            let _ = entered_tx.send(());
+            let next = waiter_queue.take_next(&waiter_stopping);
+            let _ = done_tx.send(next);
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(io::Error::other)?;
+        // Let the waiter enter `Condvar::wait` before cancelling.
+        std::thread::sleep(Duration::from_millis(20));
+
+        stopping.cancel();
+        // Calling `take_next` first transitions `guard.stopped` before `stop()` runs.
+        assert_eq!(queue.take_next(&stopping), None);
+        queue.stop();
+
+        let waiter_next = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(io::Error::other)?;
+        assert_eq!(waiter_next, None);
+        waiter
+            .join()
+            .map_err(|_| io::Error::other("job queue waiter thread panicked"))
     }
 }
