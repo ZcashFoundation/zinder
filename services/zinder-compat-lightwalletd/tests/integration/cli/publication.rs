@@ -665,13 +665,18 @@ async fn publisher_rejects_out_of_range_workers_argument() -> Result<()> {
     let (private, _) = shielded_catalog_keys(files.path())?;
     let catalog = files.path().join("catalog");
     let scratch = files.path().join("secondary");
-    for bad_workers in ["0", "17"] {
+    for (bad_workers, expected_error) in [
+        ("0", "worker count must be between 1 and 16"),
+        ("17", "worker count 17 exceeds maximum 16"),
+    ] {
         let rejected =
             publication_command(&files.path().join("primary"), &scratch, &catalog, &private)
                 .args(["--workers", bad_workers])
                 .output()
                 .await?;
         assert!(!rejected.status.success(), "{bad_workers}: {rejected:?}");
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(stderr.contains(expected_error), "{bad_workers}: {stderr}");
     }
     Ok(())
 }
