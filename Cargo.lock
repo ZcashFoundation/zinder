@@ -6657,6 +6657,9 @@ name = "zinder-store"
 version = "0.25.0"
 dependencies = [
  "base64 0.23.1",
+ "bytes",
+ "composefs-ioctls",
+ "fs-verity",
  "getrandom 0.4.3",
  "hmac",
  "incrementalmerkletree",
