@@ -1,0 +1,6 @@
+kind: changed
+body: Wired `ZebraIndexerBlockSource` into `zinder-ingest` (`ingest.source = "zebra-indexer-grpc"`) with lazy failover validation across `[node]` and `[node_fallbacks.N]`, skipped redundant `tip_id()` polls on strictly settled history segments with continuity fallbacks, and prepared canonical blocks concurrently via byte-bounded out-of-order streams while preserving contiguous commit order.
+time: 2026-11-25T16:23:00Z
+custom:
+    Bump: patch
+    PR: "610"
