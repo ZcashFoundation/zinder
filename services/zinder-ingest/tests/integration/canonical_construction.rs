@@ -1858,3 +1858,151 @@ async fn fresh_construction_with_tree_hashing_workers_and_checkpoint_advances_re
     );
     Ok(())
 }
+
+type ColumnFamilyEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn read_cf_entries(
+    store_path: &std::path::Path,
+    family_name: &str,
+) -> Result<ColumnFamilyEntries, Box<dyn std::error::Error>> {
+    let options = rust_rocksdb::Options::default();
+    let families = rust_rocksdb::DB::list_cf(&options, store_path)?;
+    let db = rust_rocksdb::DB::open_cf_for_read_only(&options, store_path, families, false)?;
+    let family = db
+        .cf_handle(family_name)
+        .ok_or_else(|| format!("missing column family {family_name}"))?;
+    let mut entries = Vec::new();
+    for entry in db.iterator_cf(&family, rust_rocksdb::IteratorMode::Start) {
+        let (key, bytes) = entry?;
+        entries.push((key.to_vec(), bytes.to_vec()));
+    }
+    Ok(entries)
+}
+
+fn dense_multi_pool_source(
+    activations: &NetworkUpgradeActivations,
+) -> Result<MultiBlockConstructionSource, Box<dyn std::error::Error>> {
+    let sapling = fixture_sapling_source_block()?;
+    let orchard = fixture_orchard_source_block()?;
+    MultiBlockConstructionSource::build_with_transactions(8, activations, |height| match height {
+        3 => shielded_transactions_with_lock_time(&sapling, Some(300)),
+        4 => {
+            let mut transactions = shielded_transactions_with_lock_time(&sapling, Some(400))?;
+            transactions.extend(shielded_transactions_with_lock_time(&orchard, Some(401))?);
+            Ok(transactions)
+        }
+        5 => {
+            let mut transactions = shielded_transactions_with_lock_time(&sapling, Some(500))?;
+            for index in 0_u32..20 {
+                transactions.extend(shielded_transactions_with_lock_time(
+                    &orchard,
+                    Some(501 + index),
+                )?);
+            }
+            Ok(transactions)
+        }
+        7 => shielded_transactions_with_lock_time(&orchard, Some(700)),
+        _ => Ok(Vec::new()),
+    })
+}
+
+async fn build_explorer_every_block_store(
+    source: &MultiBlockConstructionSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+    store_path: &std::path::Path,
+    tree_hashing_workers: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tip = source.checkpoint_at(7)?;
+    let genesis = source.checkpoint_at(0)?;
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        activations,
+        genesis.block_time_seconds,
+        tip.block_id,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(1)?,
+    )?;
+    let builder = RocksDbCanonicalBuilder::create_fresh(
+        store_path,
+        CanonicalStoreWorkload::Explorer,
+        build_plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?
+    .with_tree_state_checkpoint_selection(zinder_store::TreeStateCheckpointSelection::EveryBlock)?;
+    let mut config = CanonicalConstructionConfig::for_local_tests(
+        Duration::from_secs(5),
+        Arc::clone(activations),
+    );
+    config.pipeline_limits.tree_hashing_workers =
+        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
+    let loaded = load_fresh_canonical(builder, source, &config).await?;
+    // Explorer publication requires authenticated daily value-pool evidence, so
+    // stop after bulk loading ingests checkpoints, final roots, and subtrees.
+    drop(loaded);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_block_construction_with_dense_and_multi_pool_commitments_matches_serial_across_workers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let source = dense_multi_pool_source(&activations)?;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let temporary = TempDir::new()?;
+
+    let mut serial_checkpoints: Option<ColumnFamilyEntries> = None;
+    let mut serial_final_roots: Option<ColumnFamilyEntries> = None;
+    let mut serial_subtrees: Option<ColumnFamilyEntries> = None;
+    let mut serial_fence = None;
+
+    for workers in [1_u32, 2, 4, 8] {
+        let wallet_path = temporary.path().join(format!("wallet-{workers}"));
+        let mut wallet_config =
+            multi_block_writer_config(wallet_path.clone(), Arc::clone(&activations), true);
+        wallet_config
+            .construction
+            .pipeline_limits
+            .tree_hashing_workers = NonZeroU32::new(workers).ok_or("workers must be non-zero")?;
+        let wallet_store = admit_canonical_store(
+            &source,
+            Arc::clone(&activations),
+            &wallet_config,
+            &readiness,
+            &CancellationToken::new(),
+        )
+        .await?;
+        for height in 0_u32..=7 {
+            assert_eq!(
+                wallet_store
+                    .tree_state_checkpoint_at(BlockHeight::new(height), &activations)?
+                    .as_ref(),
+                Some(source.checkpoint_at(height)?)
+            );
+        }
+        let fence = wallet_store.event_fence();
+        drop(wallet_store);
+        let wallet_checkpoints = read_cf_entries(&wallet_path, "tree_state_checkpoint")?;
+        assert_eq!(wallet_checkpoints.len(), 8);
+
+        let explorer_path = temporary.path().join(format!("explorer-{workers}"));
+        build_explorer_every_block_store(&source, &activations, &explorer_path, workers).await?;
+        let explorer_checkpoints = read_cf_entries(&explorer_path, "tree_state_checkpoint")?;
+        let explorer_final_roots =
+            read_cf_entries(&explorer_path, "block_final_note_commitment_roots")?;
+        let explorer_subtrees = read_cf_entries(&explorer_path, "subtree_root")?;
+        assert_eq!(explorer_checkpoints, wallet_checkpoints);
+        assert_eq!(explorer_final_roots.len(), 7);
+
+        if let Some(expected_checkpoints) = &serial_checkpoints {
+            assert_eq!(&wallet_checkpoints, expected_checkpoints);
+            assert_eq!(Some(&explorer_final_roots), serial_final_roots.as_ref());
+            assert_eq!(Some(&explorer_subtrees), serial_subtrees.as_ref());
+            assert_eq!(Some(fence), serial_fence);
+        } else {
+            serial_checkpoints = Some(wallet_checkpoints);
+            serial_final_roots = Some(explorer_final_roots);
+            serial_subtrees = Some(explorer_subtrees);
+            serial_fence = Some(fence);
+        }
+    }
+    Ok(())
+}

@@ -28,7 +28,10 @@ const MAX_PENDING_BLOCKS: usize = 64;
 
 /// Worker threads and the blocks whose checkpoints they are still deriving.
 pub(super) struct TreeHashers {
-    workers: rayon::ThreadPool,
+    /// Dedicated pool for synchronous block appends, or `None` when `workers == 2`
+    /// keeps both spawned threads for checkpoints and runs appends inline.
+    append_workers: Option<rayon::ThreadPool>,
+    checkpoint_workers: rayon::ThreadPool,
     /// The runtime the loader's blocking thread waits on, so a wait for a
     /// worker also ends when construction is cancelled.
     runtime: Handle,
@@ -36,6 +39,45 @@ pub(super) struct TreeHashers {
     /// the queue, so the blocks before it still reach the store first.
     pending: VecDeque<Result<PendingBuildBlock, CanonicalConstructionError>>,
     max_pending: usize,
+}
+
+/// Splits `threads` (`>= 2`) into `(append_threads, checkpoint_threads)`.
+///
+/// With two threads, appends run inline on the loader thread so all spawned
+/// workers stay dedicated to checkpoints. With three or more threads, appends
+/// and checkpoints each receive their own pool within the configured ceiling.
+fn partition_worker_threads(threads: usize) -> (usize, usize) {
+    if threads <= 2 {
+        return (0, threads);
+    }
+    let append_threads = (threads / 2).max(2);
+    (append_threads, threads - append_threads)
+}
+
+fn build_worker_pool(
+    threads: usize,
+    configured_workers: NonZeroU32,
+    name_prefix: &'static str,
+) -> Result<rayon::ThreadPool, CanonicalConstructionError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(move |index| format!("{name_prefix}-{index}"))
+        // A panicking job drops its result sender, which the loader
+        // reports as a failed block instead of aborting the process.
+        .panic_handler(|_| {
+            tracing::error!(
+                target: "zinder::ingest",
+                event = "commitment_tree_hashing_worker_panicked",
+                "a commitment-tree hashing worker panicked"
+            );
+        })
+        .build()
+        .map_err(
+            |source| CanonicalConstructionError::TreeHashingWorkersUnavailable {
+                workers: configured_workers.get(),
+                reason: source.to_string(),
+            },
+        )
 }
 
 impl TreeHashers {
@@ -49,36 +91,33 @@ impl TreeHashers {
         if threads == 1 {
             return Ok(None);
         }
-        let workers = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|index| format!("zinder-tree-hash-{index}"))
-            // A panicking job drops its result sender, which the loader
-            // reports as a failed block instead of aborting the process.
-            .panic_handler(|_| {
-                tracing::error!(
-                    target: "zinder::ingest",
-                    event = "commitment_tree_hashing_worker_panicked",
-                    "a commitment-tree hashing worker panicked"
-                );
-            })
-            .build()
-            .map_err(
-                |source| CanonicalConstructionError::TreeHashingWorkersUnavailable {
-                    workers: workers.get(),
-                    reason: source.to_string(),
-                },
-            )?;
+        let (append_threads, checkpoint_threads) = partition_worker_threads(threads);
+        let append_workers = (append_threads > 0)
+            .then(|| build_worker_pool(append_threads, workers, "zinder-tree-append"))
+            .transpose()?;
+        let checkpoint_workers =
+            build_worker_pool(checkpoint_threads, workers, "zinder-tree-ckpt")?;
         Ok(Some(Self {
-            workers,
+            append_workers,
+            checkpoint_workers,
             runtime,
             pending: VecDeque::new(),
             max_pending: threads.saturating_mul(2).min(MAX_PENDING_BLOCKS),
         }))
     }
 
-    /// Runs `hash` on the workers, which it may split further.
+    /// Whether a dedicated append pool is available for parallel block appends.
+    pub(super) const fn has_append_workers(&self) -> bool {
+        self.append_workers.is_some()
+    }
+
+    /// Runs `hash` on the dedicated append workers, or inline on the caller
+    /// when `workers == 2` leaves all spawned workers for checkpoints.
     pub(super) fn install<T: Send>(&self, hash: impl FnOnce() -> T + Send) -> T {
-        self.workers.install(hash)
+        match &self.append_workers {
+            Some(workers) => workers.install(hash),
+            None => hash(),
+        }
     }
 
     /// Whether the loader should take another block before handing one to
@@ -127,7 +166,7 @@ impl TreeHashers {
 
     fn spawn_job(&self, job: impl FnOnce() -> TreeWorkOutput + Send + 'static) -> PendingTreeWork {
         let (sender, receiver) = oneshot::channel();
-        self.workers.spawn(move || {
+        self.checkpoint_workers.spawn(move || {
             // The loader drops the receiver only when construction stops.
             let _loader_stopped = sender.send(job());
         });
@@ -209,23 +248,89 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
 
-    use super::{CanonicalConstructionError, NonZeroU32, TreeHashers, TreeWorkOutput};
+    use super::{
+        CanonicalConstructionError, NonZeroU32, TreeHashers, TreeWorkOutput,
+        partition_worker_threads,
+    };
+
+    /// Starts `workers` hashing threads whose waits run on `runtime`.
+    fn workers_pool(
+        workers: u32,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<TreeHashers, Box<dyn std::error::Error>> {
+        TreeHashers::start(
+            NonZeroU32::new(workers).ok_or("workers must be non-zero")?,
+            runtime.handle().clone(),
+        )?
+        .ok_or_else(|| "multiple workers start a pool".into())
+    }
 
     /// Starts two workers whose waits run on `runtime`.
     fn two_workers(
         runtime: &tokio::runtime::Runtime,
     ) -> Result<TreeHashers, Box<dyn std::error::Error>> {
-        TreeHashers::start(
-            NonZeroU32::new(2).ok_or("two is non-zero")?,
-            runtime.handle().clone(),
-        )?
-        .ok_or_else(|| "two workers start a pool".into())
+        workers_pool(2, runtime)
     }
 
     #[test]
     fn one_worker_hashes_on_the_loader_thread() -> Result<(), Box<dyn std::error::Error>> {
         let runtime = tokio::runtime::Runtime::new()?;
         assert!(TreeHashers::start(NonZeroU32::MIN, runtime.handle().clone())?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn partition_worker_threads_respects_configured_worker_budget() {
+        assert_eq!(partition_worker_threads(2), (0, 2));
+        for workers in 3_usize..=16 {
+            let (append_threads, checkpoint_threads) = partition_worker_threads(workers);
+            assert_eq!(append_threads + checkpoint_threads, workers);
+            assert!(checkpoint_threads >= 1);
+            assert!(append_threads >= 2);
+        }
+    }
+
+    #[test]
+    fn queued_checkpoint_jobs_do_not_starve_synchronous_append_install()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = tokio::runtime::Runtime::new()?;
+        let cancel = CancellationToken::new();
+        for workers in [2_u32, 4, 8] {
+            let tree_hashers = workers_pool(workers, &runtime)?;
+            let worker_count = usize::try_from(workers).unwrap_or(usize::MAX);
+            let (_, checkpoint_threads) = partition_worker_threads(worker_count);
+            let inside_jobs = Arc::new(Barrier::new(checkpoint_threads + 1));
+            let release_jobs = Arc::new(Barrier::new(checkpoint_threads + 1));
+            let mut held_jobs = Vec::with_capacity(checkpoint_threads * 2);
+            for _ in 0..checkpoint_threads {
+                let inside_jobs = Arc::clone(&inside_jobs);
+                let release_jobs = Arc::clone(&release_jobs);
+                held_jobs.push(tree_hashers.spawn_job(move || {
+                    inside_jobs.wait();
+                    release_jobs.wait();
+                    TreeWorkOutput::default()
+                }));
+            }
+            for _ in 0..checkpoint_threads {
+                held_jobs.push(tree_hashers.spawn_job(TreeWorkOutput::default));
+            }
+            inside_jobs.wait();
+
+            let started_at = Instant::now();
+            let computed = tree_hashers.install(|| rayon::join(|| 20_u32, || 22_u32));
+            let elapsed = started_at.elapsed();
+            drop(tree_hashers);
+            assert_eq!(computed, (20, 22));
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "synchronous install stalled behind held checkpoint jobs for {workers} workers"
+            );
+
+            release_jobs.wait();
+            for job in held_jobs {
+                let _completed = job.wait(&cancel)?;
+            }
+        }
         Ok(())
     }
 

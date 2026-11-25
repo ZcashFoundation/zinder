@@ -1379,16 +1379,19 @@ impl CanonicalBuildBlockReceiver {
             .commitment_extract
             .record(extracted_at.duration_since(started_at));
         let accumulator = &mut self.commitment_tree_accumulator;
+        let parallel_append = should_parallelize_append(&commitments);
         match &self.tree_hashers {
-            Some(tree_hashers) => tree_hashers.install(|| {
-                accumulator.append_block_commitments_in_parallel(
-                    height,
-                    &commitments.sapling,
-                    &commitments.orchard,
-                    &commitments.ironwood,
-                )
-            }),
-            None => accumulator.append_block_commitments(
+            Some(tree_hashers) if parallel_append && tree_hashers.has_append_workers() => {
+                tree_hashers.install(|| {
+                    accumulator.append_block_commitments_in_parallel(
+                        height,
+                        &commitments.sapling,
+                        &commitments.orchard,
+                        &commitments.ironwood,
+                    )
+                })
+            }
+            Some(_) | None => accumulator.append_block_commitments(
                 height,
                 &commitments.sapling,
                 &commitments.orchard,
@@ -1428,6 +1431,20 @@ impl CanonicalBuildBlockReceiver {
         (roots.sapling.is_some() || roots.orchard.is_some() || roots.ironwood.is_some())
             .then_some(roots)
     }
+}
+
+/// Minimum note commitments in one pool before block appends enter the parallel
+/// append worker pool.
+const PARALLEL_COMMITMENT_THRESHOLD: usize = 32;
+
+fn should_parallelize_append(commitments: &CompactBlockCommitments) -> bool {
+    let active_pools = usize::from(!commitments.sapling.is_empty())
+        + usize::from(!commitments.orchard.is_empty())
+        + usize::from(!commitments.ironwood.is_empty());
+    active_pools >= 2
+        || commitments.sapling.len() >= PARALLEL_COMMITMENT_THRESHOLD
+        || commitments.orchard.len() >= PARALLEL_COMMITMENT_THRESHOLD
+        || commitments.ironwood.len() >= PARALLEL_COMMITMENT_THRESHOLD
 }
 
 #[derive(Default)]
