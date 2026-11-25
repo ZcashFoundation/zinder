@@ -1,6 +1,0 @@
-kind: changed
-body: Eliminated duplicate depth-32 checkpoint root derivation in `CommitmentTreeAccumulator::cross_checked_pool` and global `parking_lot::Mutex` contention in `with_frontier_root_memo`, partitioned `TreeHashers` worker pools so asynchronous checkpoint tasks do not stall block commitment appends, and parallelized large/multi-pool leaf commitment decoding during canonical store construction.
-time: 2026-11-25T15:23:20Z
-custom:
-    Bump: patch
-    PR: "606"

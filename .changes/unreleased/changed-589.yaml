@@ -1,6 +1,0 @@
-kind: changed
-body: Raised the default wallet-projection RocksDB reader open-file limit (`wallet.rocksdb.max_open_files`) from `64` to `1024`, capped the wallet-projection writer live WAL ceiling (`wallet.rocksdb.max_wal_bytes`) at `32 MiB` (`33554432` bytes) while keeping materialized-view defaults unchanged, and enabled partitioned `10`-bits-per-key hybrid Ribbon filters with two-level index search and pinned top-level index and filter blocks on canonical `block_hash_index` and `transaction_location` column families and bulk SSTs.
-time: 2026-11-25T12:14:33Z
-custom:
-    Bump: patch
-    PR: "589"

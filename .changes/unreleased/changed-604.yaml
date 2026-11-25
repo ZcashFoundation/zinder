@@ -1,6 +1,0 @@
-kind: changed
-body: Parallelized settled `ZSHRNG01` segment construction and `fs-verity` sealing in `zinder-compat-lightwalletd publish-shielded-history` across bounded worker threads (`--workers <COUNT>`, `1..=16`, default `min(CPUs, 4)`) with batched manifest durability during initial bulk catchup while preserving strict sequential height ordering, atomic rollback guarantees, and unchanged on-disk formats.
-time: 2026-11-25T15:20:51Z
-custom:
-    Bump: patch
-    PR: "604"
