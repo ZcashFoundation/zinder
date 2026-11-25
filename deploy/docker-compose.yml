@@ -192,7 +192,7 @@ services:
 
   zinder-history-publisher:
     <<: *compat-image
-    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-${ZINDER_COMPAT_MEMORY_LIMIT:-4g}}
+    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-4g}
     network_mode: none
     restart: unless-stopped
     depends_on:
@@ -229,6 +229,9 @@ services:
 
   zinder-compat-lightwalletd:
     <<: *compat-image
+    # Under cgroup v2, ZSHRNG01 shielded-history page cache counts toward mem_limit;
+    # keep 4g for self-hosted VMs and raise ZINDER_COMPAT_MEMORY_LIMIT (for example 32g+) on
+    # 64+ GiB public Mainnet endpoints (see docs/runbooks/deploying.md).
     mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-4g}
     ulimits:
       nofile:
