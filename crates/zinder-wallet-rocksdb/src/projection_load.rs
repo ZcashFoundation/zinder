@@ -1682,7 +1682,9 @@ fn finish_projection_ssts_with_plan(
                 shard_count: shard_plan.address_index_push_shards,
                 max_accounted_memory_bytes: config.max_secondary_sort_memory_bytes_per_sorter,
                 max_temporary_file_bytes: config.max_temporary_file_bytes_per_sorter,
-                per_shard_merge_fan_in_cap: Some(shard_plan.address_index_per_shard_fan_in),
+                // Descriptor fan-in is resolved at the start of secondary derivation once
+                // `sorted_outpoints` closes its open run readers.
+                per_shard_merge_fan_in_cap: None,
             },
         )?;
     let address_transaction_sorter =
@@ -1693,7 +1695,7 @@ fn finish_projection_ssts_with_plan(
                 shard_count: shard_plan.address_transaction_shards,
                 max_accounted_memory_bytes: address_transaction_sort_memory,
                 max_temporary_file_bytes: config.max_temporary_file_bytes_per_sorter,
-                per_shard_merge_fan_in_cap: Some(shard_plan.address_transaction_per_shard_fan_in),
+                per_shard_merge_fan_in_cap: None,
             },
         )?;
     let mut accumulators =
@@ -2183,15 +2185,80 @@ struct SecondaryAccumulators<'a> {
     sst_evidence: &'a mut WalletProjectionSstEvidence,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecondaryPhaseFanIn {
+    overlap_secondary: bool,
+    address_index_per_shard_fan_in: usize,
+    address_transaction_per_shard_fan_in: usize,
+}
+
+fn invalid_secondary_fan_in(reason: &str) -> RocksDbWalletError {
+    BulkLoadError::InvalidInput {
+        reason: reason.to_owned(),
+    }
+    .into()
+}
+
+fn resolve_secondary_phase_fan_in(
+    address_index_push_shards: NonZeroU32,
+    address_transaction_shards: NonZeroU32,
+    overlap_requested: bool,
+    active_fan_in: usize,
+) -> Result<SecondaryPhaseFanIn, RocksDbWalletError> {
+    const MIN_FAN_IN: usize = 2;
+    let idx_shards = usize::try_from(address_index_push_shards.get())
+        .map_err(|_| invalid_secondary_fan_in("address index shard count exceeds usize::MAX"))?;
+    let tx_shards = usize::try_from(address_transaction_shards.get()).map_err(|_| {
+        invalid_secondary_fan_in("address transaction shard count exceeds usize::MAX")
+    })?;
+    let min_idx_total = idx_shards
+        .checked_mul(MIN_FAN_IN)
+        .ok_or_else(|| invalid_secondary_fan_in("address index fan-in overflows usize"))?;
+    let min_tx_total = tx_shards
+        .checked_mul(MIN_FAN_IN)
+        .ok_or_else(|| invalid_secondary_fan_in("address transaction fan-in overflows usize"))?;
+    if overlap_requested && min_idx_total.saturating_add(min_tx_total) <= active_fan_in {
+        let idx_budget = (active_fan_in / 4)
+            .max(min_idx_total)
+            .min(active_fan_in.saturating_sub(min_tx_total));
+        let tx_budget = active_fan_in.saturating_sub(idx_budget);
+        return Ok(SecondaryPhaseFanIn {
+            overlap_secondary: true,
+            address_index_per_shard_fan_in: (idx_budget / idx_shards).max(MIN_FAN_IN),
+            address_transaction_per_shard_fan_in: (tx_budget / tx_shards).max(MIN_FAN_IN),
+        });
+    }
+    let idx_per_shard = active_fan_in / idx_shards.max(1);
+    let tx_per_shard = active_fan_in / tx_shards.max(1);
+    if idx_per_shard < MIN_FAN_IN || tx_per_shard < MIN_FAN_IN {
+        return Err(invalid_secondary_fan_in(
+            "secondary sharded sort exceeds active merge file-descriptor fan-in",
+        ));
+    }
+    Ok(SecondaryPhaseFanIn {
+        overlap_secondary: false,
+        address_index_per_shard_fan_in: idx_per_shard,
+        address_transaction_per_shard_fan_in: tx_per_shard,
+    })
+}
+
 struct ConcurrentSecondaryHashing {
     index: Option<crate::accumulator_hashing::BranchHashingConfig>,
     tx: Vec<Option<crate::accumulator_hashing::BranchHashingConfig>>,
     active_writers: usize,
+    fan_in: SecondaryPhaseFanIn,
+}
+
+struct AddressIndexBranchBudget {
+    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
+    active_writers: usize,
+    merge_fan_in: usize,
 }
 
 struct AddressTxHashingBudget {
     configs: Vec<Option<crate::accumulator_hashing::BranchHashingConfig>>,
     active_writers: usize,
+    merge_fan_in: usize,
 }
 
 struct AddressTxShardSpec {
@@ -2218,7 +2285,13 @@ fn derive_secondary_address_artifacts(
     let tx_shards_usize = usize::try_from(sorters.shard_plan.address_transaction_shards.get())
         .unwrap_or(1)
         .max(1);
-    let (index_branch, tx_branch) = if sorters.shard_plan.overlap_secondary {
+    let secondary_fan_in = resolve_secondary_phase_fan_in(
+        sorters.shard_plan.address_index_push_shards,
+        sorters.shard_plan.address_transaction_shards,
+        sorters.shard_plan.overlap_secondary,
+        active_merge_fan_in(),
+    )?;
+    let (index_branch, tx_branch) = if secondary_fan_in.overlap_secondary {
         let active_writers = 2_usize.saturating_add(tx_shards_usize);
         let (index_hashing, tx_hashing) = branch_pool.map_or_else(
             || (None, (0..tx_shards_usize).map(|_| None).collect()),
@@ -2232,6 +2305,7 @@ fn derive_secondary_address_artifacts(
                 index: index_hashing,
                 tx: tx_hashing,
                 active_writers,
+                fan_in: secondary_fan_in,
             },
             &aborted,
         )?
@@ -2240,7 +2314,7 @@ fn derive_secondary_address_artifacts(
             config,
             sorters,
             &undo_collector,
-            tx_shards_usize,
+            (tx_shards_usize, secondary_fan_in),
             &aborted,
         )?
     };
@@ -2273,7 +2347,7 @@ fn run_sequential_secondary_branches(
     config: WalletProjectionLoadConfig<'_>,
     sorters: SecondaryDerivationSorters,
     undo_collector: &RetainedUndoCollector,
-    tx_shards_usize: usize,
+    tx_budget: (usize, SecondaryPhaseFanIn),
     aborted: &AtomicBool,
 ) -> Result<
     (
@@ -2282,14 +2356,23 @@ fn run_sequential_secondary_branches(
     ),
     RocksDbWalletError,
 > {
-    let index_branch =
-        match run_address_index_branch(config, sorters.address_index, None, 2, aborted) {
-            SecondaryBranchOutcome::Completed(completed) => completed,
-            SecondaryBranchOutcome::Failed(error) => return Err(error),
-            SecondaryBranchOutcome::SiblingAborted => {
-                return Err(RocksDbWalletError::SecondaryDerivationWorkerStopped);
-            }
-        };
+    let (tx_shards_usize, secondary_fan_in) = tx_budget;
+    let index_branch = match run_address_index_branch(
+        config,
+        sorters.address_index,
+        AddressIndexBranchBudget {
+            branch_hashing: None,
+            active_writers: 2,
+            merge_fan_in: secondary_fan_in.address_index_per_shard_fan_in,
+        },
+        aborted,
+    ) {
+        SecondaryBranchOutcome::Completed(completed) => completed,
+        SecondaryBranchOutcome::Failed(error) => return Err(error),
+        SecondaryBranchOutcome::SiblingAborted => {
+            return Err(RocksDbWalletError::SecondaryDerivationWorkerStopped);
+        }
+    };
     let tx_branch = match run_address_transaction_branch(
         config,
         sorters.address_transaction,
@@ -2297,6 +2380,7 @@ fn run_sequential_secondary_branches(
         AddressTxHashingBudget {
             configs: (0..tx_shards_usize).map(|_| None).collect(),
             active_writers: tx_shards_usize,
+            merge_fan_in: secondary_fan_in.address_transaction_per_shard_fan_in,
         },
         aborted,
     ) {
@@ -2326,6 +2410,7 @@ fn run_concurrent_secondary_branches(
         index: index_hashing,
         tx: tx_hashing,
         active_writers,
+        fan_in,
     } = hashing;
     std::thread::scope(|scope| {
         let tx_handle = std::thread::Builder::new()
@@ -2338,6 +2423,7 @@ fn run_concurrent_secondary_branches(
                     AddressTxHashingBudget {
                         configs: tx_hashing,
                         active_writers,
+                        merge_fan_in: fan_in.address_transaction_per_shard_fan_in,
                     },
                     aborted,
                 )
@@ -2350,8 +2436,11 @@ fn run_concurrent_secondary_branches(
         let index_outcome = run_address_index_branch(
             config,
             sorters.address_index,
-            index_hashing,
-            active_writers,
+            AddressIndexBranchBudget {
+                branch_hashing: index_hashing,
+                active_writers,
+                merge_fan_in: fan_in.address_index_per_shard_fan_in,
+            },
             aborted,
         );
         let tx_join = tx_handle.join();
@@ -2387,15 +2476,14 @@ fn resolve_secondary_branch_outcomes(
 fn run_address_index_branch(
     config: WalletProjectionLoadConfig<'_>,
     sorter: ShardedKeyPrefixSorter<ADDRESS_UNSPENT_KEY_BYTES>,
-    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
-    active_writers: usize,
+    budget: AddressIndexBranchBudget,
     aborted: &AtomicBool,
 ) -> SecondaryBranchOutcome<AddressIndexBranchOutput> {
     let _abort_on_unwind = SetAbortOnUnwind(aborted);
     if aborted.load(Ordering::Acquire) {
         return SecondaryBranchOutcome::SiblingAborted;
     }
-    match run_address_index_branch_inner(config, sorter, branch_hashing, active_writers, aborted) {
+    match run_address_index_branch_inner(config, sorter, budget, aborted) {
         Ok(Some(completed)) => SecondaryBranchOutcome::Completed(Box::new(completed)),
         Ok(None) => SecondaryBranchOutcome::SiblingAborted,
         Err(error) => {
@@ -2408,12 +2496,16 @@ fn run_address_index_branch(
 fn run_address_index_branch_inner(
     config: WalletProjectionLoadConfig<'_>,
     sorter: ShardedKeyPrefixSorter<ADDRESS_UNSPENT_KEY_BYTES>,
-    branch_hashing: Option<crate::accumulator_hashing::BranchHashingConfig>,
-    active_writers: usize,
+    budget: AddressIndexBranchBudget,
     aborted: &AtomicBool,
 ) -> Result<Option<AddressIndexBranchOutput>, RocksDbWalletError> {
+    let AddressIndexBranchBudget {
+        branch_hashing,
+        active_writers,
+        merge_fan_in,
+    } = budget;
     let sort_started = Instant::now();
-    let sorted_rows = sorter.finish()?;
+    let sorted_rows = sorter.finish_with_per_shard_merge_fan_in(merge_fan_in)?;
     let sort_evidence = sorted_rows.evidence();
     let sort_durations = sorted_rows.durations();
     let sort_duration = sort_started.elapsed();
@@ -2488,8 +2580,13 @@ fn run_address_transaction_branch(
     if aborted.load(Ordering::Acquire) {
         return SecondaryBranchOutcome::SiblingAborted;
     }
+    let AddressTxHashingBudget {
+        configs: hashing_configs,
+        active_writers,
+        merge_fan_in,
+    } = hashing_budget;
     let sort_started = Instant::now();
-    let sorted_rows = match sorter.finish() {
+    let sorted_rows = match sorter.finish_with_per_shard_merge_fan_in(merge_fan_in) {
         Ok(finished_rows) => finished_rows,
         Err(error) => {
             aborted.store(true, Ordering::Release);
@@ -2505,10 +2602,6 @@ fn run_address_transaction_branch(
     let drain_started = Instant::now();
     let shards = sorted_rows.into_shards();
     let shard_count = shards.len();
-    let AddressTxHashingBudget {
-        configs: hashing_configs,
-        active_writers,
-    } = hashing_budget;
     if shard_count <= 1 {
         let Some(stream) = shards.into_iter().next() else {
             return SecondaryBranchOutcome::Failed(
@@ -4919,6 +5012,141 @@ mod tests {
             scaled_pipelined_sst_queue_budget_bytes(128 * MIB, 512),
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_secondary_phase_fan_in_adapts_to_post_outpoint_headroom()
+    -> Result<(), Box<dyn Error>> {
+        let one = NonZeroU32::MIN;
+        let two = NonZeroU32::new(2).ok_or("nonzero")?;
+
+        let asymmetric = resolve_secondary_phase_fan_in(one, one, true, 48)?;
+        assert!(asymmetric.overlap_secondary);
+        assert_eq!(asymmetric.address_index_per_shard_fan_in, 12);
+        assert_eq!(asymmetric.address_transaction_per_shard_fan_in, 36);
+
+        let tight_overlap = resolve_secondary_phase_fan_in(one, two, true, 6)?;
+        assert!(tight_overlap.overlap_secondary);
+        assert_eq!(tight_overlap.address_index_per_shard_fan_in, 2);
+        assert_eq!(tight_overlap.address_transaction_per_shard_fan_in, 2);
+
+        let fallback_seq = resolve_secondary_phase_fan_in(two, two, true, 6)?;
+        assert!(!fallback_seq.overlap_secondary);
+        assert_eq!(fallback_seq.address_index_per_shard_fan_in, 3);
+        assert_eq!(fallback_seq.address_transaction_per_shard_fan_in, 3);
+
+        let too_small = resolve_secondary_phase_fan_in(two, two, true, 3);
+        assert!(matches!(
+            too_small,
+            Err(RocksDbWalletError::BulkLoad(
+                BulkLoadError::InvalidInput { .. }
+            ))
+        ));
+        Ok(())
+    }
+
+    fn low_nofile_blocks(output_count: usize) -> Result<Vec<CanonicalBlockFacts>, Box<dyn Error>> {
+        let mut txs = Vec::with_capacity(output_count);
+        for index in 0..output_count {
+            let low = u8::try_from(index)?;
+            let mut tx_bytes = [0_u8; 32];
+            tx_bytes[0] = low.wrapping_mul(7);
+            tx_bytes[1] = low;
+            let mut addr_bytes = [0_u8; 32];
+            addr_bytes[0] = low.wrapping_mul(11);
+            addr_bytes[1] = 0x50_u8.wrapping_add(low);
+            txs.push(transaction_facts(
+                TransactionId::from_bytes(tx_bytes),
+                Vec::new(),
+                vec![TransparentOutputFact::new(
+                    0,
+                    100 + u64::from(low),
+                    [0x51],
+                    TransparentAddressScriptHash::from_bytes(addr_bytes),
+                )],
+            ));
+        }
+        Ok(vec![
+            block_facts(1, [0; 32], [0xc1; 32], txs),
+            block_facts(2, [0xc1; 32], [0xc2; 32], Vec::new()),
+        ])
+    }
+
+    #[cfg(unix)]
+    fn run_low_nofile_child_builds() -> Result<(), Box<dyn Error>> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let initial_fan_in = active_merge_fan_in();
+        assert!(initial_fan_in >= 12);
+        assert!(initial_fan_in < 128);
+        let run_target = initial_fan_in.saturating_sub(6).clamp(16, 40);
+        let blocks = low_nofile_blocks(run_target)?;
+        let temporary = TempDir::new()?;
+        let options = test_column_family_options();
+        let limits = TestByteLimits {
+            outpoint_sort: 192,
+            secondary_sort_per_sorter: TEST_SORT_MEMORY_BYTES,
+            temporary_files_per_sorter: TEST_TEMPORARY_FILE_BYTES,
+        };
+        let first = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0xc1; 32]));
+        let settled_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32]));
+
+        let run_with_plan = |subdir: &str, workers: NonZeroU32, plan: BuildShardPlan| {
+            let dir = temporary.path().join(subdir);
+            fs::create_dir_all(&dir)?;
+            let mut cfg = test_config_with_bounds(&dir, &options, limits, first, settled_tip);
+            cfg.accumulator_hashing_workers = workers;
+            write_projection_ssts_with_plan(cfg, canonical_scan(validated_replays(&blocks)?), plan)
+                .map_err(|err| Box::new(err) as Box<dyn Error>)
+        };
+
+        let serial_plan = resolve_build_shard_plan_for(
+            NonZeroU32::MIN,
+            4 * GIB,
+            GIB,
+            initial_fan_in,
+            Some(NonZeroU32::MIN),
+        );
+        let serial = run_with_plan("serial", NonZeroU32::MIN, serial_plan)?;
+        assert!(serial.outpoint_sort_evidence.initial_run_count >= 16);
+
+        let w_four = NonZeroU32::new(4).ok_or("nonzero workers")?;
+        let prod_plan = resolve_build_shard_plan_for(w_four, 4 * GIB, GIB, initial_fan_in, None);
+        let prod = run_with_plan("prod", w_four, prod_plan)?;
+        assert_eq!(prod.projection_digest, serial.projection_digest);
+
+        let three = NonZeroU32::new(3).ok_or("nonzero shards")?;
+        let sharded_plan =
+            resolve_build_shard_plan_for(w_four, 4 * GIB, GIB, initial_fan_in, Some(three));
+        let sharded = run_with_plan("sharded", w_four, sharded_plan)?;
+        assert_eq!(sharded.projection_digest, serial.projection_digest);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sharded_projection_build_succeeds_under_low_file_descriptor_limit()
+    -> Result<(), Box<dyn Error>> {
+        const CHILD_ENV: &str = "ZINDER_WALLET_TEST_LOW_NOFILE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            return run_low_nofile_child_builds();
+        }
+        let binary = std::env::current_exe()?;
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "cur=\"$(ulimit -n)\"; if [ \"$cur\" = \"unlimited\" ] || [ \"$cur\" -gt 112 ]; then ulimit -n 112; fi; exec \"$@\"",
+                "sh",
+            ])
+            .arg(&binary)
+            .args([
+                "--exact",
+                "projection_load::tests::sharded_projection_build_succeeds_under_low_file_descriptor_limit",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()?;
+        assert!(status.success(), "child process failed with {status}");
         Ok(())
     }
 }

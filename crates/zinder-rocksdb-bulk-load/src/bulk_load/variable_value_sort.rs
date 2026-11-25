@@ -1651,6 +1651,7 @@ impl<const KEY_LEN: usize> ShardedSortedVariableValues<KEY_LEN> {
 
 struct SharedTempFileState {
     active: u64,
+    live_data_bytes: u64,
     peak: u64,
     max: u64,
     reserved_run_count: u64,
@@ -1665,6 +1666,7 @@ impl SharedTempFileBudget {
         Self {
             state: Mutex::new(SharedTempFileState {
                 active: 0,
+                live_data_bytes: 0,
                 peak: 0,
                 max: max_bytes,
                 reserved_run_count: 0,
@@ -1674,16 +1676,22 @@ impl SharedTempFileBudget {
 
     fn reserve_initial_run(&self, bytes: u64) -> Result<(), BulkLoadError> {
         let mut guard = self.state.lock();
-        let next = guard
+        let next_active = guard
             .active
             .checked_add(bytes)
             .ok_or_else(|| BulkLoadError::invalid("temporary file byte sum exceeds u64::MAX"))?;
-        let required_bytes = if guard.reserved_run_count == 0 {
-            next
+        let next_live_data = guard
+            .live_data_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| BulkLoadError::invalid("temporary file byte sum exceeds u64::MAX"))?;
+        let headroom_required = if guard.reserved_run_count == 0 {
+            next_live_data
         } else {
-            next.checked_mul(2)
+            next_live_data
+                .checked_mul(2)
                 .ok_or_else(|| BulkLoadError::invalid("temporary file byte sum exceeds u64::MAX"))?
         };
+        let required_bytes = headroom_required.max(next_active);
         if required_bytes > guard.max {
             return Err(BulkLoadError::TemporaryFileLimit {
                 limit_bytes: guard.max,
@@ -1694,8 +1702,9 @@ impl SharedTempFileBudget {
             .reserved_run_count
             .checked_add(1)
             .ok_or_else(|| BulkLoadError::invalid("sharded run count exceeds u64::MAX"))?;
-        guard.active = next;
-        guard.peak = guard.peak.max(next);
+        guard.active = next_active;
+        guard.live_data_bytes = next_live_data;
+        guard.peak = guard.peak.max(next_active);
         drop(guard);
         Ok(())
     }
@@ -1705,11 +1714,15 @@ impl SharedTempFileBudget {
         let remaining = guard.active.checked_sub(bytes).ok_or_else(|| {
             BulkLoadError::invalid("released more temporary file bytes than reserved")
         })?;
+        let remaining_live = guard.live_data_bytes.checked_sub(bytes).ok_or_else(|| {
+            BulkLoadError::invalid("released more live initial run bytes than reserved")
+        })?;
         guard.reserved_run_count = guard
             .reserved_run_count
             .checked_sub(1)
             .ok_or_else(|| BulkLoadError::invalid("sharded run count underflow"))?;
         guard.active = remaining;
+        guard.live_data_bytes = remaining_live;
         drop(guard);
         Ok(())
     }
@@ -1753,6 +1766,7 @@ struct SharedMemoryTracker {
     active_bytes: AtomicU64,
     peak_bytes: AtomicU64,
     in_flight_work: AtomicU64,
+    publish_epoch: AtomicU64,
     waiters: AtomicU64,
     wait_lock: Mutex<()>,
     reclaimed: Condvar,
@@ -1767,6 +1781,7 @@ impl SharedMemoryTracker {
             active_bytes: AtomicU64::new(0),
             peak_bytes: AtomicU64::new(0),
             in_flight_work: AtomicU64::new(0),
+            publish_epoch: AtomicU64::new(0),
             waiters: AtomicU64::new(0),
             wait_lock: Mutex::new(()),
             reclaimed: Condvar::new(),
@@ -1787,8 +1802,40 @@ impl SharedMemoryTracker {
         })
     }
 
+    fn try_reserve_up_to(&self, max_bytes: u64) -> u64 {
+        if max_bytes == 0 {
+            return 0;
+        }
+        let mut current = self.active_bytes.load(Ordering::SeqCst);
+        loop {
+            let headroom = self.max_accounted_bytes.saturating_sub(current);
+            let grant = headroom.min(max_bytes);
+            if grant == 0 {
+                return 0;
+            }
+            let next = current.saturating_add(grant);
+            match self.active_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.peak_bytes.fetch_max(next, Ordering::AcqRel);
+                    return grant;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     fn release_bytes(&self, bytes: u64) {
         self.active_bytes.fetch_sub(bytes, Ordering::SeqCst);
+        self.notify_waiters();
+    }
+
+    fn record_publish(&self) {
+        self.publish_epoch.fetch_add(1, Ordering::SeqCst);
         self.notify_waiters();
     }
 
@@ -1801,6 +1848,23 @@ impl SharedMemoryTracker {
 
     fn peak_bytes(&self) -> u64 {
         self.peak_bytes.load(Ordering::Acquire)
+    }
+}
+
+struct WaiterGuard<'tracker> {
+    waiters: &'tracker AtomicU64,
+}
+
+impl<'tracker> WaiterGuard<'tracker> {
+    fn new(waiters: &'tracker AtomicU64) -> Self {
+        waiters.fetch_add(1, Ordering::SeqCst);
+        Self { waiters }
+    }
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1824,10 +1888,24 @@ impl<'tracker> InFlightMemoryGuard<'tracker> {
         }
     }
 
-    fn disarm(mut self) {
+    fn add_bytes(&mut self, extra_bytes: u64) {
+        self.bytes = self.bytes.saturating_add(extra_bytes);
+    }
+
+    fn consume_bytes(&mut self, consumed_bytes: u64) {
+        self.bytes = self.bytes.saturating_sub(consumed_bytes);
+    }
+
+    fn commit_and_release_excess(mut self, consumed_bytes: u64) {
+        let excess = self.bytes.saturating_sub(consumed_bytes);
+        self.bytes = 0;
         self.active = false;
         if self.count_in_flight {
             self.tracker.in_flight_work.fetch_sub(1, Ordering::SeqCst);
+        }
+        if excess > 0 {
+            self.tracker.release_bytes(excess);
+        } else if self.count_in_flight {
             self.tracker.notify_waiters();
         }
     }
@@ -1844,6 +1922,67 @@ impl Drop for InFlightMemoryGuard<'_> {
         }
         self.tracker.release_bytes(self.bytes);
     }
+}
+
+#[derive(Clone, Copy)]
+struct VecReserveSpec {
+    additional: usize,
+    max_growth_bytes: u64,
+    min_initial_elems: usize,
+    operation: &'static str,
+}
+
+fn reserve_vec_within_budget<T>(
+    buffer: &mut Vec<T>,
+    spec: VecReserveSpec,
+) -> Result<u64, BulkLoadError> {
+    let needed_cap = buffer
+        .len()
+        .checked_add(spec.additional)
+        .ok_or_else(|| BulkLoadError::invalid("staged partition capacity exceeds usize::MAX"))?;
+    let old_cap = buffer.capacity();
+    if needed_cap <= old_cap {
+        return Ok(0);
+    }
+    let elem_size = size_of::<T>();
+    if elem_size == 0 {
+        return Err(BulkLoadError::invalid(
+            "zero-sized partition staging elements are unsupported",
+        ));
+    }
+    let min_delta_elems = needed_cap.saturating_sub(old_cap);
+    let elem_size_u64 = u64::try_from(elem_size)
+        .map_err(|_| BulkLoadError::invalid("element size exceeds u64::MAX"))?;
+    let max_delta_elems =
+        usize::try_from(spec.max_growth_bytes / elem_size_u64).unwrap_or(usize::MAX);
+    if max_delta_elems < min_delta_elems {
+        return Err(BulkLoadError::invalid(
+            "partition vector growth exceeds accounted memory budget",
+        ));
+    }
+    let desired_cap = old_cap
+        .saturating_mul(2)
+        .max(spec.min_initial_elems)
+        .max(needed_cap);
+    let target_delta_elems = desired_cap
+        .saturating_sub(old_cap)
+        .clamp(min_delta_elems, max_delta_elems);
+    let reserve_from_len = old_cap
+        .saturating_add(target_delta_elems)
+        .saturating_sub(buffer.len());
+    buffer
+        .try_reserve_exact(reserve_from_len)
+        .map_err(|source| BulkLoadError::MemoryAllocation {
+            operation: spec.operation,
+            source,
+        })?;
+    let actual_delta_bytes = buffer
+        .capacity()
+        .saturating_sub(old_cap)
+        .checked_mul(elem_size)
+        .ok_or_else(|| BulkLoadError::invalid("allocated partition bytes exceed usize::MAX"))?;
+    u64::try_from(actual_delta_bytes)
+        .map_err(|_| BulkLoadError::invalid("allocated partition bytes exceed u64::MAX"))
 }
 
 struct PartitionBatch<const KEY_LEN: usize> {
@@ -1867,31 +2006,171 @@ impl<const KEY_LEN: usize> PartitionBatch<KEY_LEN> {
         self.staged_records.is_empty()
     }
 
-    fn push_record(
+    fn allocated_bytes(&self) -> Result<u64, BulkLoadError> {
+        let rec_bytes = self
+            .staged_records
+            .capacity()
+            .checked_mul(size_of::<StagedVariableValue<KEY_LEN>>())
+            .ok_or_else(|| {
+                BulkLoadError::invalid("partition record capacity exceeds usize::MAX")
+            })?;
+        let total = rec_bytes
+            .checked_add(self.encoded_values.capacity())
+            .ok_or_else(|| BulkLoadError::invalid("partition allocated bytes exceed usize::MAX"))?;
+        u64::try_from(total)
+            .map_err(|_| BulkLoadError::invalid("partition allocated bytes exceed u64::MAX"))
+    }
+
+    fn min_growth_bytes_split(
+        &self,
+        additional_records: usize,
+        additional_value_bytes: usize,
+    ) -> Result<(u64, u64), BulkLoadError> {
+        let needed_rec = self
+            .staged_records
+            .len()
+            .checked_add(additional_records)
+            .ok_or_else(|| BulkLoadError::invalid("staged record count exceeds usize::MAX"))?;
+        let extra_rec = needed_rec.saturating_sub(self.staged_records.capacity());
+        let rec_bytes_usize = extra_rec
+            .checked_mul(size_of::<StagedVariableValue<KEY_LEN>>())
+            .ok_or_else(|| BulkLoadError::invalid("partition growth bytes exceed usize::MAX"))?;
+        let rec_bytes = u64::try_from(rec_bytes_usize)
+            .map_err(|_| BulkLoadError::invalid("partition growth bytes exceed u64::MAX"))?;
+
+        let needed_val = self
+            .encoded_values
+            .len()
+            .checked_add(additional_value_bytes)
+            .ok_or_else(|| BulkLoadError::invalid("staged encoded buffer exceeds usize::MAX"))?;
+        let extra_val = needed_val.saturating_sub(self.encoded_values.capacity());
+        let val_bytes = u64::try_from(extra_val)
+            .map_err(|_| BulkLoadError::invalid("partition growth bytes exceed u64::MAX"))?;
+        Ok((rec_bytes, val_bytes))
+    }
+
+    fn min_growth_bytes(
+        &self,
+        additional_records: usize,
+        additional_value_bytes: usize,
+    ) -> Result<u64, BulkLoadError> {
+        let (rec_bytes, val_bytes) =
+            self.min_growth_bytes_split(additional_records, additional_value_bytes)?;
+        rec_bytes
+            .checked_add(val_bytes)
+            .ok_or_else(|| BulkLoadError::invalid("partition growth bytes exceed u64::MAX"))
+    }
+
+    fn desired_growth_slack(
+        &self,
+        additional_records: usize,
+        additional_value_bytes: usize,
+    ) -> u64 {
+        let rec_size = size_of::<StagedVariableValue<KEY_LEN>>();
+        let needed_rec = self.staged_records.len().saturating_add(additional_records);
+        let rec_slack = if needed_rec <= self.staged_records.capacity() {
+            0
+        } else {
+            let cap_bytes = u64::try_from(self.staged_records.capacity().saturating_mul(rec_size))
+                .unwrap_or(u64::MAX);
+            let min_slack = u64::try_from(rec_size.saturating_mul(16)).unwrap_or(u64::MAX);
+            cap_bytes.max(min_slack)
+        };
+        let needed_val = self
+            .encoded_values
+            .len()
+            .saturating_add(additional_value_bytes);
+        let val_slack = if needed_val <= self.encoded_values.capacity() {
+            0
+        } else {
+            u64::try_from(self.encoded_values.capacity())
+                .unwrap_or(u64::MAX)
+                .max(256)
+        };
+        rec_slack.saturating_add(val_slack)
+    }
+
+    fn reserve_within(
+        &mut self,
+        additional_records: usize,
+        additional_value_bytes: usize,
+        max_growth_bytes: u64,
+        charged: &mut u64,
+    ) -> Result<(), BulkLoadError> {
+        let (min_rec_bytes, min_val_bytes) =
+            self.min_growth_bytes_split(additional_records, additional_value_bytes)?;
+        let total_min = min_rec_bytes
+            .checked_add(min_val_bytes)
+            .ok_or_else(|| BulkLoadError::invalid("partition growth bytes exceed u64::MAX"))?;
+        let mut remaining_slack = max_growth_bytes.saturating_sub(total_min);
+        let rec_slack_budget = if min_val_bytes == 0 {
+            remaining_slack
+        } else {
+            remaining_slack / 2
+        };
+        let rec_delta = reserve_vec_within_budget(
+            &mut self.staged_records,
+            VecReserveSpec {
+                additional: additional_records,
+                max_growth_bytes: min_rec_bytes.saturating_add(rec_slack_budget),
+                min_initial_elems: 16,
+                operation: "sharded partition record staging",
+            },
+        )?;
+        self.accounted_bytes = self
+            .accounted_bytes
+            .checked_add(rec_delta)
+            .ok_or_else(|| BulkLoadError::invalid("partition accounted bytes exceed u64::MAX"))?;
+        *charged = charged.saturating_add(rec_delta);
+        let rec_slack_used = rec_delta.saturating_sub(min_rec_bytes);
+        remaining_slack = remaining_slack.saturating_sub(rec_slack_used);
+
+        let val_delta = reserve_vec_within_budget(
+            &mut self.encoded_values,
+            VecReserveSpec {
+                additional: additional_value_bytes,
+                max_growth_bytes: min_val_bytes.saturating_add(remaining_slack),
+                min_initial_elems: 256,
+                operation: "sharded partition value staging",
+            },
+        )?;
+        self.accounted_bytes = self
+            .accounted_bytes
+            .checked_add(val_delta)
+            .ok_or_else(|| BulkLoadError::invalid("partition accounted bytes exceed u64::MAX"))?;
+        *charged = charged.saturating_add(val_delta);
+        debug_assert_eq!(self.allocated_bytes().ok(), Some(self.accounted_bytes));
+        Ok(())
+    }
+
+    fn push_record_within(
         &mut self,
         key: [u8; KEY_LEN],
         encoded_value: &[u8],
-        record_bytes: u64,
+        max_growth_bytes: u64,
+        charged: &mut u64,
     ) -> Result<(), BulkLoadError> {
         let value_start = self.encoded_values.len();
         let value_end = value_start
             .checked_add(encoded_value.len())
             .ok_or_else(|| BulkLoadError::invalid("staged encoded buffer exceeds usize::MAX"))?;
-        let next_bytes = self
-            .accounted_bytes
-            .checked_add(record_bytes)
-            .ok_or_else(|| BulkLoadError::invalid("partition accounted bytes exceed u64::MAX"))?;
+        self.reserve_within(1, encoded_value.len(), max_growth_bytes, charged)?;
         self.encoded_values.extend_from_slice(encoded_value);
         self.staged_records.push(StagedVariableValue {
             key,
             value_start,
             value_end,
         });
-        self.accounted_bytes = next_bytes;
+        debug_assert_eq!(self.allocated_bytes().ok(), Some(self.accounted_bytes));
         Ok(())
     }
 
-    fn append_batch(&mut self, other: &mut Self) -> Result<(), BulkLoadError> {
+    fn append_batch_within(
+        &mut self,
+        other: &mut Self,
+        max_growth_bytes: u64,
+        charged: &mut u64,
+    ) -> Result<(), BulkLoadError> {
         if other.staged_records.is_empty() {
             return Ok(());
         }
@@ -1899,22 +2178,12 @@ impl<const KEY_LEN: usize> PartitionBatch<KEY_LEN> {
         let next_encoded_len = base_offset
             .checked_add(other.encoded_values.len())
             .ok_or_else(|| BulkLoadError::invalid("staged encoded buffer exceeds usize::MAX"))?;
-        let next_bytes = self
-            .accounted_bytes
-            .checked_add(other.accounted_bytes)
-            .ok_or_else(|| BulkLoadError::invalid("partition accounted bytes exceed u64::MAX"))?;
-        self.encoded_values
-            .try_reserve(other.encoded_values.len())
-            .map_err(|source| BulkLoadError::MemoryAllocation {
-                operation: "sharded partition value staging",
-                source,
-            })?;
-        self.staged_records
-            .try_reserve(other.staged_records.len())
-            .map_err(|source| BulkLoadError::MemoryAllocation {
-                operation: "sharded partition record staging",
-                source,
-            })?;
+        self.reserve_within(
+            other.staged_records.len(),
+            other.encoded_values.len(),
+            max_growth_bytes,
+            charged,
+        )?;
         debug_assert!(next_encoded_len >= base_offset);
         self.encoded_values.extend_from_slice(&other.encoded_values);
         for mut entry in other.staged_records.drain(..) {
@@ -1927,8 +2196,8 @@ impl<const KEY_LEN: usize> PartitionBatch<KEY_LEN> {
             self.staged_records.push(entry);
         }
         other.encoded_values.clear();
-        other.accounted_bytes = 0;
-        self.accounted_bytes = next_bytes;
+        other.accounted_bytes = other.allocated_bytes()?;
+        debug_assert_eq!(self.allocated_bytes().ok(), Some(self.accounted_bytes));
         Ok(())
     }
 }
@@ -1997,6 +2266,26 @@ struct FlushedPartitionOutput<const KEY_LEN: usize> {
     final_run_file_bytes: u64,
 }
 
+enum BucketAdmission<const KEY_LEN: usize> {
+    Admitted(u64),
+    FlushPartition(PartitionBatch<KEY_LEN>, u64),
+    SpillBucket(u64),
+}
+
+#[cfg(test)]
+trait ReclaimRaceHook: Send + Sync {
+    fn on_before_publish(&self);
+    fn on_after_empty_scan(&self);
+}
+
+fn default_per_shard_merge_fan_in(shards_usize: usize, total_fan_in: usize) -> usize {
+    if shards_usize <= 1 {
+        total_fan_in
+    } else {
+        total_fan_in / shards_usize
+    }
+}
+
 /// Configuration bounds for creating a [`ShardedKeyPrefixSorter`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShardedSortBudget {
@@ -2007,7 +2296,7 @@ pub struct ShardedSortBudget {
     /// Shared temporary spill-file ceiling across all partitions.
     pub max_temporary_file_bytes: u64,
     /// Optional explicit per-shard merge fan-in ceiling (`None` divides active
-    /// descriptor headroom evenly across all `shard_count` shards).
+    /// descriptor headroom evenly across all `shard_count` shards when merging).
     pub per_shard_merge_fan_in_cap: Option<usize>,
 }
 
@@ -2015,12 +2304,14 @@ pub struct ShardedSortBudget {
 /// shard streams across `[0, shard_count)`.
 pub struct ShardedKeyPrefixSorter<const KEY_LEN: usize> {
     shard_count: NonZeroU32,
-    per_shard_fan_in: usize,
+    per_shard_merge_fan_in_cap: Option<usize>,
     max_temporary_file_bytes: u64,
     workspaces: Vec<TempDir>,
     memory: SharedMemoryTracker,
     temporary_files: SharedTempFileBudget,
     partitions: Vec<Mutex<PartitionState<KEY_LEN>>>,
+    #[cfg(test)]
+    reclaim_race_hook: Option<std::sync::Arc<dyn ReclaimRaceHook>>,
 }
 
 impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
@@ -2069,31 +2360,17 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
         }
         let shards_usize = usize::try_from(budget.shard_count.get())
             .map_err(|_| BulkLoadError::invalid("shard count exceeds platform usize::MAX"))?;
-        let total_fan_in = effective_merge_fan_in();
-        let default_per_shard = if budget.shard_count.get() == 1 {
-            total_fan_in
-        } else {
-            total_fan_in / shards_usize
-        };
-        let per_shard_fan_in = match budget.per_shard_merge_fan_in_cap {
-            Some(explicit) => {
-                validate_merge_fan_in(explicit)?;
-                if explicit
-                    .checked_mul(shards_usize)
-                    .is_none_or(|total| total > total_fan_in)
-                {
-                    return Err(BulkLoadError::invalid(
-                        "explicit per-shard fan-in exceeds active descriptor headroom",
-                    ));
-                }
-                explicit
+        if let Some(explicit) = budget.per_shard_merge_fan_in_cap {
+            validate_merge_fan_in(explicit)?;
+            let total_fan_in = effective_merge_fan_in();
+            if explicit
+                .checked_mul(shards_usize)
+                .is_none_or(|total| total > total_fan_in)
+            {
+                return Err(BulkLoadError::invalid(
+                    "explicit per-shard fan-in exceeds active descriptor headroom",
+                ));
             }
-            None => default_per_shard,
-        };
-        if per_shard_fan_in < MIN_MERGE_FAN_IN {
-            return Err(BulkLoadError::invalid(
-                "sharded sort exceeds active merge file-descriptor fan-in",
-            ));
         }
         let mut workspaces = Vec::with_capacity(shards_usize);
         let mut partitions = Vec::with_capacity(shards_usize);
@@ -2108,12 +2385,14 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
         }
         Ok(Self {
             shard_count: budget.shard_count,
-            per_shard_fan_in,
+            per_shard_merge_fan_in_cap: budget.per_shard_merge_fan_in_cap,
             max_temporary_file_bytes: budget.max_temporary_file_bytes,
             workspaces,
             memory: SharedMemoryTracker::new(budget.max_accounted_memory_bytes, budget.shard_count),
             temporary_files: SharedTempFileBudget::new(budget.max_temporary_file_bytes),
             partitions,
+            #[cfg(test)]
+            reclaim_race_hook: None,
         })
     }
 
@@ -2124,7 +2403,10 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
 
     /// Returns the per-shard merge fan-in reserved from active file descriptor limits.
     pub fn per_shard_merge_fan_in(&self) -> usize {
-        self.per_shard_fan_in
+        self.per_shard_merge_fan_in_cap.unwrap_or_else(|| {
+            let shards_usize = usize::try_from(self.shard_count.get()).unwrap_or(1);
+            default_per_shard_merge_fan_in(shards_usize, effective_merge_fan_in())
+        })
     }
 
     /// Maps `key` to its disjoint shard index in `[0, shard_count)`.
@@ -2167,7 +2449,54 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
     /// Flushes remaining staged records in all shards and merges runs down to
     /// each shard's safe concurrent merge fan-in.
     pub fn finish(self) -> Result<ShardedSortedVariableValues<KEY_LEN>, BulkLoadError> {
-        let per_shard_fan_in = self.per_shard_fan_in;
+        let shards_usize = usize::try_from(self.shard_count.get())
+            .map_err(|_| BulkLoadError::invalid("shard count exceeds platform usize::MAX"))?;
+        let total_fan_in = effective_merge_fan_in();
+        let per_shard_fan_in = match self.per_shard_merge_fan_in_cap {
+            Some(explicit) => {
+                validate_merge_fan_in(explicit)?;
+                if explicit
+                    .checked_mul(shards_usize)
+                    .is_none_or(|total| total > total_fan_in)
+                {
+                    return Err(BulkLoadError::invalid(
+                        "explicit per-shard fan-in exceeds active descriptor headroom",
+                    ));
+                }
+                explicit
+            }
+            None => default_per_shard_merge_fan_in(shards_usize, total_fan_in),
+        };
+        if per_shard_fan_in < MIN_MERGE_FAN_IN {
+            return Err(BulkLoadError::invalid(
+                "sharded sort exceeds active merge file-descriptor fan-in",
+            ));
+        }
+        self.finish_with_per_shard_merge_fan_in(per_shard_fan_in)
+    }
+
+    /// Flushes remaining staged records in all shards and merges runs using an
+    /// explicit per-shard fan-in budgeted by the caller for the merge phase.
+    ///
+    /// Callers coordinating multiple concurrent sorters compute `per_shard_fan_in`
+    /// from [`active_merge_fan_in`](crate::active_merge_fan_in) once earlier
+    /// phase run readers have closed, preserving global descriptor limits across
+    /// all shards (`per_shard_fan_in * shard_count <= MAX_MERGE_FAN_IN`).
+    pub fn finish_with_per_shard_merge_fan_in(
+        self,
+        per_shard_fan_in: usize,
+    ) -> Result<ShardedSortedVariableValues<KEY_LEN>, BulkLoadError> {
+        validate_merge_fan_in(per_shard_fan_in)?;
+        let shards_usize = usize::try_from(self.shard_count.get())
+            .map_err(|_| BulkLoadError::invalid("shard count exceeds platform usize::MAX"))?;
+        if per_shard_fan_in
+            .checked_mul(shards_usize)
+            .is_none_or(|total| total > super::MAX_MERGE_FAN_IN)
+        {
+            return Err(BulkLoadError::invalid(
+                "sharded sort per-shard fan-in exceeds MAX_MERGE_FAN_IN",
+            ));
+        }
         let max_accounted = self.memory.max_accounted_bytes;
         let max_temporary = self.max_temporary_file_bytes;
         let temporary_files = &self.temporary_files;
@@ -2176,27 +2505,12 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
             .into_iter()
             .zip(self.partitions.into_iter().map(Mutex::into_inner))
             .collect();
-        let outcomes = if shards_input.len() == 1 {
-            shards_input
-                .into_iter()
-                .map(|(workspace, partition)| {
-                    finish_single_partition(
-                        workspace,
-                        partition,
-                        per_shard_fan_in,
-                        max_accounted,
-                        temporary_files,
-                    )
-                })
-                .collect::<Result<Vec<_>, BulkLoadError>>()?
-        } else {
-            finish_partitions_in_parallel(
-                shards_input,
-                per_shard_fan_in,
-                max_accounted,
-                temporary_files,
-            )?
-        };
+        let outcomes = finish_partition_phases(
+            shards_input,
+            per_shard_fan_in,
+            max_accounted,
+            temporary_files,
+        )?;
         let peak_accounted_memory_bytes = self.memory.peak_bytes();
         let peak_temporary_file_bytes = self.temporary_files.peak_bytes();
         assemble_sharded_sorted_values(
@@ -2229,6 +2543,7 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
         record_bytes: u64,
     ) -> Result<InFlightMemoryGuard<'_>, BulkLoadError> {
         loop {
+            let epoch_before_scan = self.memory.publish_epoch.load(Ordering::SeqCst);
             let mut drained_any = false;
             for shard_idx in 0..self.partitions.len() {
                 if self.flush_partition_if_nonempty(shard_idx)? {
@@ -2241,21 +2556,31 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
             if drained_any {
                 continue;
             }
-            self.memory.waiters.fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            if let Some(hook) = &self.reclaim_race_hook {
+                hook.on_after_empty_scan();
+            }
+            if self.memory.publish_epoch.load(Ordering::SeqCst) != epoch_before_scan {
+                continue;
+            }
+            let _waiter = WaiterGuard::new(&self.memory.waiters);
             let mut wait_guard = self.memory.wait_lock.lock();
             if self.memory.try_reserve_bytes(record_bytes) {
-                self.memory.waiters.fetch_sub(1, Ordering::SeqCst);
                 return Ok(InFlightMemoryGuard::new(&self.memory, record_bytes, true));
             }
+            if self.memory.publish_epoch.load(Ordering::SeqCst) != epoch_before_scan {
+                continue;
+            }
             if self.memory.in_flight_work.load(Ordering::SeqCst) == 0 {
-                self.memory.waiters.fetch_sub(1, Ordering::SeqCst);
+                if self.memory.publish_epoch.load(Ordering::SeqCst) != epoch_before_scan {
+                    continue;
+                }
                 return Err(BulkLoadError::AccountedMemoryLimit {
                     limit_bytes: self.memory.max_accounted_bytes,
                     required_bytes: record_bytes,
                 });
             }
             self.memory.reclaimed.wait(&mut wait_guard);
-            self.memory.waiters.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -2296,26 +2621,56 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
         &self,
         shard_idx: usize,
         record: ([u8; KEY_LEN], &[u8], u64),
-        reservation: InFlightMemoryGuard<'_>,
+        mut reservation: InFlightMemoryGuard<'_>,
     ) -> Result<(), BulkLoadError> {
         let (key, encoded_value, record_bytes) = record;
+        #[cfg(test)]
+        if let Some(hook) = &self.reclaim_race_hook {
+            hook.on_before_publish();
+        }
         loop {
             let pending = {
                 let mut partition = self.partitions[shard_idx].lock();
-                if partition
-                    .staging
-                    .accounted_bytes
-                    .saturating_add(record_bytes)
+                let min_needed = partition.staging.min_growth_bytes(1, encoded_value.len())?;
+                if partition.staging.accounted_bytes.saturating_add(min_needed)
                     <= self.memory.per_partition_bytes
                 {
-                    partition
+                    let partition_headroom = self.memory.per_partition_bytes.saturating_sub(
+                        partition.staging.accounted_bytes.saturating_add(min_needed),
+                    );
+                    let desired_slack = partition
                         .staging
-                        .push_record(key, encoded_value, record_bytes)?;
+                        .desired_growth_slack(1, encoded_value.len())
+                        .min(partition_headroom);
+                    let excess_reserved = record_bytes.saturating_sub(min_needed);
+                    if desired_slack > excess_reserved {
+                        let extra = self
+                            .memory
+                            .try_reserve_up_to(desired_slack.saturating_sub(excess_reserved));
+                        reservation.add_bytes(extra);
+                    }
+                    let max_growth = min_needed
+                        .saturating_add(desired_slack)
+                        .min(reservation.bytes);
+                    let mut charged = 0_u64;
+                    let push_outcome = partition.staging.push_record_within(
+                        key,
+                        encoded_value,
+                        max_growth,
+                        &mut charged,
+                    );
+                    if let Err(error) = push_outcome {
+                        drop(partition);
+                        reservation.consume_bytes(charged);
+                        return Err(error);
+                    }
                     partition.record_count =
                         partition.record_count.checked_add(1).ok_or_else(|| {
                             BulkLoadError::invalid("sharded record count exceeds u64::MAX")
                         })?;
-                    reservation.disarm();
+                    drop(partition);
+                    self.memory.record_publish();
+                    reservation.commit_and_release_excess(charged);
                     return Ok(());
                 }
                 partition.take_pending_flush()?
@@ -2326,38 +2681,103 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
         }
     }
 
-    fn push_preaccounted_bucket(
+    fn try_admit_bucket_to_partition(
         &self,
         shard_idx: usize,
         bucket: &mut PartitionBatch<KEY_LEN>,
+        reservation: &mut InFlightMemoryGuard<'_>,
+    ) -> Result<BucketAdmission<KEY_LEN>, BulkLoadError> {
+        let batch_records = u64::try_from(bucket.staged_records.len())
+            .map_err(|_| BulkLoadError::invalid("bucket record count exceeds u64::MAX"))?;
+        let mut partition = self.partitions[shard_idx].lock();
+        if partition.staging.is_empty() && bucket.accounted_bytes <= self.memory.per_partition_bytes
+        {
+            let moved = bucket.accounted_bytes;
+            partition.staging = std::mem::take(bucket);
+            partition.record_count = partition
+                .record_count
+                .checked_add(batch_records)
+                .ok_or_else(|| BulkLoadError::invalid("sharded record count exceeds u64::MAX"))?;
+            return Ok(BucketAdmission::Admitted(moved));
+        }
+        let min_needed = partition
+            .staging
+            .min_growth_bytes(bucket.staged_records.len(), bucket.encoded_values.len())?;
+        if partition.staging.accounted_bytes.saturating_add(min_needed)
+            <= self.memory.per_partition_bytes
+        {
+            let partition_headroom = self
+                .memory
+                .per_partition_bytes
+                .saturating_sub(partition.staging.accounted_bytes.saturating_add(min_needed));
+            let desired_slack = partition
+                .staging
+                .desired_growth_slack(bucket.staged_records.len(), bucket.encoded_values.len())
+                .min(partition_headroom);
+            let target_growth = min_needed.saturating_add(desired_slack);
+            if target_growth > reservation.bytes {
+                let extra = self
+                    .memory
+                    .try_reserve_up_to(target_growth.saturating_sub(reservation.bytes));
+                reservation.add_bytes(extra);
+            }
+            let max_growth = target_growth.min(reservation.bytes);
+            let mut charged = 0_u64;
+            if let Err(error) =
+                partition
+                    .staging
+                    .append_batch_within(bucket, max_growth, &mut charged)
+            {
+                drop(partition);
+                reservation.consume_bytes(charged);
+                return Err(error);
+            }
+            partition.record_count = partition
+                .record_count
+                .checked_add(batch_records)
+                .ok_or_else(|| BulkLoadError::invalid("sharded record count exceeds u64::MAX"))?;
+            return Ok(BucketAdmission::Admitted(charged));
+        }
+        if let Some((batch, run_index)) = partition.take_pending_flush()? {
+            return Ok(BucketAdmission::FlushPartition(batch, run_index));
+        }
+        let run_index = partition.allocate_run_index()?;
+        partition.record_count = partition
+            .record_count
+            .checked_add(batch_records)
+            .ok_or_else(|| BulkLoadError::invalid("sharded record count exceeds u64::MAX"))?;
+        drop(partition);
+        Ok(BucketAdmission::SpillBucket(run_index))
+    }
+
+    fn push_preaccounted_bucket(
+        &self,
+        shard_idx: usize,
+        mut bucket: PartitionBatch<KEY_LEN>,
     ) -> Result<(), BulkLoadError> {
         if bucket.is_empty() {
             return Ok(());
         }
-        let batch_records = u64::try_from(bucket.staged_records.len())
-            .map_err(|_| BulkLoadError::invalid("bucket record count exceeds u64::MAX"))?;
+        let mut reservation = InFlightMemoryGuard::new(&self.memory, bucket.accounted_bytes, true);
         loop {
-            let pending = {
-                let mut partition = self.partitions[shard_idx].lock();
-                if partition
-                    .staging
-                    .accounted_bytes
-                    .saturating_add(bucket.accounted_bytes)
-                    <= self.memory.per_partition_bytes
-                {
-                    partition.staging.append_batch(bucket)?;
-                    partition.record_count = partition
-                        .record_count
-                        .checked_add(batch_records)
-                        .ok_or_else(|| {
-                            BulkLoadError::invalid("sharded record count exceeds u64::MAX")
-                        })?;
+            match self.try_admit_bucket_to_partition(shard_idx, &mut bucket, &mut reservation)? {
+                BucketAdmission::Admitted(consumed) => {
+                    drop(bucket);
+                    self.memory.record_publish();
+                    reservation.commit_and_release_excess(consumed);
                     return Ok(());
                 }
-                partition.take_pending_flush()?
-            };
-            if let Some((batch, run_index)) = pending {
-                self.flush_taken_batch(shard_idx, batch, run_index)?;
+                BucketAdmission::FlushPartition(batch, run_index) => {
+                    self.flush_taken_batch(shard_idx, batch, run_index)?;
+                }
+                BucketAdmission::SpillBucket(run_index) => {
+                    return self.flush_taken_batch_with_guard(
+                        shard_idx,
+                        bucket,
+                        run_index,
+                        reservation,
+                    );
+                }
             }
         }
     }
@@ -2380,7 +2800,17 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
         batch: PartitionBatch<KEY_LEN>,
         run_index: u64,
     ) -> Result<(), BulkLoadError> {
-        let _flush_guard = InFlightMemoryGuard::new(&self.memory, batch.accounted_bytes, true);
+        let guard = InFlightMemoryGuard::new(&self.memory, batch.accounted_bytes, true);
+        self.flush_taken_batch_with_guard(shard_idx, batch, run_index, guard)
+    }
+
+    fn flush_taken_batch_with_guard(
+        &self,
+        shard_idx: usize,
+        batch: PartitionBatch<KEY_LEN>,
+        run_index: u64,
+        _flush_guard: InFlightMemoryGuard<'_>,
+    ) -> Result<(), BulkLoadError> {
         let spill_started = Instant::now();
         let workspace_path = self.workspaces[shard_idx].path();
         let run = write_batch_to_run(workspace_path, run_index, batch, &self.temporary_files)
@@ -2410,17 +2840,26 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixWriter<'_, KEY_LEN> {
             self.flush_all_buckets()?;
             return self.sorter.push(key, encoded_value);
         }
-        if record_bytes > self.unused_credit_bytes {
+        let shard_idx = self.sorter.partition_index(&key);
+        let min_needed = self.buckets[shard_idx].min_growth_bytes(1, encoded_value.len())?;
+        if min_needed > self.unused_credit_bytes {
             self.flush_all_buckets()?;
-            self.refill_credit(record_bytes);
-            if record_bytes > self.unused_credit_bytes {
+            self.refill_credit(min_needed.max(record_bytes));
+            let refreshed_needed =
+                self.buckets[shard_idx].min_growth_bytes(1, encoded_value.len())?;
+            if refreshed_needed > self.unused_credit_bytes {
                 return self.sorter.push(key, encoded_value);
             }
         }
-        let shard_idx = self.sorter.partition_index(&key);
-        self.buckets[shard_idx].push_record(key, encoded_value, record_bytes)?;
-        self.unused_credit_bytes = self.unused_credit_bytes.saturating_sub(record_bytes);
-        Ok(())
+        let mut charged = 0_u64;
+        let stage_outcome = self.buckets[shard_idx].push_record_within(
+            key,
+            encoded_value,
+            self.unused_credit_bytes,
+            &mut charged,
+        );
+        self.unused_credit_bytes = self.unused_credit_bytes.saturating_sub(charged);
+        stage_outcome
     }
 
     /// Flushes every locally buffered record to its owning sorter partition and
@@ -2443,8 +2882,10 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixWriter<'_, KEY_LEN> {
 
     fn flush_all_buckets(&mut self) -> Result<(), BulkLoadError> {
         for idx in 0..self.buckets.len() {
-            self.sorter
-                .push_preaccounted_bucket(idx, &mut self.buckets[idx])?;
+            let taken = std::mem::take(&mut self.buckets[idx]);
+            if !taken.is_empty() {
+                self.sorter.push_preaccounted_bucket(idx, taken)?;
+            }
         }
         if self.unused_credit_bytes > 0 {
             let released = self.unused_credit_bytes;
@@ -2602,26 +3043,20 @@ fn verify_run_file_size(
     Ok(())
 }
 
-fn finish_partitions_in_parallel<const KEY_LEN: usize>(
-    shards_input: Vec<(TempDir, PartitionState<KEY_LEN>)>,
-    per_shard_fan_in: usize,
-    max_accounted: u64,
-    temporary_files: &SharedTempFileBudget,
-) -> Result<Vec<FlushedPartitionOutput<KEY_LEN>>, BulkLoadError> {
+fn run_scoped_partition_phase<Input, Output, Task>(
+    inputs: Vec<Input>,
+    task: Task,
+) -> Result<Vec<Output>, BulkLoadError>
+where
+    Input: Send,
+    Output: Send,
+    Task: Fn(Input) -> Result<Output, BulkLoadError> + Sync,
+{
     thread::scope(|scope| {
-        let handles: Vec<_> = shards_input
+        let task_ref = &task;
+        let handles: Vec<_> = inputs
             .into_iter()
-            .map(|(workspace, partition)| {
-                scope.spawn(move || {
-                    finish_single_partition(
-                        workspace,
-                        partition,
-                        per_shard_fan_in,
-                        max_accounted,
-                        temporary_files,
-                    )
-                })
-            })
+            .map(|input| scope.spawn(move || task_ref(input)))
             .collect();
         let mut outcomes = Vec::with_capacity(handles.len());
         let mut first_error = None;
@@ -2647,14 +3082,47 @@ fn finish_partitions_in_parallel<const KEY_LEN: usize>(
     })
 }
 
-fn finish_single_partition<const KEY_LEN: usize>(
-    workspace: TempDir,
-    mut partition: PartitionState<KEY_LEN>,
+fn finish_partition_phases<const KEY_LEN: usize>(
+    shards_input: Vec<(TempDir, PartitionState<KEY_LEN>)>,
     per_shard_fan_in: usize,
     max_accounted: u64,
     temporary_files: &SharedTempFileBudget,
+) -> Result<Vec<FlushedPartitionOutput<KEY_LEN>>, BulkLoadError> {
+    if shards_input.len() == 1 {
+        return shards_input
+            .into_iter()
+            .map(|(workspace, mut partition)| {
+                let tail_flush = flush_tail_batch(&workspace, &mut partition, temporary_files)?;
+                merge_and_open_partition(
+                    workspace,
+                    partition,
+                    tail_flush,
+                    (per_shard_fan_in, max_accounted, temporary_files),
+                )
+            })
+            .collect();
+    }
+    let flushed_shards = run_scoped_partition_phase(shards_input, |(workspace, mut partition)| {
+        let tail_flush = flush_tail_batch(&workspace, &mut partition, temporary_files)?;
+        Ok((workspace, partition, tail_flush))
+    })?;
+    run_scoped_partition_phase(flushed_shards, |(workspace, partition, tail_flush)| {
+        merge_and_open_partition(
+            workspace,
+            partition,
+            tail_flush,
+            (per_shard_fan_in, max_accounted, temporary_files),
+        )
+    })
+}
+
+fn merge_and_open_partition<const KEY_LEN: usize>(
+    workspace: TempDir,
+    partition: PartitionState<KEY_LEN>,
+    final_run_flush_duration: Duration,
+    budget: (usize, u64, &SharedTempFileBudget),
 ) -> Result<FlushedPartitionOutput<KEY_LEN>, BulkLoadError> {
-    let final_run_flush_duration = flush_tail_batch(&workspace, &mut partition, temporary_files)?;
+    let (per_shard_fan_in, max_accounted, temporary_files) = budget;
     let (runs, merge_pass_count, merge_duration) = merge_partition_runs::<KEY_LEN>(
         workspace.path(),
         temporary_files,
@@ -4020,6 +4488,217 @@ mod tests {
         let finished = multi_pass.finish()?;
         assert_eq!(finished.evidence().record_count, 16);
         assert!(finished.evidence().merge_pass_count >= 1);
+        Ok(())
+    }
+
+    fn assert_sorter_capacity_invariants<const KEY_LEN: usize>(
+        sorter: &ShardedKeyPrefixSorter<KEY_LEN>,
+        global_limit: u64,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let mut total_capacity_bytes = 0_u64;
+        for partition_lock in &sorter.partitions {
+            let partition = partition_lock.lock();
+            let rec_bytes = partition
+                .staging
+                .staged_records
+                .capacity()
+                .checked_mul(size_of::<StagedVariableValue<KEY_LEN>>())
+                .ok_or("record capacity overflow")?;
+            let actual_bytes = u64::try_from(
+                rec_bytes
+                    .checked_add(partition.staging.encoded_values.capacity())
+                    .ok_or("capacity sum overflow")?,
+            )?;
+            assert_eq!(actual_bytes, partition.staging.accounted_bytes);
+            assert_eq!(actual_bytes, partition.staging.allocated_bytes()?);
+            total_capacity_bytes = total_capacity_bytes.saturating_add(actual_bytes);
+        }
+        let active_bytes = sorter.memory.active_bytes.load(Ordering::SeqCst);
+        assert!(total_capacity_bytes <= global_limit);
+        assert!(active_bytes <= global_limit);
+        assert!(total_capacity_bytes <= active_bytes);
+        Ok(total_capacity_bytes)
+    }
+
+    #[test]
+    fn sharded_key_prefix_sorter_bounds_actual_vector_capacity_within_memory_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(4).ok_or("nonzero shards")?;
+        let tight_limit = one_record_memory_limit::<2>(64) * 4;
+        let tight = ShardedKeyPrefixSorter::<2>::new(
+            dir.path(),
+            "cap-tight",
+            shard_count,
+            tight_limit,
+            tight_limit * 4,
+        )?;
+        for (idx, prefix) in [0x00_u8, 0x40, 0x80, 0xc0].into_iter().enumerate() {
+            tight.push([prefix, 0x01], &[u8::try_from(idx)?; 64])?;
+            assert_sorter_capacity_invariants(&tight, tight_limit)?;
+        }
+        assert_eq!(tight.finish()?.evidence().record_count, 4);
+
+        let global_limit = WRITER_CREDIT_MIN_MEMORY_BYTES;
+        let sorter = ShardedKeyPrefixSorter::<2>::new(
+            dir.path(),
+            "cap-growth",
+            shard_count,
+            global_limit,
+            global_limit * 4,
+        )?;
+        let mut writer = sorter.writer(NonZeroU32::MIN);
+        for index in 0_usize..120 {
+            let prefix = u8::try_from((index % 4) * 64)?;
+            let payload_len = 17 + (index % 253);
+            let payload = vec![u8::try_from(index & 0xff)?; payload_len];
+            writer.push([prefix, u8::try_from(index)?], &payload)?;
+            for bucket in &writer.buckets {
+                assert_eq!(bucket.allocated_bytes()?, bucket.accounted_bytes);
+            }
+        }
+        writer.flush()?;
+        assert_sorter_capacity_invariants(&sorter, global_limit)?;
+        for index in 120_usize..160 {
+            let prefix = u8::try_from((index % 4) * 64)?;
+            let payload = vec![0x77_u8; 40 + (index % 190)];
+            sorter.push([prefix, u8::try_from(index)?], &payload)?;
+            if index % 10 == 0 {
+                assert_sorter_capacity_invariants(&sorter, global_limit)?;
+            }
+        }
+        let live = assert_sorter_capacity_invariants(&sorter, global_limit)?;
+        assert_eq!(live, sorter.memory.active_bytes.load(Ordering::SeqCst));
+        assert_eq!(sorter.finish()?.evidence().record_count, 160);
+        Ok(())
+    }
+
+    struct BarrierPublishRaceHook {
+        publish_gated: std::sync::atomic::AtomicBool,
+        scan_gated: std::sync::atomic::AtomicBool,
+        reserved_barrier: std::sync::Barrier,
+        scanned_barrier: std::sync::Barrier,
+        after_publish_barrier: std::sync::Barrier,
+    }
+
+    impl ReclaimRaceHook for BarrierPublishRaceHook {
+        fn on_before_publish(&self) {
+            if !self.publish_gated.swap(true, Ordering::SeqCst) {
+                self.reserved_barrier.wait();
+                self.scanned_barrier.wait();
+            }
+        }
+
+        fn on_after_empty_scan(&self) {
+            if !self.scan_gated.swap(true, Ordering::SeqCst) {
+                self.scanned_barrier.wait();
+                self.after_publish_barrier.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn sharded_key_prefix_sorter_retries_reclaim_when_concurrent_writer_publishes_after_scan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(2).ok_or("nonzero shards")?;
+        let r_small = one_record_memory_limit::<2>(16);
+        let global_limit = r_small * 2;
+        let hook = std::sync::Arc::new(BarrierPublishRaceHook {
+            publish_gated: std::sync::atomic::AtomicBool::new(false),
+            scan_gated: std::sync::atomic::AtomicBool::new(false),
+            reserved_barrier: std::sync::Barrier::new(2),
+            scanned_barrier: std::sync::Barrier::new(2),
+            after_publish_barrier: std::sync::Barrier::new(2),
+        });
+        let mut sorter = ShardedKeyPrefixSorter::<2>::new(
+            dir.path(),
+            "reclaim-race",
+            shard_count,
+            global_limit,
+            64_000,
+        )?;
+        sorter.reclaim_race_hook = Some(std::sync::Arc::clone(&hook) as _);
+
+        thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let sorter_ref = &sorter;
+            let hook_a = std::sync::Arc::clone(&hook);
+            let handle_a = scope.spawn(move || -> Result<(), BulkLoadError> {
+                sorter_ref.push([0x00, 0x01], &[0xaa; 16])?;
+                hook_a.after_publish_barrier.wait();
+                Ok(())
+            });
+            let hook_b = std::sync::Arc::clone(&hook);
+            let handle_b = scope.spawn(move || -> Result<(), BulkLoadError> {
+                hook_b.reserved_barrier.wait();
+                sorter_ref.push([0x80, 0x02], &[0xbb; 32])
+            });
+            handle_a.join().map_err(|_| "writer A panicked")??;
+            handle_b.join().map_err(|_| "writer B panicked")??;
+            Ok(())
+        })?;
+
+        let finished = sorter.finish()?;
+        assert_eq!(finished.evidence().record_count, 2);
+        let mut keys = Vec::new();
+        for mut stream in finished.into_shards() {
+            while let Some(record) = stream.next_record()? {
+                keys.push(record.key);
+            }
+        }
+        assert_eq!(keys, vec![[0x00, 0x01], [0x80, 0x02]]);
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_key_prefix_sorter_flushes_all_tails_before_merging_within_two_x_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_budget = SharedTempFileBudget::new(1_000);
+        for _ in 0..4 {
+            temp_budget.reserve_initial_run(100)?;
+        }
+        temp_budget.reserve(200)?;
+        temp_budget.reserve_initial_run(100)?;
+        assert!(matches!(
+            temp_budget.reserve_initial_run(1),
+            Err(BulkLoadError::TemporaryFileLimit {
+                limit_bytes: 1_000,
+                required_bytes: 1_002,
+            })
+        ));
+        temp_budget.release(200)?;
+
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(2).ok_or("nonzero shards")?;
+        let one_rec = one_record_memory_limit::<2>(32);
+        let run_bytes = encoded_run_record_bytes::<2>(32)?;
+        let exact_temp_limit = run_bytes * 10;
+        let sorter = ShardedKeyPrefixSorter::<2>::new_with_budget(
+            dir.path(),
+            "phased-tail-flush",
+            ShardedSortBudget {
+                shard_count,
+                max_accounted_memory_bytes: one_rec * 2,
+                max_temporary_file_bytes: exact_temp_limit,
+                per_shard_merge_fan_in_cap: Some(2),
+            },
+        )?;
+        for seq in 0_u8..4 {
+            sorter.push([0x00, seq], &[0x44; 32])?;
+        }
+        sorter.push([0x80, 0x01], &[0x55; 32])?;
+        let finished = sorter.finish()?;
+        let evidence = finished.evidence();
+        assert_eq!(evidence.initial_run_count, 5);
+        assert!(evidence.merge_pass_count >= 1);
+        assert!(evidence.peak_temporary_file_bytes <= exact_temp_limit);
+        let mut count = 0_usize;
+        for mut stream in finished.into_shards() {
+            while stream.next_record()?.is_some() {
+                count = count.saturating_add(1);
+            }
+        }
+        assert_eq!(count, 5);
         Ok(())
     }
 }
