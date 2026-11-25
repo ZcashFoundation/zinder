@@ -1,0 +1,6 @@
+kind: fixed
+body: Pre-register `zinder_node_rate_limited_total` and `zinder_compat_block_range_stream_refusals_total` at zero on startup with `# HELP` and `# TYPE` metadata so alerts and dashboards distinguish zero refusals from missing metrics.
+time: 2026-11-25T07:40:00.000000000Z
+custom:
+    Bump: patch
+    PR: "572"
