@@ -69,26 +69,27 @@ pub(super) fn encode_default_shielded_block_with_options(
     let mut has_unrepresentable_wire_fee = false;
     for tx in block.transactions() {
         let scan = &tx.data;
-        let tx_mask = transaction_pool_mask(scan);
-        presence = presence.union(tx_mask);
-        if tx_mask.is_empty() {
-            continue;
-        }
-        let fee = match scan.fee_zat {
+        let wire_fee = match scan.fee_zat {
             Some(fee_zat) => match u32::try_from(fee_zat) {
-                Ok(wire_fee) => wire_fee,
-                Err(_) if allow_wide_fee_in_supplement => {
-                    has_unrepresentable_wire_fee = true;
-                    0
-                }
+                Ok(fee) => Some(fee),
+                Err(_) if allow_wide_fee_in_supplement => None,
                 Err(_) => {
                     return Err(SettledShieldedSegmentError::PayloadIntegrity(
                         "compact transaction fee exceeds u32".to_owned(),
                     ));
                 }
             },
-            None => 0,
+            None => Some(0),
         };
+        let tx_mask = transaction_pool_mask(scan);
+        presence = presence.union(tx_mask);
+        if tx_mask.is_empty() {
+            continue;
+        }
+        let fee = wire_fee.unwrap_or_else(|| {
+            has_unrepresentable_wire_fee = true;
+            0
+        });
         vtx.push(lightwalletd::CompactTx {
             index: tx.index,
             txid: encode_internal_transaction_id(tx.transaction_id).to_vec(),
