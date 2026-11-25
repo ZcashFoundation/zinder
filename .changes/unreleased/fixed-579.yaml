@@ -1,5 +1,5 @@
 kind: fixed
-body: Raised Mainnet `ZINDER_QUERY_MEMORY_LIMIT` and `ZINDER_COMPAT_MEMORY_LIMIT` defaults from `4g` to `32g` (and decoupled `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` at `8g`) so cgroup v2 containers keep the `ZSHRNG01` shielded history catalog in page cache instead of re-reading from disk under concurrent stream load.
+body: Decoupled `zinder-history-publisher`'s default container memory ceiling (`ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` set to `4g` Mainnet, `2g` Testnet, `1g` Regtest) from `ZINDER_COMPAT_MEMORY_LIMIT` and documented cgroup v2 `ZSHRNG01` page-cache sizing for high-concurrency Mainnet `zinder-compat-lightwalletd` deployments.
 time: 2026-11-25T11:30:00Z
 custom:
     Bump: patch

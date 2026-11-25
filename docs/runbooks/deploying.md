@@ -62,8 +62,10 @@ its own disk on top of the figures below.
 | Regtest | Not measured | Compose container limits: 2, 2, 1, and 1 GiB | Not measured |
 
 The memory figures are the limits the shipped Compose env files set. They are
-ceilings. Actual usage varies. The publisher has its own container with the same
-memory limit as the compatibility reader. Give the single-volume container at
+ceilings. Actual usage varies. The publisher has its own container with an
+independent memory ceiling (`ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT`: `4 GiB` on
+Mainnet, `2 GiB` on Testnet, `1 GiB` on Regtest), decoupled from
+`ZINDER_COMPAT_MEMORY_LIMIT`. Give the single-volume container at
 least 8 GB. The release binaries need an x86-64-v3 or AArch64 CPU. On x86-64
 CPUs that report AVX-512F and AVX-512VL, the wallet accumulators hash with
 AVX-512 code selected at run time; other x86-64-v3 CPUs use AVX2. Both produce
@@ -79,6 +81,16 @@ reached READY in 9.75 s, compared with 5.72 s for the canonical reader. At
 readiness it had read 1.30 GiB, used 0.66 CPU-seconds, and reached 537 MiB
 peak RSS and 1,218 open descriptors. These figures describe startup on a
 12,000-IOPS disk. Catalog growth and concurrent wallet traffic affect sizing.
+
+Under cgroup v2, `zinder-compat-lightwalletd` (and only
+`zinder-compat-lightwalletd` — `zinder-query` uses `O_DIRECT` RocksDB reads and
+does not mount the catalog) charges OS page cache for `ZSHRNG01` segments
+(~20–21 GiB on Mainnet and growing) against `ZINDER_COMPAT_MEMORY_LIMIT`. Keep
+`4 GiB` as an OOM guardrail on 16–32 GiB self-hosted VMs; on 64+ GiB public
+Mainnet endpoints serving high-concurrency range syncs, raise
+`ZINDER_COMPAT_MEMORY_LIMIT` (for example `32g` or higher) above the catalog
+size plus working set so segments remain warm in page cache and concurrent
+streams do not hit `wait_timeout` refusals.
 
 ### Optional Pasta assembly backend
 

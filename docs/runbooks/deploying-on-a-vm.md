@@ -319,10 +319,15 @@ for coverage, tail reads, and fs-verity requirements.
 If you customize the canonical reorg window, match it
 in `deploy/config/history-publisher.toml`. The publisher ignores
 `storage.raw_blob_policy`, but earlier releases require it to match ingest,
-so keep it equal to ingest's value if you might roll back. The publisher defaults to an `8g` memory ceiling
-(`ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT`), independent of the reader page-cache
-ceiling (`ZINDER_COMPAT_MEMORY_LIMIT`, `32g` in Mainnet `.env` files to keep
-cgroup v2 page cache for the ~21 GB signed history catalog resident). The wallet reader keeps one file open per admitted
+so keep it equal to ingest's value if you might roll back. The publisher uses its own `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` ceiling
+(`4g` Mainnet, `2g` Testnet, `1g` Regtest), independent of
+`ZINDER_COMPAT_MEMORY_LIMIT`. On 64+ GiB public Mainnet endpoints serving
+high-concurrency range syncs, operators who want the signed catalog resident
+in page cache should raise `ZINDER_COMPAT_MEMORY_LIMIT` in `/etc/zinder/env`
+(leaving `ZINDER_QUERY_MEMORY_LIMIT` and `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT`
+at `4g`) and recreate `zinder-compat-lightwalletd` or update it live with
+`docker update`; see [What you need](deploying.md#what-you-need). The wallet
+reader keeps one file open per admitted
 segment alongside its database files and sockets. Compose sets its soft and
 hard open-file limits to 65,536.
 
