@@ -24,7 +24,7 @@ use super::{
     },
     verity,
     wire_projection::{
-        project_shielded_block_wire_into, synthesize_empty_nullifier_block,
+        ExpectedShieldedBlock, project_shielded_block_wire_into, synthesize_empty_nullifier_block,
         validate_shielded_block_wire,
     },
 };
@@ -384,10 +384,13 @@ impl SettledShieldedSegmentReader {
             let prev_hash_wire = self.prev_hash_wire_at(row_idx);
             validate_shielded_block_wire(
                 payload,
-                height,
-                &row.block_hash_wire,
-                prev_hash_wire,
-                row.pool_presence,
+                ExpectedShieldedBlock {
+                    height,
+                    block_hash_wire: &row.block_hash_wire,
+                    prev_hash_wire,
+                    block_time: row.block_time,
+                    pool_presence: row.pool_presence,
+                },
             )?;
             row.mark_valid();
         }

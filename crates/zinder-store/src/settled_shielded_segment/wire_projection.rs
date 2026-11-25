@@ -201,77 +201,118 @@ pub(super) fn project_shielded_block_wire_into(
     patch_frame_prefix(out, frame_start)
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ExpectedShieldedBlock<'a> {
+    pub(super) height: BlockHeight,
+    pub(super) block_hash_wire: &'a [u8; 32],
+    pub(super) prev_hash_wire: &'a [u8; 32],
+    pub(super) block_time: u32,
+    pub(super) pool_presence: PoolPresenceMask,
+}
+
+#[derive(Default)]
+struct ObservedShieldedBlock {
+    height: Option<u64>,
+    time: Option<u64>,
+    has_hash: bool,
+    has_prev_hash: bool,
+    pool_presence: PoolPresenceMask,
+}
+
 /// Validates a `Slab 0` `CompactBlock` protobuf payload without heap allocation.
 pub(super) fn validate_shielded_block_wire(
     raw_payload: &[u8],
-    expected_height: BlockHeight,
-    expected_hash_wire: &[u8; 32],
-    expected_prev_hash_wire: &[u8; 32],
-    expected_pool_presence: PoolPresenceMask,
+    expected: ExpectedShieldedBlock<'_>,
 ) -> Result<(), SettledShieldedSegmentError> {
     let mut cursor = raw_payload;
-    let mut seen_height = None;
-    let mut seen_hash = false;
-    let mut seen_prev_hash = false;
-    let mut observed_presence = PoolPresenceMask::EMPTY;
+    let mut observed = ObservedShieldedBlock::default();
     while !cursor.is_empty() {
         let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
         match tag {
             COMPACT_BLOCK_TAG_HEIGHT => {
-                expect_wire_type(wire_type, WireType::Varint, "CompactBlock.height")?;
-                let decoded = decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
-                if seen_height.replace(decoded).is_some() {
-                    return Err(SettledShieldedSegmentError::PayloadIntegrity(
-                        "duplicate height field in shielded segment block".to_owned(),
-                    ));
-                }
+                check_unique_varint_field(wire_type, &mut cursor, &mut observed.height, "height")?;
             }
             COMPACT_BLOCK_TAG_HASH => {
-                seen_hash = check_header_hash_field(
+                observed.has_hash = check_header_hash_field(
                     wire_type,
                     &mut cursor,
-                    expected_hash_wire,
-                    seen_hash,
+                    expected.block_hash_wire,
+                    observed.has_hash,
                     "hash",
                 )?;
             }
             COMPACT_BLOCK_TAG_PREV_HASH => {
-                seen_prev_hash = check_header_hash_field(
+                observed.has_prev_hash = check_header_hash_field(
                     wire_type,
                     &mut cursor,
-                    expected_prev_hash_wire,
-                    seen_prev_hash,
+                    expected.prev_hash_wire,
+                    observed.has_prev_hash,
                     "prev_hash",
                 )?;
             }
             COMPACT_BLOCK_TAG_TIME => {
-                expect_wire_type(wire_type, WireType::Varint, "CompactBlock.time")?;
-                decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
+                check_unique_varint_field(wire_type, &mut cursor, &mut observed.time, "time")?;
             }
-            COMPACT_BLOCK_TAG_HEADER | COMPACT_BLOCK_TAG_CHAIN_METADATA => {
-                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock bytes")?;
+            COMPACT_BLOCK_TAG_HEADER => {
+                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.header")?;
                 let nested = take_length_delimited(&mut cursor)?;
-                if tag == COMPACT_BLOCK_TAG_CHAIN_METADATA {
-                    validate_chain_metadata_wire(nested)?;
+                if !nested.is_empty() {
+                    return Err(SettledShieldedSegmentError::PayloadIntegrity(
+                        "unexpected header bytes inside shielded segment block".to_owned(),
+                    ));
                 }
+            }
+            COMPACT_BLOCK_TAG_CHAIN_METADATA => {
+                expect_wire_type(wire_type, WireType::LengthDelimited, "chain_metadata")?;
+                let nested = take_length_delimited(&mut cursor)?;
+                validate_chain_metadata_wire(nested)?;
             }
             COMPACT_BLOCK_TAG_VTX => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.vtx")?;
                 let tx_bytes = take_length_delimited(&mut cursor)?;
-                observed_presence = observed_presence.union(validate_compact_tx_wire(tx_bytes)?);
+                let tx_presence = validate_compact_tx_wire(tx_bytes)?;
+                observed.pool_presence = observed.pool_presence.union(tx_presence);
             }
             _ => skip_wire_field(wire_type, &mut cursor)?,
         }
     }
-    if seen_height.unwrap_or(0) != u64::from(expected_height.value())
-        || !seen_hash
-        || !seen_prev_hash
+    verify_observed_shielded_block(&observed, expected)
+}
+
+fn check_unique_varint_field(
+    wire_type: WireType,
+    cursor: &mut &[u8],
+    seen: &mut Option<u64>,
+    label: &str,
+) -> Result<(), SettledShieldedSegmentError> {
+    expect_wire_type(wire_type, WireType::Varint, label)?;
+    let decoded = decode_varint(cursor).map_err(|err| wire_error(&err))?;
+    if seen.replace(decoded).is_some() {
+        return Err(SettledShieldedSegmentError::PayloadIntegrity(format!(
+            "duplicate {label} field in shielded segment block"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_observed_shielded_block(
+    observed: &ObservedShieldedBlock,
+    expected: ExpectedShieldedBlock<'_>,
+) -> Result<(), SettledShieldedSegmentError> {
+    if observed.height.unwrap_or(0) != u64::from(expected.height.value())
+        || !observed.has_hash
+        || !observed.has_prev_hash
     {
         return Err(SettledShieldedSegmentError::PayloadIntegrity(
             "shielded segment payload height, hash, or prev_hash mismatches index".to_owned(),
         ));
     }
-    if observed_presence != expected_pool_presence {
+    if observed.time.unwrap_or(0) != u64::from(expected.block_time) {
+        return Err(SettledShieldedSegmentError::PayloadIntegrity(
+            "shielded segment payload time disagrees with row index".to_owned(),
+        ));
+    }
+    if observed.pool_presence != expected.pool_presence {
         return Err(SettledShieldedSegmentError::PayloadIntegrity(
             "shielded segment payload pool_presence disagrees with row index".to_owned(),
         ));

@@ -993,6 +993,8 @@ fn build_raw_block_header_fields(out: &mut Vec<u8>) -> TestOutcome {
     let prev_wire = encode_internal_block_hash(block_hash(0));
     encode_length_delimited_field(3, &hash_wire, out)?;
     encode_length_delimited_field(4, &prev_wire, out)?;
+    encode_key(5, WireType::Varint, out);
+    encode_varint(1_700_000_001, out);
     Ok(())
 }
 
@@ -1022,6 +1024,19 @@ fn open_raw_portable_segment(
     name: &str,
     payload: &[u8],
 ) -> TestOutcome<SettledShieldedSegmentReader> {
+    let all_pools = PoolPresenceMask::SAPLING_SPEND
+        .union(PoolPresenceMask::SAPLING_OUTPUT)
+        .union(PoolPresenceMask::ORCHARD)
+        .union(PoolPresenceMask::IRONWOOD);
+    open_raw_portable_segment_with_presence(dir, name, payload, all_pools)
+}
+
+fn open_raw_portable_segment_with_presence(
+    dir: &Path,
+    name: &str,
+    payload: &[u8],
+    pool_presence: PoolPresenceMask,
+) -> TestOutcome<SettledShieldedSegmentReader> {
     let prefix = encode_frame_prefix(payload.len())?;
     let frame_len = u64::try_from(FRAME_PREFIX_LEN + payload.len())?;
     let header_len_u64 = u64::try_from(HEADER_LEN)?;
@@ -1040,17 +1055,13 @@ fn open_raw_portable_segment(
         slab_offset: header_len_u64,
         index_offset,
     };
-    let all_pools = PoolPresenceMask::SAPLING_SPEND
-        .union(PoolPresenceMask::SAPLING_OUTPUT)
-        .union(PoolPresenceMask::ORCHARD)
-        .union(PoolPresenceMask::IRONWOOD);
     let entry = DecodedRowIndexEntry {
         block_hash_wire: last_block_hash_wire,
         payload_sha256: Sha256::digest(payload).into(),
         block_time: 1_700_000_001,
         slab_rel_offset: 0,
         native_bytes: 128,
-        pool_presence: all_pools,
+        pool_presence,
     };
     let mut segment_bytes = Vec::with_capacity(
         HEADER_LEN + FRAME_PREFIX_LEN + payload.len() + ROW_INDEX_ENTRY_LEN + TRAILER_LEN,
@@ -1488,6 +1499,84 @@ fn reader_latches_invalid_state_on_slab_read_truncation() -> TestOutcome {
     let sapling_nullifiers = ShieldedProjectionSelection::new(true, false, false, true);
     assert!(matches!(
         reader.read_projected_range(range_3, HeightOrder::Ascending, sapling_nullifiers),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_mismatched_block_time_on_consecutive_unmatched_nullifier_reads() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = mixed_fixture_blocks()?;
+    let (src_path, identity) = write_segment(dir.path(), "bad-time-src", &blocks)?;
+    let mut mutated = fs::read(&src_path)?;
+    let index_offset = usize::try_from(u64::from_be_bytes(mutated[96..104].try_into()?))?;
+    // Mutate Orchard-only height = 3 (row index 2) indexed block_time (bytes 64..68).
+    mutated[index_offset + 2 * ROW_INDEX_ENTRY_LEN + 67] ^= 0x01;
+    let forged_sha = recompute_portable_sha256(&mutated);
+    let body_end = mutated.len() - TRAILER_LEN;
+    mutated[body_end..].copy_from_slice(&forged_sha);
+    let forged_path = dir.path().join("forged-block-time");
+    fs::write(&forged_path, &mutated)?;
+    let forged_identity = ShieldedSegmentIdentity {
+        sha256: forged_sha,
+        fs_verity_sha256: None,
+        ..identity
+    };
+    let reader = SettledShieldedSegmentReader::open(
+        &forged_path,
+        &forged_identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let range_3 = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(3));
+    let sapling_nullifiers = ShieldedProjectionSelection::new(true, false, false, true);
+    assert!(matches!(
+        reader.read_projected_range(range_3, HeightOrder::Ascending, sapling_nullifiers),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader.read_projected_range(range_3, HeightOrder::Ascending, sapling_nullifiers),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+
+    let mut omitted_time_payload = Vec::new();
+    encode_key(2, WireType::Varint, &mut omitted_time_payload);
+    encode_varint(1, &mut omitted_time_payload);
+    let hash_wire = encode_internal_block_hash(block_hash(1));
+    let prev_wire = encode_internal_block_hash(block_hash(0));
+    encode_length_delimited_field(3, &hash_wire, &mut omitted_time_payload)?;
+    encode_length_delimited_field(4, &prev_wire, &mut omitted_time_payload)?;
+    encode_length_delimited_field(8, &[], &mut omitted_time_payload)?;
+    let omitted_reader = open_raw_portable_segment_with_presence(
+        dir.path(),
+        "omitted-time",
+        &omitted_time_payload,
+        PoolPresenceMask::EMPTY,
+    )?;
+    let range_1 = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1));
+    assert!(matches!(
+        omitted_reader.read_default_range(range_1, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn reader_rejects_nonempty_compact_block_header() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let mut header_payload = Vec::new();
+    build_raw_block_header_fields(&mut header_payload)?;
+    encode_length_delimited_field(6, &[0x01, 0x02], &mut header_payload)?;
+    encode_length_delimited_field(8, &[], &mut header_payload)?;
+    let reader = open_raw_portable_segment_with_presence(
+        dir.path(),
+        "nonempty-header",
+        &header_payload,
+        PoolPresenceMask::EMPTY,
+    )?;
+    let range_1 = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1));
+    assert!(matches!(
+        reader.read_default_range(range_1, HeightOrder::Ascending),
         Err(SettledShieldedSegmentError::PayloadIntegrity(_))
     ));
     Ok(())
