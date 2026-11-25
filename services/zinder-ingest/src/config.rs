@@ -34,6 +34,7 @@ use zinder_runtime::{
 use zinder_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
     MempoolSourceAdmissionLimits, NodeFallbackSections, NodeSection, NodeTarget,
+    ZebraIndexerSourceTarget,
 };
 use zinder_store::TreeStateCheckpointSelection;
 
@@ -299,8 +300,8 @@ struct IngestPrimaryStorageSection {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestSection {
-    /// Canonical source-adapter selector. The supported value is
-    /// `zebra-json-rpc`.
+    /// Canonical source-adapter selector (`zebra-json-rpc` or
+    /// `zebra-indexer-grpc`).
     source: Option<String>,
     /// Whether the complete bundled Explorer materialized-view workload is
     /// requested. Omitted values remain false for every coverage.
@@ -399,6 +400,7 @@ struct IngestRunOverridesSection {
 const fn node_source_name(node_source: NodeSourceKind) -> &'static str {
     match node_source {
         NodeSourceKind::ZebraJsonRpc => "zebra-json-rpc",
+        NodeSourceKind::ZebraIndexerGrpc => "zebra-indexer-grpc",
     }
 }
 
@@ -470,6 +472,38 @@ fn detected_logical_core_count() -> Option<NonZeroU32> {
         .and_then(|cpus| NonZeroU32::new(u32::try_from(cpus.get()).unwrap_or(u32::MAX)))
 }
 
+fn validate_node_source_targets(
+    node_source: NodeSourceKind,
+    primary: &NodeTarget,
+    fallbacks: &[NodeTarget],
+) -> Result<(), ConfigError> {
+    validate_node_source_target(node_source, "node", primary)?;
+    for (index, fallback) in fallbacks.iter().enumerate() {
+        let section = format!("node_fallbacks.{}", index + 1);
+        validate_node_source_target(node_source, &section, fallback)?;
+    }
+    Ok(())
+}
+
+fn validate_node_source_target(
+    node_source: NodeSourceKind,
+    section: &str,
+    target: &NodeTarget,
+) -> Result<(), ConfigError> {
+    match node_source {
+        NodeSourceKind::ZebraJsonRpc => Ok(()),
+        NodeSourceKind::ZebraIndexerGrpc => {
+            if ZebraIndexerSourceTarget::from_node_target(target).is_some() {
+                Ok(())
+            } else {
+                Err(ConfigError::invalid(format!(
+                    "ingest.source = \"zebra-indexer-grpc\" requires {section}.indexer_grpc_addr"
+                )))
+            }
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the ingest resolver composes the network, source, storage, phase, construction, follow, and modifier knobs in one auditable validation sequence."
@@ -512,6 +546,7 @@ fn resolve_ingest_config(
         .clone()
         .unwrap_or_else(|| node_source_name(NodeSourceKind::ZebraJsonRpc).to_owned());
     let node_source = parse_node_source(&node_source_text)?;
+    validate_node_source_targets(node_source, &node_target, &node_fallbacks)?;
     let configured_raw_blob_policy = config.storage.raw_blob_policy;
     let storage_path = require_field(config.storage.path, "storage.path")?;
     let canonical_rocksdb_budget =
@@ -1294,5 +1329,89 @@ mod tests {
             return;
         };
         assert!(error.to_string().contains("explorer_views = true"));
+    }
+
+    #[test]
+    fn parse_node_source_accepts_zebra_json_rpc_and_zebra_indexer_grpc() {
+        assert_eq!(
+            parse_node_source("zebra-json-rpc").ok(),
+            Some(NodeSourceKind::ZebraJsonRpc)
+        );
+        assert_eq!(
+            parse_node_source("zebra-indexer-grpc").ok(),
+            Some(NodeSourceKind::ZebraIndexerGrpc)
+        );
+        assert!(parse_node_source("unsupported-source").is_err());
+    }
+
+    #[test]
+    fn validate_node_source_targets_requires_indexer_grpc_addr_on_primary_and_fallbacks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rpc_only_section: NodeSection =
+            toml::from_str("json_rpc_addr = \"http://127.0.0.1:8232\"")?;
+        let with_indexer_section: NodeSection = toml::from_str(
+            "json_rpc_addr = \"http://127.0.0.1:8232\"\n\
+             indexer_grpc_addr = \"http://127.0.0.1:8231\"",
+        )?;
+        let rpc_only_target =
+            NodeTarget::resolve(zinder_core::Network::ZcashRegtest, rpc_only_section)?;
+        let with_indexer_target =
+            NodeTarget::resolve(zinder_core::Network::ZcashRegtest, with_indexer_section)?;
+
+        assert!(
+            validate_node_source_targets(NodeSourceKind::ZebraJsonRpc, &rpc_only_target, &[])
+                .is_ok()
+        );
+
+        let missing_primary =
+            validate_node_source_targets(NodeSourceKind::ZebraIndexerGrpc, &rpc_only_target, &[])
+                .err()
+                .map_or_default(|error| error.to_string());
+        assert!(
+            missing_primary.contains("node.indexer_grpc_addr"),
+            "{missing_primary}"
+        );
+
+        let missing_fallback = validate_node_source_targets(
+            NodeSourceKind::ZebraIndexerGrpc,
+            &with_indexer_target,
+            &[rpc_only_target],
+        )
+        .err()
+        .map_or_default(|error| error.to_string());
+        assert!(
+            missing_fallback.contains("node_fallbacks.1.indexer_grpc_addr"),
+            "{missing_fallback}"
+        );
+
+        assert!(
+            validate_node_source_targets(
+                NodeSourceKind::ZebraIndexerGrpc,
+                &with_indexer_target,
+                std::slice::from_ref(&with_indexer_target),
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_node_source_targets_rejects_invalid_indexer_tls_combination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_tls_section: NodeSection = toml::from_str(
+            "json_rpc_addr = \"http://127.0.0.1:8232\"\n\
+             indexer_grpc_addr = \"http://127.0.0.1:8231\"\n\
+             [indexer_tls]\n\
+             server_name = \"zebra.internal\"",
+        )?;
+        let tls_error =
+            NodeTarget::resolve(zinder_core::Network::ZcashRegtest, invalid_tls_section)
+                .err()
+                .map_or_default(|error| error.to_string());
+        assert!(
+            tls_error.contains("node.indexer_tls requires an https:// node.indexer_grpc_addr"),
+            "{tls_error}"
+        );
+        Ok(())
     }
 }

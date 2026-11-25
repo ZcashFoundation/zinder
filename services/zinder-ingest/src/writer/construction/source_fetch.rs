@@ -534,6 +534,14 @@ pub(crate) struct SourceBlockChunk {
 }
 
 impl SourceBlockChunk {
+    #[cfg(test)]
+    pub(crate) fn from_test_blocks(blocks: Vec<SourceBlock>, reservation: ByteReservation) -> Self {
+        Self {
+            blocks: VecDeque::from(blocks),
+            _reservation: reservation,
+        }
+    }
+
     pub(crate) fn front(&self) -> Option<&SourceBlock> {
         self.blocks.front()
     }

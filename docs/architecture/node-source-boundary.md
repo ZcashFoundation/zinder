@@ -22,13 +22,15 @@ own refusal messages.
 
 | Type | Role | Selected when |
 | --- | --- | --- |
-| `ZebraJsonRpcSource` | Blocks, block batches, tip, tree states, subtree roots, value pools, health, broadcast, transparent-address lookups | Always; `ingest.source` accepts only `zebra-json-rpc` |
+| `ZebraJsonRpcSource` | Blocks, block batches, tip, tree states, subtree roots, value pools, health, broadcast, transparent-address lookups | Default (`ingest.source = "zebra-json-rpc"`); always provides the control plane |
+| `ZebraIndexerBlockSource` | Binary unary `GetBlock` raw-block reads paired with the JSON-RPC control plane | `ingest.source = "zebra-indexer-grpc"` with `node.indexer_grpc_addr` set |
 | `ZebraIndexerMempoolSource` | Streaming mempool events | `node.indexer_grpc_addr` is set |
 | `JsonRpcMempoolSource` | Polling mempool | No indexer endpoint is set |
-| `ZebraIndexerBlockSource`, `ZebraIndexerChainTipSource` | Block reads and tip notifications over indexer gRPC | Library only; no runtime selects them |
+| `ZebraIndexerChainTipSource` | Tip notifications over indexer gRPC | Library only; no runtime selects it |
 
-JSON-RPC is required. The indexer gRPC endpoint is optional and changes only
-how ingest follows the mempool.
+JSON-RPC is always required. Setting `node.indexer_grpc_addr` switches mempool
+updates to streaming and allows `ingest.source = "zebra-indexer-grpc"` to fetch
+raw blocks as binary protobuf payloads instead of JSON-RPC hex strings.
 
 The JSON-RPC library exposes no connection-pool limit, so every concurrent call
 can open another HTTP connection. `ZebraJsonRpcSource` therefore admits its

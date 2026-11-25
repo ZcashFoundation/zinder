@@ -182,6 +182,20 @@ pub async fn connect_zebra_indexer_channel(
         .map_err(|error| ZebraTransportError::ConnectFailed(transport_error_chain(&error)))
 }
 
+/// Builds a lazily connecting HTTP/2 channel to a Zebra Indexer endpoint.
+///
+/// Validates the URI and loads any configured `https://` TLS material
+/// eagerly while deferring TCP/TLS handshakes until the first RPC, matching
+/// [`build_zebra_json_rpc_client`](crate::build_zebra_json_rpc_client) so
+/// startup failover sets can construct endpoints that are temporarily
+/// unreachable.
+pub fn connect_zebra_indexer_channel_lazy(
+    target: &ZebraIndexerSourceTarget,
+    options: ZebraIndexerChannelOptions,
+) -> Result<Channel, ZebraTransportError> {
+    Ok(zebra_indexer_endpoint(target, options)?.connect_lazy())
+}
+
 /// Checks that an indexer channel to `target` can be built, without
 /// connecting.
 ///

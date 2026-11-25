@@ -30,10 +30,12 @@ use zinder_proto::external::zebra_indexer_rpc::{
 };
 
 use crate::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainSegment,
+    MempoolSource, MempoolSourceAdmissionLimits, MempoolSourceFactory, NodeCapabilities,
+    NodeCapability, NodeSource, NodeStorageMode, NodeTarget, SourceBlock, SourceChainSegment,
     SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
     SourceSubtreeRoots, UpstreamHealthSnapshot, ZebraIndexerChannelOptions,
     ZebraIndexerSourceTarget, ZebraJsonRpcSource, connect_zebra_indexer_channel,
+    connect_zebra_indexer_channel_lazy,
     source_chain_update::SourceChainCursorPosition,
     zebra_json_rpc::{is_unreadable_stored_block_refusal, validate_source_block_links},
 };
@@ -78,7 +80,7 @@ pub struct ZebraIndexerBlockSource {
 }
 
 impl ZebraIndexerBlockSource {
-    /// Opens the shared indexer channel without changing the shipped source selection.
+    /// Connects eagerly to the indexer endpoint paired with `control_plane`.
     pub async fn connect(
         target: ZebraIndexerSourceTarget,
         control_plane: ZebraJsonRpcSource,
@@ -95,16 +97,68 @@ impl ZebraIndexerBlockSource {
         .map_err(|error| SourceError::NodeUnavailable {
             reason: format!("Zebra indexer GetBlock channel could not connect: {error}"),
         })?;
+        Ok(Self::with_channel(control_plane, channel, options))
+    }
+
+    /// Builds a lazily connecting indexer source paired with `control_plane`.
+    ///
+    /// Validates the endpoint URL and TLS material synchronously while
+    /// deferring the HTTP/2 connection until the first request.
+    pub fn connect_lazy(
+        target: &ZebraIndexerSourceTarget,
+        control_plane: ZebraJsonRpcSource,
+        options: ZebraIndexerBlockSourceOptions,
+    ) -> Result<Self, SourceError> {
+        let channel = connect_zebra_indexer_channel_lazy(
+            target,
+            ZebraIndexerChannelOptions {
+                connect_timeout: options.connect_timeout,
+                request_timeout: options.request_timeout,
+            },
+        )
+        .map_err(|error| SourceError::NodeUnavailable {
+            reason: format!("Zebra indexer GetBlock channel could not be configured: {error}"),
+        })?;
+        Ok(Self::with_channel(control_plane, channel, options))
+    }
+
+    /// Builds an indexer block source and its JSON-RPC control plane from one
+    /// resolved [`NodeTarget`].
+    pub fn from_node_target_lazy(target: &NodeTarget) -> Result<Self, SourceError> {
+        let control_plane = ZebraJsonRpcSource::from_node_target(target)?;
+        let Some(indexer_target) = ZebraIndexerSourceTarget::from_node_target(target) else {
+            return Err(SourceError::NodeUnavailable {
+                reason: "node.indexer_grpc_addr is required for zebra-indexer-grpc source"
+                    .to_owned(),
+            });
+        };
+        let options = ZebraIndexerBlockSourceOptions {
+            connect_timeout: Self::default_connect_timeout(),
+            request_timeout: target.request_timeout,
+            max_in_flight_requests: target.max_concurrent_requests,
+        };
+        Self::connect_lazy(&indexer_target, control_plane, options)
+    }
+
+    fn default_connect_timeout() -> Duration {
+        ZebraIndexerBlockSourceOptions::default().connect_timeout
+    }
+
+    fn with_channel(
+        control_plane: ZebraJsonRpcSource,
+        channel: Channel,
+        options: ZebraIndexerBlockSourceOptions,
+    ) -> Self {
         let max_in_flight_requests =
             usize::try_from(options.max_in_flight_requests.get()).unwrap_or(usize::MAX);
-        Ok(Self {
+        Self {
             network: control_plane.network(),
             control_plane,
             channel,
             request_permits: Arc::new(Semaphore::new(max_in_flight_requests)),
             queued_requests: Arc::new(AtomicU64::new(0)),
             active_requests: Arc::new(AtomicU64::new(0)),
-        })
+        }
     }
 
     #[allow(
@@ -174,23 +228,93 @@ impl ZebraIndexerBlockSource {
         }
         Ok(block)
     }
-}
 
-#[async_trait]
-impl NodeSource for ZebraIndexerBlockSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.control_plane.capabilities()
+    async fn fetch_indexer_block_range(
+        &self,
+        start_height: BlockHeight,
+        end_height: BlockHeight,
+        max_response_bytes: u64,
+    ) -> Result<(Vec<SourceBlock>, SourceChainSegmentStats), SourceError> {
+        let mut in_flight = FuturesUnordered::new();
+        for height_value in start_height.value()..=end_height.value() {
+            let height = BlockHeight::new(height_value);
+            in_flight.push(async move { (height, self.fetch_indexer_block_at(height).await) });
+        }
+        let mut blocks_by_height = BTreeMap::new();
+        while let Some((height, outcome)) = in_flight.next().await {
+            blocks_by_height.insert(height.value(), outcome?);
+        }
+        let blocks = blocks_by_height.into_values().collect::<Vec<_>>();
+        let response_payload_bytes = blocks.iter().fold(0_u64, |bytes, block| {
+            bytes.saturating_add(u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX))
+        });
+        if blocks.iter().any(|block| {
+            u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX) > max_response_bytes
+        }) {
+            return Err(SourceError::SourceResponseTooLarge {
+                operation: "indexer_get_block_segment",
+                max_response_bytes,
+            });
+        }
+        let stats = SourceChainSegmentStats::from_response_payload_bytes(response_payload_bytes)
+            .with_connected_blocks(blocks.len());
+        Ok((blocks, stats))
     }
 
-    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        self.fetch_indexer_block_at(height).await
-    }
-
-    async fn fetch_chain_segment(
+    async fn fetch_settled_segment_without_tip_poll(
         &self,
         limits: SourceChainSegmentLimits,
+        range: SettledIndexerRange,
     ) -> Result<SourceChainSegment, SourceError> {
-        let observed_tip_id = self.control_plane.tip_id().await?;
+        let (blocks, stats) = match self
+            .fetch_indexer_block_range(
+                range.start_height,
+                range.end_height,
+                limits.max_response_bytes,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error)
+                if matches!(
+                    error,
+                    SourceError::BlockUnavailable { .. }
+                        | SourceError::HistoricalBlockBodyUnavailable { .. }
+                ) =>
+            {
+                let observed_tip_id = self.control_plane.tip_id().await?;
+                if observed_tip_id.height < range.end_height {
+                    return self
+                        .fetch_chain_segment_from_observed_tip(limits, observed_tip_id)
+                        .await;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if let (Some(expected_parent_id), Some(first_block)) =
+            (range.expected_parent_id, blocks.first())
+            && first_block.parent_hash != expected_parent_id.hash
+        {
+            let _observed_tip_id = self.control_plane.tip_id().await?;
+            return Ok(SourceChainSegment::new([
+                SourceChainUpdate::reverted_block(expected_parent_id),
+            ]));
+        }
+        if let Err(error) = validate_source_block_links(&blocks) {
+            let _observed_tip_id = self.control_plane.tip_id().await?;
+            return Err(error);
+        }
+        Ok(SourceChainSegment::connected_blocks_with_stats(
+            blocks, stats,
+        ))
+    }
+
+    async fn fetch_chain_segment_from_observed_tip(
+        &self,
+        limits: SourceChainSegmentLimits,
+        observed_tip_id: BlockId,
+    ) -> Result<SourceChainSegment, SourceError> {
         let (start_height, expected_parent_id) = match limits.cursor.position() {
             SourceChainCursorPosition::BeforeHeight(height) => (height, None),
             SourceChainCursorPosition::AtBlock(block_id) => {
@@ -220,16 +344,9 @@ impl NodeSource for ZebraIndexerBlockSource {
                 .saturating_add(limits.max_connected_blocks.get().saturating_sub(1))
                 .min(observed_tip_id.height.value()),
         );
-        let mut in_flight = FuturesUnordered::new();
-        for height_value in start_height.value()..=end_height.value() {
-            let height = BlockHeight::new(height_value);
-            in_flight.push(async move { (height, self.fetch_indexer_block_at(height).await) });
-        }
-        let mut blocks_by_height = BTreeMap::new();
-        while let Some((height, outcome)) = in_flight.next().await {
-            blocks_by_height.insert(height.value(), outcome?);
-        }
-        let blocks = blocks_by_height.into_values().collect::<Vec<_>>();
+        let (blocks, stats) = self
+            .fetch_indexer_block_range(start_height, end_height, limits.max_response_bytes)
+            .await?;
         if let (Some(expected_parent_id), Some(first_block)) = (expected_parent_id, blocks.first())
             && first_block.parent_hash != expected_parent_id.hash
         {
@@ -238,23 +355,57 @@ impl NodeSource for ZebraIndexerBlockSource {
             ]));
         }
         validate_source_block_links(&blocks)?;
-        let response_payload_bytes = blocks.iter().fold(0_u64, |bytes, block| {
-            bytes.saturating_add(u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX))
-        });
-        if blocks.iter().any(|block| {
-            u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX)
-                > limits.max_response_bytes
-        }) {
-            return Err(SourceError::SourceResponseTooLarge {
-                operation: "indexer_get_block_segment",
-                max_response_bytes: limits.max_response_bytes,
-            });
-        }
-        let stats = SourceChainSegmentStats::from_response_payload_bytes(response_payload_bytes)
-            .with_connected_blocks(blocks.len());
         Ok(SourceChainSegment::connected_blocks_with_stats(
             blocks, stats,
         ))
+    }
+}
+
+impl MempoolSourceFactory for ZebraIndexerBlockSource {
+    fn mempool_source(
+        &self,
+        admission_limits: MempoolSourceAdmissionLimits,
+    ) -> Arc<dyn MempoolSource> {
+        self.control_plane.mempool_source(admission_limits)
+    }
+}
+
+#[async_trait]
+impl NodeSource for ZebraIndexerBlockSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        self.control_plane.capabilities()
+    }
+
+    async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
+        self.control_plane.probe_capabilities().await
+    }
+
+    async fn fetch_network_upgrade_activations(
+        &self,
+    ) -> Result<NetworkUpgradeActivations, SourceError> {
+        self.control_plane.fetch_network_upgrade_activations().await
+    }
+
+    async fn fetch_storage_mode(&self) -> Result<NodeStorageMode, SourceError> {
+        self.control_plane.fetch_storage_mode().await
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        self.fetch_indexer_block_at(height).await
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        if let Some(range) = settled_indexer_segment_bounds_without_tip_poll(limits) {
+            return self
+                .fetch_settled_segment_without_tip_poll(limits, range)
+                .await;
+        }
+        let observed_tip_id = self.control_plane.tip_id().await?;
+        self.fetch_chain_segment_from_observed_tip(limits, observed_tip_id)
+            .await
     }
 
     async fn fetch_chain_checkpoint(
@@ -279,6 +430,10 @@ impl NodeSource for ZebraIndexerBlockSource {
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
         self.control_plane.tip_id().await
+    }
+
+    async fn probe_tip_id(&self) -> Result<BlockId, SourceError> {
+        self.control_plane.probe_tip_id().await
     }
 
     async fn fetch_subtree_roots(
@@ -315,6 +470,36 @@ impl NodeSource for ZebraIndexerBlockSource {
     async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
         self.control_plane.poll_upstream_health().await
     }
+}
+
+#[derive(Clone, Copy)]
+struct SettledIndexerRange {
+    start_height: BlockHeight,
+    expected_parent_id: Option<BlockId>,
+    end_height: BlockHeight,
+}
+
+fn settled_indexer_segment_bounds_without_tip_poll(
+    limits: SourceChainSegmentLimits,
+) -> Option<SettledIndexerRange> {
+    let known_tip = limits.known_tip?;
+    let (start_height, expected_parent_id) = match limits.cursor.position() {
+        SourceChainCursorPosition::BeforeHeight(height) => (height, None),
+        SourceChainCursorPosition::AtBlock(block_id) => (block_id.height.next()?, Some(block_id)),
+    };
+    let settled_upper_bound =
+        known_tip.settled_upper_bound_below_window(start_height, limits.max_connected_blocks)?;
+    let end_height = BlockHeight::new(
+        start_height
+            .value()
+            .saturating_add(limits.max_connected_blocks.get().saturating_sub(1))
+            .min(settled_upper_bound.value()),
+    );
+    Some(SettledIndexerRange {
+        start_height,
+        expected_parent_id,
+        end_height,
+    })
 }
 
 struct ActiveUnaryRequest {

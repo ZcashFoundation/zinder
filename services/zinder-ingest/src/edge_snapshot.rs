@@ -25,7 +25,10 @@ use zinder_store::{
     },
 };
 
-use crate::{IngestConfigError, IngestConfigOverrides, config, zebra_json_rpc_source_for_target};
+use crate::{
+    IngestConfigError, IngestConfigOverrides, config, ingest_node_endpoint_for_target,
+    validate_indexer_endpoint,
+};
 
 #[derive(Subcommand)]
 pub(crate) enum SnapshotCommand {
@@ -101,7 +104,8 @@ pub(crate) async fn run(
     overrides: IngestConfigOverrides,
 ) -> Result<(), SnapshotCommandError> {
     let runtime = config::load_ingest_config(config_path, overrides)?.runtime_config;
-    let validator = zebra_json_rpc_source_for_target(runtime.node_source, &runtime.node)?;
+    validate_indexer_endpoint(runtime.node_source, "node", &runtime.node)?;
+    let validator = ingest_node_endpoint_for_target(runtime.node_source, &runtime.node)?;
     let activations = validator.fetch_network_upgrade_activations().await?;
     if activations.network() != runtime.node.network {
         return Err(SnapshotCommandError::Refused("validator network mismatch"));

@@ -270,6 +270,13 @@ lists what must stay private.
 
 ## Optional pieces
 
+- **Binary indexer block source.** When your node exposes Zebra's indexer
+  gRPC listener (`node.indexer_grpc_addr`), setting
+  `ingest.source = "zebra-indexer-grpc"` (or `ZINDER_INGEST__SOURCE=zebra-indexer-grpc`)
+  switches historical block fetches from hex JSON-RPC batches to binary unary
+  `GetBlock` RPCs. Keep `node.json_rpc_addr` configured as well (and
+  `indexer_grpc_addr` set on every `[node_fallbacks.N]` entry), because tip,
+  tree-state, subtree-root, and health control-plane reads continue using JSON-RPC.
 - **Fallback nodes.** Ingest can switch to a second node when the first stops
   answering, and broadcasts move to the next node. See
   [Fail over to a second node](deploying-on-a-vm.md#fail-over-to-a-second-node)

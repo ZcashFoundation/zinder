@@ -12,6 +12,7 @@ use zinder_runtime::ConfigError;
 pub(crate) fn parse_node_source(node_source: &str) -> Result<NodeSourceKind, IngestError> {
     match node_source {
         "zebra-json-rpc" => Ok(NodeSourceKind::ZebraJsonRpc),
+        "zebra-indexer-grpc" => Ok(NodeSourceKind::ZebraIndexerGrpc),
         _ => Err(IngestError::UnknownNodeSource {
             node_source: node_source.to_owned(),
         }),

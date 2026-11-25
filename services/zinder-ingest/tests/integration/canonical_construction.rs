@@ -2006,3 +2006,347 @@ async fn every_block_construction_with_dense_and_multi_pool_commitments_matches_
     }
     Ok(())
 }
+
+mod indexer_parity {
+    use std::{collections::HashMap, num::NonZeroU32, pin::Pin, sync::Arc, time::Duration};
+
+    use futures_util::Stream;
+    use serde_json::{Value, json};
+    use tonic::{Request, Response, Status, transport::Server};
+    use zinder_core::{
+        BlockHeight, CommitmentTreeCheckpoint, CommitmentTreeFrontier, Network,
+        NetworkUpgradeActivations, wire::encode_rpc_block_hash_hex,
+    };
+    use zinder_ingest::{CanonicalWriterConfig, admit_canonical_store};
+    use zinder_proto::external::zebra_indexer_rpc::{
+        BlockAndHash, BlockHashAndHeight, BlockRequest, Empty, MempoolChangeMessage,
+        NonFinalizedStateChangeRequest,
+        indexer_server::{Indexer, IndexerServer},
+    };
+    use zinder_runtime::{ComposedReadiness, Readiness};
+    use zinder_source::{
+        NodeAuth, NodeSource, NodeTarget, SourceBlock, ZebraIndexerBlockSource, ZebraJsonRpcSource,
+        ZebraJsonRpcSourceOptions,
+    };
+    use zinder_store::{RocksDbCanonicalStore, TreeStateCheckpointSelection};
+    use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
+
+    use crate::common::construction_fixture::{
+        MultiBlockConstructionSource, multi_block_writer_config,
+    };
+
+    type ChainTipStream =
+        Pin<Box<dyn Stream<Item = Result<BlockHashAndHeight, Status>> + Send + 'static>>;
+    type BlockStream = Pin<Box<dyn Stream<Item = Result<BlockAndHash, Status>> + Send + 'static>>;
+    type MempoolStream =
+        Pin<Box<dyn Stream<Item = Result<MempoolChangeMessage, Status>> + Send + 'static>>;
+
+    #[derive(Clone)]
+    struct ParityIndexerService {
+        blocks_by_height: Arc<HashMap<u32, BlockAndHash>>,
+    }
+
+    #[tonic::async_trait]
+    impl Indexer for ParityIndexerService {
+        type ChainTipChangeStream = ChainTipStream;
+        type NonFinalizedStateChangeStream = BlockStream;
+        type MempoolChangeStream = MempoolStream;
+
+        async fn chain_tip_change(
+            &self,
+            _request: Request<Empty>,
+        ) -> Result<Response<Self::ChainTipChangeStream>, Status> {
+            Err(Status::unimplemented("parity server serves only GetBlock"))
+        }
+
+        async fn non_finalized_state_change(
+            &self,
+            _request: Request<NonFinalizedStateChangeRequest>,
+        ) -> Result<Response<Self::NonFinalizedStateChangeStream>, Status> {
+            Err(Status::unimplemented("parity server serves only GetBlock"))
+        }
+
+        async fn mempool_change(
+            &self,
+            _request: Request<Empty>,
+        ) -> Result<Response<Self::MempoolChangeStream>, Status> {
+            Err(Status::unimplemented("parity server serves only GetBlock"))
+        }
+
+        async fn get_block(
+            &self,
+            request: Request<BlockRequest>,
+        ) -> Result<Response<BlockAndHash>, Status> {
+            let key = request.into_inner().hash_or_height;
+            if key.len() != 4 {
+                return Err(Status::invalid_argument("expected 4-byte height"));
+            }
+            let height = u32::from_be_bytes([key[0], key[1], key[2], key[3]]);
+            self.blocks_by_height
+                .get(&height)
+                .cloned()
+                .map(Response::new)
+                .ok_or_else(|| Status::not_found("block unavailable"))
+        }
+    }
+
+    fn frontier_json(frontier: Option<&CommitmentTreeFrontier>) -> Value {
+        frontier.map_or_else(
+            || json!({"commitments": {}}),
+            |frontier| {
+                json!({
+                    "commitments": {
+                        "finalRoot": hex::encode(frontier.final_root().as_bytes()),
+                        "finalState": hex::encode(frontier.final_state_bytes()),
+                    }
+                })
+            },
+        )
+    }
+
+    fn checkpoint_json(checkpoint: &CommitmentTreeCheckpoint) -> Value {
+        json!({
+            "height": checkpoint.block_id.height.value(),
+            "hash": encode_rpc_block_hash_hex(checkpoint.block_id.hash),
+            "time": checkpoint.block_time_seconds,
+            "sapling": frontier_json(checkpoint.frontiers.sapling()),
+            "orchard": frontier_json(checkpoint.frontiers.orchard()),
+            "ironwood": frontier_json(checkpoint.frontiers.ironwood()),
+        })
+    }
+
+    pub(super) struct ParityFixture {
+        pub(super) tip_height: u32,
+        pub(super) tip_json: Value,
+        pub(super) block_hex_by_height: Arc<HashMap<String, String>>,
+        pub(super) checkpoints_by_key: Arc<HashMap<String, Value>>,
+        pub(super) grpc_blocks: Arc<HashMap<u32, BlockAndHash>>,
+    }
+
+    pub(super) async fn build_parity_fixture(
+        tip_height: u32,
+        activations: &Arc<NetworkUpgradeActivations>,
+    ) -> Result<ParityFixture, Box<dyn std::error::Error>> {
+        let chain_source = MultiBlockConstructionSource::build(tip_height, activations)?;
+        let tip = chain_source.tip_id().await?;
+        let mut block_hex_by_height = HashMap::new();
+        let mut checkpoints_by_key = HashMap::new();
+        let mut grpc_blocks = HashMap::new();
+        for height_num in 0..=tip_height {
+            let height = BlockHeight::new(height_num);
+            let checkpoint = chain_source
+                .fetch_chain_checkpoint(height, activations)
+                .await?;
+            let checkpoint_payload = checkpoint_json(&checkpoint);
+            checkpoints_by_key.insert(height_num.to_string(), checkpoint_payload.clone());
+            checkpoints_by_key.insert(
+                encode_rpc_block_hash_hex(checkpoint.block_id.hash),
+                checkpoint_payload,
+            );
+            if height_num > 0 {
+                let source_block: SourceBlock = chain_source.fetch_block_at(height).await?;
+                let hash_bytes = hex::decode(encode_rpc_block_hash_hex(source_block.hash))?;
+                block_hex_by_height.insert(
+                    height_num.to_string(),
+                    hex::encode(&source_block.raw_block_bytes),
+                );
+                grpc_blocks.insert(
+                    height_num,
+                    BlockAndHash {
+                        hash: hash_bytes,
+                        data: source_block.raw_block_bytes,
+                    },
+                );
+            }
+        }
+        Ok(ParityFixture {
+            tip_height,
+            tip_json: json!({
+                "height": tip.height.value(),
+                "hash": tip.hash.as_bytes(),
+            }),
+            block_hex_by_height: Arc::new(block_hex_by_height),
+            checkpoints_by_key: Arc::new(checkpoints_by_key),
+            grpc_blocks: Arc::new(grpc_blocks),
+        })
+    }
+
+    pub(super) fn parity_writer_config(
+        path: std::path::PathBuf,
+        activations: Arc<NetworkUpgradeActivations>,
+    ) -> Result<CanonicalWriterConfig, Box<dyn std::error::Error>> {
+        let mut config = multi_block_writer_config(path, activations, true);
+        config.checkpoint_height = Some(BlockHeight::new(1));
+        config.reorg_window_blocks = 2;
+        config
+            .construction
+            .pipeline_limits
+            .source_segment_max_blocks =
+            NonZeroU32::new(2).ok_or("segment max blocks must be non-zero")?;
+        config
+            .construction
+            .pipeline_limits
+            .source_fetch_max_in_flight_requests =
+            NonZeroU32::new(2).ok_or("in-flight requests must be non-zero")?;
+        config
+            .construction
+            .pipeline_limits
+            .block_prepare_concurrency =
+            NonZeroU32::new(3).ok_or("prepare concurrency must be non-zero")?;
+        config.tree_state_checkpoint_selection = Some(TreeStateCheckpointSelection::EveryBlock);
+        Ok(config)
+    }
+
+    pub(super) async fn start_parity_indexer(
+        grpc_blocks: Arc<HashMap<u32, BlockAndHash>>,
+    ) -> Result<
+        (
+            std::net::SocketAddr,
+            tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let incoming = futures_util::stream::unfold(listener, |listener| async move {
+            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        });
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(IndexerServer::new(ParityIndexerService {
+                    blocks_by_height: grpc_blocks,
+                }))
+                .serve_with_incoming(Box::pin(incoming)),
+        );
+        Ok((address, server))
+    }
+
+    pub(super) fn start_parity_rpc_server(
+        fixture: &ParityFixture,
+        serve_getblock: bool,
+    ) -> Result<JsonRpcTestServer, Box<dyn std::error::Error>> {
+        let tip_json = fixture.tip_json.clone();
+        let checkpoints = Arc::clone(&fixture.checkpoints_by_key);
+        let blocks = Arc::clone(&fixture.block_hex_by_height);
+        let mut stubs = vec![
+            method("getbestblockheightandhash")
+                .reply_with(move |_| RpcReply::result(tip_json.clone())),
+            method("z_gettreestate").reply_with(move |params| {
+                let key = params.get(0).and_then(Value::as_str).unwrap_or_default();
+                checkpoints.get(key).map_or_else(
+                    || RpcReply::error_with_code(-5, "tree state not found"),
+                    |payload| RpcReply::result(payload.clone()),
+                )
+            }),
+        ];
+        if serve_getblock {
+            stubs.push(method("getblock").reply_with(move |params| {
+                let key = params.get(0).and_then(Value::as_str).unwrap_or_default();
+                blocks.get(key).map_or_else(
+                    || RpcReply::error("height out of range"),
+                    |hex_block| RpcReply::result(json!(hex_block)),
+                )
+            }));
+        }
+        JsonRpcTestServer::start(stubs).map_err(Into::into)
+    }
+
+    pub(super) async fn construct_with_rpc(
+        fixture: &ParityFixture,
+        activations: &Arc<NetworkUpgradeActivations>,
+        path: std::path::PathBuf,
+    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+        let rpc_server = start_parity_rpc_server(fixture, true)?;
+        let rpc_source = ZebraJsonRpcSource::with_options(
+            Network::ZcashRegtest,
+            rpc_server.url(),
+            NodeAuth::None,
+            ZebraJsonRpcSourceOptions::default(),
+        )?;
+        let config = parity_writer_config(path, Arc::clone(activations))?;
+        let store = admit_canonical_store(
+            &rpc_source,
+            Arc::clone(activations),
+            &config,
+            &ComposedReadiness::new(Readiness::default(), &[]),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+        Ok(store)
+    }
+
+    pub(super) async fn construct_with_indexer(
+        fixture: &ParityFixture,
+        activations: &Arc<NetworkUpgradeActivations>,
+        path: std::path::PathBuf,
+    ) -> Result<(RocksDbCanonicalStore, JsonRpcTestServer), Box<dyn std::error::Error>> {
+        let (grpc_addr, grpc_server) =
+            start_parity_indexer(Arc::clone(&fixture.grpc_blocks)).await?;
+        let control_plane = start_parity_rpc_server(fixture, false)?;
+        let target = NodeTarget::new(
+            Network::ZcashRegtest,
+            control_plane.url(),
+            NodeAuth::None,
+            Duration::from_secs(5),
+            std::num::NonZeroU64::new(64 * 1_024 * 1_024).unwrap_or(std::num::NonZeroU64::MIN),
+        )
+        .with_indexer_grpc_addr(Some(format!("http://{grpc_addr}")));
+        let indexer_source = ZebraIndexerBlockSource::from_node_target_lazy(&target)?;
+        let config = parity_writer_config(path, Arc::clone(activations))?;
+        let outcome = admit_canonical_store(
+            &indexer_source,
+            Arc::clone(activations),
+            &config,
+            &ComposedReadiness::new(Readiness::default(), &[]),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        grpc_server.abort();
+        Ok((outcome?, control_plane))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indexer_and_json_rpc_sources_construct_identical_canonical_stores()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let fixture = indexer_parity::build_parity_fixture(10, &activations).await?;
+    let rpc_dir = TempDir::new()?;
+    let indexer_dir = TempDir::new()?;
+
+    let rpc_store = indexer_parity::construct_with_rpc(
+        &fixture,
+        &activations,
+        rpc_dir.path().join("canonical"),
+    )
+    .await?;
+    let (indexer_store, control_plane) = Box::pin(indexer_parity::construct_with_indexer(
+        &fixture,
+        &activations,
+        indexer_dir.path().join("canonical"),
+    ))
+    .await?;
+
+    assert_eq!(rpc_store.event_fence(), indexer_store.event_fence());
+    assert_eq!(rpc_store.history_bounds(), indexer_store.history_bounds());
+    for height_num in 0..=fixture.tip_height {
+        let height = BlockHeight::new(height_num);
+        assert_eq!(
+            rpc_store.tree_state_checkpoint_at(height, &activations)?,
+            indexer_store.tree_state_checkpoint_at(height, &activations)?,
+            "checkpoint mismatch at height {height_num}"
+        );
+    }
+    assert!(
+        control_plane.requests_for("getblock")?.is_empty(),
+        "indexer source must never fetch blocks through JSON-RPC getblock"
+    );
+    let tip_polls = control_plane
+        .requests_for("getbestblockheightandhash")?
+        .len();
+    assert!(
+        tip_polls <= 5,
+        "expected O(1) tip polls during 10-block settled construction, observed {tip_polls}"
+    );
+    Ok(())
+}
