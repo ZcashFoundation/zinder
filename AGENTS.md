@@ -18,7 +18,7 @@ Project 7 uses these delivery fields:
 
 - Priority: `P0 Now`, `P1 Next`, `P2 Later`, `P3 Backlog`, `Epic`.
 - Track: `Wallet adoption`, `Single-host production`, `Query scalability`, `PostgreSQL topology`, `Explorer`, `Release engineering`.
-- Milestones: M0 Consumer adoption, M1 v0.6.x reliability, M2 Operator-ready RocksDB, M3 Horizontal topology, and M4 Explorer. A milestone is an exit gate, not merely a topic label.
+- Milestones: M0 Consumer adoption, M1 Core reliability, M2 Operator-ready RocksDB, M3 Horizontal topology, and M4 Explorer. A milestone is an exit gate, not merely a topic label.
 
 Wallet compatibility evidence and production-topology qualification are separate claims. The supported candidate remains `rocksdb` until release-specific capacity, recovery, replacement, and operator evidence admit another topology. ADR-0004 records `postgres` as the decided topology for hosted fleets. It is not implemented, certified, or advertised, and PostgreSQL tracer or benchmark work remains diagnostic and non-production until the ADR-0004 benchmark gate passes and a slice ships.
 

@@ -74,6 +74,7 @@ how each kind of client connects. A Rust application can start from its
 - [Releasing](runbooks/releasing.md)
 - [Capturing node fixtures](runbooks/capturing-node-fixtures.md)
 - [Restoring the Mainnet benchmark fixture](runbooks/mainnet-benchmark-fixture.md)
+- [Compare wallet reader performance](runbooks/wallet-performance-qualification.md)
 - [Cipherscan adapter verification](runbooks/cipherscan-adapter-verification.md)
 
 ## Keeping the documentation useful
