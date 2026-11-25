@@ -416,6 +416,8 @@ struct ChunkWindow {
     chunks: Vec<BlockHeightRange>,
     max_in_flight: usize,
     stop_flag: AtomicBool,
+    #[cfg(test)]
+    panic_on_chunk: std::sync::atomic::AtomicUsize,
     state: Mutex<ChunkWindowState>,
     available: Condvar,
 }
@@ -426,6 +428,10 @@ impl ChunkWindow {
             chunks,
             max_in_flight: max_in_flight.max(1),
             stop_flag: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_on_chunk: std::sync::atomic::AtomicUsize::new(
+                NEXT_WINDOW_PANIC_CHUNK.take().unwrap_or(usize::MAX),
+            ),
             state: Mutex::new(ChunkWindowState {
                 next_to_claim: 0,
                 next_to_verify: 0,
@@ -473,23 +479,43 @@ thread_local! {
     /// on this thread returns a refused-thread error.
     static REFUSED_CANONICAL_SCAN_THREAD: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+
+    /// Test-only one-shot arming slot consumed by [`ChunkWindow::new`] on the
+    /// spawning thread so concurrent tests do not share a process-global hook.
+    static NEXT_WINDOW_PANIC_CHUNK: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
-static PANIC_ON_CANONICAL_SCAN_CHUNK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
+struct PanicChunkArmGuard;
 
 #[cfg(test)]
-#[expect(
-    clippy::panic,
-    reason = "intentional unwind injection for testing worker-panic recovery"
-)]
-fn maybe_inject_worker_unwind(chunk_index: usize) {
-    if PANIC_ON_CANONICAL_SCAN_CHUNK
-        .compare_exchange(chunk_index, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        panic!("injected canonical scan worker unwind on chunk {chunk_index}");
+impl Drop for PanicChunkArmGuard {
+    fn drop(&mut self) {
+        NEXT_WINDOW_PANIC_CHUNK.set(None);
+    }
+}
+
+#[cfg(test)]
+fn arm_next_window_panic_chunk(chunk_index: usize) -> PanicChunkArmGuard {
+    NEXT_WINDOW_PANIC_CHUNK.set(Some(chunk_index));
+    PanicChunkArmGuard
+}
+
+#[cfg(test)]
+impl ChunkWindow {
+    #[expect(
+        clippy::panic,
+        reason = "intentional unwind injection for testing worker-panic recovery"
+    )]
+    fn maybe_inject_worker_unwind(&self, chunk_index: usize) {
+        if self
+            .panic_on_chunk
+            .compare_exchange(chunk_index, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            panic!("injected canonical scan worker unwind on chunk {chunk_index}");
+        }
     }
 }
 
@@ -903,7 +929,7 @@ fn scan_worker_chunks<'sorter>(
     let _stop_on_unwind = StopWindowOnUnwind(window);
     while let Some((chunk_index, range)) = window.claim_next() {
         #[cfg(test)]
-        maybe_inject_worker_unwind(chunk_index);
+        window.maybe_inject_worker_unwind(chunk_index);
         let outcome = scan_one_settled_chunk(slice_source, window, chunk_index, range, &mut shard);
         let failed = outcome.is_err();
         if failed {
@@ -2960,9 +2986,8 @@ mod tests {
         config.supported_reorg_depth = 5;
         config.accumulator_hashing_workers = NonZeroU32::new(2).ok_or("zero")?;
         config.scan_chunk_blocks = NonZeroU32::MIN;
-        PANIC_ON_CANONICAL_SCAN_CHUNK.store(0, Ordering::Release);
+        let _panic_guard = arm_next_window_panic_chunk(0);
         let outcome = write_projection_ssts_from_source(config, &canonical);
-        PANIC_ON_CANONICAL_SCAN_CHUNK.store(usize::MAX, Ordering::Release);
         assert!(
             matches!(outcome, Err(RocksDbWalletError::CanonicalScanWorkerStopped)),
             "expected CanonicalScanWorkerStopped after worker unwind, got {:?}",

@@ -1048,7 +1048,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::canonical_store::live_replacement_tests::published_store;
+    use crate::canonical_store::live_replacement_tests::{canonical_block, published_store};
 
     #[test]
     fn incremental_replay_range_enforces_the_exact_span_limit() {
@@ -1163,6 +1163,169 @@ mod tests {
                 [0xdd; 32],
             );
         assert!(slice_source.verify_complete_sequence(bad_digest).is_err());
+        Ok(())
+    }
+
+    fn exhaust_slice(
+        slice_source: &CanonicalReplaySliceSource<'_>,
+        range: BlockHeightRange,
+    ) -> Result<usize, CanonicalStoreError> {
+        let mut observed = 0usize;
+        for replay in slice_source.scan_slice(range)? {
+            replay?;
+            observed += 1;
+        }
+        Ok(observed)
+    }
+
+    fn collect_slices(
+        slice_source: &CanonicalReplaySliceSource<'_>,
+        slices: &[BlockHeightRange],
+    ) -> Result<ObservedCanonicalReplaySequence, Box<dyn std::error::Error>> {
+        let mut sequence_digest = CanonicalBlockFactsSequenceDigestBuilder::new(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+        );
+        let mut first_block = None;
+        let mut tip = None;
+        let mut block_count = 0u64;
+        for &range in slices {
+            for replay in slice_source.scan_slice(range)? {
+                let replay = replay?;
+                sequence_digest.try_append(replay.reference_digest())?;
+                let header = &replay.facts().block_header;
+                let block_id = BlockId::new(header.height, header.block_hash);
+                if first_block.is_none() {
+                    first_block = Some(block_id);
+                }
+                tip = Some(block_id);
+                block_count += 1;
+            }
+        }
+        Ok(ObservedCanonicalReplaySequence {
+            first_block: first_block.ok_or("missing first block")?,
+            tip: tip.ok_or("missing tip block")?,
+            block_count,
+            sequence_digest: sequence_digest.finish(),
+        })
+    }
+
+    #[test]
+    fn replay_slice_source_rejects_deleted_and_detached_stored_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let slice_1_3 = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
+
+        let missing_internal = published_store(
+            &temporary.path().join("missing-internal"),
+            2,
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+        )?;
+        let internal_cf = missing_internal
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+            .ok_or("missing block_replay column family")?;
+        missing_internal.bounded_open.db.delete_cf(
+            &internal_cf,
+            encode_height_key_ascending(BlockHeight::new(2)),
+        )?;
+        assert!(matches!(
+            exhaust_slice(&missing_internal.canonical_replay_slice_source(), slice_1_3),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+
+        let missing_final = published_store(
+            &temporary.path().join("missing-final"),
+            2,
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+        )?;
+        let final_cf = missing_final
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+            .ok_or("missing block_replay column family")?;
+        missing_final
+            .bounded_open
+            .db
+            .delete_cf(&final_cf, encode_height_key_ascending(BlockHeight::new(3)))?;
+        assert!(matches!(
+            exhaust_slice(&missing_final.canonical_replay_slice_source(), slice_1_3),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+
+        let detached = published_store(
+            &temporary.path().join("detached-parent"),
+            2,
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+        )?;
+        let mut wrong_parent = detached
+            .ready_evidence()
+            .first_retained_block
+            .hash
+            .as_bytes();
+        wrong_parent[0] ^= 0xff;
+        let replacement = canonical_block(BlockHeight::new(2), [0x22; 32], wrong_parent, 2);
+        let detached_cf = detached
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+            .ok_or("missing block_replay column family")?;
+        detached.bounded_open.db.put_cf(
+            &detached_cf,
+            encode_height_key_ascending(BlockHeight::new(2)),
+            replacement.replay_envelope.as_bytes(),
+        )?;
+        assert!(matches!(
+            exhaust_slice(&detached.canonical_replay_slice_source(), slice_1_3),
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_slice_source_rejects_trailing_row_beyond_ready_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store = published_store(
+            &temporary.path().join("trailing-fence"),
+            2,
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+        )?;
+        let ready = store.ready_evidence();
+        let trailing = canonical_block(
+            BlockHeight::new(9),
+            [0x99; 32],
+            ready.visible_tip.hash.as_bytes(),
+            9,
+        );
+        let replay_cf = store
+            .bounded_open
+            .db
+            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+            .ok_or("missing block_replay column family")?;
+        store.bounded_open.db.put_cf(
+            &replay_cf,
+            encode_height_key_ascending(BlockHeight::new(9)),
+            trailing.replay_envelope.as_bytes(),
+        )?;
+
+        let slices = [
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3)),
+            BlockHeightRange::inclusive(BlockHeight::new(4), BlockHeight::new(6)),
+            BlockHeightRange::inclusive(BlockHeight::new(7), BlockHeight::new(8)),
+        ];
+        let slice_source = store.canonical_replay_slice_source();
+        let observed = collect_slices(&slice_source, &slices)?;
+        let outcome = slice_source.verify_complete_sequence(observed);
+        assert!(matches!(
+            outcome,
+            Err(CanonicalStoreError::BlockReplaySequenceInvalid { ref reason })
+                if reason.contains("beyond the visible fence")
+        ));
         Ok(())
     }
 }
