@@ -31,6 +31,11 @@ const MAX_BLOCK_BYTES_U32: u32 = 16 * 1024 * 1024;
 const _: () = assert!(
     (SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS as u64) * (MAX_BLOCK_BYTES_U32 as u64) <= u32::MAX as u64
 );
+const _: () = assert!(
+    (SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS as u64) * (MAX_BLOCK_BYTES_U32 as u64)
+        + (((SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS as u64) * (MAX_BLOCK_BYTES_U32 as u64)) >> 8)
+        <= u32::MAX as u64
+);
 const _: () = assert!(MAX_BLOCK_BYTES_U32 as usize == SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES);
 
 /// Fixed 128-byte header of one `ZSTSUP01` segment.
@@ -229,6 +234,24 @@ pub(super) fn max_chunk_bytes(chunk_blocks: u16) -> Result<u32, SettledSupplemen
         .ok_or_else(|| {
             SettledSupplementSegmentError::InvalidFormat("chunk byte limit overflow".to_owned())
         })
+}
+
+pub(super) fn max_compressed_chunk_bytes(
+    chunk_blocks: u16,
+    codec: SupplementCompressionCodec,
+) -> Result<u32, SettledSupplementSegmentError> {
+    let uncompressed_limit = max_chunk_bytes(chunk_blocks)?;
+    match codec {
+        SupplementCompressionCodec::None => Ok(uncompressed_limit),
+        // Matches libzstd `ZSTD_COMPRESSBOUND(src_size)` for all `src_size >= 128 KiB`.
+        SupplementCompressionCodec::Zstd => uncompressed_limit
+            .checked_add(uncompressed_limit >> 8)
+            .ok_or_else(|| {
+                SettledSupplementSegmentError::InvalidFormat(
+                    "compressed chunk byte limit overflow".to_owned(),
+                )
+            }),
+    }
 }
 
 /// Decoded 48-byte on-disk chunk index record.

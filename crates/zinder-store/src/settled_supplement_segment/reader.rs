@@ -12,7 +12,8 @@ use super::{
     format::{
         CHUNK_INDEX_ENTRY_LEN, DecodedChunkIndexEntry, DecodedRowIndexEntry, HEADER_LEN,
         IndexedChunk, IndexedSupplementBlock, ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader,
-        TRAILER_LEN, VALIDATION_INVALID, max_chunk_bytes, validate_block_payload_limit,
+        TRAILER_LEN, VALIDATION_INVALID, max_chunk_bytes, max_compressed_chunk_bytes,
+        validate_block_payload_limit,
     },
     section::{
         BlockEnvelopeIdentity, BlockSupplementRecord, CanonicalBlockSupplement,
@@ -976,19 +977,20 @@ fn validate_chunk_entries(
     codec: SupplementCompressionCodec,
     chunks: &[IndexedChunk],
 ) -> Result<(), SettledSupplementSegmentError> {
-    let chunk_limit = max_chunk_bytes(header.chunk_blocks)?;
+    let uncompressed_limit = max_chunk_bytes(header.chunk_blocks)?;
+    let compressed_limit = max_compressed_chunk_bytes(header.chunk_blocks, codec)?;
     let total_data_len = header.data_len()?;
     let mut expected_rel = 0_u64;
     for (idx, chunk) in chunks.iter().enumerate() {
-        if chunk.compressed_len == 0 || chunk.compressed_len > chunk_limit {
+        if chunk.compressed_len == 0 || chunk.compressed_len > compressed_limit {
             return Err(SettledSupplementSegmentError::InvalidFormat(format!(
-                "supplement chunk {idx} compressed length {} violates bounds [1, {chunk_limit}]",
+                "supplement chunk {idx} compressed length {} violates bounds [1, {compressed_limit}]",
                 chunk.compressed_len
             )));
         }
-        if chunk.uncompressed_len == 0 || chunk.uncompressed_len > chunk_limit {
+        if chunk.uncompressed_len == 0 || chunk.uncompressed_len > uncompressed_limit {
             return Err(SettledSupplementSegmentError::InvalidFormat(format!(
-                "supplement chunk {idx} uncompressed length {} violates bounds [1, {chunk_limit}]",
+                "supplement chunk {idx} uncompressed length {} violates bounds [1, {uncompressed_limit}]",
                 chunk.uncompressed_len
             )));
         }

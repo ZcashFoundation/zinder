@@ -19,20 +19,22 @@ use zinder_core::{
     CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, ConsensusBranchId,
     LockTime, Network, PrivacyShape, SerializedBytesDigest, TransactionComponentCounts,
     TransactionId, TransactionIntrinsicValueBalances, TransactionPublicFacts, TransactionVersion,
+    TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
     UnsupportedSection, Wtxid,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
 
 use super::{
-    SETTLED_SUPPLEMENT_SEGMENT_MAGIC, SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
-    SettledSupplementSegmentError, SettledSupplementSegmentOpenOptions,
-    SettledSupplementSegmentReader, SettledSupplementSegmentWriteOptions,
-    SettledSupplementSegmentWriter, SupplementCompressionCodec, SupplementSegmentIdentity,
+    SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS, SETTLED_SUPPLEMENT_SEGMENT_MAGIC,
+    SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES, SettledSupplementSegmentError,
+    SettledSupplementSegmentOpenOptions, SettledSupplementSegmentReader,
+    SettledSupplementSegmentWriteOptions, SettledSupplementSegmentWriter,
+    SupplementCompressionCodec, SupplementSegmentIdentity,
     format::{
         CHUNK_INDEX_ENTRY_LEN, DecodedChunkIndexEntry, DecodedRowIndexEntry, HEADER_LEN,
         IndexedChunk, IndexedSupplementBlock, ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN,
-        VALIDATION_INVALID, max_chunk_bytes,
+        VALIDATION_INVALID, max_chunk_bytes, max_compressed_chunk_bytes,
     },
     reader::{
         AdmittedHeaderAndIndexBytes, PortablePin, SegmentTables, admit_portable, admit_protected,
@@ -1103,6 +1105,48 @@ fn validate_indices_rejects_oversized_bounds_before_allocation_on_both_paths() -
             SupplementCompressionCodec::None,
             &[synthetic_chunk(100, 200)],
             &[synthetic_row(200)],
+            None,
+        ),
+        Err(SettledSupplementSegmentError::InvalidFormat(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn validate_indices_enforces_codec_specific_compressed_bounds() -> TestOutcome {
+    let _ = max_compressed_chunk_bytes(
+        SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS,
+        SupplementCompressionCodec::Zstd,
+    )?;
+    let uncompressed_single = max_chunk_bytes(1)?;
+    let zstd_single = max_compressed_chunk_bytes(1, SupplementCompressionCodec::Zstd)?;
+    assert!(zstd_single > uncompressed_single);
+    validate_indices(
+        &synthetic_header(1, u64::from(zstd_single)),
+        SupplementCompressionCodec::Zstd,
+        &[synthetic_chunk(zstd_single, uncompressed_single)],
+        &[synthetic_row(uncompressed_single)],
+        None,
+    )?;
+    assert!(matches!(
+        validate_indices(
+            &synthetic_header(1, u64::from(zstd_single) + 1),
+            SupplementCompressionCodec::Zstd,
+            &[synthetic_chunk(zstd_single + 1, uncompressed_single)],
+            &[synthetic_row(uncompressed_single)],
+            None,
+        ),
+        Err(SettledSupplementSegmentError::InvalidFormat(_))
+    ));
+    assert!(matches!(
+        validate_indices(
+            &synthetic_header(1, u64::from(uncompressed_single) + 1),
+            SupplementCompressionCodec::None,
+            &[synthetic_chunk(
+                uncompressed_single + 1,
+                uncompressed_single
+            )],
+            &[synthetic_row(uncompressed_single)],
             None,
         ),
         Err(SettledSupplementSegmentError::InvalidFormat(_))
@@ -3055,5 +3099,275 @@ fn assert_wide_fee_shielded_and_splice_behavior(
             Err(SettledSupplementSegmentError::PayloadIntegrity(_))
         ));
     }
+    Ok(())
+}
+
+fn fill_incompressible_splitmix64(bytes: &mut [u8]) {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    for chunk in bytes.chunks_mut(8) {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let word = z.to_le_bytes();
+        chunk.copy_from_slice(&word[..chunk.len()]);
+    }
+}
+
+fn build_exact_max_incompressible_record(
+    height: BlockHeight,
+    block_hash: BlockHash,
+    prev_hash: BlockHash,
+    block_time: u32,
+) -> TestOutcome<BlockSupplementRecord> {
+    let probe_len = 1_000_000_usize;
+    let mut record = BlockSupplementRecord {
+        transparent_transactions: vec![CompactTransparentSupplementTx {
+            index: 0,
+            transaction_id: det_txid(88),
+            fee_zat: Some(1_000),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: vec![CompactTransparentOutput {
+                value_zat: 50_000,
+                script_pub_key: vec![0_u8; probe_len],
+            }],
+        }],
+        canonical_metadata: None,
+    };
+    let identity = BlockEnvelopeIdentity {
+        height,
+        block_hash_wire: encode_internal_block_hash(block_hash),
+        prev_hash_wire: encode_internal_block_hash(prev_hash),
+        block_time,
+    };
+    let (probe_encoded, _) = encode_block_record(identity, &record)?;
+    let target_script_len =
+        probe_len + (SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES - probe_encoded.len());
+    let mut script = vec![0_u8; target_script_len];
+    fill_incompressible_splitmix64(&mut script);
+    record.transparent_transactions[0].transparent_outputs[0].script_pub_key = script;
+    let (final_encoded, _) = encode_block_record(identity, &record)?;
+    assert_eq!(
+        final_encoded.len(),
+        SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES
+    );
+    Ok(record)
+}
+
+#[test]
+fn near_limit_incompressible_record_roundtrips_with_single_block_zstd_chunk() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let height = BlockHeight::new(600);
+    let end_id = BlockId::new(height, det_block_hash(600));
+    let prev_hash = det_block_hash(599);
+    let block_time = 1_735_000_600;
+    let record = build_exact_max_incompressible_record(height, end_id.hash, prev_hash, block_time)?;
+
+    let seg_path = dir.path().join("incompressible-16mib.zstsup01");
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &seg_path,
+        SupplementSegmentIdentity::span(Network::ZcashMainnet, 1, height, end_id),
+        SettledSupplementSegmentWriteOptions {
+            codec: SupplementCompressionCodec::Zstd,
+            chunk_blocks: 1,
+        },
+    )?;
+    writer.push_record(end_id, prev_hash, block_time, &record)?;
+    let id = writer.finish()?;
+
+    let file = File::open(&seg_path)?;
+    let mut header_bytes = [0_u8; HEADER_LEN];
+    file.take(u64::try_from(HEADER_LEN)?)
+        .read_exact(&mut header_bytes)?;
+    let header = SegmentHeader::decode(&header_bytes)?;
+    let file = File::open(&seg_path)?;
+    let decoded = read_indexes_and_trailer(&file, &header)?;
+    assert_eq!(decoded.chunks.len(), 1);
+    assert_eq!(decoded.chunks[0].uncompressed_len, max_chunk_bytes(1)?);
+    assert!(decoded.chunks[0].compressed_len > max_chunk_bytes(1)?);
+    assert!(
+        decoded.chunks[0].compressed_len
+            <= max_compressed_chunk_bytes(1, SupplementCompressionCodec::Zstd)?
+    );
+
+    let reader = SettledSupplementSegmentReader::open(
+        &seg_path,
+        &id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    assert_eq!(reader.read_block(height)?, record);
+    Ok(())
+}
+
+fn synthetic_tx_facts_with_scripts(
+    block_height: BlockHeight,
+    pos: u8,
+    counts: TransactionComponentCounts,
+    transparent_inputs: Vec<TransparentInputFact>,
+    output_script_lens: &[usize],
+) -> CanonicalTransactionFacts {
+    let transparent_outputs = output_script_lens
+        .iter()
+        .enumerate()
+        .map(|(idx, &len)| {
+            let script = vec![0x51_u8.wrapping_add(pos); len];
+            let script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+            TransparentOutputFact::new(u32::try_from(idx).unwrap_or(0), 10_000, script, script_hash)
+        })
+        .collect();
+    CanonicalTransactionFacts {
+        public_facts: TransactionPublicFacts {
+            transaction_id: det_txid(pos),
+            auth_digest: None,
+            wtxid: None,
+            version: TransactionVersion::V5,
+            consensus_branch_id: Some(ConsensusBranchId::new(0xC2D6_D0B4)),
+            lock_time: LockTime::Height(block_height),
+            expiry_height: None,
+            size_bytes: 512,
+            counts,
+            orchard_value_balance_zat: None,
+            orchard_anchor: None,
+            ironwood_value_balance_zat: None,
+            privacy_shape: PrivacyShape::Mixed,
+            is_coinbase: false,
+            unsupported_sections: Vec::new(),
+        },
+        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[pos; 8]),
+        intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+        transparent_inputs,
+        transparent_outputs,
+    }
+}
+
+fn zip317_regression_facts(height: BlockHeight) -> CanonicalBlockFacts {
+    let p2pkh_only = TransactionComponentCounts {
+        transparent_output_count: 1,
+        ..TransactionComponentCounts::EMPTY
+    };
+    let large_script_with_orchard = TransactionComponentCounts {
+        transparent_output_count: 1,
+        orchard_action_count: 1,
+        ..TransactionComponentCounts::EMPTY
+    };
+    let varint3_script_with_sprout = TransactionComponentCounts {
+        transparent_output_count: 1,
+        sprout_joinsplit_count: 1,
+        ..TransactionComponentCounts::EMPTY
+    };
+    let unknown_vin_size = TransactionComponentCounts {
+        transparent_input_count: 1,
+        transparent_output_count: 1,
+        ..TransactionComponentCounts::EMPTY
+    };
+    CanonicalBlockFacts {
+        block_header: BlockHeaderArtifact::new(
+            height,
+            det_block_hash(height.value()),
+            det_block_hash(height.value() - 1),
+            [0xAA; 32],
+            [0xBB; 32],
+            1_735_000_610,
+            0x1d00_ffff,
+            [0xCC; 32],
+            1,
+            1_024,
+        ),
+        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[0x77; 8]),
+        transactions: vec![
+            synthetic_tx_facts_with_scripts(height, 1, p2pkh_only, Vec::new(), &[25]),
+            synthetic_tx_facts_with_scripts(
+                height,
+                2,
+                large_script_with_orchard,
+                Vec::new(),
+                &[100],
+            ),
+            synthetic_tx_facts_with_scripts(
+                height,
+                3,
+                varint3_script_with_sprout,
+                Vec::new(),
+                &[253],
+            ),
+            synthetic_tx_facts_with_scripts(
+                height,
+                4,
+                unknown_vin_size,
+                vec![TransparentInputFact::new(
+                    0,
+                    TransparentOutPoint::new(det_txid(99), 0),
+                )],
+                &[25],
+            ),
+        ],
+    }
+}
+
+#[test]
+fn tag2_zip317_logical_actions_uses_serialized_output_sizes_and_omits_unknown_vin_sizes()
+-> TestOutcome {
+    let dir = TempDir::new()?;
+    let height = BlockHeight::new(610);
+    let facts = zip317_regression_facts(height);
+    let mut meta = CanonicalBlockSupplement::from_canonical_facts(&facts, None)?;
+    assert_eq!(meta.transactions[0].zip317_logical_actions, Some(1));
+    assert_eq!(meta.transactions[1].zip317_logical_actions, Some(5));
+    assert_ne!(
+        meta.transactions[1].zip317_logical_actions,
+        Some(facts.transactions[1].public_facts.counts.logical_actions())
+    );
+    assert_eq!(meta.transactions[2].zip317_logical_actions, Some(10));
+    assert_eq!(meta.transactions[3].zip317_logical_actions, None);
+
+    let seg_path = dir.path().join("zip317.zstsup01");
+    let end_id = BlockId::new(height, facts.block_header.block_hash);
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &seg_path,
+        SupplementSegmentIdentity::span(Network::ZcashMainnet, 1, height, end_id),
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    let record = BlockSupplementRecord {
+        transparent_transactions: Vec::new(),
+        canonical_metadata: Some(meta.clone()),
+    };
+    writer.push_record(
+        end_id,
+        facts.block_header.parent_hash,
+        u32::try_from(facts.block_header.block_time)?,
+        &record,
+    )?;
+    let id = writer.finish()?;
+    let reader = SettledSupplementSegmentReader::open(
+        &seg_path,
+        &id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    assert_eq!(reader.read_canonical_metadata(height)?, Some(meta.clone()));
+
+    meta.transactions[3].zip317_logical_actions = Some(9);
+    let explicit_path = dir.path().join("zip317-explicit.zstsup01");
+    let mut explicit_writer = SettledSupplementSegmentWriter::create(
+        &explicit_path,
+        SupplementSegmentIdentity::span(Network::ZcashMainnet, 1, height, end_id),
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    explicit_writer.push_record(
+        end_id,
+        facts.block_header.parent_hash,
+        u32::try_from(facts.block_header.block_time)?,
+        &BlockSupplementRecord {
+            transparent_transactions: Vec::new(),
+            canonical_metadata: Some(meta.clone()),
+        },
+    )?;
+    let explicit_id = explicit_writer.finish()?;
+    let explicit_reader = SettledSupplementSegmentReader::open(
+        &explicit_path,
+        &explicit_id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    assert_eq!(explicit_reader.read_canonical_metadata(height)?, Some(meta));
     Ok(())
 }

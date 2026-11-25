@@ -20,7 +20,8 @@ use super::{
     format::{
         CHUNK_INDEX_ENTRY_LEN, DecodedChunkIndexEntry, DecodedRowIndexEntry, HEADER_LEN,
         ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader, ZSTD_COMPRESSION_LEVEL,
-        check_contiguous_block, max_chunk_bytes, validate_block_payload_limit,
+        check_contiguous_block, max_chunk_bytes, max_compressed_chunk_bytes,
+        validate_block_payload_limit,
     },
     parent_directory,
     section::{
@@ -275,8 +276,10 @@ impl SettledSupplementSegmentWriter {
                 "chunk uncompressed length exceeds u32".to_owned(),
             )
         })?;
-        let chunk_limit = max_chunk_bytes(self.options.chunk_blocks)?;
-        if uncompressed_len == 0 || uncompressed_len > chunk_limit {
+        let uncompressed_limit = max_chunk_bytes(self.options.chunk_blocks)?;
+        let compressed_limit =
+            max_compressed_chunk_bytes(self.options.chunk_blocks, self.options.codec)?;
+        if uncompressed_len == 0 || uncompressed_len > uncompressed_limit {
             return Err(SettledSupplementSegmentError::InvalidFormat(
                 "chunk uncompressed length outside admitted bounds".to_owned(),
             ));
@@ -293,7 +296,7 @@ impl SettledSupplementSegmentWriter {
                 "compressed chunk length exceeds u32".to_owned(),
             )
         })?;
-        if compressed_len == 0 || compressed_len > chunk_limit {
+        if compressed_len == 0 || compressed_len > compressed_limit {
             return Err(SettledSupplementSegmentError::InvalidFormat(
                 "compressed chunk length outside admitted bounds".to_owned(),
             ));

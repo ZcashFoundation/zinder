@@ -83,8 +83,16 @@ pub struct CanonicalTransactionSupplement {
     pub intrinsic_value_balances: TransactionIntrinsicValueBalances,
     /// Explicit optional shielded anchors without all-zero sentinels.
     pub shielded_anchors: SupplementShieldedAnchors,
-    /// ZIP-317 logical action count for this transaction.
-    pub zip317_logical_actions: u32,
+    /// Exact [ZIP-317](https://zips.z.cash/zip-0317) logical action count when
+    /// all serialized transparent and shielded inputs to the formula are known.
+    ///
+    /// [`CanonicalBlockSupplement::from_canonical_facts`] populates `Some` when
+    /// the transaction has no transparent inputs and matching transparent output
+    /// facts supply exact `script_pub_key` byte lengths, and stores `None` when
+    /// transparent inputs are present (since [`CanonicalBlockFacts`] omits
+    /// `script_sig` byte lengths) or output facts are incomplete. Callers with
+    /// full raw transaction bytes may populate `Some(exact_actions)` directly.
+    pub zip317_logical_actions: Option<u32>,
     /// Transaction-derived fee and burn amounts.
     pub fee_and_burn: SupplementTxFeeAndBurn,
 }
@@ -185,6 +193,64 @@ fn advance_fee_lookup(
     }
 }
 
+const ZIP317_OUTPUT_DIVISOR: u64 = 34;
+
+const fn compact_size_len(len: u64) -> u64 {
+    if len < 253 {
+        1
+    } else if len <= 0xFFFF {
+        3
+    } else if len <= 0xFFFF_FFFF {
+        5
+    } else {
+        9
+    }
+}
+
+pub(crate) fn exact_zip317_logical_actions_from_outputs(
+    counts: TransactionComponentCounts,
+    output_scripts: impl IntoIterator<Item = usize>,
+) -> Option<u32> {
+    if counts.transparent_input_count != 0 {
+        return None;
+    }
+    let mut tx_out_total_size = 0_u64;
+    let mut observed_outputs = 0_u32;
+    for script_len in output_scripts {
+        observed_outputs = observed_outputs.checked_add(1)?;
+        let script_len_u64 = u64::try_from(script_len).ok()?;
+        let output_bytes = 8_u64
+            .checked_add(compact_size_len(script_len_u64))?
+            .checked_add(script_len_u64)?;
+        tx_out_total_size = tx_out_total_size.checked_add(output_bytes)?;
+    }
+    if observed_outputs != counts.transparent_output_count {
+        return None;
+    }
+    let transparent_actions = tx_out_total_size.div_ceil(ZIP317_OUTPUT_DIVISOR);
+    let sprout_actions = u64::from(counts.sprout_joinsplit_count).checked_mul(2)?;
+    let sapling_actions = u64::from(counts.sapling_spend_count.max(counts.sapling_output_count));
+    let total = transparent_actions
+        .checked_add(sprout_actions)?
+        .checked_add(sapling_actions)?
+        .checked_add(u64::from(counts.orchard_action_count))?
+        .checked_add(u64::from(counts.ironwood_action_count))?;
+    u32::try_from(total).ok()
+}
+
+fn exact_zip317_logical_actions_from_facts(tx_facts: &CanonicalTransactionFacts) -> Option<u32> {
+    if !tx_facts.transparent_inputs.is_empty() {
+        return None;
+    }
+    exact_zip317_logical_actions_from_outputs(
+        tx_facts.public_facts.counts,
+        tx_facts
+            .transparent_outputs
+            .iter()
+            .map(|out| out.script_pub_key.len()),
+    )
+}
+
 fn transaction_supplement_from_facts(
     tx_index: u64,
     tx_facts: &CanonicalTransactionFacts,
@@ -200,7 +266,7 @@ fn transaction_supplement_from_facts(
             ironwood: None,
             sapling: None,
         },
-        zip317_logical_actions: tx_facts.public_facts.counts.logical_actions(),
+        zip317_logical_actions: exact_zip317_logical_actions_from_facts(tx_facts),
         fee_and_burn: SupplementTxFeeAndBurn {
             fee_zat,
             burn_zat: None,
@@ -679,7 +745,7 @@ fn encode_tag2_tx(
     out.extend_from_slice(&tx.serialized_bytes_digest.as_bytes());
     encode_intrinsic_balances(out, tx.intrinsic_value_balances);
     encode_shielded_anchors(out, tx.shielded_anchors);
-    out.extend_from_slice(&tx.zip317_logical_actions.to_be_bytes());
+    encode_optional_u32(out, tx.zip317_logical_actions);
     encode_optional_u64(out, tx.fee_and_burn.fee_zat);
     encode_optional_u64(out, tx.fee_and_burn.burn_zat);
     out.extend_from_slice(&0_u16.to_be_bytes());
@@ -859,7 +925,7 @@ fn decode_tag2_tx(
         sapling: read_optional_fixed::<32>(cursor, "Tag 2 sapling_anchor")?,
     };
     public_facts.orchard_anchor = shielded_anchors.orchard;
-    let zip317_logical_actions = read_u32(cursor, "Tag 2 zip317_logical_actions")?;
+    let zip317_logical_actions = read_optional_u32(cursor, "Tag 2 zip317_logical_actions")?;
     let fee_and_burn = SupplementTxFeeAndBurn {
         fee_zat: read_optional_u64(cursor, "Tag 2 fee_zat")?,
         burn_zat: read_optional_u64(cursor, "Tag 2 burn_zat")?,
