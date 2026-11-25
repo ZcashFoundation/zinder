@@ -9,6 +9,7 @@ use std::{
     mem::size_of,
     num::NonZeroU32,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use tempfile::{Builder as TemporaryDirectoryBuilder, TempDir};
@@ -497,6 +498,8 @@ impl SharedRunBudget {
     }
 }
 
+static NEXT_PARALLEL_SORTER_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Shared workspace and temporary-file budget for concurrent variable-value
 /// sort shards that merge into one [`SortedVariableValues`].
 ///
@@ -507,6 +510,7 @@ impl SharedRunBudget {
 /// temporary-file budget enforcing `max_temporary_file_bytes` across all
 /// spilled and merged runs.
 pub struct ParallelVariableValueSorter<const KEY_LEN: usize> {
+    sorter_id: u64,
     workspace: TempDir,
     shard_count: NonZeroU32,
     max_accounted_memory_bytes: u64,
@@ -532,8 +536,12 @@ pub struct VariableValueSortShard<'a, const KEY_LEN: usize> {
 }
 
 /// Flushed runs collected from all shards of a [`ParallelVariableValueSorter`].
+///
+/// Bound to both the key width (`KEY_LEN`) and originating sorter instance so
+/// staged runs cannot be finished against an unrelated sorter's run budget.
 #[derive(Debug)]
-pub struct StagedParallelVariableRuns {
+pub struct StagedParallelVariableRuns<const KEY_LEN: usize> {
+    sorter_id: u64,
     runs: Vec<RunFile>,
     record_count: u64,
     initial_run_count: u64,
@@ -578,6 +586,7 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
             .tempdir_in(staging_path)
             .map_err(|source| path_unavailable(staging_path, source))?;
         Ok(Self {
+            sorter_id: NEXT_PARALLEL_SORTER_ID.fetch_add(1, Ordering::Relaxed),
             workspace,
             shard_count,
             max_accounted_memory_bytes,
@@ -628,6 +637,13 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
         &self,
         shards: &[VariableValueSortShard<'_, KEY_LEN>],
     ) -> Result<(), BulkLoadError> {
+        let expected_count = usize::try_from(self.shard_count.get()).unwrap_or(usize::MAX);
+        if shards.len() != expected_count {
+            return Err(BulkLoadError::invalid(format!(
+                "expected {expected_count} variable-value sort shards, got {}",
+                shards.len()
+            )));
+        }
         if shards
             .iter()
             .any(|shard| !std::ptr::eq(shard.shared_budget, &raw const self.shared_budget))
@@ -643,7 +659,7 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
     pub fn flush_shards<'a>(
         &'a self,
         mut shards: Vec<VariableValueSortShard<'a, KEY_LEN>>,
-    ) -> Result<StagedParallelVariableRuns, BulkLoadError> {
+    ) -> Result<StagedParallelVariableRuns<KEY_LEN>, BulkLoadError> {
         self.verify_owned_shards(&shards)?;
         let flush_started = Instant::now();
         let outcomes = if let Some((first, rest)) = shards.split_first_mut() {
@@ -687,6 +703,14 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
         for outcome in outcomes {
             outcome?;
         }
+        self.collect_staged_runs(shards, final_run_flush)
+    }
+
+    fn collect_staged_runs(
+        &self,
+        shards: Vec<VariableValueSortShard<'_, KEY_LEN>>,
+        final_run_flush: Duration,
+    ) -> Result<StagedParallelVariableRuns<KEY_LEN>, BulkLoadError> {
         let mut runs = Vec::new();
         let mut record_count = 0_u64;
         let mut initial_run_count = 0_u64;
@@ -711,6 +735,7 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
         }
         let peak_accounted_memory_bytes = buffered_peak_bytes.max(oversized_peak_bytes);
         Ok(StagedParallelVariableRuns {
+            sorter_id: self.sorter_id,
             runs,
             record_count,
             initial_run_count,
@@ -726,8 +751,13 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
     /// Merges any runs beyond `MAX_MERGE_FAN_IN` and opens the streaming reader.
     pub fn finish(
         self,
-        mut staged: StagedParallelVariableRuns,
+        mut staged: StagedParallelVariableRuns<KEY_LEN>,
     ) -> Result<SortedVariableValues<KEY_LEN>, BulkLoadError> {
+        if staged.sorter_id != self.sorter_id {
+            return Err(BulkLoadError::invalid(
+                "cannot finish variable-value runs staged by another sorter",
+            ));
+        }
         let mut temporary_files = self.shared_budget.into_inner().temporary_files;
         let mut runs = staged.runs;
         let mut merge_pass_count = 0_u64;
@@ -2288,6 +2318,10 @@ mod tests {
             parallel_a.flush_shards(shards_b),
             Err(BulkLoadError::InvalidInput { .. })
         ));
+        assert!(matches!(
+            parallel_a.flush_shards(Vec::new()),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
 
         let staged_a = parallel_a.flush_shards(shards_a)?;
         assert!(matches!(
@@ -2296,6 +2330,35 @@ mod tests {
         ));
         let mut sorted = parallel_a.finish(staged_a)?;
         assert_eq!(collect_sorted(&mut sorted)?, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_sorter_rejects_foreign_staged_runs_and_incomplete_shard_flush()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let two = NonZeroU32::new(2).ok_or("zero shards")?;
+        let parallel_a =
+            ParallelVariableValueSorter::<2>::new(dir.path(), "staged-a", two, 1_024, 4_096)?;
+        let parallel_b =
+            ParallelVariableValueSorter::<2>::new(dir.path(), "staged-b", two, 1_024, 4_096)?;
+
+        let mut shards_a = parallel_a.open_shards()?;
+        shards_a[0].push([0, 1], &[0x11; 8])?;
+        let staged_a = parallel_a.flush_shards(shards_a)?;
+        assert!(matches!(
+            parallel_b.finish(staged_a),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+
+        let parallel_c =
+            ParallelVariableValueSorter::<2>::new(dir.path(), "incomplete-c", two, 1_024, 4_096)?;
+        let mut shards_c = parallel_c.open_shards()?;
+        shards_c.pop();
+        assert!(matches!(
+            parallel_c.flush_shards(shards_c),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
         Ok(())
     }
 }
