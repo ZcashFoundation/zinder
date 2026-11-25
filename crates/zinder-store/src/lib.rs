@@ -16,6 +16,7 @@ mod mempool_event_store;
 mod proto_codec;
 mod raw_blob_retention;
 mod rocksdb_resource_budget;
+mod settled_raw_block_segment;
 mod settled_shielded_segment;
 mod store_error;
 
@@ -90,6 +91,12 @@ pub use proto_codec::{
 };
 pub use raw_blob_retention::RawBlobRetention;
 pub use rocksdb_resource_budget::{RocksDbResourceBudget, RocksDbStatisticsLevel};
+pub use settled_raw_block_segment::{
+    RawBlockCodec, RawBlockSegmentIdentity, RawBlockTransactionSlice,
+    SETTLED_RAW_BLOCK_SEGMENT_MAGIC, SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES,
+    SettledRawBlockSegmentError, SettledRawBlockSegmentOpenOptions, SettledRawBlockSegmentReader,
+    SettledRawBlockSegmentWriter,
+};
 pub use settled_shielded_segment::{
     PoolPresenceMask, SEGMENT_FLAG_RESERVED_SHIFTED_EPK, SETTLED_SHIELDED_SEGMENT_MAGIC,
     SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES, SettledShieldedSegmentError,
