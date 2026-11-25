@@ -1,6 +1,0 @@
-kind: fixed
-body: Ingest rejects a mempool transaction that the node returns with extra bytes after it. Previously the entry was admitted, wallets received the extra bytes, and the Explorer and Cipherscan mempool reads failed to parse it.
-time: 2026-11-23T23:27:43.907085571Z
-custom:
-    Bump: patch
-    PR: "532"
