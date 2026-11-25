@@ -1856,6 +1856,43 @@ impl SharedMemoryTracker {
     fn peak_bytes(&self) -> u64 {
         self.peak_bytes.load(Ordering::Acquire)
     }
+
+    fn try_reserve_in_flight(&self, bytes: u64) -> Option<InFlightMemoryGuard<'_>> {
+        self.in_flight_work.fetch_add(1, Ordering::SeqCst);
+        if self.try_reserve_bytes(bytes) {
+            #[cfg(test)]
+            if let Some(hook) = &self.hook {
+                hook.on_after_reserve_before_guard_return(
+                    self.in_flight_work.load(Ordering::SeqCst),
+                );
+            }
+            return Some(InFlightMemoryGuard::from_registered(self, bytes));
+        }
+        self.in_flight_work.fetch_sub(1, Ordering::SeqCst);
+        self.notify_waiters();
+        None
+    }
+
+    fn try_reserve_in_flight_locked(
+        &self,
+        bytes: u64,
+        _wait_guard: &parking_lot::MutexGuard<'_, ()>,
+    ) -> Option<InFlightMemoryGuard<'_>> {
+        self.in_flight_work.fetch_add(1, Ordering::SeqCst);
+        if self.try_reserve_bytes(bytes) {
+            #[cfg(test)]
+            if let Some(hook) = &self.hook {
+                hook.on_after_reserve_before_guard_return(
+                    self.in_flight_work.load(Ordering::SeqCst),
+                );
+            }
+            return Some(InFlightMemoryGuard::from_registered(self, bytes));
+        }
+        self.in_flight_work.fetch_sub(1, Ordering::SeqCst);
+        // `wait_lock` is already held by `_wait_guard`; notify directly to avoid re-locking.
+        self.reclaimed.notify_all();
+        None
+    }
 }
 
 struct WaiterGuard<'tracker> {
@@ -1891,6 +1928,15 @@ impl<'tracker> InFlightMemoryGuard<'tracker> {
             tracker,
             bytes,
             count_in_flight,
+            active: true,
+        }
+    }
+
+    fn from_registered(tracker: &'tracker SharedMemoryTracker, bytes: u64) -> Self {
+        Self {
+            tracker,
+            bytes,
+            count_in_flight: true,
             active: true,
         }
     }
@@ -2321,6 +2367,7 @@ trait ReclaimRaceHook: Send + Sync {
     fn on_after_empty_scan(&self, _in_flight_work: u64) {}
     fn on_after_flush_detach(&self) {}
     fn on_after_guard_bytes_released(&self, _active_bytes: u64, _in_flight_work: u64) {}
+    fn on_after_reserve_before_guard_return(&self, _in_flight_work: u64) {}
     fn on_after_bucket_append(
         &self,
         _staging_allocated_bytes: u64,
@@ -2585,8 +2632,8 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
                 required_bytes: record_bytes,
             });
         }
-        if self.memory.try_reserve_bytes(record_bytes) {
-            return Ok(InFlightMemoryGuard::new(&self.memory, record_bytes, true));
+        if let Some(guard) = self.memory.try_reserve_in_flight(record_bytes) {
+            return Ok(guard);
         }
         self.reclaim_and_reserve(record_bytes)
     }
@@ -2602,8 +2649,8 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
                 if self.flush_partition_if_nonempty(shard_idx)? {
                     drained_any = true;
                 }
-                if self.memory.try_reserve_bytes(record_bytes) {
-                    return Ok(InFlightMemoryGuard::new(&self.memory, record_bytes, true));
+                if let Some(guard) = self.memory.try_reserve_in_flight(record_bytes) {
+                    return Ok(guard);
                 }
             }
             if drained_any {
@@ -2618,8 +2665,11 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
             }
             let _waiter = WaiterGuard::new(&self.memory.waiters);
             let mut wait_guard = self.memory.wait_lock.lock();
-            if self.memory.try_reserve_bytes(record_bytes) {
-                return Ok(InFlightMemoryGuard::new(&self.memory, record_bytes, true));
+            if let Some(guard) = self
+                .memory
+                .try_reserve_in_flight_locked(record_bytes, &wait_guard)
+            {
+                return Ok(guard);
             }
             if self.memory.transition_epoch.load(Ordering::SeqCst) != epoch_before_scan {
                 continue;
@@ -3145,6 +3195,53 @@ fn verify_run_file_size(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static REFUSED_SORT_PHASE_THREAD: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct RefusedSortThreadGuard;
+
+#[cfg(test)]
+impl Drop for RefusedSortThreadGuard {
+    fn drop(&mut self) {
+        REFUSED_SORT_PHASE_THREAD.set(None);
+    }
+}
+
+#[cfg(test)]
+fn arm_refused_sort_phase_thread(skip_spawns: usize) -> RefusedSortThreadGuard {
+    REFUSED_SORT_PHASE_THREAD.set(Some(skip_spawns));
+    RefusedSortThreadGuard
+}
+
+fn spawn_partition_worker<'scope, 'env, F, T>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    worker_index: usize,
+    task: F,
+) -> std::io::Result<thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    #[cfg(test)]
+    if let Some(remaining) = REFUSED_SORT_PHASE_THREAD.get() {
+        if remaining == 0 {
+            REFUSED_SORT_PHASE_THREAD.set(None);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "injected sort worker thread start refusal",
+            ));
+        }
+        REFUSED_SORT_PHASE_THREAD.set(Some(remaining - 1));
+    }
+    thread::Builder::new()
+        .name(format!("zinder-sharded-sort-{worker_index}"))
+        .spawn_scoped(scope, task)
+}
+
 fn run_scoped_partition_phase<Input, Output, Task>(
     inputs: Vec<Input>,
     task: Task,
@@ -3154,34 +3251,47 @@ where
     Output: Send,
     Task: Fn(Input) -> Result<Output, BulkLoadError> + Sync,
 {
-    thread::scope(|scope| {
+    let count = inputs.len();
+    let slots = inputs
+        .into_iter()
+        .map(|entry| Mutex::new(Some(entry)))
+        .collect::<Vec<_>>();
+    let slot_outcomes = thread::scope(|scope| {
         let task_ref = &task;
-        let handles: Vec<_> = inputs
-            .into_iter()
-            .map(|input| scope.spawn(move || task_ref(input)))
-            .collect();
-        let mut outcomes = Vec::with_capacity(handles.len());
-        let mut first_error = None;
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(outcome)) => outcomes.push(outcome),
-                Ok(Err(error)) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
-                Err(_) => {
-                    if first_error.is_none() {
-                        first_error = Some(BulkLoadError::invalid("sharded sort worker panicked"));
-                    }
+        let mut handles = Vec::with_capacity(count);
+        let mut outcomes: Vec<Option<Result<Output, BulkLoadError>>> =
+            (0..count).map(|_| None).collect();
+        for (index, slot) in slots.iter().enumerate() {
+            if let Ok(handle) = spawn_partition_worker(scope, index, move || {
+                let taken = slot.lock().take();
+                taken.map_or_else(
+                    || Err(BulkLoadError::invalid("sharded sort slot missing input")),
+                    task_ref,
+                )
+            }) {
+                handles.push((index, handle));
+            } else {
+                let taken = slot.lock().take();
+                if let Some(entry) = taken {
+                    outcomes[index] = Some(task_ref(entry));
                 }
             }
         }
-        if let Some(error) = first_error {
-            return Err(error);
+        for (index, handle) in handles {
+            let outcome = handle
+                .join()
+                .unwrap_or_else(|_| Err(BulkLoadError::invalid("sharded sort worker panicked")));
+            outcomes[index] = Some(outcome);
         }
-        Ok(outcomes)
-    })
+        outcomes
+    });
+    let mut collected = Vec::with_capacity(count);
+    for slot_outcome in slot_outcomes {
+        let outcome = slot_outcome
+            .ok_or_else(|| BulkLoadError::invalid("sharded sort worker outcome missing"))?;
+        collected.push(outcome?);
+    }
+    Ok(collected)
 }
 
 fn finish_partition_phases<const KEY_LEN: usize>(
@@ -5086,6 +5196,138 @@ mod tests {
         let finished = sorter.finish()?;
         assert_eq!(finished.evidence().record_count, 1);
         assert!(finished.evidence().peak_accounted_memory_bytes <= global_limit);
+        Ok(())
+    }
+
+    struct ReserveRegistrationHook {
+        reserve_gated: std::sync::atomic::AtomicBool,
+        scan_gated: std::sync::atomic::AtomicBool,
+        reserved_barrier: std::sync::Barrier,
+        scanned_barrier: std::sync::Barrier,
+        in_flight_at_reserve: AtomicU64,
+        in_flight_at_scan: AtomicU64,
+    }
+
+    impl ReclaimRaceHook for ReserveRegistrationHook {
+        fn on_after_reserve_before_guard_return(&self, in_flight_work: u64) {
+            if !self.reserve_gated.swap(true, Ordering::SeqCst) {
+                self.in_flight_at_reserve
+                    .store(in_flight_work, Ordering::SeqCst);
+                self.reserved_barrier.wait();
+                self.scanned_barrier.wait();
+            }
+        }
+
+        fn on_after_empty_scan(&self, in_flight_work: u64) {
+            if !self.scan_gated.swap(true, Ordering::SeqCst) {
+                self.in_flight_at_scan
+                    .store(in_flight_work, Ordering::SeqCst);
+                self.scanned_barrier.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn sharded_key_prefix_sorter_registers_in_flight_before_charging_reservation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(2).ok_or("nonzero shards")?;
+        let global_limit = one_record_memory_limit::<2>(64);
+        let hook = std::sync::Arc::new(ReserveRegistrationHook {
+            reserve_gated: std::sync::atomic::AtomicBool::new(false),
+            scan_gated: std::sync::atomic::AtomicBool::new(false),
+            reserved_barrier: std::sync::Barrier::new(2),
+            scanned_barrier: std::sync::Barrier::new(2),
+            in_flight_at_reserve: AtomicU64::new(0),
+            in_flight_at_scan: AtomicU64::new(0),
+        });
+        let mut sorter = ShardedKeyPrefixSorter::<2>::new(
+            dir.path(),
+            "reserve-before-guard",
+            shard_count,
+            global_limit,
+            64_000,
+        )?;
+        let held = sorter.reserve_global_memory(global_limit)?;
+        assert!(sorter.memory.try_reserve_in_flight(1).is_none());
+        assert_eq!(sorter.memory.in_flight_work.load(Ordering::SeqCst), 1);
+        drop(held);
+        assert_eq!(sorter.memory.in_flight_work.load(Ordering::SeqCst), 0);
+        assert_eq!(sorter.memory.active_bytes.load(Ordering::SeqCst), 0);
+
+        sorter.set_reclaim_race_hook(std::sync::Arc::clone(&hook) as _);
+        thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let sorter_ref = &sorter;
+            let writer_a = scope.spawn(move || sorter_ref.push([0x00, 0x01], &[0xaa; 64]));
+            let hook_b = std::sync::Arc::clone(&hook);
+            let writer_b = scope.spawn(move || -> Result<(), BulkLoadError> {
+                hook_b.reserved_barrier.wait();
+                sorter_ref.push([0x80, 0x02], &[0xbb; 64])
+            });
+            writer_a.join().map_err(|_| "writer A panicked")??;
+            writer_b.join().map_err(|_| "writer B panicked")??;
+            Ok(())
+        })?;
+
+        assert_eq!(hook.in_flight_at_reserve.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.in_flight_at_scan.load(Ordering::SeqCst), 1);
+        let finished = sorter.finish()?;
+        let mut keys = Vec::new();
+        for mut stream in finished.into_shards() {
+            while let Some(record) = stream.next_record()? {
+                keys.push(record.key);
+            }
+        }
+        assert_eq!(keys, vec![[0x00, 0x01], [0x80, 0x02]]);
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_key_prefix_sorter_falls_back_synchronously_when_worker_spawn_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(4).ok_or("nonzero shards")?;
+        let single_record_bytes = one_record_memory_limit::<4>(8);
+        let sorter = ShardedKeyPrefixSorter::<4>::new(
+            dir.path(),
+            "spawn-fallback",
+            shard_count,
+            single_record_bytes * 6,
+            64_000,
+        )?;
+        let entries = [
+            ([0xc0, 0x02, 0x00, 0x01], [0x44; 8]),
+            ([0x40, 0x01, 0x00, 0x02], [0x22; 8]),
+            ([0x80, 0x03, 0x00, 0x03], [0x33; 8]),
+            ([0x00, 0x04, 0x00, 0x04], [0x11; 8]),
+            ([0xc0, 0x01, 0x00, 0x05], [0x55; 8]),
+            ([0x00, 0x02, 0x00, 0x06], [0x66; 8]),
+        ];
+        for (key, payload) in entries {
+            sorter.push(key, &payload)?;
+        }
+
+        let _guard = arm_refused_sort_phase_thread(1);
+        let finished = sorter.finish()?;
+        assert_eq!(finished.shard_count(), 4);
+        assert_eq!(finished.evidence().record_count, 6);
+        let mut observed_keys = Vec::new();
+        for mut stream in finished.into_shards() {
+            while let Some(record) = stream.next_record()? {
+                observed_keys.push(record.key);
+            }
+        }
+        assert_eq!(
+            observed_keys,
+            vec![
+                [0x00, 0x02, 0x00, 0x06],
+                [0x00, 0x04, 0x00, 0x04],
+                [0x40, 0x01, 0x00, 0x02],
+                [0x80, 0x03, 0x00, 0x03],
+                [0xc0, 0x01, 0x00, 0x05],
+                [0xc0, 0x02, 0x00, 0x01],
+            ]
+        );
         Ok(())
     }
 }
