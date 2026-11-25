@@ -1232,6 +1232,10 @@ fn finish_projection_ssts(
     } = scanned;
 
     let phase_started = Instant::now();
+    let address_transaction_sort_memory = address_transaction_sort_memory_bytes(
+        config.max_outpoint_sort_memory_bytes,
+        config.max_secondary_sort_memory_bytes_per_sorter,
+    );
     let mut address_index_sorter = VariableValueSorter::<ADDRESS_UNSPENT_KEY_BYTES>::new(
         config.staging_path,
         "wallet-address-unspent",
@@ -1241,7 +1245,7 @@ fn finish_projection_ssts(
     let mut address_transaction_sorter = VariableValueSorter::<ADDRESS_TRANSACTION_KEY_BYTES>::new(
         config.staging_path,
         "wallet-address-transactions",
-        config.max_secondary_sort_memory_bytes_per_sorter,
+        address_transaction_sort_memory,
         config.max_temporary_file_bytes_per_sorter,
     )?;
     let mut unspent_writer = ordered_writer(
@@ -1429,6 +1433,18 @@ fn finish_projection_ssts(
         sst_file_count,
         families,
     })
+}
+
+const fn address_transaction_sort_memory_bytes(
+    max_outpoint_sort_memory_bytes: u64,
+    max_secondary_sort_memory_bytes_per_sorter: u64,
+) -> u64 {
+    let recycled_outpoint_budget = max_outpoint_sort_memory_bytes / 2;
+    if max_secondary_sort_memory_bytes_per_sorter >= recycled_outpoint_budget {
+        max_secondary_sort_memory_bytes_per_sorter
+    } else {
+        recycled_outpoint_budget
+    }
 }
 
 #[allow(
@@ -2261,7 +2277,7 @@ mod tests {
         )?;
 
         assert!(prepared.outpoint_sort_evidence.initial_run_count > 1);
-        // At most 64 runs merge inside the reader without a written pass.
+        // At most 256 runs merge inside the reader without a written pass.
         assert_eq!(prepared.outpoint_sort_evidence.merge_pass_count, 0);
         assert_eq!(prepared.row_counts.transparent_unspent_output_count, 3);
         assert_eq!(prepared.utxo_summary.total_value_zat, 6);
@@ -3045,6 +3061,79 @@ mod tests {
         assert!(
             parallel.outpoint_sort_evidence.peak_accounted_memory_bytes <= limits.outpoint_sort
         );
+        Ok(())
+    }
+
+    #[test]
+    fn address_transaction_sorter_recycles_outpoint_sort_headroom() -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            address_transaction_sort_memory_bytes(4 * 1024 * 1024 * 1024, 1024 * 1024 * 1024),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            address_transaction_sort_memory_bytes(1024 * 1024 * 1024, 256 * 1024 * 1024),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            address_transaction_sort_memory_bytes(4 * 1024 * 1024 * 1024, 3 * 1024 * 1024 * 1024),
+            3 * 1024 * 1024 * 1024
+        );
+
+        let temporary = TempDir::new()?;
+        let options = test_column_family_options();
+        let address = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
+        let funding = TransactionId::from_bytes([0xb1; 32]);
+        let spending = TransactionId::from_bytes([0xb2; 32]);
+        // Every created output is spent before the tip, so `address_index_sorter`
+        // initializes within `secondary_sort_per_sorter` (>= 88 bytes) while
+        // `address_transaction_sorter` recycles half of `max_outpoint_sort_memory_bytes`.
+        let blocks = vec![
+            block_facts(
+                1,
+                [0; 32],
+                [0xc1; 32],
+                vec![transaction_facts(
+                    funding,
+                    Vec::new(),
+                    vec![TransparentOutputFact::new(0, 10, [0x51], address)],
+                )],
+            ),
+            block_facts(
+                2,
+                [0xc1; 32],
+                [0xc2; 32],
+                vec![transaction_facts(
+                    spending,
+                    vec![TransparentInputFact::new(
+                        0,
+                        TransparentOutPoint::new(funding, 0),
+                    )],
+                    Vec::new(),
+                )],
+            ),
+        ];
+        let tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32]));
+        let prepared = write_projection_ssts(
+            test_config_with_settled_tip(
+                temporary.path(),
+                &options,
+                TestByteLimits {
+                    outpoint_sort: 4_096,
+                    secondary_sort_per_sorter: 96,
+                    ..TestByteLimits::default()
+                },
+                tip,
+            ),
+            canonical_scan(validated_replays(&blocks)?),
+        )?;
+        assert_eq!(prepared.row_counts.transparent_unspent_output_count, 0);
+        assert_eq!(prepared.row_counts.transparent_spent_output_count, 1);
+        assert_eq!(prepared.row_counts.transparent_address_transaction_count, 2);
+        let index_evidence = prepared.address_index_sort_evidence;
+        let tx_evidence = prepared.address_transaction_sort_evidence;
+        assert_eq!(index_evidence.max_accounted_memory_bytes, 96);
+        assert_eq!(tx_evidence.max_accounted_memory_bytes, 2_048);
+        assert_eq!(tx_evidence.merge_pass_count, 0);
         Ok(())
     }
 }

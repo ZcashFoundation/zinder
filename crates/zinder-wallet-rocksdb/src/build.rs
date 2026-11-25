@@ -250,7 +250,10 @@ pub struct RocksDbWalletBuildOptions {
     pub resource_budget: RocksDbResourceBudget,
     /// Accounted memory ceiling for the outpoint event sorter.
     pub max_outpoint_sort_memory_bytes: u64,
-    /// Accounted memory ceiling applied independently to each secondary sorter.
+    /// Accounted memory ceiling applied to the address-unspent sorter and
+    /// minimum floor for the address-transaction sorter (which may recycle up
+    /// to half of `max_outpoint_sort_memory_bytes` once `outpoint_sorter` has
+    /// flushed and freed its buffers).
     pub max_secondary_sort_memory_bytes_per_sorter: u64,
     /// Temporary-run byte ceiling applied independently to each external sorter.
     pub max_temporary_file_bytes_per_sorter: u64,

@@ -15,14 +15,18 @@ pub(super) struct PublicationScratch {
 impl PublicationScratch {
     pub(super) fn reserve(root: &Path, catalog: &Path, primary: &Path) -> io::Result<Self> {
         let catalog = resolve_catalog(catalog)?;
-        let primary = primary.canonicalize()?;
+        let primary = primary.canonicalize().map_err(|error| {
+            path_io_error("canonical primary path is unavailable", primary, &error)
+        })?;
         let identity = Sha256::new()
             .chain_update(catalog.as_os_str().as_encoded_bytes())
             .chain_update([0])
             .chain_update(primary.as_os_str().as_encoded_bytes())
             .finalize();
         let name = format!("history-publisher-{}", hex::encode(identity));
-        fs::create_dir_all(root)?;
+        fs::create_dir_all(root).map_err(|error| {
+            path_io_error("could not create canonical secondary root", root, &error)
+        })?;
         let reservation = root.join(&name);
         let marker = reservation.join(".publisher-owned");
         let mut create = fs::DirBuilder::new();
@@ -31,26 +35,44 @@ impl PublicationScratch {
         match create.create(&reservation) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-        if !reservation.symlink_metadata()?.is_dir() {
-            return Err(io::Error::other("expected a publisher scratch directory"));
-        }
-        let lease = match marker.symlink_metadata() {
-            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
-                File::options().read(true).write(true).open(&marker)?
+            Err(error) => {
+                return Err(path_io_error(
+                    "could not create publisher scratch directory",
+                    &reservation,
+                    &error,
+                ));
             }
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    && fs::read_dir(&reservation)?.next().is_none() =>
-            {
-                File::create_new(&marker)?
-            }
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            _ => return Err(io::Error::other("unrecognized publisher scratch directory")),
-        };
-        lease.try_lock()?;
-        File::open(&reservation)?.sync_all()?;
+        }
+        let reservation_meta = reservation.symlink_metadata().map_err(|error| {
+            path_io_error(
+                "could not inspect publisher scratch directory",
+                &reservation,
+                &error,
+            )
+        })?;
+        if !reservation_meta.is_dir() {
+            return Err(io::Error::other(format!(
+                "expected a publisher scratch directory at {}",
+                reservation.display()
+            )));
+        }
+        let lease = open_scratch_lease(&reservation, &marker)?;
+        lease.try_lock().map_err(|error| {
+            path_io_error(
+                "could not lock publisher scratch lease",
+                &marker,
+                &io::Error::from(error),
+            )
+        })?;
+        File::open(&reservation)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                path_io_error(
+                    "could not sync publisher scratch directory",
+                    &reservation,
+                    &error,
+                )
+            })?;
         Ok(Self {
             directory: reservation,
             _lease: lease,
@@ -62,25 +84,102 @@ impl PublicationScratch {
         let reservation = &self.directory;
         let path = reservation.join(GENERATION);
         match path.symlink_metadata() {
-            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&path)?,
-            Ok(_) => return Err(io::Error::other("expected a publisher secondary directory")),
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&path).map_err(|error| {
+                path_io_error("could not remove stale publisher secondary", &path, &error)
+            })?,
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "expected a publisher secondary directory at {}",
+                    path.display()
+                )));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(path_io_error(
+                    "could not inspect publisher secondary",
+                    &path,
+                    &error,
+                ));
+            }
         }
         Builder::new()
             .prefix(GENERATION)
             .rand_bytes(0)
             .tempdir_in(reservation)
+            .map_err(|error| {
+                path_io_error(
+                    "could not create publisher secondary directory under",
+                    reservation,
+                    &error,
+                )
+            })
     }
+}
+
+fn open_scratch_lease(reservation: &Path, marker: &Path) -> io::Result<File> {
+    match marker.symlink_metadata() {
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => File::options()
+            .read(true)
+            .write(true)
+            .open(marker)
+            .map_err(|error| {
+                path_io_error("could not open publisher lease marker", marker, &error)
+            }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut entries = fs::read_dir(reservation).map_err(|read_error| {
+                path_io_error(
+                    "could not read publisher scratch directory",
+                    reservation,
+                    &read_error,
+                )
+            })?;
+            if entries.next().is_some() {
+                return Err(io::Error::other(format!(
+                    "unrecognized publisher scratch directory {}",
+                    reservation.display()
+                )));
+            }
+            File::create_new(marker).map_err(|create_error| {
+                path_io_error(
+                    "could not create publisher lease marker",
+                    marker,
+                    &create_error,
+                )
+            })
+        }
+        Err(error) => Err(path_io_error(
+            "could not inspect publisher lease marker",
+            marker,
+            &error,
+        )),
+        Ok(_) => Err(io::Error::other(format!(
+            "unrecognized publisher scratch directory {}",
+            reservation.display()
+        ))),
+    }
+}
+
+pub(super) fn path_io_error(context: &'static str, path: &Path, source: &io::Error) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        format!("{context} {}: {source}", path.display()),
+    )
 }
 
 // The catalog may not exist until its first publisher acquires the catalog lock.
 fn resolve_catalog(path: &Path) -> io::Result<PathBuf> {
-    let path = std::path::absolute(path)?;
-    for ancestor in path.ancestors() {
+    let absolute_path = std::path::absolute(path).map_err(|error| {
+        path_io_error("could not resolve shielded history directory", path, &error)
+    })?;
+    for ancestor in absolute_path.ancestors() {
         match ancestor.canonicalize() {
             Ok(mut base) => {
-                let suffix = path.strip_prefix(ancestor).map_err(io::Error::other)?;
+                let suffix = absolute_path.strip_prefix(ancestor).map_err(|_| {
+                    io::Error::other(format!(
+                        "could not resolve shielded history directory {}",
+                        path.display()
+                    ))
+                })?;
                 for component in suffix.components() {
                     if component == std::path::Component::ParentDir {
                         base.pop();
@@ -91,12 +190,19 @@ fn resolve_catalog(path: &Path) -> io::Result<PathBuf> {
                 return Ok(base);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(path_io_error(
+                    "could not access ancestor of shielded history directory",
+                    ancestor,
+                    &error,
+                ));
+            }
         }
     }
-    Err(io::Error::other(
-        "publisher catalog has no existing ancestor",
-    ))
+    Err(io::Error::other(format!(
+        "publisher catalog {} has no existing ancestor",
+        path.display()
+    )))
 }
 
 #[cfg(test)]

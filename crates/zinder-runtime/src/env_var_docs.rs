@@ -1682,8 +1682,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-projector"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Memory ceiling for each wallet secondary-index sorter. Defaults to \
-                      1073741824.",
+        description: "Memory ceiling for each wallet secondary-index sorter (the \
+                      address-transaction sorter may also recycle up to half of \
+                      `projector.build.max_outpoint_sort_memory_bytes` once the outpoint sorter \
+                      has flushed to disk). Defaults to 1073741824.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER",

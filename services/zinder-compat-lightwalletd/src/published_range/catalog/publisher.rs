@@ -67,6 +67,19 @@ pub struct ShieldedCatalogPublisher {
 }
 
 impl ShieldedCatalogPublisher {
+    /// Validates that `signing_key` is a readable, size-bounded Ed25519
+    /// PKCS#8 signing key file without opening or locking a catalog directory.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unreadable paths, non-regular files (such as directories or
+    /// FIFOs), keys exceeding the bounded read limit, and malformed PKCS#8
+    /// key material.
+    pub fn validate_signing_key(signing_key: &Path) -> io::Result<()> {
+        let _key = signing_key_from(signing_key)?;
+        Ok(())
+    }
+
     /// Resumes the signed catalog in `directory`, or starts at `first` when empty.
     /// Both operations hold one exclusive publisher lease for this directory.
     /// `segment_blocks` sets the number of newly settled heights per publication.

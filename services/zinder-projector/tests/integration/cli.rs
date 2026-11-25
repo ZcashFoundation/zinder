@@ -606,3 +606,64 @@ fn wallet_profiles_supply_omitted_retention_and_round_trip_printed_config() -> e
     }
     Ok(())
 }
+
+#[test]
+fn startup_creates_nested_secondary_and_reports_missing_paths() -> eyre::Result<()> {
+    let directory = tempdir()?;
+    let missing_canonical = directory.path().join("missing/canonical");
+    let nested_secondary = directory.path().join("nested/parent/canonical-secondary");
+    let wallet_path = directory.path().join("wallet");
+    let created = projector_command()
+        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .args([
+            "--network",
+            "zcash-regtest",
+            "--canonical-path",
+            path_str(&missing_canonical)?,
+            "--canonical-secondary-path",
+            path_str(&nested_secondary)?,
+            "--wallet-path",
+            path_str(&wallet_path)?,
+            "--build-owner-hex",
+            "00112233445566778899aabbccddeeff",
+            "--lease-duration-seconds",
+            "14400",
+        ])
+        .output()?;
+    assert!(!created.status.success(), "{created:?}");
+    assert!(
+        nested_secondary.is_dir(),
+        "missing nested canonical_secondary_path parents should be created before opening"
+    );
+    let stderr = String::from_utf8(created.stderr)?;
+    assert!(stderr.contains(path_str(&nested_secondary)?), "{stderr}");
+    assert!(stderr.contains(path_str(&missing_canonical)?), "{stderr}");
+
+    let file_obstacle = directory.path().join("blocker");
+    fs::write(&file_obstacle, b"not-a-directory")?;
+    let uncreatable_secondary = file_obstacle.join("canonical-secondary");
+    let failure_output = projector_command()
+        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .args([
+            "--network",
+            "zcash-regtest",
+            "--canonical-path",
+            path_str(&missing_canonical)?,
+            "--canonical-secondary-path",
+            path_str(&uncreatable_secondary)?,
+            "--wallet-path",
+            path_str(&wallet_path)?,
+            "--build-owner-hex",
+            "00112233445566778899aabbccddeeff",
+            "--lease-duration-seconds",
+            "14400",
+        ])
+        .output()?;
+    assert!(!failure_output.status.success(), "{failure_output:?}");
+    let failure_stderr = String::from_utf8(failure_output.stderr)?;
+    assert!(
+        failure_stderr.contains(path_str(&uncreatable_secondary)?),
+        "{failure_stderr}"
+    );
+    Ok(())
+}

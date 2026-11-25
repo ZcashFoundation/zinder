@@ -5,7 +5,7 @@
 
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -13,23 +13,42 @@ const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 
 /// Returns the container memory budget in bytes, derived from cgroup v2.
 ///
-/// Prefers `memory.high` (the soft throttle where the kernel starts
-/// reclaiming) over `memory.max` (the hard kill threshold) so the
-/// budget describes the limit Zinder should stay under, not the limit
-/// past which the kernel kills it.
+/// Walks ancestors from the process's cgroup v2 directory up to
+/// `/sys/fs/cgroup` inclusive so limits enforced on parent slices (such as
+/// a systemd service slice whose own leaf reports `max`) are detected too.
+/// Takes the tightest finite (`!= "max"`, `> 0`) limit across `memory.high`
+/// and `memory.max`, preserving `memory.high` whenever it is tighter than
+/// `memory.max` so the budget stays below soft kernel reclaim thresholds and
+/// hard container OOM limits alike.
 ///
 /// Returns `None` when cgroup v2 is unavailable (dev hosts without
-/// containers, macOS, older Linux) or when the limit is unset (the
-/// kernel exposes the literal string `max`, which the cgroup reader
-/// translates to `None`). Callers fall through to their hand-tuned
-/// fallback constants, matching pre-existing behavior on dev hosts.
+/// containers, macOS, older Linux) or when every ancestor's limit is unset
+/// (`max` or `0`). Callers fall through to their hand-tuned fallback
+/// constants, matching pre-existing behavior on dev hosts.
 #[must_use]
 pub fn container_memory_budget_bytes() -> Option<u64> {
-    let cgroup_dir = cgroup_v2_dir(Path::new(CGROUP_ROOT), Path::new(PROC_SELF_CGROUP));
-    let high = read_cgroup_u64(&cgroup_dir, "memory.high");
-    let max = read_cgroup_u64(&cgroup_dir, "memory.max");
-    let limit = high.or(max)?;
-    if limit == 0 { None } else { Some(limit) }
+    cgroup_memory_budget_bytes_in(Path::new(CGROUP_ROOT), Path::new(PROC_SELF_CGROUP))
+}
+
+fn cgroup_memory_budget_bytes_in(cgroup_root: &Path, proc_cgroup: &Path) -> Option<u64> {
+    let cgroup_dir = cgroup_v2_dir(cgroup_root, proc_cgroup);
+    let mut min_high: Option<u64> = None;
+    let mut min_max: Option<u64> = None;
+    for ancestor in cgroup_dir.ancestors() {
+        if !ancestor.starts_with(cgroup_root) {
+            break;
+        }
+        if let Some(high) = read_cgroup_u64(ancestor, "memory.high") {
+            min_high = Some(min_high.map_or(high, |current| current.min(high)));
+        }
+        if let Some(max) = read_cgroup_u64(ancestor, "memory.max") {
+            min_max = Some(min_max.map_or(max, |current| current.min(max)));
+        }
+    }
+    match (min_high, min_max) {
+        (Some(high), Some(max)) => Some(high.min(max)),
+        (high, max) => high.or(max),
+    }
 }
 
 /// Derives the canonical-reader block-cache size from the container memory budget.
@@ -41,10 +60,14 @@ pub fn container_memory_budget_bytes() -> Option<u64> {
 /// CF on-disk size, defeating the purpose of a bounded block cache.
 #[must_use]
 pub fn canonical_reader_block_cache_bytes() -> u64 {
+    canonical_reader_block_cache_bytes_for(container_memory_budget_bytes())
+}
+
+fn canonical_reader_block_cache_bytes_for(budget: Option<u64>) -> u64 {
     const FLOOR: u64 = 128 * MIB;
     const CAP: u64 = 512 * MIB;
 
-    container_memory_budget_bytes().map_or(FLOOR, |budget| (budget / 8).clamp(FLOOR, CAP))
+    budget.map_or(FLOOR, |bytes| (bytes / 8).clamp(FLOOR, CAP))
 }
 
 /// Derives the canonical reader's open-file budget from its default block cache.
@@ -53,13 +76,17 @@ pub fn canonical_reader_block_cache_bytes() -> u64 {
 /// The 512 MiB cache ceiling gives a maximum default of 256 files.
 #[must_use]
 pub fn canonical_reader_max_open_files() -> i32 {
+    canonical_reader_max_open_files_for(container_memory_budget_bytes())
+}
+
+fn canonical_reader_max_open_files_for(budget: Option<u64>) -> i32 {
     const FLOOR: i32 = 128;
     const CAP: i32 = 1024;
     const PER_128_MIB: i32 = 64;
 
-    let files = container_memory_budget_bytes()
-        .and_then(|budget| {
-            let cache = (budget / 8).min(512 * MIB);
+    let files = budget
+        .and_then(|bytes| {
+            let cache = (bytes / 8).min(512 * MIB);
             let units = i32::try_from(cache / (128 * MIB)).ok()?;
             Some((units * PER_128_MIB).max(FLOOR))
         })
@@ -83,10 +110,26 @@ fn cgroup_v2_dir(cgroup_root: &Path, proc_cgroup: &Path) -> PathBuf {
             continue;
         };
         if hierarchy_id == "0" && controllers.is_empty() {
-            return cgroup_root.join(relative_path.trim_start_matches('/'));
+            return resolve_cgroup_relative_dir(cgroup_root, relative_path);
         }
     }
     cgroup_root.to_path_buf()
+}
+
+fn resolve_cgroup_relative_dir(cgroup_root: &Path, relative_path: &str) -> PathBuf {
+    let mut resolved = cgroup_root.to_path_buf();
+    for component in Path::new(relative_path.trim_start_matches('/')).components() {
+        match component {
+            Component::Normal(segment) => resolved.push(segment),
+            Component::ParentDir => {
+                if resolved != cgroup_root {
+                    let _was_popped = resolved.pop();
+                }
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    resolved
 }
 
 fn read_cgroup_u64(cgroup_dir: &Path, file_name: &str) -> Option<u64> {
@@ -95,7 +138,7 @@ fn read_cgroup_u64(cgroup_dir: &Path, file_name: &str) -> Option<u64> {
     if trimmed == "max" {
         return None;
     }
-    trimmed.parse::<u64>().ok()
+    trimmed.parse::<u64>().ok().filter(|bytes| *bytes > 0)
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -129,38 +172,168 @@ mod tests {
     }
 
     #[test]
-    fn block_cache_is_floored_at_128_mib_when_cgroup_absent() {
-        assert_eq!(canonical_reader_block_cache_bytes(), 128 * MIB);
+    fn cgroup_budget_inherits_ancestor_limit_when_leaf_is_max() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let cgroup_root = tempdir.path().join("sys-fs-cgroup");
+        let slice_dir = cgroup_root.join("zbmidx.slice");
+        let service_dir = slice_dir.join("zbm-projector.service");
+        fs::create_dir_all(&service_dir)?;
+        let cgroup_file = tempdir.path().join("cgroup");
+        fs::write(&cgroup_file, "0::/zbmidx.slice/zbm-projector.service\n")?;
+        let slice_limit = 64 * 1024 * MIB;
+        fs::write(slice_dir.join("memory.max"), format!("{slice_limit}\n"))?;
+        fs::write(slice_dir.join("memory.high"), "max\n")?;
+        fs::write(service_dir.join("memory.max"), "max\n")?;
+        fs::write(service_dir.join("memory.high"), "max\n")?;
+
+        assert_eq!(
+            cgroup_memory_budget_bytes_in(&cgroup_root, &cgroup_file),
+            Some(slice_limit)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cgroup_budget_picks_tightest_ancestor_limit_across_high_and_max()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let cgroup_root = tempdir.path().join("sys-fs-cgroup");
+        let slice_dir = cgroup_root.join("zbmidx.slice");
+        let service_dir = slice_dir.join("zbm-projector.service");
+        fs::create_dir_all(&service_dir)?;
+        let cgroup_file = tempdir.path().join("cgroup");
+        fs::write(&cgroup_file, "0::/zbmidx.slice/zbm-projector.service\n")?;
+
+        fs::write(
+            cgroup_root.join("memory.max"),
+            format!("{}\n", 128 * 1024 * MIB),
+        )?;
+        fs::write(
+            slice_dir.join("memory.max"),
+            format!("{}\n", 64 * 1024 * MIB),
+        )?;
+        fs::write(
+            slice_dir.join("memory.high"),
+            format!("{}\n", 56 * 1024 * MIB),
+        )?;
+        fs::write(
+            service_dir.join("memory.max"),
+            format!("{}\n", 96 * 1024 * MIB),
+        )?;
+        fs::write(
+            service_dir.join("memory.high"),
+            format!("{}\n", 72 * 1024 * MIB),
+        )?;
+
+        assert_eq!(
+            cgroup_memory_budget_bytes_in(&cgroup_root, &cgroup_file),
+            Some(56 * 1024 * MIB)
+        );
+
+        // When a parent slice imposes a tighter memory.max than the leaf's memory.high,
+        // the kernel enforces the parent hard limit first.
+        fs::write(slice_dir.join("memory.high"), "max\n")?;
+        fs::write(
+            slice_dir.join("memory.max"),
+            format!("{}\n", 32 * 1024 * MIB),
+        )?;
+        assert_eq!(
+            cgroup_memory_budget_bytes_in(&cgroup_root, &cgroup_file),
+            Some(32 * 1024 * MIB)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cgroup_budget_stops_at_root_and_ignores_unset_or_zero() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let cgroup_root = tempdir.path().join("sys-fs-cgroup");
+        let service_dir = cgroup_root.join("zbmidx.slice/zbm-projector.service");
+        fs::create_dir_all(&service_dir)?;
+        // A file outside cgroup_root must never be consulted even with `..` in proc_cgroup.
+        fs::write(
+            tempdir.path().join("memory.max"),
+            format!("{}\n", 512 * MIB),
+        )?;
+        fs::write(cgroup_root.join("memory.max"), "max\n")?;
+        fs::write(service_dir.join("memory.max"), "0\n")?;
+        fs::write(service_dir.join("memory.high"), "max\n")?;
+
+        let cgroup_file = tempdir.path().join("cgroup");
+        fs::write(&cgroup_file, "0::/zbmidx.slice/zbm-projector.service\n")?;
+        assert_eq!(
+            cgroup_memory_budget_bytes_in(&cgroup_root, &cgroup_file),
+            None
+        );
+
+        fs::write(&cgroup_file, "0::/../../../etc\n")?;
+        assert_eq!(
+            cgroup_v2_dir(&cgroup_root, &cgroup_file),
+            cgroup_root.join("etc")
+        );
+        assert_eq!(
+            cgroup_memory_budget_bytes_in(&cgroup_root, &cgroup_file),
+            None
+        );
+
+        fs::write(&cgroup_file, "0::/zbmidx.slice/../../..\n")?;
+        assert_eq!(cgroup_v2_dir(&cgroup_root, &cgroup_file), cgroup_root);
+        assert_eq!(
+            cgroup_memory_budget_bytes_in(&cgroup_root, &cgroup_file),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn block_cache_is_floored_at_128_mib_when_cgroup_absent() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let absent_budget = cgroup_memory_budget_bytes_in(
+            &tempdir.path().join("missing-cgroup"),
+            &tempdir.path().join("missing-proc-cgroup"),
+        );
+        assert_eq!(absent_budget, None);
+        assert_eq!(
+            canonical_reader_block_cache_bytes_for(absent_budget),
+            128 * MIB
+        );
+        Ok(())
     }
 
     #[test]
     fn block_cache_is_eighth_of_budget_up_to_512_mib() {
-        let budget = 4 * 1024 * MIB; // 4 GiB
-        let result = (budget / 8).min(512 * MIB);
-        assert_eq!(result, 512 * MIB);
+        let large_budget = 4 * 1024 * MIB; // 4 GiB
+        assert_eq!(
+            canonical_reader_block_cache_bytes_for(Some(large_budget)),
+            512 * MIB
+        );
 
-        let budget = 2 * 1024 * MIB; // 2 GiB
-        let result = (budget / 8).min(512 * MIB);
-        assert_eq!(result, 256 * MIB);
+        let small_budget = 2 * 1024 * MIB; // 2 GiB
+        assert_eq!(
+            canonical_reader_block_cache_bytes_for(Some(small_budget)),
+            256 * MIB
+        );
     }
 
     #[test]
-    fn open_files_floor_is_128_when_cgroup_absent() {
-        assert_eq!(canonical_reader_max_open_files(), 128);
-    }
-
-    #[test]
-    fn open_files_rises_with_budget() -> Result<(), Box<dyn Error>> {
-        // 512 MiB cache => 4 * 64 = 256 files
-        let cache = 512 * MIB;
-        let units = i32::try_from(cache / (128 * MIB))?;
-        assert_eq!(units * 64, 256);
-
-        // 128 MiB cache (1 GiB budget) => 1 * 64 = 64, but floored at 128
-        let cache = 128 * MIB;
-        let units = i32::try_from(cache / (128 * MIB))?;
-        let raw = (units * 64).max(128);
-        assert_eq!(raw, 128);
+    fn open_files_floor_is_128_when_cgroup_absent() -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let absent_budget = cgroup_memory_budget_bytes_in(
+            &tempdir.path().join("missing-cgroup"),
+            &tempdir.path().join("missing-proc-cgroup"),
+        );
+        assert_eq!(canonical_reader_max_open_files_for(absent_budget), 128);
         Ok(())
+    }
+
+    #[test]
+    fn open_files_rises_with_budget() {
+        // 4 GiB budget => 512 MiB cache => 4 * 64 = 256 files
+        assert_eq!(
+            canonical_reader_max_open_files_for(Some(4 * 1024 * MIB)),
+            256
+        );
+        // 1 GiB budget => 128 MiB cache => 1 * 64 = 64, floored at 128
+        assert_eq!(canonical_reader_max_open_files_for(Some(1024 * MIB)), 128);
     }
 }

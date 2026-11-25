@@ -112,6 +112,20 @@ pub(crate) struct ProjectorConfigOverrides {
     pub(crate) ops_listen_addr: Option<SocketAddr>,
 }
 
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut nested = error.source();
+    while let Some(cause) = nested {
+        let cause_text = cause.to_string();
+        if !cause_text.is_empty() && !rendered.contains(&cause_text) {
+            rendered.push_str(": ");
+            rendered.push_str(&cause_text);
+        }
+        nested = cause.source();
+    }
+    rendered
+}
+
 /// Startup or runtime error surfaced by the release binary.
 #[derive(Debug, Error)]
 pub(crate) enum ProjectorError {
@@ -120,6 +134,29 @@ pub(crate) enum ProjectorError {
 
     #[error(transparent)]
     OpsServer(#[from] OpsServerError),
+
+    #[error("could not create canonical secondary directory {path:?}: {source}")]
+    CanonicalSecondaryDirectoryCreate {
+        /// Configured `storage.canonical_secondary_path` directory.
+        path: PathBuf,
+        /// Underlying filesystem creation failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "could not open canonical secondary at {secondary_path:?} against canonical primary {primary_path:?}: {}",
+        format_error_chain(source)
+    )]
+    CanonicalSecondaryOpen {
+        /// Configured `storage.canonical_path` directory.
+        primary_path: PathBuf,
+        /// Configured `storage.canonical_secondary_path` directory.
+        secondary_path: PathBuf,
+        /// Underlying canonical-store admission or open failure.
+        #[source]
+        source: zinder_store::CanonicalStoreError,
+    },
 
     #[error(transparent)]
     CanonicalStore(#[from] zinder_store::CanonicalStoreError),
@@ -292,6 +329,19 @@ pub(crate) fn load_projector_config(
         config_path,
         overrides,
         std::env::vars(),
+    )?)
+}
+
+#[cfg(test)]
+pub(crate) fn load_projector_config_with_env(
+    config_path: Option<PathBuf>,
+    overrides: ProjectorConfigOverrides,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> Result<ProjectorConfig, ProjectorError> {
+    resolve_projector_config(load_raw_projector_config(
+        config_path,
+        overrides,
+        environment,
     )?)
 }
 
@@ -1041,5 +1091,46 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn canonical_secondary_open_error_displays_nested_rocksdb_cause()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let files = tempfile::tempdir()?;
+        let missing_primary = files.path().join("missing/canonical");
+        let Err(rocks_error) =
+            rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), &missing_primary)
+        else {
+            return Err("missing RocksDB path should fail list_cf".into());
+        };
+        let rocks_message = rocks_error.to_string();
+        let secondary_path = files.path().join("canonical-secondary");
+        let open_error = ProjectorError::CanonicalSecondaryOpen {
+            primary_path: missing_primary.clone(),
+            secondary_path: secondary_path.clone(),
+            source: zinder_store::CanonicalStoreError::RocksDbOperation {
+                operation: "open canonical secondary",
+                source: rocks_error,
+            },
+        };
+        let rendered = open_error.to_string();
+        assert!(
+            rendered.contains(&secondary_path.display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&missing_primary.display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("canonical store RocksDB open canonical secondary failed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&rocks_message), "{rendered}");
+        let nested_source = std::error::Error::source(&open_error)
+            .and_then(std::error::Error::source)
+            .ok_or("canonical secondary open failure should preserve nested RocksDB source")?;
+        assert_eq!(nested_source.to_string(), rocks_message);
+        Ok(())
     }
 }
