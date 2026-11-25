@@ -1,17 +1,20 @@
 # syntax=docker/dockerfile:1.7
 
-# Moves Cargo state between a runner directory and the BuildKit cache mounts
-# that deploy/Dockerfile compiles in. BuildKit never exports cache mounts with
-# `--cache-to`, so the action copies them through these stages instead. The
-# mount ids must stay identical to the `zinder-binaries` stage there.
+# Moves Cargo state between a runner directory (`cache.tar`) and the BuildKit
+# cache mounts that deploy/Dockerfile compiles in. BuildKit never exports cache
+# mounts with `--cache-to`, so the action moves them as a single uncompressed
+# `cache.tar` (`--output type=tar` avoids the `type=local` HTTP/2 flow-control
+# deadlock in moby/buildkit#2950 and skips walking tens of thousands of files in
+# actions/cache and `seed`). The mount ids must stay identical to the
+# `zinder-binaries` stage there.
 #
-# `seed` copies a restored directory into the mounts. `export` copies the mounts
-# out, without workspace artifacts, because every release build recompiles the
-# workspace crates anyway.
+# `seed` extracts `/seed/cache.tar` directly into the cache mounts. `export`
+# copies the mounts out, without workspace artifacts, because every release
+# build recompiles the workspace crates anyway.
 #
 # Each run passes a unique CACHE_BUST so BuildKit never reuses a cached layer
-# and skips the copy. `--no-cache` would not do: it also gives the RUN empty
-# cache mounts and discards what the RUN writes to them.
+# and skips the extraction or copy. `--no-cache` would not do: it also gives
+# the RUN empty cache mounts and discards what the RUN writes to them.
 
 ARG BASE_IMAGE
 
@@ -24,15 +27,14 @@ ARG RELEASE_CACHE_SCOPE
 ARG CACHE_BUST
 
 RUN --mount=type=bind,from=cargo-seed,target=/seed \
-    --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/workspace/target,sharing=locked \
+    --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/dst/registry,sharing=locked \
+    --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/dst/git,sharing=locked \
+    --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/dst/target,sharing=locked \
     set -eu; \
     echo "seeding run ${CACHE_BUST}"; \
-    for pair in registry:/usr/local/cargo/registry git:/usr/local/cargo/git target:/workspace/target; do \
-        if [ -d "/seed/${pair%%:*}" ]; then cp -a "/seed/${pair%%:*}/." "${pair#*:}/"; fi; \
-    done; \
-    du -sh /usr/local/cargo/registry /usr/local/cargo/git /workspace/target
+    test -f /seed/cache.tar; \
+    tar -xf /seed/cache.tar -C /dst; \
+    du -sh /dst/registry /dst/git /dst/target
 
 FROM ${BASE_IMAGE} AS collect
 

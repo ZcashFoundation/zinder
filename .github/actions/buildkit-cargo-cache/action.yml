@@ -86,8 +86,8 @@ runs:
       run: |
         set -euo pipefail
         context="$(mktemp -d)"
-        # A cached seed layer would skip the copy into the mounts, so every run
-        # passes a unique CACHE_BUST (see the Dockerfile for why not --no-cache).
+        # A cached seed layer would skip the extraction into the mounts, so
+        # every run passes a unique CACHE_BUST (see the Dockerfile for why not --no-cache).
         docker buildx build \
           --progress plain \
           --platform "linux/${CACHE_ARCH}" \
@@ -100,7 +100,7 @@ runs:
           --file "${GITHUB_ACTION_PATH}/Dockerfile" \
           "${context}"
         rm -rf "${CACHE_DIRECTORY}" "${context}"
-        # The builder keeps its own copy of the transferred seed directory.
+        # The builder keeps its own copy of the transferred seed archive.
         # The cache mounts hold the data now, so drop that copy before the
         # release build needs the disk.
         docker buildx prune --force --filter type=source.local
@@ -130,8 +130,12 @@ runs:
         set -euo pipefail
         context="$(mktemp -d)"
         rm -rf "${CACHE_DIRECTORY}"
+        mkdir -p "${CACHE_DIRECTORY}"
         # A cached collect layer would export stale mount contents, so every run
         # passes a unique CACHE_BUST (see the Dockerfile for why not --no-cache).
+        # Export a single tar stream instead of `type=local` to avoid the
+        # `fsutil`/HTTP/2 flow-control deadlock (moby/buildkit#2950) and keep the
+        # cache and seed boundary to a single file.
         docker buildx build \
           --progress plain \
           --platform "linux/${CACHE_ARCH}" \
@@ -141,11 +145,12 @@ runs:
           --build-arg "RELEASE_CACHE_SCOPE=${CACHE_SCOPE}" \
           --build-arg "WORKSPACE_PACKAGES=${WORKSPACE_PACKAGES}" \
           --build-arg "CACHE_BUST=${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$(date +%s%N)" \
-          --output "type=local,dest=${CACHE_DIRECTORY}" \
+          --output "type=tar,dest=${CACHE_DIRECTORY}/cache.tar" \
           --file "${GITHUB_ACTION_PATH}/Dockerfile" \
           "${context}"
         rm -rf "${context}"
-        du -sh "${CACHE_DIRECTORY}"/*
+        test -s "${CACHE_DIRECTORY}/cache.tar"
+        du -sh "${CACHE_DIRECTORY}/cache.tar"
         df -h "${RUNNER_TEMP}" /var/lib/docker || true
 
     # Another main run may save the same key first. The build this step
