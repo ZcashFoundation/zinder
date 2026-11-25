@@ -1906,11 +1906,15 @@ fn assert_phase_breakdowns_fit_their_parents(report: &RocksDbWalletBuildReport) 
     let phases = report.phase_durations;
     let secondary = phases.secondary_row_derivation_phases;
     assert!(
-        secondary.address_index_sort
-            + secondary.address_index_drain
-            + secondary.address_transaction_sort
-            + secondary.address_transaction_drain
-            + secondary.reorg_undo_write
+        secondary.address_index_sort + secondary.address_index_drain
+            <= secondary.concurrent_address_derivation
+    );
+    assert!(
+        secondary.address_transaction_sort + secondary.address_transaction_drain
+            <= secondary.concurrent_address_derivation
+    );
+    assert!(
+        secondary.concurrent_address_derivation + secondary.reorg_undo_write
             <= phases.secondary_row_derivation
     );
     let sst_write = phases.sst_write;
@@ -1951,12 +1955,7 @@ fn assert_phase_breakdowns_fit_their_parents(report: &RocksDbWalletBuildReport) 
             "primary_sst_write",
             "address_index_run_spill",
             "address_transaction_run_spill",
-            "address_index_sort",
-            "address_index_drain",
-            "address_index_sst_write",
-            "address_transaction_sort",
-            "address_transaction_drain",
-            "address_transaction_sst_write",
+            "secondary_address_derivation",
             "reorg_undo_write",
             "logical_evidence",
             "row_load",

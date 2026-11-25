@@ -144,6 +144,38 @@ impl ConstructionAccumulators {
         self.settle()?;
         Ok((self.digest, self.commitment))
     }
+
+    /// Settles every batch and returns opaque finished branch accumulators.
+    pub(crate) fn finish_branch(self) -> Result<FinishedBranchAccumulators, RocksDbWalletError> {
+        let (digest, commitment) = self.finish()?;
+        Ok(FinishedBranchAccumulators { digest, commitment })
+    }
+
+    /// Combines finished branch accumulators into this instance after settling.
+    pub(crate) fn combine_finished(
+        &mut self,
+        branch_digest: &WalletProjectionDigestBuilder,
+        branch_commitment: &TransparentUtxoSetCommitment,
+    ) -> Result<(), RocksDbWalletError> {
+        self.settle()?;
+        self.digest.combine(branch_digest)?;
+        self.commitment.combine(branch_commitment)?;
+        Ok(())
+    }
+
+    /// Combines finished branch accumulators returned by [`Self::finish_branch`].
+    pub(crate) fn combine_branch(
+        &mut self,
+        branch: &FinishedBranchAccumulators,
+    ) -> Result<(), RocksDbWalletError> {
+        self.combine_finished(&branch.digest, &branch.commitment)
+    }
+}
+
+/// Settled partial accumulators produced by an independent derivation branch.
+pub(crate) struct FinishedBranchAccumulators {
+    digest: WalletProjectionDigestBuilder,
+    commitment: TransparentUtxoSetCommitment,
 }
 
 fn utxo_element<'script>(
