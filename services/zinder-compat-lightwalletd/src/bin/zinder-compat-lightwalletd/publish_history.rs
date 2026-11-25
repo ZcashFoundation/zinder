@@ -1,6 +1,6 @@
 use std::{
     fmt, io,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -8,7 +8,7 @@ use std::{
 use clap::Args;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use zinder_compat_lightwalletd::ShieldedCatalogPublisher;
+use zinder_compat_lightwalletd::{PublicationConcurrency, ShieldedCatalogPublisher};
 use zinder_core::BlockHeight;
 use zinder_query::{RocksDbCanonicalReader, StorageReadError};
 use zinder_store::{
@@ -19,6 +19,32 @@ use super::config::{HistoryPublisherConfig, LightwalletdConfigError};
 
 mod scratch;
 use scratch::{PublicationScratch, path_io_error};
+
+/// Maximum concurrent segment builders accepted by `--workers`.
+const MAX_PUBLISH_WORKERS: usize = 16;
+/// Default cap on concurrent segment builders when `--workers` is omitted.
+const DEFAULT_MAX_PUBLISH_WORKERS: usize = 4;
+/// Maximum settled segments combined into one manifest commit during initial bulk catchup.
+const CATCHUP_COMMIT_BATCH: usize = 16;
+
+fn parse_publish_workers(raw: &str) -> Result<NonZeroUsize, String> {
+    let parsed: usize = raw
+        .parse()
+        .map_err(|err| format!("invalid worker count {raw:?}: {err}"))?;
+    let workers = NonZeroUsize::new(parsed)
+        .ok_or_else(|| "worker count must be between 1 and 16".to_owned())?;
+    if workers.get() > MAX_PUBLISH_WORKERS {
+        return Err(format!(
+            "worker count {parsed} exceeds maximum {MAX_PUBLISH_WORKERS}"
+        ));
+    }
+    Ok(workers)
+}
+
+fn default_publish_workers() -> NonZeroUsize {
+    let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    NonZeroUsize::new(cpus.clamp(1, DEFAULT_MAX_PUBLISH_WORKERS)).unwrap_or(NonZeroUsize::MIN)
+}
 
 #[derive(Args)]
 pub(super) struct PublishHistory {
@@ -34,6 +60,9 @@ pub(super) struct PublishHistory {
     /// Number of settled heights per segment.
     #[arg(long, default_value = "4096")]
     segment_blocks: NonZeroU32,
+    /// Concurrent workers building settled segments (defaults to up to 4 CPUs, max 16).
+    #[arg(long, value_name = "COUNT", value_parser = parse_publish_workers)]
+    workers: Option<NonZeroUsize>,
     /// Keep publishing and check for newly settled blocks at this interval.
     #[arg(long, value_name = "SECONDS")]
     follow_interval_secs: Option<NonZeroU32>,
@@ -46,6 +75,7 @@ impl PublishHistory {
     ) -> Result<(), LightwalletdConfigError> {
         validate_signing_key_readable(&self.signing_key)?;
         validate_catalog_destination(&self.directory)?;
+        let workers = self.workers.unwrap_or_else(default_publish_workers);
         let stopping = CancellationToken::new();
         let _signal = self
             .follow_interval_secs
@@ -58,28 +88,45 @@ impl PublishHistory {
         let mut generation: Option<PublicationReader> = None;
         let mut admitted_stored_set = None;
         let mut publisher = None;
+        let mut initial_catchup = true;
         loop {
             let candidate = generation.take().map_or_else(
                 || PublicationReader::open(config, &scratch, admitted_stored_set),
                 PublicationReader::catch_up,
             );
+            let commit_batch = if initial_catchup {
+                NonZeroUsize::new(CATCHUP_COMMIT_BATCH).unwrap_or(NonZeroUsize::MIN)
+            } else {
+                NonZeroUsize::MIN
+            };
             let publication = candidate.and_then(|current| {
                 admitted_stored_set.get_or_insert_with(|| current.reader.secondary().stored_set());
                 let publisher = match &mut publisher {
                     Some(resumed) => resumed,
                     None => publisher.insert(self.open_publisher(&current.reader)?),
                 };
-                let mut segments = 0_u32;
-                while !stopping.is_cancelled() && publisher.publish_next(&current.reader)? {
-                    segments += 1;
-                }
+                let segments = publisher.publish_available(
+                    &current.reader,
+                    PublicationConcurrency {
+                        workers,
+                        commit_batch,
+                    },
+                    &stopping,
+                )?;
                 if segments > 0 || self.follow_interval_secs.is_none() {
-                    tracing::info!(segments, "settled shielded history publication complete");
+                    tracing::info!(
+                        segments,
+                        workers = workers.get(),
+                        "settled shielded history publication complete"
+                    );
                 }
                 Ok(current)
             });
             match publication {
-                Ok(current) => generation = Some(current),
+                Ok(current) => {
+                    initial_catchup = false;
+                    generation = Some(current);
+                }
                 Err(error) if self.follow_interval_secs.is_some() && reader_invalidated(&error) => {
                     tracing::warn!(%error, "reopening the history publisher's compacted canonical secondary");
                 }

@@ -274,15 +274,17 @@ To publish, configure the network, canonical storage paths, and reorg window for
 ```sh
 zinder-compat-lightwalletd --config reader.toml publish-shielded-history \
   --directory /srv/zinder/published-history --signing-key /etc/zinder/publisher.pk8 \
-  --segment-blocks 4096
+  --segment-blocks 4096 --workers 4
 ```
 
 Add `--print-config` to this invocation to inspect the publisher's effective
 network, storage paths, RocksDB budget, and reorg window without opening storage.
 
+`--workers` defaults to `min(available CPUs, 4)` (accepted range `1..=16`). Initial bulk catchup builds complete settled segments across those worker threads and commits signed catalog updates in bounded batches, while subsequent `--follow-interval-secs` polls commit each newly settled segment incrementally. Pass `--workers 1` on constrained shared-disk hosts that need sequential disk I/O; every worker setting produces identical segments and signed manifests.
+
 The command reserves one directory under `storage.secondary_path` for each catalog and canonical store pair. On restart it replaces the previous secondary under that reservation, including after a forced stop. It publishes complete segments through its captured settled tip and exits. Add `--follow-interval-secs 60` to keep the publisher running and catch up its secondary every minute. If writer compaction removes a table file the publisher still needs, the next interval opens a fresh secondary and resumes from the last published segment under the same catalog lock. The listener can serve the recent unpublished suffix from its encoded tail while the chain view matches. It reads other uncovered heights from canonical storage. The [single-host Compose runbook](../runbooks/deploying-on-a-vm.md#publish-signed-wallet-history) covers installation and key rotation.
 
-One publisher holds the directory lock. On restart it reclaims its temporary files, `.publisher-write.tmp`, `.publisher-segment.tmp`, and `.publisher-nullifiers.tmp`, and verifies the existing segments and links before appending. The publisher stages each segment's nullifier slab in `.publisher-nullifiers.tmp` and streams it into the segment when the segment completes, so its memory does not grow with `--segment-blocks`. Keep its signed `.publisher-head.json` with the publication directory when restarting or restoring it. A missing checkpoint beside an existing catalog, a regressed prefix, or an incompatible chain stops publication.
+One publisher holds the directory lock. On restart it reclaims its temporary files, `.publisher-write.tmp`, `.publisher-segment.tmp`, and `.publisher-nullifiers.tmp` (including per-worker `.tmp.<slot>` suffixes), and verifies the existing segments and links before appending. The publisher stages each segment's nullifier slab in `.publisher-nullifiers.tmp` (or `.publisher-nullifiers.tmp.<slot>`) and streams it into the segment when the segment completes, so its memory does not grow with `--segment-blocks`. Keep its signed `.publisher-head.json` with the publication directory when restarting or restoring it. A missing checkpoint beside an existing catalog, a regressed prefix, or an incompatible chain stops publication.
 
 Single-host Compose points `compat.shielded_history.directory` at the publisher's read-only catalog and mounts its raw 32-byte Ed25519 public key separately. The reader authenticates the signed publisher checkpoint before binding. An empty checkpoint lets it serve ranges from canonical storage and the standalone live tail until the first catalog arrives. A populated checkpoint requires a signed catalog containing that prefix. The listener adopts the first verified catalog and later extensions on the same wallet connection.
 

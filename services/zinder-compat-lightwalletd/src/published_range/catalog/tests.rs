@@ -2095,3 +2095,255 @@ async fn sapling_orchard_ranges_route_by_the_request_end_under_signed_read_conte
     drop(contended);
     Ok(())
 }
+
+fn concurrency_for_test(workers: usize, commit_batch: usize) -> Result<PublicationConcurrency> {
+    Ok(PublicationConcurrency {
+        workers: std::num::NonZeroUsize::new(workers).ok_or_else(|| eyre!("non-zero workers"))?,
+        commit_batch: std::num::NonZeroUsize::new(commit_batch)
+            .ok_or_else(|| eyre!("non-zero commit batch"))?,
+    })
+}
+
+#[test]
+fn parallel_catchup_is_byte_identical_to_sequential_publication() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(16);
+    let (_files, canonical) = reader(&chain)?;
+    let sequential_fixture = Fixture::new()?;
+    let parallel_fixture = Fixture::new()?;
+    fs::write(
+        &parallel_fixture.private,
+        fs::read(&sequential_fixture.private)?,
+    )?;
+    fs::write(
+        &parallel_fixture.public,
+        fs::read(&sequential_fixture.public)?,
+    )?;
+
+    let mut sequential = sequential_fixture.publisher()?;
+    let mut seq_count = 0_usize;
+    while sequential.publish_next(&canonical)? {
+        seq_count += 1;
+    }
+    assert_eq!(seq_count, 8);
+
+    let mut parallel = parallel_fixture.publisher()?;
+    let par_count = parallel.publish_available(
+        &canonical,
+        concurrency_for_test(4, 3)?,
+        &tokio_util::sync::CancellationToken::new(),
+    )?;
+    assert_eq!(par_count, seq_count);
+    drop(sequential);
+    drop(parallel);
+
+    let seq_dir = sequential_fixture.directory.path();
+    let par_dir = parallel_fixture.directory.path();
+    assert_eq!(
+        fs::read(sequential_fixture.current())?,
+        fs::read(parallel_fixture.current())?
+    );
+    assert_eq!(
+        fs::read(seq_dir.join(".publisher-head.json"))?,
+        fs::read(par_dir.join(".publisher-head.json"))?
+    );
+    let entries = parallel_fixture.entries()?;
+    assert_eq!(entries, sequential_fixture.entries()?);
+    for entry in &entries {
+        assert_eq!(
+            fs::read(segment_path(seq_dir, entry.sha256))?,
+            fs::read(segment_path(par_dir, entry.sha256))?
+        );
+    }
+    // Every worker thread must drop its RocksDbCanonicalReader clone before returning.
+    assert!(canonical.into_secondary().is_ok());
+    Ok(())
+}
+
+#[test]
+fn parallel_publication_commits_contiguous_prefix_before_worker_error() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(12);
+    let (_files, canonical) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    let stopping = tokio_util::sync::CancellationToken::new();
+    let concurrency = concurrency_for_test(4, 2)?;
+    let build_segment = |canonical_reader: &RocksDbCanonicalReader,
+                         dir: &std::path::Path,
+                         range: BlockHeightRange,
+                         slot: usize| {
+        let segment_index = usize::try_from((range.start.value() - 1) / 2)
+            .map_err(|_| io::Error::other("height conversion"))?;
+        if segment_index < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        if segment_index == 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected builder failure",
+            ));
+        }
+        manifest::stage_segment(canonical_reader, dir, range, slot)
+    };
+
+    let err = publisher
+        .publish_available_with(&canonical, concurrency, &stopping, &build_segment)
+        .err()
+        .ok_or_else(|| eyre!("expected injected worker error"))?;
+    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+
+    let committed = fixture.catalog(None)?;
+    assert_eq!(committed.segments().len(), 2);
+    assert_eq!(committed.bounds().end, BlockHeight::new(4));
+
+    let resumed = publisher.publish_available(&canonical, concurrency, &stopping)?;
+    assert_eq!(resumed, 4);
+    let completed = fixture.catalog(Some(&committed))?;
+    assert_eq!(completed.segments().len(), 6);
+    assert_eq!(completed.bounds().end, BlockHeight::new(12));
+    Ok(())
+}
+
+#[test]
+fn parallel_publication_rejects_parent_mismatch_after_prefix() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(12);
+    let (_files, canonical) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    let stopping = tokio_util::sync::CancellationToken::new();
+    let concurrency = concurrency_for_test(4, 2)?;
+    let build_segment = |canonical_reader: &RocksDbCanonicalReader,
+                         dir: &std::path::Path,
+                         range: BlockHeightRange,
+                         slot: usize| {
+        let segment_index = usize::try_from((range.start.value() - 1) / 2)
+            .map_err(|_| io::Error::other("height conversion"))?;
+        if segment_index < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut built = manifest::stage_segment(canonical_reader, dir, range, slot)?;
+        if segment_index == 3 {
+            built.first_parent = zinder_core::BlockHash::from_bytes([0xff; 32]);
+        }
+        Ok(built)
+    };
+
+    let err = publisher
+        .publish_available_with(&canonical, concurrency, &stopping, &build_segment)
+        .err()
+        .ok_or_else(|| eyre!("expected parent link mismatch"))?;
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+    let committed = fixture.catalog(None)?;
+    assert_eq!(committed.segments().len(), 3);
+    assert_eq!(committed.bounds().end, BlockHeight::new(6));
+    Ok(())
+}
+
+#[test]
+fn parallel_publication_stops_cleanly_on_cancellation_and_resumes() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(16);
+    let (_files, canonical) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    let stopping = tokio_util::sync::CancellationToken::new();
+    let concurrency = concurrency_for_test(3, 2)?;
+    let completed_calls = std::sync::atomic::AtomicUsize::new(0);
+    let build_segment = |canonical_reader: &RocksDbCanonicalReader,
+                         dir: &std::path::Path,
+                         range: BlockHeightRange,
+                         slot: usize| {
+        let built = manifest::stage_segment(canonical_reader, dir, range, slot)?;
+        if completed_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= 1 {
+            stopping.cancel();
+        }
+        Ok(built)
+    };
+    let partial =
+        publisher.publish_available_with(&canonical, concurrency, &stopping, &build_segment)?;
+    assert!((1..8).contains(&partial), "partial={partial}");
+    let committed = fixture.catalog(None)?;
+    assert_eq!(committed.segments().len(), partial);
+
+    let resume_token = tokio_util::sync::CancellationToken::new();
+    let remainder = publisher.publish_available(&canonical, concurrency, &resume_token)?;
+    assert_eq!(partial + remainder, 8);
+    let full = fixture.catalog(Some(&committed))?;
+    assert_eq!(full.segments().len(), 8);
+    assert_eq!(full.bounds().end, BlockHeight::new(16));
+    Ok(())
+}
+
+#[test]
+fn publisher_cleans_slot_staging_files_and_keeps_unrelated_files() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
+    let (_files, canonical) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    let mut first = fixture.publisher()?;
+    assert!(first.publish_next(&canonical)?);
+    drop(first);
+
+    let dir = fixture.directory.path();
+    let stale_paths = [
+        dir.join(".publisher-write.tmp"),
+        dir.join(".publisher-write.tmp.0"),
+        dir.join(".publisher-segment.tmp.3"),
+        dir.join(".publisher-nullifiers.tmp.12"),
+    ];
+    for stale in &stale_paths {
+        fs::write(stale, b"stale staging artifact")?;
+    }
+    let operator_backup = dir.join(".operator-backup");
+    let non_slot_suffix = dir.join(".publisher-write.tmp.operator");
+    fs::write(&operator_backup, b"keep-operator")?;
+    fs::write(&non_slot_suffix, b"keep-non-numeric")?;
+
+    let mut resumed = fixture.publisher()?;
+    for stale in &stale_paths {
+        assert!(!stale.exists(), "expected cleanup of {}", stale.display());
+    }
+    assert_eq!(fs::read(&operator_backup)?, b"keep-operator");
+    assert_eq!(fs::read(&non_slot_suffix)?, b"keep-non-numeric");
+    assert!(resumed.publish_next(&canonical)?);
+    assert_eq!(fixture.catalog(None)?.segments().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn parallel_publication_commits_up_to_segment_limit_and_rejects_overflow() -> Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(8);
+    let (_files, canonical) = reader(&chain)?;
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&canonical)?);
+    let seed = publisher
+        .entries
+        .last()
+        .copied()
+        .ok_or_else(|| eyre!("missing seed segment"))?;
+    let filler_count = MAX_SEGMENTS - 2 - publisher.entries.len();
+    publisher
+        .entries
+        .extend(std::iter::repeat_n(seed, filler_count));
+    assert_eq!(publisher.entries.len(), MAX_SEGMENTS - 2);
+
+    let err = publisher
+        .publish_available(
+            &canonical,
+            concurrency_for_test(2, 2)?,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .err()
+        .ok_or_else(|| eyre!("expected MAX_SEGMENTS overflow"))?;
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(publisher.entries.len(), MAX_SEGMENTS);
+    let key = verification_key_from(&fixture.public)?;
+    let raw_manifest = manifest::signed_contents(&fixture.current(), &key, CATALOG_LIMIT)?;
+    let manifest: CatalogManifest = serde_json::from_str(&raw_manifest)?;
+    assert_eq!(manifest.segments.len(), MAX_SEGMENTS);
+    assert_eq!(
+        manifest.segments.last().map(|last| (last.first, last.last)),
+        Some((5, 6))
+    );
+    PublisherHead::read(fixture.directory.path(), &key)?.verify(&publisher.entries)?;
+    Ok(())
+}

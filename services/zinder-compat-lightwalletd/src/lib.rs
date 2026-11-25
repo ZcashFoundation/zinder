@@ -20,7 +20,9 @@ mod node_tip_witness;
 mod ping;
 mod published_range;
 mod sealed_history;
-pub use published_range::{PublishedShieldedHistory, ShieldedCatalogPublisher};
+pub use published_range::{
+    PublicationConcurrency, PublishedShieldedHistory, ShieldedCatalogPublisher,
+};
 mod request_limits;
 mod stale_tip;
 mod tip_wait;

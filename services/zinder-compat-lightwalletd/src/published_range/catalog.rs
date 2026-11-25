@@ -2,12 +2,12 @@
 mod publisher;
 
 pub(super) use publisher::PublisherHead;
-pub use publisher::ShieldedCatalogPublisher;
+pub use publisher::{PublicationConcurrency, ShieldedCatalogPublisher};
 
 use std::{io, path::Path, sync::Arc};
 
 use serde::{Deserialize, Serialize};
-use zinder_core::{BlockHeight, BlockHeightRange};
+use zinder_core::{BlockHash, BlockHeight, BlockHeightRange};
 use zinder_query::CanonicalReader;
 
 use super::{
@@ -61,16 +61,23 @@ fn open_segment(
     Ok(range)
 }
 
-fn check_parent(
+fn check_parent_hashes(
     previous: Option<ShieldedRangeIdentity>,
-    range: &PublishedShieldedRange,
+    first_parent: BlockHash,
 ) -> io::Result<()> {
-    if previous.is_some_and(|prior| prior.last_hash != range.segment.first_parent().as_bytes()) {
+    if previous.is_some_and(|prior| prior.last_hash != first_parent.as_bytes()) {
         return Err(invalid(
             "shielded catalog segment does not link to its predecessor",
         ));
     }
     Ok(())
+}
+
+fn check_parent(
+    previous: Option<ShieldedRangeIdentity>,
+    range: &PublishedShieldedRange,
+) -> io::Result<()> {
+    check_parent_hashes(previous, range.segment.first_parent())
 }
 
 /// Signed, contiguous historical coverage admitted from one publisher.
