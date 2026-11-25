@@ -13,6 +13,8 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+bytes.workspace = true
+fs-verity.workspace = true
 getrandom = { version = "0.4.3", features = ["std"] }
 hmac.workspace = true
 metrics.workspace = true
@@ -24,6 +26,7 @@ rustix.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tonic.workspace = true
@@ -33,11 +36,13 @@ zinder-core = { workspace = true, features = ["commitment-tree-codec"] }
 zinder-proto.workspace = true
 zinder-rocksdb-bulk-load.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+composefs-ioctls.workspace = true
+
 [dev-dependencies]
 incrementalmerkletree.workspace = true
 metrics-exporter-prometheus.workspace = true
 sapling.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 zcash_primitives.workspace = true
 zinder-testkit.workspace = true
