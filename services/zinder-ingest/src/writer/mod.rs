@@ -26,7 +26,8 @@ use crate::{
     follow_canonical_tip_with_control,
 };
 use construction::{
-    load_fresh_canonical_until_cancelled, record_construction_cancelled, record_construction_phase,
+    load_fresh_canonical_until_cancelled, progress::ConstructionProgress,
+    record_construction_cancelled, record_construction_phase,
 };
 
 /// Complete concrete configuration for the first `RocksDB` single-host writer.
@@ -476,16 +477,7 @@ where
     };
     let (build_plan, build_tip) = construction_range?;
     record_construction_phase("construction_range", range_started_at);
-    readiness.publish_admission(
-        ReadinessState::syncing(
-            Some(u64::from(build_tip.height.value().saturating_sub(
-                build_plan.history_bounds().first_available_height().value(),
-            ))),
-            None,
-            Some(build_tip.height.value()),
-        )
-        .with_phase(IngestPhase::BulkCatchup),
-    );
+    let progress = ConstructionProgress::start(&build_plan, Some(readiness.clone()));
     let builder = create_fresh_canonical_builder(staging_path, build_plan, config)?;
     tracing::info!(
         target: "zinder::ingest",
@@ -496,16 +488,21 @@ where
         "started canonical construction"
     );
     warn_if_every_block_construction_lacks_qualified_cpus(config.tree_state_checkpoint_selection);
-    let loaded =
-        load_fresh_canonical_until_cancelled(builder, source, &config.construction, cancel)
-            .await
-            .map_err(|error| {
-                if matches!(error, CanonicalConstructionError::Cancelled) {
-                    CanonicalWriterError::Cancelled
-                } else {
-                    CanonicalWriterError::Construction(error)
-                }
-            })?;
+    let loaded = load_fresh_canonical_until_cancelled(
+        builder,
+        source,
+        &config.construction,
+        cancel,
+        Some(progress),
+    )
+    .await
+    .map_err(|error| {
+        if matches!(error, CanonicalConstructionError::Cancelled) {
+            CanonicalWriterError::Cancelled
+        } else {
+            CanonicalWriterError::Construction(error)
+        }
+    })?;
     let published_fence = publish_constructed_baseline(loaded, build_tip, cancel).await?;
     install_staged_store(staging_path, &config.storage_path)?;
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(

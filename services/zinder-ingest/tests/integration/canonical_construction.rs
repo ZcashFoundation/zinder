@@ -4,17 +4,18 @@
 )]
 
 use std::{
+    net::SocketAddr,
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use tempfile::TempDir;
-use tokio::sync::Notify;
+use tokio::{net::TcpListener, sync::Notify};
 use tokio_util::sync::CancellationToken;
 use zebra_chain::{
     block::{Block as ZebraBlock, Height as ZebraHeight},
@@ -29,9 +30,12 @@ use zinder_core::{
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
     CanonicalFollowConfig, CanonicalWriterConfig, CanonicalWriterError, IngestError,
-    admit_canonical_store, load_fresh_canonical, load_fresh_canonical_blocks,
+    admit_canonical_store, follow_admitted_canonical_store, load_fresh_canonical,
+    load_fresh_canonical_blocks,
 };
-use zinder_runtime::{ComposedReadiness, Readiness};
+use zinder_runtime::{
+    ComposedReadiness, IngestPhase, OpsServer, Readiness, ReadinessCause, spawn_ops_endpoint,
+};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceBlockHeader, SourceChainSegment,
     SourceChainSegmentLimits, SourceError,
@@ -2017,5 +2021,400 @@ fn assert_ironwood_activation_checkpoints(
         post_activation_ironwood.final_root()
     );
     assert_eq!(post_activation_ironwood, tip_ironwood);
+    Ok(())
+}
+
+/// Multi-block construction source that holds segment fetches until a test
+/// permits the requested height span to proceed.
+#[derive(Clone)]
+struct GatedConstructionSource {
+    inner: MultiBlockConstructionSource,
+    allowed_through: Arc<AtomicU32>,
+    gate_changed: Arc<Notify>,
+}
+
+impl GatedConstructionSource {
+    fn new(inner: MultiBlockConstructionSource) -> Self {
+        Self {
+            inner,
+            allowed_through: Arc::new(AtomicU32::new(0)),
+            gate_changed: Arc::new(Notify::new()),
+        }
+    }
+
+    fn allow_through(&self, height: u32) {
+        self.allowed_through.store(height, Ordering::SeqCst);
+        self.gate_changed.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl NodeSource for GatedConstructionSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        self.inner.fetch_block_at(height).await
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        let next_height =
+            limits
+                .cursor
+                .next_connected_height()
+                .ok_or(SourceError::SourceProtocolMismatch {
+                    reason: "gated construction test cursor has no next height",
+                })?;
+        let required_top = next_height
+            .value()
+            .saturating_add(limits.max_connected_blocks.get())
+            .saturating_sub(1);
+        loop {
+            let notified = self.gate_changed.notified();
+            if required_top <= self.allowed_through.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
+        self.inner.fetch_chain_segment(limits).await
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        self.inner.tip_id().await
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.inner
+            .fetch_chain_checkpoint(height, network_upgrade_activations)
+            .await
+    }
+}
+
+async fn spawn_ingest_ops_endpoint(
+    readiness: Readiness,
+) -> Result<(SocketAddr, zinder_runtime::OpsEndpointHandle), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let ops_addr = listener.local_addr()?;
+    drop(listener);
+    let handle = spawn_ops_endpoint(
+        ops_addr,
+        OpsServer {
+            service_name: "zinder-ingest",
+            service_version: "0.0.0",
+            network_name: "zcash-regtest",
+            advertised_capabilities: Arc::from([]),
+        },
+        readiness,
+    )
+    .await?;
+    Ok((ops_addr, handle))
+}
+
+async fn fetch_readyz_json(
+    client: &reqwest::Client,
+    ops_addr: SocketAddr,
+) -> Result<(u16, serde_json::Value), Box<dyn std::error::Error>> {
+    let response = client
+        .get(format!("http://{ops_addr}/readyz"))
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let parsed_json: serde_json::Value = serde_json::from_str(&response.text().await?)?;
+    Ok((status, parsed_json))
+}
+
+async fn fetch_metrics_text(
+    client: &reqwest::Client,
+    ops_addr: SocketAddr,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let response = client
+        .get(format!("http://{ops_addr}/metrics"))
+        .send()
+        .await?;
+    assert_eq!(response.status().as_u16(), 200);
+    Ok(response.text().await?)
+}
+
+fn prometheus_gauge_sample(
+    metrics_text: &str,
+    name: &str,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let expected_type = format!("# TYPE {name} gauge");
+    if !metrics_text.lines().any(|line| line == expected_type) {
+        return Err(format!("missing gauge TYPE line for {name} in:\n{metrics_text}").into());
+    }
+    let unlabeled_prefix = format!("{name} ");
+    let labeled_prefix = format!("{name}{{");
+    let sample_text = metrics_text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(&unlabeled_prefix).or_else(|| {
+                line.starts_with(&labeled_prefix)
+                    .then(|| line.rsplit(' ').next())
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| format!("missing sample for gauge {name} in:\n{metrics_text}"))?;
+    Ok(sample_text.parse()?)
+}
+
+async fn assert_construction_stage(
+    client: &reqwest::Client,
+    ops_addr: SocketAddr,
+    expected_current: u32,
+    expected_target: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let readyz_json = loop {
+        let (status, body) = fetch_readyz_json(client, ops_addr).await?;
+        if body["current_height"] == expected_current && body["target_height"] == expected_target {
+            assert_eq!(status, 503);
+            break body;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for /readyz current_height={expected_current}, target_height={expected_target}; last={body}"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let expected_lag = u64::from(expected_target.saturating_sub(expected_current));
+    assert_eq!(readyz_json["status"], "not_ready");
+    assert_eq!(readyz_json["phase"], "bulk_catchup");
+    assert_eq!(
+        readyz_json["cause"],
+        serde_json::json!({ "syncing": { "lag_blocks": expected_lag } })
+    );
+
+    let metrics_text = fetch_metrics_text(client, ops_addr).await?;
+    for metric_name in [
+        "zinder_ingest_construction_loaded_height",
+        "zinder_ingest_construction_target_height",
+    ] {
+        assert!(
+            metrics_text
+                .lines()
+                .any(|line| line.starts_with(&format!("# HELP {metric_name} "))),
+            "missing HELP for {metric_name} in:\n{metrics_text}"
+        );
+    }
+    assert_eq!(
+        prometheus_gauge_sample(&metrics_text, "zinder_ingest_construction_loaded_height")?,
+        f64::from(expected_current)
+    );
+    assert_eq!(
+        prometheus_gauge_sample(&metrics_text, "zinder_ingest_construction_target_height")?,
+        f64::from(expected_target)
+    );
+    assert_eq!(
+        prometheus_gauge_sample(&metrics_text, "zinder_readiness_sync_lag_blocks")?,
+        f64::from(expected_current.abs_diff(expected_target))
+    );
+    Ok(())
+}
+
+async fn wait_for_ready_follow(
+    client: &reqwest::Client,
+    ops_addr: SocketAddr,
+    expected_tip: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = fetch_readyz_json(client, ops_addr).await?;
+        if status == 200
+            && body["status"] == "ready"
+            && body["phase"] == "following_tip"
+            && body["current_height"] == expected_tip
+            && body["target_height"] == expected_tip
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for following_tip readyz: {body}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn gated_construction_writer_config(
+    storage_path: std::path::PathBuf,
+    activations: Arc<NetworkUpgradeActivations>,
+    tree_hashing_workers: u32,
+) -> Result<CanonicalWriterConfig, Box<dyn std::error::Error>> {
+    let mut config = multi_block_writer_config(storage_path, activations, false);
+    config.construction.request_timeout = Duration::from_secs(30);
+    config
+        .construction
+        .pipeline_limits
+        .source_segment_max_blocks =
+        NonZeroU32::new(3).ok_or("segment max blocks must be non-zero")?;
+    config
+        .construction
+        .pipeline_limits
+        .source_fetch_max_in_flight_requests =
+        NonZeroU32::new(1).ok_or("in-flight requests must be non-zero")?;
+    config.construction.pipeline_limits.tree_hashing_workers =
+        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
+    Ok(config)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_construction_reports_live_progress_on_readyz_and_metrics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let source =
+        GatedConstructionSource::new(MultiBlockConstructionSource::build(10, &activations)?);
+    let temporary = TempDir::new()?;
+    let config = gated_construction_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        1,
+    )?;
+    let readiness = Readiness::default();
+    let composed = ComposedReadiness::new(readiness.clone(), &[]);
+    let (ops_addr, ops_handle) = spawn_ingest_ops_endpoint(readiness).await?;
+    let client = reqwest::Client::new();
+
+    let admission_task = tokio::spawn({
+        let source = source.clone();
+        let activations = Arc::clone(&activations);
+        let config = config.clone();
+        let composed = composed.clone();
+        async move {
+            admit_canonical_store(
+                &source,
+                activations,
+                &config,
+                &composed,
+                &CancellationToken::new(),
+            )
+            .await
+        }
+    });
+
+    assert_construction_stage(&client, ops_addr, 0, 9).await?;
+    source.allow_through(3);
+    assert_construction_stage(&client, ops_addr, 3, 9).await?;
+    source.allow_through(6);
+    assert_construction_stage(&client, ops_addr, 6, 9).await?;
+    source.allow_through(9);
+    let store = admission_task.await??;
+    assert_construction_stage(&client, ops_addr, 9, 9).await?;
+
+    let follow_cancel = CancellationToken::new();
+    let follow_task = tokio::spawn({
+        let source = source.clone();
+        let follow = config.follow.clone();
+        let composed = composed.clone();
+        let follow_cancel = follow_cancel.clone();
+        async move {
+            follow_admitted_canonical_store(store, &source, follow, &composed, &follow_cancel, None)
+                .await
+        }
+    });
+    wait_for_ready_follow(&client, ops_addr, 10).await?;
+
+    let metrics_text = fetch_metrics_text(&client, ops_addr).await?;
+    assert_eq!(
+        prometheus_gauge_sample(&metrics_text, "zinder_ingest_construction_loaded_height")?,
+        9.0
+    );
+    assert_eq!(
+        prometheus_gauge_sample(&metrics_text, "zinder_ingest_construction_target_height")?,
+        9.0
+    );
+    assert_eq!(
+        prometheus_gauge_sample(&metrics_text, "zinder_readiness_sync_lag_blocks")?,
+        0.0
+    );
+
+    follow_cancel.cancel();
+    follow_task.await??;
+    ops_handle.shutdown().await?;
+    Ok(())
+}
+
+async fn wait_for_composed_progress(
+    composed: &ComposedReadiness,
+    expected_current: u32,
+    expected_target: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let report = composed.runtime_readiness().report();
+        if report.current_height == Some(expected_current)
+            && report.target_height == Some(expected_target)
+        {
+            assert!(!report.is_ready);
+            assert_eq!(report.phase, Some(IngestPhase::BulkCatchup));
+            assert_eq!(
+                report.cause,
+                ReadinessCause::Syncing {
+                    lag_blocks: Some(u64::from(expected_target.saturating_sub(expected_current))),
+                    wait_reason: None,
+                }
+            );
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for readiness progress {expected_current}/{expected_target}; last={report:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_construction_with_tree_hashing_workers_and_checkpoint_advances_readiness_lag()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let source =
+        GatedConstructionSource::new(MultiBlockConstructionSource::build(10, &activations)?);
+    let temporary = TempDir::new()?;
+    let mut config = gated_construction_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        4,
+    )?;
+    config.checkpoint_height = Some(BlockHeight::new(2));
+    let composed = ComposedReadiness::new(Readiness::default(), &[]);
+
+    let admission_task = tokio::spawn({
+        let source = source.clone();
+        let activations = Arc::clone(&activations);
+        let composed = composed.clone();
+        async move {
+            admit_canonical_store(
+                &source,
+                activations,
+                &config,
+                &composed,
+                &CancellationToken::new(),
+            )
+            .await
+        }
+    });
+
+    wait_for_composed_progress(&composed, 2, 9).await?;
+    source.allow_through(5);
+    wait_for_composed_progress(&composed, 5, 9).await?;
+    source.allow_through(9);
+    let store = admission_task.await??;
+    wait_for_composed_progress(&composed, 9, 9).await?;
+    assert_eq!(
+        store.event_fence().visible_tip().height,
+        BlockHeight::new(9)
+    );
     Ok(())
 }

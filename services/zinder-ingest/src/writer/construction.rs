@@ -1,5 +1,6 @@
 //! Fresh canonical construction from one ordered node-source pass.
 
+pub(crate) mod progress;
 pub(crate) mod source_fetch;
 mod tree_hashing;
 pub(crate) mod watermark;
@@ -44,6 +45,7 @@ use crate::{
     chain_ingest::IngestError,
     subtree_verification::SubtreeVerificationObservation,
 };
+use progress::ConstructionProgress;
 use source_fetch::{
     CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
 };
@@ -450,6 +452,7 @@ where
         source,
         config,
         &CancellationToken::new(),
+        None,
     ))
     .await
 }
@@ -459,6 +462,7 @@ async fn load_fresh_canonical_blocks_until_cancelled<Source>(
     source: &Source,
     config: &CanonicalConstructionConfig,
     cancel: &CancellationToken,
+    progress: Option<ConstructionProgress>,
 ) -> Result<CanonicalBlockLoadOutcome, CanonicalConstructionError>
 where
     Source: NodeSource + Clone,
@@ -467,6 +471,7 @@ where
     register_prohibited_read_metrics();
     let build_plan = builder.build_plan().clone();
     validate_construction_identity(&build_plan, config)?;
+    let progress = progress.unwrap_or_else(|| ConstructionProgress::start(&build_plan, None));
     let block_queue_capacity =
         usize::try_from(config.pipeline_limits.block_prepare_concurrency.get())
             .unwrap_or(usize::MAX)
@@ -483,6 +488,7 @@ where
             checkpoint_selection,
             tree_hashing_workers: config.pipeline_limits.tree_hashing_workers,
             cancel: cancel.clone(),
+            progress,
         },
     )
     .await?;
@@ -610,6 +616,7 @@ where
         source,
         config,
         &CancellationToken::new(),
+        None,
     ))
     .await
 }
@@ -624,12 +631,14 @@ pub(crate) async fn load_fresh_canonical_until_cancelled<Source>(
     source: &Source,
     config: &CanonicalConstructionConfig,
     cancel: &CancellationToken,
+    progress: Option<ConstructionProgress>,
 ) -> Result<CanonicalSourceLoadOutcome, CanonicalConstructionError>
 where
     Source: NodeSource + Clone,
 {
     let block_outcome =
-        load_fresh_canonical_blocks_until_cancelled(builder, source, config, cancel).await?;
+        load_fresh_canonical_blocks_until_cancelled(builder, source, config, cancel, progress)
+            .await?;
     cancel
         .run_until_cancelled(load_fresh_canonical_source_families(
             block_outcome,
@@ -884,6 +893,14 @@ struct BlockLoaderSettings {
     checkpoint_selection: Option<TreeStateCheckpointSelection>,
     tree_hashing_workers: NonZeroU32,
     cancel: CancellationToken,
+    progress: ConstructionProgress,
+}
+
+struct BuildBlockReceiverConfig {
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    checkpoint_selection: Option<TreeStateCheckpointSelection>,
+    cancel: CancellationToken,
+    progress: ConstructionProgress,
 }
 
 async fn drive_block_loader<PreparedBlocks>(
@@ -900,53 +917,18 @@ where
         checkpoint_selection,
         tree_hashing_workers,
         cancel,
+        progress,
     } = settings;
     let tree_hashers = TreeHashers::start(tree_hashing_workers, tokio::runtime::Handle::current())?;
-    let predecessor = builder.build_plan().history_predecessor();
-    let predecessor_tip_metadata = predecessor.tip_metadata();
-    let commitment_tree_accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
-        predecessor.block_id.height,
-        &predecessor.frontiers,
-        &network_upgrade_activations,
-    )
-    .map_err(|source| CanonicalConstructionError::CommitmentTreeState {
-        height: predecessor.block_id.height,
-        source,
-    })?;
-    let workload = builder.workload();
-    let build_tip_height = builder.build_plan().build_tip().height;
     let (block_sender, block_receiver) = mpsc::channel(block_queue_capacity);
-    let loader_cancel = cancel.clone();
+    let receiver_config = BuildBlockReceiverConfig {
+        network_upgrade_activations,
+        checkpoint_selection,
+        cancel: cancel.clone(),
+        progress,
+    };
     let loader_task = tokio::task::spawn_blocking(move || {
-        let mut builder = builder;
-        let mut build_blocks = CanonicalBuildBlockReceiver {
-            receiver: block_receiver,
-            active_memory_permit: None,
-            running_tree_sizes: CommitmentTreeSizes::from_tip_metadata(predecessor_tip_metadata),
-            commitment_tree_accumulator,
-            derived_subtree_roots: Vec::new(),
-            workload,
-            build_tip_height,
-            checkpoint_selection,
-            checkpoint_tree_sizes: predecessor_tip_metadata,
-            cancel: loader_cancel,
-            stage_timers: BlockLoaderStageTimers::register(workload),
-            tree_hashers,
-        };
-        let evidence = builder
-            .bulk_load_blocks(&network_upgrade_activations, &mut build_blocks)
-            .map_err(canonical_build_error)?;
-        builder.record_resource_gauges();
-        let mut derived_subtree_roots = std::mem::take(&mut build_blocks.derived_subtree_roots);
-        drop(build_blocks);
-        // Blocks complete different pools' subtrees in any order, while the
-        // node's ranges and the store's keys list one pool after another.
-        derived_subtree_roots.sort_by_key(|root| (root.protocol.id(), root.subtree_index.value()));
-        Ok(CanonicalBlockLoadOutcome {
-            builder,
-            evidence,
-            derived_subtree_roots,
-        })
+        run_block_loader(builder, block_receiver, tree_hashers, receiver_config)
     });
 
     let forwarded = cancel
@@ -968,6 +950,61 @@ where
     loaded.map_err(|source| CanonicalConstructionError::LoaderTaskFailed {
         reason: source.to_string(),
     })?
+}
+
+fn run_block_loader(
+    mut builder: RocksDbCanonicalBuilder,
+    block_receiver: mpsc::Receiver<Result<QueuedPreparedBlock, CanonicalConstructionError>>,
+    tree_hashers: Option<TreeHashers>,
+    receiver_config: BuildBlockReceiverConfig,
+) -> Result<CanonicalBlockLoadOutcome, CanonicalConstructionError> {
+    let predecessor = builder.build_plan().history_predecessor();
+    let predecessor_tip_metadata = predecessor.tip_metadata();
+    let commitment_tree_accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+        predecessor.block_id.height,
+        &predecessor.frontiers,
+        &receiver_config.network_upgrade_activations,
+    )
+    .map_err(|source| CanonicalConstructionError::CommitmentTreeState {
+        height: predecessor.block_id.height,
+        source,
+    })?;
+    let workload = builder.workload();
+    let build_tip_height = builder.build_plan().build_tip().height;
+    let mut build_blocks = CanonicalBuildBlockReceiver {
+        receiver: block_receiver,
+        active_memory_permit: None,
+        running_tree_sizes: CommitmentTreeSizes::from_tip_metadata(predecessor_tip_metadata),
+        commitment_tree_accumulator,
+        derived_subtree_roots: Vec::new(),
+        workload,
+        build_tip_height,
+        checkpoint_selection: receiver_config.checkpoint_selection,
+        checkpoint_tree_sizes: predecessor_tip_metadata,
+        cancel: receiver_config.cancel,
+        stage_timers: BlockLoaderStageTimers::register(workload),
+        tree_hashers,
+        in_flight_store_height: None,
+        progress: receiver_config.progress,
+    };
+    let evidence = builder
+        .bulk_load_blocks(
+            &receiver_config.network_upgrade_activations,
+            &mut build_blocks,
+        )
+        .map_err(canonical_build_error)?;
+    build_blocks.progress.finish();
+    builder.record_resource_gauges();
+    let mut derived_subtree_roots = std::mem::take(&mut build_blocks.derived_subtree_roots);
+    drop(build_blocks);
+    // Blocks complete different pools' subtrees in any order, while the
+    // node's ranges and the store's keys list one pool after another.
+    derived_subtree_roots.sort_by_key(|root| (root.protocol.id(), root.subtree_index.value()));
+    Ok(CanonicalBlockLoadOutcome {
+        builder,
+        evidence,
+        derived_subtree_roots,
+    })
 }
 
 async fn forward_prepared_blocks<PreparedBlocks>(
@@ -999,6 +1036,8 @@ struct CanonicalBuildBlockReceiver {
     stage_timers: BlockLoaderStageTimers,
     /// Hashing threads, or `None` when the loader hashes on its own thread.
     tree_hashers: Option<TreeHashers>,
+    in_flight_store_height: Option<BlockHeight>,
+    progress: ConstructionProgress,
 }
 
 /// Per-block durations of the serial loader, resolved once per construction.
@@ -1047,13 +1086,18 @@ impl Iterator for CanonicalBuildBlockReceiver {
     )]
     fn next(&mut self) -> Option<Self::Item> {
         self.active_memory_permit = None;
+        self.record_staged_block();
         if self.tree_hashers.is_some() {
             return self.next_hashed_ahead();
         }
         match self.receive(true) {
             Received::Block(queued_block) => {
                 self.active_memory_permit = Some(queued_block.memory_permit);
-                Some(self.build_block(queued_block.prepared))
+                let built = self.build_block(queued_block.prepared);
+                if let Ok(block) = &built {
+                    self.in_flight_store_height = Some(block.facts.block_header.height);
+                }
+                Some(built)
             }
             Received::Failed(source) => Some(Err(source)),
             Received::Empty | Received::Closed => self
@@ -1075,12 +1119,30 @@ enum Received {
 }
 
 impl CanonicalBuildBlockReceiver {
+    /// Advances construction progress for the block just staged into the store.
+    fn record_staged_block(&mut self) {
+        if let Some(height) = self.in_flight_store_height.take()
+            && !self.cancel.is_cancelled()
+        {
+            self.progress.record_loaded(height);
+        }
+    }
+
     /// Takes the next prepared block, waiting for one only when `wait` is
     /// set.
     fn receive(&mut self, wait: bool) -> Received {
         let received = if wait {
             let wait_started_at = Instant::now();
-            let received = self.receiver.blocking_recv();
+            let received = match self.receiver.try_recv() {
+                Ok(received) => Some(received),
+                Err(TryRecvError::Disconnected) => None,
+                Err(TryRecvError::Empty) => {
+                    if !self.cancel.is_cancelled() {
+                        self.progress.flush_pending();
+                    }
+                    self.receiver.blocking_recv()
+                }
+            };
             if matches!(received, Some(Ok(_))) {
                 self.stage_timers
                     .receive_wait
@@ -1134,7 +1196,11 @@ impl CanonicalBuildBlockReceiver {
                 .is_cancelled()
                 .then_some(Err(CanonicalConstructionError::Cancelled));
         };
-        Some(pending.and_then(|pending| self.finish_block(pending)))
+        let built = pending.and_then(|pending| self.finish_block(pending));
+        if let Ok(block) = &built {
+            self.in_flight_store_height = Some(block.facts.block_header.height);
+        }
+        Some(built)
     }
 
     /// Appends and positions one block, and starts deriving its checkpoint
