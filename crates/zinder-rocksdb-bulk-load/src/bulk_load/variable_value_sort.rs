@@ -1766,10 +1766,12 @@ struct SharedMemoryTracker {
     active_bytes: AtomicU64,
     peak_bytes: AtomicU64,
     in_flight_work: AtomicU64,
-    publish_epoch: AtomicU64,
+    transition_epoch: AtomicU64,
     waiters: AtomicU64,
     wait_lock: Mutex<()>,
     reclaimed: Condvar,
+    #[cfg(test)]
+    hook: Option<std::sync::Arc<dyn ReclaimRaceHook>>,
 }
 
 impl SharedMemoryTracker {
@@ -1781,10 +1783,12 @@ impl SharedMemoryTracker {
             active_bytes: AtomicU64::new(0),
             peak_bytes: AtomicU64::new(0),
             in_flight_work: AtomicU64::new(0),
-            publish_epoch: AtomicU64::new(0),
+            transition_epoch: AtomicU64::new(0),
             waiters: AtomicU64::new(0),
             wait_lock: Mutex::new(()),
             reclaimed: Condvar::new(),
+            #[cfg(test)]
+            hook: None,
         }
     }
 
@@ -1830,12 +1834,15 @@ impl SharedMemoryTracker {
     }
 
     fn release_bytes(&self, bytes: u64) {
-        self.active_bytes.fetch_sub(bytes, Ordering::SeqCst);
+        if bytes > 0 {
+            self.active_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            self.transition_epoch.fetch_add(1, Ordering::SeqCst);
+        }
         self.notify_waiters();
     }
 
-    fn record_publish(&self) {
-        self.publish_epoch.fetch_add(1, Ordering::SeqCst);
+    fn record_transition(&self) {
+        self.transition_epoch.fetch_add(1, Ordering::SeqCst);
         self.notify_waiters();
     }
 
@@ -1900,12 +1907,25 @@ impl<'tracker> InFlightMemoryGuard<'tracker> {
         let excess = self.bytes.saturating_sub(consumed_bytes);
         self.bytes = 0;
         self.active = false;
+        if excess > 0 {
+            self.tracker
+                .active_bytes
+                .fetch_sub(excess, Ordering::SeqCst);
+            self.tracker.transition_epoch.fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            if self.count_in_flight
+                && let Some(hook) = &self.tracker.hook
+            {
+                hook.on_after_guard_bytes_released(
+                    self.tracker.active_bytes.load(Ordering::SeqCst),
+                    self.tracker.in_flight_work.load(Ordering::SeqCst),
+                );
+            }
+        }
         if self.count_in_flight {
             self.tracker.in_flight_work.fetch_sub(1, Ordering::SeqCst);
         }
-        if excess > 0 {
-            self.tracker.release_bytes(excess);
-        } else if self.count_in_flight {
+        if excess > 0 || self.count_in_flight {
             self.tracker.notify_waiters();
         }
     }
@@ -1917,10 +1937,29 @@ impl Drop for InFlightMemoryGuard<'_> {
             return;
         }
         self.active = false;
+        let released = self.bytes;
+        self.bytes = 0;
+        if released > 0 {
+            self.tracker
+                .active_bytes
+                .fetch_sub(released, Ordering::SeqCst);
+            self.tracker.transition_epoch.fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            if self.count_in_flight
+                && let Some(hook) = &self.tracker.hook
+            {
+                hook.on_after_guard_bytes_released(
+                    self.tracker.active_bytes.load(Ordering::SeqCst),
+                    self.tracker.in_flight_work.load(Ordering::SeqCst),
+                );
+            }
+        }
         if self.count_in_flight {
             self.tracker.in_flight_work.fetch_sub(1, Ordering::SeqCst);
         }
-        self.tracker.release_bytes(self.bytes);
+        if released > 0 || self.count_in_flight {
+            self.tracker.notify_waiters();
+        }
     }
 }
 
@@ -2225,15 +2264,18 @@ impl<const KEY_LEN: usize> Default for PartitionState<KEY_LEN> {
 }
 
 impl<const KEY_LEN: usize> PartitionState<KEY_LEN> {
-    fn take_pending_flush(
+    fn take_pending_flush_with_guard<'tracker>(
         &mut self,
-    ) -> Result<Option<(PartitionBatch<KEY_LEN>, u64)>, BulkLoadError> {
+        memory: &'tracker SharedMemoryTracker,
+    ) -> Result<Option<(PartitionBatch<KEY_LEN>, u64, InFlightMemoryGuard<'tracker>)>, BulkLoadError>
+    {
         if self.staging.is_empty() {
             return Ok(None);
         }
         let run_index = self.allocate_run_index()?;
+        let guard = InFlightMemoryGuard::new(memory, self.staging.accounted_bytes, true);
         let taken = std::mem::take(&mut self.staging);
-        Ok(Some((taken, run_index)))
+        Ok(Some((taken, run_index, guard)))
     }
 
     fn allocate_run_index(&mut self) -> Result<u64, BulkLoadError> {
@@ -2266,16 +2308,26 @@ struct FlushedPartitionOutput<const KEY_LEN: usize> {
     final_run_file_bytes: u64,
 }
 
-enum BucketAdmission<const KEY_LEN: usize> {
-    Admitted(u64),
-    FlushPartition(PartitionBatch<KEY_LEN>, u64),
+enum BucketAdmission<'tracker, const KEY_LEN: usize> {
+    Moved(u64),
+    Appended,
+    FlushPartition(PartitionBatch<KEY_LEN>, u64, InFlightMemoryGuard<'tracker>),
     SpillBucket(u64),
 }
 
 #[cfg(test)]
 trait ReclaimRaceHook: Send + Sync {
-    fn on_before_publish(&self);
-    fn on_after_empty_scan(&self);
+    fn on_before_publish(&self) {}
+    fn on_after_empty_scan(&self, _in_flight_work: u64) {}
+    fn on_after_flush_detach(&self) {}
+    fn on_after_guard_bytes_released(&self, _active_bytes: u64, _in_flight_work: u64) {}
+    fn on_after_bucket_append(
+        &self,
+        _staging_allocated_bytes: u64,
+        _bucket_allocated_bytes: u64,
+        _active_bytes: u64,
+    ) {
+    }
 }
 
 fn default_per_shard_merge_fan_in(shards_usize: usize, total_fan_in: usize) -> usize {
@@ -2310,8 +2362,6 @@ pub struct ShardedKeyPrefixSorter<const KEY_LEN: usize> {
     memory: SharedMemoryTracker,
     temporary_files: SharedTempFileBudget,
     partitions: Vec<Mutex<PartitionState<KEY_LEN>>>,
-    #[cfg(test)]
-    reclaim_race_hook: Option<std::sync::Arc<dyn ReclaimRaceHook>>,
 }
 
 impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
@@ -2391,9 +2441,12 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
             memory: SharedMemoryTracker::new(budget.max_accounted_memory_bytes, budget.shard_count),
             temporary_files: SharedTempFileBudget::new(budget.max_temporary_file_bytes),
             partitions,
-            #[cfg(test)]
-            reclaim_race_hook: None,
         })
+    }
+
+    #[cfg(test)]
+    fn set_reclaim_race_hook(&mut self, hook: std::sync::Arc<dyn ReclaimRaceHook>) {
+        self.memory.hook = Some(hook);
     }
 
     /// Returns the number of disjoint key-prefix shards.
@@ -2543,7 +2596,7 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
         record_bytes: u64,
     ) -> Result<InFlightMemoryGuard<'_>, BulkLoadError> {
         loop {
-            let epoch_before_scan = self.memory.publish_epoch.load(Ordering::SeqCst);
+            let epoch_before_scan = self.memory.transition_epoch.load(Ordering::SeqCst);
             let mut drained_any = false;
             for shard_idx in 0..self.partitions.len() {
                 if self.flush_partition_if_nonempty(shard_idx)? {
@@ -2557,10 +2610,10 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
                 continue;
             }
             #[cfg(test)]
-            if let Some(hook) = &self.reclaim_race_hook {
-                hook.on_after_empty_scan();
+            if let Some(hook) = &self.memory.hook {
+                hook.on_after_empty_scan(self.memory.in_flight_work.load(Ordering::SeqCst));
             }
-            if self.memory.publish_epoch.load(Ordering::SeqCst) != epoch_before_scan {
+            if self.memory.transition_epoch.load(Ordering::SeqCst) != epoch_before_scan {
                 continue;
             }
             let _waiter = WaiterGuard::new(&self.memory.waiters);
@@ -2568,11 +2621,11 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
             if self.memory.try_reserve_bytes(record_bytes) {
                 return Ok(InFlightMemoryGuard::new(&self.memory, record_bytes, true));
             }
-            if self.memory.publish_epoch.load(Ordering::SeqCst) != epoch_before_scan {
+            if self.memory.transition_epoch.load(Ordering::SeqCst) != epoch_before_scan {
                 continue;
             }
             if self.memory.in_flight_work.load(Ordering::SeqCst) == 0 {
-                if self.memory.publish_epoch.load(Ordering::SeqCst) != epoch_before_scan {
+                if self.memory.transition_epoch.load(Ordering::SeqCst) != epoch_before_scan {
                     continue;
                 }
                 return Err(BulkLoadError::AccountedMemoryLimit {
@@ -2625,7 +2678,7 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
     ) -> Result<(), BulkLoadError> {
         let (key, encoded_value, record_bytes) = record;
         #[cfg(test)]
-        if let Some(hook) = &self.reclaim_race_hook {
+        if let Some(hook) = &self.memory.hook {
             hook.on_before_publish();
         }
         loop {
@@ -2669,24 +2722,89 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
                             BulkLoadError::invalid("sharded record count exceeds u64::MAX")
                         })?;
                     drop(partition);
-                    self.memory.record_publish();
+                    self.memory.record_transition();
                     reservation.commit_and_release_excess(charged);
                     return Ok(());
                 }
-                partition.take_pending_flush()?
+                partition.take_pending_flush_with_guard(&self.memory)?
             };
-            if let Some((batch, run_index)) = pending {
-                self.flush_taken_batch(shard_idx, batch, run_index)?;
+            if let Some((batch, run_index, flush_guard)) = pending {
+                self.flush_taken_batch_with_guard(shard_idx, batch, run_index, flush_guard)?;
             }
         }
+    }
+
+    #[cfg(test)]
+    fn record_bucket_append_hook(
+        &self,
+        staging: &PartitionBatch<KEY_LEN>,
+        bucket: &PartitionBatch<KEY_LEN>,
+    ) -> Result<(), BulkLoadError> {
+        if let Some(hook) = &self.memory.hook {
+            let staging_alloc = staging.allocated_bytes()?;
+            let bucket_alloc = bucket.allocated_bytes()?;
+            hook.on_after_bucket_append(
+                staging_alloc,
+                bucket_alloc,
+                self.memory.active_bytes.load(Ordering::SeqCst),
+            );
+        }
+        Ok(())
+    }
+
+    fn try_reserve_and_append_bucket(
+        &self,
+        partition: &mut PartitionState<KEY_LEN>,
+        bucket: &mut PartitionBatch<KEY_LEN>,
+        min_needed: u64,
+    ) -> Result<bool, BulkLoadError> {
+        if min_needed == 0 {
+            let mut charged = 0_u64;
+            partition
+                .staging
+                .append_batch_within(bucket, 0, &mut charged)?;
+            #[cfg(test)]
+            self.record_bucket_append_hook(&partition.staging, bucket)?;
+            return Ok(true);
+        }
+        // Reserve destination growth separately while the source bucket's
+        // reservation keeps covering `bucket` until `drop(bucket)`.
+        if !self.memory.try_reserve_bytes(min_needed) {
+            return Ok(false);
+        }
+        let mut dest_guard = InFlightMemoryGuard::new(&self.memory, min_needed, false);
+        let partition_headroom = self
+            .memory
+            .per_partition_bytes
+            .saturating_sub(partition.staging.accounted_bytes.saturating_add(min_needed));
+        let desired_slack = partition
+            .staging
+            .desired_growth_slack(bucket.staged_records.len(), bucket.encoded_values.len())
+            .min(partition_headroom);
+        if desired_slack > 0 {
+            let extra = self.memory.try_reserve_up_to(desired_slack);
+            dest_guard.add_bytes(extra);
+        }
+        let mut charged = 0_u64;
+        if let Err(error) =
+            partition
+                .staging
+                .append_batch_within(bucket, dest_guard.bytes, &mut charged)
+        {
+            dest_guard.consume_bytes(charged);
+            return Err(error);
+        }
+        dest_guard.commit_and_release_excess(charged);
+        #[cfg(test)]
+        self.record_bucket_append_hook(&partition.staging, bucket)?;
+        Ok(true)
     }
 
     fn try_admit_bucket_to_partition(
         &self,
         shard_idx: usize,
         bucket: &mut PartitionBatch<KEY_LEN>,
-        reservation: &mut InFlightMemoryGuard<'_>,
-    ) -> Result<BucketAdmission<KEY_LEN>, BulkLoadError> {
+    ) -> Result<BucketAdmission<'_, KEY_LEN>, BulkLoadError> {
         let batch_records = u64::try_from(bucket.staged_records.len())
             .map_err(|_| BulkLoadError::invalid("bucket record count exceeds u64::MAX"))?;
         let mut partition = self.partitions[shard_idx].lock();
@@ -2698,48 +2816,32 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
                 .record_count
                 .checked_add(batch_records)
                 .ok_or_else(|| BulkLoadError::invalid("sharded record count exceeds u64::MAX"))?;
-            return Ok(BucketAdmission::Admitted(moved));
+            drop(partition);
+            return Ok(BucketAdmission::Moved(moved));
         }
         let min_needed = partition
             .staging
             .min_growth_bytes(bucket.staged_records.len(), bucket.encoded_values.len())?;
         if partition.staging.accounted_bytes.saturating_add(min_needed)
             <= self.memory.per_partition_bytes
+            && self.try_reserve_and_append_bucket(&mut partition, bucket, min_needed)?
         {
-            let partition_headroom = self
-                .memory
-                .per_partition_bytes
-                .saturating_sub(partition.staging.accounted_bytes.saturating_add(min_needed));
-            let desired_slack = partition
-                .staging
-                .desired_growth_slack(bucket.staged_records.len(), bucket.encoded_values.len())
-                .min(partition_headroom);
-            let target_growth = min_needed.saturating_add(desired_slack);
-            if target_growth > reservation.bytes {
-                let extra = self
-                    .memory
-                    .try_reserve_up_to(target_growth.saturating_sub(reservation.bytes));
-                reservation.add_bytes(extra);
-            }
-            let max_growth = target_growth.min(reservation.bytes);
-            let mut charged = 0_u64;
-            if let Err(error) =
-                partition
-                    .staging
-                    .append_batch_within(bucket, max_growth, &mut charged)
-            {
-                drop(partition);
-                reservation.consume_bytes(charged);
-                return Err(error);
-            }
             partition.record_count = partition
                 .record_count
                 .checked_add(batch_records)
                 .ok_or_else(|| BulkLoadError::invalid("sharded record count exceeds u64::MAX"))?;
-            return Ok(BucketAdmission::Admitted(charged));
+            drop(partition);
+            return Ok(BucketAdmission::Appended);
         }
-        if let Some((batch, run_index)) = partition.take_pending_flush()? {
-            return Ok(BucketAdmission::FlushPartition(batch, run_index));
+        if let Some((batch, run_index, flush_guard)) =
+            partition.take_pending_flush_with_guard(&self.memory)?
+        {
+            drop(partition);
+            return Ok(BucketAdmission::FlushPartition(
+                batch,
+                run_index,
+                flush_guard,
+            ));
         }
         let run_index = partition.allocate_run_index()?;
         partition.record_count = partition
@@ -2758,17 +2860,23 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
         if bucket.is_empty() {
             return Ok(());
         }
-        let mut reservation = InFlightMemoryGuard::new(&self.memory, bucket.accounted_bytes, true);
+        let reservation = InFlightMemoryGuard::new(&self.memory, bucket.accounted_bytes, true);
         loop {
-            match self.try_admit_bucket_to_partition(shard_idx, &mut bucket, &mut reservation)? {
-                BucketAdmission::Admitted(consumed) => {
+            match self.try_admit_bucket_to_partition(shard_idx, &mut bucket)? {
+                BucketAdmission::Moved(moved) => {
                     drop(bucket);
-                    self.memory.record_publish();
-                    reservation.commit_and_release_excess(consumed);
+                    self.memory.record_transition();
+                    reservation.commit_and_release_excess(moved);
                     return Ok(());
                 }
-                BucketAdmission::FlushPartition(batch, run_index) => {
-                    self.flush_taken_batch(shard_idx, batch, run_index)?;
+                BucketAdmission::Appended => {
+                    drop(bucket);
+                    self.memory.record_transition();
+                    drop(reservation);
+                    return Ok(());
+                }
+                BucketAdmission::FlushPartition(batch, run_index, flush_guard) => {
+                    self.flush_taken_batch_with_guard(shard_idx, batch, run_index, flush_guard)?;
                 }
                 BucketAdmission::SpillBucket(run_index) => {
                     return self.flush_taken_batch_with_guard(
@@ -2785,23 +2893,17 @@ impl<const KEY_LEN: usize> ShardedKeyPrefixSorter<KEY_LEN> {
     fn flush_partition_if_nonempty(&self, shard_idx: usize) -> Result<bool, BulkLoadError> {
         let pending = {
             let mut partition = self.partitions[shard_idx].lock();
-            partition.take_pending_flush()?
+            partition.take_pending_flush_with_guard(&self.memory)?
         };
-        let Some((batch, run_index)) = pending else {
+        let Some((batch, run_index, flush_guard)) = pending else {
             return Ok(false);
         };
-        self.flush_taken_batch(shard_idx, batch, run_index)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.memory.hook {
+            hook.on_after_flush_detach();
+        }
+        self.flush_taken_batch_with_guard(shard_idx, batch, run_index, flush_guard)?;
         Ok(true)
-    }
-
-    fn flush_taken_batch(
-        &self,
-        shard_idx: usize,
-        batch: PartitionBatch<KEY_LEN>,
-        run_index: u64,
-    ) -> Result<(), BulkLoadError> {
-        let guard = InFlightMemoryGuard::new(&self.memory, batch.accounted_bytes, true);
-        self.flush_taken_batch_with_guard(shard_idx, batch, run_index, guard)
     }
 
     fn flush_taken_batch_with_guard(
@@ -3178,9 +3280,11 @@ fn flush_tail_batch<const KEY_LEN: usize>(
     temporary_files: &SharedTempFileBudget,
 ) -> Result<Duration, BulkLoadError> {
     let flush_started = Instant::now();
-    let Some((batch, run_index)) = partition.take_pending_flush()? else {
+    if partition.staging.is_empty() {
         return Ok(Duration::ZERO);
-    };
+    }
+    let run_index = partition.allocate_run_index()?;
+    let batch = std::mem::take(&mut partition.staging);
     let run = write_batch_to_run(workspace.path(), run_index, batch, temporary_files)?;
     partition.runs.push(run);
     partition.initial_run_count = partition
@@ -4589,7 +4693,7 @@ mod tests {
             }
         }
 
-        fn on_after_empty_scan(&self) {
+        fn on_after_empty_scan(&self, _in_flight_work: u64) {
             if !self.scan_gated.swap(true, Ordering::SeqCst) {
                 self.scanned_barrier.wait();
                 self.after_publish_barrier.wait();
@@ -4618,7 +4722,7 @@ mod tests {
             global_limit,
             64_000,
         )?;
-        sorter.reclaim_race_hook = Some(std::sync::Arc::clone(&hook) as _);
+        sorter.set_reclaim_race_hook(std::sync::Arc::clone(&hook) as _);
 
         thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
             let sorter_ref = &sorter;
@@ -4699,6 +4803,289 @@ mod tests {
             }
         }
         assert_eq!(count, 5);
+        Ok(())
+    }
+
+    struct BucketAppendPeakHook {
+        calls: AtomicU64,
+        observed_combined: AtomicU64,
+        observed_active: AtomicU64,
+    }
+
+    impl ReclaimRaceHook for BucketAppendPeakHook {
+        fn on_after_bucket_append(
+            &self,
+            staging_allocated_bytes: u64,
+            bucket_allocated_bytes: u64,
+            active_bytes: u64,
+        ) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let combined = staging_allocated_bytes.saturating_add(bucket_allocated_bytes);
+            self.observed_combined.fetch_max(combined, Ordering::SeqCst);
+            self.observed_active
+                .fetch_max(active_bytes, Ordering::SeqCst);
+        }
+    }
+
+    fn make_exact_preaccounted_bucket<const KEY_LEN: usize>(
+        sorter: &ShardedKeyPrefixSorter<KEY_LEN>,
+        key: [u8; KEY_LEN],
+        payload: &[u8],
+    ) -> Result<PartitionBatch<KEY_LEN>, Box<dyn std::error::Error>> {
+        let mut bucket = PartitionBatch::default();
+        let min_bytes = bucket.min_growth_bytes(1, payload.len())?;
+        assert!(sorter.memory.try_reserve_bytes(min_bytes));
+        let mut charged = 0_u64;
+        bucket.push_record_within(key, payload, min_bytes, &mut charged)?;
+        assert_eq!(charged, min_bytes);
+        assert_eq!(bucket.allocated_bytes()?, min_bytes);
+        Ok(bucket)
+    }
+
+    fn assert_tight_bucket_append_flush_fallback(
+        staging_root: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let one_shard = NonZeroU32::MIN;
+        let tight_base = one_record_memory_limit::<2>(64) * 16;
+        let incoming_bytes = one_record_memory_limit::<2>(512);
+        let probe = ShardedKeyPrefixSorter::<2>::new(
+            staging_root,
+            "append-tight-probe",
+            one_shard,
+            tight_base + incoming_bytes,
+            256_000,
+        )?;
+        probe.push([0x00, 0x01], &[0x33; 64])?;
+        let staged_cap = probe.partitions[0].lock().staging.accounted_bytes;
+        drop(probe);
+
+        let exact_limit = staged_cap + incoming_bytes;
+        let tight = ShardedKeyPrefixSorter::<2>::new(
+            staging_root,
+            "append-tight-fallback",
+            one_shard,
+            exact_limit,
+            256_000,
+        )?;
+        tight.push([0x00, 0x01], &[0x33; 64])?;
+        let min_growth = tight.partitions[0]
+            .lock()
+            .staging
+            .min_growth_bytes(1, 512)?;
+        assert!(min_growth > 0);
+        assert!(staged_cap + min_growth <= tight.memory.per_partition_bytes);
+        let tight_bucket = make_exact_preaccounted_bucket(&tight, [0x00, 0x02], &[0x44; 512])?;
+        assert_eq!(
+            tight.memory.active_bytes.load(Ordering::SeqCst),
+            exact_limit
+        );
+        tight.push_preaccounted_bucket(0, tight_bucket)?;
+        assert_eq!(
+            tight.memory.active_bytes.load(Ordering::SeqCst),
+            incoming_bytes
+        );
+        let finished_tight = tight.finish()?;
+        let evidence = finished_tight.evidence();
+        assert_eq!(evidence.record_count, 2);
+        assert!(evidence.initial_run_count >= 2);
+        assert!(evidence.peak_accounted_memory_bytes <= exact_limit);
+        let mut keys = Vec::new();
+        for mut stream in finished_tight.into_shards() {
+            while let Some(record) = stream.next_record()? {
+                keys.push(record.key);
+            }
+        }
+        assert_eq!(keys, vec![[0x00, 0x01], [0x00, 0x02]]);
+        Ok(())
+    }
+
+    #[test]
+    fn sharded_key_prefix_sorter_accounts_for_intermediate_bucket_append_peak()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(2).ok_or("nonzero shards")?;
+        let r_large = one_record_memory_limit::<2>(512);
+        let global_limit = r_large * 16;
+        let hook = std::sync::Arc::new(BucketAppendPeakHook {
+            calls: AtomicU64::new(0),
+            observed_combined: AtomicU64::new(0),
+            observed_active: AtomicU64::new(0),
+        });
+        let mut sorter = ShardedKeyPrefixSorter::<2>::new(
+            dir.path(),
+            "append-peak",
+            shard_count,
+            global_limit,
+            256_000,
+        )?;
+        sorter.set_reclaim_race_hook(std::sync::Arc::clone(&hook) as _);
+        sorter.push([0x00, 0x01], &[0x11; 64])?;
+        let bucket = make_exact_preaccounted_bucket(&sorter, [0x00, 0x02], &[0x22; 512])?;
+        let shard_idx = sorter.partition_index(&[0x00, 0x02]);
+        assert!(
+            sorter.partitions[shard_idx]
+                .lock()
+                .staging
+                .min_growth_bytes(1, 512)?
+                > 0
+        );
+        sorter.push_preaccounted_bucket(shard_idx, bucket)?;
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+        let combined = hook.observed_combined.load(Ordering::SeqCst);
+        let active = hook.observed_active.load(Ordering::SeqCst);
+        assert!(combined > 0);
+        assert!(combined <= active);
+        assert!(active <= global_limit);
+        assert!(sorter.memory.peak_bytes() >= combined);
+        let finished = sorter.finish()?;
+        assert_eq!(finished.evidence().record_count, 2);
+        assert!(finished.evidence().peak_accounted_memory_bytes <= global_limit);
+
+        assert_tight_bucket_append_flush_fallback(dir.path())
+    }
+
+    struct FlushDetachBarrierHook {
+        flush_gated: std::sync::atomic::AtomicBool,
+        scan_gated: std::sync::atomic::AtomicBool,
+        detached_barrier: std::sync::Barrier,
+        scanned_barrier: std::sync::Barrier,
+        observed_in_flight: AtomicU64,
+    }
+
+    impl ReclaimRaceHook for FlushDetachBarrierHook {
+        fn on_after_empty_scan(&self, in_flight_work: u64) {
+            if !self.scan_gated.swap(true, Ordering::SeqCst) {
+                self.observed_in_flight
+                    .store(in_flight_work, Ordering::SeqCst);
+                self.scanned_barrier.wait();
+            }
+        }
+
+        fn on_after_flush_detach(&self) {
+            if !self.flush_gated.swap(true, Ordering::SeqCst) {
+                self.detached_barrier.wait();
+                self.scanned_barrier.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn sharded_key_prefix_sorter_tracks_flush_in_flight_across_detach_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(2).ok_or("nonzero shards")?;
+        let r_small = one_record_memory_limit::<2>(16);
+        let global_limit = r_small * 2;
+        let hook = std::sync::Arc::new(FlushDetachBarrierHook {
+            flush_gated: std::sync::atomic::AtomicBool::new(false),
+            scan_gated: std::sync::atomic::AtomicBool::new(false),
+            detached_barrier: std::sync::Barrier::new(2),
+            scanned_barrier: std::sync::Barrier::new(2),
+            observed_in_flight: AtomicU64::new(0),
+        });
+        let mut sorter = ShardedKeyPrefixSorter::<2>::new(
+            dir.path(),
+            "flush-detach-window",
+            shard_count,
+            global_limit,
+            64_000,
+        )?;
+        sorter.push([0x00, 0x01], &[0xaa; 16])?;
+        sorter.set_reclaim_race_hook(std::sync::Arc::clone(&hook) as _);
+
+        thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let sorter_ref = &sorter;
+            let flusher = scope.spawn(move || sorter_ref.flush_partition_if_nonempty(0));
+            let hook_pusher = std::sync::Arc::clone(&hook);
+            let pusher = scope.spawn(move || -> Result<(), BulkLoadError> {
+                hook_pusher.detached_barrier.wait();
+                sorter_ref.push([0x80, 0x02], &[0xbb; 32])
+            });
+            assert!(flusher.join().map_err(|_| "flusher panicked")??);
+            pusher.join().map_err(|_| "pusher panicked")??;
+            Ok(())
+        })?;
+
+        assert!(hook.observed_in_flight.load(Ordering::SeqCst) >= 1);
+        let finished = sorter.finish()?;
+        assert_eq!(finished.evidence().record_count, 2);
+        assert!(finished.evidence().peak_accounted_memory_bytes <= global_limit);
+        Ok(())
+    }
+
+    struct GuardDropOrderHook {
+        scan_gated: std::sync::atomic::AtomicBool,
+        release_gated: std::sync::atomic::AtomicBool,
+        scanned_barrier: std::sync::Barrier,
+        after_drop_barrier: std::sync::Barrier,
+        active_at_release: AtomicU64,
+        in_flight_at_release: AtomicU64,
+    }
+
+    impl ReclaimRaceHook for GuardDropOrderHook {
+        fn on_after_empty_scan(&self, _in_flight_work: u64) {
+            if !self.scan_gated.swap(true, Ordering::SeqCst) {
+                self.scanned_barrier.wait();
+                // Wait until `drop(guard)` has completely finished and decremented
+                // `in_flight_work` to 0 so `reclaim_and_reserve` must observe `transition_epoch`.
+                self.after_drop_barrier.wait();
+            }
+        }
+
+        fn on_after_guard_bytes_released(&self, active_bytes: u64, in_flight_work: u64) {
+            if !self.release_gated.swap(true, Ordering::SeqCst) {
+                self.active_at_release.store(active_bytes, Ordering::SeqCst);
+                self.in_flight_at_release
+                    .store(in_flight_work, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn sharded_key_prefix_sorter_keeps_in_flight_registered_until_guard_releases_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let shard_count = NonZeroU32::new(2).ok_or("nonzero shards")?;
+        let global_limit = one_record_memory_limit::<2>(64);
+        let hook = std::sync::Arc::new(GuardDropOrderHook {
+            scan_gated: std::sync::atomic::AtomicBool::new(false),
+            release_gated: std::sync::atomic::AtomicBool::new(false),
+            scanned_barrier: std::sync::Barrier::new(2),
+            after_drop_barrier: std::sync::Barrier::new(2),
+            active_at_release: AtomicU64::new(u64::MAX),
+            in_flight_at_release: AtomicU64::new(0),
+        });
+        let mut sorter = ShardedKeyPrefixSorter::<2>::new(
+            dir.path(),
+            "guard-drop-order",
+            shard_count,
+            global_limit,
+            64_000,
+        )?;
+        sorter.set_reclaim_race_hook(std::sync::Arc::clone(&hook) as _);
+
+        let guard = sorter.reserve_global_memory(global_limit)?;
+        thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let hook_dropper = std::sync::Arc::clone(&hook);
+            let dropper = scope.spawn(move || {
+                hook_dropper.scanned_barrier.wait();
+                drop(guard);
+                hook_dropper.after_drop_barrier.wait();
+            });
+            let sorter_ref = &sorter;
+            let pusher = scope.spawn(|| -> Result<(), BulkLoadError> {
+                sorter_ref.push([0x80, 0x02], &[0xbb; 64])
+            });
+            dropper.join().map_err(|_| "dropper panicked")?;
+            pusher.join().map_err(|_| "pusher panicked")??;
+            Ok(())
+        })?;
+
+        assert_eq!(hook.active_at_release.load(Ordering::SeqCst), 0);
+        assert_eq!(hook.in_flight_at_release.load(Ordering::SeqCst), 1);
+        let finished = sorter.finish()?;
+        assert_eq!(finished.evidence().record_count, 1);
+        assert!(finished.evidence().peak_accounted_memory_bytes <= global_limit);
         Ok(())
     }
 }

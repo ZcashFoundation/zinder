@@ -593,80 +593,175 @@ impl RetainedUndo {
     }
 }
 
+const UNDO_KEY_VEC_MIN_INITIAL_CAP: usize = 8;
+
 struct RetainedUndoCollector {
     heights: Vec<BlockHeight>,
+    slots: Vec<Mutex<Vec<WalletAddressTransactionKey>>>,
     accounted_bytes: AtomicU64,
     peak_accounted_bytes: AtomicU64,
     max_accounted_bytes: u64,
 }
 
 impl RetainedUndoCollector {
-    fn from_retained_undo(retained: &RetainedUndo) -> Self {
-        let heights = retained
-            .records
-            .iter()
-            .map(|undo| undo.block.height)
-            .collect();
+    fn from_retained_undo(retained: &mut RetainedUndo) -> Self {
+        let mut heights = Vec::with_capacity(retained.records.len());
+        let mut slots = Vec::with_capacity(retained.records.len());
+        for undo in &mut retained.records {
+            heights.push(undo.block.height);
+            slots.push(Mutex::new(std::mem::take(
+                &mut undo.address_transaction_keys,
+            )));
+        }
         Self {
             heights,
+            slots,
             accounted_bytes: AtomicU64::new(retained.accounted_bytes),
             peak_accounted_bytes: AtomicU64::new(retained.peak_accounted_bytes),
             max_accounted_bytes: retained.max_accounted_bytes,
         }
     }
 
-    fn try_collect(
+    fn reserve_accounted_elems(
         &self,
-        key: WalletAddressTransactionKey,
-        collected: &mut Vec<(usize, WalletAddressTransactionKey)>,
-    ) -> Result<(), RocksDbWalletError> {
-        let Ok(undo_index) = self.heights.binary_search(&key.block_height()) else {
-            return Ok(());
-        };
-        let key_bytes = u64::try_from(size_of::<WalletAddressTransactionKey>())
-            .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
-        let max_bytes = self.max_accounted_bytes;
-        let updated =
-            self.accounted_bytes
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                    let next = current.checked_add(key_bytes)?;
-                    (next <= max_bytes).then_some(next)
-                });
-        if let Ok(previous) = updated {
-            let next = previous.saturating_add(key_bytes);
-            self.peak_accounted_bytes.fetch_max(next, Ordering::AcqRel);
-            collected.push((undo_index, key));
-            Ok(())
-        } else {
-            let current = self.accounted_bytes.load(Ordering::Acquire);
-            let required_bytes = current
-                .checked_add(key_bytes)
-                .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
-            if required_bytes <= max_bytes {
-                Err(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)
-            } else {
-                Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit {
-                    limit_bytes: max_bytes,
+        desired_delta_elems: usize,
+        elem_bytes: u64,
+    ) -> Result<(usize, u64), RocksDbWalletError> {
+        let mut current = self.accounted_bytes.load(Ordering::SeqCst);
+        loop {
+            let headroom = self.max_accounted_bytes.saturating_sub(current);
+            let max_delta_elems = usize::try_from(headroom / elem_bytes).unwrap_or(usize::MAX);
+            if max_delta_elems == 0 {
+                let required_bytes = current
+                    .checked_add(elem_bytes)
+                    .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+                return Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit {
+                    limit_bytes: self.max_accounted_bytes,
                     required_bytes,
-                })
+                });
+            }
+            let grant_elems = desired_delta_elems.min(max_delta_elems).max(1);
+            let charge_bytes = u64::try_from(grant_elems)
+                .ok()
+                .and_then(|elems| elems.checked_mul(elem_bytes))
+                .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+            let next = current
+                .checked_add(charge_bytes)
+                .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+            match self.accounted_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.peak_accounted_bytes.fetch_max(next, Ordering::AcqRel);
+                    return Ok((grant_elems, charge_bytes));
+                }
+                Err(observed) => current = observed,
             }
         }
     }
 
-    fn apply_collected(
+    fn charge_overallocated_elems(
         &self,
-        retained: &mut RetainedUndo,
-        shard_collections: Vec<Vec<(usize, WalletAddressTransactionKey)>>,
+        extra_elems: usize,
+        elem_bytes: u64,
     ) -> Result<(), RocksDbWalletError> {
-        for shard_entries in shard_collections {
-            for (undo_index, key) in shard_entries {
-                retained
-                    .records
-                    .get_mut(undo_index)
-                    .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?
-                    .address_transaction_keys
-                    .push(key);
+        let extra_bytes = u64::try_from(extra_elems)
+            .ok()
+            .and_then(|elems| elems.checked_mul(elem_bytes))
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+        let max_bytes = self.max_accounted_bytes;
+        let updated =
+            self.accounted_bytes
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    let next = current.checked_add(extra_bytes)?;
+                    (next <= max_bytes).then_some(next)
+                });
+        match updated {
+            Ok(previous) => {
+                let next = previous.saturating_add(extra_bytes);
+                self.peak_accounted_bytes.fetch_max(next, Ordering::AcqRel);
+                Ok(())
             }
+            Err(current) => {
+                let required_bytes = current
+                    .checked_add(extra_bytes)
+                    .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+                if required_bytes <= max_bytes {
+                    Err(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)
+                } else {
+                    Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit {
+                        limit_bytes: max_bytes,
+                        required_bytes,
+                    })
+                }
+            }
+        }
+    }
+
+    fn reserve_slot_capacity(
+        &self,
+        keys: &mut Vec<WalletAddressTransactionKey>,
+    ) -> Result<(), RocksDbWalletError> {
+        if keys.len() < keys.capacity() {
+            return Ok(());
+        }
+        let elem_size = size_of::<WalletAddressTransactionKey>();
+        const {
+            assert!(size_of::<WalletAddressTransactionKey>() > 0);
+        }
+        let elem_bytes = u64::try_from(elem_size)
+            .map_err(|_| RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+        let old_cap = keys.capacity();
+        let needed_cap = old_cap
+            .checked_add(1)
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+        let desired_cap = old_cap
+            .saturating_mul(2)
+            .max(UNDO_KEY_VEC_MIN_INITIAL_CAP)
+            .max(needed_cap);
+        let desired_delta = desired_cap.saturating_sub(old_cap);
+        let (grant_elems, charge_bytes) =
+            self.reserve_accounted_elems(desired_delta, elem_bytes)?;
+        let expected_cap = old_cap
+            .checked_add(grant_elems)
+            .ok_or(RocksDbWalletError::WalletProjectionLoadAccountingOverflow)?;
+        let additional = expected_cap.saturating_sub(keys.len());
+        if let Err(source) = keys.try_reserve_exact(additional) {
+            self.accounted_bytes
+                .fetch_sub(charge_bytes, Ordering::SeqCst);
+            return Err(BulkLoadError::MemoryAllocation {
+                operation: "wallet reorg undo address transaction keys",
+                source,
+            }
+            .into());
+        }
+        let actual_cap = keys.capacity();
+        if actual_cap > expected_cap {
+            self.charge_overallocated_elems(actual_cap.saturating_sub(expected_cap), elem_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn try_collect(&self, key: WalletAddressTransactionKey) -> Result<(), RocksDbWalletError> {
+        let Ok(undo_index) = self.heights.binary_search(&key.block_height()) else {
+            return Ok(());
+        };
+        let mut keys = self.slots[undo_index].lock();
+        self.reserve_slot_capacity(&mut keys)?;
+        keys.push(key);
+        drop(keys);
+        Ok(())
+    }
+
+    fn apply_collected(self, retained: &mut RetainedUndo) -> Result<(), RocksDbWalletError> {
+        if self.slots.len() != retained.records.len() {
+            return Err(RocksDbWalletError::WalletProjectionLoadAccountingOverflow);
+        }
+        for (undo, slot) in retained.records.iter_mut().zip(self.slots) {
+            undo.address_transaction_keys = slot.into_inner();
         }
         retained.accounted_bytes = self.accounted_bytes.load(Ordering::Acquire);
         retained.peak_accounted_bytes = retained
@@ -2134,7 +2229,6 @@ struct AddressTransactionBranchOutput {
     transaction_write: Duration,
     accumulators: crate::accumulator_hashing::FinishedBranchAccumulators,
     evidence: WalletProjectionSstEvidence,
-    undo_collections: Vec<Vec<(usize, WalletAddressTransactionKey)>>,
 }
 
 struct AddressTransactionShardOutput {
@@ -2142,7 +2236,6 @@ struct AddressTransactionShardOutput {
     transaction_write: Duration,
     accumulators: crate::accumulator_hashing::FinishedBranchAccumulators,
     evidence: WalletProjectionSstEvidence,
-    undo_entries: Vec<(usize, WalletAddressTransactionKey)>,
 }
 
 struct SecondaryAddressDerivationArtifacts {
@@ -2318,7 +2411,7 @@ fn derive_secondary_address_artifacts(
             &aborted,
         )?
     };
-    undo_collector.apply_collected(retained_undo, tx_branch.undo_collections)?;
+    undo_collector.apply_collected(retained_undo)?;
     accumulators.combine_branch(&index_branch.accumulators)?;
     accumulators.combine_branch(&tx_branch.accumulators)?;
     sst_evidence.merge(&index_branch.evidence)?;
@@ -2632,7 +2725,6 @@ fn run_address_transaction_branch(
                     transaction_write: shard_out.transaction_write,
                     accumulators: shard_out.accumulators,
                     evidence: shard_out.evidence,
-                    undo_collections: vec![shard_out.undo_entries],
                 }))
             }
             SecondaryBranchOutcome::SiblingAborted => SecondaryBranchOutcome::SiblingAborted,
@@ -2777,11 +2869,9 @@ fn drain_single_address_tx_shard(
         let mut branch_accumulators =
             ConstructionAccumulators::start_optional_branch(config.network, branch_hashing);
         let mut branch_evidence = WalletProjectionSstEvidence::default();
-        let mut undo_entries = Vec::new();
         let mut targets = AddressTransactionTargets {
             writer: &mut writer,
             undo_collector,
-            collected_undo: &mut undo_entries,
             accumulators: &mut branch_accumulators,
             evidence: &mut branch_evidence,
             aborted,
@@ -2796,7 +2886,6 @@ fn drain_single_address_tx_shard(
             transaction_write,
             accumulators: finished_accumulators,
             evidence: branch_evidence,
-            undo_entries,
         }))
     })();
     match outcome {
@@ -2820,13 +2909,11 @@ fn merge_address_tx_shard_outputs(
     let mut transaction_write = Duration::ZERO;
     let mut accumulators = ConstructionAccumulators::start_optional_branch(config.network, None);
     let mut evidence = WalletProjectionSstEvidence::default();
-    let mut undo_collections = Vec::with_capacity(outputs.len());
     for output in outputs {
         tx_sets.push(output.transaction_files);
         transaction_write = transaction_write.max(output.transaction_write);
         accumulators.combine_branch(&output.accumulators)?;
         evidence.merge(&output.evidence)?;
-        undo_collections.push(output.undo_entries);
     }
     let finished_accumulators = accumulators.finish_branch()?;
     Ok(AddressTransactionBranchOutput {
@@ -2838,7 +2925,6 @@ fn merge_address_tx_shard_outputs(
         transaction_write,
         accumulators: finished_accumulators,
         evidence,
-        undo_collections,
     })
 }
 
@@ -2990,7 +3076,6 @@ struct AddressIndexTargets<'a, 'options> {
 struct AddressTransactionTargets<'a, 'options> {
     writer: &'a mut TimedSstWriter<'options>,
     undo_collector: &'a RetainedUndoCollector,
-    collected_undo: &'a mut Vec<(usize, WalletAddressTransactionKey)>,
     accumulators: &'a mut ConstructionAccumulators,
     evidence: &'a mut WalletProjectionSstEvidence,
     aborted: &'a AtomicBool,
@@ -3109,9 +3194,7 @@ fn drain_address_transactions(
         }
         let key = WalletAddressTransactionKey::decode(&first.key)?;
         WalletAddressTransaction::decode_value(key, &canonical_value)?;
-        targets
-            .undo_collector
-            .try_collect(key, targets.collected_undo)?;
+        targets.undo_collector.try_collect(key)?;
         append_row(
             targets.writer,
             targets.accumulators,
@@ -5148,5 +5231,140 @@ mod tests {
             .status()?;
         assert!(status.success(), "child process failed with {status}");
         Ok(())
+    }
+
+    fn build_test_retained_undo_suffix(
+        settled_tip: BlockId,
+        limit_bytes: u64,
+    ) -> Result<RetainedUndo, Box<dyn Error>> {
+        let digest = CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+            1,
+            [2; 32],
+        );
+        let mut undo = RetainedUndo::new(4, settled_tip, limit_bytes);
+        for offset in 1..=4_u32 {
+            let height = BlockHeight::new(settled_tip.height.value() + offset);
+            let hash = BlockHash::from_bytes([u8::try_from(offset)?; 32]);
+            undo.begin_block(BlockId::new(height, hash), hash, digest, digest)?;
+            undo.finish_block()?;
+        }
+        Ok(undo)
+    }
+
+    fn assert_tight_undo_collector_budget_clamp_and_refusal(
+        settled_tip: BlockId,
+        key_bytes: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        let base_only = 4 * u64::try_from(size_of::<WalletReorgUndo>())?;
+        let tight_limit = base_only + 3 * key_bytes;
+        let mut tight_retained = build_test_retained_undo_suffix(settled_tip, tight_limit)?;
+        let tight_collector = RetainedUndoCollector::from_retained_undo(&mut tight_retained);
+        let height = BlockHeight::new(settled_tip.height.value() + 1);
+        for seq in 0..3_u32 {
+            tight_collector.try_collect(WalletAddressTransactionKey::new(
+                TransparentAddressScriptHash::from_bytes([0x44; 32]),
+                height,
+                seq,
+            ))?;
+        }
+        {
+            let first_slot = tight_collector.slots[0].lock();
+            assert_eq!(first_slot.len(), 3);
+            assert_eq!(first_slot.capacity(), 3);
+        }
+        assert_eq!(
+            tight_collector.accounted_bytes.load(Ordering::Acquire),
+            tight_limit
+        );
+        let refused = tight_collector.try_collect(WalletAddressTransactionKey::new(
+            TransparentAddressScriptHash::from_bytes([0x44; 32]),
+            height,
+            3,
+        ));
+        assert!(matches!(
+            refused,
+            Err(RocksDbWalletError::AccountedReorgUndoMemoryLimit {
+                limit_bytes,
+                required_bytes,
+            }) if limit_bytes == tight_limit && required_bytes == tight_limit + key_bytes
+        ));
+        let first_slot = tight_collector.slots[0].lock();
+        assert_eq!(first_slot.len(), 3);
+        assert_eq!(first_slot.capacity(), 3);
+        drop(first_slot);
+        tight_collector.apply_collected(&mut tight_retained)?;
+        assert_eq!(tight_retained.peak_accounted_bytes, tight_limit);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_undo_collector_accounts_capacity_with_zero_handoff_overlap()
+    -> Result<(), Box<dyn Error>> {
+        let settled_tip = BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([1; 32]));
+        let mut retained = build_test_retained_undo_suffix(settled_tip, 1024 * 1024)?;
+        let base_bytes = retained.accounted_bytes;
+        let collector = RetainedUndoCollector::from_retained_undo(&mut retained);
+        let key_bytes = u64::try_from(size_of::<WalletAddressTransactionKey>())?;
+
+        std::thread::scope(|scope| -> Result<(), Box<dyn Error>> {
+            let mut handles = Vec::new();
+            for worker_id in 0..4_u32 {
+                let collector_ref = &collector;
+                handles.push(scope.spawn(move || -> Result<(), RocksDbWalletError> {
+                    for offset in 1..=4_u32 {
+                        let height = BlockHeight::new(settled_tip.height.value() + offset);
+                        for seq in 0..10_u32 {
+                            let tx_index = worker_id * 10 + seq;
+                            let mut addr = [0_u8; 32];
+                            addr[0] = u8::try_from(offset).unwrap_or(0);
+                            addr[1] = u8::try_from(worker_id).unwrap_or(0);
+                            collector_ref.try_collect(WalletAddressTransactionKey::new(
+                                TransparentAddressScriptHash::from_bytes(addr),
+                                height,
+                                tx_index,
+                            ))?;
+                        }
+                    }
+                    collector_ref.try_collect(WalletAddressTransactionKey::new(
+                        TransparentAddressScriptHash::from_bytes([0xff; 32]),
+                        settled_tip.height,
+                        worker_id,
+                    ))
+                }));
+            }
+            for handle in handles {
+                handle.join().map_err(|_| "collector worker panicked")??;
+            }
+            Ok(())
+        })?;
+
+        let mut slot_cap_bytes = 0_u64;
+        let mut slot_layouts = Vec::with_capacity(collector.slots.len());
+        for slot_lock in &collector.slots {
+            let slot = slot_lock.lock();
+            slot_cap_bytes =
+                slot_cap_bytes.saturating_add(u64::try_from(slot.capacity())? * key_bytes);
+            slot_layouts.push((slot.as_ptr(), slot.len(), slot.capacity()));
+        }
+        assert_eq!(
+            collector.accounted_bytes.load(Ordering::Acquire),
+            base_bytes + slot_cap_bytes
+        );
+        let peak_before_apply = collector.peak_accounted_bytes.load(Ordering::Acquire);
+        assert_eq!(peak_before_apply, base_bytes + slot_cap_bytes);
+        assert!(peak_before_apply <= retained.max_accounted_bytes);
+
+        collector.apply_collected(&mut retained)?;
+        assert_eq!(retained.peak_accounted_bytes, peak_before_apply);
+        assert_eq!(retained.accounted_bytes, base_bytes + slot_cap_bytes);
+        for (undo, (ptr, len, cap)) in retained.records.iter().zip(slot_layouts) {
+            assert_eq!(undo.address_transaction_keys.as_ptr(), ptr);
+            assert_eq!(undo.address_transaction_keys.len(), len);
+            assert_eq!(undo.address_transaction_keys.capacity(), cap);
+            assert_eq!(len, 40);
+        }
+
+        assert_tight_undo_collector_budget_clamp_and_refusal(settled_tip, key_bytes)
     }
 }
