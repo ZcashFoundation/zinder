@@ -319,9 +319,10 @@ for coverage, tail reads, and fs-verity requirements.
 If you customize the canonical reorg window, match it
 in `deploy/config/history-publisher.toml`. The publisher ignores
 `storage.raw_blob_policy`, but earlier releases require it to match ingest,
-so keep it equal to ingest's value if you might roll back. The publisher inherits the compatibility
-reader's memory limit. Set `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` to size its
-container separately. The wallet reader keeps one file open per admitted
+so keep it equal to ingest's value if you might roll back. The publisher defaults to an `8g` memory ceiling
+(`ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT`), independent of the reader page-cache
+ceiling (`ZINDER_COMPAT_MEMORY_LIMIT`, `32g` in Mainnet `.env` files to keep
+cgroup v2 page cache for the ~21 GB signed history catalog resident). The wallet reader keeps one file open per admitted
 segment alongside its database files and sockets. Compose sets its soft and
 hard open-file limits to 65,536.
 

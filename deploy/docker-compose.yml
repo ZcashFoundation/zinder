@@ -148,7 +148,9 @@ services:
 
   zinder-query:
     image: ${ZINDER_QUERY_IMAGE:-ghcr.io/zcashfoundation/zinder-query:${ZINDER_VERSION:-local}}
-    mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-4g}
+    # Cgroup v2 charges ZSHRNG01 shielded-history (~21 GB on Mainnet) and RocksDB page cache
+    # against mem_limit; tight caps force repeated disk reads and wait_timeout refusals under load.
+    mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-32g}
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -192,7 +194,7 @@ services:
 
   zinder-history-publisher:
     <<: *compat-image
-    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-${ZINDER_COMPAT_MEMORY_LIMIT:-4g}}
+    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-8g}
     network_mode: none
     restart: unless-stopped
     depends_on:
@@ -229,7 +231,9 @@ services:
 
   zinder-compat-lightwalletd:
     <<: *compat-image
-    mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-4g}
+    # Cgroup v2 charges ZSHRNG01 shielded-history (~21 GB on Mainnet) and RocksDB page cache
+    # against mem_limit; tight caps force repeated disk reads and wait_timeout refusals under load.
+    mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-32g}
     ulimits:
       nofile:
         soft: 65536
