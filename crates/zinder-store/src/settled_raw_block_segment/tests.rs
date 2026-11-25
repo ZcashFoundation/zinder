@@ -470,6 +470,28 @@ fn corrupt_and_open(
     }
 }
 
+fn assert_slab_prefix_tamper_rejected(
+    out: &Path,
+    original: &[u8],
+    identity: RawBlockSegmentIdentity,
+) -> TestOutcome {
+    assert!(matches!(
+        corrupt_and_open(
+            out,
+            original,
+            identity,
+            &|buf| buf[HEADER_LEN] = 0xff,
+            false,
+        )?,
+        SettledRawBlockSegmentError::PayloadIntegrity(_)
+    ));
+    assert!(matches!(
+        corrupt_and_open(out, original, identity, &|buf| buf[HEADER_LEN] = 0xff, true,)?,
+        SettledRawBlockSegmentError::InvalidFormat(_)
+    ));
+    Ok(())
+}
+
 #[test]
 fn reader_fails_closed_on_tampered_header_index_slab_and_trailer() -> TestOutcome {
     let dir = TempDir::new()?;
@@ -505,16 +527,7 @@ fn reader_fails_closed_on_tampered_header_index_slab_and_trailer() -> TestOutcom
         )?,
         SettledRawBlockSegmentError::InvalidFormat(_)
     ));
-    assert!(matches!(
-        corrupt_and_open(
-            &out,
-            &original,
-            identity,
-            &|buf| buf[HEADER_LEN] = 0xff,
-            false
-        )?,
-        SettledRawBlockSegmentError::InvalidFormat(_)
-    ));
+    assert_slab_prefix_tamper_rejected(&out, &original, identity)?;
     let slab_payload_byte = HEADER_LEN + usize::try_from(FRAME_PREFIX_U32)? + 2;
     assert!(matches!(
         corrupt_and_open(
@@ -819,26 +832,35 @@ fn reader_latches_invalid_on_truncated_slab_io_error() -> TestOutcome {
     Ok(())
 }
 
-fn write_forged_sparse_segment(
-    path: &Path,
+#[derive(Clone, Copy)]
+struct ForgedSparseSpec {
+    block_count: u32,
+    slab_len: u64,
     tx_count: u64,
     write_frame_prefix: bool,
-) -> TestOutcome<RawBlockSegmentIdentity> {
-    let payload_len = 64_u64;
-    let slab_len = u64::from(FRAME_PREFIX_U32) + payload_len;
-    let slab_offset = HEADER_LEN as u64;
-    let tx_table_offset = slab_offset + slab_len;
-    let tx_table_bytes = tx_count * TX_SLICE_ENTRY_LEN as u64;
-    let row_index_offset = tx_table_offset + tx_table_bytes;
-    let total_len = row_index_offset + ROW_INDEX_ENTRY_LEN as u64 + TRAILER_LEN as u64;
+}
 
-    let end_block = BlockId::new(BlockHeight::new(1), block_hash(1));
+fn write_forged_sparse_segment(
+    path: &Path,
+    spec: ForgedSparseSpec,
+) -> TestOutcome<RawBlockSegmentIdentity> {
+    let slab_offset = HEADER_LEN as u64;
+    let tx_table_offset = slab_offset + spec.slab_len;
+    let tx_table_bytes = spec.tx_count * TX_SLICE_ENTRY_LEN as u64;
+    let row_index_offset = tx_table_offset + tx_table_bytes;
+    let index_bytes = u64::from(spec.block_count) * ROW_INDEX_ENTRY_LEN as u64;
+    let total_len = row_index_offset + index_bytes + TRAILER_LEN as u64;
+
+    let end_block = BlockId::new(
+        BlockHeight::new(spec.block_count),
+        block_hash(spec.block_count),
+    );
     let header = SegmentHeader {
         network_tag: TEST_NETWORK.id(),
         segment_flags: 0,
         codec_id: RawBlockCodec::None.id(),
         start_height: 1,
-        block_count: 1,
+        block_count: spec.block_count,
         first_prev_hash_wire: encode_internal_block_hash(block_hash(0)),
         last_block_hash_wire: encode_internal_block_hash(end_block.hash),
         slab_offset,
@@ -852,7 +874,8 @@ fn write_forged_sparse_segment(
         .write(true)
         .open(path)?;
     sparse.write_all(&header.encode())?;
-    if write_frame_prefix {
+    if spec.write_frame_prefix {
+        let payload_len = spec.slab_len - u64::from(FRAME_PREFIX_U32);
         sparse.write_all(&u32::try_from(payload_len)?.to_be_bytes())?;
     }
     sparse.set_len(total_len)?;
@@ -872,7 +895,15 @@ fn write_forged_sparse_segment(
 fn open_rejects_forged_sparse_file_with_huge_tx_table_without_allocating() -> TestOutcome {
     let dir = TempDir::new()?;
     let path = dir.path().join("sparse-huge-tx.seg");
-    let expected = write_forged_sparse_segment(&path, u64::from(u32::MAX), false)?;
+    let expected = write_forged_sparse_segment(
+        &path,
+        ForgedSparseSpec {
+            block_count: 1,
+            slab_len: u64::from(FRAME_PREFIX_U32) + 64,
+            tx_count: u64::from(u32::MAX),
+            write_frame_prefix: false,
+        },
+    )?;
     let outcome = SettledRawBlockSegmentReader::open(
         &path,
         &expected,
@@ -889,7 +920,65 @@ fn open_rejects_forged_sparse_file_with_huge_tx_table_without_allocating() -> Te
 fn open_rejects_forged_sparse_file_with_bounded_tx_table_and_bad_digest() -> TestOutcome {
     let dir = TempDir::new()?;
     let path = dir.path().join("sparse-bounded-tx.seg");
-    let expected = write_forged_sparse_segment(&path, 65_536, true)?;
+    let expected = write_forged_sparse_segment(
+        &path,
+        ForgedSparseSpec {
+            block_count: 1,
+            slab_len: u64::from(FRAME_PREFIX_U32) + 64,
+            tx_count: 65_536,
+            write_frame_prefix: true,
+        },
+    )?;
+    let outcome = SettledRawBlockSegmentReader::open(
+        &path,
+        &expected,
+        SettledRawBlockSegmentOpenOptions::default(),
+    );
+    assert!(matches!(
+        outcome,
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn open_rejects_forged_sparse_file_with_oversized_block_count_without_allocating() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("sparse-huge-blocks.seg");
+    let expected = write_forged_sparse_segment(
+        &path,
+        ForgedSparseSpec {
+            block_count: 100_000_000,
+            slab_len: u64::from(FRAME_PREFIX_U32) + 1,
+            tx_count: 0,
+            write_frame_prefix: false,
+        },
+    )?;
+    let outcome = SettledRawBlockSegmentReader::open(
+        &path,
+        &expected,
+        SettledRawBlockSegmentOpenOptions::default(),
+    );
+    assert!(matches!(
+        outcome,
+        Err(SettledRawBlockSegmentError::InvalidFormat(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn open_rejects_forged_sparse_file_with_large_bounded_block_count_and_bad_digest() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("sparse-bounded-blocks.seg");
+    let expected = write_forged_sparse_segment(
+        &path,
+        ForgedSparseSpec {
+            block_count: 500_000,
+            slab_len: 2_500_000,
+            tx_count: 0,
+            write_frame_prefix: false,
+        },
+    )?;
     let outcome = SettledRawBlockSegmentReader::open(
         &path,
         &expected,
@@ -975,5 +1064,73 @@ fn writer_rejects_block_exceeding_max_tx_entries_limit() -> TestOutcome {
         outcome,
         Err(SettledRawBlockSegmentError::InvalidFormat(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn validate_entries_rejects_single_block_exceeding_per_block_tx_limit() -> TestOutcome {
+    let per_block_overflow = u32::try_from(MAX_TX_ENTRIES_PER_BLOCK)? + 1;
+    let tx_count_usize = usize::try_from(per_block_overflow)?;
+    let sample_tx = TxSliceEntry {
+        offset: 0,
+        len: 1,
+        sha256: [0x11; 32],
+    };
+    let tx_entries = vec![sample_tx; tx_count_usize];
+    let frame_len = FRAME_PREFIX_U32 + 64;
+    let slab_len = 2 * frame_len;
+    let tx_table_offset = HEADER_LEN as u64 + u64::from(slab_len);
+    let tx_table_bytes = u64::from(per_block_overflow) * TX_SLICE_ENTRY_LEN as u64;
+    let row_index_offset = tx_table_offset + tx_table_bytes;
+    let header = SegmentHeader {
+        network_tag: TEST_NETWORK.id(),
+        segment_flags: 0,
+        codec_id: RawBlockCodec::None.id(),
+        start_height: 1,
+        block_count: 2,
+        first_prev_hash_wire: encode_internal_block_hash(block_hash(0)),
+        last_block_hash_wire: encode_internal_block_hash(block_hash(2)),
+        slab_offset: HEADER_LEN as u64,
+        tx_table_offset,
+        row_index_offset,
+    };
+    let entries = [
+        DecodedRowIndexEntry {
+            block_hash_wire: encode_internal_block_hash(block_hash(1)),
+            payload_sha256: [0xaa; 32],
+            uncompressed_sha256: [0xaa; 32],
+            slab_rel_offset: 0,
+            uncompressed_len: 64,
+            tx_start_index: 0,
+            tx_count: per_block_overflow,
+        },
+        DecodedRowIndexEntry {
+            block_hash_wire: encode_internal_block_hash(block_hash(2)),
+            payload_sha256: [0xbb; 32],
+            uncompressed_sha256: [0xbb; 32],
+            slab_rel_offset: frame_len,
+            uncompressed_len: 64,
+            tx_start_index: per_block_overflow,
+            tx_count: 0,
+        },
+    ];
+    let frames = [
+        PortableFrameDigest {
+            rel_offset: 0,
+            frame_len,
+            payload_sha256: [0xaa; 32],
+        },
+        PortableFrameDigest {
+            rel_offset: frame_len,
+            frame_len,
+            payload_sha256: [0xbb; 32],
+        },
+    ];
+    for streamed in [None, Some(frames.as_slice())] {
+        assert!(matches!(
+            validate_entries(&entries, &tx_entries, slab_len, &header, streamed),
+            Err(SettledRawBlockSegmentError::InvalidFormat(_))
+        ));
+    }
     Ok(())
 }

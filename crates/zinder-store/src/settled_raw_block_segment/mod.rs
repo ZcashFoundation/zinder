@@ -175,11 +175,18 @@ impl RawBlockSegmentIdentity {
                     "reversed raw block segment interval".to_owned(),
                 )
             })?;
-        span.checked_add(1).ok_or_else(|| {
+        let count = span.checked_add(1).ok_or_else(|| {
             SettledRawBlockSegmentError::ChainLinkage(
                 "raw block segment interval exceeds u32 height span".to_owned(),
             )
-        })
+        })?;
+        if count > format::MAX_SEGMENT_BLOCKS {
+            return Err(SettledRawBlockSegmentError::InvalidFormat(format!(
+                "raw block segment block count {count} exceeds maximum {}",
+                format::MAX_SEGMENT_BLOCKS
+            )));
+        }
+        Ok(count)
     }
 }
 

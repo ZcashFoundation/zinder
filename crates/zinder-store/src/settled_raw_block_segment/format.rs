@@ -16,6 +16,8 @@ pub(super) const TX_SLICE_ENTRY_LEN: usize = 40;
 pub(super) const ROW_INDEX_ENTRY_LEN: usize = 128;
 pub(super) const TRAILER_LEN: usize = 32;
 pub(super) const MAX_SLAB_BYTES: u64 = u32::MAX as u64;
+pub(super) const MAX_SEGMENT_BLOCKS: u32 = 1_048_576;
+pub(super) const MIN_FRAME_BYTES: u64 = FRAME_PREFIX_LEN as u64 + 1;
 pub(super) const MAX_TX_ENTRIES_PER_BLOCK: u64 = 262_144;
 pub(super) const MAX_SEGMENT_TX_ENTRIES: usize = 8_388_608;
 pub(super) const STAGING_CHUNK: usize = 256 * 1024;
@@ -184,17 +186,25 @@ fn validate_header_fields(header: &SegmentHeader) -> Result<(), SettledRawBlockS
         )));
     }
     header.codec()?;
-    if header.block_count == 0 {
-        return Err(SettledRawBlockSegmentError::InvalidFormat(
-            "raw block segment block count must be positive".to_owned(),
-        ));
+    if header.block_count == 0 || header.block_count > MAX_SEGMENT_BLOCKS {
+        return Err(SettledRawBlockSegmentError::InvalidFormat(format!(
+            "raw block segment block count {} is out of bounds (1..={MAX_SEGMENT_BLOCKS})",
+            header.block_count
+        )));
     }
     if header.slab_offset != HEADER_LEN as u64 {
         return Err(SettledRawBlockSegmentError::InvalidFormat(
             "raw block segment slab must start immediately after header".to_owned(),
         ));
     }
-    header.slab_len()?;
+    let slab_len = header.slab_len()?;
+    let block_count_u64 = u64::from(header.block_count);
+    let min_slab_len = block_count_u64.saturating_mul(MIN_FRAME_BYTES);
+    if u64::from(slab_len) < min_slab_len {
+        return Err(SettledRawBlockSegmentError::InvalidFormat(format!(
+            "raw block segment slab length {slab_len} is smaller than minimum {min_slab_len}"
+        )));
+    }
     header.tx_entry_count()?;
     Ok(())
 }

@@ -15,9 +15,9 @@ use super::{
     SettledRawBlockSegmentError,
     format::{
         DecodedRowIndexEntry, FRAME_PREFIX_LEN, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock,
-        ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader, TRAILER_LEN, TX_SLICE_ENTRY_LEN,
-        TxSliceEntry, VALIDATION_INVALID, VALIDATION_VALID, decode_frame_prefix, frame_span,
-        max_stored_payload_bytes,
+        MAX_TX_ENTRIES_PER_BLOCK, ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader, TRAILER_LEN,
+        TX_SLICE_ENTRY_LEN, TxSliceEntry, VALIDATION_INVALID, VALIDATION_VALID,
+        decode_frame_prefix, frame_span, max_stored_payload_bytes,
     },
     verity,
 };
@@ -340,20 +340,19 @@ fn admit_portable(
     })?;
     let tx_count = header.tx_entry_count()?;
     let slab_len = header.slab_len()?;
-    let streamed = hash_slab_frames(
-        &mut buffered,
-        count,
-        slab_len,
-        expected.codec,
-        &mut whole_digest,
-    )?;
     let meta_len = metadata_span_bytes(&header)?;
-    let mut meta_digest_pass1 = Sha256::new();
+    let slab_len_u64 = u64::from(slab_len);
+    let body_len = slab_len_u64.checked_add(meta_len).ok_or_else(|| {
+        SettledRawBlockSegmentError::InvalidFormat(
+            "raw block segment body span exceeds u64".to_owned(),
+        )
+    })?;
+    let mut body_digest_pass1 = Sha256::new();
     hash_streamed_span(
         &mut buffered,
-        meta_len,
+        body_len,
         &mut whole_digest,
-        &mut meta_digest_pass1,
+        &mut body_digest_pass1,
     )?;
     let mut trailer = [0_u8; TRAILER_LEN];
     buffered.read_exact(&mut trailer)?;
@@ -363,13 +362,21 @@ fn admit_portable(
             "portable raw block segment length or SHA-256 mismatch".to_owned(),
         ));
     }
-    buffered.seek(SeekFrom::Start(header.tx_table_offset))?;
-    let mut meta_digest_pass2 = Sha256::new();
-    let tx_entries = read_and_hash_tx_entries(&mut buffered, tx_count, &mut meta_digest_pass2)?;
-    let entries = read_and_hash_index_entries(&mut buffered, count, &mut meta_digest_pass2)?;
-    if meta_digest_pass2.finalize() != meta_digest_pass1.finalize() {
+
+    buffered.seek(SeekFrom::Start(header.slab_offset))?;
+    let mut body_digest_pass2 = Sha256::new();
+    let streamed = hash_slab_frames(
+        &mut buffered,
+        count,
+        slab_len,
+        expected.codec,
+        &mut body_digest_pass2,
+    )?;
+    let tx_entries = read_and_hash_tx_entries(&mut buffered, tx_count, &mut body_digest_pass2)?;
+    let entries = read_and_hash_index_entries(&mut buffered, count, &mut body_digest_pass2)?;
+    if body_digest_pass2.finalize() != body_digest_pass1.finalize() {
         return Err(SettledRawBlockSegmentError::PayloadIntegrity(
-            "portable raw block segment metadata changed during admission".to_owned(),
+            "portable raw block segment body changed during admission".to_owned(),
         ));
     }
     let rows = validate_entries(&entries, &tx_entries, slab_len, &header, Some(&streamed))?;
@@ -680,6 +687,12 @@ fn validate_entry_tx_slices(
         return Err(SettledRawBlockSegmentError::InvalidFormat(
             "non-contiguous transaction slice start index".to_owned(),
         ));
+    }
+    if u64::from(entry.tx_count) > MAX_TX_ENTRIES_PER_BLOCK {
+        return Err(SettledRawBlockSegmentError::InvalidFormat(format!(
+            "block transaction count {} exceeds maximum {MAX_TX_ENTRIES_PER_BLOCK}",
+            entry.tx_count
+        )));
     }
     let tx_end = entry
         .tx_start_index
