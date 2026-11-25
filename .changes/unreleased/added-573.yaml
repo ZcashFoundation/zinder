@@ -1,6 +1,0 @@
-kind: added
-body: Export canonical construction progress as `zinder_ingest_construction_loaded_height` and `zinder_ingest_construction_target_height` Prometheus gauges and update `/readyz` (`current_height`, `cause.syncing.lag_blocks`) and `zinder_readiness_sync_lag_blocks` while fresh canonical construction runs in `bulk_catchup`.
-time: 2026-11-25T07:45:00Z
-custom:
-    Bump: minor
-    PR: "573"

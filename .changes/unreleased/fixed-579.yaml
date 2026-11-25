@@ -1,6 +1,0 @@
-kind: fixed
-body: Decoupled `zinder-history-publisher`'s default container memory ceiling (`ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` set to `4g` Mainnet, `2g` Testnet, `1g` Regtest) from `ZINDER_COMPAT_MEMORY_LIMIT` and documented cgroup v2 `ZSHRNG01` page-cache sizing for high-concurrency Mainnet `zinder-compat-lightwalletd` deployments.
-time: 2026-11-25T11:30:00Z
-custom:
-    Bump: patch
-    PR: "579"

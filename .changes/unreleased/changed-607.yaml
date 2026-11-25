@@ -1,6 +1,0 @@
-kind: changed
-body: Pipelined bulk `OrderedSstWriter` SST compression and dual SHA-256 evidence hashing onto bounded-memory worker queues, overlapped secondary address-index and address-transaction sort-and-drain stages during multi-worker wallet projection construction, consolidated overlapping secondary phase labels into `secondary_address_derivation` on `zinder_wallet_projection_build_stage_duration_seconds`, and updated `ZINDER_PROJECTOR__BUILD__ACCUMULATOR_HASHING_WORKERS` configuration docs.
-time: 2026-11-25T15:38:29Z
-custom:
-    Bump: patch
-    PR: "607"

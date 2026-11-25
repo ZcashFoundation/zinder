@@ -1,6 +1,0 @@
-kind: changed
-body: Cached settled stored commitment-tree checkpoints in `zinder-query`'s in-memory `SettledStates` cache on `EveryBlock` canonical stores so repeated `GetTreeState` lookups for settled blocks serve preformatted cached entries instead of re-reading RocksDB and re-encoding hexadecimal tree state on every call, while leaving unsettled blocks uncached across tip reorgs and stale reader generations.
-time: 2026-11-25T12:13:41Z
-custom:
-    Bump: patch
-    PR: "588"
