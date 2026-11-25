@@ -3,7 +3,7 @@
 use std::{fs::File, io, path::Path, sync::atomic::Ordering};
 
 use sha2::{Digest as _, Sha256};
-use zinder_core::{BlockHeight, CompactBlockArtifact};
+use zinder_core::{BlockHash, BlockHeight, CompactBlockArtifact};
 use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zstd::bulk::Decompressor;
 
@@ -51,7 +51,24 @@ impl SettledSupplementSegmentReader {
         options: SettledSupplementSegmentOpenOptions,
     ) -> Result<Self, SettledSupplementSegmentError> {
         let file = verity::open_regular_file(path.as_ref())?;
-        let file_len = file.metadata()?.len();
+        Self::open_file(file, expected, options)
+    }
+
+    /// Admits and binds one already-opened regular `ZSTSUP01` segment file against `expected`.
+    pub(crate) fn open_file(
+        file: File,
+        expected: &SupplementSegmentIdentity,
+        options: SettledSupplementSegmentOpenOptions,
+    ) -> Result<Self, SettledSupplementSegmentError> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected a regular settled supplement segment file",
+            )
+            .into());
+        }
+        let file_len = metadata.len();
         let min_len = u64::try_from(HEADER_LEN + TRAILER_LEN).map_err(|_| {
             SettledSupplementSegmentError::InvalidFormat("header size overflow".to_owned())
         })?;
@@ -134,6 +151,23 @@ impl SettledSupplementSegmentReader {
         self.kernel_verified
     }
 
+    /// Returns the authenticated previous block hash declared before the segment's first block.
+    pub fn first_previous_block_hash(&self) -> Result<BlockHash, SettledSupplementSegmentError> {
+        block_hash_wire_to_domain(&self.header.first_prev_hash_wire)
+    }
+
+    /// Returns the authenticated block hash recorded in the row index for `height`.
+    ///
+    /// Fails closed if `height` is outside the segment or that row/chunk failed verification.
+    pub fn block_hash_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<BlockHash, SettledSupplementSegmentError> {
+        let row_idx = self.row_index_for(height)?;
+        self.ensure_row_not_invalid(row_idx)?;
+        block_hash_wire_to_domain(&self.rows[row_idx].block_hash_wire)
+    }
+
     #[cfg(test)]
     pub(super) fn chunk_validation_state(&self, chunk_idx: usize) -> u8 {
         self.chunks[chunk_idx]
@@ -206,6 +240,46 @@ impl SettledSupplementSegmentReader {
         Ok(self.read_block(height)?.canonical_metadata)
     }
 
+    /// Streams optional Tag-2 canonical metadata across `[start_height, end_height]` one chunk at a time.
+    pub fn visit_canonical_metadata_range<E, F>(
+        &self,
+        start_height: BlockHeight,
+        end_height: BlockHeight,
+        mut visit: F,
+    ) -> Result<(), E>
+    where
+        E: From<SettledSupplementSegmentError>,
+        F: FnMut(BlockHeight, Option<&CanonicalBlockSupplement>) -> Result<(), E>,
+    {
+        let (first_row, last_row) = self.row_range_for(start_height, end_height)?;
+        let chunk_span = usize::from(self.header.chunk_blocks);
+        let first_chunk = first_row / chunk_span;
+        let last_chunk = last_row / chunk_span;
+        for chunk_idx in first_chunk..=last_chunk {
+            let chunk_row_start = (chunk_idx * chunk_span).max(first_row);
+            let chunk_row_end = ((chunk_idx + 1) * chunk_span - 1).min(last_row);
+            for row_idx in chunk_row_start..=chunk_row_end {
+                self.ensure_row_not_invalid(row_idx)?;
+            }
+            let chunk_bytes = self.read_chunk_bytes(chunk_idx)?;
+            for row_idx in chunk_row_start..=chunk_row_end {
+                let offset = u32::try_from(row_idx - first_row).map_err(|_| {
+                    SettledSupplementSegmentError::InvalidFormat(
+                        "row offset exceeds u32".to_owned(),
+                    )
+                })?;
+                let height = BlockHeight::new(
+                    start_height.value().checked_add(offset).ok_or_else(|| {
+                        SettledSupplementSegmentError::InvalidFormat("height overflow".to_owned())
+                    })?,
+                );
+                let record = self.decode_row_from_chunk(row_idx, &chunk_bytes)?;
+                visit(height, record.canonical_metadata.as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Splices one `ZSHRNG02` `Slab 0` `CompactBlock` payload at `height` with this
     /// segment's Tag-1 transparent supplement into one gRPC-framed [`EncodedBlock`].
     pub fn splice_block_wire(
@@ -216,6 +290,11 @@ impl SettledSupplementSegmentReader {
     ) -> Result<EncodedBlock, SettledSupplementSegmentError> {
         let row_idx = self.row_index_for(height)?;
         self.ensure_row_not_invalid(row_idx)?;
+        if self.rows[row_idx].has_wide_fee() {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "supplement compact transaction fee exceeds u32".to_owned(),
+            ));
+        }
         let expected_envelope = Some(self.expected_envelope_identity(row_idx)?);
         let transparent = if splice_needs_tag1(selection, &self.rows[row_idx]) {
             self.read_block(height)?.transparent_transactions
@@ -252,6 +331,11 @@ impl SettledSupplementSegmentReader {
         let (first_row, last_row) = self.row_range_for(start_height, end_height)?;
         for row_idx in first_row..=last_row {
             self.ensure_row_not_invalid(row_idx)?;
+            if self.rows[row_idx].has_wide_fee() {
+                return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                    "supplement compact transaction fee exceeds u32".to_owned(),
+                ));
+            }
         }
 
         let mut encoded_blocks = Vec::with_capacity(shielded_payloads.len());

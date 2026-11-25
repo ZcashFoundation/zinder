@@ -222,6 +222,7 @@ pub(super) fn splice_compact_block_wire_into(
     scratch: &mut SpliceScratch,
 ) -> Result<(), SettledSupplementSegmentError> {
     validate_transparent_supplement_order(target.transparent)?;
+    validate_transparent_supplement_wire_fees(target.transparent)?;
     let frame_start = out.len();
     out.resize(frame_start + FRAME_PREFIX_LEN, 0);
     let mut ctx = BlockSpliceContext {
@@ -811,6 +812,12 @@ fn validate_transparent_supplement_order(
             "transparent supplement transactions are not strictly ascending by index".to_owned(),
         ));
     }
+    Ok(())
+}
+
+fn validate_transparent_supplement_wire_fees(
+    transparent_supplement: &[CompactTransparentSupplementTx],
+) -> Result<(), SettledSupplementSegmentError> {
     for sup_tx in transparent_supplement {
         fee_to_wire_u32(sup_tx.fee_zat)?;
     }
@@ -1026,6 +1033,10 @@ fn reconstruct_shielded_or_mixed_tx(
     })
 }
 
+fn expected_shielded_wire_fee(fee_zat: Option<u64>) -> u32 {
+    fee_zat.and_then(|fee| u32::try_from(fee).ok()).unwrap_or(0)
+}
+
 fn resolve_reconstructed_fee(
     proto_tx: &lightwalletd::CompactTx,
     transaction_id: zinder_core::TransactionId,
@@ -1040,7 +1051,7 @@ fn resolve_reconstructed_fee(
         ));
     }
     if let Some(sup) = mixed_sup {
-        if fee_to_wire_u32(sup.fee_zat)? != proto_tx.fee {
+        if expected_shielded_wire_fee(sup.fee_zat) != proto_tx.fee {
             return Err(SettledSupplementSegmentError::PayloadIntegrity(
                 "mixed transaction fee disagrees on reconstruction".to_owned(),
             ));
@@ -1058,7 +1069,7 @@ fn resolve_reconstructed_fee(
     if let Some(meta) = meta_tx
         && let Some(tag2_fee) = meta.fee_and_burn.fee_zat
     {
-        if fee_to_wire_u32(Some(tag2_fee))? != proto_tx.fee {
+        if expected_shielded_wire_fee(Some(tag2_fee)) != proto_tx.fee {
             return Err(SettledSupplementSegmentError::PayloadIntegrity(
                 "Tag 2 fee disagrees with shielded CompactTx".to_owned(),
             ));

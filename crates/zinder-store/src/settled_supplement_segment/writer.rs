@@ -53,7 +53,7 @@ pub struct SettledSupplementSegmentWriter {
     target: PathBuf,
     identity: SupplementSegmentIdentity,
     options: SettledSupplementSegmentWriteOptions,
-    staged_file: NamedTempFile,
+    staged_file: Option<NamedTempFile>,
     compressor: Option<Compressor<'static>>,
     first_prev_hash_wire: Option<[u8; 32]>,
     last_block: Option<BlockId>,
@@ -62,6 +62,8 @@ pub struct SettledSupplementSegmentWriter {
     pending_chunk_blocks: u16,
     chunk_index: Vec<DecodedChunkIndexEntry>,
     row_index: Vec<DecodedRowIndexEntry>,
+    #[cfg(test)]
+    fail_flush_after_partial_bytes: std::cell::Cell<Option<usize>>,
 }
 
 impl SettledSupplementSegmentWriter {
@@ -102,7 +104,7 @@ impl SettledSupplementSegmentWriter {
             target,
             identity: expected,
             options,
-            staged_file,
+            staged_file: Some(staged_file),
             compressor,
             first_prev_hash_wire: None,
             last_block: None,
@@ -111,7 +113,14 @@ impl SettledSupplementSegmentWriter {
             pending_chunk_blocks: 0,
             chunk_index: Vec::with_capacity(chunk_count),
             row_index: Vec::with_capacity(row_capacity),
+            #[cfg(test)]
+            fail_flush_after_partial_bytes: std::cell::Cell::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_partial_write_failure(&self, partial_bytes: usize) {
+        self.fail_flush_after_partial_bytes.set(Some(partial_bytes));
     }
 
     /// Appends the next contiguous block derived from `block` and optional
@@ -148,6 +157,9 @@ impl SettledSupplementSegmentWriter {
         block_time: u32,
         record: &BlockSupplementRecord,
     ) -> Result<(), SettledSupplementSegmentError> {
+        if self.staged_file.is_none() {
+            return Err(writer_poisoned());
+        }
         check_contiguous_block(&self.identity, block_id, self.last_block)?;
         if let Some(prior) = self.last_block
             && prev_hash != prior.hash
@@ -208,6 +220,9 @@ impl SettledSupplementSegmentWriter {
 
     /// Finalizes indexes, SHA-256 trailer, `fs-verity`, and persists to target.
     pub fn finish(mut self) -> Result<SupplementSegmentIdentity, SettledSupplementSegmentError> {
+        if self.staged_file.is_none() {
+            return Err(writer_poisoned());
+        }
         let block_count = self.identity.block_count()?;
         let row_len = u32::try_from(self.row_index.len()).map_err(|_| {
             SettledSupplementSegmentError::InvalidFormat("row index length exceeds u32".to_owned())
@@ -227,13 +242,18 @@ impl SettledSupplementSegmentWriter {
             self.flush_pending_chunk()?;
         }
 
-        let trailer_offset = self.write_indexes_and_header(block_count, first_prev_hash_wire)?;
-        let (trailer, verity_digest) = hash_staged(self.staged_file.as_file(), trailer_offset)?;
-        write_all_at(self.staged_file.as_file(), &trailer, trailer_offset)?;
-        self.staged_file.as_file().sync_all()?;
+        let mut staged_file = self.staged_file.take().ok_or_else(writer_poisoned)?;
+        let trailer_offset = self.write_indexes_and_header(
+            staged_file.as_file_mut(),
+            block_count,
+            first_prev_hash_wire,
+        )?;
+        let (trailer, verity_digest) = hash_staged(staged_file.as_file(), trailer_offset)?;
+        write_all_at(staged_file.as_file(), &trailer, trailer_offset)?;
+        staged_file.as_file().sync_all()?;
 
-        let readonly_staged = verity::reopen_staged(&self.staged_file)?;
-        let (writable_file, temp_path) = self.staged_file.into_parts();
+        let readonly_staged = verity::reopen_staged(&staged_file)?;
+        let (writable_file, temp_path) = staged_file.into_parts();
         drop(writable_file);
         verity::protect_new_segment(&readonly_staged, Some(verity_digest))?;
         drop(readonly_staged);
@@ -249,6 +269,7 @@ impl SettledSupplementSegmentWriter {
     }
 
     fn flush_pending_chunk(&mut self) -> Result<(), SettledSupplementSegmentError> {
+        let mut staged_file = self.staged_file.take().ok_or_else(writer_poisoned)?;
         let uncompressed_len = u32::try_from(self.pending_chunk.len()).map_err(|_| {
             SettledSupplementSegmentError::InvalidFormat(
                 "chunk uncompressed length exceeds u32".to_owned(),
@@ -279,14 +300,15 @@ impl SettledSupplementSegmentWriter {
         }
 
         let chunk_sha256: [u8; 32] = Sha256::digest(frame).into();
-        self.staged_file.as_file_mut().write_all(frame)?;
-        self.chunk_index.push(DecodedChunkIndexEntry {
-            data_rel_offset: self.data_cursor,
-            compressed_len,
-            uncompressed_len,
-            chunk_sha256,
-        });
-        self.data_cursor = self
+        #[cfg(test)]
+        write_chunk_frame(
+            staged_file.as_file_mut(),
+            frame,
+            &self.fail_flush_after_partial_bytes,
+        )?;
+        #[cfg(not(test))]
+        write_chunk_frame(staged_file.as_file_mut(), frame)?;
+        let next_data_cursor = self
             .data_cursor
             .checked_add(u64::from(compressed_len))
             .ok_or_else(|| {
@@ -294,13 +316,22 @@ impl SettledSupplementSegmentWriter {
                     "chunk data cursor overflow".to_owned(),
                 )
             })?;
+        self.chunk_index.push(DecodedChunkIndexEntry {
+            data_rel_offset: self.data_cursor,
+            compressed_len,
+            uncompressed_len,
+            chunk_sha256,
+        });
+        self.data_cursor = next_data_cursor;
         self.pending_chunk.clear();
         self.pending_chunk_blocks = 0;
+        self.staged_file = Some(staged_file);
         Ok(())
     }
 
     fn write_indexes_and_header(
-        &mut self,
+        &self,
+        file: &mut File,
         block_count: u32,
         first_prev_hash_wire: [u8; 32],
     ) -> Result<u64, SettledSupplementSegmentError> {
@@ -329,7 +360,6 @@ impl SettledSupplementSegmentWriter {
                 SettledSupplementSegmentError::InvalidFormat("trailer offset overflow".to_owned())
             })?;
 
-        let file = self.staged_file.as_file_mut();
         for entry in &self.chunk_index {
             file.write_all(&entry.encode())?;
         }
@@ -356,6 +386,39 @@ impl SettledSupplementSegmentWriter {
         file.sync_all()?;
         Ok(trailer_offset)
     }
+}
+
+#[cfg(test)]
+fn write_chunk_frame(
+    file: &mut File,
+    frame: &[u8],
+    fail_after_partial: &std::cell::Cell<Option<usize>>,
+) -> Result<(), SettledSupplementSegmentError> {
+    if let Some(partial_bytes) = fail_after_partial.take() {
+        let prefix_len = partial_bytes.min(frame.len());
+        if prefix_len > 0 {
+            file.write_all(&frame[..prefix_len])?;
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "injected partial supplement chunk write failure",
+        )
+        .into());
+    }
+    file.write_all(frame)?;
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn write_chunk_frame(file: &mut File, frame: &[u8]) -> Result<(), SettledSupplementSegmentError> {
+    file.write_all(frame)?;
+    Ok(())
+}
+
+fn writer_poisoned() -> SettledSupplementSegmentError {
+    SettledSupplementSegmentError::InvalidFormat(
+        "supplement segment writer is poisoned after a failed write".to_owned(),
+    )
 }
 
 fn check_canonical_facts_header(

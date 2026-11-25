@@ -2632,3 +2632,339 @@ fn wire_validator_enforces_crypto_field_presence_lengths_and_nullifier_mode() ->
     )?;
     Ok(())
 }
+
+fn encode_shielded_wire_with_wide_fee_zero(block: &CompactBlockArtifact) -> Vec<u8> {
+    let vtx = block
+        .transactions()
+        .iter()
+        .filter(|tx| {
+            !tx.data.sapling_spends.is_empty()
+                || !tx.data.sapling_outputs.is_empty()
+                || !tx.data.orchard_actions.is_empty()
+                || !tx.data.ironwood_actions.is_empty()
+        })
+        .map(|tx| lightwalletd::CompactTx {
+            index: tx.index,
+            txid: encode_internal_transaction_id(tx.transaction_id).to_vec(),
+            fee: tx
+                .data
+                .fee_zat
+                .and_then(|fee| u32::try_from(fee).ok())
+                .unwrap_or(0),
+            spends: tx
+                .data
+                .sapling_spends
+                .iter()
+                .map(|spend| lightwalletd::CompactSaplingSpend {
+                    nf: spend.nullifier.to_vec(),
+                })
+                .collect(),
+            outputs: tx
+                .data
+                .sapling_outputs
+                .iter()
+                .map(|output| lightwalletd::CompactSaplingOutput {
+                    cmu: output.commitment.to_vec(),
+                    ephemeral_key: output.ephemeral_key.to_vec(),
+                    ciphertext: output.ciphertext.to_vec(),
+                })
+                .collect(),
+            actions: tx
+                .data
+                .orchard_actions
+                .iter()
+                .map(|act| prost_action(act, false))
+                .collect(),
+            ironwood_actions: tx
+                .data
+                .ironwood_actions
+                .iter()
+                .map(|act| prost_action(act, false))
+                .collect(),
+            vin: Vec::new(),
+            vout: Vec::new(),
+        })
+        .collect();
+    let meta = block.chain_metadata();
+    lightwalletd::CompactBlock {
+        height: u64::from(block.height().value()),
+        hash: encode_internal_block_hash(block.block_hash()).to_vec(),
+        prev_hash: encode_internal_block_hash(block.previous_block_hash()).to_vec(),
+        time: block.time(),
+        header: Vec::new(),
+        vtx,
+        chain_metadata: Some(lightwalletd::ChainMetadata {
+            sapling_commitment_tree_size: meta.sapling_commitment_tree_size,
+            orchard_commitment_tree_size: meta.orchard_commitment_tree_size,
+            ironwood_commitment_tree_size: meta.ironwood_commitment_tree_size,
+        }),
+    }
+    .encode_to_vec()
+}
+
+#[test]
+fn push_record_rejects_conflicting_tag1_and_tag2_txids() -> TestOutcome {
+    let temp = TempDir::new()?;
+    let seg_path = temp.path().join("conflict.zstsup01");
+    let first = empty_block(500);
+    let second = transparent_only_block(501)?;
+    let identity = SupplementSegmentIdentity::span(
+        Network::ZcashMainnet,
+        1,
+        first.height(),
+        BlockId::new(second.height(), second.block_hash()),
+    );
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &seg_path,
+        identity,
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    writer.push(&first, Some(&make_canonical_facts(&first)))?;
+
+    let mut canonical_meta = CanonicalBlockSupplement::from_canonical_facts(
+        &make_canonical_facts(&second),
+        Some(&second),
+    )?;
+    canonical_meta.transactions[1].public_facts.transaction_id = det_txid(99);
+    let bad_record = BlockSupplementRecord {
+        transparent_transactions: transparent_supplement_from_compact(&second),
+        canonical_metadata: Some(canonical_meta),
+    };
+    let push_outcome = writer.push_record(
+        BlockId::new(second.height(), second.block_hash()),
+        second.previous_block_hash(),
+        second.time(),
+        &bad_record,
+    );
+    assert!(matches!(
+        push_outcome,
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+    let finish_outcome = writer.finish();
+    assert!(matches!(
+        finish_outcome,
+        Err(SettledSupplementSegmentError::ChainLinkage(_))
+    ));
+    assert!(!seg_path.exists());
+    Ok(())
+}
+
+#[test]
+fn partial_write_failure_poisons_writer_and_prevents_finish_publication() -> TestOutcome {
+    let temp = TempDir::new()?;
+    let seg_path = temp.path().join("poisoned.zstsup01");
+    let first = empty_block(510);
+    let second = transparent_only_block(511)?;
+    let identity = SupplementSegmentIdentity::span(
+        Network::ZcashMainnet,
+        1,
+        first.height(),
+        BlockId::new(second.height(), second.block_hash()),
+    );
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &seg_path,
+        identity,
+        SettledSupplementSegmentWriteOptions {
+            codec: SupplementCompressionCodec::None,
+            chunk_blocks: 1,
+        },
+    )?;
+    writer.push(&first, None)?;
+    writer.inject_partial_write_failure(5);
+
+    let failed_push = writer.push(&second, None);
+    assert!(matches!(
+        failed_push,
+        Err(SettledSupplementSegmentError::Io(_))
+    ));
+    let retry_record = BlockSupplementRecord {
+        transparent_transactions: transparent_supplement_from_compact(&second),
+        canonical_metadata: None,
+    };
+    let poisoned_push = writer.push_record(
+        BlockId::new(second.height(), second.block_hash()),
+        second.previous_block_hash(),
+        second.time(),
+        &retry_record,
+    );
+    assert!(matches!(
+        poisoned_push,
+        Err(SettledSupplementSegmentError::InvalidFormat(_))
+    ));
+    let poisoned_finish = writer.finish();
+    assert!(matches!(
+        poisoned_finish,
+        Err(SettledSupplementSegmentError::InvalidFormat(_))
+    ));
+    assert!(!seg_path.exists());
+    Ok(())
+}
+
+#[test]
+fn reader_exposes_authenticated_boundary_hashes_and_bounded_metadata_visitor() -> TestOutcome {
+    let temp = TempDir::new()?;
+    let blocks = [
+        empty_block(520),
+        transparent_only_block(521)?,
+        shielded_only_block(522)?,
+        mixed_interleaved_block(523)?,
+    ];
+    let (_sup_path, _shielded_reader, _sup_id, sup_reader) = write_paired_segments(
+        temp.path(),
+        &blocks,
+        true,
+        SettledSupplementSegmentWriteOptions {
+            codec: SupplementCompressionCodec::Zstd,
+            chunk_blocks: 2,
+        },
+    )?;
+
+    assert_eq!(
+        sup_reader.first_previous_block_hash()?,
+        blocks[0].previous_block_hash()
+    );
+    for block in &blocks {
+        assert_eq!(
+            sup_reader.block_hash_at(block.height())?,
+            block.block_hash()
+        );
+    }
+
+    let mut visited = Vec::new();
+    sup_reader.visit_canonical_metadata_range::<SettledSupplementSegmentError, _>(
+        BlockHeight::new(520),
+        BlockHeight::new(523),
+        |height, meta| {
+            let digest = meta.map(|canonical| canonical.serialized_bytes_digest);
+            visited.push((height, digest));
+            Ok(())
+        },
+    )?;
+    let expected: Vec<(BlockHeight, Option<SerializedBytesDigest>)> = blocks
+        .iter()
+        .map(|block| {
+            (
+                block.height(),
+                Some(make_canonical_facts(block).serialized_bytes_digest),
+            )
+        })
+        .collect();
+    assert_eq!(visited, expected);
+    Ok(())
+}
+
+fn wide_fee_corpus() -> TestOutcome<Vec<CompactBlockArtifact>> {
+    let wide_transparent_fee = u64::from(u32::MAX) + 7;
+    let wide_mixed_fee = u64::from(u32::MAX) + 11;
+    let wide_shielded_fee = u64::from(u32::MAX) + 19;
+    Ok(vec![
+        CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(530), det_block_hash(530)),
+            det_block_hash(529),
+            1_735_000_530,
+            vec![CompactTransaction {
+                index: 0,
+                transaction_id: det_txid(71),
+                data: CompactTransactionData {
+                    fee_zat: Some(wide_transparent_fee),
+                    transparent_outputs: vec![t_out(10_000, 0x61)],
+                    ..CompactTransactionData::default()
+                },
+            }],
+            make_meta(530),
+        )?,
+        CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(531), det_block_hash(531)),
+            det_block_hash(530),
+            1_735_000_531,
+            vec![CompactTransaction {
+                index: 0,
+                transaction_id: det_txid(72),
+                data: CompactTransactionData {
+                    fee_zat: Some(wide_mixed_fee),
+                    sapling_outputs: vec![sapling_output(0x62)],
+                    transparent_inputs: vec![t_in(17, 0)],
+                    transparent_outputs: vec![t_out(20_000, 0x63)],
+                    ..CompactTransactionData::default()
+                },
+            }],
+            make_meta(531),
+        )?,
+        CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(532), det_block_hash(532)),
+            det_block_hash(531),
+            1_735_000_532,
+            vec![CompactTransaction {
+                index: 0,
+                transaction_id: det_txid(73),
+                data: CompactTransactionData {
+                    fee_zat: Some(wide_shielded_fee),
+                    orchard_actions: vec![shielded_action(0x64)],
+                    ..CompactTransactionData::default()
+                },
+            }],
+            make_meta(532),
+        )?,
+    ])
+}
+
+#[test]
+fn reconstruct_preserves_shielded_and_transparent_wide_fees_while_splice_rejects() -> TestOutcome {
+    let blocks = wide_fee_corpus()?;
+    let temp = TempDir::new()?;
+    let sup_path = temp.path().join("wide-fees.zstsup01");
+    let sup_id_req = SupplementSegmentIdentity::span(
+        Network::ZcashMainnet,
+        1,
+        blocks[0].height(),
+        BlockId::new(blocks[2].height(), blocks[2].block_hash()),
+    );
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &sup_path,
+        sup_id_req,
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    for block in &blocks {
+        writer.push(block, Some(&make_canonical_facts(block)))?;
+    }
+    let sup_id = writer.finish()?;
+    let reader = SettledSupplementSegmentReader::open(
+        &sup_path,
+        &sup_id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    let wires: Vec<Vec<u8>> = blocks
+        .iter()
+        .map(encode_shielded_wire_with_wide_fee_zero)
+        .collect();
+    for (block, wire) in blocks.iter().zip(wires.iter()) {
+        assert_eq!(reader.reconstruct_block(block.height(), wire)?, *block);
+    }
+    assert_eq!(
+        reader.reconstruct_range(BlockHeight::new(530), &wires)?,
+        blocks
+    );
+
+    let all_modes = [
+        CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
+        CompactBlockSpliceSelection::DEFAULT_SHIELDED,
+        CompactBlockSpliceSelection::DEFAULT_NULLIFIERS,
+        CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+    ];
+    for mode in all_modes {
+        for (block, wire) in blocks.iter().zip(wires.iter()) {
+            let single_err = reader.splice_block_wire(block.height(), wire, mode);
+            assert!(matches!(
+                single_err,
+                Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+            ));
+        }
+        let range_err = reader.splice_range_wire(BlockHeight::new(530), &wires, mode);
+        assert!(matches!(
+            range_err,
+            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+        ));
+    }
+    Ok(())
+}

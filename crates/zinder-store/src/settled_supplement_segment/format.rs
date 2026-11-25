@@ -19,7 +19,9 @@ pub(super) const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 pub(super) const ROW_FLAG_HAS_TRANSPARENT: u8 = 0x01;
 pub(super) const ROW_FLAG_HAS_CANONICAL_METADATA: u8 = 0x02;
-pub(super) const ROW_KNOWN_FLAGS: u8 = ROW_FLAG_HAS_TRANSPARENT | ROW_FLAG_HAS_CANONICAL_METADATA;
+pub(super) const ROW_FLAG_HAS_WIDE_FEE: u8 = 0x04;
+pub(super) const ROW_KNOWN_FLAGS: u8 =
+    ROW_FLAG_HAS_TRANSPARENT | ROW_FLAG_HAS_CANONICAL_METADATA | ROW_FLAG_HAS_WIDE_FEE;
 
 pub(super) const VALIDATION_UNVALIDATED: u8 = 0;
 pub(super) const VALIDATION_VALID: u8 = 1;
@@ -369,6 +371,10 @@ impl IndexedSupplementBlock {
 
     pub(super) const fn has_transparent(&self) -> bool {
         (self.row_flags & ROW_FLAG_HAS_TRANSPARENT) != 0
+    }
+
+    pub(super) const fn has_wide_fee(&self) -> bool {
+        (self.row_flags & ROW_FLAG_HAS_WIDE_FEE) != 0
     }
 
     pub(super) fn mark_valid(&self) {

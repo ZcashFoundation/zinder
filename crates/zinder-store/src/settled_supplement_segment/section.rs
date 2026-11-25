@@ -16,7 +16,10 @@ use zinder_core::{
 
 use super::{
     SettledSupplementSegmentError,
-    format::{ROW_FLAG_HAS_CANONICAL_METADATA, ROW_FLAG_HAS_TRANSPARENT, ROW_KNOWN_FLAGS},
+    format::{
+        ROW_FLAG_HAS_CANONICAL_METADATA, ROW_FLAG_HAS_TRANSPARENT, ROW_FLAG_HAS_WIDE_FEE,
+        ROW_KNOWN_FLAGS,
+    },
 };
 
 const BLOCK_ENVELOPE_VERSION_V1: u8 = 1;
@@ -205,7 +208,7 @@ fn transaction_supplement_from_facts(
     }
 }
 
-pub(super) fn transparent_supplement_from_compact(
+pub(crate) fn transparent_supplement_from_compact(
     block: &CompactBlockArtifact,
 ) -> Vec<CompactTransparentSupplementTx> {
     block
@@ -253,6 +256,17 @@ pub(super) fn encode_block_record(
         append_section(&mut encoded, SECTION_TAG_CANONICAL_METADATA, &tag2)?;
         row_flags |= ROW_FLAG_HAS_CANONICAL_METADATA;
     }
+    if record_has_wide_fee(
+        &record.transparent_transactions,
+        record.canonical_metadata.as_ref(),
+    ) {
+        row_flags |= ROW_FLAG_HAS_WIDE_FEE;
+    }
+    verify_decoded_record_consistency(
+        &record.transparent_transactions,
+        record.canonical_metadata.as_ref(),
+        row_flags,
+    )?;
     Ok((encoded, row_flags))
 }
 
@@ -413,7 +427,11 @@ fn verify_decoded_record_consistency(
 ) -> Result<(), SettledSupplementSegmentError> {
     let has_transparent = (expected_row_flags & ROW_FLAG_HAS_TRANSPARENT) != 0;
     let has_canonical = (expected_row_flags & ROW_FLAG_HAS_CANONICAL_METADATA) != 0;
-    if transparent.is_empty() == has_transparent || canonical.is_some() != has_canonical {
+    let has_wide_fee = (expected_row_flags & ROW_FLAG_HAS_WIDE_FEE) != 0;
+    if transparent.is_empty() == has_transparent
+        || canonical.is_some() != has_canonical
+        || record_has_wide_fee(transparent, canonical) != has_wide_fee
+    {
         return Err(SettledSupplementSegmentError::PayloadIntegrity(
             "supplement block sections disagree with row index flags".to_owned(),
         ));
@@ -437,6 +455,22 @@ fn verify_decoded_record_consistency(
         }
     }
     Ok(())
+}
+
+fn record_has_wide_fee(
+    transparent: &[CompactTransparentSupplementTx],
+    canonical: Option<&CanonicalBlockSupplement>,
+) -> bool {
+    transparent
+        .iter()
+        .any(|tx| tx.fee_zat.is_some_and(|fee| u32::try_from(fee).is_err()))
+        || canonical.is_some_and(|canonical_block| {
+            canonical_block.transactions.iter().any(|tx| {
+                tx.fee_and_burn
+                    .fee_zat
+                    .is_some_and(|fee| u32::try_from(fee).is_err())
+            })
+        })
 }
 
 fn encode_tag1_section(
