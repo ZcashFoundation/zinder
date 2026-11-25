@@ -1513,3 +1513,306 @@ async fn extension_storage_error_is_not_masked_by_stored_checkpoint_fallback() -
     let _ = leader.await?;
     Ok(())
 }
+
+fn publish_every_block_reader(
+    chain: &ChainFixture,
+    through: u32,
+    settled: u32,
+) -> eyre::Result<(WalletServingStoreFixture, Arc<ObservedCanonicalReader>)> {
+    let baseline = CanonicalBaseline::new(chain)
+        .through(BlockHeight::new(through))
+        .with_settled_tip(BlockHeight::new(settled))
+        .with_every_block_tree_state_checkpoints();
+    let mut store =
+        CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?
+            .into_serving_store_fixture()?;
+    let reader = Arc::new(ObservedCanonicalReader::new(RocksDbCanonicalReader::new(
+        store.take_readers()?.0,
+    )?));
+    Ok((store, reader))
+}
+
+#[tokio::test]
+async fn settled_stored_checkpoint_is_cached_on_first_read_and_reused_without_storage_reads()
+-> eyre::Result<()> {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
+
+    let chain = zinder_testkit::with_note_commitments(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(5),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (_store, reader) = publish_every_block_reader(&chain, 5, 3)?;
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let height = BlockHeight::new(2);
+    let key = ReplayKey::new(height, reader.as_ref());
+    let generation = ReaderGeneration::static_for_test(&Arc::downgrade(&reader), true);
+    let dyn_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;
+
+    let first = limit
+        .ready_state(&key, &generation, &dyn_reader, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing settled stored checkpoint"))?;
+    assert!(matches!(first, ReadyState::Stored(_)));
+    let expected = first.serve();
+    assert_eq!(reader.reads(), 1);
+    assert_eq!(limit.settled.read().len(), 1);
+
+    let second = limit
+        .ready_state(&key, &generation, &dyn_reader, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing cached settled checkpoint"))?;
+    assert!(matches!(second, ReadyState::Cached(ref cached) if cached.state() == &expected));
+    assert_eq!(reader.reads(), 1);
+    let expected_hex = crate::ServedTreeStateHex::from_served(Network::ZcashRegtest, &expected);
+    assert_eq!(second.serve_hex(Network::ZcashRegtest), expected_hex);
+
+    let visible_tip = reader.chain_epoch().visible_tip_height;
+    let fast_hit = limit
+        .cached_for_reader(height, visible_tip, &reader)
+        .ok_or_else(|| eyre::eyre!("missing tracked-generation cache hit"))?;
+    assert_eq!(fast_hit.serve_hex(Network::ZcashRegtest), expected_hex);
+    assert_eq!(reader.reads(), 1);
+
+    let rendered = metrics.render();
+    for expected_line in [
+        r#"zinder_query_tree_state_reads_total{source="stored",height_band="0"} 1"#,
+        r#"zinder_query_tree_state_reads_total{source="cached",height_band="0"} 2"#,
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == expected_line),
+            "missing {expected_line}:\n{rendered}"
+        );
+    }
+    assert!(!rendered.contains(r#"source="replayed""#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsettled_stored_checkpoint_is_not_cached_in_settled_states() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let (_store, reader) = publish_every_block_reader(&chain, 5, 3)?;
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let unsettled_height = BlockHeight::new(4);
+    let key = ReplayKey::new(unsettled_height, reader.as_ref());
+    let generation = ReaderGeneration::static_for_test(&Arc::downgrade(&reader), true);
+    let dyn_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;
+
+    let first = limit
+        .ready_state(&key, &generation, &dyn_reader, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing unsettled stored checkpoint"))?;
+    assert!(matches!(first, ReadyState::Stored(_)));
+    let expected = first.serve();
+    assert_eq!(reader.reads(), 1);
+    assert_eq!(limit.settled.read().len(), 0);
+
+    let second = limit
+        .ready_state(&key, &generation, &dyn_reader, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing second unsettled stored checkpoint"))?;
+    assert!(matches!(second, ReadyState::Stored(ref state) if state == &expected));
+    assert_eq!(reader.reads(), 2);
+    assert_eq!(limit.settled.read().len(), 0);
+    let visible_tip = reader.chain_epoch().visible_tip_height;
+    assert!(
+        limit
+            .cached_for_reader(unsettled_height, visible_tip, &reader)
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_generation_does_not_populate_or_overwrite_settled_cache_for_stored_checkpoints()
+-> eyre::Result<()> {
+    let activations = sample_regtest_upgrade_activations();
+    let base = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let chain = zinder_testkit::with_note_commitments(&base, &activations)?;
+    let fork_chain = zinder_testkit::with_note_commitments(
+        &base.fork_at(BlockHeight::new(2))?.extend_blocks(4),
+        &activations,
+    )?;
+    let (_s1, reader) = publish_every_block_reader(&chain, 5, 3)?;
+    let (_s2, fork_reader) = publish_every_block_reader(&fork_chain, 5, 3)?;
+
+    let empty_limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let height_two = BlockHeight::new(2);
+    let key_two = ReplayKey::new(height_two, reader.as_ref());
+    let stale_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&reader), false);
+    let dyn_reader = Arc::clone(&reader) as Arc<dyn CanonicalReader>;
+    assert!(matches!(
+        empty_limit
+            .ready_state(&key_two, &stale_gen, &dyn_reader, empty_limit.deadline())
+            .await?,
+        Some(ReadyState::Stored(_))
+    ));
+    assert_eq!(empty_limit.settled.read().len(), 0);
+
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+    let current_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&reader), true);
+    let expected_two = limit
+        .ready_state(&key_two, &current_gen, &dyn_reader, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing settled stored checkpoint"))?
+        .serve();
+    let reads_after_populate = reader.reads();
+    assert_eq!(limit.settled.read().len(), 1);
+
+    let height_three = BlockHeight::new(3);
+    let key_three = ReplayKey::new(height_three, reader.as_ref());
+    assert!(matches!(
+        limit
+            .ready_state(&key_three, &stale_gen, &dyn_reader, limit.deadline())
+            .await?,
+        Some(ReadyState::Stored(_))
+    ));
+    assert_eq!(limit.settled.read().len(), 1);
+    let visible_tip = reader.chain_epoch().visible_tip_height;
+    assert!(
+        limit
+            .cached_for_reader(height_three, visible_tip, &reader)
+            .is_none()
+    );
+
+    let fork_key = ReplayKey::new(height_two, fork_reader.as_ref());
+    let stale_fork_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&fork_reader), false);
+    let dyn_fork = Arc::clone(&fork_reader) as Arc<dyn CanonicalReader>;
+    let fork_served = limit
+        .ready_state(&fork_key, &stale_fork_gen, &dyn_fork, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing fork stored checkpoint"))?
+        .serve();
+    assert_ne!(fork_served, expected_two);
+    assert_eq!(limit.settled.read().len(), 1);
+    let reads_before_cached_lookup = reader.reads();
+    assert_eq!(reads_before_cached_lookup, reads_after_populate + 1);
+    assert!(matches!(
+        limit
+            .ready_state(&key_two, &current_gen, &dyn_reader, limit.deadline())
+            .await?,
+        Some(ReadyState::Cached(ref cached)) if cached.state() == &expected_two
+    ));
+    assert_eq!(reader.reads(), reads_before_cached_lookup);
+    Ok(())
+}
+
+#[tokio::test]
+async fn settled_stored_checkpoint_survives_settled_tip_advance() -> eyre::Result<()> {
+    let chain = zinder_testkit::with_note_commitments(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(5),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (_s1, initial) = publish_every_block_reader(&chain, 4, 2)?;
+    let (_s2, extended) = publish_every_block_reader(&chain, 5, 4)?;
+
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(5));
+    let height_two = BlockHeight::new(2);
+    let height_three = BlockHeight::new(3);
+
+    let init_key = ReplayKey::new(height_two, initial.as_ref());
+    let init_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&initial), true);
+    let dyn_init = Arc::clone(&initial) as Arc<dyn CanonicalReader>;
+    let expected_two = limit
+        .ready_state(&init_key, &init_gen, &dyn_init, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing initial settled checkpoint"))?
+        .serve();
+    assert_eq!(initial.reads(), 1);
+
+    let ext_key_two = ReplayKey::new(height_two, extended.as_ref());
+    let ext_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&extended), true);
+    let dyn_ext = Arc::clone(&extended) as Arc<dyn CanonicalReader>;
+    assert!(matches!(
+        limit
+            .ready_state(&ext_key_two, &ext_gen, &dyn_ext, limit.deadline())
+            .await?,
+        Some(ReadyState::Cached(ref cached)) if cached.state() == &expected_two
+    ));
+    assert_eq!(extended.reads(), 1);
+    let ext_tip = extended.chain_epoch().visible_tip_height;
+    assert!(matches!(
+        limit.cached_for_reader(height_two, ext_tip, &extended),
+        Some(ReadyState::Cached(ref cached)) if cached.state() == &expected_two
+    ));
+
+    let ext_key_three = ReplayKey::new(height_three, extended.as_ref());
+    let expected_three = limit
+        .ready_state(&ext_key_three, &ext_gen, &dyn_ext, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing newly settled checkpoint"))?
+        .serve();
+    assert_eq!(extended.reads(), 2);
+    assert_eq!(limit.settled.read().len(), 2);
+    assert!(matches!(
+        limit.cached_for_reader(height_three, ext_tip, &extended),
+        Some(ReadyState::Cached(ref cached)) if cached.state() == &expected_three
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn settled_stored_checkpoint_clears_and_replaces_on_fork() -> eyre::Result<()> {
+    let activations = sample_regtest_upgrade_activations();
+    let base = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+    let chain_a = zinder_testkit::with_note_commitments(&base, &activations)?;
+    let chain_fork = zinder_testkit::with_note_commitments(
+        &base.fork_at(BlockHeight::new(2))?.extend_blocks(4),
+        &activations,
+    )?;
+    let (_s1, initial) = publish_every_block_reader(&chain_a, 4, 2)?;
+    let (_s2, forked) = publish_every_block_reader(&chain_fork, 5, 4)?;
+
+    let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_secs(5));
+    let height_one = BlockHeight::new(1);
+    let height_two = BlockHeight::new(2);
+    let init_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&initial), true);
+    let dyn_init = Arc::clone(&initial) as Arc<dyn CanonicalReader>;
+
+    let init_key_one = ReplayKey::new(height_one, initial.as_ref());
+    let expected_one = limit
+        .ready_state(&init_key_one, &init_gen, &dyn_init, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing settled checkpoint at height 1"))?
+        .serve();
+    let init_key_two = ReplayKey::new(height_two, initial.as_ref());
+    let expected_two = limit
+        .ready_state(&init_key_two, &init_gen, &dyn_init, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing settled checkpoint at height 2"))?
+        .serve();
+    assert_eq!(limit.settled.read().len(), 2);
+
+    let fork_key_two = ReplayKey::new(height_two, forked.as_ref());
+    let fork_gen = ReaderGeneration::static_for_test(&Arc::downgrade(&forked), true);
+    let dyn_fork = Arc::clone(&forked) as Arc<dyn CanonicalReader>;
+    let fork_two = limit
+        .ready_state(&fork_key_two, &fork_gen, &dyn_fork, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing fork checkpoint at height 2"))?;
+    assert!(matches!(fork_two, ReadyState::Stored(_)));
+    let fork_two_state = fork_two.serve();
+    assert_ne!(fork_two_state, expected_two);
+    assert_eq!(limit.settled.read().len(), 1);
+    assert_eq!(forked.reads(), 2);
+
+    assert!(matches!(
+        limit
+            .ready_state(&fork_key_two, &fork_gen, &dyn_fork, limit.deadline())
+            .await?,
+        Some(ReadyState::Cached(ref cached)) if cached.state() == &fork_two_state
+    ));
+    assert_eq!(forked.reads(), 2);
+
+    // Height 1 from the pre-fork anchor was also evicted and must be re-read on the fork anchor.
+    let fork_key_one = ReplayKey::new(height_one, forked.as_ref());
+    let fork_one = limit
+        .ready_state(&fork_key_one, &fork_gen, &dyn_fork, limit.deadline())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing fork checkpoint at height 1"))?;
+    assert!(matches!(fork_one, ReadyState::Stored(_)));
+    assert_eq!(fork_one.serve(), expected_one);
+    assert_eq!(forked.reads(), 3);
+    Ok(())
+}

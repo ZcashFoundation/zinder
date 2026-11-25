@@ -403,6 +403,13 @@ impl TreeStateReplayLimit {
             .await
             .map_err(QueryError::canonical_read)?;
         if let Some(state) = stored {
+            let anchor = key.settled_anchor();
+            if state.block_id().height == key.height
+                && anchor.covers(key.height)
+                && generation.is_current()
+            {
+                self.settled.write().remember(anchor, generation, &state);
+            }
             return Ok(Some(ReadyState::Stored(state)));
         }
         if let Some(refusal) = lookup_refusal {
