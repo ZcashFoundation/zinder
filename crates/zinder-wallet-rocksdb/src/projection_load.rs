@@ -852,7 +852,7 @@ fn run_parallel_settled_chunks<'sorter>(
     first_retained_block: BlockId,
     sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
 ) -> Result<ParallelSettledScan<'sorter>, RocksDbWalletError> {
-    let initial_shards = parallel_sorter.open_shards();
+    let initial_shards = parallel_sorter.open_shards()?;
     let total_chunks = chunks.len();
     let worker_threads = initial_shards.len();
     let max_in_flight = worker_threads

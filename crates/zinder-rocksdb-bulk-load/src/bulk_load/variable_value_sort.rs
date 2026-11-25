@@ -461,6 +461,7 @@ struct SharedRunBudget {
     temporary_files: TemporaryFileBudget,
     next_run_index: u64,
     reserved_run_count: u64,
+    shards_opened: bool,
 }
 
 impl SharedRunBudget {
@@ -501,8 +502,10 @@ impl SharedRunBudget {
 ///
 /// The accounted memory ceiling is split evenly across `shard_count` shards so
 /// the sum of every shard's peak accounted memory never exceeds
-/// `max_accounted_memory_bytes`. Every shard shares one temporary-file budget
-/// enforcing `max_temporary_file_bytes` across all spilled and merged runs.
+/// `max_accounted_memory_bytes`. `open_shards` is single-use per sorter so
+/// outstanding shards cannot duplicate that allowance. Every shard shares one
+/// temporary-file budget enforcing `max_temporary_file_bytes` across all
+/// spilled and merged runs.
 pub struct ParallelVariableValueSorter<const KEY_LEN: usize> {
     workspace: TempDir,
     shard_count: NonZeroU32,
@@ -583,15 +586,27 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
                 temporary_files: TemporaryFileBudget::new(max_temporary_file_bytes),
                 next_run_index: 0,
                 reserved_run_count: 0,
+                shards_opened: false,
             }),
         })
     }
 
     /// Opens one shard writer per configured worker.
-    #[must_use]
-    pub fn open_shards(&self) -> Vec<VariableValueSortShard<'_, KEY_LEN>> {
+    ///
+    /// Shards may be opened only once per sorter so outstanding shard buffers
+    /// cannot exceed `max_accounted_memory_bytes`.
+    pub fn open_shards(&self) -> Result<Vec<VariableValueSortShard<'_, KEY_LEN>>, BulkLoadError> {
+        {
+            let mut budget = self.shared_budget.lock();
+            if budget.shards_opened {
+                return Err(BulkLoadError::invalid(
+                    "parallel variable-value sorter shards were already opened",
+                ));
+            }
+            budget.shards_opened = true;
+        }
         let count = usize::try_from(self.shard_count.get()).unwrap_or(usize::MAX);
-        (0..count)
+        Ok((0..count)
             .map(|_| VariableValueSortShard {
                 workspace_path: self.workspace.path(),
                 shared_budget: &self.shared_budget,
@@ -606,7 +621,22 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
                 peak_oversized_record_bytes: 0,
                 initial_run_spill: Duration::ZERO,
             })
-            .collect()
+            .collect())
+    }
+
+    fn verify_owned_shards(
+        &self,
+        shards: &[VariableValueSortShard<'_, KEY_LEN>],
+    ) -> Result<(), BulkLoadError> {
+        if shards
+            .iter()
+            .any(|shard| !std::ptr::eq(shard.shared_budget, &raw const self.shared_budget))
+        {
+            return Err(BulkLoadError::invalid(
+                "cannot flush variable-value sort shards opened by another sorter",
+            ));
+        }
+        Ok(())
     }
 
     /// Flushes all remaining staged records across `shards` in parallel.
@@ -614,6 +644,7 @@ impl<const KEY_LEN: usize> ParallelVariableValueSorter<KEY_LEN> {
         &'a self,
         mut shards: Vec<VariableValueSortShard<'a, KEY_LEN>>,
     ) -> Result<StagedParallelVariableRuns, BulkLoadError> {
+        self.verify_owned_shards(&shards)?;
         let flush_started = Instant::now();
         let outcomes = if let Some((first, rest)) = shards.split_first_mut() {
             let slots = rest
@@ -2070,7 +2101,7 @@ mod tests {
                 max_memory,
                 max_temp,
             )?;
-            let open_shards = parallel.open_shards();
+            let open_shards = parallel.open_shards()?;
             let chunk_size = records.len().div_ceil(open_shards.len());
             let returned_shards = std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(open_shards.len());
@@ -2119,7 +2150,7 @@ mod tests {
             one_record * 4,
             1024 * 1024,
         )?;
-        let mut shards = parallel.open_shards();
+        let mut shards = parallel.open_shards()?;
         for index in 0_u16..80 {
             let shard_idx = usize::from(index) % shards.len();
             shards[shard_idx].push((80 - index).to_be_bytes(), &[0xAB; 4])?;
@@ -2153,7 +2184,7 @@ mod tests {
             one_record * 2,
             tight_temp_limit,
         )?;
-        let mut shards = parallel.open_shards();
+        let mut shards = parallel.open_shards()?;
         shards[0].push([0, 1], &[1_u8; 16])?;
         shards[1].push([0, 2], &[2_u8; 16])?;
         let flushed = parallel.flush_shards(shards);
@@ -2201,7 +2232,7 @@ mod tests {
             global_budget,
             4 * 1024 * 1024,
         )?;
-        let mut shards = parallel.open_shards();
+        let mut shards = parallel.open_shards()?;
         shards[0].push([0, 3], &[0x11; 16])?;
         shards[0].push([0, 1], &oversized_payload)?;
         shards[1].push([0, 2], &[0x22; 16])?;
@@ -2222,6 +2253,49 @@ mod tests {
         assert_eq!(drained[0].encoded_value, oversized_payload);
         assert_eq!(drained[1].key, [0, 2]);
         assert_eq!(drained[2].key, [0, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_sorter_rejects_second_open_shards_and_foreign_shards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let two = NonZeroU32::new(2).ok_or("zero shards")?;
+        let min_record = u64::try_from(size_of::<StagedVariableValue<2>>())?;
+        let parallel_a = ParallelVariableValueSorter::<2>::new(
+            dir.path(),
+            "sorter-a",
+            two,
+            min_record * 4,
+            1024,
+        )?;
+        let parallel_b = ParallelVariableValueSorter::<2>::new(
+            dir.path(),
+            "sorter-b",
+            two,
+            min_record * 4,
+            1024,
+        )?;
+
+        let shards_a = parallel_a.open_shards()?;
+        assert!(matches!(
+            parallel_a.open_shards(),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+
+        let shards_b = parallel_b.open_shards()?;
+        assert!(matches!(
+            parallel_a.flush_shards(shards_b),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+
+        let staged_a = parallel_a.flush_shards(shards_a)?;
+        assert!(matches!(
+            parallel_a.open_shards(),
+            Err(BulkLoadError::InvalidInput { .. })
+        ));
+        let mut sorted = parallel_a.finish(staged_a)?;
+        assert_eq!(collect_sorted(&mut sorted)?, Vec::new());
         Ok(())
     }
 }
