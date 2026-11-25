@@ -16,6 +16,8 @@ pub(super) const TX_SLICE_ENTRY_LEN: usize = 40;
 pub(super) const ROW_INDEX_ENTRY_LEN: usize = 128;
 pub(super) const TRAILER_LEN: usize = 32;
 pub(super) const MAX_SLAB_BYTES: u64 = u32::MAX as u64;
+pub(super) const MAX_TX_ENTRIES_PER_BLOCK: u64 = 262_144;
+pub(super) const MAX_SEGMENT_TX_ENTRIES: usize = 8_388_608;
 pub(super) const STAGING_CHUNK: usize = 256 * 1024;
 pub(super) const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 /// Worst-case `Zstd` compressed frame payload upper bound for one `16 MiB` block.
@@ -130,7 +132,13 @@ impl SegmentHeader {
             ));
         }
         let count_u64 = byte_len / stride;
-        let _count_u32 = u32::try_from(count_u64).map_err(|_| {
+        let max_entries = max_tx_entries_for_blocks(self.block_count);
+        if count_u64 > max_entries as u64 {
+            return Err(SettledRawBlockSegmentError::InvalidFormat(format!(
+                "raw block segment tx table count {count_u64} exceeds maximum {max_entries}"
+            )));
+        }
+        let _ = u32::try_from(count_u64).map_err(|_| {
             SettledRawBlockSegmentError::InvalidFormat(
                 "raw block segment tx table exceeds u32 entry count".to_owned(),
             )
@@ -206,6 +214,13 @@ pub(super) fn expected_total_file_len(
         .ok_or_else(|| {
             SettledRawBlockSegmentError::InvalidFormat("segment total length overflow".to_owned())
         })
+}
+
+pub(super) fn max_tx_entries_for_blocks(block_count: u32) -> usize {
+    let block_count_u64 = u64::from(block_count);
+    let scaled = block_count_u64.saturating_mul(MAX_TX_ENTRIES_PER_BLOCK);
+    let bounded = scaled.min(MAX_SEGMENT_TX_ENTRIES as u64);
+    usize::try_from(bounded).unwrap_or(MAX_SEGMENT_TX_ENTRIES)
 }
 
 /// Decoded 40-byte transaction slice record in the flat transaction table.

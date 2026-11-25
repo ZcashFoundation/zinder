@@ -16,9 +16,10 @@ use super::{
     SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES, SettledRawBlockSegmentError,
     SettledRawBlockSegmentOpenOptions, SettledRawBlockSegmentReader,
     format::{
-        DecodedRowIndexEntry, FRAME_PREFIX_LEN, HEADER_LEN, MAX_SLAB_BYTES, ROW_INDEX_ENTRY_LEN,
-        STAGING_CHUNK, SegmentHeader, TX_SLICE_ENTRY_LEN, TxSliceEntry, ZSTD_COMPRESSION_LEVEL,
-        check_contiguous_block, encode_frame_prefix,
+        DecodedRowIndexEntry, FRAME_PREFIX_LEN, HEADER_LEN, MAX_SEGMENT_TX_ENTRIES, MAX_SLAB_BYTES,
+        MAX_TX_ENTRIES_PER_BLOCK, ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader,
+        TX_SLICE_ENTRY_LEN, TxSliceEntry, ZSTD_COMPRESSION_LEVEL, check_contiguous_block,
+        encode_frame_prefix,
     },
     parent_directory, verity,
 };
@@ -74,21 +75,8 @@ impl SettledRawBlockSegmentWriter {
             &mut self.first_prev_hash,
         )?;
         let uncompressed_len = validate_raw_block_len(block_id.height, raw_block_bytes)?;
-        let tx_start_index = u32::try_from(self.tx_entries.len()).map_err(|_| {
-            SettledRawBlockSegmentError::InvalidFormat(
-                "raw block segment tx table exceeds u32".to_owned(),
-            )
-        })?;
-        let tx_count = u32::try_from(tx_slices.len()).map_err(|_| {
-            SettledRawBlockSegmentError::InvalidFormat(
-                "block transaction count exceeds u32".to_owned(),
-            )
-        })?;
-        tx_start_index.checked_add(tx_count).ok_or_else(|| {
-            SettledRawBlockSegmentError::InvalidFormat(
-                "raw block segment tx table exceeds u32".to_owned(),
-            )
-        })?;
+        let (tx_start_index, tx_count) =
+            validate_push_tx_limits(self.tx_entries.len(), tx_slices.len())?;
         let encoded_tx_entries = encode_block_tx_slices(raw_block_bytes, tx_slices)?;
         let payload = encode_block_payload(raw_block_bytes, self.identity.codec)?;
         let prefix = encode_frame_prefix(payload.len(), self.identity.codec)?;
@@ -247,6 +235,39 @@ fn validate_raw_block_len(
     u32::try_from(raw_block_bytes.len()).map_err(|_| {
         SettledRawBlockSegmentError::InvalidFormat("raw block byte length exceeds u32".to_owned())
     })
+}
+
+fn validate_push_tx_limits(
+    existing_tx_count: usize,
+    block_tx_count: usize,
+) -> Result<(u32, u32), SettledRawBlockSegmentError> {
+    let block_tx_u64 = u64::try_from(block_tx_count).map_err(|_| {
+        SettledRawBlockSegmentError::InvalidFormat("block transaction count exceeds u64".to_owned())
+    })?;
+    if block_tx_u64 > MAX_TX_ENTRIES_PER_BLOCK {
+        return Err(SettledRawBlockSegmentError::InvalidFormat(format!(
+            "block tx count {block_tx_u64} exceeds {MAX_TX_ENTRIES_PER_BLOCK}"
+        )));
+    }
+    if existing_tx_count.saturating_add(block_tx_count) > MAX_SEGMENT_TX_ENTRIES {
+        return Err(SettledRawBlockSegmentError::InvalidFormat(format!(
+            "segment tx table exceeds {MAX_SEGMENT_TX_ENTRIES} entries"
+        )));
+    }
+    let tx_start_index = u32::try_from(existing_tx_count).map_err(|_| {
+        SettledRawBlockSegmentError::InvalidFormat(
+            "raw block segment tx table exceeds u32".to_owned(),
+        )
+    })?;
+    let tx_count = u32::try_from(block_tx_count).map_err(|_| {
+        SettledRawBlockSegmentError::InvalidFormat("block transaction count exceeds u32".to_owned())
+    })?;
+    tx_start_index.checked_add(tx_count).ok_or_else(|| {
+        SettledRawBlockSegmentError::InvalidFormat(
+            "raw block segment tx table exceeds u32".to_owned(),
+        )
+    })?;
+    Ok((tx_start_index, tx_count))
 }
 
 fn encode_block_tx_slices(

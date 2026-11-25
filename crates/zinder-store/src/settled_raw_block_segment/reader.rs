@@ -15,8 +15,8 @@ use super::{
     SettledRawBlockSegmentError,
     format::{
         DecodedRowIndexEntry, FRAME_PREFIX_LEN, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock,
-        ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN, TX_SLICE_ENTRY_LEN, TxSliceEntry,
-        VALIDATION_INVALID, VALIDATION_VALID, decode_frame_prefix, frame_span,
+        ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader, TRAILER_LEN, TX_SLICE_ENTRY_LEN,
+        TxSliceEntry, VALIDATION_INVALID, VALIDATION_VALID, decode_frame_prefix, frame_span,
         max_stored_payload_bytes,
     },
     verity,
@@ -293,12 +293,12 @@ fn decode_payload(
     }
 }
 
-fn admit_protected(
+pub(super) fn admit_protected(
     file: File,
     expected: &RawBlockSegmentIdentity,
     header: SegmentHeader,
 ) -> Result<SettledRawBlockSegmentReader, SettledRawBlockSegmentError> {
-    let mut input = &file;
+    let mut input = BufReader::with_capacity(STAGING_CHUNK, &file);
     input.seek(SeekFrom::Start(header.tx_table_offset))?;
     let tx_count = header.tx_entry_count()?;
     let block_count = usize::try_from(header.block_count).map_err(|_| {
@@ -332,7 +332,7 @@ fn admit_portable(
     header: SegmentHeader,
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<SettledRawBlockSegmentReader, SettledRawBlockSegmentError> {
-    let mut buffered = BufReader::new(&file);
+    let mut buffered = BufReader::with_capacity(STAGING_CHUNK, &file);
     let mut whole_digest = Sha256::new();
     whole_digest.update(header_bytes);
     let count = usize::try_from(header.block_count).map_err(|_| {
@@ -347,14 +347,29 @@ fn admit_portable(
         expected.codec,
         &mut whole_digest,
     )?;
-    let tx_entries = hash_tx_entries(&mut buffered, tx_count, &mut whole_digest)?;
-    let entries = hash_index_entries(&mut buffered, count, &mut whole_digest)?;
+    let meta_len = metadata_span_bytes(&header)?;
+    let mut meta_digest_pass1 = Sha256::new();
+    hash_streamed_span(
+        &mut buffered,
+        meta_len,
+        &mut whole_digest,
+        &mut meta_digest_pass1,
+    )?;
     let mut trailer = [0_u8; TRAILER_LEN];
     buffered.read_exact(&mut trailer)?;
     let computed: [u8; 32] = whole_digest.finalize().into();
     if !buffered.fill_buf()?.is_empty() || computed != expected.sha256 || trailer != computed {
         return Err(SettledRawBlockSegmentError::PayloadIntegrity(
             "portable raw block segment length or SHA-256 mismatch".to_owned(),
+        ));
+    }
+    buffered.seek(SeekFrom::Start(header.tx_table_offset))?;
+    let mut meta_digest_pass2 = Sha256::new();
+    let tx_entries = read_and_hash_tx_entries(&mut buffered, tx_count, &mut meta_digest_pass2)?;
+    let entries = read_and_hash_index_entries(&mut buffered, count, &mut meta_digest_pass2)?;
+    if meta_digest_pass2.finalize() != meta_digest_pass1.finalize() {
+        return Err(SettledRawBlockSegmentError::PayloadIntegrity(
+            "portable raw block segment metadata changed during admission".to_owned(),
         ));
     }
     let rows = validate_entries(&entries, &tx_entries, slab_len, &header, Some(&streamed))?;
@@ -369,6 +384,37 @@ fn admit_portable(
     })
 }
 
+fn try_reserve_vec<T>(count: usize, label: &str) -> Result<Vec<T>, SettledRawBlockSegmentError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).map_err(|err| {
+        SettledRawBlockSegmentError::InvalidFormat(format!("{label} allocation failed: {err}"))
+    })?;
+    Ok(out)
+}
+
+fn metadata_span_bytes(header: &SegmentHeader) -> Result<u64, SettledRawBlockSegmentError> {
+    let tx_table_bytes = header
+        .row_index_offset
+        .checked_sub(header.tx_table_offset)
+        .ok_or_else(|| {
+            SettledRawBlockSegmentError::InvalidFormat(
+                "raw block segment row index precedes tx table".to_owned(),
+            )
+        })?;
+    let index_bytes = u64::from(header.block_count)
+        .checked_mul(ROW_INDEX_ENTRY_LEN as u64)
+        .ok_or_else(|| {
+            SettledRawBlockSegmentError::InvalidFormat(
+                "raw block segment row index exceeds u64".to_owned(),
+            )
+        })?;
+    tx_table_bytes.checked_add(index_bytes).ok_or_else(|| {
+        SettledRawBlockSegmentError::InvalidFormat(
+            "raw block segment metadata span exceeds u64".to_owned(),
+        )
+    })
+}
+
 fn hash_slab_frames(
     input: &mut impl BufRead,
     count: usize,
@@ -376,7 +422,7 @@ fn hash_slab_frames(
     codec: RawBlockCodec,
     whole_digest: &mut Sha256,
 ) -> Result<Vec<PortableFrameDigest>, SettledRawBlockSegmentError> {
-    let mut frames = Vec::with_capacity(count);
+    let mut frames = try_reserve_vec(count, "slab frame index")?;
     let mut rel_offset = 0_u64;
     for _ in 0..count {
         let mut prefix = [0_u8; FRAME_PREFIX_LEN];
@@ -416,8 +462,21 @@ fn hash_streamed_payload(
     payload_len: usize,
     whole_digest: &mut Sha256,
 ) -> Result<[u8; 32], SettledRawBlockSegmentError> {
+    let span_len = u64::try_from(payload_len).map_err(|_| {
+        SettledRawBlockSegmentError::InvalidFormat("payload length exceeds u64".to_owned())
+    })?;
     let mut payload_digest = Sha256::new();
-    let mut remaining = payload_len;
+    hash_streamed_span(input, span_len, whole_digest, &mut payload_digest)?;
+    Ok(payload_digest.finalize().into())
+}
+
+fn hash_streamed_span(
+    input: &mut impl BufRead,
+    span_len: u64,
+    whole_digest: &mut Sha256,
+    span_digest: &mut Sha256,
+) -> Result<(), SettledRawBlockSegmentError> {
+    let mut remaining = span_len;
     while remaining > 0 {
         let available = input.fill_buf()?;
         if available.is_empty() {
@@ -425,20 +484,28 @@ fn hash_streamed_payload(
                 io::ErrorKind::UnexpectedEof.into(),
             ));
         }
-        let take = remaining.min(available.len());
-        payload_digest.update(&available[..take]);
+        let available_u64 = u64::try_from(available.len()).map_err(|_| {
+            SettledRawBlockSegmentError::InvalidFormat(
+                "stream buffer length exceeds u64".to_owned(),
+            )
+        })?;
+        let take_u64 = remaining.min(available_u64);
+        let take = usize::try_from(take_u64).map_err(|_| {
+            SettledRawBlockSegmentError::InvalidFormat("stream chunk exceeds usize".to_owned())
+        })?;
         whole_digest.update(&available[..take]);
+        span_digest.update(&available[..take]);
         input.consume(take);
-        remaining -= take;
+        remaining -= take_u64;
     }
-    Ok(payload_digest.finalize().into())
+    Ok(())
 }
 
 fn read_tx_entries(
     input: &mut impl Read,
     count: usize,
 ) -> Result<Vec<TxSliceEntry>, SettledRawBlockSegmentError> {
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = try_reserve_vec(count, "tx slice table")?;
     for _ in 0..count {
         let mut raw = [0_u8; TX_SLICE_ENTRY_LEN];
         input.read_exact(&mut raw)?;
@@ -447,16 +514,16 @@ fn read_tx_entries(
     Ok(entries)
 }
 
-fn hash_tx_entries(
+fn read_and_hash_tx_entries(
     input: &mut impl BufRead,
     count: usize,
-    whole_digest: &mut Sha256,
+    span_digest: &mut Sha256,
 ) -> Result<Vec<TxSliceEntry>, SettledRawBlockSegmentError> {
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = try_reserve_vec(count, "tx slice table")?;
     for _ in 0..count {
         let mut raw = [0_u8; TX_SLICE_ENTRY_LEN];
         input.read_exact(&mut raw)?;
-        whole_digest.update(raw);
+        span_digest.update(raw);
         entries.push(TxSliceEntry::decode(&raw)?);
     }
     Ok(entries)
@@ -466,7 +533,7 @@ fn read_index_entries(
     input: &mut impl Read,
     count: usize,
 ) -> Result<Vec<DecodedRowIndexEntry>, SettledRawBlockSegmentError> {
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = try_reserve_vec(count, "row index")?;
     for _ in 0..count {
         let mut raw = [0_u8; ROW_INDEX_ENTRY_LEN];
         input.read_exact(&mut raw)?;
@@ -475,16 +542,16 @@ fn read_index_entries(
     Ok(entries)
 }
 
-fn hash_index_entries(
+fn read_and_hash_index_entries(
     input: &mut impl BufRead,
     count: usize,
-    whole_digest: &mut Sha256,
+    span_digest: &mut Sha256,
 ) -> Result<Vec<DecodedRowIndexEntry>, SettledRawBlockSegmentError> {
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = try_reserve_vec(count, "row index")?;
     for _ in 0..count {
         let mut raw = [0_u8; ROW_INDEX_ENTRY_LEN];
         input.read_exact(&mut raw)?;
-        whole_digest.update(raw);
+        span_digest.update(raw);
         entries.push(DecodedRowIndexEntry::decode(&raw)?);
     }
     Ok(entries)
@@ -504,7 +571,7 @@ pub(super) fn validate_entries(
         ));
     }
     let codec = header.codec()?;
-    let mut rows = Vec::with_capacity(entries.len());
+    let mut rows = try_reserve_vec(entries.len(), "validated rows")?;
     let mut expected_tx_start = 0_u32;
     for (idx, entry) in entries.iter().enumerate() {
         let next_rel = entries

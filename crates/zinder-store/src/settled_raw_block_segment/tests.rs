@@ -1,6 +1,6 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::{Seek, SeekFrom, Write},
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::Ordering,
 };
@@ -14,11 +14,11 @@ use super::{
     SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES, SettledRawBlockSegmentError,
     SettledRawBlockSegmentOpenOptions, SettledRawBlockSegmentReader, SettledRawBlockSegmentWriter,
     format::{
-        DecodedRowIndexEntry, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock, ROW_INDEX_ENTRY_LEN,
-        SegmentHeader, TRAILER_LEN, TX_SLICE_ENTRY_LEN, TxSliceEntry, VALIDATION_INVALID,
-        VALIDATION_UNVALIDATED, VALIDATION_VALID,
+        DecodedRowIndexEntry, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock, MAX_TX_ENTRIES_PER_BLOCK,
+        ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN, TX_SLICE_ENTRY_LEN, TxSliceEntry,
+        VALIDATION_INVALID, VALIDATION_UNVALIDATED, VALIDATION_VALID,
     },
-    reader::{PortableFrameDigest, validate_entries},
+    reader::{PortableFrameDigest, admit_protected, validate_entries},
 };
 
 type TestOutcome<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -815,6 +815,165 @@ fn reader_latches_invalid_on_truncated_slab_io_error() -> TestOutcome {
     assert!(matches!(
         reader.read_raw_transaction(BlockHeight::new(2), 0),
         Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+fn write_forged_sparse_segment(
+    path: &Path,
+    tx_count: u64,
+    write_frame_prefix: bool,
+) -> TestOutcome<RawBlockSegmentIdentity> {
+    let payload_len = 64_u64;
+    let slab_len = u64::from(FRAME_PREFIX_U32) + payload_len;
+    let slab_offset = HEADER_LEN as u64;
+    let tx_table_offset = slab_offset + slab_len;
+    let tx_table_bytes = tx_count * TX_SLICE_ENTRY_LEN as u64;
+    let row_index_offset = tx_table_offset + tx_table_bytes;
+    let total_len = row_index_offset + ROW_INDEX_ENTRY_LEN as u64 + TRAILER_LEN as u64;
+
+    let end_block = BlockId::new(BlockHeight::new(1), block_hash(1));
+    let header = SegmentHeader {
+        network_tag: TEST_NETWORK.id(),
+        segment_flags: 0,
+        codec_id: RawBlockCodec::None.id(),
+        start_height: 1,
+        block_count: 1,
+        first_prev_hash_wire: encode_internal_block_hash(block_hash(0)),
+        last_block_hash_wire: encode_internal_block_hash(end_block.hash),
+        slab_offset,
+        tx_table_offset,
+        row_index_offset,
+    };
+
+    let mut sparse = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    sparse.write_all(&header.encode())?;
+    if write_frame_prefix {
+        sparse.write_all(&u32::try_from(payload_len)?.to_be_bytes())?;
+    }
+    sparse.set_len(total_len)?;
+    sparse.sync_all()?;
+
+    let mut identity = RawBlockSegmentIdentity::span(
+        TEST_NETWORK,
+        RawBlockCodec::None,
+        BlockHeight::new(1),
+        end_block,
+    );
+    identity.sha256 = [0x99; 32];
+    Ok(identity)
+}
+
+#[test]
+fn open_rejects_forged_sparse_file_with_huge_tx_table_without_allocating() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("sparse-huge-tx.seg");
+    let expected = write_forged_sparse_segment(&path, u64::from(u32::MAX), false)?;
+    let outcome = SettledRawBlockSegmentReader::open(
+        &path,
+        &expected,
+        SettledRawBlockSegmentOpenOptions::default(),
+    );
+    assert!(matches!(
+        outcome,
+        Err(SettledRawBlockSegmentError::InvalidFormat(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn open_rejects_forged_sparse_file_with_bounded_tx_table_and_bad_digest() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("sparse-bounded-tx.seg");
+    let expected = write_forged_sparse_segment(&path, 65_536, true)?;
+    let outcome = SettledRawBlockSegmentReader::open(
+        &path,
+        &expected,
+        SettledRawBlockSegmentOpenOptions::default(),
+    );
+    assert!(matches!(
+        outcome,
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn admit_protected_reads_buffered_metadata_across_buffer_refills() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let slices_per_block = 3_500_usize;
+    let raw_block = vec![0xab_u8; 8_192];
+    let mut tx_slices = Vec::with_capacity(slices_per_block);
+    for idx in 0..slices_per_block {
+        let offset = u32::try_from(idx % 8_000)?;
+        tx_slices.push(RawBlockTransactionSlice::new(offset, 1));
+    }
+    let blocks = vec![
+        FixtureBlock {
+            id: BlockId::new(BlockHeight::new(1), block_hash(1)),
+            parent_hash: block_hash(0),
+            raw_bytes: raw_block.clone(),
+            tx_slices: tx_slices.clone(),
+        },
+        FixtureBlock {
+            id: BlockId::new(BlockHeight::new(2), block_hash(2)),
+            parent_hash: block_hash(1),
+            raw_bytes: raw_block.clone(),
+            tx_slices,
+        },
+    ];
+    let (path, identity) = write_segment(dir.path(), "prot-buf", RawBlockCodec::Zstd, &blocks)?;
+
+    let mut file = File::open(&path)?;
+    let mut header_bytes = [0_u8; HEADER_LEN];
+    file.read_exact(&mut header_bytes)?;
+    let header = SegmentHeader::decode(&header_bytes)?;
+    let reader = admit_protected(file, &identity, header)?;
+    assert!(reader.kernel_verified());
+    assert_eq!(reader.read_raw_block(BlockHeight::new(2))?, raw_block);
+    assert_eq!(
+        reader.read_raw_transaction(BlockHeight::new(2), 3_499)?,
+        vec![0xab_u8]
+    );
+
+    let mut wrong_identity = identity;
+    wrong_identity.sha256[0] ^= 0xff;
+    let mut bad_file = File::open(&path)?;
+    bad_file.read_exact(&mut header_bytes)?;
+    assert!(matches!(
+        admit_protected(bad_file, &wrong_identity, header),
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn writer_rejects_block_exceeding_max_tx_entries_limit() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let target = dir.path().join("too-many-txs");
+    let staged = NamedTempFile::new_in(dir.path())?;
+    let block_id = BlockId::new(BlockHeight::new(1), block_hash(1));
+    let mut writer = SettledRawBlockSegmentWriter::create(
+        &target,
+        staged,
+        RawBlockSegmentIdentity::span(
+            TEST_NETWORK,
+            RawBlockCodec::None,
+            BlockHeight::new(1),
+            block_id,
+        ),
+    )?;
+    let overflow_count = usize::try_from(MAX_TX_ENTRIES_PER_BLOCK)? + 1;
+    let raw_bytes = vec![0x5a_u8; 64];
+    let tx_slices = vec![RawBlockTransactionSlice::new(0, 1); overflow_count];
+    let outcome = writer.push(block_id, block_hash(0), &raw_bytes, &tx_slices);
+    assert!(matches!(
+        outcome,
+        Err(SettledRawBlockSegmentError::InvalidFormat(_))
     ));
     Ok(())
 }
