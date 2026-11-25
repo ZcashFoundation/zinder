@@ -64,6 +64,68 @@ fn counter_value(rendered: &str, series_prefix: &str, labels: &[&str]) -> Option
         .and_then(|count| count.parse().ok())
 }
 
+#[test]
+fn node_rate_limited_counter_is_preregistered_at_zero_before_any_call() -> eyre::Result<()> {
+    const EXPECTED_METHODS: [&str; 15] = [
+        "batch_getblock",
+        "getaddressbalance",
+        "getaddresstxids",
+        "getaddressutxos",
+        "getbestblockheightandhash",
+        "getblock",
+        "getblockchaininfo",
+        "getblockhash",
+        "getrawmempool",
+        "getrawtransaction",
+        "getstandardfee",
+        "rpc.discover",
+        "sendrawtransaction",
+        "z_getsubtreesbyindex",
+        "z_gettreestate",
+    ];
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let recorded_metrics = recorder.handle();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
+    let _source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        "http://127.0.0.1:18232",
+        NodeAuth::None,
+        Duration::from_secs(5),
+    )?;
+
+    let rendered = recorded_metrics.render();
+    assert!(
+        rendered.contains("# HELP zinder_node_rate_limited_total "),
+        "missing # HELP for zinder_node_rate_limited_total in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("# TYPE zinder_node_rate_limited_total counter"),
+        "missing # TYPE for zinder_node_rate_limited_total in:\n{rendered}"
+    );
+    let series_count = rendered
+        .lines()
+        .filter(|line| line.starts_with("zinder_node_rate_limited_total{"))
+        .count();
+    assert_eq!(
+        series_count,
+        EXPECTED_METHODS.len(),
+        "unexpected zinder_node_rate_limited_total series count in:\n{rendered}"
+    );
+    for method_name in EXPECTED_METHODS {
+        let method_label = format!("method=\"{method_name}\"");
+        assert_eq!(
+            counter_value(
+                &rendered,
+                "zinder_node_rate_limited_total{",
+                &["source=\"zebra_json_rpc\"", &method_label],
+            ),
+            Some(0),
+            "expected zero counter for {method_name} in:\n{rendered}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn http_429_is_node_rate_limited_on_every_call_path() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([

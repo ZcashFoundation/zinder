@@ -21,8 +21,8 @@ Conventions:
   `zinder_grpc_request_receive_slots_held_at_admission` and the wallet RPC
   block-count histogram `zinder_wallet_rpc_block_range_blocks`. Other histograms
   export as summaries with quantiles.
-- A series appears only after its first sample. For example, a runtime that
-  has not broadcast yet exports no broadcast series.
+- Unless noted below, a series appears only after its first sample. For
+  example, a runtime that has not broadcast yet exports no broadcast series.
 - Each runtime folds new histogram samples into their buckets or summaries
   every five seconds, so its metrics memory stays bounded when nothing
   scrapes `/metrics`.
@@ -474,7 +474,7 @@ bidirectional calls.
 | `zinder_compat_serving_info` | gauge | `serving` | 1 for the selected serving mode (`wallet`, `compact-blocks`, or `light-wallet`). |
 | `zinder_compat_block_range_streams_open` | gauge | | Block-range streams holding a slot of `compat.max_concurrent_block_range_streams`. |
 | `zinder_compat_block_range_streams_admitted_total` | counter | | Block-range requests that took a slot. |
-| `zinder_compat_block_range_stream_refusals_total` | counter | `reason` | Block-range requests refused with `UNAVAILABLE`: `wait_timeout` when no slot returned within 10 seconds, `waiters_full` when three times as many requests already waited as the limit has slots. |
+| `zinder_compat_block_range_stream_refusals_total` | counter | `reason` | Block-range requests refused with `UNAVAILABLE`: `wait_timeout` when no slot returned within 10 seconds, `waiters_full` when three times as many requests already waited as the limit has slots. Both `reason` series are registered and start at zero when the process starts. |
 | `zinder_compat_block_range_slot_wait_duration_seconds` | histogram | `outcome` | Time a block-range request waited before it took a slot (`admitted`), was refused (`refused`), or its client went away (`cancelled`). |
 | `zinder_compat_block_range_stage_duration_seconds` | histogram | `stage` | Time one chunk of a block-range stream spent reading from storage (`read`), converting to lightwalletd messages (`convert`), or, for each chunk after the first, waiting for room for it before its read (`send`). The adapter holds two chunks of a stream, so a chunk waits until the gRPC server has taken every block of the chunk two before it to send. A later read that finds a height outside retained history and gives way to a read of heights an earlier read checked records a `read` sample for each. In compact-blocks mode `read` is the storage read alone; in wallet mode it is the wallet query, including its wait for a blocking thread, and ends when the query returns, so it leaves out the conversion's wait for one. |
 | `zinder_compat_tip_wait_total` | counter | `method`, `outcome`, `blocks_ahead` | Height-selected reads that asked for a height just past the visible tip, by how the [tip wait](lightwalletd-compatibility.md#waiting-for-a-height-just-past-the-tip) ended. `method` is snake_case, such as `get_block`, `get_block_range`, or `get_tree_state`. `outcome` is `served` (the height arrived), `expired` (the wait ran out), `cancelled` (the client left, shutdown began, or the publisher stopped), `waiters_full` (every waiting place was taken), `left_window` (the tip moved down out of the window), or `refused` (reading the tip failed, and the request failed with that status). `blocks_ahead` is `1` to `4`, or `over_4`. |
@@ -503,7 +503,7 @@ Any runtime that calls a node exports these series. `source` is
 | `zinder_node_request_duration_seconds` | histogram | `source`, `method`, `status`, `error_class` | Duration of node requests. |
 | `zinder_node_request_admission_wait_seconds` | histogram | `source`, `method` | Time a request waited for a request slot: an indexer block request, or a JSON-RPC call under `node.max_concurrent_requests`. |
 | `zinder_node_request_admission_timeouts_total` | counter | `source`, `method` | JSON-RPC calls that found no free slot under `node.max_concurrent_requests` within their timeout. They fail with `NodeUnavailable` without reaching the node. |
-| `zinder_node_rate_limited_total` | counter | `source`, `method` | JSON-RPC calls the node refused with HTTP 429. Each refusal also counts in `zinder_node_request_total` with `error_class="node_rate_limited"`. |
+| `zinder_node_rate_limited_total` | counter | `source`, `method` | JSON-RPC calls the node refused with HTTP 429. Each refusal also counts in `zinder_node_request_total` with `error_class="node_rate_limited"`. Registered and starts at zero for `source="zebra_json_rpc"` and each known JSON-RPC `method` when the process starts its JSON-RPC node client. |
 | `zinder_node_active_requests` | gauge | `source`, `method` | Indexer requests in flight. |
 | `zinder_node_queued_requests` | gauge | `source`, `method` | Indexer requests waiting for a slot. |
 | `zinder_node_response_bytes_total` | counter | `source`, `method`, `encoding` | Bytes received from the indexer stream. |
@@ -554,6 +554,13 @@ When a level empties, its previous count clears to zero. Each data column
 family also exports `rocksdb.live-sst-files-size` (live on-disk SST bytes)
 alongside its memtable and compaction integer properties. The `cf` label is
 `__db__` for database-wide write pressure.
+
+In `zinder-ingest`, `rocksdb.live-sst-files-size` is exported under both
+`store_role="canonical_primary"` and `store_role="tree_state_verification_secondary"`
+(as well as `store_role="canonical_secondary"` when Explorer views are enabled),
+and those roles report properties from the same canonical SST files on disk.
+Filter canonical disk-size queries and alerts by `store_role="canonical_primary"`
+rather than summing ungrouped across all `store_role` values.
 
 Inspect `rocksdb.aggregated-table-properties` offline for index and filter
 sizes. RocksDB can open every uncached SST to collect them. Per-level
