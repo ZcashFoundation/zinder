@@ -2521,6 +2521,14 @@ mod tests {
         height_value: u32,
         semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
     ) -> Result<super::QueuedPreparedBlock, Box<dyn std::error::Error>> {
+        test_queued_prepared_block_with_sapling_commitments(height_value, &[], semaphore)
+    }
+
+    fn test_queued_prepared_block_with_sapling_commitments(
+        height_value: u32,
+        sapling_commitments: &[[u8; 32]],
+        semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Result<super::QueuedPreparedBlock, Box<dyn std::error::Error>> {
         let height = zinder_core::BlockHeight::new(height_value);
         let hash = zinder_core::BlockHash::from_bytes([u8::try_from(height_value)?; 32]);
         let parent_hash =
@@ -2549,13 +2557,35 @@ mod tests {
             zinder_core::CanonicalBlockReplayFormatVersion::CURRENT,
             zinder_core::CanonicalBlockFactsDigestVersion::CURRENT,
         );
+        let compact_transactions = if sapling_commitments.is_empty() {
+            Vec::new()
+        } else {
+            let sapling_outputs = sapling_commitments
+                .iter()
+                .map(|commitment| zinder_core::CompactSaplingOutput {
+                    commitment: *commitment,
+                    ephemeral_key: [0x11; 32],
+                    ciphertext: [0x22; 52],
+                })
+                .collect();
+            vec![zinder_core::CompactTransaction {
+                index: 0,
+                transaction_id: zinder_core::TransactionId::from_bytes(
+                    [u8::try_from(height_value)?; 32],
+                ),
+                data: zinder_core::CompactTransactionData {
+                    sapling_outputs,
+                    ..Default::default()
+                },
+            }]
+        };
         let partial_compact_block = zinder_core::CompactBlockArtifact::new(
             zinder_core::BlockId::new(height, hash),
             parent_hash,
             1_700_000_000_u32.saturating_add(height_value),
-            Vec::new(),
+            compact_transactions,
             zinder_core::CompactChainMetadata {
-                sapling_commitment_tree_size: 0,
+                sapling_commitment_tree_size: u32::try_from(sapling_commitments.len())?,
                 orchard_commitment_tree_size: 0,
                 ironwood_commitment_tree_size: 0,
             },
@@ -2569,7 +2599,7 @@ mod tests {
             },
             partial_compact_block,
             tree_size_additions: crate::artifact_builder::CommitmentTreeSizes {
-                sapling: 0,
+                sapling: u32::try_from(sapling_commitments.len())?,
                 orchard: 0,
                 ironwood: 0,
             },
@@ -2699,6 +2729,80 @@ mod tests {
             Some(super::CanonicalConstructionError::LoaderTaskFailed { ref reason })
                 if reason == "injected source error"
         ));
+        Ok(())
+    }
+
+    async fn collect_prefix_and_failure_for_workers(
+        workers: u32,
+    ) -> Result<(Vec<u32>, String, Vec<u32>, Vec<usize>), Box<dyn std::error::Error>> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+        sender
+            .try_send(Ok(test_queued_prepared_block(1, &semaphore)?))
+            .map_err(|_| "channel capacity exceeded")?;
+        sender
+            .try_send(Ok(test_queued_prepared_block(2, &semaphore)?))
+            .map_err(|_| "channel capacity exceeded")?;
+        sender
+            .try_send(Ok(test_queued_prepared_block_with_sapling_commitments(
+                3,
+                &[[0xff; 32]],
+                &semaphore,
+            )?))
+            .map_err(|_| "channel capacity exceeded")?;
+        sender
+            .try_send(Ok(test_queued_prepared_block(4, &semaphore)?))
+            .map_err(|_| "channel capacity exceeded")?;
+        sender
+            .try_send(Ok(test_queued_prepared_block(5, &semaphore)?))
+            .map_err(|_| "channel capacity exceeded")?;
+        drop(sender);
+        let mut build_blocks = test_build_receiver(receiver, 5, workers)?;
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut prefix_heights = Vec::new();
+            let mut terminal_error = None;
+            let mut trailing_heights = Vec::new();
+            for next_entry in &mut build_blocks {
+                match next_entry {
+                    Ok(block) if terminal_error.is_none() => {
+                        prefix_heights.push(block.facts.block_header.height.value());
+                    }
+                    Ok(block) => {
+                        trailing_heights.push(block.facts.block_header.height.value());
+                    }
+                    Err(error) if terminal_error.is_none() => {
+                        terminal_error = Some(error.to_string());
+                    }
+                    Err(_) => {}
+                }
+            }
+            (
+                prefix_heights,
+                terminal_error.unwrap_or_default(),
+                trailing_heights,
+                build_blocks.parallel_batch_sizes,
+            )
+        })
+        .await?;
+        Ok(outcome)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backlogged_receiver_recovers_valid_prefix_before_batch_append_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (serial_prefix, serial_error, serial_trailing, serial_batches) =
+            collect_prefix_and_failure_for_workers(1).await?;
+        let (batched_prefix, batched_error, batched_trailing, batched_batches) =
+            collect_prefix_and_failure_for_workers(4).await?;
+
+        assert_eq!(serial_prefix, vec![1, 2]);
+        assert_eq!(batched_prefix, vec![1, 2]);
+        assert_ne!(batched_error, "");
+        assert_eq!(batched_error, serial_error);
+        assert_eq!(serial_trailing, Vec::<u32>::new());
+        assert_eq!(batched_trailing, Vec::<u32>::new());
+        assert_eq!(serial_batches, Vec::<usize>::new());
+        assert_eq!(batched_batches, Vec::<usize>::new());
         Ok(())
     }
 }
