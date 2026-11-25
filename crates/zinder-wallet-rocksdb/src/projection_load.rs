@@ -475,6 +475,36 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+static PANIC_ON_CANONICAL_SCAN_CHUNK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+#[expect(
+    clippy::panic,
+    reason = "intentional unwind injection for testing worker-panic recovery"
+)]
+fn maybe_inject_worker_unwind(chunk_index: usize) {
+    if PANIC_ON_CANONICAL_SCAN_CHUNK
+        .compare_exchange(chunk_index, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        panic!("injected canonical scan worker unwind on chunk {chunk_index}");
+    }
+}
+
+/// Stops and wakes the shared [`ChunkWindow`] if a scan worker unwinds so
+/// sibling workers exit instead of filling the claim window and deadlocking.
+struct StopWindowOnUnwind<'a>(&'a ChunkWindow);
+
+impl Drop for StopWindowOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.stop();
+        }
+    }
+}
+
 /// Spawns one scoped canonical-scan worker, converting OS thread-start
 /// failures into [`RocksDbWalletError::CanonicalScanThreadUnavailable`].
 fn spawn_canonical_scan_worker<'scope, 'env, F, T>(
@@ -537,8 +567,9 @@ fn partition_settled_height_chunks(
 /// Effective worker count for parallel canonical replay scanning.
 ///
 /// Caps workers by the configured worker limit, the number of settled chunks,
-/// and the per-shard minimum sort memory so each worker can stage any valid
-/// transparent output without hitting a shrunk shard ceiling.
+/// and the per-shard minimum sort memory so each worker can keep typical
+/// transparent outputs buffered before spilling (while oversized outputs within
+/// the global budget spill directly as single-record runs).
 fn parallel_scan_worker_count(
     requested_workers: NonZeroU32,
     chunk_count: usize,
@@ -869,7 +900,10 @@ fn scan_worker_chunks<'sorter>(
     mut shard: VariableValueSortShard<'sorter, OUTPOINT_EVENT_KEY_BYTES>,
     completed_tx: &SyncSender<Result<CompletedReplayChunk, RocksDbWalletError>>,
 ) -> VariableValueSortShard<'sorter, OUTPOINT_EVENT_KEY_BYTES> {
+    let _stop_on_unwind = StopWindowOnUnwind(window);
     while let Some((chunk_index, range)) = window.claim_next() {
+        #[cfg(test)]
+        maybe_inject_worker_unwind(chunk_index);
         let outcome = scan_one_settled_chunk(slice_source, window, chunk_index, range, &mut shard);
         let failed = outcome.is_err();
         if failed {
@@ -2900,6 +2934,92 @@ mod tests {
                 "refused index {refused_index}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_canonical_scan_stops_window_when_worker_unwinds_past_window_capacity()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let blocks = multi_chunk_canonical_blocks();
+        // 12 settled blocks with chunk_blocks=1 gives 12 chunks, exceeding the
+        // 2-worker claim window (max_in_flight = 8) so siblings would deadlock
+        // if an unwinding worker on chunk 0 did not stop and wake the window.
+        let canonical =
+            build_ready_test_canonical_store(&temporary.path().join("canonical"), &blocks, 12, 5)?;
+        let ready = canonical.ready_evidence();
+        let options = test_column_family_options();
+        let staging = TempDir::new()?;
+        let mut config = test_config_with_bounds(
+            staging.path(),
+            &options,
+            TestByteLimits::default(),
+            ready.first_retained_block,
+            ready.sequence_checkpoint.through(),
+        );
+        config.supported_reorg_depth = 5;
+        config.accumulator_hashing_workers = NonZeroU32::new(2).ok_or("zero")?;
+        config.scan_chunk_blocks = NonZeroU32::MIN;
+        PANIC_ON_CANONICAL_SCAN_CHUNK.store(0, Ordering::Release);
+        let outcome = write_projection_ssts_from_source(config, &canonical);
+        PANIC_ON_CANONICAL_SCAN_CHUNK.store(usize::MAX, Ordering::Release);
+        assert!(
+            matches!(outcome, Err(RocksDbWalletError::CanonicalScanWorkerStopped)),
+            "expected CanonicalScanWorkerStopped after worker unwind, got {:?}",
+            outcome.err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_canonical_scan_admits_script_larger_than_single_shard_budget()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let mut blocks = multi_chunk_canonical_blocks();
+        // Give one settled output a 100 KiB script: exceeds one 64 KiB shard
+        // (256 KiB / 4 workers) while fitting well inside the 256 KiB global
+        // outpoint-sort memory limit that the serial path accepts.
+        blocks[2].transactions[0].transparent_outputs[0].script_pub_key = vec![0x6a_u8; 100 * 1024];
+        let canonical =
+            build_ready_test_canonical_store(&temporary.path().join("canonical"), &blocks, 12, 5)?;
+        let ready = canonical.ready_evidence();
+        let options = test_column_family_options();
+        let limits = TestByteLimits {
+            outpoint_sort: 256 * 1024,
+            ..TestByteLimits::default()
+        };
+        let serial_staging = TempDir::new()?;
+        let mut serial_config = test_config_with_bounds(
+            serial_staging.path(),
+            &options,
+            limits,
+            ready.first_retained_block,
+            ready.sequence_checkpoint.through(),
+        );
+        serial_config.supported_reorg_depth = 5;
+        serial_config.accumulator_hashing_workers = NonZeroU32::MIN;
+        let serial = write_projection_ssts_from_source(serial_config, &canonical)?;
+
+        let parallel_staging = TempDir::new()?;
+        let mut parallel_config = serial_config;
+        parallel_config.staging_path = parallel_staging.path();
+        parallel_config.accumulator_hashing_workers = NonZeroU32::new(4).ok_or("zero")?;
+        parallel_config.scan_chunk_blocks = NonZeroU32::new(3).ok_or("zero")?;
+        let parallel = write_projection_ssts_from_source(parallel_config, &canonical)?;
+        assert_eq!(parallel.projection_digest, serial.projection_digest);
+        assert_eq!(
+            parallel.projection_accumulator,
+            serial.projection_accumulator
+        );
+        assert_eq!(
+            parallel.source_sequence_digest,
+            serial.source_sequence_digest
+        );
+        assert_eq!(parallel.row_counts, serial.row_counts);
+        assert_eq!(parallel.utxo_summary, serial.utxo_summary);
+        assert!(
+            parallel.outpoint_sort_evidence.peak_accounted_memory_bytes <= limits.outpoint_sort
+        );
         Ok(())
     }
 }

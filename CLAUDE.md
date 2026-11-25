@@ -50,6 +50,7 @@ cargo mutants --workspace --all-features --cap-lints true \
   --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
   --file crates/zinder-store/src/format/stream_cursor.rs \
   --file crates/zinder-store/src/canonical_store/rocksdb.rs \
+  --file crates/zinder-store/src/canonical_store/block_replay.rs \
   --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
   --file crates/zinder-store/src/canonical_store/control.rs \
   --file crates/zinder-store/src/canonical_store/block_load/codec.rs \
@@ -65,6 +66,7 @@ cargo mutants --workspace --all-features --cap-lints true \
   --file services/zinder-ingest/src/artifact_builder.rs \
   --file crates/zinder-rocksdb-bulk-load/src/bulk_load/variable_value_sort.rs \
   --file crates/zinder-wallet-rocksdb/src/accumulator_hashing.rs \
+  --file crates/zinder-wallet-rocksdb/src/projection_load.rs \
   --file crates/zinder-wallet-rocksdb/src/store.rs \
   --file crates/zinder-core/src/utxo_set_commitment.rs \
   --file crates/zinder-wallet-projection/src/digest.rs \
