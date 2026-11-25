@@ -20,7 +20,10 @@
 use std::{
     collections::VecDeque,
     num::NonZeroU32,
-    sync::mpsc::{Receiver, SyncSender, sync_channel},
+    sync::{
+        Arc,
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
 };
 
 use zinder_core::{
@@ -136,6 +139,44 @@ impl ConstructionAccumulators {
         Ok(())
     }
 
+    /// Settles in-flight batches, releases primary's working batches, and
+    /// extracts the shared worker pool so secondary branches reuse the same
+    /// threads without exceeding the build-wide worker or batch ceiling.
+    pub(crate) fn take_branch_hashing_pool(
+        &mut self,
+    ) -> Result<Option<BranchHashingPool>, RocksDbWalletError> {
+        self.settle()?;
+        Ok(self.workers.take().map(HashingWorkers::into_branch_pool))
+    }
+
+    /// Creates a branch accumulator sharing an existing worker pool and batch
+    /// budget, or an inline accumulator when `branch_config` is `None`.
+    pub(crate) fn start_optional_branch(
+        network: Network,
+        branch_config: Option<BranchHashingConfig>,
+    ) -> Self {
+        Self {
+            network,
+            digest: WalletProjectionDigestBuilder::new(),
+            commitment: TransparentUtxoSetCommitment::empty(),
+            workers: branch_config
+                .map(|config| HashingWorkers::from_branch_config(network, config)),
+        }
+    }
+
+    /// Re-attaches a fresh [`HashingWorkers`] backed by `pool` after concurrent
+    /// branches have finished and dropped their own batches.
+    pub(crate) fn restore_branch_hashing_pool(&mut self, pool: BranchHashingPool) {
+        let max_pending = max_pending_for_workers(pool.worker_count);
+        self.workers = Some(HashingWorkers::from_shared_pool(
+            pool.pool,
+            pool.worker_count,
+            network_for_restore(self.network),
+            pool.payload_capacity,
+            max_pending,
+        ));
+    }
+
     /// Settles every batch and returns the combined accumulators.
     pub(crate) fn finish(
         mut self,
@@ -144,6 +185,103 @@ impl ConstructionAccumulators {
         self.settle()?;
         Ok((self.digest, self.commitment))
     }
+
+    /// Settles every batch and returns opaque finished branch accumulators.
+    pub(crate) fn finish_branch(self) -> Result<FinishedBranchAccumulators, RocksDbWalletError> {
+        let (digest, commitment) = self.finish()?;
+        Ok(FinishedBranchAccumulators { digest, commitment })
+    }
+
+    /// Combines finished branch accumulators into this instance after settling.
+    pub(crate) fn combine_finished(
+        &mut self,
+        branch_digest: &WalletProjectionDigestBuilder,
+        branch_commitment: &TransparentUtxoSetCommitment,
+    ) -> Result<(), RocksDbWalletError> {
+        self.settle()?;
+        self.digest.combine(branch_digest)?;
+        self.commitment.combine(branch_commitment)?;
+        Ok(())
+    }
+
+    /// Combines finished branch accumulators returned by [`Self::finish_branch`].
+    pub(crate) fn combine_branch(
+        &mut self,
+        branch: &FinishedBranchAccumulators,
+    ) -> Result<(), RocksDbWalletError> {
+        self.combine_finished(&branch.digest, &branch.commitment)
+    }
+}
+
+const fn network_for_restore(network: Network) -> Network {
+    network
+}
+
+const fn max_pending_for_workers(workers: NonZeroU32) -> usize {
+    let threads = workers.get() as usize;
+    let doubled = threads.saturating_mul(2);
+    if doubled <= MAX_PENDING_BATCHES {
+        doubled
+    } else {
+        MAX_PENDING_BATCHES
+    }
+}
+
+/// Shared worker pool retired from primary hashing for concurrent secondary
+/// derivation branches and later restored for final `reorg_undo` hashing.
+pub(crate) struct BranchHashingPool {
+    pool: Arc<rayon::ThreadPool>,
+    worker_count: NonZeroU32,
+    payload_capacity: usize,
+}
+
+impl BranchHashingPool {
+    const BATCHES_HELD_PER_SLICE: usize = 2;
+
+    const fn global_batch_budget(worker_count: NonZeroU32) -> usize {
+        max_pending_for_workers(worker_count).saturating_add(Self::BATCHES_HELD_PER_SLICE)
+    }
+
+    /// Splits the build-wide batch budget across two concurrent branches while
+    /// keeping total `pending + filling + spare` batches within
+    /// `min(2 * workers, MAX_PENDING_BATCHES) + 2`.
+    pub(crate) fn split_two(&self) -> (BranchHashingConfig, BranchHashingConfig) {
+        let total_batches = Self::global_batch_budget(self.worker_count);
+        let first_total = total_batches / 2;
+        let second_total = total_batches.saturating_sub(first_total);
+        (
+            BranchHashingConfig {
+                pool: Arc::clone(&self.pool),
+                worker_count: self.worker_count,
+                payload_capacity: self.payload_capacity,
+                max_pending: first_total
+                    .saturating_sub(Self::BATCHES_HELD_PER_SLICE)
+                    .max(1),
+            },
+            BranchHashingConfig {
+                pool: Arc::clone(&self.pool),
+                worker_count: self.worker_count,
+                payload_capacity: self.payload_capacity,
+                max_pending: second_total
+                    .saturating_sub(Self::BATCHES_HELD_PER_SLICE)
+                    .max(1),
+            },
+        )
+    }
+}
+
+/// Per-branch slice of the shared [`BranchHashingPool`] and global batch cap.
+pub(crate) struct BranchHashingConfig {
+    pool: Arc<rayon::ThreadPool>,
+    worker_count: NonZeroU32,
+    payload_capacity: usize,
+    max_pending: usize,
+}
+
+/// Settled partial accumulators produced by an independent derivation branch.
+pub(crate) struct FinishedBranchAccumulators {
+    digest: WalletProjectionDigestBuilder,
+    commitment: TransparentUtxoSetCommitment,
 }
 
 fn utxo_element<'script>(
@@ -166,7 +304,8 @@ fn utxo_element<'script>(
 /// the threads finish the batches already handed to them, discard the
 /// results, and exit.
 struct HashingWorkers {
-    pool: rayon::ThreadPool,
+    pool: Arc<rayon::ThreadPool>,
+    worker_count: NonZeroU32,
     network: Network,
     filling: RowBatch,
     /// One emptied batch kept for reuse, so steady-state batches do not
@@ -216,15 +355,50 @@ impl HashingWorkers {
                     reason: source.to_string(),
                 },
             )?;
-        Ok(Some(Self {
+        Ok(Some(Self::from_shared_pool(
+            Arc::new(pool),
+            workers,
+            network,
+            payload_capacity,
+            max_pending_for_workers(workers),
+        )))
+    }
+
+    fn from_shared_pool(
+        pool: Arc<rayon::ThreadPool>,
+        worker_count: NonZeroU32,
+        network: Network,
+        payload_capacity: usize,
+        max_pending: usize,
+    ) -> Self {
+        Self {
             pool,
+            worker_count,
             network,
             filling: RowBatch::with_capacity(payload_capacity),
             spare: None,
             pending: VecDeque::new(),
-            max_pending: threads.saturating_mul(2).min(MAX_PENDING_BATCHES),
+            max_pending,
             payload_capacity,
-        }))
+        }
+    }
+
+    fn from_branch_config(network: Network, config: BranchHashingConfig) -> Self {
+        Self::from_shared_pool(
+            config.pool,
+            config.worker_count,
+            network,
+            config.payload_capacity,
+            config.max_pending,
+        )
+    }
+
+    fn into_branch_pool(self) -> BranchHashingPool {
+        BranchHashingPool {
+            pool: self.pool,
+            worker_count: self.worker_count,
+            payload_capacity: self.payload_capacity,
+        }
     }
 
     /// Makes room in the filling batch for one more entry of `payload_bytes`,
@@ -728,6 +902,122 @@ mod tests {
         let started = Instant::now();
         drop(accumulators);
         assert!(started.elapsed() < Duration::from_millis(150));
+        Ok(())
+    }
+
+    #[test]
+    fn branch_hashing_pool_retires_primary_and_bounds_global_threads_and_batches()
+    -> Result<(), RocksDbWalletError> {
+        let mut serial = ConstructionAccumulators::start(NETWORK, workers(1))?;
+        assert!(serial.take_branch_hashing_pool()?.is_none());
+        let inline_branch = ConstructionAccumulators::start_optional_branch(NETWORK, None);
+        assert!(inline_branch.workers.is_none());
+
+        for worker_count in [2, 3, 4, 8, 31, 32, 33, 64] {
+            let mut primary = ConstructionAccumulators::start(NETWORK, workers(worker_count))?;
+            let primary_pool = primary
+                .workers
+                .as_ref()
+                .map(|w| Arc::clone(&w.pool))
+                .ok_or(RocksDbWalletError::AccumulatorHashingWorkerStopped)?;
+            let branch_pool = primary
+                .take_branch_hashing_pool()?
+                .ok_or(RocksDbWalletError::AccumulatorHashingWorkerStopped)?;
+            assert!(
+                primary.workers.is_none(),
+                "primary must drop its pool and batches on retire"
+            );
+
+            let (index_config, tx_config) = branch_pool.split_two();
+            assert!(Arc::ptr_eq(&index_config.pool, &primary_pool));
+            assert!(Arc::ptr_eq(&tx_config.pool, &primary_pool));
+            assert_eq!(
+                primary_pool.current_num_threads(),
+                usize::try_from(worker_count).unwrap_or(usize::MAX)
+            );
+            let total_pending_cap = index_config.max_pending + tx_config.max_pending;
+            assert!(
+                total_pending_cap <= MAX_PENDING_BATCHES,
+                "{worker_count} workers exceeded global pending ceiling: {total_pending_cap}"
+            );
+            let total_batch_cap = (index_config.max_pending + 2) + (tx_config.max_pending + 2);
+            let expected_cap = (usize::try_from(worker_count).unwrap_or(usize::MAX) * 2)
+                .min(MAX_PENDING_BATCHES)
+                + 2;
+            assert!(
+                total_batch_cap <= expected_cap,
+                "{worker_count} workers total batch cap {total_batch_cap} > {expected_cap}"
+            );
+
+            drop(index_config);
+            drop(tx_config);
+            primary.restore_branch_hashing_pool(branch_pool);
+            let restored = primary
+                .workers
+                .as_ref()
+                .ok_or(RocksDbWalletError::AccumulatorHashingWorkerStopped)?;
+            assert!(Arc::ptr_eq(&restored.pool, &primary_pool));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_branch_pools_match_serial_accumulators_across_phases()
+    -> Result<(), RocksDbWalletError> {
+        let (rows, outputs) = sample_input();
+        let (reference_digest, reference_commitment) = serial_reference(&rows, &outputs)?;
+        let (primary_rows, rest_rows) = rows.split_at(80);
+        let (index_rows, middle_rows) = rest_rows.split_at(60);
+        let (tx_rows, undo_rows) = middle_rows.split_at(60);
+
+        let mut primary =
+            ConstructionAccumulators::start_with_payload_capacity(NETWORK, workers(4), 100)?;
+        for (family, key, value) in primary_rows {
+            primary.append_row(*family, key, value)?;
+        }
+        for output in &outputs {
+            primary.insert_unspent_output(output)?;
+        }
+
+        let branch_pool = primary
+            .take_branch_hashing_pool()?
+            .ok_or(RocksDbWalletError::AccumulatorHashingWorkerStopped)?;
+        assert!(primary.workers.is_none());
+        let (index_cfg, tx_cfg) = branch_pool.split_two();
+
+        let (index_finished, tx_finished) = std::thread::scope(|scope| {
+            let tx_handle = scope.spawn(
+                move || -> Result<FinishedBranchAccumulators, RocksDbWalletError> {
+                    let mut branch =
+                        ConstructionAccumulators::start_optional_branch(NETWORK, Some(tx_cfg));
+                    for (family, key, value) in tx_rows {
+                        branch.append_row(*family, key, value)?;
+                    }
+                    branch.finish_branch()
+                },
+            );
+            let mut index_branch =
+                ConstructionAccumulators::start_optional_branch(NETWORK, Some(index_cfg));
+            for (family, key, value) in index_rows {
+                index_branch.append_row(*family, key, value)?;
+            }
+            let index_res = index_branch.finish_branch();
+            let tx_res = tx_handle
+                .join()
+                .map_err(|_| RocksDbWalletError::AccumulatorHashingWorkerStopped)?;
+            Ok::<_, RocksDbWalletError>((index_res?, tx_res?))
+        })?;
+
+        primary.restore_branch_hashing_pool(branch_pool);
+        primary.combine_branch(&index_finished)?;
+        primary.combine_branch(&tx_finished)?;
+        for (family, key, value) in undo_rows {
+            primary.append_row(*family, key, value)?;
+        }
+        let (digest, commitment) = primary.finish()?;
+        assert_eq!(digest.row_counts(), reference_digest.row_counts());
+        assert_eq!(digest.accumulator(), reference_digest.accumulator());
+        assert_eq!(commitment, reference_commitment);
         Ok(())
     }
 }

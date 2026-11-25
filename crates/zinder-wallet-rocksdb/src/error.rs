@@ -242,6 +242,15 @@ pub enum RocksDbWalletError {
     /// A canonical-scan worker thread stopped before finishing its chunks.
     #[error("a wallet canonical-scan worker thread stopped before finishing its chunks")]
     CanonicalScanWorkerStopped,
+    /// Secondary projection derivation could not start its worker thread.
+    #[error("could not start a wallet secondary-derivation thread: {reason}")]
+    SecondaryDerivationThreadUnavailable {
+        /// Thread-start failure reported by the operating system.
+        reason: String,
+    },
+    /// A secondary-derivation worker thread stopped before finishing.
+    #[error("a wallet secondary-derivation worker thread stopped before finishing")]
+    SecondaryDerivationWorkerStopped,
     /// An accumulator hashing thread stopped before returning its batch.
     #[error("a wallet accumulator hashing thread stopped before finishing its rows")]
     AccumulatorHashingWorkerStopped,

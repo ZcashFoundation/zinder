@@ -343,11 +343,12 @@ pub struct WalletColdValidationPhaseDurations {
     pub reorg_undo_readback: Duration,
 }
 
-/// Sequential steps of [`WalletBuildPhaseDurations::secondary_row_derivation`].
+/// Steps of [`WalletBuildPhaseDurations::secondary_row_derivation`].
 ///
-/// The steps run one after another and do not overlap. Each sort is the
-/// sorter's final run flush and any merge passes that write runs; each drain
-/// merges and reads the sorted runs back and writes its families' SST files.
+/// The address-unspent index/balance derivation and the address-transaction
+/// history derivation run sequentially when `accumulator_hashing_workers` is 1
+/// and concurrently when it is above 1; [`Self::reorg_undo_write`] runs after
+/// address-transaction derivation finishes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WalletSecondaryRowDerivationPhaseDurations {
     /// Final sort of the address-unspent index rows.
@@ -358,6 +359,9 @@ pub struct WalletSecondaryRowDerivationPhaseDurations {
     pub address_transaction_sort: Duration,
     /// Address-transaction rows deduplicated and drained into SST files.
     pub address_transaction_drain: Duration,
+    /// Wall time spent sorting and draining address-index, address-balance, and
+    /// address-transaction rows.
+    pub concurrent_address_derivation: Duration,
     /// Retained reorg-undo rows encoded and written to SST files.
     pub reorg_undo_write: Duration,
 }
@@ -540,30 +544,9 @@ impl RocksDbWalletBuildReport {
             ("primary_sst_write", sst_write.primary_outputs),
             ("address_index_run_spill", address_index_spill),
             ("address_transaction_run_spill", address_transaction_spill),
-            ("address_index_sort", secondary.address_index_sort),
             (
-                "address_index_drain",
-                secondary
-                    .address_index_drain
-                    .saturating_sub(sst_write.address_index_and_balance),
-            ),
-            (
-                "address_index_sst_write",
-                sst_write.address_index_and_balance,
-            ),
-            (
-                "address_transaction_sort",
-                secondary.address_transaction_sort,
-            ),
-            (
-                "address_transaction_drain",
-                secondary
-                    .address_transaction_drain
-                    .saturating_sub(sst_write.address_transaction),
-            ),
-            (
-                "address_transaction_sst_write",
-                sst_write.address_transaction,
+                "secondary_address_derivation",
+                secondary.concurrent_address_derivation,
             ),
             ("reorg_undo_write", secondary.reorg_undo_write),
             ("logical_evidence", phases.logical_evidence),

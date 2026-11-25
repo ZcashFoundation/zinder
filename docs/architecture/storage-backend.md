@@ -191,7 +191,12 @@ in-flight chunk digests to at most `min(4W, 64)` chunks while verifying every
 chunk boundary and the ordered sequence digest against the READY fence (and
 scanning the unsettled suffix serially for `reorg_undo`). Construction hashes
 rows on `projector.build.accumulator_hashing_workers` threads, in batches,
-while the build thread drains its sorters and writes SST files. Each batch is allocated
+while the build thread drains its sorters and writes SST files (and, above 1 worker,
+overlaps the secondary address-index/balance and address-transaction sort-and-drain
+branches, sharing the build's hashing worker pool and global batch budget between them, while offloading `SstFileWriter`
+writes and dual SHA-256 evidence hashing onto bounded-memory worker queues capped
+at `clamp(sst_target_logical_bytes / 8, 64 KiB, 4 MiB)` per open bulk SST writer,
+at most 12 MiB across the 3 concurrent secondary writers). Each batch is allocated
 once with room for 256 KiB of keys, values, and scripts, 4,096 rows, and 2,048
 unspent outputs, and is handed to a worker before an entry would overflow it.
 A batch takes 512 KiB on 64-bit targets and less on 32-bit ones, whose row and
