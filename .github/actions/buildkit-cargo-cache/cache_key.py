@@ -64,7 +64,7 @@ def main() -> None:
     root = pathlib.Path.cwd()
     names = workspace_package_names(root)
     lock_digest = third_party_lock_digest(root, set(names))
-    prefix = f"v1-bk-cargo-{arch}-{rust_version}-{dockerfile_prefix_digest(root)[:12]}-"
+    prefix = f"v2-bk-cargo-{arch}-{rust_version}-{dockerfile_prefix_digest(root)[:12]}-"
     print(f"key={prefix}{lock_digest[:16]}")
     print(f"restore-key={prefix}")
     print(f"workspace-packages={' '.join(names)}")
