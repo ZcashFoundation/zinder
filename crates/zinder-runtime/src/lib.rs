@@ -108,7 +108,10 @@ pub use http_listener::{
 pub use logging::{TracingSubscriberError, install_tracing_subscriber};
 pub use memory_budget::{
     canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
-    container_memory_budget_bytes,
+    container_memory_budget_bytes, wallet_build_outpoint_sort_memory_bytes,
+    wallet_build_outpoint_sort_memory_bytes_for, wallet_build_reorg_undo_memory_bytes,
+    wallet_build_reorg_undo_memory_bytes_for, wallet_build_secondary_sort_memory_bytes_per_sorter,
+    wallet_build_secondary_sort_memory_bytes_per_sorter_for,
 };
 pub use metrics::{
     MetricsHandle, MetricsInstallError, install_metrics_recorder,
