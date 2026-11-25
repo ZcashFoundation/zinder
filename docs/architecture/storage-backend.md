@@ -198,9 +198,9 @@ at 64.
 Each completed batch also carries two 2 KiB partial accumulators, and each
 worker builds one row's hash input at a time, at most 256 KiB plus 45 bytes.
 None of this grows with the number of rows, as
-[ADR-0005](../adrs/0005-bounded-process-memory.md) requires. Cold validation reads the unspent and spent output families back in up
-to the same number of outpoint key ranges, at most one per 65,536 of their
-rows, each on its own thread, and checks every row as one scan would. The
+[ADR-0005](../adrs/0005-bounded-process-memory.md) requires. Cold validation reads the unspent and spent output families and the address-transaction family back in up
+to the same number of hash-prefix key ranges, at most one per 65,536 of each
+scan's rows, each on its own thread, and checks every row as one scan would. The
 setting is at most 64; a build that asks for more is refused before it creates
 any wallet state. A thread that cannot start fails the build like any other
 error, so its lease is released. Any worker count publishes the same rows and

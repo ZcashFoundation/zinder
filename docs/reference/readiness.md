@@ -260,6 +260,24 @@ snapshot for up to 30 seconds while it loads the next one.
 | `canonical_store_damaged` | The tree-state verification pass found a damaged checkpoint row, logged as `tree_state_verification_mismatch`. Ingest keeps following but stays not ready until it stops. Every `CanonicalControl.WriterStatus` answer reports the damage, so readers refuse traffic on their next refresh. After a restart, writer status reports the recorded damage from its first answer, and ingest reports this cause again once the verification pass confirms it, which it checks as soon as the store is published. A verification record ingest cannot read is damage without a height until a full verification cycle passes. Rebuild the canonical store. See [Chain ingestion](../architecture/chain-ingestion.md#tree-state-verification). |
 | `cursor_at_risk` | Explorer view replay falls near the event-retention limit. |
 
+During fresh construction, `/readyz` stays `not_ready` (`503`) with
+`phase: "bulk_catchup"` and `cause: { "syncing": { "lag_blocks": ... } }`:
+
+- While resolving the construction range from the node, `current_height`,
+  `target_height`, and `cause.syncing.lag_blocks` are absent or `null`.
+- Once the fixed build tip is resolved, `target_height` holds that build tip,
+  `current_height` starts at the build predecessor height (`0` for a genesis
+  build, or the configured checkpoint height), and `lag_blocks` starts at
+  `target_height - current_height`.
+- As block loading stages blocks into the builder, ingest updates
+  `current_height`, `lag_blocks`, and `zinder_readiness_sync_lag_blocks` at a
+  bounded cadence until `current_height` reaches `target_height` and
+  `lag_blocks` reaches `0`.
+- Ingest stays `not_ready` in `bulk_catchup` through subtree verification,
+  baseline publication, and store installation, then transitions to
+  `following_tip`. See [Fresh construction](metrics.md#fresh-construction) for
+  the matching Prometheus gauges.
+
 While ingest follows the node, its `/readyz` can include the optional field
 `cause.syncing.wait_reason`. It has two values.
 

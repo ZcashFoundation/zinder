@@ -32,7 +32,7 @@ use crate::{
         DEFAULT_CANONICAL_SCAN_CHUNK_BLOCKS, PreparedWalletProjectionLoad,
         WalletProjectionLoadConfig, write_projection_ssts_from_source,
     },
-    store::{MIN_PRIMARY_ROWS_PER_SCAN_RANGE, RocksDbWalletBuilder, WalletColdValidationConfig},
+    store::{MIN_ROWS_PER_SCAN_RANGE, RocksDbWalletBuilder, WalletColdValidationConfig},
 };
 
 const DEFAULT_BUILD_LEASE_DURATION_MILLIS: u64 = 60 * 60 * 1000;
@@ -40,9 +40,10 @@ const AUTOMATIC_ACCUMULATOR_HASHING_WORKERS_CEILING: u32 = 4;
 
 /// Most accumulator hashing threads a wallet build uses.
 ///
-/// Cold validation reads the primary output families in at most this many key
-/// ranges as well, so the setting also bounds its threads. A build that asks
-/// for more is refused before it creates any wallet state.
+/// Cold validation reads the primary output and address-transaction families
+/// in at most this many key ranges each as well, so the setting also bounds
+/// its threads. A build that asks for more is refused before it creates any
+/// wallet state.
 pub const MAX_ACCUMULATOR_HASHING_WORKERS: u32 = 64;
 const BUILD_STAGE_DURATION_METRIC: &str = "zinder_wallet_projection_build_stage_duration_seconds";
 
@@ -261,15 +262,17 @@ pub struct RocksDbWalletBuildOptions {
     pub supported_reorg_depth: u32,
     /// Threads that hash wallet rows into the projection accumulator and the
     /// UTXO set commitment, scan the settled canonical replay in height chunks,
-    /// and read primary output families back during cold validation.
+    /// and read output and address-transaction families back during cold
+    /// validation.
     ///
     /// One runs all work on the build's own thread. More scan settled canonical
     /// replay chunks in parallel into sharded outpoint sorters (splitting
     /// `max_outpoint_sort_memory_bytes` across workers while sharing
     /// `max_temporary_file_bytes_per_sorter`), hash bounded batches of rows on
     /// that many threads while the build thread drains the sorters and writes
-    /// SST files, and read the unspent and spent output families back in up to
-    /// this many outpoint key ranges at once.
+    /// SST files, and read the unspent and spent output families and the
+    /// address-transaction family back in up to this many hash-prefix key
+    /// ranges at once.
     /// The published rows, sequence digest, and accumulators do not change. At
     /// most [`MAX_ACCUMULATOR_HASHING_WORKERS`].
     pub accumulator_hashing_workers: NonZeroU32,
@@ -320,9 +323,9 @@ fn accumulator_hashing_workers_for(detected_logical_cpus: Option<NonZeroU32>) ->
 /// primary output, address-index, and address-transaction scans run
 /// concurrently, so their three durations overlap: each is the wall time of
 /// its own scan, and `concurrent_family_readback` is the wall time of all
-/// three together. The primary output scan reads its outpoint key ranges
-/// concurrently, and its duration covers all of them. The reorg-undo scan
-/// runs after them.
+/// three together. The primary output and address-transaction scans each read
+/// their hash-prefix key ranges concurrently, and each duration covers all of
+/// them. The reorg-undo scan runs after them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WalletColdValidationPhaseDurations {
     /// Merged scan of the unspent and spent primary output families.
@@ -895,8 +898,8 @@ where
             ready_evidence,
             WalletColdValidationConfig {
                 max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
-                primary_output_scan_ranges: options.accumulator_hashing_workers,
-                min_primary_rows_per_scan_range: MIN_PRIMARY_ROWS_PER_SCAN_RANGE,
+                family_scan_ranges: options.accumulator_hashing_workers,
+                min_rows_per_scan_range: MIN_ROWS_PER_SCAN_RANGE,
             },
         )?;
         let cold_validation = phase_started.elapsed();

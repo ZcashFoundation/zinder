@@ -273,8 +273,10 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     ///
     /// Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`,
     /// `GetBlockRangeNullifiers`, the encoded range methods, and, where this
-    /// adapter serves it, `GetTreeState`, when they select by height. The
-    /// adapter defaults to [`TipWait::disabled`]; the
+    /// adapter serves it, `GetTreeState`, when they select by height. In
+    /// light-wallet serving, it also bounds the wait when forwarded UTXO and
+    /// transparent balance reads observe a node tip ahead of the served tip.
+    /// The adapter defaults to [`TipWait::disabled`]; the
     /// `zinder-compat-lightwalletd` binary sets the configured wait.
     #[must_use]
     pub fn with_tip_wait(mut self, tip_wait: TipWait) -> Self {

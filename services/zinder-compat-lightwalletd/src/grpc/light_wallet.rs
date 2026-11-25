@@ -28,7 +28,11 @@ use zinder_core::{
         decode_internal_transaction_id, decode_rpc_block_hash_bytes, encode_internal_transaction_id,
     },
 };
-use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
+use zinder_proto::{
+    compat::lightwalletd::{self, compact_tx_streamer_server},
+    status_for_reason,
+    v1::ops::ErrorReason,
+};
 use zinder_query::{
     ArtifactKey, CanonicalReader, FORWARDED_HISTORY_DEADLINE, ForwardedReadKind,
     ForwardedReadLimit, ForwardedReadRefused, ForwardedResponseKind, ForwardedResponsePermit,
@@ -56,6 +60,7 @@ use super::{
 use crate::CanonicalReaderSlot;
 use crate::block_methods::{self, RequestedBlock, requested_block};
 use crate::compact_block_messages::CompactBlockShape;
+use crate::tip_wait::{TipWait, TipWaitProgress};
 
 /// The canonical reader and node-backed methods for light-wallet serving.
 #[derive(Clone)]
@@ -273,6 +278,8 @@ impl NodeBackedLightWallet {
     async fn balance(
         &self,
         mut addresses: impl Stream<Item = Result<String, Status>> + Unpin,
+        method: &'static str,
+        tip_wait: &TipWait,
     ) -> Result<lightwalletd::Balance, Status> {
         let network = self.slot.capture().network();
         let mut distinct = HashSet::new();
@@ -297,15 +304,21 @@ impl NodeBackedLightWallet {
         // The node's balance RPC does not report the tip it answered at, so
         // the balance is summed from outputs the node attests at the served tip.
         let deadline = self.reads.deadline();
-        let view = served_view(&self.slot.capture())?;
-        let reads = NodeReads {
-            node: self.schedule_node(&view).await?,
-            limit: &self.reads,
-            kind: ForwardedReadKind::Utxo,
-            deadline,
-        };
-        let unspent =
-            served_utxo_page(&reads, &lookup, BlockHeight::new(0), None, view.tip).await?;
+        let unspent = self
+            .run_with_tip_wait(method, tip_wait, deadline, || async {
+                let view = served_view(&self.slot.capture()).map_err(UtxoAttemptError::Status)?;
+                let reads = NodeReads {
+                    node: self
+                        .schedule_node(&view)
+                        .await
+                        .map_err(UtxoAttemptError::Status)?,
+                    limit: &self.reads,
+                    kind: ForwardedReadKind::Utxo,
+                    deadline,
+                };
+                served_utxo_page(&reads, &lookup, BlockHeight::new(0), None, view.tip).await
+            })
+            .await?;
         let exceeds = || Status::out_of_range("transparent address balance exceeds i64");
         let balance_zat = unspent
             .outputs
@@ -321,13 +334,14 @@ impl NodeBackedLightWallet {
         &self,
         request: lightwalletd::GetAddressUtxosArg,
         response_limit: NonZeroU32,
+        method: &'static str,
+        tip_wait: &TipWait,
     ) -> Result<Option<(Vec<SourceTransparentUnspentOutput>, ForwardedResponsePermit)>, Status>
     {
         if request.addresses.is_empty() {
             return Ok(None);
         }
-        let view = served_view(&self.slot.capture())?;
-        let network = view.network;
+        let network = self.slot.capture().network();
         let mut addresses = Vec::with_capacity(request.addresses.len());
         for text in request.addresses {
             let parsed = indexed_address(&text, network)?;
@@ -343,21 +357,33 @@ impl NodeBackedLightWallet {
                 .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?,
         );
         // The response slot is taken before any node-call slot, so this
-        // request never holds a node-call slot while it waits.
+        // request never holds a node-call slot while it waits, and it is
+        // dropped before TipWait waits on a mismatch.
         let deadline = self.reads.deadline();
-        let response_permit = self
-            .reads
-            .admit_response(ForwardedResponseKind::UtxoResponse, deadline)
-            .await
-            .map_err(forwarded_read_refused)?;
-        let reads = NodeReads {
-            node: self.schedule_node(&view).await?,
-            limit: &self.reads,
-            kind: ForwardedReadKind::Utxo,
-            deadline,
-        };
-        let mut rows =
-            wallet_ordered_utxos(&reads, &lookup, height, request.max_entries, view.tip).await?;
+        let (mut rows, response_permit) = self
+            .run_with_tip_wait(method, tip_wait, deadline, || async {
+                let response_permit = self
+                    .reads
+                    .admit_response(ForwardedResponseKind::UtxoResponse, deadline)
+                    .await
+                    .map_err(forwarded_read_refused)
+                    .map_err(UtxoAttemptError::Status)?;
+                let view = served_view(&self.slot.capture()).map_err(UtxoAttemptError::Status)?;
+                let reads = NodeReads {
+                    node: self
+                        .schedule_node(&view)
+                        .await
+                        .map_err(UtxoAttemptError::Status)?,
+                    limit: &self.reads,
+                    kind: ForwardedReadKind::Utxo,
+                    deadline,
+                };
+                let rows =
+                    wallet_ordered_utxos(&reads, &lookup, height, request.max_entries, view.tip)
+                        .await?;
+                Ok((rows, response_permit))
+            })
+            .await?;
         let count = wallet_utxo_response_len(rows.len(), request.max_entries, response_limit)?;
         if count == 0 {
             return Ok(None);
@@ -372,6 +398,35 @@ impl NodeBackedLightWallet {
         rows.truncate(count);
         rows.shrink_to_fit();
         Ok(Some((rows, response_permit)))
+    }
+
+    async fn run_with_tip_wait<T, Attempt, Fut>(
+        &self,
+        method: &'static str,
+        tip_wait: &TipWait,
+        deadline: Instant,
+        mut attempt: Attempt,
+    ) -> Result<T, Status>
+    where
+        Attempt: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, UtxoAttemptError>> + Send,
+    {
+        match attempt().await {
+            Ok(answer) => Ok(answer),
+            Err(UtxoAttemptError::TipMismatch {
+                served_tip,
+                answered_tip,
+            }) if answered_tip.height > served_tip.height => {
+                let progress = tip_wait
+                    .await_height_until(&self.slot, method, answered_tip.height, Some(deadline))
+                    .await?;
+                if progress != TipWaitProgress::Reached {
+                    return Err(served_tip_mismatch(TIP_MISMATCH_MESSAGE));
+                }
+                attempt().await.map_err(UtxoAttemptError::into_status)
+            }
+            Err(error) => Err(error.into_status()),
+        }
     }
 
     async fn history(
@@ -433,7 +488,6 @@ impl NodeBackedLightWallet {
 /// The served tip a forwarded request answers for, captured once per request
 /// with the node admission target of the same reader.
 struct ServedView {
-    network: Network,
     tip: BlockId,
     target: VerifiedNodeTarget,
 }
@@ -441,7 +495,6 @@ struct ServedView {
 fn served_view(reader: &RocksDbCanonicalReader) -> Result<ServedView, Status> {
     let epoch = reader.chain_epoch();
     Ok(ServedView {
-        network: epoch.network,
         tip: BlockId::new(epoch.visible_tip_height, epoch.visible_tip_hash),
         target: VerifiedNodeTarget::of(reader)
             .map_err(|error| status_from_query_error(&QueryError::Node(error)))?,
@@ -530,7 +583,7 @@ async fn served_utxo_page(
     height: BlockHeight,
     limit: Option<TransparentAddressRowLimit>,
     served: BlockId,
-) -> Result<SourceTransparentUtxoPage, Status> {
+) -> Result<SourceTransparentUtxoPage, UtxoAttemptError> {
     let node = reads.node;
     let page = match limit {
         None => {
@@ -543,13 +596,15 @@ async fn served_utxo_page(
                 .call(node.fetch_transparent_address_utxo_page(lookup, height, limit))
                 .await
         }
-    }?;
+    }
+    .map_err(UtxoAttemptError::Status)?;
     if page.tip == served {
         Ok(page)
     } else {
-        Err(outside_served_view(
-            "node answered at another tip than the served tip",
-        ))
+        Err(UtxoAttemptError::TipMismatch {
+            served_tip: served,
+            answered_tip: page.tip,
+        })
     }
 }
 
@@ -563,7 +618,7 @@ async fn wallet_ordered_utxos(
     height: BlockHeight,
     max_entries: u32,
     served: BlockId,
-) -> Result<Vec<SourceTransparentUnspentOutput>, Status> {
+) -> Result<Vec<SourceTransparentUnspentOutput>, UtxoAttemptError> {
     let Some(requested) = TransparentAddressRowLimit::new(max_entries) else {
         return Ok(served_utxo_page(node, lookup, height, None, served)
             .await?
@@ -610,9 +665,7 @@ async fn wallet_ordered_utxos(
                 .iter()
                 .any(|row| earlier.contains(&row.outpoint));
         if !agrees {
-            return Err(outside_served_view(
-                "node UTXO pages at the served tip disagree",
-            ));
+            return Err(UtxoAttemptError::PagesDisagreed);
         }
         let finished = unbounded || page.complete || at_cutoff < page.outputs.len();
         verified = page.outputs;
@@ -937,11 +990,43 @@ fn history_changed() -> Status {
     )
 }
 
-/// Refuses a forwarded answer the node cannot give for the served chain view.
-fn outside_served_view(reason: &str) -> Status {
-    status_from_query_error(&QueryError::Node(SourceError::NodeUnavailable {
-        reason: format!("{reason}; retry with backoff"),
-    }))
+/// Retry pushback hint in milliseconds attached to `SERVED_TIP_MISMATCH`
+/// refusals as `grpc-retry-pushback-ms` metadata.
+const SERVED_TIP_MISMATCH_RETRY_PUSHBACK_MS: u64 = 1_000;
+const GRPC_RETRY_PUSHBACK_MS_HEADER: &str = "grpc-retry-pushback-ms";
+const TIP_MISMATCH_MESSAGE: &str =
+    "node answered at another tip than the served tip; retry shortly";
+const PAGES_DISAGREED_MESSAGE: &str = "node UTXO pages at the served tip disagree; retry shortly";
+
+enum UtxoAttemptError {
+    TipMismatch {
+        served_tip: BlockId,
+        answered_tip: BlockId,
+    },
+    PagesDisagreed,
+    Status(Status),
+}
+
+impl UtxoAttemptError {
+    fn into_status(self) -> Status {
+        match self {
+            Self::TipMismatch { .. } => served_tip_mismatch(TIP_MISMATCH_MESSAGE),
+            Self::PagesDisagreed => served_tip_mismatch(PAGES_DISAGREED_MESSAGE),
+            Self::Status(status) => status,
+        }
+    }
+}
+
+/// Refuses a forwarded UTXO or balance answer whose tip differs from the served
+/// view (or whose pages disagreed) with `SERVED_TIP_MISMATCH` and retry
+/// pushback guidance.
+fn served_tip_mismatch(message: &str) -> Status {
+    let mut status = status_for_reason(ErrorReason::ServedTipMismatch, message);
+    status.metadata_mut().insert(
+        GRPC_RETRY_PUSHBACK_MS_HEADER,
+        tonic::metadata::MetadataValue::from(SERVED_TIP_MISMATCH_RETRY_PUSHBACK_MS),
+    );
+    status
 }
 
 #[allow(
@@ -1180,9 +1265,11 @@ impl compact_tx_streamer_server::CompactTxStreamer
         request: Request<lightwalletd::AddressList>,
     ) -> Result<Response<lightwalletd::Balance>, Status> {
         self.query_api
-            .balance(stream::iter(
-                request.into_inner().addresses.into_iter().map(Ok),
-            ))
+            .balance(
+                stream::iter(request.into_inner().addresses.into_iter().map(Ok)),
+                "get_taddress_balance",
+                self.block_methods.tip_wait(),
+            )
             .await
             .map(Response::new)
     }
@@ -1196,6 +1283,8 @@ impl compact_tx_streamer_server::CompactTxStreamer
                 request
                     .into_inner()
                     .map(|row| row.map(|address| address.address)),
+                "get_taddress_balance_stream",
+                self.block_methods.tip_wait(),
             )
             .await
             .map(Response::new)
@@ -1299,7 +1388,12 @@ impl compact_tx_streamer_server::CompactTxStreamer
     ) -> Result<Response<lightwalletd::GetAddressUtxosReplyList>, Status> {
         let outputs = self
             .query_api
-            .utxos(request.into_inner(), self.response_limits.max_address_utxos)
+            .utxos(
+                request.into_inner(),
+                self.response_limits.max_address_utxos,
+                "get_address_utxos",
+                self.block_methods.tip_wait(),
+            )
             .await?;
         let Some((rows, permit)) = outputs else {
             return Ok(Response::new(
@@ -1322,7 +1416,12 @@ impl compact_tx_streamer_server::CompactTxStreamer
     ) -> Result<Response<Self::GetAddressUtxosStreamStream>, Status> {
         let outputs = self
             .query_api
-            .utxos(request.into_inner(), self.response_limits.max_address_utxos)
+            .utxos(
+                request.into_inner(),
+                self.response_limits.max_address_utxos,
+                "get_address_utxos_stream",
+                self.block_methods.tip_wait(),
+            )
             .await?;
         let outputs: Self::GetAddressUtxosStreamStream = match outputs {
             None => Box::pin(stream::empty()),

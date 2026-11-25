@@ -1408,7 +1408,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Milliseconds a height-selected lightwalletd block read waits for a height just past the visible tip before it runs unchanged. Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, the encoded block range methods, and, in wallet and light-wallet serving, `GetTreeState` by height. Applies to every serving mode. The worst delay before a block-range response's headers is this wait plus the existing 10-second block-range admission wait. A value of 0 disables the wait. A nonzero value must be at least twice `storage.secondary_catchup_interval_ms`. There is no upper bound. Defaults to 3000, which is provisional pending cross-region skew measurement.",
+        description: "Milliseconds a height-selected lightwalletd block read, or a light-wallet forwarded UTXO or balance read whose node answered ahead of the served tip, waits for a height just past the visible tip before continuing or failing. Applies to `GetBlock`, `GetBlockNullifiers`, `GetBlockRange`, `GetBlockRangeNullifiers`, the encoded block range methods, `GetTreeState` by height (wallet and light-wallet serving), and forwarded `GetAddressUtxos`, `GetAddressUtxosStream`, `GetTaddressBalance`, and `GetTaddressBalanceStream` (light-wallet serving). Applies to every serving mode. The worst delay before a block-range response's headers is this wait plus the existing 10-second block-range admission wait. A value of 0 disables the wait. A nonzero value must be at least twice `storage.secondary_catchup_interval_ms`. There is no upper bound. Defaults to 3000, which is provisional pending cross-region skew measurement.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS",
@@ -1416,7 +1416,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Furthest past the visible tip, in blocks, that a read may name and still wait for the tip. A read naming a height further ahead runs at once. Applies to every serving mode. Must be at least 1, with no upper bound. Defaults to 2.",
+        description: "Furthest past the visible tip, in blocks, that a read may name or observe and still wait for the tip. A read naming or observing a height further ahead runs or refuses at once. Applies to every serving mode. Must be at least 1, with no upper bound. Defaults to 2.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS",
@@ -1424,7 +1424,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Most lightwalletd block reads that may wait for the tip at once. A read that finds every waiting place taken runs at once without waiting. Applies to every serving mode. Must be at least 1. Defaults to 256.",
+        description: "Most lightwalletd reads that may wait for the tip at once. A read that finds every waiting place taken runs or refuses at once without waiting. Applies to every serving mode. Must be at least 1. Defaults to 256.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__PING_VERY_INSECURE",
@@ -1727,16 +1727,17 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       height chunks across that many workers (splitting \
                       max_outpoint_sort_memory_bytes across workers while sharing \
                       max_temporary_file_bytes_per_sorter and verifying the ordered sequence \
-                      digest), hashes batches of rows on that many threads while the build \
+                      digest), and hashes batches of rows on that many threads while the build \
                       thread drains its sorters and writes SST files. Each batch is allocated \
                       once and takes at most 512 KiB, and at most twice that many batches, \
                       never more than 64, plus two on the build thread exist at once: at most \
                       5 MiB at 4 threads and 33 MiB at 64. A row larger than a batch is \
                       hashed on the build thread. Cold validation also reads the unspent and \
-                      spent output families back in up to that many outpoint key ranges at \
-                      once, at most one per 65,536 of their rows. The published rows, digest, \
-                      and commitment do not change. Must be between 1 and 64; the projector \
-                      refuses a larger value at startup.",
+                      spent output families and the address-transaction family back in up to \
+                      that many hash-prefix key ranges at once, at most one per 65,536 of \
+                      each scan's rows. The published rows, digest, and commitment do not \
+                      change. Must be between 1 and 64; the projector refuses a larger value at \
+                      startup.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES",

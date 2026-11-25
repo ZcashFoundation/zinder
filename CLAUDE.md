@@ -76,7 +76,7 @@ cargo mutants --workspace --all-features --cap-lints true \
   --re 'block_replay\.rs:.*\b(CanonicalReplaySliceSource|CanonicalReplaySliceScan|expected_visible_block_count)\b' \
   --re 'projection_load\.rs:.*\b(partition_settled_height_chunks|parallel_scan_worker_count|verify_completed_chunks|scan_one_settled_chunk|spawn_canonical_scan_worker)\b' \
   --re 'accumulator_hashing\.rs:.*\b(append_row|insert_unspent_output|settle|make_room|submit|spawn|drain|combine|push_row|push_unspent_output|hash_partial|HashingWorkers::start)\b' \
-  --re 'zinder-wallet-rocksdb/src/store\.rs:.*\b(outpoint_key_ranges|OutpointKeyRange|primary_output_scan_range_count|read_back_primary_output_rows|scan_primary_output_range|PrimaryOutputTotals|PrimaryScanRange|SharedExpectedReorgUndoSuffix|spawn_validation_scan)\b' \
+  --re 'zinder-wallet-rocksdb/src/store\.rs:.*\b(hash_prefix_key_ranges|HashPrefixKeyRange|scan_range_count|primary_output_scan_range_count|address_transaction_scan_range_count|read_back_primary_output_rows|scan_primary_output_range|read_back_address_transaction_rows|scan_address_transaction_range|AddressTransactionTotals|PrimaryOutputTotals|PrimaryScanRange|SharedExpectedReorgUndoSuffix|spawn_validation_scan)\b' \
   --re '(utxo_set_commitment|zinder-wallet-projection/src/digest)\.rs:.*\b(combine|fold_lanes)\b' \
   --re '(artifact_builder|source_transaction)\.rs:.*\b(parse_source_block|bytes_consumed|validate_transaction_byte_layout|transaction_identifiers|witnessed_transaction_identifiers)\b' \
   --re 'lthash16\.rs:.*\bexpand_lthash16_element\b' \

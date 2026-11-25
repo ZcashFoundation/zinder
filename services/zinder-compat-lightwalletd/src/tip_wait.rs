@@ -50,6 +50,16 @@ const WAITS_COUNTER: &str = "zinder_compat_tip_wait_total";
 const WAIT_DURATION_HISTOGRAM: &str = "zinder_compat_tip_wait_duration_seconds";
 const WAITERS_GAUGE: &str = "zinder_compat_tip_waiters";
 
+/// Whether a bounded tip wait observed the requested height.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TipWaitProgress {
+    /// The visible tip is now at or above the requested height.
+    Reached,
+    /// The wait was disabled, skipped, expired, cancelled, full, or left the
+    /// window.
+    NotReached,
+}
+
 /// How long, and how far past the visible tip, a height-selected block read
 /// waits for its height before it answers.
 ///
@@ -134,38 +144,67 @@ impl TipWait {
     /// arrived, the wait expired or was cut short, or the request never
     /// qualified. Returns `Err` only when capturing the visible tip failed,
     /// with that capture's status, which the method would have returned.
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the waiter keeps its place for the whole wait"
-    )]
     pub(crate) async fn await_height<Reads: CompactBlockReads>(
         &self,
         reads: &Reads,
         method: &'static str,
         requested: BlockHeight,
     ) -> Result<(), Status> {
+        self.await_height_until(reads, method, requested, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Waits until `reads` publishes a visible tip at or above `requested`,
+    /// bounded by both `self.max_wait` and an optional `deadline_cap`.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the waiter keeps its place for the whole wait"
+    )]
+    pub(crate) async fn await_height_until<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        method: &'static str,
+        requested: BlockHeight,
+        deadline_cap: Option<Instant>,
+    ) -> Result<TipWaitProgress, Status> {
         if self.max_wait.is_zero() {
-            return Ok(());
+            return Ok(TipWaitProgress::NotReached);
         }
         // Subscribe before the tip is read, so a publication between the two
         // still wakes the wait.
         let Some(mut publications) = reads.subscribe_publications() else {
-            return Ok(());
+            return Ok(TipWaitProgress::NotReached);
         };
         let tip = visible_tip_height(reads).await?;
+        if requested <= tip {
+            return Ok(TipWaitProgress::Reached);
+        }
         let Some(blocks_ahead) = self.blocks_ahead(requested, tip) else {
-            return Ok(());
+            return Ok(TipWaitProgress::NotReached);
+        };
+        let now = Instant::now();
+        let wait_deadline = match deadline_cap {
+            Some(cap) if cap <= now => return Ok(TipWaitProgress::NotReached),
+            Some(cap) => (now + self.max_wait).min(cap),
+            None => now + self.max_wait,
         };
         let Ok(place) = Arc::clone(&self.waiters).try_acquire_owned() else {
             record_waiters_full(method, blocks_ahead);
-            return Ok(());
+            return Ok(TipWaitProgress::NotReached);
         };
         let waiter = Waiter::start(place, method, blocks_ahead);
         let outcome = self
-            .wait_for_height(reads, &mut publications, requested)
+            .wait_for_height(reads, &mut publications, requested, wait_deadline)
             .await;
         waiter.end(*outcome.as_ref().unwrap_or(&WaitOutcome::Refused));
-        outcome.map(|_| ())
+        outcome.map(|wait_outcome| match wait_outcome {
+            WaitOutcome::Served => TipWaitProgress::Reached,
+            WaitOutcome::Expired
+            | WaitOutcome::Cancelled
+            | WaitOutcome::LeftWindow
+            | WaitOutcome::Refused => TipWaitProgress::NotReached,
+        })
     }
 
     async fn wait_for_height<Reads: CompactBlockReads>(
@@ -173,8 +212,8 @@ impl TipWait {
         reads: &Reads,
         publications: &mut watch::Receiver<()>,
         requested: BlockHeight,
+        deadline: Instant,
     ) -> Result<WaitOutcome, Status> {
-        let deadline = Instant::now() + self.max_wait;
         loop {
             tokio::select! {
                 biased;

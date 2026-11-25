@@ -1419,14 +1419,7 @@ async fn utxo_prefix_completes_its_last_height_at_one_node_tip() -> Result<()> {
     assert_eq!(outputs.len(), 2);
     assert_eq!(outputs[0].txid, vec![4; 32]);
     assert_eq!(outputs[1].txid, vec![1; 32]);
-    let changed = fixture
-        .adapter
-        .get_address_utxos(request())
-        .await
-        .err()
-        .ok_or_else(|| eyre!("combined UTXOs from different node tips"))?;
-    assert_eq!(changed.code(), Code::Unavailable);
-    assert!(changed.message().contains("retry with backoff"));
+    served_view::served_tip_mismatch(fixture.adapter.get_address_utxos(request()).await)?;
     Ok(())
 }
 

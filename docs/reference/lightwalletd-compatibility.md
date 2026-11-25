@@ -103,7 +103,7 @@ Every forwarded read first confirms that the node's network-upgrade schedule mat
 | --- | --- |
 | `GetTransaction` for a mined transaction | None. The reply names the mining block, and the bytes match the recorded digest. |
 | `GetTransaction` for a transaction the served chain does not hold | Before the mempool answers |
-| `GetAddressUtxos`, `GetAddressUtxosStream`, `GetTaddressBalance`, `GetTaddressBalanceStream` | None. Each `getaddressutxos` page reports the tip it answered at, and it must be the served tip. |
+| `GetAddressUtxos`, `GetAddressUtxosStream`, `GetTaddressBalance`, `GetTaddressBalanceStream` | None. Each `getaddressutxos` page reports the tip it answered at, and it must be the served tip. If the node answers ahead of the served tip, the listener releases any response slot and [waits briefly](#waiting-for-a-height-just-past-the-tip) before retrying once; if it still mismatches or pages disagree, it refuses with `UNAVAILABLE`, `SERVED_TIP_MISMATCH`, and `grpc-retry-pushback-ms: 1000`. |
 | `GetTaddressTxids`, `GetTaddressTransactions` | Before and after each page of IDs, and once at the end of the stream |
 | `SendTransaction`, `GetStandardFee` | Before the call |
 
@@ -163,7 +163,7 @@ How each engine uses the tip calls:
 
 ### Waiting for a height just past the tip
 
-Readers behind a load balancer publish each block at slightly different times, and the balancer routes every request on its own. A wallet can learn tip H+1 from one reader and then ask another, still at H, for block H+1. Instead of failing at once, Zinder waits briefly for the height to arrive. For how this fits a multi-reader deployment, see [More than one reader on a host](../architecture/service-operations.md#more-than-one-reader-on-a-host).
+Readers behind a load balancer publish each block at slightly different times, and the balancer routes every request on its own. A wallet can learn tip H+1 from one reader, or a forwarded node can advance to H+1, while a reader is still at H. Instead of failing at once, Zinder waits briefly for the height to arrive. For how this fits a multi-reader deployment, see [More than one reader on a host](../architecture/service-operations.md#more-than-one-reader-on-a-host).
 
 These methods wait when they select a height:
 
@@ -171,20 +171,22 @@ These methods wait when they select a height:
 - `GetBlockRange` and `GetBlockRangeNullifiers`, and the encoded block range methods `GetEncodedBlockRange` and `GetEncodedBlockRangeNullifiers`. A range waits on its higher end, whichever end the request names first.
 - `GetTreeState` by height, in the serving modes that answer it: wallet and light-wallet serving.
 
-A hash-only selector never waits and keeps its immediate `NOT_FOUND`. `GetLatestBlock`, `GetLightdInfo`, `GetLatestTreeState`, `GetTransaction`, `SendTransaction`, the mempool methods, the transparent-address methods, `GetSubtreeRoots`, and native `WalletQuery` never wait.
+In light-wallet serving, forwarded `GetAddressUtxos`, `GetAddressUtxosStream`, `GetTaddressBalance`, and `GetTaddressBalanceStream` calls also wait when the node answers at a tip height above the served tip. A waiting call drops any held forwarded-read permits first, waits up to the shorter of `compat.tip_wait_ms` and the request's remaining forwarded-read wait budget, then recaptures the served view and retries the node lookup at most once. Multi-page UTXO disagreement at the same tip and non-advancing forks fail at once without waiting.
+
+A hash-only selector never waits and keeps its immediate `NOT_FOUND`. `GetLatestBlock`, `GetLightdInfo`, `GetLatestTreeState`, `GetTransaction`, `SendTransaction`, the mempool methods, `GetTaddressTxids`, `GetTaddressTransactions`, wallet-serving transparent-address reads, `GetSubtreeRoots`, and native `WalletQuery` never wait.
 
 A request waits only when its height is above the visible tip by at most `compat.tip_wait_max_blocks` blocks (default 2). It waits up to `compat.tip_wait_ms` milliseconds (default 3000, and 0 turns the wait off). At most `compat.tip_wait_max_waiters` requests (default 256) wait at once, and a request that finds them all taken answers at once. [Configuration](configuration.md) lists the settings and their limits. The default wait is provisional until cross-region skew has been measured, and operators can raise it.
 
 A waiting request wakes each time the reader publishes a new tip and checks the fresh tip, with no polling:
 
 - When the height arrives, the method runs as if it had been there from the start.
-- When the wait expires, the method answers with its usual status against the fresh tip: `OUT_OF_RANGE` with `block N is newer than latest block M` for block reads, and `INVALID_ARGUMENT` for `GetTreeState`. There is no new status or error reason.
+- When the wait expires, block and tree-state methods answer with their usual status against the fresh tip: `OUT_OF_RANGE` with `block N is newer than latest block M` for block reads, and `INVALID_ARGUMENT` for `GetTreeState`. There is no new status or error reason for those methods. Forwarded UTXO and balance reads refuse with `UNAVAILABLE`, `SERVED_TIP_MISMATCH`, and `grpc-retry-pushback-ms: 1000` without calling the node again (and refuse the same way if the single retry still mismatches).
 - When a publication moves the tip down so that the height is outside the window, the wait ends at once.
 - When the reader adopts a different block at the awaited height, a request by height alone serves the local block. A request by height and hash gets the usual `NOT_FOUND` with `requested block hash does not match indexed block`.
 - When shutdown begins, every wait ends at once.
 - When the client sets a `grpc-timeout` shorter than the wait, the request ends with `DEADLINE_EXCEEDED`. A public listener answers any expired `grpc-timeout` whose response has not started with `DEADLINE_EXCEEDED`, as the gRPC status-code specification and grpc-go servers such as lightwalletd do.
 
-A waiting request holds no reader generation, serving pair, or block-range stream slot, so waiting requests never use the stream slots below. [Metrics](metrics.md#zinder-compat-lightwalletd) lists `zinder_compat_tip_wait_total`, `zinder_compat_tip_wait_duration_seconds`, and `zinder_compat_tip_waiters`.
+A waiting request holds no reader generation, serving pair, forwarded-read slot, or block-range stream slot, so waiting requests never use the stream or forwarded-read slots below. [Metrics](metrics.md#zinder-compat-lightwalletd) lists `zinder_compat_tip_wait_total`, `zinder_compat_tip_wait_duration_seconds`, and `zinder_compat_tip_waiters`.
 
 ### `GetBlock` and `GetBlockNullifiers`
 
@@ -389,7 +391,7 @@ A failure can end either kind of stream after it has delivered rows. For forward
 
 ### `GetTaddressBalance` and `GetTaddressBalanceStream`
 
-Both methods return the confirmed balance, the sum of unspent outputs, of up to 256 distinct addresses. Wallet serving reads at one chain epoch. Light-wallet serving sums the outputs reported by its node at the captured canonical tip. A repeated address counts once. Mempool state is excluded.
+Both methods return the confirmed balance, the sum of unspent outputs, of up to 256 distinct addresses. Wallet serving reads at one chain epoch. Light-wallet serving sums the outputs reported by its node at the captured canonical tip. A repeated address counts once. Mempool state is excluded. When light-wallet serving observes a node tip different from the captured served tip, it performs any configured [tip wait](#waiting-for-a-height-just-past-the-tip) and single retry and otherwise refuses with `UNAVAILABLE`, reason `SERVED_TIP_MISMATCH`, and `grpc-retry-pushback-ms: 1000` instead of `NODE_UNAVAILABLE`.
 
 - An empty list is `INVALID_ARGUMENT`.
 - The 257th distinct address is `INVALID_ARGUMENT` with `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`. The streaming method refuses as soon as that address arrives, without waiting for the client to finish. lightwalletd bounds the streaming method at 10,000 addresses.
@@ -406,7 +408,7 @@ One response returns at most 100,000 outputs. The handling of an oversized respo
 
 - In wallet serving, `GetAddressUtxos` reads every row before it answers. A request that would return more fails with `RESOURCE_EXHAUSTED` and no rows.
 - In wallet serving, `GetAddressUtxosStream` sends rows as it merges them, at most 64 ahead of the client. A request that would return more sends the first 100,000 rows and then ends with `RESOURCE_EXHAUSTED`. A later failure such as `CHAIN_EPOCH_PIN_UNAVAILABLE` also ends the stream after the rows already sent. Treat a stream that ends with an error as incomplete.
-- In light-wallet serving, both methods fetch the node results and check the response limit before sending any rows. A response that exceeds the limit returns `RESOURCE_EXHAUSTED` without a partial output list. Each node page must name the captured canonical tip. For a bounded prefix, Zinder verifies the outputs at the cutoff height before selecting rows in wallet order.
+- In light-wallet serving, both methods fetch the node results and check the response limit before sending any rows. A response that exceeds the limit returns `RESOURCE_EXHAUSTED` without a partial output list. Each node page must name the captured canonical tip. For a bounded prefix, Zinder verifies the outputs at the cutoff height before selecting rows in wallet order. A tip mismatch (after any [tip wait](#waiting-for-a-height-just-past-the-tip) and single retry) or disagreeing pages at the served tip fail with `UNAVAILABLE`, reason `SERVED_TIP_MISMATCH`, and `grpc-retry-pushback-ms: 1000` instead of `NODE_UNAVAILABLE`.
 
 In light-wallet serving, the unspent-output and balance methods share the UTXO kind of node-call slots, and each node page holds a slot only while it is read. The unspent-output methods also take one of the unspent-output response slots before their first node call, as [Admission](#admission) describes. A streamed reply holds its response slot until its row iterator ends or is dropped. A unary reply holds its response slot until its body ends or fails after the send-stall layer hands the buffered data to the transport, or until the handler body is dropped on disconnect or a send stall. The bound covers the listener’s buffered reply. Bytes already handed to the transport are outside this bound.
 

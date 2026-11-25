@@ -349,6 +349,7 @@ impl BlockRangeStreamLimit {
         // Publishes the gauge before the first stream opens. Setting it to
         // zero would discard the slots that other limits in the process hold.
         metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
+        register_refusal_counter();
         Self {
             published_reads: Arc::new(Semaphore::new(PUBLISHED_READERS)),
             slots: Arc::new(Semaphore::new(permits)),
@@ -495,11 +496,28 @@ enum RefusalReason {
 }
 
 impl RefusalReason {
+    const ALL: [Self; 2] = [Self::WaitTimeout, Self::WaitersFull];
+
     const fn label(self) -> &'static str {
         match self {
             Self::WaitersFull => "waiters_full",
             Self::WaitTimeout => "wait_timeout",
         }
+    }
+}
+
+/// Describes and pre-registers `zinder_compat_block_range_stream_refusals_total`
+/// at zero for every finite refusal reason.
+fn register_refusal_counter() {
+    metrics::describe_counter!(
+        REFUSED_STREAMS_COUNTER,
+        metrics::Unit::Count,
+        "Block-range stream requests refused with UNAVAILABLE, by reason: `wait_timeout` \
+         when no slot returned within the admission wait, and `waiters_full` when every \
+         waiting place was taken."
+    );
+    for reason in RefusalReason::ALL {
+        metrics::counter!(REFUSED_STREAMS_COUNTER, "reason" => reason.label()).increment(0);
     }
 }
 
@@ -1745,6 +1763,37 @@ mod tests {
                 .parse::<f64>()
                 .ok()
         })
+    }
+
+    #[test]
+    fn stream_limit_preregisters_refusal_counters_at_zero_with_metadata() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let _limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("# HELP zinder_compat_block_range_stream_refusals_total "),
+            "missing # HELP for block-range refusals in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE zinder_compat_block_range_stream_refusals_total counter"),
+            "missing # TYPE for block-range refusals in:\n{rendered}"
+        );
+        for reason in ["wait_timeout", "waiters_full"] {
+            assert_eq!(
+                rendered_sample(
+                    &rendered,
+                    &format!(
+                        "zinder_compat_block_range_stream_refusals_total{{reason=\"{reason}\"}}"
+                    ),
+                ),
+                Some(0.0),
+                "expected 0 sample for reason={reason} in:\n{rendered}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

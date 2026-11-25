@@ -1003,6 +1003,33 @@ fn block_range_stage_samples(rendered: &str, stage: &str) -> Option<u64> {
 ///
 /// Each chunk after the first also records how long its reader waited to
 /// queue it for the client; the first is sent from the response.
+#[test]
+fn adapter_preregisters_block_range_refusal_counters_at_zero() -> eyre::Result<()> {
+    let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = metrics_recorder.handle();
+    let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+    let store_fixture = acceptance_store_fixture()?;
+    let _adapter = LightwalletdGrpcAdapter::new(store_fixture.query());
+
+    let rendered = metrics_handle.render();
+    assert!(
+        rendered.contains("# HELP zinder_compat_block_range_stream_refusals_total "),
+        "missing # HELP in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("# TYPE zinder_compat_block_range_stream_refusals_total counter"),
+        "missing # TYPE in:\n{rendered}"
+    );
+    for reason in ["wait_timeout", "waiters_full"] {
+        assert_eq!(
+            block_range_refusals(&rendered, reason),
+            Some(0),
+            "expected zero refusal counter for reason={reason} in:\n{rendered}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_block_range_times_each_chunk_stage() -> eyre::Result<()> {
     let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();

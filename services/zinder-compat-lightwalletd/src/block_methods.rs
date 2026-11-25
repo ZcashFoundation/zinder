@@ -368,6 +368,11 @@ impl BlockMethods {
         self
     }
 
+    /// Returns the configured bounded tip wait.
+    pub(crate) const fn tip_wait(&self) -> &TipWait {
+        &self.tip_wait
+    }
+
     /// Waits, within the configured tip wait, for the visible tip to reach
     /// `requested` before the method `method` reads it.
     ///

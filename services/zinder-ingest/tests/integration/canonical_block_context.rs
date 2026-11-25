@@ -16,18 +16,13 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use parking_lot::RwLock;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use zcash_primitives::transaction::{Authorized, Transaction as ZcashTransaction, TransactionData};
-use zebra_chain::{
-    block::Block as ZebraBlock,
-    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
-    transaction::Transaction as ZebraTransaction,
-};
+use zebra_chain::transaction::Transaction as ZebraTransaction;
 use zinder_core::{
-    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockHeightRange, BlockId,
-    CanonicalBlockFacts, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontier, CommitmentTreeFrontiers, ConsensusBranchId, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, ShieldedProtocol, TransactionId,
-    TransparentOutPoint, UnixTimestampMillis,
+    BlockFinalNoteCommitmentRoots, BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFacts,
+    CommitmentTreeAccumulator, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
+    CommitmentTreeFrontiers, ConsensusBranchId, Network, NetworkUpgradeActivation,
+    NetworkUpgradeActivations, ShieldedProtocol, TransactionId, TransparentOutPoint,
+    UnixTimestampMillis,
 };
 use zinder_ingest::{
     CanonicalBlockContextReader, CanonicalConstructionConfig, CanonicalFollowConfig,
@@ -64,19 +59,12 @@ use zinder_testkit::{
     sample_regtest_upgrade_activations,
 };
 
-use super::fixture_block::{
-    fixture_orchard_source_block, fixture_sapling_source_block, fixture_source_block,
-};
+use super::fixture_block::{fixture_orchard_source_block, fixture_sapling_source_block};
 use super::materialized_view_replay::{
     clear_transparent_address_ranking, transparent_address_ranking, view_rows, view_store,
 };
 use super::tree_state_densification::following_tip_gate;
 
-const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
-const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
-const SERIALIZED_HEADER_TIME_OFFSET: usize = 100;
-const COINBASE_SCRIPT_LENGTH_OFFSET: usize = 1_533;
-const COINBASE_HEIGHT_OPCODE_OFFSET: usize = COINBASE_SCRIPT_LENGTH_OFFSET + 1;
 const CHAIN_TIP_HEIGHT: u32 = 4;
 const SAPLING_BLOCK_HEIGHT: u32 = 2;
 const SPENDING_BLOCK_HEIGHT: u32 = 3;
@@ -1516,48 +1504,10 @@ fn append_source_block(
     Ok(())
 }
 
-#[derive(Default)]
-pub(super) struct PoolCommitments {
-    pub(super) sapling: Vec<[u8; 32]>,
-    pub(super) orchard: Vec<[u8; 32]>,
-    pub(super) ironwood: Vec<[u8; 32]>,
-}
-
-pub(super) fn pool_commitments(
-    source_block: &SourceBlock,
-) -> Result<PoolCommitments, Box<dyn Error>> {
-    let compact_block = prepare_canonical_block(
-        source_block,
-        &sample_regtest_upgrade_activations(),
-        RawBlobPolicy::Transactions,
-    )?
-    .partial_compact_block;
-    let mut commitments = PoolCommitments::default();
-    for transaction in compact_block.transactions() {
-        commitments.sapling.extend(
-            transaction
-                .data
-                .sapling_outputs
-                .iter()
-                .map(|output| output.commitment),
-        );
-        commitments.orchard.extend(
-            transaction
-                .data
-                .orchard_actions
-                .iter()
-                .map(|action| action.commitment),
-        );
-        commitments.ironwood.extend(
-            transaction
-                .data
-                .ironwood_actions
-                .iter()
-                .map(|action| action.commitment),
-        );
-    }
-    Ok(commitments)
-}
+pub(super) use crate::common::construction_fixture::{
+    chained_source_block, pool_commitments, shielded_transactions,
+    shielded_transactions_with_lock_time,
+};
 
 fn sapling_only_frontiers()
 -> Result<CommitmentTreeFrontiers, zinder_core::CommitmentTreeFrontiersError> {
@@ -1643,127 +1593,10 @@ fn shielded_transactions_at(height: u32) -> Result<Vec<Arc<ZebraTransaction>>, B
     Ok(Vec::new())
 }
 
-/// Lifts a fixture block's note-commitment-bearing transactions into the synthetic chain.
-///
-/// Transparent inputs are dropped: their previous outputs belong to the
-/// fixture's own chain, which the synthetic chain does not contain.
-pub(super) fn shielded_transactions(
-    fixture: &SourceBlock,
-) -> Result<Vec<Arc<ZebraTransaction>>, Box<dyn Error>> {
-    shielded_transactions_with_lock_time(fixture, None)
-}
-
-pub(super) fn shielded_transactions_with_lock_time(
-    fixture: &SourceBlock,
-    lock_time: Option<u32>,
-) -> Result<Vec<Arc<ZebraTransaction>>, Box<dyn Error>> {
-    let block: ZebraBlock = fixture
-        .raw_block_bytes
-        .as_slice()
-        .zcash_deserialize_into()?;
-    let transactions = block
-        .transactions
-        .iter()
-        .filter(|transaction| !transaction.is_coinbase() && creates_note_commitments(transaction))
-        .map(|transaction| without_transparent_inputs(transaction, lock_time).map(Arc::new))
-        .collect::<Result<Vec<_>, _>>()?;
-    if transactions.is_empty() {
-        return Err("fixture must carry a note-commitment-bearing transaction".into());
-    }
-    Ok(transactions)
-}
-
-fn creates_note_commitments(transaction: &ZebraTransaction) -> bool {
-    transaction.sapling_outputs().next().is_some() || transaction.orchard_actions().next().is_some()
-}
-
-fn without_transparent_inputs(
-    transaction: &ZebraTransaction,
-    lock_time: Option<u32>,
-) -> Result<ZebraTransaction, Box<dyn Error>> {
-    let mut bytes = Vec::new();
-    transaction.zcash_serialize(&mut bytes)?;
-    let transaction_data =
-        ZcashTransaction::read(bytes.as_slice(), transaction.consensus_branch_id())?.into_data();
-    if !matches!(
-        transaction_data.version(),
-        zcash_primitives::transaction::TxVersion::V4 | zcash_primitives::transaction::TxVersion::V5
-    ) {
-        return Err("fixture shielded transactions must be v4 or v5".into());
-    }
-
-    let transparent_bundle = transaction_data
-        .transparent_bundle()
-        .cloned()
-        .map(|mut bundle| {
-            bundle.vin.clear();
-            bundle
-        });
-    let rebuilt = TransactionData::<Authorized>::from_parts(
-        transaction_data.version(),
-        transaction_data.consensus_branch_id(),
-        lock_time.unwrap_or_else(|| transaction_data.lock_time()),
-        transaction_data.expiry_height(),
-        transparent_bundle,
-        transaction_data.sprout_bundle().cloned(),
-        transaction_data.sapling_bundle().cloned(),
-        transaction_data.orchard_bundle().cloned(),
-    )
-    .freeze()?;
-    let mut rebuilt_bytes = Vec::new();
-    rebuilt.write(&mut rebuilt_bytes)?;
-    ZebraTransaction::zcash_deserialize(rebuilt_bytes.as_slice()).map_err(Into::into)
-}
-
-pub(super) fn chained_source_block(
-    height: BlockHeight,
-    parent_hash: BlockHash,
-    time_nonce: u8,
-    extra_transactions: Vec<Arc<ZebraTransaction>>,
-) -> Result<SourceBlock, Box<dyn Error>> {
-    let fixture = fixture_source_block()?;
-    let mut raw_block_bytes = fixture.raw_block_bytes;
-    raw_block_bytes
-        .get_mut(SERIALIZED_HEADER_PARENT_OFFSET..SERIALIZED_HEADER_PARENT_END)
-        .ok_or("fixture block is too short to carry a parent hash")?
-        .copy_from_slice(&parent_hash.as_bytes());
-    let block_time = raw_block_bytes
-        .get_mut(SERIALIZED_HEADER_TIME_OFFSET)
-        .ok_or("fixture block is too short to carry a block time")?;
-    *block_time = block_time.wrapping_add(time_nonce);
-    let height_byte = u8::try_from(height.value())?;
-    let coinbase_height_opcode = raw_block_bytes
-        .get_mut(COINBASE_HEIGHT_OPCODE_OFFSET)
-        .ok_or("fixture block is too short to carry a coinbase height")?;
-    if height_byte <= 16 {
-        *coinbase_height_opcode = 0x50_u8.saturating_add(height_byte);
-    } else {
-        assert!(
-            height_byte <= 127,
-            "fixture needs a one-byte positive script integer"
-        );
-        *coinbase_height_opcode = 1;
-        raw_block_bytes.insert(COINBASE_HEIGHT_OPCODE_OFFSET + 1, height_byte);
-        let script_length = raw_block_bytes
-            .get_mut(COINBASE_SCRIPT_LENGTH_OFFSET)
-            .ok_or("fixture block is too short to carry a coinbase script length")?;
-        *script_length = script_length
-            .checked_add(1)
-            .ok_or("fixture coinbase script is too long")?;
-    }
-    let mut block: ZebraBlock = raw_block_bytes.as_slice().zcash_deserialize_into()?;
-    block.transactions.extend(extra_transactions);
-    let raw_block_bytes = block.zcash_serialize_to_vec()?;
-    Ok(SourceBlock::from_raw_block_bytes(
-        Network::ZcashRegtest,
-        height,
-        raw_block_bytes,
-    )?)
-}
-
 fn spending_transaction(
     spent_outpoint: TransparentOutPoint,
 ) -> Result<ZebraTransaction, Box<dyn Error>> {
+    use zebra_chain::serialization::ZcashDeserialize as _;
     let key = TransparentTestKey::from_seed(&[0x42; 32])?;
     let recipient = key.scratch_recipient_address(1);
     let coinbase_value_zats = SPEND_OUTPUT_VALUE_ZAT.saturating_add(ZIP317_FEE_ONE_IN_ONE_OUT_ZATS);

@@ -183,6 +183,7 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         WireErrorReason::CompactBlockStreamLimitReached,
         WireErrorReason::NodeRateLimited,
         WireErrorReason::ForwardedReadLimitReached,
+        WireErrorReason::ServedTipMismatch,
     ];
 
     for reason in reasons {

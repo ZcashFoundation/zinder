@@ -21,7 +21,7 @@ use zinder_core::{
 };
 use zinder_proto::compat::lightwalletd;
 
-use super::TipWait;
+use super::{TipWait, TipWaitProgress};
 use crate::{
     block_methods::{
         BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, CompactBlockReads,
@@ -605,6 +605,64 @@ async fn waits_record_outcome_duration_and_waiter_metrics() -> Result<()> {
         text.lines()
             .any(|line| line == "zinder_compat_tip_waiters 0"),
         "every waiter released its gauge: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn await_height_until_respects_enabled_state_and_deadline_cap() -> Result<()> {
+    let reads = FakeReads::at_tip(9);
+    let wait = tip_wait(2, 8)?;
+
+    assert_eq!(
+        TipWait::disabled()
+            .await_height_until(&reads, METHOD, BlockHeight::new(10), None)
+            .await?,
+        TipWaitProgress::NotReached
+    );
+
+    assert_eq!(
+        wait.await_height_until(&reads, METHOD, BlockHeight::new(9), None)
+            .await?,
+        TipWaitProgress::Reached
+    );
+
+    let expired_cap = Instant::now();
+    let started = Instant::now();
+    assert_eq!(
+        wait.await_height_until(&reads, METHOD, BlockHeight::new(10), Some(expired_cap))
+            .await?,
+        TipWaitProgress::NotReached
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO);
+
+    let short_cap = Instant::now() + Duration::from_millis(250);
+    let started = Instant::now();
+    assert_eq!(
+        wait.await_height_until(&reads, METHOD, BlockHeight::new(10), Some(short_cap))
+            .await?,
+        TipWaitProgress::NotReached
+    );
+    assert_eq!(started.elapsed(), Duration::from_millis(250));
+
+    let generous_cap = Instant::now() + Duration::from_secs(10);
+    let waiting = {
+        let wait = wait.clone();
+        let reads = reads.clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let progress = wait
+                .await_height_until(&reads, METHOD, BlockHeight::new(10), Some(generous_cap))
+                .await?;
+            Ok::<_, Status>((progress, started.elapsed()))
+        })
+    };
+    settle().await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    reads.publish_tip(10);
+    assert_eq!(
+        waiting.await??,
+        (TipWaitProgress::Reached, Duration::from_millis(400))
     );
     Ok(())
 }

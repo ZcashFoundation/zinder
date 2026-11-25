@@ -1,0 +1,6 @@
+kind: changed
+body: Fresh wallet projection cold validation now splits the `transparent_address_transaction` readback across up to `projector.build.accumulator_hashing_workers` disjoint hash-prefix key ranges (at most one range per 65,536 rows), matching the parallel range scan already used for primary output families while producing byte-identical READY digests and row counts.
+time: 2026-11-25T08:12:00Z
+custom:
+    Bump: patch
+    PR: "575"

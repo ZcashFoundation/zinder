@@ -19,19 +19,20 @@ use tokio_util::sync::CancellationToken;
 use zebra_chain::{
     block::{Block as ZebraBlock, Height as ZebraHeight},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
-    transaction::Transaction as ZebraTransaction,
 };
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
-    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers, Network,
-    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
+    BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint,
+    CommitmentTreeFrontier, CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
+    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
 };
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
-    CanonicalFollowConfig, CanonicalWriterConfig, CanonicalWriterError, IngestError,
-    admit_canonical_store, load_fresh_canonical, load_fresh_canonical_blocks,
+    CanonicalWriterConfig, CanonicalWriterError, IngestError, admit_canonical_store,
+    load_fresh_canonical, load_fresh_canonical_blocks,
 };
-use zinder_runtime::{ComposedReadiness, Readiness};
+use zinder_runtime::{
+    ComposedReadiness, IngestPhase, OpsServer, Readiness, ReadinessCause, install_metrics_recorder,
+};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceBlockHeader, SourceChainSegment,
     SourceChainSegmentLimits, SourceError,
@@ -41,13 +42,15 @@ use zinder_store::{
     RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
     TreeStateLookup,
 };
-use zinder_testkit::{frontier_from_note_commitments, sample_regtest_upgrade_activations};
+use zinder_testkit::frontier_from_note_commitments;
+
+use crate::common::construction_fixture::{
+    GatedConstructionSource, MultiBlockConstructionSource, gated_construction_writer_config,
+    held_construction_writer_config, multi_block_writer_config, regtest_activations,
+};
 
 use super::{
-    canonical_block_context::{
-        chained_source_block, pool_commitments, shielded_transactions,
-        shielded_transactions_with_lock_time,
-    },
+    canonical_block_context::shielded_transactions_with_lock_time,
     fixture_block::{
         fixture_ironwood_source_block, fixture_orchard_source_block, fixture_sapling_source_block,
         fixture_source_block, fixture_zakura_ironwood_source_block,
@@ -569,10 +572,6 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
     Ok(())
 }
 
-fn regtest_activations() -> Arc<NetworkUpgradeActivations> {
-    Arc::new(sample_regtest_upgrade_activations())
-}
-
 /// Upper bound for a cancelled construction to return, well inside the
 /// wallet-serving supervisor's 20-second shutdown grace window.
 const CANCELLED_CONSTRUCTION_STOP_BOUND: Duration = Duration::from_secs(5);
@@ -681,35 +680,6 @@ impl NodeSource for HeldConstructionSource {
             height,
             reason: "held construction source has no checkpoint at the requested height".to_owned(),
         })
-    }
-}
-
-fn held_construction_writer_config(
-    storage_path: std::path::PathBuf,
-    activations: Arc<NetworkUpgradeActivations>,
-) -> CanonicalWriterConfig {
-    CanonicalWriterConfig {
-        storage_path,
-        resource_budget: RocksDbResourceBudget::for_local_tests(),
-        construction: CanonicalConstructionConfig::for_local_tests(
-            Duration::from_secs(5),
-            activations,
-        ),
-        checkpoint_height: None,
-        raw_blob_retention: RawBlobRetention::Transactions,
-        reorg_window_blocks: 100,
-        tree_state_checkpoint_selection: None,
-        follow: CanonicalFollowConfig {
-            request_timeout: Duration::from_secs(5),
-            poll_interval: Duration::from_millis(10),
-            lag_threshold_blocks: 0,
-            target_height: None,
-            event_retention_window: None,
-            event_retention_check_interval: Duration::from_secs(1),
-            mempool_ready_gate: None,
-            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
-            node_failover: None,
-        },
     }
 }
 
@@ -841,10 +811,12 @@ async fn shutdown_before_publication_finishes_publishing_and_the_next_start_inst
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn construction_times_each_phase_and_serial_loader_stage()
 -> Result<(), Box<dyn std::error::Error>> {
-    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-    let recorded_metrics = recorder.handle();
-    metrics::set_global_recorder(recorder)
-        .map_err(|_| "another test in this process installed a global recorder")?;
+    let recorded_metrics = install_metrics_recorder(&OpsServer {
+        service_name: "zinder-ingest",
+        service_version: "0.0.0",
+        network_name: "zcash-regtest",
+        advertised_capabilities: Arc::from([]),
+    })?;
     let (source_block, chain_checkpoint) = held_construction_chain()?;
     let source = HeldConstructionSource::new(source_block, chain_checkpoint);
     source.release_chain_segments();
@@ -904,215 +876,6 @@ async fn construction_times_each_phase_and_serial_loader_stage()
         );
     }
     Ok(())
-}
-
-/// Multi-block Regtest source with exact per-height checkpoints and optional
-/// cancellation hooks for construction lifecycle tests.
-#[derive(Clone)]
-struct MultiBlockConstructionSource {
-    genesis: SourceBlock,
-    blocks: Vec<SourceBlock>,
-    checkpoints: Vec<CommitmentTreeCheckpoint>,
-    hold_checkpoint: Option<(BlockHeight, Arc<Notify>)>,
-    chain_segment_requests: Arc<AtomicUsize>,
-    cancel_with_tip_checkpoint: Option<(BlockHeight, CancellationToken)>,
-}
-
-impl MultiBlockConstructionSource {
-    fn build(
-        height_count: u32,
-        activations: &NetworkUpgradeActivations,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let sapling_shielded = shielded_transactions(&fixture_sapling_source_block()?)?;
-        let orchard_shielded = shielded_transactions(&fixture_orchard_source_block()?)?;
-        Self::build_with_transactions(height_count, activations, |height| {
-            Ok(match height {
-                2 => sapling_shielded.clone(),
-                4 => orchard_shielded.clone(),
-                _ => Vec::new(),
-            })
-        })
-    }
-
-    fn build_with_transactions(
-        height_count: u32,
-        activations: &NetworkUpgradeActivations,
-        extra_transactions: impl Fn(
-            u32,
-        )
-            -> Result<Vec<Arc<ZebraTransaction>>, Box<dyn std::error::Error>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let block_one = fixture_source_block()?;
-        let genesis = SourceBlock::new(
-            SourceBlockHeader {
-                network: Network::ZcashRegtest,
-                height: BlockHeight::new(0),
-                hash: block_one.parent_hash,
-                parent_hash: block_one.parent_hash,
-                block_time_seconds: block_one.block_time_seconds.saturating_sub(1),
-            },
-            Vec::new(),
-        );
-        let mut blocks = Vec::with_capacity(usize::try_from(height_count)?);
-        let mut parent_hash = genesis.hash;
-        for height_num in 1..=height_count {
-            let block = if height_num == 1 {
-                block_one.clone()
-            } else {
-                chained_source_block(
-                    BlockHeight::new(height_num),
-                    parent_hash,
-                    u8::try_from(height_num)?,
-                    extra_transactions(height_num)?,
-                )?
-            };
-            parent_hash = block.hash;
-            blocks.push(block);
-        }
-        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
-            BlockHeight::new(0),
-            &CommitmentTreeFrontiers::default(),
-            activations,
-        )?;
-        let mut checkpoints = vec![CommitmentTreeCheckpoint::new(
-            BlockId::new(genesis.height, genesis.hash),
-            genesis.block_time_seconds,
-            accumulator.cross_checked_frontiers()?,
-        )];
-        for block in &blocks {
-            let commitments = pool_commitments(block)?;
-            accumulator.append_block_commitments(
-                block.height,
-                &commitments.sapling,
-                &commitments.orchard,
-                &commitments.ironwood,
-            )?;
-            checkpoints.push(CommitmentTreeCheckpoint::new(
-                BlockId::new(block.height, block.hash),
-                block.block_time_seconds,
-                accumulator.cross_checked_frontiers()?,
-            ));
-        }
-        Ok(Self {
-            genesis,
-            blocks,
-            checkpoints,
-            hold_checkpoint: None,
-            chain_segment_requests: Arc::new(AtomicUsize::new(0)),
-            cancel_with_tip_checkpoint: None,
-        })
-    }
-
-    fn cancelling_at_checkpoint(mut self, height: BlockHeight, cancel: CancellationToken) -> Self {
-        self.cancel_with_tip_checkpoint = Some((height, cancel));
-        self
-    }
-
-    fn checkpoint_at(
-        &self,
-        height: u32,
-    ) -> Result<&CommitmentTreeCheckpoint, Box<dyn std::error::Error>> {
-        self.checkpoints
-            .get(usize::try_from(height)?)
-            .ok_or_else(|| format!("missing checkpoint at height {height}").into())
-    }
-}
-
-#[async_trait]
-impl NodeSource for MultiBlockConstructionSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities::default()
-    }
-
-    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        if height == BlockHeight::new(0) {
-            return Ok(self.genesis.clone());
-        }
-        self.blocks
-            .iter()
-            .find(|block| block.height == height)
-            .cloned()
-            .ok_or_else(|| SourceError::BlockUnavailable {
-                height,
-                reason: "multi-block test source has no block at the requested height".to_owned(),
-            })
-    }
-
-    async fn fetch_chain_segment(
-        &self,
-        limits: SourceChainSegmentLimits,
-    ) -> Result<SourceChainSegment, SourceError> {
-        self.chain_segment_requests.fetch_add(1, Ordering::SeqCst);
-        let next_height =
-            limits
-                .cursor
-                .next_connected_height()
-                .ok_or(SourceError::SourceProtocolMismatch {
-                    reason: "multi-block construction test cursor has no next height",
-                })?;
-        let max_blocks = usize::try_from(limits.max_connected_blocks.get()).unwrap_or(usize::MAX);
-        let segment = self
-            .blocks
-            .iter()
-            .filter(|block| block.height >= next_height)
-            .take(max_blocks)
-            .cloned()
-            .collect::<Vec<_>>();
-        Ok(SourceChainSegment::connected_blocks(segment))
-    }
-
-    async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        let tip = self
-            .blocks
-            .last()
-            .ok_or_else(|| SourceError::BlockUnavailable {
-                height: BlockHeight::new(1),
-                reason: "multi-block test source has no blocks".to_owned(),
-            })?;
-        Ok(BlockId::new(tip.height, tip.hash))
-    }
-
-    async fn fetch_chain_checkpoint(
-        &self,
-        height: BlockHeight,
-        _network_upgrade_activations: &NetworkUpgradeActivations,
-    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
-        let checkpoint = self
-            .checkpoints
-            .iter()
-            .find(|checkpoint| checkpoint.block_id.height == height)
-            .cloned()
-            .ok_or_else(|| SourceError::BlockUnavailable {
-                height,
-                reason: "multi-block test source has no checkpoint at the requested height"
-                    .to_owned(),
-            })?;
-        if let Some((held_height, reached)) = &self.hold_checkpoint
-            && *held_height == height
-        {
-            reached.notify_one();
-            std::future::pending::<()>().await;
-        }
-        if let Some((cancel_height, cancel)) = &self.cancel_with_tip_checkpoint
-            && *cancel_height == height
-        {
-            cancel.cancel();
-        }
-        Ok(checkpoint)
-    }
-}
-
-fn multi_block_writer_config(
-    storage_path: std::path::PathBuf,
-    activations: Arc<NetworkUpgradeActivations>,
-    every_block_tree_state_checkpoints: bool,
-) -> CanonicalWriterConfig {
-    CanonicalWriterConfig {
-        reorg_window_blocks: 1,
-        tree_state_checkpoint_selection: every_block_tree_state_checkpoints
-            .then_some(zinder_store::TreeStateCheckpointSelection::EveryBlock),
-        ..held_construction_writer_config(storage_path, activations)
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2017,5 +1780,81 @@ fn assert_ironwood_activation_checkpoints(
         post_activation_ironwood.final_root()
     );
     assert_eq!(post_activation_ironwood, tip_ironwood);
+    Ok(())
+}
+
+async fn wait_for_composed_progress(
+    composed: &ComposedReadiness,
+    expected_current: u32,
+    expected_target: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let report = composed.runtime_readiness().report();
+        if report.current_height == Some(expected_current)
+            && report.target_height == Some(expected_target)
+        {
+            assert!(!report.is_ready);
+            assert_eq!(report.phase, Some(IngestPhase::BulkCatchup));
+            assert_eq!(
+                report.cause,
+                ReadinessCause::Syncing {
+                    lag_blocks: Some(u64::from(expected_target.saturating_sub(expected_current))),
+                    wait_reason: None,
+                }
+            );
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for readiness progress {expected_current}/{expected_target}; last={report:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_construction_with_tree_hashing_workers_and_checkpoint_advances_readiness_lag()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = regtest_activations();
+    let source =
+        GatedConstructionSource::new(MultiBlockConstructionSource::build(10, &activations)?);
+    let temporary = TempDir::new()?;
+    let mut config = gated_construction_writer_config(
+        temporary.path().join("canonical"),
+        Arc::clone(&activations),
+        4,
+    )?;
+    config.checkpoint_height = Some(BlockHeight::new(2));
+    let composed = ComposedReadiness::new(Readiness::default(), &[]);
+
+    let admission_task = tokio::spawn({
+        let source = source.clone();
+        let activations = Arc::clone(&activations);
+        let composed = composed.clone();
+        async move {
+            admit_canonical_store(
+                &source,
+                activations,
+                &config,
+                &composed,
+                &CancellationToken::new(),
+            )
+            .await
+        }
+    });
+
+    wait_for_composed_progress(&composed, 2, 9).await?;
+    source.allow_through(5);
+    wait_for_composed_progress(&composed, 5, 9).await?;
+    source.allow_through(9);
+    let store = admission_task.await??;
+    wait_for_composed_progress(&composed, 9, 9).await?;
+    assert_eq!(
+        store.event_fence().visible_tip().height,
+        BlockHeight::new(9)
+    );
     Ok(())
 }

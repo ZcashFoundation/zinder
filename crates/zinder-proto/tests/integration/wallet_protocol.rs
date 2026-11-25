@@ -1790,6 +1790,42 @@ fn node_rate_limited_refusal_is_unavailable_and_retryable() -> eyre::Result<()> 
 }
 
 #[test]
+fn served_tip_mismatch_refusal_is_unavailable_and_retryable() -> eyre::Result<()> {
+    use tonic_types::StatusExt as _;
+
+    let reason = ops::ErrorReason::ServedTipMismatch;
+    assert_eq!(reason.as_str_name(), "SERVED_TIP_MISMATCH");
+    assert_eq!(
+        ops::ErrorReason::from_str_name("SERVED_TIP_MISMATCH"),
+        Some(reason)
+    );
+    assert_eq!(ops::ErrorReason::try_from(59)?, reason);
+    let policy = zinder_proto::reason_policy(reason);
+    assert_eq!(policy.code, tonic::Code::Unavailable);
+    assert_eq!(
+        policy.retry,
+        zinder_proto::RetryDisposition::RetryAfterBackoff
+    );
+
+    let status = zinder_proto::status_for_reason(
+        reason,
+        "node answered at another tip than the served tip; retry shortly",
+    );
+    let received = tonic::Status::with_details(
+        status.code(),
+        status.message().to_owned(),
+        status.details().to_vec().into(),
+    );
+    assert_eq!(received.code(), tonic::Code::Unavailable);
+    let error_info = received
+        .get_details_error_info()
+        .ok_or_else(|| eyre!("the status carries no google.rpc.ErrorInfo"))?;
+    assert_eq!(error_info.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+    assert_eq!(error_info.reason, "SERVED_TIP_MISMATCH");
+    Ok(())
+}
+
+#[test]
 fn transaction_lookup_reasons_round_trip_by_name_and_scalar() -> eyre::Result<()> {
     for (reason, name, scalar) in [
         (

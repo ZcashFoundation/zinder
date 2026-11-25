@@ -164,4 +164,10 @@ enum ErrorReason {
   // node-call or response slot of its kind stayed taken through the wait, or
   // every waiting place was taken. Retry with backoff.
   FORWARDED_READ_LIMIT_REACHED = 58;
+
+  // UNAVAILABLE family.
+  // A forwarded transparent UTXO or balance lookup answered at a different
+  // tip than the reader's served tip, or consecutive pages disagreed at that
+  // tip. The node is up; retry after the `grpc-retry-pushback-ms` delay.
+  SERVED_TIP_MISMATCH = 59;
 }
