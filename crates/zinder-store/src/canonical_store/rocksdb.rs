@@ -12,9 +12,9 @@ use zinder_core::{
 
 use crate::{
     BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    build_block_based_table_factory, keep_blocks_of_dropped_table_files,
-    kv::build_uncached_block_based_table_factory, open_bounded_rocksdb,
-    open_bounded_rocksdb_read_only_probe,
+    build_block_based_table_factory, build_point_lookup_block_based_table_factory,
+    keep_blocks_of_dropped_table_files, kv::build_uncached_block_based_table_factory,
+    open_bounded_rocksdb, open_bounded_rocksdb_read_only_probe,
 };
 
 use super::{
@@ -1099,6 +1099,9 @@ impl CanonicalColumnFamilyOptions {
 
         let mut uncompressed = hot.clone();
         uncompressed.set_compression_type(DBCompressionType::None);
+        uncompressed.set_block_based_table_factory(&build_point_lookup_block_based_table_factory(
+            block_cache,
+        ));
         Self {
             hot,
             cold,
@@ -1476,13 +1479,19 @@ fn validate_activation_expectation(
 
 #[cfg(test)]
 mod tests {
+    use rust_rocksdb::{DEFAULT_COLUMN_FAMILY_NAME, statistics::Ticker};
     use tempfile::TempDir;
-    use zinder_core::{BlockHash, BlockHeight, BlockId};
+    use zinder_core::{
+        BlockHash, BlockHeight, BlockId, TransactionId, TransactionLocation, UnixTimestampMillis,
+    };
 
     use super::*;
     use crate::{
-        CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, RocksDbCanonicalBuilder,
+        BlockHashLookup, CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION,
+        CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
+        CanonicalStoreRequirements, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+        RocksDbOpenResources, SharedBlockCache,
+        canonical_store::live_replacement_tests::{published_store, replacement_block},
     };
 
     /// A canonical secondary may share its block cache with other secondaries
@@ -1929,5 +1938,388 @@ mod tests {
             RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
         )?)
+    }
+
+    #[test]
+    fn point_lookup_families_carry_partitioned_filters_and_the_rest_do_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_store(&store_path, 2, BlockHeight::new(4), BlockHeight::new(2))?;
+        let activations = super::super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let store = append_block_five_for_filter_test(store, &activations)?;
+        store.bounded_open.db.flush()?;
+        for family_name in [
+            BLOCK_HASH_INDEX_COLUMN_FAMILY,
+            TRANSACTION_LOCATION_COLUMN_FAMILY,
+            BLOCK_HEADER_COLUMN_FAMILY,
+            COMPACT_BLOCK_COLUMN_FAMILY,
+        ] {
+            let family = store
+                .bounded_open
+                .db
+                .cf_handle(family_name)
+                .ok_or("canonical family absent")?;
+            store.bounded_open.db.flush_cf(&family)?;
+        }
+
+        for (family_name, minimum_entries, filtered) in [
+            (BLOCK_HASH_INDEX_COLUMN_FAMILY, 5, true),
+            (TRANSACTION_LOCATION_COLUMN_FAMILY, 5, true),
+            (BLOCK_HEADER_COLUMN_FAMILY, 5, false),
+            (COMPACT_BLOCK_COLUMN_FAMILY, 5, false),
+            (DEFAULT_COLUMN_FAMILY_NAME, 1, false),
+        ] {
+            assert_filter_table_properties(
+                &store.bounded_open,
+                family_name,
+                minimum_entries,
+                filtered,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn absent_point_lookups_stop_at_the_filter_before_any_data_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let activations = super::super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let store = published_store(&store_path, 2, BlockHeight::new(4), BlockHeight::new(2))?;
+        let block_cache =
+            SharedBlockCache::new(RocksDbResourceBudget::for_local_tests().block_cache_bytes);
+        let secondary = RocksDbCanonicalSecondary::open_ready(
+            &store_path,
+            temporary.path().join("secondary"),
+            &activations,
+            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+            CanonicalReorgPolicy::new(2)?,
+            RocksDbOpenResources::with_shared_block_cache(
+                RocksDbResourceBudget::for_local_tests(),
+                &block_cache,
+            ),
+        )?;
+
+        // Both absent keys sort strictly between heights 1 and 4, so RocksDB
+        // cannot skip the SST on its key range and must consult the filter.
+        let mut absent_hash_bytes = [2_u8; 32];
+        absent_hash_bytes[16] = 0x55;
+        let absent_hash = BlockHash::from_bytes(absent_hash_bytes);
+
+        let mut absent_tx_bytes = [102_u8; 32];
+        absent_tx_bytes[16] = 0x55;
+        let absent_tx = TransactionId::from_bytes(absent_tx_bytes);
+
+        assert_filter_skips_data_blocks(&store.bounded_open, || {
+            Ok(store.block_hash_lookup(absent_hash)? == BlockHashLookup::NotIndexed)
+        })?;
+        assert_filter_skips_data_blocks(&store.bounded_open, || {
+            Ok(store.transaction_location(absent_tx)?.is_none())
+        })?;
+        assert_filter_skips_data_blocks(&secondary.bounded_open, || {
+            Ok(secondary.block_hash_lookup(absent_hash)? == BlockHashLookup::NotIndexed)
+        })?;
+        assert_filter_skips_data_blocks(&secondary.bounded_open, || {
+            Ok(secondary.transaction_location(absent_tx)?.is_none())
+        })?;
+        assert!(
+            block_cache.pinned_usage_bytes() > 0,
+            "reading partitioned point-lookup SSTs pins top-level metadata in the shared cache"
+        );
+        drop(secondary);
+        assert_eq!(block_cache.pinned_usage_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_v1_store_without_filters_opens_and_reads_under_ribbon_options()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let activations = super::super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let store = published_store(&store_path, 2, BlockHeight::new(4), BlockHeight::new(2))?;
+        drop(store);
+
+        strip_point_lookup_filters(&store_path)?;
+
+        let store = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(2)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let mut secondary = RocksDbCanonicalSecondary::open_ready(
+            &store_path,
+            temporary.path().join("secondary"),
+            &activations,
+            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+            CanonicalReorgPolicy::new(2)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+
+        assert_v1_point_lookups(&store, BlockHeight::new(3), [3; 32], 103)?;
+        assert_v1_point_lookups(&secondary, BlockHeight::new(3), [3; 32], 103)?;
+        assert_eq!(
+            store.block_hash_lookup(BlockHash::from_bytes([0xee; 32]))?,
+            BlockHashLookup::NotIndexed
+        );
+        assert_eq!(
+            store.transaction_location(TransactionId::from_bytes([0xee; 32]))?,
+            None
+        );
+        assert_eq!(
+            secondary.block_hash_lookup(BlockHash::from_bytes([0xee; 32]))?,
+            BlockHashLookup::NotIndexed
+        );
+        assert_eq!(
+            secondary.transaction_location(TransactionId::from_bytes([0xee; 32]))?,
+            None
+        );
+
+        let store = append_block_five_for_filter_test(store, &activations)?;
+        for family_name in [
+            BLOCK_HASH_INDEX_COLUMN_FAMILY,
+            TRANSACTION_LOCATION_COLUMN_FAMILY,
+        ] {
+            let family = store
+                .bounded_open
+                .db
+                .cf_handle(family_name)
+                .ok_or("canonical family absent")?;
+            store.bounded_open.db.flush_cf(&family)?;
+            assert!(
+                aggregated_table_property(&store.bounded_open, family_name, "filter block size")?
+                    > Some(0),
+                "{family_name}"
+            );
+        }
+        assert_v1_point_lookups(&store, BlockHeight::new(5), [5; 32], 105)?;
+        secondary.try_catch_up()?;
+        assert_v1_point_lookups(&secondary, BlockHeight::new(3), [3; 32], 103)?;
+        assert_v1_point_lookups(&secondary, BlockHeight::new(5), [5; 32], 105)?;
+        Ok(())
+    }
+
+    trait PointLookupReader {
+        fn lookup_block_hash(
+            &self,
+            block_hash: BlockHash,
+        ) -> Result<BlockHashLookup, CanonicalStoreError>;
+        fn lookup_transaction_location(
+            &self,
+            transaction_id: TransactionId,
+        ) -> Result<Option<TransactionLocation>, CanonicalStoreError>;
+    }
+
+    impl PointLookupReader for RocksDbCanonicalStore {
+        fn lookup_block_hash(
+            &self,
+            block_hash: BlockHash,
+        ) -> Result<BlockHashLookup, CanonicalStoreError> {
+            self.block_hash_lookup(block_hash)
+        }
+
+        fn lookup_transaction_location(
+            &self,
+            transaction_id: TransactionId,
+        ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
+            self.transaction_location(transaction_id)
+        }
+    }
+
+    impl PointLookupReader for RocksDbCanonicalSecondary {
+        fn lookup_block_hash(
+            &self,
+            block_hash: BlockHash,
+        ) -> Result<BlockHashLookup, CanonicalStoreError> {
+            self.block_hash_lookup(block_hash)
+        }
+
+        fn lookup_transaction_location(
+            &self,
+            transaction_id: TransactionId,
+        ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
+            self.transaction_location(transaction_id)
+        }
+    }
+
+    fn assert_v1_point_lookups(
+        reader: &impl PointLookupReader,
+        height: BlockHeight,
+        block_hash_bytes: [u8; 32],
+        transaction_tag: u8,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let block_hash = BlockHash::from_bytes(block_hash_bytes);
+        assert_eq!(
+            reader.lookup_block_hash(block_hash)?,
+            BlockHashLookup::Resolved(BlockId::new(height, block_hash))
+        );
+        let location = reader
+            .lookup_transaction_location(TransactionId::from_bytes([transaction_tag; 32]))?
+            .ok_or("transaction location missing")?;
+        assert_eq!(location.block_height, height);
+        assert_eq!(location.block_hash, block_hash);
+        Ok(())
+    }
+
+    fn strip_point_lookup_filters(store_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let legacy_open = open_bounded_rocksdb(
+            RocksDbOpenRole::ExistingPrimary { path: store_path },
+            RocksDbResourceBudget::for_local_tests(),
+            unfiltered_canonical_descriptors,
+        )?;
+        for family_name in [
+            BLOCK_HASH_INDEX_COLUMN_FAMILY,
+            TRANSACTION_LOCATION_COLUMN_FAMILY,
+        ] {
+            let handle = legacy_open
+                .db
+                .cf_handle(family_name)
+                .ok_or("canonical family absent")?;
+            let rows = legacy_open
+                .db
+                .iterator_cf(&handle, IteratorMode::Start)
+                .collect::<Result<Vec<_>, _>>()?;
+            for (key_bytes, row_bytes) in rows {
+                legacy_open.db.put_cf(&handle, key_bytes, row_bytes)?;
+            }
+            legacy_open.db.flush_cf(&handle)?;
+            legacy_open
+                .db
+                .compact_range_cf(&handle, None::<&[u8]>, None::<&[u8]>);
+            assert_eq!(
+                aggregated_table_property(&legacy_open, family_name, "filter block size")?,
+                Some(0),
+                "{family_name}"
+            );
+            assert_eq!(
+                aggregated_table_property(&legacy_open, family_name, "# index partitions")?,
+                None,
+                "{family_name}"
+            );
+        }
+        Ok(())
+    }
+
+    fn unfiltered_canonical_descriptors(
+        block_cache: &Cache,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Vec<ColumnFamilyDescriptor> {
+        let hot = canonical_data_options(block_cache, resource_budget);
+        let mut cold = hot.clone();
+        cold.set_bottommost_compression_type(DBCompressionType::Zstd);
+        cold.set_bottommost_compression_options(-14, 3, 0, 0, true);
+
+        let mut uncompressed = hot.clone();
+        uncompressed.set_compression_type(DBCompressionType::None);
+        CANONICAL_DATA_COLUMN_FAMILIES
+            .into_iter()
+            .map(|name| {
+                let cf_options = match name {
+                    BLOCK_REPLAY_COLUMN_FAMILY
+                    | COMPACT_BLOCK_COLUMN_FAMILY
+                    | TREE_STATE_CHECKPOINT_COLUMN_FAMILY
+                    | TRANSACTION_BLOB_COLUMN_FAMILY
+                    | BLOCK_BLOB_COLUMN_FAMILY
+                    | DISPLACED_BLOCK_FACTS_COLUMN_FAMILY => cold.clone(),
+                    BLOCK_HASH_INDEX_COLUMN_FAMILY | TRANSACTION_LOCATION_COLUMN_FAMILY => {
+                        uncompressed.clone()
+                    }
+                    _ => hot.clone(),
+                };
+                ColumnFamilyDescriptor::new(name, cf_options)
+            })
+            .collect()
+    }
+
+    fn append_block_five_for_filter_test(
+        store: RocksDbCanonicalStore,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+        let fence = store.event_fence();
+        let (store, _) = store.commit_live_append(
+            CanonicalLiveAppend::new(
+                fence,
+                replacement_block(BlockHeight::new(5), [5; 32], [4; 32], 105)?,
+                Vec::new(),
+                BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32])),
+                UnixTimestampMillis::new(1_750_000_000_002),
+            ),
+            activations,
+        )?;
+        Ok(store)
+    }
+
+    fn assert_filter_table_properties(
+        bounded_open: &BoundedRocksDbOpen,
+        family_name: &str,
+        minimum_entries: u64,
+        filtered: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let property = |field| aggregated_table_property(bounded_open, family_name, field);
+        let entry_count = property("# entries")?.ok_or("missing # entries property")?;
+        assert!(
+            entry_count >= minimum_entries,
+            "{family_name}: {entry_count}"
+        );
+        if filtered {
+            assert!(property("filter block size")? > Some(0), "{family_name}");
+            assert_eq!(
+                property("# entries for filter")?,
+                Some(entry_count),
+                "{family_name}"
+            );
+            assert!(property("# index partitions")? > Some(0), "{family_name}");
+        } else {
+            assert_eq!(property("filter block size")?, Some(0), "{family_name}");
+            assert_eq!(property("# entries for filter")?, Some(0), "{family_name}");
+            assert_eq!(property("# index partitions")?, None, "{family_name}");
+        }
+        Ok(())
+    }
+
+    fn assert_filter_skips_data_blocks(
+        bounded_open: &BoundedRocksDbOpen,
+        lookup: impl FnOnce() -> Result<bool, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let statistics = &bounded_open.statistics;
+        let useful_before = statistics.get_ticker_count(Ticker::BloomFilterUseful);
+        let data_misses_before = statistics.get_ticker_count(Ticker::BlockCacheDataMiss);
+
+        let absent = lookup()?;
+
+        assert!(absent);
+        assert!(statistics.get_ticker_count(Ticker::BloomFilterUseful) > useful_before);
+        assert_eq!(
+            statistics.get_ticker_count(Ticker::BlockCacheDataMiss),
+            data_misses_before
+        );
+        Ok(())
+    }
+
+    fn aggregated_table_property(
+        bounded_open: &BoundedRocksDbOpen,
+        family_name: &str,
+        field: &str,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        let family = bounded_open
+            .db
+            .cf_handle(family_name)
+            .ok_or_else(|| format!("column family {family_name} is absent"))?;
+        let properties = bounded_open
+            .db
+            .property_value_cf(&family, "rocksdb.aggregated-table-properties")?
+            .ok_or("aggregated table properties are unavailable")?;
+        for entry in properties.split("; ") {
+            if let Some((name, number)) = entry.split_once('=')
+                && name.trim() == field
+            {
+                return Ok(Some(number.trim().parse()?));
+            }
+        }
+        Ok(None)
     }
 }

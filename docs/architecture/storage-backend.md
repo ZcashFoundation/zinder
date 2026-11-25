@@ -74,6 +74,11 @@ RocksDB applies these codecs per data column family.
 | `block_hash_index`, `transaction_location` | None | None |
 | Other canonical data families | LZ4 | LZ4 |
 
+`block_hash_index` and `transaction_location` also carry partitioned hybrid
+Ribbon filters (10 bits per key; Bloom filters before level 1 and Ribbon
+filters at deeper levels) with two-level indexes and top-level index and filter
+blocks pinned in the block cache. Other canonical families use no filters.
+
 A control record ties the store to its network, workload (`wallet` or
 `explorer`), raw-blob retention, reorg window, network-upgrade activations,
 construction manifest, and current chain event. Admission checks all of them,
@@ -149,7 +154,8 @@ The filters let the projector prove quickly that a new output, spend, or
 history row does not exist yet. They use about 10 bits per key, for roughly a
 1% false-positive rate. Flushed and level-0 files use Bloom filters, and deeper
 files use Ribbon filters, which are about 30% smaller. Filters share the
-store's block cache. The canonical and materialized-view stores use no filters.
+store's block cache. Materialized-view stores and the other canonical families
+use no filters.
 
 **Construction.** The projector builds a new wallet store in an inactive path
 from a pinned canonical event. Before it publishes the store, it reopens it
@@ -362,9 +368,17 @@ flushes and secondary WAL replay.
 | --- | --- | --- | --- | --- |
 | Canonical writer | 512 MiB | 256 MiB | 512 | 256 MiB |
 | Canonical reader | 1/8 of the container memory limit, from 128 to 512 MiB | 32 MiB | 128 to 256, scaled with the block cache | 16 MiB |
-| Wallet and materialized-view writer | 256 MiB | 256 MiB | 512 | 512 MiB |
-| Wallet and materialized-view reader | 64 MiB | 16 MiB | 64 | 16 MiB |
+| Wallet writer | 256 MiB | 32 MiB | 512 | 512 MiB |
+| Wallet reader | 64 MiB | 16 MiB | 1024 | 16 MiB |
+| Materialized-view writer | 256 MiB | 256 MiB | 512 | 512 MiB |
+| Materialized-view reader | 64 MiB | 16 MiB | 64 | 16 MiB |
 | Read-only admission probe | 4 MiB (or caller's shared cache) | — | 32 (or caller's budget) | — |
+
+The wallet writer caps its live WAL at 32 MiB so primary flushes bound WAL
+replay memtables across retained serving secondary generations. The wallet
+reader keeps up to 1,024 SST handles open so Mainnet point-lookup files stay
+open while partitioned index and filter blocks remain bounded in the shared
+block cache.
 
 Read-only admission probes open existing stores through the same bounded open
 path with single-threaded table-file opens, index and filter blocks charged to

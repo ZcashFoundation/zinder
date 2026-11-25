@@ -161,14 +161,26 @@ impl RocksDbResourceBudget {
         }
     }
 
-    /// Wallet-projection writer defaults.
+    /// Wallet-projection writer defaults sized for sustained multi-CF following.
     ///
-    /// The wallet projection currently has the same multi-column-family write
-    /// posture as a materialized-view consumer, but it is a distinct durable
-    /// ownership domain and therefore has its own named profile.
+    /// `256 MiB` block cache, `32 MiB` WAL ceiling, `512` open file handles,
+    /// `16 MiB x 4` write buffers per column family, `2` background jobs, and
+    /// `512 MiB` total memtable budget. Capping the primary WAL at `32 MiB`
+    /// triggers earlier flushes so inactive wallet secondaries do not accumulate
+    /// large WAL replay memtables across retained serving generations.
     #[must_use]
     pub const fn wallet_projection_writer_defaults() -> Self {
-        Self::materialized_view_writer_defaults()
+        Self {
+            block_cache_bytes: 256 * MIB,
+            max_wal_bytes: 32 * MIB,
+            max_open_files: 512,
+            write_buffer_bytes: 16 * MIB,
+            max_write_buffer_count: 4,
+            max_background_jobs: 2,
+            memtable_budget_bytes: 512 * MIB,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
+        }
     }
 
     /// Canonical-store reader defaults for secondary processes.
@@ -218,12 +230,25 @@ impl RocksDbResourceBudget {
 
     /// Wallet-projection reader defaults for immutable serving secondaries.
     ///
-    /// The serving secondary currently uses the same resource profile as a
-    /// materialized-view reader, while retaining a distinct domain name at the
-    /// configuration boundary.
+    /// `64 MiB` block cache, `16 MiB` WAL ceiling, `1024` open file handles,
+    /// `4 MiB x 2` write buffers per column family, and `16 MiB` total memtable
+    /// budget. The uniform budget retains the primary-only background-job value
+    /// at `2`, but secondary opens do not apply it. The larger open-file cap
+    /// keeps Mainnet point-lookup SST readers open while partitioned index and
+    /// filter blocks stay inside the shared block cache.
     #[must_use]
     pub const fn wallet_projection_reader_defaults() -> Self {
-        Self::materialized_view_reader_defaults()
+        Self {
+            block_cache_bytes: 64 * MIB,
+            max_wal_bytes: 16 * MIB,
+            max_open_files: 1024,
+            write_buffer_bytes: 4 * MIB,
+            max_write_buffer_count: 2,
+            max_background_jobs: 2,
+            memtable_budget_bytes: 16 * MIB,
+            statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
+        }
     }
 
     /// Minimal bounded defaults for short-lived read-only admission probes.
@@ -398,17 +423,37 @@ mod tests {
             RocksDbResourceBudget::materialized_view_reader_defaults().block_cache_bytes
                 < RocksDbResourceBudget::materialized_view_writer_defaults().block_cache_bytes
         );
+        assert!(
+            RocksDbResourceBudget::wallet_projection_reader_defaults().block_cache_bytes
+                < RocksDbResourceBudget::wallet_projection_writer_defaults().block_cache_bytes
+        );
     }
 
     #[test]
-    fn wallet_projection_profiles_match_the_current_multi_family_profiles() {
+    fn wallet_projection_writer_defaults_cap_wal_at_thirty_two_mebibytes() {
+        let budget = RocksDbResourceBudget::wallet_projection_writer_defaults();
+        assert_eq!(budget.validate(), Ok(()));
+        assert_eq!(budget.max_wal_bytes, 32 * MIB);
         assert_eq!(
-            RocksDbResourceBudget::wallet_projection_writer_defaults(),
-            RocksDbResourceBudget::materialized_view_writer_defaults()
+            budget,
+            RocksDbResourceBudget {
+                max_wal_bytes: 32 * MIB,
+                ..RocksDbResourceBudget::materialized_view_writer_defaults()
+            }
         );
+    }
+
+    #[test]
+    fn wallet_projection_reader_defaults_raise_open_files_to_1024() {
+        let budget = RocksDbResourceBudget::wallet_projection_reader_defaults();
+        assert_eq!(budget.validate(), Ok(()));
+        assert_eq!(budget.max_open_files, 1024);
         assert_eq!(
-            RocksDbResourceBudget::wallet_projection_reader_defaults(),
-            RocksDbResourceBudget::materialized_view_reader_defaults()
+            budget,
+            RocksDbResourceBudget {
+                max_open_files: 1024,
+                ..RocksDbResourceBudget::materialized_view_reader_defaults()
+            }
         );
     }
 
