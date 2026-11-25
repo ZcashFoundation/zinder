@@ -9,7 +9,7 @@ use std::{
 
 use parking_lot::Mutex;
 use rust_rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType,
+    BlockBasedIndexType, BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType,
     DEFAULT_COLUMN_FAMILY_NAME, Options, WriteBufferManager,
     statistics::{StatsLevel, Ticker},
 };
@@ -19,6 +19,8 @@ use crate::{RocksDbResourceBudget, RocksDbStatisticsLevel};
 
 const DIRECT_IO_COMPACTION_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
 const NON_PRIMARY_MAX_FILE_OPENING_THREADS: i32 = 1;
+const POINT_LOOKUP_FILTER_BITS_PER_KEY: f64 = 10.0;
+const POINT_LOOKUP_FILTER_BLOOM_BEFORE_LEVEL: i32 = 1;
 
 /// Filesystem I/O mode of a `RocksDB` instance: the mode a resource budget
 /// requests, or the mode an open resolved to.
@@ -1130,10 +1132,10 @@ fn build_write_buffer_manager(memtable_budget_bytes: u64) -> WriteBufferManager 
 ///
 /// Index and filter blocks are accounted to `cache` so the at-rest
 /// metadata budget stays bounded by [`RocksDbResourceBudget::block_cache_bytes`].
-/// The factory sets no filter policy; a store that filters a family adds one
-/// to the returned options, as the wallet store does for its hash-keyed
-/// families. Public because the materialized-view and wallet stores re-use the
-/// same factory; see
+/// The factory sets no filter policy; point-lookup families that need one use
+/// [`build_point_lookup_block_based_table_factory`] or add one to the
+/// returned options. Public because the materialized-view and wallet stores
+/// re-use the same factory; see
 /// [ADR-0005](../../../docs/adrs/0005-bounded-process-memory.md).
 #[must_use]
 pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
@@ -1143,6 +1145,31 @@ pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
     bbt.set_block_cache(cache);
     bbt.set_cache_index_and_filter_blocks(true);
     bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    bbt
+}
+
+/// Builds `BlockBasedOptions` for point-lookup column families with a
+/// partitioned hybrid Ribbon filter and two-level index.
+///
+/// Extends [`build_block_based_table_factory`] with a 10-bits-per-key hybrid
+/// Ribbon filter (Bloom filters before level 1, Ribbon filters at deeper
+/// levels), [`BlockBasedIndexType::TwoLevelIndexSearch`], partitioned filters,
+/// and pinned top-level index and filter blocks in `cache`. Pinning only the
+/// small top-level partition directory avoids re-reading index/filter headers
+/// on deep lookups while leaving partition leaf blocks evictable inside
+/// `cache`.
+#[must_use]
+pub fn build_point_lookup_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
+    let mut bbt = build_block_based_table_factory(cache);
+    bbt.set_hybrid_ribbon_filter(
+        POINT_LOOKUP_FILTER_BITS_PER_KEY,
+        POINT_LOOKUP_FILTER_BLOOM_BEFORE_LEVEL,
+    );
+    // Partitioned filters require the two-level index. Together they cache
+    // filter and index data in small partitions instead of one block per file.
+    bbt.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
+    bbt.set_partition_filters(true);
+    bbt.set_pin_top_level_index_and_filter(true);
     bbt
 }
 

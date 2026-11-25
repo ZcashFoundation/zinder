@@ -915,7 +915,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Wallet-projection RocksDB live WAL ceiling in bytes. Defaults to 268435456 \
+        description: "Wallet-projection RocksDB live WAL ceiling in bytes. Defaults to 33554432 \
                       for the writer and 16777216 for the wallet-serving reader.",
     },
     EnvVarDoc {
@@ -929,7 +929,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection RocksDB open SST file cap. Defaults to 512 for the writer \
-                      and 64 for the wallet-serving reader.",
+                      and 1024 for the wallet-serving reader.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__WRITE_BUFFER_BYTES",
