@@ -1,4 +1,11 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use arc_swap::ArcSwapOption;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +27,11 @@ use crate::{
 const TAIL_BLOCKS: u32 = 5_096;
 const TAIL_BYTES: usize = 64 * 1024 * 1024;
 const ENCODE_BATCH_BLOCKS: u32 = 1_000;
+static NEXT_TAIL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_tail_generation() -> u64 {
+    NEXT_TAIL_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Counter of live `EncodedTail` cache lookups, labelled by `outcome`.
 const ENCODED_TAIL_LOOKUPS_COUNTER: &str = "zinder_compat_encoded_tail_lookups_total";
@@ -53,7 +65,7 @@ impl TailLookupOutcome {
         Self::Bypass,
     ];
 
-    const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Hit => "hit",
             Self::Rebuild => "rebuild",
@@ -192,12 +204,13 @@ struct ShieldedTailBufferInner {
 pub(super) struct EncodedTail {
     pub(super) epoch: ChainEpoch,
     pub(super) fence: Fence,
+    pub(super) tail_generation: u64,
     /// The admitted serving generation the rows were read from. Rows are
     /// reused only while requests read that same immutable generation.
     source: CompactBlockSource,
     rows: VecDeque<TailRow>,
     bytes: usize,
-    byte_capped: bool,
+    pub(super) byte_capped: bool,
     evicted_rows: u64,
     held: HeldBytes,
 }
@@ -636,6 +649,7 @@ impl EncodedTail {
         Self {
             epoch: self.epoch,
             fence: self.fence,
+            tail_generation: next_tail_generation(),
             source: self.source.clone(),
             bytes: payload_bytes(&rows),
             byte_capped,
@@ -812,6 +826,7 @@ async fn build<Source: TailSource>(
     let mut tail = EncodedTail {
         epoch,
         fence,
+        tail_generation: next_tail_generation(),
         source: source.source().clone(),
         bytes: 0,
         byte_capped: false,
@@ -2475,6 +2490,7 @@ mod tests {
         let partial_tail = Arc::new(EncodedTail {
             epoch: partial_source.epoch,
             fence: partial_source.fence,
+            tail_generation: next_tail_generation(),
             source: partial_source.source.clone(),
             bytes: payload_bytes(&partial_rows),
             byte_capped: false,

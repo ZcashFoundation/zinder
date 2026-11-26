@@ -1498,10 +1498,12 @@ epoch-pin lookup (`SwappableWalletQuery`, matching `WalletServingPairPublisher`)
 and canonical-only `ingest_active` drives 2 canonical secondary generations. All
 arms share a deterministic `WorkloadTrace` (`request_trace_digest`) plus unified Prometheus
 scraping (`zinder_compat_encoded_tail_*` fills, hits, fallback_native, bypass,
-byte_capped_fills, byte_cap_evictions, peak retained bytes) alongside unary
+byte_capped_fills, byte_cap_evictions, peak retained bytes) and request-scoped
+`encoded_tail_lookup` outcome/generation verification alongside unary
 `GetLatestBlock`, transparent wallet RPCs (`GetTaddressBalance`, `GetAddressUtxos`,
 `GetTransaction` via real coinbase spends), `GetTreeState`, slow boundary-crossing
-streams, descending uncovered-tail cold/warm probes, mempool churn (`writer_overlap_verified`),
+streams, descending uncovered-tail cold/warm probes (split across `unpublished_*` and
+span-matched `published_*` coverage), mempool churn (`writer_overlap_verified`),
 ingest prepare/commit histograms, writer WAL fsyncs, `NodeSource` RPC counts,
 per-role RocksDB tickers (`canonical_writer`, `reader_canonical_secondaries`,
 `reader_wallet_secondaries`, `wallet_writer`, `projector_secondary`, `publisher_secondary`),

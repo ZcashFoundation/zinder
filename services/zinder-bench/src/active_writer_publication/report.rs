@@ -480,10 +480,22 @@ pub struct PublisherMetrics {
 /// standard `zinder_compat_encoded_tail_*` Prometheus counters.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct TailRefillMetrics {
-    /// First tail `GetBlockRange(tip, floor)` after tip advance or generation rotation.
+    /// First tail `GetBlockRange(tip, floor)` after tip advance or generation rotation
+    /// across all verified pairs.
     pub cold_after_advance: StreamLatencyReport,
-    /// Immediate repeat tail `GetBlockRange(tip, floor)` on the same generation.
+    /// Immediate repeat tail `GetBlockRange(tip, floor)` on the same generation
+    /// across all verified pairs.
     pub warm_repeat: StreamLatencyReport,
+    /// Verified cold tail pairs served with no signed catalog boundary (`catalog_end_height == 0`).
+    pub unpublished_cold_after_advance: StreamLatencyReport,
+    /// Verified warm tail repeat pairs served with no signed catalog boundary (`catalog_end_height == 0`).
+    pub unpublished_warm_repeat: StreamLatencyReport,
+    /// Verified cold tail pairs matching `published_quiescent_control` uncovered/catalog span.
+    pub published_cold_after_advance: StreamLatencyReport,
+    /// Verified warm tail repeat pairs matching `published_quiescent_control` uncovered/catalog span.
+    pub published_warm_repeat: StreamLatencyReport,
+    /// Verified published-catalog tail pairs skipped because their uncovered span differed from control.
+    pub published_mismatched_span_pairs: u64,
     /// Peak payload bytes observed across a single uncovered-tail range response.
     pub peak_tail_response_bytes: u64,
     /// Peak retained bytes observed on `zinder_compat_encoded_tail_bytes`.
@@ -500,7 +512,7 @@ pub struct TailRefillMetrics {
     pub encoded_tail_fallback_native: u64,
     /// Delta of `zinder_compat_encoded_tail_lookups_total{outcome="bypass"}`.
     pub encoded_tail_bypass: u64,
-    /// Cold/warm pairs where the warm probe ran against a different served generation.
+    /// Tail probe pairs excluded because verification failed or generation/epoch changed mid-pair.
     pub unpaired_tail_probes: u64,
     /// Whether `EncodedTail` reported any byte-capped fill or byte-cap eviction.
     pub byte_cap_exceeded: bool,
@@ -678,14 +690,30 @@ pub struct ModeDifferential {
     pub published_catalog_completion_p50_delta_ms: Option<f64>,
     /// Change in signed-catalog settled completion p95 vs `published_quiescent_control` (ms).
     pub published_catalog_completion_p95_delta_ms: Option<f64>,
-    /// Change in cold tail refill completion p50 vs matched baseline (ms), if available.
+    /// Change in cold tail refill completion p50 vs phase-matched baseline (ms), if available.
     pub cold_tail_completion_p50_delta_ms: Option<f64>,
-    /// Change in cold tail refill completion p95 vs matched baseline (ms), if available.
+    /// Change in cold tail refill completion p95 vs phase-matched baseline (ms), if available.
     pub cold_tail_completion_p95_delta_ms: Option<f64>,
-    /// Change in warm tail repeat completion p50 vs matched baseline (ms), if available.
+    /// Change in warm tail repeat completion p50 vs phase-matched baseline (ms), if available.
     pub warm_tail_completion_p50_delta_ms: Option<f64>,
-    /// Change in warm tail repeat completion p95 vs matched baseline (ms), if available.
+    /// Change in warm tail repeat completion p95 vs phase-matched baseline (ms), if available.
     pub warm_tail_completion_p95_delta_ms: Option<f64>,
+    /// Change in unpublished (`catalog_end_height == 0`) cold tail p50 vs `quiescent_control` (ms).
+    pub unpublished_cold_tail_completion_p50_delta_ms: Option<f64>,
+    /// Change in unpublished (`catalog_end_height == 0`) cold tail p95 vs `quiescent_control` (ms).
+    pub unpublished_cold_tail_completion_p95_delta_ms: Option<f64>,
+    /// Change in unpublished (`catalog_end_height == 0`) warm tail p50 vs `quiescent_control` (ms).
+    pub unpublished_warm_tail_completion_p50_delta_ms: Option<f64>,
+    /// Change in unpublished (`catalog_end_height == 0`) warm tail p95 vs `quiescent_control` (ms).
+    pub unpublished_warm_tail_completion_p95_delta_ms: Option<f64>,
+    /// Change in span-matched published cold tail p50 vs `published_quiescent_control` (ms).
+    pub published_cold_tail_completion_p50_delta_ms: Option<f64>,
+    /// Change in span-matched published cold tail p95 vs `published_quiescent_control` (ms).
+    pub published_cold_tail_completion_p95_delta_ms: Option<f64>,
+    /// Change in span-matched published warm tail p50 vs `published_quiescent_control` (ms).
+    pub published_warm_tail_completion_p50_delta_ms: Option<f64>,
+    /// Change in span-matched published warm tail p95 vs `published_quiescent_control` (ms).
+    pub published_warm_tail_completion_p95_delta_ms: Option<f64>,
     /// Change in slow boundary-crossing completion p50 (ms), if both arms recorded samples.
     pub slow_boundary_completion_p50_delta_ms: Option<f64>,
     /// Change in `GetTreeState` p95 (ms), if both arms recorded samples.
@@ -728,6 +756,89 @@ fn total_reader_bytes_read(report: &ModeReport) -> u64 {
         .saturating_add(report.rocksdb_activity.reader_wallet_secondaries.bytes_read)
 }
 
+struct TailDifferentialDeltas {
+    cold_p50: Option<f64>,
+    cold_p95: Option<f64>,
+    warm_p50: Option<f64>,
+    warm_p95: Option<f64>,
+    unpub_cold_p50: Option<f64>,
+    unpub_cold_p95: Option<f64>,
+    unpub_warm_p50: Option<f64>,
+    unpub_warm_p95: Option<f64>,
+    pub_cold_p50: Option<f64>,
+    pub_cold_p95: Option<f64>,
+    pub_warm_p50: Option<f64>,
+    pub_warm_p95: Option<f64>,
+}
+
+fn compute_tail_deltas(
+    baselines: DifferentialBaselines<'_>,
+    candidate: &ModeReport,
+) -> TailDifferentialDeltas {
+    let (unpub_cold_p50, unpub_cold_p95) = optional_p50_p95(
+        &baselines
+            .unpublished
+            .tail_refill
+            .unpublished_cold_after_advance
+            .completion_ms,
+        &candidate
+            .tail_refill
+            .unpublished_cold_after_advance
+            .completion_ms,
+    );
+    let (unpub_warm_p50, unpub_warm_p95) = optional_p50_p95(
+        &baselines
+            .unpublished
+            .tail_refill
+            .unpublished_warm_repeat
+            .completion_ms,
+        &candidate.tail_refill.unpublished_warm_repeat.completion_ms,
+    );
+    let (pub_cold_p50, pub_cold_p95) = optional_p50_p95(
+        &baselines
+            .published
+            .tail_refill
+            .published_cold_after_advance
+            .completion_ms,
+        &candidate
+            .tail_refill
+            .published_cold_after_advance
+            .completion_ms,
+    );
+    let (pub_warm_p50, pub_warm_p95) = optional_p50_p95(
+        &baselines
+            .published
+            .tail_refill
+            .published_warm_repeat
+            .completion_ms,
+        &candidate.tail_refill.published_warm_repeat.completion_ms,
+    );
+    let (cold_p50, cold_p95, warm_p50, warm_p95) = if baselines.baseline_catalog_published {
+        (pub_cold_p50, pub_cold_p95, pub_warm_p50, pub_warm_p95)
+    } else {
+        (
+            unpub_cold_p50,
+            unpub_cold_p95,
+            unpub_warm_p50,
+            unpub_warm_p95,
+        )
+    };
+    TailDifferentialDeltas {
+        cold_p50,
+        cold_p95,
+        warm_p50,
+        warm_p95,
+        unpub_cold_p50,
+        unpub_cold_p95,
+        unpub_warm_p50,
+        unpub_warm_p95,
+        pub_cold_p50,
+        pub_cold_p95,
+        pub_warm_p50,
+        pub_warm_p95,
+    }
+}
+
 impl ModeDifferential {
     /// Computes stage latency and secondary-read deltas relative to matched `baselines`.
     #[must_use]
@@ -753,14 +864,7 @@ impl ModeDifferential {
         } else {
             (unpublished_p50, unpublished_p95)
         };
-        let (cold_tail_p50, cold_tail_p95) = optional_p50_p95(
-            &primary.tail_refill.cold_after_advance.completion_ms,
-            &candidate.tail_refill.cold_after_advance.completion_ms,
-        );
-        let (warm_tail_p50, warm_tail_p95) = optional_p50_p95(
-            &primary.tail_refill.warm_repeat.completion_ms,
-            &candidate.tail_refill.warm_repeat.completion_ms,
-        );
+        let tail = compute_tail_deltas(baselines, candidate);
         Self {
             mode: candidate.mode,
             baseline_label: baselines.baseline_label.to_owned(),
@@ -771,10 +875,18 @@ impl ModeDifferential {
             unpublished_catalog_completion_p95_delta_ms: unpublished_p95,
             published_catalog_completion_p50_delta_ms: published_p50,
             published_catalog_completion_p95_delta_ms: published_p95,
-            cold_tail_completion_p50_delta_ms: cold_tail_p50,
-            cold_tail_completion_p95_delta_ms: cold_tail_p95,
-            warm_tail_completion_p50_delta_ms: warm_tail_p50,
-            warm_tail_completion_p95_delta_ms: warm_tail_p95,
+            cold_tail_completion_p50_delta_ms: tail.cold_p50,
+            cold_tail_completion_p95_delta_ms: tail.cold_p95,
+            warm_tail_completion_p50_delta_ms: tail.warm_p50,
+            warm_tail_completion_p95_delta_ms: tail.warm_p95,
+            unpublished_cold_tail_completion_p50_delta_ms: tail.unpub_cold_p50,
+            unpublished_cold_tail_completion_p95_delta_ms: tail.unpub_cold_p95,
+            unpublished_warm_tail_completion_p50_delta_ms: tail.unpub_warm_p50,
+            unpublished_warm_tail_completion_p95_delta_ms: tail.unpub_warm_p95,
+            published_cold_tail_completion_p50_delta_ms: tail.pub_cold_p50,
+            published_cold_tail_completion_p95_delta_ms: tail.pub_cold_p95,
+            published_warm_tail_completion_p50_delta_ms: tail.pub_warm_p50,
+            published_warm_tail_completion_p95_delta_ms: tail.pub_warm_p95,
             slow_boundary_completion_p50_delta_ms: optional_delta(
                 primary.slow_boundary_range.completion_ms,
                 candidate.slow_boundary_range.completion_ms,
@@ -1040,6 +1152,11 @@ mod tests {
         serde_json::json!({
             "cold_after_advance": { "first_frame_ms": { "samples": 1, "p50": 2.0, "p95": 2.0, "max": 2.0, "mean": 2.0 }, "completion_ms": { "samples": 1, "p50": 4.0, "p95": 6.0, "max": 6.0, "mean": 4.0 }, "frames_delivered": 10, "payload_bytes_delivered": 100 },
             "warm_repeat": stream_json(1.0, 1.0),
+            "unpublished_cold_after_advance": { "first_frame_ms": { "samples": 1, "p50": 2.0, "p95": 2.0, "max": 2.0, "mean": 2.0 }, "completion_ms": { "samples": 1, "p50": 4.0, "p95": 6.0, "max": 6.0, "mean": 4.0 }, "frames_delivered": 10, "payload_bytes_delivered": 100 },
+            "unpublished_warm_repeat": stream_json(1.0, 1.0),
+            "published_cold_after_advance": { "first_frame_ms": { "samples": 1, "p50": 2.0, "p95": 2.0, "max": 2.0, "mean": 2.0 }, "completion_ms": { "samples": 1, "p50": 3.0, "p95": 5.0, "max": 5.0, "mean": 3.0 }, "frames_delivered": 10, "payload_bytes_delivered": 100 },
+            "published_warm_repeat": stream_json(1.0, 1.0),
+            "published_mismatched_span_pairs": 0,
             "peak_tail_response_bytes": 100,
             "peak_encoded_tail_bytes": 200,
             "encoded_tail_byte_cap_evictions": 0,
@@ -1141,7 +1258,7 @@ mod tests {
             blank_mode_report(WriterMode::IngestProjectorAndPublisher, 9.0, 3.5, 1_900)?;
         candidate
             .tail_refill
-            .cold_after_advance
+            .published_cold_after_advance
             .completion_ms
             .samples = 0;
         candidate.tree_state_ms.samples = 0;
@@ -1164,8 +1281,46 @@ mod tests {
                 .is_some_and(|delta| (delta - 1.5).abs() < f64::EPSILON)
         );
         assert!(diff.cold_tail_completion_p50_delta_ms.is_none());
+        assert!(diff.published_cold_tail_completion_p50_delta_ms.is_none());
+        assert!(
+            diff.unpublished_cold_tail_completion_p50_delta_ms
+                .is_some_and(|delta| delta.abs() < f64::EPSILON)
+        );
         assert!(diff.tree_state_p95_delta_ms.is_none());
         assert_eq!(diff.reader_bytes_read_delta, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn published_differential_never_pools_unpublished_tail_samples() -> Result<(), Box<dyn Error>> {
+        let unpublished = blank_mode_report(WriterMode::QuiescentControl, 5.0, 0.0, 2_000)?;
+        let published = blank_mode_report(WriterMode::QuiescentControl, 0.0, 2.0, 1_800)?;
+        let mut publisher_arm =
+            blank_mode_report(WriterMode::IngestProjectorAndPublisher, 9.0, 3.5, 1_900)?;
+        publisher_arm
+            .tail_refill
+            .published_cold_after_advance
+            .completion_ms
+            .samples = 0;
+        publisher_arm
+            .tail_refill
+            .published_warm_repeat
+            .completion_ms
+            .samples = 0;
+
+        let diff = ModeDifferential::between(
+            super::DifferentialBaselines {
+                unpublished: &unpublished,
+                published: &published,
+                baseline_label: "published_quiescent_control",
+                baseline_catalog_published: true,
+            },
+            &publisher_arm,
+        );
+        assert!(diff.cold_tail_completion_p50_delta_ms.is_none());
+        assert!(diff.warm_tail_completion_p50_delta_ms.is_none());
+        assert!(diff.published_cold_tail_completion_p50_delta_ms.is_none());
+        assert!(diff.unpublished_cold_tail_completion_p50_delta_ms.is_some());
         Ok(())
     }
 

@@ -1509,9 +1509,24 @@ impl SupervisedGrpcServer {
         .with_tip_change_watcher(tip_watcher)
         .with_tip_wait(TipWait::default());
         let (addr, incoming, shutdown_tx, shutdown_rx) = bind_listener().await?;
+        let port = addr.port();
         let service = adapter.into_server();
         let handle = tokio::spawn(async move {
             Server::builder()
+                .trace_fn(move |req| {
+                    let probe_id = req
+                        .headers()
+                        .get(crate::recorder::BENCH_PROBE_ID_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    tracing::debug_span!(
+                        target: crate::recorder::BENCH_SERVER_SPAN_TARGET,
+                        "bench_grpc_request",
+                        server_port = u64::from(port),
+                        probe_id
+                    )
+                })
                 .add_service(service)
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = shutdown_rx.await;
@@ -1539,9 +1554,24 @@ impl SupervisedGrpcServer {
             .with_tip_change_watcher(tip_watcher)
             .with_tip_wait(TipWait::default());
         let (addr, incoming, shutdown_tx, shutdown_rx) = bind_listener().await?;
+        let port = addr.port();
         let service = adapter.into_server();
         let handle = tokio::spawn(async move {
             Server::builder()
+                .trace_fn(move |req| {
+                    let probe_id = req
+                        .headers()
+                        .get(crate::recorder::BENCH_PROBE_ID_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    tracing::debug_span!(
+                        target: crate::recorder::BENCH_SERVER_SPAN_TARGET,
+                        "bench_grpc_request",
+                        server_port = u64::from(port),
+                        probe_id
+                    )
+                })
                 .add_service(service)
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = shutdown_rx.await;

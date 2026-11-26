@@ -48,6 +48,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
+use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
 };
@@ -656,9 +657,11 @@ impl BlockRangeStreamSlot {
         Read: Future<Output = Result<Output, Status>> + Send + 'static,
     {
         let stream_slot = self.clone();
-        let (outcome, _stream_slot) = tokio::spawn(async move { (read.await, stream_slot) })
-            .await
-            .map_err(|error| Status::unavailable(format!("block-range read failed: {error}")))?;
+        let (outcome, _stream_slot) = tokio::spawn(
+            async move { (read.await, stream_slot) }.instrument(tracing::Span::current()),
+        )
+        .await
+        .map_err(|error| Status::unavailable(format!("block-range read failed: {error}")))?;
         outcome
     }
 
@@ -695,11 +698,14 @@ impl BlockRangeStreamSlot {
     {
         let (next_chunk, next_chunks) = mpsc::channel(1);
         let cancel = CancellationToken::new();
-        tokio::spawn(reader(BlockRangeSink {
-            next_chunk,
-            cancel: cancel.clone(),
-            _stream_slot: self.clone(),
-        }));
+        tokio::spawn(
+            reader(BlockRangeSink {
+                next_chunk,
+                cancel: cancel.clone(),
+                _stream_slot: self.clone(),
+            })
+            .instrument(tracing::Span::current()),
+        );
         self.hold_for_stream(Box::pin(ChunkedMessages {
             current: Some(ChunkIter::new(first_messages)),
             next_chunks,

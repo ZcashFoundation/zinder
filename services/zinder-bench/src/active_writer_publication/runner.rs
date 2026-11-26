@@ -63,6 +63,7 @@ pub async fn run_active_writer_publication(
     config: &ActiveWriterPublicationConfig,
 ) -> Result<ActiveWriterPublicationReport, BenchError> {
     validate_config(config)?;
+    crate::recorder::install_tracing_subscriber();
     let chain = GeneratedChain::build(ChainSpecConfig {
         base_blocks: config.base_blocks,
         live_blocks: config.live_blocks,
@@ -495,6 +496,7 @@ async fn run_mode_workload_with_source(
             cancel: cancel.clone(),
             error_collector: Arc::clone(&error_collector),
             prom_handle: inputs.prom_handle.clone(),
+            server_port: inputs.boot.server.addr.port(),
             quiescent_rotator,
             rotation_requester: Some(inputs.boot.serving.clone()),
         },
@@ -597,6 +599,11 @@ fn assemble_mode_report(assembly: ModeReportAssembly) -> ModeReport {
         tail_refill: TailRefillMetrics {
             cold_after_advance: fleet.tail_cold_after_advance,
             warm_repeat: fleet.tail_warm_repeat,
+            unpublished_cold_after_advance: fleet.tail_unpublished_cold_after_advance,
+            unpublished_warm_repeat: fleet.tail_unpublished_warm_repeat,
+            published_cold_after_advance: fleet.tail_published_cold_after_advance,
+            published_warm_repeat: fleet.tail_published_warm_repeat,
+            published_mismatched_span_pairs: fleet.published_mismatched_span_pairs,
             peak_tail_response_bytes: fleet.peak_tail_response_bytes,
             peak_encoded_tail_bytes: fleet.peak_encoded_tail_bytes,
             encoded_tail_byte_cap_evictions: tail_delta.byte_cap_evictions,

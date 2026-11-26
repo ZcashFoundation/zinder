@@ -310,9 +310,7 @@ struct CaptureTipReplayCheckpointsArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .try_init();
+    zinder_bench::recorder::install_tracing_subscriber();
     let cli = Cli::parse();
     if !zinder_runtime::host_cpu_meets_compiled_baseline() {
         return ExitCode::FAILURE;
@@ -355,25 +353,7 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             emit_report(&output.report, output.report_path.as_deref())
         }
         Command::ServeCanonicalFixtureTransports(args) => {
-            let max_response_bytes = u32::try_from(args.max_response_bytes).map_err(|_| {
-                BenchError::invalid_argument("--max-response-bytes must fit in u32")
-            })?;
-            let report =
-                run_canonical_fixture_transport_server(CanonicalFixtureTransportServerConfig {
-                    fixture_directory: args.fixture,
-                    json_rpc_listen_addr: args.json_rpc_listen_addr,
-                    indexer_grpc_listen_addr: args.indexer_grpc_listen_addr,
-                    response_delay: Duration::from_millis(args.response_delay_millis),
-                    max_response_bytes,
-                })
-                .await?;
-            let encoded = serde_json::to_vec_pretty(&report)?;
-            if let Some(path) = args.report.as_deref() {
-                create_report_file(path, &encoded)?;
-            } else {
-                write_report_to_stdout(&encoded);
-            }
-            Ok(())
+            run_serve_canonical_fixture_transports_command(args).await
         }
         Command::RocksDbStorageLifecycle(args) => {
             let output = run_rocksdb_storage_lifecycle(args).await?;
@@ -410,8 +390,32 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::RocksDbTipReorg(args) => run_rocksdb_tip_reorg(args).await,
         Command::LightwalletdWalletLoad(args) => run_wallet_load_command(args).await,
         Command::RawRangeProbe(args) => run_raw_range_probe_command(args).await,
-        Command::ActiveWriterPublication(args) => run_active_writer_publication_command(args).await,
+        Command::ActiveWriterPublication(args) => {
+            Box::pin(run_active_writer_publication_command(args)).await
+        }
     }
+}
+
+async fn run_serve_canonical_fixture_transports_command(
+    args: ServeCanonicalFixtureTransportsArgs,
+) -> Result<(), BenchError> {
+    let max_response_bytes = u32::try_from(args.max_response_bytes)
+        .map_err(|_| BenchError::invalid_argument("--max-response-bytes must fit in u32"))?;
+    let report = run_canonical_fixture_transport_server(CanonicalFixtureTransportServerConfig {
+        fixture_directory: args.fixture,
+        json_rpc_listen_addr: args.json_rpc_listen_addr,
+        indexer_grpc_listen_addr: args.indexer_grpc_listen_addr,
+        response_delay: Duration::from_millis(args.response_delay_millis),
+        max_response_bytes,
+    })
+    .await?;
+    let encoded = serde_json::to_vec_pretty(&report)?;
+    if let Some(path) = args.report.as_deref() {
+        create_report_file(path, &encoded)?;
+    } else {
+        write_report_to_stdout(&encoded);
+    }
+    Ok(())
 }
 
 fn parse_io_mode(text: &str) -> Result<RocksDbIoMode, String> {

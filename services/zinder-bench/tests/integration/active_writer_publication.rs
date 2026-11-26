@@ -22,7 +22,7 @@ async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary
         segment_blocks: NonZeroU32::new(4_096).unwrap_or(NonZeroU32::MIN),
         dense_block_cadence: 16,
         dense_txs_per_block: 1,
-        commit_interval: Duration::from_millis(15),
+        commit_interval: Duration::from_millis(80),
         slow_reader_frame_delay: Duration::from_millis(1),
         mempool_churn_sizes: vec![50, 500],
         quiescent_rounds: 6,
@@ -65,9 +65,28 @@ async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary
             .samples
             > 0
     );
+    assert!(
+        report
+            .published_quiescent_control
+            .tail_refill
+            .published_cold_after_advance
+            .completion_ms
+            .samples
+            > 0
+    );
     assert_eq!(report.modes.len(), 4);
     for mode_report in &report.modes {
         assert_mode_report_invariants(mode_report, &config, None)?;
+        if mode_report.mode == WriterMode::QuiescentControl {
+            assert!(
+                mode_report
+                    .tail_refill
+                    .unpublished_cold_after_advance
+                    .completion_ms
+                    .samples
+                    > 0
+            );
+        }
     }
     Ok(())
 }
@@ -85,7 +104,7 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
         dense_txs_per_block: 1,
         dense_orchard_actions_per_tx: 8,
         tail_probe_blocks: 8,
-        commit_interval: Duration::from_millis(8),
+        commit_interval: Duration::from_millis(12),
         slow_reader_frame_delay: Duration::from_millis(2),
         mempool_churn_sizes: vec![20, 120],
         quiescent_rounds: 3,
@@ -112,8 +131,27 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
         &config,
         Some("buffered"),
     )?;
+    assert!(
+        report
+            .published_quiescent_control
+            .tail_refill
+            .published_cold_after_advance
+            .completion_ms
+            .samples
+            > 0
+    );
     for mode_report in &report.modes {
         assert_mode_report_invariants(mode_report, &config, Some("buffered"))?;
+        if mode_report.mode == WriterMode::QuiescentControl {
+            assert!(
+                mode_report
+                    .tail_refill
+                    .unpublished_cold_after_advance
+                    .completion_ms
+                    .samples
+                    > 0
+            );
+        }
     }
     Ok(())
 }
@@ -272,6 +310,23 @@ fn assert_mode_report_invariants(
         assert!(mode_report.publisher.segments_published >= 1);
         assert!(mode_report.publisher.catalog_refreshes >= 1);
         assert!(mode_report.catalog_range_published.completion_ms.samples > 0);
+    } else if mode_report.mode != WriterMode::QuiescentControl {
+        assert!(
+            mode_report
+                .tail_refill
+                .unpublished_cold_after_advance
+                .completion_ms
+                .samples
+                > 0
+        );
+        assert!(
+            mode_report
+                .tail_refill
+                .unpublished_warm_repeat
+                .completion_ms
+                .samples
+                > 0
+        );
     }
     Ok(())
 }

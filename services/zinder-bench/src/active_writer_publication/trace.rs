@@ -19,6 +19,7 @@ pub(crate) struct WorkloadTrace {
     pub(crate) final_tip_height: u32,
     pub(crate) reorg_window_blocks: u32,
     pub(crate) segment_boundary_height: u32,
+    pub(crate) published_control_catalog_end: u32,
     pub(crate) catalog_span_blocks: u32,
     pub(crate) tail_probe_span_blocks: u32,
     pub(crate) slow_boundary_span_blocks: u32,
@@ -43,6 +44,9 @@ impl WorkloadTrace {
     ) -> Self {
         let base_tip_height = config.base_blocks;
         let final_tip_height = config.base_blocks.saturating_add(config.live_blocks);
+        let published_control_catalog_end =
+            (final_tip_height.saturating_sub(config.reorg_window_blocks) / config.segment_blocks)
+                .saturating_mul(config.segment_blocks.get());
         let base_settled = base_tip_height
             .saturating_sub(config.reorg_window_blocks)
             .max(1);
@@ -67,6 +71,7 @@ impl WorkloadTrace {
             final_tip_height,
             reorg_window_blocks: config.reorg_window_blocks,
             segment_boundary_height,
+            published_control_catalog_end,
             catalog_span_blocks,
             tail_probe_span_blocks,
             slow_boundary_span_blocks,
@@ -87,6 +92,45 @@ impl WorkloadTrace {
     pub(crate) fn descending_tail_range(&self, tip: u32) -> (u32, u32) {
         let floor = tip.saturating_sub(self.tail_probe_span_blocks).max(1);
         (tip, floor)
+    }
+
+    /// Returns `(uncovered_blocks, catalog_blocks)` covered by a descending
+    /// `(start, end)` tail probe against `catalog_end_height`.
+    pub(crate) const fn tail_probe_span(
+        start: u32,
+        end: u32,
+        catalog_end_height: u32,
+    ) -> (u32, u32) {
+        let hi = if start >= end { start } else { end };
+        let lo = if start >= end { end } else { start };
+        let uncovered_lo = if catalog_end_height >= lo {
+            catalog_end_height.saturating_add(1)
+        } else {
+            lo
+        };
+        let uncovered = if hi >= uncovered_lo {
+            hi.saturating_sub(uncovered_lo).saturating_add(1)
+        } else {
+            0
+        };
+        let catalog = if catalog_end_height >= lo {
+            let cat_hi = if hi <= catalog_end_height {
+                hi
+            } else {
+                catalog_end_height
+            };
+            cat_hi.saturating_sub(lo).saturating_add(1)
+        } else {
+            0
+        };
+        (uncovered, catalog)
+    }
+
+    /// Expected `(uncovered_blocks, catalog_blocks)` span of a published tail probe
+    /// against `published_quiescent_control` at `final_tip_height`.
+    pub(crate) fn published_control_tail_span(&self) -> (u32, u32) {
+        let (start, end) = self.descending_tail_range(self.final_tip_height);
+        Self::tail_probe_span(start, end, self.published_control_catalog_end)
     }
 
     /// Ascending `(start, end)` bounds for the slow boundary-crossing range probe.

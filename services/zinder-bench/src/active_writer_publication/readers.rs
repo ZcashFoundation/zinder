@@ -79,6 +79,7 @@ pub(crate) struct ReaderFleetContext {
     pub(crate) cancel: CancellationToken,
     pub(crate) error_collector: Arc<Mutex<ErrorCollector>>,
     pub(crate) prom_handle: PrometheusHandle,
+    pub(crate) server_port: u16,
     pub(crate) quiescent_rotator: Option<Arc<TwoGenWalletPairPublisher>>,
     pub(crate) rotation_requester: Option<ModeServingHandle>,
 }
@@ -93,6 +94,11 @@ pub(crate) struct ReaderFleetOutput {
     pub(crate) catalog_range_during_seal: StreamLatencyReport,
     pub(crate) tail_cold_after_advance: StreamLatencyReport,
     pub(crate) tail_warm_repeat: StreamLatencyReport,
+    pub(crate) tail_unpublished_cold_after_advance: StreamLatencyReport,
+    pub(crate) tail_unpublished_warm_repeat: StreamLatencyReport,
+    pub(crate) tail_published_cold_after_advance: StreamLatencyReport,
+    pub(crate) tail_published_warm_repeat: StreamLatencyReport,
+    pub(crate) published_mismatched_span_pairs: u64,
     pub(crate) peak_tail_response_bytes: u64,
     pub(crate) peak_encoded_tail_bytes: u64,
     pub(crate) unpaired_tail_probes: u64,
@@ -176,6 +182,11 @@ pub(crate) fn spawn_reader_fleet(
             catalog_range_during_seal: catalog_out.during_seal,
             tail_cold_after_advance: tail_out.cold.finish(),
             tail_warm_repeat: tail_out.warm.finish(),
+            tail_unpublished_cold_after_advance: tail_out.unpublished_cold.finish(),
+            tail_unpublished_warm_repeat: tail_out.unpublished_warm.finish(),
+            tail_published_cold_after_advance: tail_out.published_cold.finish(),
+            tail_published_warm_repeat: tail_out.published_warm.finish(),
+            published_mismatched_span_pairs: tail_out.published_mismatched_span_pairs,
             peak_tail_response_bytes: tail_out.peak_response_bytes,
             peak_encoded_tail_bytes: tail_out.peak_encoded_tail_bytes,
             unpaired_tail_probes: tail_out.unpaired_tail_probes,
@@ -188,6 +199,29 @@ pub(crate) fn spawn_reader_fleet(
     ReaderFleetHandle { cancel, task }
 }
 
+async fn watch_served_changed(rx: &mut watch::Receiver<ServedState>, open: &mut bool) -> bool {
+    if !*open {
+        std::future::pending::<()>().await;
+        return false;
+    }
+    if rx.changed().await.is_err() {
+        *open = false;
+        return false;
+    }
+    true
+}
+
+async fn await_next_tip_poll(ctx: &mut ReaderFleetContext, served_open: &mut bool) -> bool {
+    tokio::select! {
+        biased;
+        () = ctx.cancel.cancelled() => false,
+        changed = watch_served_changed(&mut ctx.served_rx, served_open) => {
+            changed || ctx.served_rx.borrow().serving_caught_up_done
+        }
+        () = tokio::time::sleep(Duration::from_millis(2)) => true,
+    }
+}
+
 async fn run_tip_observer(
     channel: AuthenticatedChannel,
     mut ctx: ReaderFleetContext,
@@ -197,6 +231,8 @@ async fn run_tip_observer(
     let mut visibility_lags = Vec::new();
     let mut round = 0_u32;
     let mut last_observed_tip = 0_u32;
+    let mut last_tip_observed_at = Instant::now();
+    let mut served_open = true;
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -205,13 +241,17 @@ async fn run_tip_observer(
         let Some((elapsed, height)) = fetch_latest_block_with_retry(&mut client, &ctx).await else {
             break;
         };
+        let observed_at = Instant::now();
         rpc_latencies.push(elapsed);
-        last_observed_tip = last_observed_tip.max(height);
+        if height > last_observed_tip {
+            last_observed_tip = height;
+            last_tip_observed_at = observed_at;
+        }
         if ctx.mode != WriterMode::QuiescentControl {
             drain_committed_delays(
                 &ctx.commit_instants,
-                height,
-                Instant::now(),
+                last_observed_tip,
+                last_tip_observed_at,
                 &mut visibility_lags,
             );
         }
@@ -221,17 +261,18 @@ async fn run_tip_observer(
             && (ctx.mode == WriterMode::QuiescentControl
                 || last_observed_tip >= ctx.trace.final_tip_height)
         {
+            if ctx.mode != WriterMode::QuiescentControl {
+                drain_committed_delays(
+                    &ctx.commit_instants,
+                    last_observed_tip,
+                    last_tip_observed_at,
+                    &mut visibility_lags,
+                );
+            }
             break;
         }
-        tokio::select! {
-            biased;
-            () = ctx.cancel.cancelled() => break,
-            res = ctx.served_rx.changed() => {
-                if res.is_err() {
-                    break;
-                }
-            }
-            () = tokio::time::sleep(Duration::from_millis(2)) => {}
+        if !await_next_tip_poll(&mut ctx, &mut served_open).await {
+            break;
         }
     }
 
@@ -336,6 +377,7 @@ async fn run_catalog_reader(
                 label: "GetBlockRange(catalog)",
                 request: range_request(start_height, end_height),
                 frame_delay: Duration::ZERO,
+                probe_id: None,
             },
             &ctx,
         )
@@ -380,9 +422,79 @@ async fn run_catalog_reader(
 struct TailTrackers {
     cold: StreamStatsTracker,
     warm: StreamStatsTracker,
+    unpublished_cold: StreamStatsTracker,
+    unpublished_warm: StreamStatsTracker,
+    published_cold: StreamStatsTracker,
+    published_warm: StreamStatsTracker,
+    published_mismatched_span_pairs: u64,
     peak_response_bytes: u64,
     peak_encoded_tail_bytes: u64,
     unpaired_tail_probes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedColdTail {
+    chain_epoch: u64,
+    visible_tip_height: u32,
+    catalog_end_height: u32,
+    tail_generation: u64,
+    byte_capped: bool,
+    first_range_end: u32,
+}
+
+fn tail_followups_match(
+    rest: &[crate::recorder::EncodedTailLookupRecord],
+    cold: VerifiedColdTail,
+) -> bool {
+    rest.iter().all(|ev| {
+        ev.order == "descending"
+            && ev.chain_epoch == cold.chain_epoch
+            && ev.catalog_end_height == cold.catalog_end_height
+            && ((ev.outcome == "hit" && ev.tail_generation == cold.tail_generation)
+                || (cold.byte_capped
+                    && ev.outcome == "fallback_native"
+                    && ev.range_end < cold.first_range_end))
+    })
+}
+
+fn verify_cold_tail_events(
+    events: &[crate::recorder::EncodedTailLookupRecord],
+) -> Option<VerifiedColdTail> {
+    let first = events.first()?;
+    if first.order != "descending" || first.outcome != "rebuild" || first.tail_generation == 0 {
+        return None;
+    }
+    let cold = VerifiedColdTail {
+        chain_epoch: first.chain_epoch,
+        visible_tip_height: first.visible_tip_height,
+        catalog_end_height: first.catalog_end_height,
+        tail_generation: first.tail_generation,
+        byte_capped: first.byte_capped,
+        first_range_end: first.range_end,
+    };
+    tail_followups_match(&events[1..], cold).then_some(cold)
+}
+
+fn verify_warm_tail_events(
+    events: &[crate::recorder::EncodedTailLookupRecord],
+    cold: VerifiedColdTail,
+) -> bool {
+    let Some(first) = events.first() else {
+        return false;
+    };
+    first.order == "descending"
+        && first.outcome == "hit"
+        && first.tail_generation == cold.tail_generation
+        && first.chain_epoch == cold.chain_epoch
+        && first.visible_tip_height == cold.visible_tip_height
+        && first.catalog_end_height == cold.catalog_end_height
+        && tail_followups_match(
+            &events[1..],
+            VerifiedColdTail {
+                first_range_end: first.range_end,
+                ..cold
+            },
+        )
 }
 
 async fn run_tail_refill_reader(
@@ -405,9 +517,14 @@ async fn run_quiescent_tail_loop(
     ctx: &ReaderFleetContext,
     trackers: &mut TailTrackers,
 ) {
-    let mut round = 0_u32;
-    while round < ctx.trace.quiescent_rounds && !ctx.cancel.is_cancelled() {
-        if round > 0
+    let mut verified_rounds = 0_u32;
+    let mut attempts = 0_u32;
+    let max_attempts = ctx.trace.quiescent_rounds.saturating_mul(4).max(4);
+    while verified_rounds < ctx.trace.quiescent_rounds
+        && attempts < max_attempts
+        && !ctx.cancel.is_cancelled()
+    {
+        if attempts > 0
             && let Some(rotator) = ctx.quiescent_rotator.as_ref()
         {
             let rotated = rotator.rotate_generation_for_cold_tail(&ctx.cancel).await;
@@ -421,10 +538,12 @@ async fn run_quiescent_tail_loop(
             .tip_height
             .max(ctx.trace.base_tip_height);
         let (start, end) = ctx.trace.descending_tail_range(tip);
-        probe_tail_pair(client, ctx, trackers, start, end).await;
+        if probe_tail_pair(client, ctx, trackers, start, end).await {
+            verified_rounds = verified_rounds.saturating_add(1);
+        }
 
-        round = round.saturating_add(1);
-        if round < ctx.trace.quiescent_rounds {
+        attempts = attempts.saturating_add(1);
+        if verified_rounds < ctx.trace.quiescent_rounds && attempts < max_attempts {
             tokio::select! {
                 biased;
                 () = ctx.cancel.cancelled() => break,
@@ -443,18 +562,15 @@ async fn run_active_tail_loop(
     let mut last_catalog_gen = ctx.served_rx.borrow().catalog_generation;
     loop {
         let served = *ctx.served_rx.borrow_and_update();
-        if ctx.cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() || served.serving_caught_up_done {
             break;
         }
         if served.tip_height > last_tip || served.catalog_generation > last_catalog_gen {
             last_tip = last_tip.max(served.tip_height);
             last_catalog_gen = last_catalog_gen.max(served.catalog_generation);
             let (start, end) = ctx.trace.descending_tail_range(served.tip_height);
-            probe_tail_pair(client, ctx, trackers, start, end).await;
+            let _ = probe_tail_pair(client, ctx, trackers, start, end).await;
             continue;
-        }
-        if served.serving_caught_up_done {
-            break;
         }
         tokio::select! {
             biased;
@@ -475,58 +591,91 @@ async fn probe_tail_pair(
     trackers: &mut TailTrackers,
     start: u32,
     end: u32,
-) {
+) -> bool {
     let req = range_request(start, end);
-    let before_state = *ctx.served_rx.borrow();
-    let Some(cold) = measure_range_sample(
+    let cold_guard = crate::recorder::begin_probe_capture(ctx.server_port);
+    let cold_opt = measure_range_sample(
         client,
         RangeProbe {
             label: "GetBlockRange(tail-cold)",
             request: req.clone(),
             frame_delay: Duration::ZERO,
+            probe_id: Some(cold_guard.probe_id()),
         },
         ctx,
     )
-    .await
-    else {
-        return;
+    .await;
+    let cold_events = cold_guard.take_events();
+    let Some(cold) = cold_opt else {
+        return false;
     };
-    trackers.cold.record_sample(&cold);
-    trackers.peak_response_bytes = trackers.peak_response_bytes.max(cold.payload_bytes);
-    trackers.peak_encoded_tail_bytes = trackers
-        .peak_encoded_tail_bytes
-        .max(EncodedTailMetricSnapshot::capture(&ctx.prom_handle).current_bytes);
-
-    let mid_state = *ctx.served_rx.borrow();
-    if mid_state.generation_seq != before_state.generation_seq
-        || mid_state.catalog_generation != before_state.catalog_generation
+    if cold.retries > 0
+        || (ctx.mode != WriterMode::QuiescentControl
+            && ctx.served_rx.borrow().serving_caught_up_done)
     {
         trackers.unpaired_tail_probes = trackers.unpaired_tail_probes.saturating_add(1);
-        return;
+        return false;
     }
+    let Some(cold_meta) = verify_cold_tail_events(&cold_events) else {
+        trackers.unpaired_tail_probes = trackers.unpaired_tail_probes.saturating_add(1);
+        return false;
+    };
 
-    let Some(warm) = measure_range_sample(
+    let warm_guard = crate::recorder::begin_probe_capture(ctx.server_port);
+    let warm_opt = measure_range_sample(
         client,
         RangeProbe {
             label: "GetBlockRange(tail-warm)",
             request: req,
             frame_delay: Duration::ZERO,
+            probe_id: Some(warm_guard.probe_id()),
         },
         ctx,
     )
-    .await
-    else {
-        return;
+    .await;
+    let warm_events = warm_guard.take_events();
+    let Some(warm) = warm_opt else {
+        return false;
     };
-    trackers.peak_response_bytes = trackers.peak_response_bytes.max(warm.payload_bytes);
-    let after_state = *ctx.served_rx.borrow();
-
-    if after_state.generation_seq == mid_state.generation_seq
-        && after_state.catalog_generation == mid_state.catalog_generation
+    if warm.retries > 0
+        || (ctx.mode != WriterMode::QuiescentControl
+            && ctx.served_rx.borrow().serving_caught_up_done)
+        || !verify_warm_tail_events(&warm_events, cold_meta)
     {
-        trackers.warm.record_sample(&warm);
-    } else {
         trackers.unpaired_tail_probes = trackers.unpaired_tail_probes.saturating_add(1);
+        return false;
+    }
+
+    record_verified_tail_pair(trackers, ctx, (start, end), (cold, warm), cold_meta);
+    true
+}
+
+fn record_verified_tail_pair(
+    trackers: &mut TailTrackers,
+    ctx: &ReaderFleetContext,
+    (start, end): (u32, u32),
+    (cold, warm): (StreamSample, StreamSample),
+    cold_meta: VerifiedColdTail,
+) {
+    trackers.cold.record_sample(&cold);
+    trackers.warm.record_sample(&warm);
+    trackers.peak_response_bytes = trackers
+        .peak_response_bytes
+        .max(cold.payload_bytes.max(warm.payload_bytes));
+    trackers.peak_encoded_tail_bytes = trackers
+        .peak_encoded_tail_bytes
+        .max(EncodedTailMetricSnapshot::capture(&ctx.prom_handle).current_bytes);
+    if cold_meta.catalog_end_height == 0 {
+        trackers.unpublished_cold.record_sample(&cold);
+        trackers.unpublished_warm.record_sample(&warm);
+    } else if WorkloadTrace::tail_probe_span(start, end, cold_meta.catalog_end_height)
+        == ctx.trace.published_control_tail_span()
+    {
+        trackers.published_cold.record_sample(&cold);
+        trackers.published_warm.record_sample(&warm);
+    } else {
+        trackers.published_mismatched_span_pairs =
+            trackers.published_mismatched_span_pairs.saturating_add(1);
     }
 }
 
@@ -552,6 +701,7 @@ async fn run_slow_boundary_reader(
                     label: "GetBlockRange(slow-boundary)",
                     request: range_request(start, end),
                     frame_delay,
+                    probe_id: None,
                 },
                 &ctx,
             )
@@ -855,8 +1005,9 @@ async fn run_mempool_tier(
         await_commit_progress_or_done(ctx, required_commits).await;
     }
 
-    let commits_before = ctx.writer_rx.borrow().commits_completed;
-    let active_at_start = !ctx.writer_rx.borrow().commits_done;
+    let before = *ctx.writer_rx.borrow();
+    let commits_before = before.commits_completed;
+    let active_at_start = !before.commits_done;
     let round_id = u32::try_from(index + 1).unwrap_or(1);
     let mut tracker = StreamStatsTracker::default();
     mempool.apply_churn_batch(batch_size, round_id, ctx.sample_v5_tx.as_slice())?;
@@ -989,8 +1140,7 @@ async fn probe_mempool_tx(
                             first_elapsed = Some(started.elapsed());
                         }
                         frames = frames.saturating_add(1);
-                        bytes = bytes
-                            .saturating_add(u64::try_from(tx.encode_to_vec().len()).unwrap_or(0));
+                        bytes = bytes.saturating_add(u64::try_from(tx.encoded_len()).unwrap_or(0));
                     }
                     Ok(None) => break,
                     Err(status) if !ctx.cancel.is_cancelled() => {
@@ -1007,6 +1157,7 @@ async fn probe_mempool_tx(
                 total_elapsed: started.elapsed(),
                 frames,
                 payload_bytes: bytes,
+                retries: 0,
             });
         }
         Err(status) if !ctx.cancel.is_cancelled() => ctx
@@ -1023,6 +1174,7 @@ struct StreamSample {
     total_elapsed: Duration,
     frames: u64,
     payload_bytes: u64,
+    retries: u32,
 }
 
 #[derive(Default)]
@@ -1037,6 +1189,7 @@ struct RangeProbe<'a> {
     label: &'a str,
     request: BlockRange,
     frame_delay: Duration,
+    probe_id: Option<u64>,
 }
 
 impl StreamStatsTracker {
@@ -1083,6 +1236,7 @@ async fn measure_range_sample(
             client,
             probe.request.clone(),
             probe.frame_delay,
+            probe.probe_id,
             logical_started,
         );
         let step = tokio::select! {
@@ -1091,7 +1245,10 @@ async fn measure_range_sample(
             res = stream_fut => res,
         };
         match step {
-            Ok(sample) => return Some(sample),
+            Ok(mut sample) => {
+                sample.retries = attempt;
+                return Some(sample);
+            }
             Err(status) if is_transient_retryable(&status) && attempt < MAX_TRANSIENT_RETRIES => {
                 if status.code() == Code::Unavailable
                     && let Some(requester) = ctx.rotation_requester.as_ref()
@@ -1126,9 +1283,18 @@ async fn try_single_range_stream(
     client: &mut CompactTxStreamerClient<AuthenticatedChannel>,
     request: BlockRange,
     frame_delay: Duration,
+    probe_id: Option<u64>,
     logical_started: Instant,
 ) -> Result<StreamSample, Status> {
-    let mut stream = client.get_block_range(request).await?.into_inner();
+    let mut tonic_req = tonic::Request::new(request);
+    if let Some(id) = probe_id
+        && let Ok(val) = id.to_string().parse()
+    {
+        tonic_req
+            .metadata_mut()
+            .insert(crate::recorder::BENCH_PROBE_ID_HEADER, val);
+    }
+    let mut stream = client.get_block_range(tonic_req).await?.into_inner();
     let mut first_elapsed = None;
     let mut frames = 0_u64;
     let mut payload_bytes = 0_u64;
@@ -1139,7 +1305,7 @@ async fn try_single_range_stream(
         }
         frames = frames.saturating_add(1);
         payload_bytes =
-            payload_bytes.saturating_add(u64::try_from(block.encode_to_vec().len()).unwrap_or(0));
+            payload_bytes.saturating_add(u64::try_from(block.encoded_len()).unwrap_or(0));
         if !frame_delay.is_zero() {
             tokio::time::sleep(frame_delay).await;
         }
@@ -1150,6 +1316,7 @@ async fn try_single_range_stream(
         total_elapsed: logical_started.elapsed(),
         frames,
         payload_bytes,
+        retries: 0,
     })
 }
 
@@ -1181,28 +1348,33 @@ fn range_request(start: u32, end: u32) -> BlockRange {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         error::Error,
         future::Future as _,
         task::{Context, Waker},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
+    use parking_lot::Mutex;
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ErrorCollector, ReaderFleetContext, ServedState, WriterMode, WriterProgress,
-        await_commit_progress_or_done,
+        ErrorCollector, ReaderFleetContext, ServedState, TailTrackers, WriterMode, WriterProgress,
+        await_commit_progress_or_done, await_next_tip_poll, drain_committed_delays,
+        run_active_tail_loop, streamer_client, verify_cold_tail_events, verify_warm_tail_events,
     };
-    use crate::active_writer_publication::{
-        ActiveWriterPublicationConfig, serving::EncodedTailMetricSnapshot, trace::WorkloadTrace,
+    use crate::{
+        active_writer_publication::{
+            ActiveWriterPublicationConfig, serving::EncodedTailMetricSnapshot, trace::WorkloadTrace,
+        },
+        recorder::EncodedTailLookupRecord,
     };
 
-    #[tokio::test]
-    async fn await_commit_progress_or_done_wakes_via_level_triggered_watch()
-    -> Result<(), Box<dyn Error>> {
-        let (writer_tx, writer_rx) = watch::channel(WriterProgress::default());
-        let (_served_tx, served_rx) = watch::channel(ServedState::default());
+    fn test_ctx(
+        writer_rx: watch::Receiver<WriterProgress>,
+        served_rx: watch::Receiver<ServedState>,
+    ) -> Result<ReaderFleetContext, Box<dyn Error>> {
         let (prom_handle, _) = EncodedTailMetricSnapshot::install_and_capture()?;
         let config = ActiveWriterPublicationConfig {
             base_blocks: 20,
@@ -1213,7 +1385,7 @@ mod tests {
             ..ActiveWriterPublicationConfig::default()
         };
         let trace = WorkloadTrace::build(&config, 16, Vec::new(), Vec::new(), Vec::new());
-        let ctx = ReaderFleetContext {
+        Ok(ReaderFleetContext {
             mode: WriterMode::IngestActive,
             trace,
             sample_v5_tx: std::sync::Arc::new(vec![0_u8; 32]),
@@ -1225,9 +1397,37 @@ mod tests {
                 parking_lot::Mutex::new(ErrorCollector::default()),
             ),
             prom_handle,
+            server_port: 0,
             quiescent_rotator: None,
             rotation_requester: None,
-        };
+        })
+    }
+
+    fn lookup_event(
+        outcome: &str,
+        (tail_generation, chain_epoch, catalog_end_height): (u64, u64, u32),
+        range_end: u32,
+        byte_capped: bool,
+    ) -> EncodedTailLookupRecord {
+        EncodedTailLookupRecord {
+            order: "descending".to_owned(),
+            range_start: range_end.saturating_sub(5),
+            range_end,
+            outcome: outcome.to_owned(),
+            chain_epoch,
+            visible_tip_height: 26,
+            catalog_end_height,
+            tail_generation,
+            byte_capped,
+        }
+    }
+
+    #[tokio::test]
+    async fn await_commit_progress_or_done_wakes_via_level_triggered_watch()
+    -> Result<(), Box<dyn Error>> {
+        let (writer_tx, writer_rx) = watch::channel(WriterProgress::default());
+        let (_served_tx, served_rx) = watch::channel(ServedState::default());
+        let ctx = test_ctx(writer_rx, served_rx)?;
 
         let noop_waker = Waker::noop();
         {
@@ -1243,6 +1443,138 @@ mod tests {
         let mut already_done = std::pin::pin!(await_commit_progress_or_done(&ctx, 99));
         let mut cx = Context::from_waker(noop_waker);
         assert!(already_done.as_mut().poll(&mut cx).is_ready());
+        Ok(())
+    }
+
+    #[test]
+    fn verify_cold_and_warm_tail_events_require_matching_rebuild_hit_and_snapshot() {
+        let cold_rebuild = [lookup_event("rebuild", (11, 5, 16), 26, false)];
+        let verified = verify_cold_tail_events(&cold_rebuild);
+        assert!(verified.is_some());
+        let Some(cold_meta) = verified else {
+            return;
+        };
+        assert!(verify_warm_tail_events(
+            &[lookup_event("hit", (11, 5, 16), 26, false)],
+            cold_meta,
+        ));
+        assert!(!verify_warm_tail_events(
+            &[lookup_event("hit", (12, 5, 16), 26, false)],
+            cold_meta,
+        ));
+        assert!(!verify_warm_tail_events(
+            &[lookup_event("hit", (11, 6, 16), 26, false)],
+            cold_meta,
+        ));
+        assert!(!verify_warm_tail_events(
+            &[lookup_event("hit", (11, 5, 32), 26, false)],
+            cold_meta,
+        ));
+        assert!(verify_cold_tail_events(&[lookup_event("hit", (11, 5, 16), 26, false)]).is_none());
+
+        let capped_cold = [
+            lookup_event("rebuild", (15, 7, 0), 26, true),
+            lookup_event("fallback_native", (0, 7, 0), 18, false),
+        ];
+        assert!(verify_cold_tail_events(&capped_cold).is_some());
+        let bad_uncapped = [
+            lookup_event("rebuild", (15, 7, 0), 26, false),
+            lookup_event("fallback_native", (0, 7, 0), 18, false),
+        ];
+        assert!(verify_cold_tail_events(&bad_uncapped).is_none());
+    }
+
+    #[tokio::test]
+    async fn coalesced_serving_caught_up_done_stops_active_tail_loop_before_idle_probe()
+    -> Result<(), Box<dyn Error>> {
+        let (_writer_tx, writer_rx) = watch::channel(WriterProgress::default());
+        let (_served_tx, served_rx) = watch::channel(ServedState {
+            tip_height: 26,
+            epoch_id: 2,
+            generation_seq: 2,
+            catalog_end_height: None,
+            catalog_generation: 0,
+            serving_caught_up_done: true,
+        });
+        let mut ctx = test_ctx(writer_rx, served_rx)?;
+        let channel = tonic::service::interceptor::InterceptedService::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            zinder_runtime::BearerTokenClientInterceptor::new(None)?,
+        );
+        let mut client = streamer_client(channel);
+        let mut trackers = TailTrackers::default();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run_active_tail_loop(&mut client, &mut ctx, &mut trackers),
+        )
+        .await?;
+        assert_eq!(trackers.cold.finish().completion_ms.samples, 0);
+        assert_eq!(trackers.warm.finish().completion_ms.samples, 0);
+        assert_eq!(ctx.error_collector.lock().unexpected_grpc_errors, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn drain_committed_delays_handles_post_observation_commit_instants() {
+        let base = Instant::now();
+        let commit_instants = Mutex::new(BTreeMap::from([
+            (10_u32, base),
+            (11_u32, base + Duration::from_millis(12)),
+        ]));
+        let observed_at = base + Duration::from_millis(7);
+        let mut lags = Vec::new();
+
+        drain_committed_delays(&commit_instants, 10, observed_at, &mut lags);
+        assert_eq!(lags, vec![Duration::from_millis(7)]);
+        assert!(commit_instants.lock().contains_key(&11));
+
+        // Height 11 observed at `observed_at` before the writer records the
+        // post-commit histogram entry at `base + 12ms`, then drained on exit.
+        drain_committed_delays(&commit_instants, 11, observed_at, &mut lags);
+        assert_eq!(lags, vec![Duration::from_millis(7), Duration::ZERO]);
+        assert!(commit_instants.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn await_next_tip_poll_continues_after_served_sender_drops_when_done()
+    -> Result<(), Box<dyn Error>> {
+        let (_writer_tx, writer_rx) = watch::channel(WriterProgress::default());
+        let (served_tx, served_rx) = watch::channel(ServedState::default());
+        let mut ctx = test_ctx(writer_rx, served_rx)?;
+        served_tx.send_modify(|state| state.serving_caught_up_done = true);
+        drop(served_tx);
+        let _ = *ctx.served_rx.borrow_and_update();
+
+        let mut served_open = true;
+        let first = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_next_tip_poll(&mut ctx, &mut served_open),
+        )
+        .await?;
+        assert!(first);
+        assert!(!served_open);
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_next_tip_poll(&mut ctx, &mut served_open),
+        )
+        .await?;
+        assert!(second);
+        assert!(!served_open);
+
+        let (_writer_tx2, writer_rx2) = watch::channel(WriterProgress::default());
+        let (abnormal_tx, abnormal_rx) = watch::channel(ServedState::default());
+        let mut abnormal_ctx = test_ctx(writer_rx2, abnormal_rx)?;
+        drop(abnormal_tx);
+        let mut abnormal_open = true;
+        let abnormal = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_next_tip_poll(&mut abnormal_ctx, &mut abnormal_open),
+        )
+        .await?;
+        assert!(!abnormal);
+        assert!(!abnormal_open);
         Ok(())
     }
 }
