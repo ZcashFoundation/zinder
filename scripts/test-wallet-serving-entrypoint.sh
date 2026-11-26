@@ -1088,7 +1088,27 @@ test_deployment_profile_resolution() {
     *) test_failure "explorer ingest.toml with views=false accepted light-wallet: '$fail_message'" ;;
   esac
 
-  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS ZINDER_STORAGE__RAW_BLOB_POLICY
+  # Explicit transactions/all overrides leave ZINDER_DEPLOYMENT__PROFILE unset
+  # so existing pre-profile volumes reopen in place.
+  ingest_config_path="$wallet_ingest_toml"
+  for legacy_policy in transactions all; do
+    unset ZINDER_DEPLOYMENT__PROFILE
+    fail_message=""
+    ZINDER_STORAGE__RAW_BLOB_POLICY="$legacy_policy" resolve_deployment_profile \
+      || test_failure "ZINDER_STORAGE__RAW_BLOB_POLICY=$legacy_policy without profile failed: $fail_message"
+    [ -z "${ZINDER_DEPLOYMENT__PROFILE:-}" ] \
+      || test_failure "ZINDER_STORAGE__RAW_BLOB_POLICY=$legacy_policy unexpectedly injected ZINDER_DEPLOYMENT__PROFILE=$ZINDER_DEPLOYMENT__PROFILE"
+  done
+
+  for bad_policy in none "" unknown; do
+    unset ZINDER_DEPLOYMENT__PROFILE
+    fail_message=""
+    ZINDER_STORAGE__RAW_BLOB_POLICY="$bad_policy" resolve_deployment_profile || true
+    [ -n "$fail_message" ] \
+      || test_failure "ZINDER_STORAGE__RAW_BLOB_POLICY='$bad_policy' without profile unexpectedly succeeded"
+  done
+
   ingest_config_path="$saved_ingest_config_path"
 }
 test_deployment_profile_resolution
@@ -1105,6 +1125,7 @@ STUB
 chmod +x "$scoping_root/bin/setpriv"
 
 # The subshell keeps the fixture environment out of the rest of this test.
+# shellcheck disable=SC2030,SC2031
 (
   export SCOPING_RECEIVED_DIR="$scoping_root/received"
   export ZINDER_DEPLOYMENT__PROFILE=wallet-archive
@@ -1185,6 +1206,40 @@ assert_received_by ZINDER_WALLET_SERVING__LIGHTWALLETD
 assert_received_by ZINDER_EXPLORER__LISTEN_ADDR
 assert_received_by INGEST_CONTROL_BEARER_TOKEN
 assert_received_by CHECKPOINT_BEARER_TOKEN
+
+# Legacy pre-profile volumes override storage.raw_blob_policy directly and must
+# leave ZINDER_DEPLOYMENT__PROFILE unset while routing raw_blob_policy to all
+# four runtimes.
+rm -f "$scoping_root/received"/*
+# shellcheck disable=SC2030,SC2031
+(
+  export SCOPING_RECEIVED_DIR="$scoping_root/received"
+  ingest_config_path="$repository_root/deploy/config/wallet-serving/ingest.toml"
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  export ZINDER_STORAGE__RAW_BLOB_POLICY=transactions
+  resolve_deployment_profile
+  [ -z "${ZINDER_DEPLOYMENT__PROFILE:-}" ] \
+    || test_failure "legacy transactions override unexpectedly injected ZINDER_DEPLOYMENT__PROFILE"
+  export ZINDER_NETWORK__NAME=zcash-testnet
+  export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232
+  export ZINDER_WALLET__SECONDARY_PATH=/var/lib/zinder/query/wallet-secondary
+  export INGEST_CONTROL_BEARER_TOKEN=fixture-token
+  export CHECKPOINT_BEARER_TOKEN=fixture-token
+  stub_path="$scoping_root/bin:$PATH"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-ingest /etc/zinder/ingest.toml "$ingest_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-projector /etc/zinder/projector.toml "$projector_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-query /etc/zinder/query.toml "$query_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-compat-lightwalletd /etc/zinder/compat-lightwalletd.toml \
+    "$compat_config_paths"
+  wait
+)
+assert_received_by ZINDER_STORAGE__RAW_BLOB_POLICY \
+  zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
+assert_received_by ZINDER_DEPLOYMENT__PROFILE
 
 unread_names="$(
   ZINDER_EXPLORER__LISTEN_ADDR=127.0.0.1:9068 \

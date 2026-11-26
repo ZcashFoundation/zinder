@@ -923,9 +923,12 @@ ingest_config_disables_explorer_views() {
 }
 
 # Resolves ZINDER_DEPLOYMENT__PROFILE for the single-volume wallet topology.
-# When ingest.toml sets explorer_views = false and ZINDER_INGEST__EXPLORER_VIEWS
-# does not enable them, an unset profile defaults to wallet. light-wallet and
-# any combination with Explorer views fail closed.
+# When ingest.toml sets explorer_views = false, ZINDER_INGEST__EXPLORER_VIEWS
+# does not enable them, and ZINDER_STORAGE__RAW_BLOB_POLICY is unset, an
+# unset profile defaults to wallet. Explicit raw-blob policies for existing
+# volumes (transactions or all) run without injecting a profile so pre-profile
+# stores reopen in place. light-wallet and any combination with Explorer views
+# fail closed.
 resolve_deployment_profile() {
   explorer_views_env="$(zinder_setting ingest.explorer_views)"
   explorer_views_env_lower="$(printf '%s' "$explorer_views_env" | tr '[:upper:]' '[:lower:]')"
@@ -962,6 +965,20 @@ resolve_deployment_profile() {
         ;;
       *)
         fail "ZINDER_DEPLOYMENT__PROFILE must be wallet or wallet-archive, got '$deployment_profile'"
+        ;;
+    esac
+  elif zinder_setting_is_set storage.raw_blob_policy; then
+    raw_blob_policy="$(zinder_setting storage.raw_blob_policy)"
+    case "$raw_blob_policy" in
+      transactions | all) ;;
+      none)
+        if [ "$effective_explorer_views" -eq 1 ]; then
+          fail "ZINDER_STORAGE__RAW_BLOB_POLICY=none cannot be combined with Explorer views; use transactions or all, or disable Explorer views and leave raw_blob_policy unset for wallet"
+        fi
+        fail "ZINDER_STORAGE__RAW_BLOB_POLICY=none requires ZINDER_DEPLOYMENT__PROFILE=wallet (leave both unset to use the wallet default)"
+        ;;
+      *)
+        fail "ZINDER_STORAGE__RAW_BLOB_POLICY must be transactions or all when ZINDER_DEPLOYMENT__PROFILE is unset (got '$raw_blob_policy')"
         ;;
     esac
   elif [ "$config_explorer_views" -eq 0 ] && [ "$effective_explorer_views" -eq 0 ]; then
