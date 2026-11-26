@@ -8,10 +8,14 @@ mod tail;
 
 pub(crate) use catalog::PublishedShieldedCatalog;
 pub use catalog::{PublicationConcurrency, ShieldedCatalogPublisher};
+pub(crate) use history::PublishedRangeSelection;
 pub use history::PublishedShieldedHistory;
 pub(crate) use read::{PublishedBatchedRangeRead, PublishedRangeRead};
-pub use tail::EncodedTailTelemetry;
 pub(crate) use tail::ShieldedTailBuffer;
+pub use tail::{
+    EncodedTailLookupEvent, EncodedTailLookupObserver, EncodedTailLookupOutcome,
+    EncodedTailTelemetry,
+};
 
 use std::{collections::VecDeque, io, path::Path};
 

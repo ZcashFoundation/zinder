@@ -31,7 +31,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use zinder_compat_lightwalletd::{
-    CanonicalReaderSlot, LightwalletdGrpcAdapter, PublicationConcurrency, PublishedShieldedHistory,
+    CanonicalReaderSlot, EncodedTailLookupEvent, EncodedTailLookupObserver,
+    LightwalletdGrpcAdapter, PublicationConcurrency, PublishedShieldedHistory,
     ShieldedCatalogPublisher, TipWait,
 };
 use zinder_core::{BlockHeight, BlockId, ChainEpoch, Network, NetworkUpgradeActivations};
@@ -62,15 +63,15 @@ use super::{
     chain_fixture::{AdvancingChainSource, ChainSpecConfig, GeneratedChain, TemplateStores},
     mempool::{BenchmarkMempoolSurface, as_mempool_surface, create_tip_watcher},
     readers::{
-        FleetSignals, ParityProbeRequest, ReaderFleetOutput, ReaderFleetSpec,
+        FleetSignals, ParityProbeRequest, ReaderFleetChannels, ReaderFleetOutput, ReaderFleetSpec,
         collect_final_tip_parity, spawn_reader_fleet,
     },
     report::{
         ACTIVE_WRITER_PUBLICATION_CONTRACT, ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION,
-        ActiveWriterPublicationReport, ByteParityReport, IngestStageMetrics, IoModeReport,
-        LatencySummaryMs, ModeDifferential, ModeParityDigests, ModeReport, ProjectorMetrics,
-        PublisherMetrics, RocksDbActivityReport, StoreTickerDelta, TickerCounterSnapshot,
-        WorkloadGeometryReport, WriterFsyncCounts, WriterMode,
+        ActiveWriterPublicationReport, ByteParityReport, DifferentialBaselines, IngestStageMetrics,
+        IoModeReport, LatencySummaryMs, ModeDifferential, ModeParityDigests, ModeReport,
+        ProjectorMetrics, PublisherMetrics, RocksDbActivityReport, StoreTickerDelta,
+        TickerCounterSnapshot, WorkloadGeometryReport, WriterFsyncCounts, WriterMode,
     },
 };
 
@@ -186,21 +187,21 @@ fn build_matched_differentials(
     active_modes
         .iter()
         .map(|candidate| {
-            if candidate.mode == WriterMode::IngestProjectorAndPublisher {
-                ModeDifferential::between(
-                    published_baseline,
-                    "published_quiescent_control",
-                    true,
-                    candidate,
-                )
-            } else {
-                ModeDifferential::between(
-                    unpublished_baseline,
-                    "quiescent_control",
-                    false,
-                    candidate,
-                )
-            }
+            let (baseline_label, baseline_catalog_published) =
+                if candidate.mode == WriterMode::IngestProjectorAndPublisher {
+                    ("published_quiescent_control", true)
+                } else {
+                    ("quiescent_control", false)
+                };
+            ModeDifferential::between(
+                DifferentialBaselines {
+                    unpublished: unpublished_baseline,
+                    published: published_baseline,
+                    baseline_label,
+                    baseline_catalog_published,
+                },
+                candidate,
+            )
         })
         .collect()
 }
@@ -247,6 +248,13 @@ fn validate_config(config: &ActiveWriterPublicationConfig) -> Result<(), BenchEr
     if config.mempool_churn_sizes.is_empty() {
         return Err(BenchError::invalid_argument(
             "mempool_churn_sizes must name at least one batch size",
+        ));
+    }
+    if u64::from(config.live_blocks)
+        < u64::try_from(config.mempool_churn_sizes.len()).unwrap_or(u64::MAX)
+    {
+        return Err(BenchError::invalid_argument(
+            "live_blocks must be at least mempool_churn_sizes.len() so every mempool tier overlaps live commits",
         ));
     }
     let base_settled = config
@@ -346,6 +354,13 @@ fn tickers_reader_budget() -> RocksDbResourceBudget {
     budget
 }
 
+struct ModeServers {
+    fleet_shutdown: oneshot::Sender<()>,
+    fleet_task: JoinHandle<()>,
+    tail_shutdown: oneshot::Sender<()>,
+    tail_task: JoinHandle<()>,
+}
+
 struct ModeRuntimeBootstrap {
     paths: ModePaths,
     boundary_height: u32,
@@ -354,11 +369,60 @@ struct ModeRuntimeBootstrap {
     history: Arc<PublishedShieldedHistory>,
     mempool: Arc<BenchmarkMempoolSurface>,
     tip_watcher_tx: watch::Sender<u64>,
-    server_shutdown: oneshot::Sender<()>,
-    server_task: JoinHandle<()>,
+    servers: ModeServers,
     channel: AuthenticatedChannel,
+    tail_channel: AuthenticatedChannel,
+    tail_lookup_events: Arc<Mutex<Vec<EncodedTailLookupEvent>>>,
     signals: Arc<FleetSignals>,
     fleet_spec: ReaderFleetSpec,
+}
+
+async fn spawn_mode_servers(
+    slot: CanonicalReaderSlot,
+    history: &Arc<PublishedShieldedHistory>,
+    mempool: &Arc<BenchmarkMempoolSurface>,
+    tip_watcher: zinder_compat_lightwalletd::SharedTipChangeWatcher,
+    tail_lookup_events: &Arc<Mutex<Vec<EncodedTailLookupEvent>>>,
+) -> Result<(ModeServers, AuthenticatedChannel, AuthenticatedChannel), BenchError> {
+    let (fleet_addr, fleet_shutdown, fleet_task) = spawn_compat_grpc_server(CompatServerDeps {
+        slot: slot.clone(),
+        history: Arc::clone(history),
+        mempool: Arc::clone(mempool),
+        tip_watcher: Arc::clone(&tip_watcher),
+        tail_observer: None,
+    })
+    .await?;
+    let observer_sink = Arc::clone(tail_lookup_events);
+    let tail_observer: EncodedTailLookupObserver =
+        Arc::new(move |event| observer_sink.lock().push(event));
+    let (tail_addr, tail_shutdown, tail_task) = match spawn_compat_grpc_server(CompatServerDeps {
+        slot,
+        history: Arc::clone(history),
+        mempool: Arc::clone(mempool),
+        tip_watcher,
+        tail_observer: Some(tail_observer),
+    })
+    .await
+    {
+        Ok(spawned) => spawned,
+        Err(err) => {
+            let _ = fleet_shutdown.send(());
+            let _ = fleet_task.await;
+            return Err(err);
+        }
+    };
+    let channel = connect_channel(fleet_addr).await?;
+    let tail_channel = connect_channel(tail_addr).await?;
+    Ok((
+        ModeServers {
+            fleet_shutdown,
+            fleet_task,
+            tail_shutdown,
+            tail_task,
+        },
+        channel,
+        tail_channel,
+    ))
 }
 
 async fn bootstrap_mode_runtime(
@@ -409,15 +473,15 @@ async fn bootstrap_mode_runtime(
     );
     let mempool = BenchmarkMempoolSurface::new(initial_epoch);
     let (tip_watcher_tx, tip_watcher) = create_tip_watcher(initial_epoch.id);
-
-    let (server_addr, server_shutdown, server_task) = spawn_compat_grpc_server(
+    let tail_lookup_events = Arc::new(Mutex::new(Vec::new()));
+    let (servers, channel, tail_channel) = spawn_mode_servers(
         reader_pool.capture_slot(),
-        Arc::clone(&history),
-        Arc::clone(&mempool),
+        &history,
+        &mempool,
         tip_watcher,
+        &tail_lookup_events,
     )
     .await?;
-    let channel = connect_channel(server_addr).await?;
 
     let signals = FleetSignals::new(initial_tip, initial_epoch.id.value());
     let fleet_spec = ReaderFleetSpec {
@@ -440,21 +504,20 @@ async fn bootstrap_mode_runtime(
         history,
         mempool,
         tip_watcher_tx,
-        server_shutdown,
-        server_task,
+        servers,
         channel,
+        tail_channel,
+        tail_lookup_events,
         signals,
         fleet_spec,
     })
 }
 
-async fn shutdown_mode_runtime(
-    server_shutdown: oneshot::Sender<()>,
-    server_task: JoinHandle<()>,
-    reader_pool: Arc<ReaderSecondaryPool>,
-) {
-    let _ = server_shutdown.send(());
-    let _ = server_task.await;
+async fn shutdown_mode_runtime(servers: ModeServers, reader_pool: Arc<ReaderSecondaryPool>) {
+    let _ = servers.fleet_shutdown.send(());
+    let _ = servers.tail_shutdown.send(());
+    let _ = servers.fleet_task.await;
+    let _ = servers.tail_task.await;
     drop(reader_pool);
 }
 
@@ -464,8 +527,23 @@ async fn run_mode_workload(
     chain: &GeneratedChain,
     boot: &mut ModeRuntimeBootstrap,
 ) -> Result<(ActiveOutcome, ReaderFleetOutput), BenchError> {
+    let source = AdvancingChainSource::new(chain, chain.base_tip_height);
+    run_mode_workload_with_source(run_spec, config, chain, boot, source).await
+}
+
+async fn run_mode_workload_with_source(
+    run_spec: ModeRunSpec,
+    config: &ActiveWriterPublicationConfig,
+    chain: &GeneratedChain,
+    boot: &mut ModeRuntimeBootstrap,
+    source: AdvancingChainSource,
+) -> Result<(ActiveOutcome, ReaderFleetOutput), BenchError> {
     let fleet_handle = spawn_reader_fleet(
-        boot.channel.clone(),
+        ReaderFleetChannels {
+            fleet: boot.channel.clone(),
+            tail: boot.tail_channel.clone(),
+            tail_lookup_events: Arc::clone(&boot.tail_lookup_events),
+        },
         boot.fleet_spec.clone(),
         Arc::clone(&boot.signals),
         Arc::clone(&boot.mempool),
@@ -488,24 +566,23 @@ async fn run_mode_workload(
                 tip_watcher_tx: &boot.tip_watcher_tx,
                 signals: &boot.signals,
                 publisher,
+                source,
             },
         )
         .await
         {
             Ok(outcome) => outcome,
             Err(err) => {
+                boot.signals.mark_writer_commits_done();
                 boot.signals.writer_done.store(true, Ordering::Release);
-                fleet_handle.abort();
-                let _ = fleet_handle.await;
+                fleet_handle.cancel_and_drain().await;
                 return Err(err);
             }
         }
     };
 
     boot.signals.writer_done.store(true, Ordering::Release);
-    let fleet_output = fleet_handle
-        .await
-        .map_err(|err| BenchError::canonical_read(err.to_string()))??;
+    let fleet_output = fleet_handle.join().await?;
     Ok((active_outcome, fleet_output))
 }
 
@@ -521,7 +598,7 @@ async fn run_single_mode(
     let (active_outcome, fleet_output) = match workload_res {
         Ok(outputs) => outputs,
         Err(err) => {
-            shutdown_mode_runtime(boot.server_shutdown, boot.server_task, boot.reader_pool).await;
+            shutdown_mode_runtime(boot.servers, boot.reader_pool).await;
             return Err(err);
         }
     };
@@ -539,7 +616,7 @@ async fn run_single_mode(
     )
     .await;
     let (reader_io_modes, reader_secondary_delta) = boot.reader_pool.collect_metrics();
-    shutdown_mode_runtime(boot.server_shutdown, boot.server_task, boot.reader_pool).await;
+    shutdown_mode_runtime(boot.servers, boot.reader_pool).await;
     let parity = parity_res?;
 
     let report = assemble_mode_report(ModeReportAssembly {
@@ -561,6 +638,7 @@ struct PipelineShared<'a> {
     tip_watcher_tx: &'a watch::Sender<u64>,
     signals: &'a Arc<FleetSignals>,
     publisher: Option<ShieldedCatalogPublisher>,
+    source: AdvancingChainSource,
 }
 
 #[derive(Default)]
@@ -702,7 +780,7 @@ async fn drive_active_pipelines(
     paths: &ModePaths,
     shared: PipelineShared<'_>,
 ) -> Result<ActiveOutcome, BenchError> {
-    let source = AdvancingChainSource::new(chain, chain.base_tip_height);
+    let source = shared.source.clone();
     let (canonical_store, canonical_io_mode, activations) =
         open_active_canonical_store(paths, chain)?;
     let signals = Arc::clone(shared.signals);
@@ -811,65 +889,75 @@ async fn run_writer_thread(
 ) -> Result<WriterThreadOutput, BenchError> {
     let (done_tx, done_rx) = oneshot::channel::<Result<WriterThreadOutput, BenchError>>();
     std::thread::spawn(move || {
-        let outcome = (|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|source_err| BenchError::tip_replay(source_err.to_string()))?;
-            let recorder = FollowStepRecorder::default();
-            let _guard = metrics::set_default_local_recorder(&recorder);
-            let readiness = ComposedReadiness::new(Readiness::default(), &[]);
-            let cancel = CancellationToken::new();
-
-            let ticker_before = capture_canonical_writer_tickers(&store);
-            let mut active_store = store;
-            let mut prepare_ms = Vec::new();
-            let mut commit_ms = Vec::new();
-
-            for raw_height in spec.start_height..=spec.end_height {
-                if !spec.commit_interval.is_zero() {
-                    std::thread::sleep(spec.commit_interval);
-                }
-                let target = BlockHeight::new(raw_height);
-                source.advance_tip_to(target);
-                recorder.clear();
-
-                let follower = CanonicalFollower::new(
-                    &source,
-                    Arc::clone(&activations),
-                    follow_config_for(target),
-                    &readiness,
-                    &cancel,
-                );
-                active_store = runtime.block_on(follow_canonical_tip(active_store, follower))?;
-                spec.signals.record_commit(raw_height);
-                spec.commit_wake.notify_waiters();
-
-                let step = recorder.take_step()?;
-                prepare_ms.push(step.prepare_secs * 1_000.0);
-                commit_ms.push(step.commit_secs * 1_000.0);
-            }
-
-            let delta = capture_canonical_writer_tickers(&active_store).delta_since(&ticker_before);
-            drop(active_store);
-            Ok(WriterThreadOutput {
-                ingest: IngestStageMetrics {
-                    live_prepare_ms: LatencySummaryMs::from_f64(&prepare_ms),
-                    live_commit_ms: LatencySummaryMs::from_f64(&commit_ms),
-                    blocks_committed: spec
-                        .end_height
-                        .saturating_sub(spec.start_height)
-                        .saturating_add(1),
-                },
-                delta,
-            })
-        })();
+        let outcome = execute_writer_commit_loop(store, &source, &activations, &spec);
+        spec.signals.mark_writer_commits_done();
         let _ = done_tx.send(outcome);
     });
 
     done_rx
         .await
         .map_err(|_| BenchError::tip_replay("writer thread terminated unexpectedly"))?
+}
+
+fn execute_writer_commit_loop(
+    store: RocksDbCanonicalStore,
+    source: &AdvancingChainSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+    spec: &WriterThreadSpec,
+) -> Result<WriterThreadOutput, BenchError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source_err| BenchError::tip_replay(source_err.to_string()))?;
+    let recorder = FollowStepRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+
+    let ticker_before = capture_canonical_writer_tickers(&store);
+    let mut active_store = store;
+    let mut prepare_ms = Vec::new();
+    let mut commit_ms = Vec::new();
+
+    for raw_height in spec.start_height..=spec.end_height {
+        if !spec.commit_interval.is_zero() {
+            std::thread::sleep(spec.commit_interval);
+        }
+        #[cfg(test)]
+        source.check_injected_failure(raw_height)?;
+        let target = BlockHeight::new(raw_height);
+        source.advance_tip_to(target);
+        recorder.clear();
+
+        let follower = CanonicalFollower::new(
+            source,
+            Arc::clone(activations),
+            follow_config_for(target),
+            &readiness,
+            &cancel,
+        );
+        active_store = runtime.block_on(follow_canonical_tip(active_store, follower))?;
+        spec.signals.record_commit(raw_height);
+        spec.commit_wake.notify_waiters();
+
+        let step = recorder.take_step()?;
+        prepare_ms.push(step.prepare_secs * 1_000.0);
+        commit_ms.push(step.commit_secs * 1_000.0);
+    }
+
+    let delta = capture_canonical_writer_tickers(&active_store).delta_since(&ticker_before);
+    drop(active_store);
+    Ok(WriterThreadOutput {
+        ingest: IngestStageMetrics {
+            live_prepare_ms: LatencySummaryMs::from_f64(&prepare_ms),
+            live_commit_ms: LatencySummaryMs::from_f64(&commit_ms),
+            blocks_committed: spec
+                .end_height
+                .saturating_sub(spec.start_height)
+                .saturating_add(1),
+        },
+        delta,
+    })
 }
 
 struct ProjectorOutput {
@@ -1461,11 +1549,16 @@ fn publish_quiescent_catalog(
     Ok(())
 }
 
-async fn spawn_compat_grpc_server(
+struct CompatServerDeps {
     slot: CanonicalReaderSlot,
     history: Arc<PublishedShieldedHistory>,
     mempool: Arc<BenchmarkMempoolSurface>,
     tip_watcher: zinder_compat_lightwalletd::SharedTipChangeWatcher,
+    tail_observer: Option<EncodedTailLookupObserver>,
+}
+
+async fn spawn_compat_grpc_server(
+    deps: CompatServerDeps,
 ) -> Result<(SocketAddr, oneshot::Sender<()>, JoinHandle<()>), BenchError> {
     let dummy_node = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
@@ -1473,17 +1566,20 @@ async fn spawn_compat_grpc_server(
         NodeAuth::None,
         Duration::from_secs(5),
     )?;
-    let adapter = LightwalletdGrpcAdapter::for_light_wallet(
-        slot,
+    let mut adapter = LightwalletdGrpcAdapter::for_light_wallet(
+        deps.slot,
         dummy_node,
         Duration::from_secs(2),
         NonZeroU32::new(4).unwrap_or(NonZeroU32::MIN),
         ForwardedReadLimit::default(),
     )
-    .with_published_shielded_history(history)
-    .with_mempool_surface(as_mempool_surface(mempool))
-    .with_tip_change_watcher(tip_watcher)
+    .with_published_shielded_history(deps.history)
+    .with_mempool_surface(as_mempool_surface(deps.mempool))
+    .with_tip_change_watcher(deps.tip_watcher)
     .with_tip_wait(TipWait::default());
+    if let Some(observer) = deps.tail_observer {
+        adapter = adapter.with_tail_lookup_observer(observer);
+    }
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1491,11 +1587,17 @@ async fn spawn_compat_grpc_server(
     let addr = listener
         .local_addr()
         .map_err(|source| BenchError::io("127.0.0.1:0", source))?;
+    let incoming = tokio_stream::StreamExt::map(TcpListenerStream::new(listener), |accepted| {
+        if let Ok(ref stream) = accepted {
+            let _ = stream.set_nodelay(true);
+        }
+        accepted
+    });
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         let _ = Server::builder()
             .add_service(adapter.into_server())
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+            .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown_rx.await;
             })
             .await;
@@ -1542,6 +1644,8 @@ fn assemble_mode_report(assembly: ModeReportAssembly) -> ModeReport {
         ingest: active.ingest,
         commit_to_served_tip_ms: fleet.commit_to_served_tip_ms,
         catalog_range: fleet.catalog_range,
+        catalog_range_unpublished: fleet.catalog_range_unpublished,
+        catalog_range_published: fleet.catalog_range_published,
         tail_refill: fleet.tail_refill,
         slow_boundary_range: fleet.slow_boundary_range,
         tree_state_ms: fleet.tree_state_ms,
@@ -1720,9 +1824,13 @@ impl metrics::Recorder for FollowStepRecorder {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{error::Error, num::NonZeroU32, sync::atomic::Ordering, time::Duration};
 
-    use super::{ActiveWriterPublicationConfig, validate_config};
+    use super::{
+        ActiveWriterPublicationConfig, AdvancingChainSource, ChainSpecConfig, GeneratedChain,
+        ModeRunSpec, TemplateStores, WriterMode, bootstrap_mode_runtime,
+        run_mode_workload_with_source, shutdown_mode_runtime, validate_config,
+    };
 
     #[test]
     fn validate_config_rejects_short_live_window_before_segment_seal() {
@@ -1746,5 +1854,66 @@ mod tests {
             ..ActiveWriterPublicationConfig::default()
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_fewer_live_blocks_than_mempool_tiers() {
+        let config = ActiveWriterPublicationConfig {
+            base_blocks: 67,
+            live_blocks: 1,
+            reorg_window_blocks: 4,
+            segment_blocks: NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+            mempool_churn_sizes: vec![50, 500],
+            ..ActiveWriterPublicationConfig::default()
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writer_failure_cancels_and_drains_fleet_projector_publisher_and_server()
+    -> Result<(), Box<dyn Error>> {
+        let config = ActiveWriterPublicationConfig {
+            base_blocks: 60,
+            live_blocks: 12,
+            reorg_window_blocks: 4,
+            segment_blocks: NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+            dense_block_cadence: 3,
+            dense_txs_per_block: 1,
+            commit_interval: Duration::from_millis(8),
+            slow_reader_frame_delay: Duration::from_millis(4),
+            mempool_churn_sizes: vec![50, 500],
+            quiescent_rounds: 3,
+        };
+        let chain = GeneratedChain::build(ChainSpecConfig {
+            base_blocks: config.base_blocks,
+            live_blocks: config.live_blocks,
+            reorg_window_blocks: config.reorg_window_blocks,
+            dense_block_cadence: config.dense_block_cadence,
+            dense_txs_per_block: config.dense_txs_per_block,
+        })?;
+        let template = TemplateStores::build(&chain).await?;
+        let run_spec = ModeRunSpec {
+            mode: WriterMode::IngestProjectorAndPublisher,
+            label: "ingest_projector_and_publisher",
+            publish_catalog: true,
+        };
+        let mut boot = bootstrap_mode_runtime(run_spec, &config, &chain, &template).await?;
+        let signals = std::sync::Arc::clone(&boot.signals);
+        let source = AdvancingChainSource::new(&chain, chain.base_tip_height)
+            .fail_at_height(config.base_blocks.saturating_add(2));
+
+        let workload_res = tokio::time::timeout(Duration::from_secs(15), async {
+            let outcome =
+                run_mode_workload_with_source(run_spec, &config, &chain, &mut boot, source).await;
+            shutdown_mode_runtime(boot.servers, boot.reader_pool).await;
+            outcome
+        })
+        .await?;
+
+        assert!(workload_res.is_err());
+        assert!(signals.fleet_cancel.is_cancelled());
+        assert!(signals.writer_commits_done.load(Ordering::Acquire));
+        assert!(signals.writer_done.load(Ordering::Acquire));
+        Ok(())
     }
 }

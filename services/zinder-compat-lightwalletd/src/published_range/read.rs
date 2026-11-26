@@ -14,7 +14,8 @@ use zinder_proto::{
 use zinder_store::{HeightOrder, ShieldedProjectionSelection};
 
 use super::{
-    PublishedShieldedCatalog,
+    EncodedTailLookupEvent, EncodedTailLookupObserver, EncodedTailLookupOutcome,
+    PublishedRangeSelection, PublishedShieldedCatalog,
     tail::{EncodedTail, Fence, ShieldedTailBuffer, TailReadLimits},
 };
 use crate::{
@@ -31,6 +32,9 @@ use crate::{
 pub(crate) struct PublishedRangeRead {
     history: Option<Arc<PublishedShieldedCatalog>>,
     tail: ShieldedTailBuffer,
+    catalog_generation: u64,
+    catalog_end_height: Option<u32>,
+    observer: Option<EncodedTailLookupObserver>,
     limits: crate::block_range::BlockRangeStreamLimit,
     shape: CompactBlockShape,
     is_descending: bool,
@@ -96,16 +100,14 @@ impl RangeChunk for PrebatchedChunk {
 }
 
 impl PublishedBatchedRangeRead {
-    pub(crate) fn new(
-        history: Option<Arc<PublishedShieldedCatalog>>,
-        tail: ShieldedTailBuffer,
+    pub(crate) fn from_selection(
+        selection: PublishedRangeSelection,
         shape: CompactBlockShape,
         is_descending: bool,
         limits: crate::block_range::BlockRangeStreamLimit,
     ) -> Self {
-        Self(PublishedRangeRead::new(
-            history,
-            tail,
+        Self(PublishedRangeRead::from_selection(
+            selection,
             shape,
             is_descending,
             limits,
@@ -163,6 +165,7 @@ enum AnchorPlan {
 }
 
 impl PublishedRangeRead {
+    #[cfg(test)]
     pub(crate) fn new(
         history: Option<Arc<PublishedShieldedCatalog>>,
         tail: ShieldedTailBuffer,
@@ -170,12 +173,47 @@ impl PublishedRangeRead {
         is_descending: bool,
         limits: crate::block_range::BlockRangeStreamLimit,
     ) -> Self {
+        let catalog_end_height = history.as_ref().map(|catalog| catalog.bounds().end.value());
+        Self::from_selection(
+            PublishedRangeSelection {
+                history,
+                tail,
+                catalog_generation: 0,
+                catalog_end_height,
+                observer: None,
+            },
+            shape,
+            is_descending,
+            limits,
+        )
+    }
+
+    pub(crate) fn from_selection(
+        selection: PublishedRangeSelection,
+        shape: CompactBlockShape,
+        is_descending: bool,
+        limits: crate::block_range::BlockRangeStreamLimit,
+    ) -> Self {
         Self {
-            history,
-            tail,
+            history: selection.history,
+            tail: selection.tail,
+            catalog_generation: selection.catalog_generation,
+            catalog_end_height: selection.catalog_end_height,
+            observer: selection.observer,
             limits,
             shape,
             is_descending,
+        }
+    }
+
+    fn notify_tail_lookup(&self, epoch: ChainEpoch, outcome: EncodedTailLookupOutcome) {
+        if let Some(observer) = &self.observer {
+            observer(EncodedTailLookupEvent {
+                catalog_generation: self.catalog_generation,
+                catalog_end_height: self.catalog_end_height,
+                epoch_id: epoch.id.value(),
+                outcome,
+            });
         }
     }
 
@@ -532,6 +570,7 @@ impl PublishedRangeRead {
         let Some(window_floor) =
             ShieldedTailBuffer::window_floor(epoch, fence.1, catalog_end.map(|(end, _)| end))
         else {
+            self.notify_tail_lookup(epoch, EncodedTailLookupOutcome::Bypass);
             return if catalog_end.is_some() && self.covers_selected_history(*chunk) {
                 AnchorPlan::UseEncoded(None)
             } else {
@@ -539,6 +578,7 @@ impl PublishedRangeRead {
             };
         };
         if chunk.end < window_floor {
+            self.notify_tail_lookup(epoch, EncodedTailLookupOutcome::Bypass);
             return if catalog_end.is_some() && self.covers_selected_history(*chunk) {
                 AnchorPlan::UseEncoded(None)
             } else {
@@ -547,7 +587,7 @@ impl PublishedRangeRead {
         }
         match self
             .tail
-            .load_or_refresh(
+            .load_or_refresh_with_outcome(
                 (reads, view, cancel),
                 catalog_end,
                 *chunk,
@@ -558,14 +598,21 @@ impl PublishedRangeRead {
             )
             .await
         {
-            Ok(Some(live)) => self.encoded_span(*chunk, self.order(), &live).map_or_else(
-                || AnchorPlan::FallbackNative,
-                |span| {
-                    *chunk = span;
-                    AnchorPlan::UseEncoded(Some(live))
-                },
-            ),
-            Ok(None) => AnchorPlan::FallbackNative,
+            Ok((live_opt, outcome)) => {
+                self.notify_tail_lookup(epoch, outcome);
+                live_opt.map_or_else(
+                    || AnchorPlan::FallbackNative,
+                    |live| {
+                        self.encoded_span(*chunk, self.order(), &live).map_or_else(
+                            || AnchorPlan::FallbackNative,
+                            |span| {
+                                *chunk = span;
+                                AnchorPlan::UseEncoded(Some(live))
+                            },
+                        )
+                    },
+                )
+            }
             // Cancellation and an expired pin end this read as the native path
             // would. A tail that fails to build spans heights beyond this
             // chunk, so the native read reports any fault at the chunk that

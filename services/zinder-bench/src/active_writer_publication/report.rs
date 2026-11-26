@@ -311,6 +311,10 @@ pub struct MempoolTierMetrics {
     pub mempool_tx_stream: StreamLatencyReport,
     /// `GetMempoolStream` tip-change closure observations.
     pub mempool_stream_closures: u64,
+    /// Whether this tier overlapped active canonical writer commits.
+    pub writer_overlap_verified: bool,
+    /// Live commits completed while this mempool tier's probes ran.
+    pub commits_observed_during_tier: u32,
 }
 
 /// Resolved filesystem I/O modes reported by `RocksDB` (`"direct"` or `"buffered"`).
@@ -396,6 +400,10 @@ pub struct ModeReport {
     pub commit_to_served_tip_ms: LatencySummaryMs,
     /// Ordinary settled catalog `GetBlockRange` timing (`first_frame` and `completion`).
     pub catalog_range: StreamLatencyReport,
+    /// Settled catalog samples served before an admitted signed catalog covered the range.
+    pub catalog_range_unpublished: StreamLatencyReport,
+    /// Settled catalog samples served once an admitted signed catalog covered the full range.
+    pub catalog_range_published: StreamLatencyReport,
     /// Uncovered live-tail `GetBlockRange` timing, separating cold refill vs warm repeat.
     pub tail_refill: TailRefillMetrics,
     /// Slow reader `GetBlockRange` crossing the `4,096` segment boundary into live tail.
@@ -418,6 +426,19 @@ pub struct ModeReport {
     pub errors: ProtocolErrorCounts,
 }
 
+/// Matched quiescent baseline pair passed to [`ModeDifferential::between`].
+#[derive(Clone, Copy, Debug)]
+pub struct DifferentialBaselines<'a> {
+    /// Unpublished `quiescent_control` report (canonical storage baseline).
+    pub unpublished: &'a ModeReport,
+    /// Published `published_quiescent_control` report (signed catalog baseline).
+    pub published: &'a ModeReport,
+    /// Matched baseline label (`"quiescent_control"` or `"published_quiescent_control"`).
+    pub baseline_label: &'a str,
+    /// Whether the candidate's primary comparison uses the published catalog baseline.
+    pub baseline_catalog_published: bool,
+}
+
 /// Latency and activity deltas for one active mode compared to its matched quiescent baseline.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModeDifferential {
@@ -427,14 +448,22 @@ pub struct ModeDifferential {
     pub baseline_label: String,
     /// Whether the matched quiescent baseline held a published signed catalog.
     pub baseline_catalog_published: bool,
-    /// Change in settled catalog `GetBlockRange` completion p50 (ms).
-    pub catalog_completion_p50_delta_ms: f64,
-    /// Change in settled catalog `GetBlockRange` completion p95 (ms).
-    pub catalog_completion_p95_delta_ms: f64,
-    /// Change in cold tail refill completion p50 (ms).
-    pub cold_tail_completion_p50_delta_ms: f64,
-    /// Change in cold tail refill completion p95 (ms).
-    pub cold_tail_completion_p95_delta_ms: f64,
+    /// Change in phase-matched settled catalog `GetBlockRange` completion p50 (ms), if available.
+    pub catalog_completion_p50_delta_ms: Option<f64>,
+    /// Change in phase-matched settled catalog `GetBlockRange` completion p95 (ms), if available.
+    pub catalog_completion_p95_delta_ms: Option<f64>,
+    /// Change in unpublished canonical settled catalog completion p50 vs `quiescent_control` (ms).
+    pub unpublished_catalog_completion_p50_delta_ms: Option<f64>,
+    /// Change in unpublished canonical settled catalog completion p95 vs `quiescent_control` (ms).
+    pub unpublished_catalog_completion_p95_delta_ms: Option<f64>,
+    /// Change in signed-catalog settled completion p50 vs `published_quiescent_control` (ms).
+    pub published_catalog_completion_p50_delta_ms: Option<f64>,
+    /// Change in signed-catalog settled completion p95 vs `published_quiescent_control` (ms).
+    pub published_catalog_completion_p95_delta_ms: Option<f64>,
+    /// Change in cold tail refill completion p50 vs matched baseline (ms), if available.
+    pub cold_tail_completion_p50_delta_ms: Option<f64>,
+    /// Change in cold tail refill completion p95 vs matched baseline (ms), if available.
+    pub cold_tail_completion_p95_delta_ms: Option<f64>,
     /// Change in slow boundary-crossing completion p50 (ms).
     pub slow_boundary_completion_p50_delta_ms: f64,
     /// Change in `GetTreeState` p95 (ms).
@@ -443,41 +472,80 @@ pub struct ModeDifferential {
     pub reader_bytes_read_delta: i64,
 }
 
+fn optional_delta(
+    baseline: LatencySummaryMs,
+    candidate: LatencySummaryMs,
+    pick: fn(LatencySummaryMs) -> f64,
+) -> Option<f64> {
+    (baseline.samples > 0 && candidate.samples > 0).then(|| pick(candidate) - pick(baseline))
+}
+
 impl ModeDifferential {
-    /// Computes stage latency and secondary-read deltas relative to `baseline`.
+    /// Computes stage latency and secondary-read deltas relative to matched `baselines`.
     #[must_use]
-    pub fn between(
-        baseline: &ModeReport,
-        baseline_label: &str,
-        baseline_catalog_published: bool,
-        candidate: &ModeReport,
-    ) -> Self {
+    pub fn between(baselines: DifferentialBaselines<'_>, candidate: &ModeReport) -> Self {
+        let primary = if baselines.baseline_catalog_published {
+            baselines.published
+        } else {
+            baselines.unpublished
+        };
+        let unpublished_p50 = optional_delta(
+            baselines
+                .unpublished
+                .catalog_range_unpublished
+                .completion_ms,
+            candidate.catalog_range_unpublished.completion_ms,
+            |summary| summary.p50,
+        );
+        let unpublished_p95 = optional_delta(
+            baselines
+                .unpublished
+                .catalog_range_unpublished
+                .completion_ms,
+            candidate.catalog_range_unpublished.completion_ms,
+            |summary| summary.p95,
+        );
+        let published_p50 = optional_delta(
+            baselines.published.catalog_range_published.completion_ms,
+            candidate.catalog_range_published.completion_ms,
+            |summary| summary.p50,
+        );
+        let published_p95 = optional_delta(
+            baselines.published.catalog_range_published.completion_ms,
+            candidate.catalog_range_published.completion_ms,
+            |summary| summary.p95,
+        );
+        let (catalog_p50, catalog_p95) = if baselines.baseline_catalog_published {
+            (published_p50, published_p95)
+        } else {
+            (unpublished_p50, unpublished_p95)
+        };
         Self {
             mode: candidate.mode,
-            baseline_label: baseline_label.to_owned(),
-            baseline_catalog_published,
-            catalog_completion_p50_delta_ms: candidate.catalog_range.completion_ms.p50
-                - baseline.catalog_range.completion_ms.p50,
-            catalog_completion_p95_delta_ms: candidate.catalog_range.completion_ms.p95
-                - baseline.catalog_range.completion_ms.p95,
-            cold_tail_completion_p50_delta_ms: candidate
-                .tail_refill
-                .cold_after_advance
-                .completion_ms
-                .p50
-                - baseline.tail_refill.cold_after_advance.completion_ms.p50,
-            cold_tail_completion_p95_delta_ms: candidate
-                .tail_refill
-                .cold_after_advance
-                .completion_ms
-                .p95
-                - baseline.tail_refill.cold_after_advance.completion_ms.p95,
+            baseline_label: baselines.baseline_label.to_owned(),
+            baseline_catalog_published: baselines.baseline_catalog_published,
+            catalog_completion_p50_delta_ms: catalog_p50,
+            catalog_completion_p95_delta_ms: catalog_p95,
+            unpublished_catalog_completion_p50_delta_ms: unpublished_p50,
+            unpublished_catalog_completion_p95_delta_ms: unpublished_p95,
+            published_catalog_completion_p50_delta_ms: published_p50,
+            published_catalog_completion_p95_delta_ms: published_p95,
+            cold_tail_completion_p50_delta_ms: optional_delta(
+                primary.tail_refill.cold_after_advance.completion_ms,
+                candidate.tail_refill.cold_after_advance.completion_ms,
+                |summary| summary.p50,
+            ),
+            cold_tail_completion_p95_delta_ms: optional_delta(
+                primary.tail_refill.cold_after_advance.completion_ms,
+                candidate.tail_refill.cold_after_advance.completion_ms,
+                |summary| summary.p95,
+            ),
             slow_boundary_completion_p50_delta_ms: candidate.slow_boundary_range.completion_ms.p50
-                - baseline.slow_boundary_range.completion_ms.p50,
-            tree_state_p95_delta_ms: candidate.tree_state_ms.p95 - baseline.tree_state_ms.p95,
+                - primary.slow_boundary_range.completion_ms.p50,
+            tree_state_p95_delta_ms: candidate.tree_state_ms.p95 - primary.tree_state_ms.p95,
             reader_bytes_read_delta: saturating_i64_delta(
                 candidate.rocksdb_activity.reader_secondaries.bytes_read,
-                baseline.rocksdb_activity.reader_secondaries.bytes_read,
+                primary.rocksdb_activity.reader_secondaries.bytes_read,
             ),
         }
     }
@@ -647,45 +715,36 @@ mod tests {
         WriterMode,
     };
 
+    fn stream_json(first_p50: f64, completion_p50: f64) -> serde_json::Value {
+        serde_json::json!({
+            "first_frame_ms": { "samples": 1, "p50": first_p50, "p95": first_p50, "max": first_p50, "mean": first_p50 },
+            "completion_ms": { "samples": 1, "p50": completion_p50, "p95": completion_p50 * 2.0, "max": completion_p50 * 2.0, "mean": completion_p50 },
+            "frames_delivered": 10,
+            "payload_bytes_delivered": 100
+        })
+    }
+
     fn blank_mode_report(
         mode: WriterMode,
-        cat_p50: f64,
+        unpub_cat_p50: f64,
+        pub_cat_p50: f64,
         bytes_read: u64,
     ) -> Result<ModeReport, Box<dyn Error>> {
-        let mut base = serde_json::json!({
+        let zero_lat =
+            serde_json::json!({ "samples": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0 });
+        let zero_ticker = serde_json::json!({ "wal_synced": 0, "wal_bytes": 0, "flush_write_bytes": 0, "compact_read_bytes": 0, "compact_write_bytes": 0, "bytes_read": 0, "bytes_written": 0, "block_cache_data_hit": 0, "block_cache_data_miss": 0, "stall_micros": 0 });
+        let base = serde_json::json!({
             "mode": mode,
             "workload_duration_ms": 100.0,
-            "io_modes": {
-                "canonical_primary": null,
-                "canonical_secondaries": ["buffered"],
-                "wallet_primary": null,
-                "publisher_secondary": null
-            },
-            "ingest": {
-                "live_prepare_ms": { "samples": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0 },
-                "live_commit_ms": { "samples": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0 },
-                "blocks_committed": 0
-            },
-            "commit_to_served_tip_ms": { "samples": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0 },
-            "catalog_range": {
-                "first_frame_ms": { "samples": 1, "p50": 1.0, "p95": 1.0, "max": 1.0, "mean": 1.0 },
-                "completion_ms": { "samples": 1, "p50": cat_p50, "p95": cat_p50 * 2.0, "max": cat_p50 * 2.0, "mean": cat_p50 },
-                "frames_delivered": 10,
-                "payload_bytes_delivered": 100
-            },
+            "io_modes": { "canonical_primary": null, "canonical_secondaries": ["buffered"], "wallet_primary": null, "publisher_secondary": null },
+            "ingest": { "live_prepare_ms": zero_lat, "live_commit_ms": zero_lat, "blocks_committed": 0 },
+            "commit_to_served_tip_ms": zero_lat,
+            "catalog_range": stream_json(1.0, unpub_cat_p50),
+            "catalog_range_unpublished": stream_json(1.0, unpub_cat_p50),
+            "catalog_range_published": stream_json(0.5, pub_cat_p50),
             "tail_refill": {
-                "cold_after_advance": {
-                    "first_frame_ms": { "samples": 1, "p50": 2.0, "p95": 2.0, "max": 2.0, "mean": 2.0 },
-                    "completion_ms": { "samples": 1, "p50": 4.0, "p95": 6.0, "max": 6.0, "mean": 4.0 },
-                    "frames_delivered": 10,
-                    "payload_bytes_delivered": 100
-                },
-                "warm_repeat": {
-                    "first_frame_ms": { "samples": 1, "p50": 1.0, "p95": 1.0, "max": 1.0, "mean": 1.0 },
-                    "completion_ms": { "samples": 1, "p50": 2.0, "p95": 2.0, "max": 2.0, "mean": 2.0 },
-                    "frames_delivered": 10,
-                    "payload_bytes_delivered": 100
-                },
+                "cold_after_advance": { "first_frame_ms": { "samples": 1, "p50": 2.0, "p95": 2.0, "max": 2.0, "mean": 2.0 }, "completion_ms": { "samples": 1, "p50": 4.0, "p95": 6.0, "max": 6.0, "mean": 4.0 }, "frames_delivered": 10, "payload_bytes_delivered": 100 },
+                "warm_repeat": stream_json(1.0, 1.0),
                 "peak_tail_response_bytes": 100,
                 "peak_encoded_tail_bytes": 200,
                 "encoded_tail_byte_cap_evictions": 0,
@@ -694,35 +753,21 @@ mod tests {
                 "excluded_cross_epoch_pairs": 0,
                 "byte_cap_exceeded": false
             },
-            "slow_boundary_range": {
-                "first_frame_ms": { "samples": 1, "p50": 1.0, "p95": 1.0, "max": 1.0, "mean": 1.0 },
-                "completion_ms": { "samples": 1, "p50": 15.0, "p95": 20.0, "max": 20.0, "mean": 15.0 },
-                "frames_delivered": 10,
-                "payload_bytes_delivered": 100
-            },
+            "slow_boundary_range": { "first_frame_ms": { "samples": 1, "p50": 1.0, "p95": 1.0, "max": 1.0, "mean": 1.0 }, "completion_ms": { "samples": 1, "p50": 15.0, "p95": 20.0, "max": 20.0, "mean": 15.0 }, "frames_delivered": 10, "payload_bytes_delivered": 100 },
             "tree_state_ms": { "samples": 1, "p50": 0.5, "p95": 1.0, "max": 1.0, "mean": 0.5 },
             "mempool_churn": [],
-            "projector": {
-                "apply_ms": { "samples": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0 },
-                "transitions_applied": 0
-            },
-            "publisher": {
-                "total_ms": 0.0,
-                "segment_publish_ms": { "samples": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0 },
-                "segments_published": 0,
-                "catalog_refreshes": 0
-            },
+            "projector": { "apply_ms": zero_lat, "transitions_applied": 0 },
+            "publisher": { "total_ms": 0.0, "segment_publish_ms": zero_lat, "segments_published": 0, "catalog_refreshes": 0 },
             "writer_fsyncs": { "canonical_wal_synced": 0, "canonical_wal_bytes": 0, "wallet_wal_synced": 0, "wallet_wal_bytes": 0 },
             "node_rpcs": { "tip_id": 0, "fetch_block_at": 0, "fetch_chain_segment": 0, "fetch_chain_checkpoint": 0, "fetch_subtree_roots": 0, "total": 0 },
             "rocksdb_activity": {
-                "canonical_writer": { "wal_synced": 0, "wal_bytes": 0, "flush_write_bytes": 0, "compact_read_bytes": 0, "compact_write_bytes": 0, "bytes_read": 0, "bytes_written": 0, "block_cache_data_hit": 0, "block_cache_data_miss": 0, "stall_micros": 0 },
+                "canonical_writer": zero_ticker,
                 "reader_secondaries": { "wal_synced": 0, "wal_bytes": 0, "flush_write_bytes": 0, "compact_read_bytes": 0, "compact_write_bytes": 0, "bytes_read": bytes_read, "bytes_written": 0, "block_cache_data_hit": 0, "block_cache_data_miss": 0, "stall_micros": 0 },
-                "wallet_writer": { "wal_synced": 0, "wal_bytes": 0, "flush_write_bytes": 0, "compact_read_bytes": 0, "compact_write_bytes": 0, "bytes_read": 0, "bytes_written": 0, "block_cache_data_hit": 0, "block_cache_data_miss": 0, "stall_micros": 0 },
-                "publisher_secondary": { "wal_synced": 0, "wal_bytes": 0, "flush_write_bytes": 0, "compact_read_bytes": 0, "compact_write_bytes": 0, "bytes_read": 0, "bytes_written": 0, "block_cache_data_hit": 0, "block_cache_data_miss": 0, "stall_micros": 0 }
+                "wallet_writer": zero_ticker,
+                "publisher_secondary": zero_ticker
             },
             "errors": { "unexpected_grpc_errors": 0, "unexpected_error_samples": [], "transient_retry_count": 0 }
         });
-        base["mode"] = serde_json::json!(mode);
         Ok(serde_json::from_value(base)?)
     }
 
@@ -739,14 +784,74 @@ mod tests {
 
     #[test]
     fn differential_reports_signed_stage_and_read_byte_changes() -> Result<(), Box<dyn Error>> {
-        let baseline = blank_mode_report(WriterMode::QuiescentControl, 5.0, 2_000)?;
-        let candidate = blank_mode_report(WriterMode::IngestActive, 8.5, 1_500)?;
-        let diff = ModeDifferential::between(&baseline, "quiescent_control", false, &candidate);
+        let unpublished = blank_mode_report(WriterMode::QuiescentControl, 5.0, 2.0, 2_000)?;
+        let published = blank_mode_report(WriterMode::QuiescentControl, 4.0, 2.0, 1_800)?;
+        let candidate = blank_mode_report(WriterMode::IngestActive, 8.5, 3.5, 1_500)?;
+        let diff = ModeDifferential::between(
+            super::DifferentialBaselines {
+                unpublished: &unpublished,
+                published: &published,
+                baseline_label: "quiescent_control",
+                baseline_catalog_published: false,
+            },
+            &candidate,
+        );
         assert_eq!(diff.baseline_label, "quiescent_control");
         assert!(!diff.baseline_catalog_published);
-        assert!((diff.catalog_completion_p50_delta_ms - 3.5).abs() < f64::EPSILON);
-        assert!((diff.catalog_completion_p95_delta_ms - 7.0).abs() < f64::EPSILON);
+        assert!(
+            diff.catalog_completion_p50_delta_ms
+                .is_some_and(|delta| (delta - 3.5).abs() < f64::EPSILON)
+        );
+        assert!(
+            diff.catalog_completion_p95_delta_ms
+                .is_some_and(|delta| (delta - 7.0).abs() < f64::EPSILON)
+        );
+        assert!(
+            diff.published_catalog_completion_p50_delta_ms
+                .is_some_and(|delta| (delta - 1.5).abs() < f64::EPSILON)
+        );
         assert_eq!(diff.reader_bytes_read_delta, -500);
+        Ok(())
+    }
+
+    #[test]
+    fn differential_separates_catalog_phases_and_marks_empty_samples_unavailable()
+    -> Result<(), Box<dyn Error>> {
+        let mut unpublished = blank_mode_report(WriterMode::QuiescentControl, 5.0, 0.0, 2_000)?;
+        unpublished.catalog_range_published.completion_ms.samples = 0;
+        let mut published = blank_mode_report(WriterMode::QuiescentControl, 0.0, 2.0, 1_800)?;
+        published.catalog_range_unpublished.completion_ms.samples = 0;
+        let mut candidate =
+            blank_mode_report(WriterMode::IngestProjectorAndPublisher, 9.0, 3.5, 1_900)?;
+        candidate
+            .tail_refill
+            .cold_after_advance
+            .completion_ms
+            .samples = 0;
+
+        let diff = ModeDifferential::between(
+            super::DifferentialBaselines {
+                unpublished: &unpublished,
+                published: &published,
+                baseline_label: "published_quiescent_control",
+                baseline_catalog_published: true,
+            },
+            &candidate,
+        );
+        assert!(
+            diff.unpublished_catalog_completion_p50_delta_ms
+                .is_some_and(|delta| (delta - 4.0).abs() < f64::EPSILON)
+        );
+        assert!(
+            diff.published_catalog_completion_p50_delta_ms
+                .is_some_and(|delta| (delta - 1.5).abs() < f64::EPSILON)
+        );
+        assert_eq!(
+            diff.catalog_completion_p50_delta_ms,
+            diff.published_catalog_completion_p50_delta_ms
+        );
+        assert!(diff.cold_tail_completion_p50_delta_ms.is_none());
+        assert!(diff.cold_tail_completion_p95_delta_ms.is_none());
         Ok(())
     }
 

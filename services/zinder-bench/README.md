@@ -1458,15 +1458,19 @@ The four matched modes are `quiescent_control`, `ingest_active`,
 `ingest_and_projector`, and `ingest_projector_and_publisher`. Alongside the
 unpublished `quiescent_control` baseline (used for `ingest_active` and
 `ingest_and_projector`), the report records `published_quiescent_control` with a
-sealed signed catalog at the settled boundary so `ingest_projector_and_publisher`
-is compared against a matched catalog-backed baseline (`baseline_label` and
-`baseline_catalog_published` on each `ModeDifferential`). The JSON report
-records separate ingest prepare and commit latencies, commit-to-served-tip
-publication delay (`p50`, `p95`, `max`), range `first_frame` and `completion`
-latencies for settled catalog, cold-refill/warm live tail (verified with direct
-`EncodedTail` cache fill/hit/eviction and peak-byte telemetry, plus cross-epoch
-pair exclusion), and fixed-span slow boundary-crossing streams, mempool churn
-(`50` and `500` tx batches), writer WAL fsyncs (`wal.synced`), `NodeSource` RPC
-counts, per-role RocksDB flush/compaction and I/O modes (`direct` vs
-`buffered`), matched stage differentials, and final-tip byte-level reply
-parity.
+sealed signed catalog at the settled boundary so settled-catalog and cold-tail
+deltas in `ModeDifferential` compare phase-matched serving paths
+(`catalog_range_unpublished` vs `quiescent_control`, `catalog_range_published`
+vs `published_quiescent_control`, returning `null` if zero qualifying
+concurrent samples exist). The JSON report records separate ingest prepare and
+commit latencies, commit-to-served-tip publication delay (`p50`, `p95`, `max`),
+range `first_frame` and `completion` latencies for settled catalog phases,
+concurrent cold-refill/warm live tail pairs (verified via request-scoped
+`EncodedTailLookupEvent` `Rebuild`/`Hit` outcomes and `catalog_generation`
+stability on a dedicated observed adapter without idle fallback or serializing
+other readers), and fixed-span slow
+boundary-crossing streams, mempool churn (`50` and `500` tx batches) with
+per-tier `writer_overlap_verified` accounting, writer WAL fsyncs (`wal.synced`),
+`NodeSource` RPC counts, per-role RocksDB flush/compaction and I/O modes
+(`direct` vs `buffered`), phase-matched stage differentials, and final-tip
+raw wire-byte SHA-256 reply parity.

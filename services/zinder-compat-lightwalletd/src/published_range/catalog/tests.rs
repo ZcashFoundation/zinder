@@ -730,6 +730,141 @@ async fn a_signed_extension_prunes_covered_tail_rows_at_the_same_fence() -> Resu
 }
 
 #[tokio::test]
+async fn same_epoch_catalog_extension_advances_telemetry_generation_without_changing_epoch()
+-> Result<()> {
+    let fixture = Fixture::new()?;
+    let trusted_dir = tempdir()?;
+    let trusted_key = trusted_dir.path().join("publisher.pub");
+    fs::copy(&fixture.public, &trusted_key)?;
+    let (_store, source) = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(6))?;
+    let source = Arc::new(source);
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&source)?);
+    let history = super::super::PublishedShieldedHistory::follow_publisher(
+        fixture.directory.path(),
+        &trusted_key,
+        false,
+        source.as_ref(),
+    )
+    .await?;
+    let (catalog_opt, _) = history.encoded_range();
+    let initial_catalog = catalog_opt.ok_or_else(|| eyre!("expected initial catalog"))?;
+    let _filled = fill_tail(
+        &initial_catalog,
+        &source,
+        BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6)),
+    )
+    .await?;
+
+    let before = history.encoded_tail_telemetry();
+    assert_eq!(before.catalog_generation, 1);
+    assert_eq!(before.catalog_end_height, Some(2));
+    assert!(before.current_epoch_id.is_some());
+
+    assert!(publisher.publish_next(&source)?);
+    assert!(history.refresh(source.as_ref()).await?);
+
+    let after = history.encoded_tail_telemetry();
+    assert_eq!(after.current_epoch_id, before.current_epoch_id);
+    assert_eq!(after.cache_rebuilds, before.cache_rebuilds);
+    assert_eq!(after.catalog_generation, before.catalog_generation + 1);
+    assert!(after.catalog_end_height > before.catalog_end_height);
+    Ok(())
+}
+
+async fn read_tail_range_len(
+    reader: &crate::published_range::PublishedRangeRead,
+    slot: &crate::CanonicalReaderSlot,
+) -> usize {
+    use crate::block_methods::{ChunkRead, ChunkView, RangeSource as _};
+    use zinder_store::HeightOrder;
+
+    let read = ChunkRead {
+        chunk: BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(6)),
+        order: HeightOrder::Ascending,
+        max_bytes: crate::BLOCK_RANGE_CHUNK_MAX_BYTES,
+        view: ChunkView::Current,
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+    let answer = reader.read(slot, read, |_, rows| rows.len()).await;
+    answer.converted.unwrap_or(0)
+}
+
+#[tokio::test]
+async fn tail_lookup_observer_reports_request_scoped_rebuild_and_hit_isolated_from_unobserved_read()
+-> Result<()> {
+    use crate::{
+        CanonicalReaderSlot,
+        block_range::BlockRangeStreamLimit,
+        compact_block_messages::CompactBlockShape,
+        published_range::{
+            EncodedTailLookupEvent, EncodedTailLookupObserver, EncodedTailLookupOutcome,
+            PublishedRangeRead,
+        },
+    };
+    use parking_lot::Mutex;
+
+    let fixture = Fixture::new()?;
+    let trusted_dir = tempdir()?;
+    let trusted_key = trusted_dir.path().join("publisher.pub");
+    fs::copy(&fixture.public, &trusted_key)?;
+    let (_store, source) = reader(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(6))?;
+    let source = Arc::new(source);
+    let mut publisher = fixture.publisher()?;
+    assert!(publisher.publish_next(&source)?);
+    let history = super::super::PublishedShieldedHistory::follow_publisher(
+        fixture.directory.path(),
+        &trusted_key,
+        false,
+        source.as_ref(),
+    )
+    .await?;
+    let expected_epoch = source.chain_epoch().id.value();
+    let observed_events: Arc<Mutex<Vec<EncodedTailLookupEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let observer_sink = Arc::clone(&observed_events);
+    let observer: EncodedTailLookupObserver =
+        Arc::new(move |event| observer_sink.lock().push(event));
+
+    let shape = CompactBlockShape::for_range(&[])?;
+    let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+    let observed_reader = PublishedRangeRead::from_selection(
+        history.encoded_range_selection(Some(observer)),
+        shape,
+        false,
+        limit.clone(),
+    );
+    let unobserved_reader = PublishedRangeRead::from_selection(
+        history.encoded_range_selection(None),
+        shape,
+        false,
+        limit,
+    );
+    let slot = CanonicalReaderSlot::new(source);
+
+    assert_eq!(read_tail_range_len(&observed_reader, &slot).await, 4);
+    assert_eq!(read_tail_range_len(&unobserved_reader, &slot).await, 4);
+    assert_eq!(read_tail_range_len(&observed_reader, &slot).await, 4);
+    assert_eq!(
+        *observed_events.lock(),
+        vec![
+            EncodedTailLookupEvent {
+                catalog_generation: 1,
+                catalog_end_height: Some(2),
+                epoch_id: expected_epoch,
+                outcome: EncodedTailLookupOutcome::Rebuild,
+            },
+            EncodedTailLookupEvent {
+                catalog_generation: 1,
+                catalog_end_height: Some(2),
+                epoch_id: expected_epoch,
+                outcome: EncodedTailLookupOutcome::Hit,
+            },
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn descending_tail_chunk_defers_an_oversized_catalog_row_until_its_own_read() -> Result<()> {
     use crate::{
         CanonicalReaderSlot,

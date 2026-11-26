@@ -120,6 +120,35 @@ impl EncodedTailCounters {
     }
 }
 
+/// Outcome of one request-scoped live `EncodedTail` lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncodedTailLookupOutcome {
+    /// Request was satisfied directly from cached live-tail rows.
+    Hit,
+    /// Request triggered a full cold tail rebuild from canonical storage.
+    Rebuild,
+    /// Request prepended missing lower heights onto an existing live tail.
+    Prepend,
+    /// Request bypassed the tail cache (covered, stale, busy, or non-qualifying).
+    Bypass,
+}
+
+/// Request-scoped observation emitted when serving a live `EncodedTail` lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncodedTailLookupEvent {
+    /// Catalog snapshot generation attached to this request (`0` before first publication).
+    pub catalog_generation: u64,
+    /// Highest block height covered by the request's admitted catalog, if any.
+    pub catalog_end_height: Option<u32>,
+    /// Chain epoch identifier of the canonical view resolved for this request.
+    pub epoch_id: u64,
+    /// Cache lookup outcome experienced by this request.
+    pub outcome: EncodedTailLookupOutcome,
+}
+
+/// Observer callback invoked once per tail lookup on configured adapters.
+pub type EncodedTailLookupObserver = Arc<dyn Fn(EncodedTailLookupEvent) + Send + Sync>;
+
 /// Read-only cache and byte-cap telemetry observed on an in-memory live `EncodedTail`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EncodedTailTelemetry {
@@ -139,6 +168,10 @@ pub struct EncodedTailTelemetry {
     pub current_cached_bytes: u64,
     /// Chain epoch ID backing the currently cached tail, if any.
     pub current_epoch_id: Option<u64>,
+    /// Monotonic snapshot generation of the admitted catalog (`0` before first publication).
+    pub catalog_generation: u64,
+    /// Highest block height covered by the currently admitted signed catalog, if any.
+    pub catalog_end_height: Option<u32>,
 }
 
 pub(super) struct EncodedTail {
@@ -318,6 +351,8 @@ impl ShieldedTailBuffer {
                 .as_ref()
                 .map_or(0, |tail| u64::try_from(tail.bytes).unwrap_or(u64::MAX)),
             current_epoch_id: current.as_ref().map(|tail| tail.epoch.id.value()),
+            catalog_generation: 0,
+            catalog_end_height: None,
         }
     }
 
@@ -353,20 +388,33 @@ impl ShieldedTailBuffer {
         (floor <= epoch.visible_tip_height).then_some(floor)
     }
 
+    #[cfg(test)]
     pub(super) async fn load_or_refresh<Reads: CompactBlockReads>(
+        &self,
+        reads_ctx: (&Reads, &Reads::View, &CancellationToken),
+        catalog: Option<(BlockHeight, BlockId)>,
+        requested: BlockHeightRange,
+        limits: TailReadLimits,
+    ) -> Result<Option<Arc<EncodedTail>>, Status> {
+        self.load_or_refresh_with_outcome(reads_ctx, catalog, requested, limits)
+            .await
+            .map(|(tail, _)| tail)
+    }
+
+    pub(super) async fn load_or_refresh_with_outcome<Reads: CompactBlockReads>(
         &self,
         (reads, view, cancel): (&Reads, &Reads::View, &CancellationToken),
         catalog: Option<(BlockHeight, BlockId)>,
         requested: BlockHeightRange,
         limits: TailReadLimits,
-    ) -> Result<Option<Arc<EncodedTail>>, Status> {
+    ) -> Result<(Option<Arc<EncodedTail>>, EncodedTailLookupOutcome), Status> {
         let Some(CompactBlockFence {
             event_fence,
             history_bounds,
             source,
         }) = reads.tail_source(view)
         else {
-            return Ok(None);
+            return Ok((None, EncodedTailLookupOutcome::Bypass));
         };
         let source = ReadsTailSource {
             reads,
@@ -376,7 +424,7 @@ impl ShieldedTailBuffer {
             cancel,
             ascending_budget: limits.ascending_bytes,
         };
-        self.refresh(
+        self.refresh_with_outcome(
             &source,
             catalog,
             (requested, TAIL_BYTES),
@@ -429,22 +477,35 @@ impl ShieldedTailBuffer {
         Some(next_tail)
     }
 
+    #[cfg(test)]
     async fn refresh<Source: TailSource>(
+        &self,
+        source: &Source,
+        catalog: Option<(BlockHeight, BlockId)>,
+        bounds: (BlockHeightRange, usize),
+        max_wait: Duration,
+    ) -> Result<Option<Arc<EncodedTail>>, Status> {
+        self.refresh_with_outcome(source, catalog, bounds, max_wait)
+            .await
+            .map(|(tail, _)| tail)
+    }
+
+    async fn refresh_with_outcome<Source: TailSource>(
         &self,
         source: &Source,
         catalog: Option<(BlockHeight, BlockId)>,
         (requested, max_tail_bytes): (BlockHeightRange, usize),
         max_wait: Duration,
-    ) -> Result<Option<Arc<EncodedTail>>, Status> {
+    ) -> Result<(Option<Arc<EncodedTail>>, EncodedTailLookupOutcome), Status> {
         let cancel = source.cancel();
         check_cancel(source)?;
         let (epoch, fence) = source.epoch_and_fence();
         let Some(window_floor) = Self::window_floor(epoch, fence.1, catalog.map(|(end, _)| end))
         else {
-            return Ok(None);
+            return Ok((None, EncodedTailLookupOutcome::Bypass));
         };
         if requested.end < window_floor {
-            return Ok(None);
+            return Ok((None, EncodedTailLookupOutcome::Bypass));
         }
         let requested_floor = requested.start.max(window_floor);
         let existing = self.load_full();
@@ -453,36 +514,52 @@ impl ShieldedTailBuffer {
             .filter(|tail| tail.satisfies(source, requested_floor))
         {
             self.0.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Some(existing.clone()));
+            return Ok((Some(existing.clone()), EncodedTailLookupOutcome::Hit));
         }
         if !fills(existing.as_deref(), source, requested) {
-            return Ok(None);
+            return Ok((None, EncodedTailLookupOutcome::Bypass));
         }
         drop(existing);
         // A stale view must not spend the refresh lock building rows it may
         // not install.
         if !source.is_current().await {
-            return Ok(None);
+            return Ok((None, EncodedTailLookupOutcome::Bypass));
         }
         check_cancel(source)?;
         let Some(_guard) = self.acquire_refresh_guard(cancel, max_wait).await? else {
-            return Ok(None);
+            return Ok((None, EncodedTailLookupOutcome::Bypass));
         };
         check_cancel(source)?;
+        self.refresh_under_lock(
+            source,
+            catalog,
+            (requested, requested_floor, max_tail_bytes),
+            epoch.visible_tip_height,
+        )
+        .await
+    }
+
+    async fn refresh_under_lock<Source: TailSource>(
+        &self,
+        source: &Source,
+        catalog: Option<(BlockHeight, BlockId)>,
+        (requested, requested_floor, max_tail_bytes): (BlockHeightRange, BlockHeight, usize),
+        visible_tip_height: BlockHeight,
+    ) -> Result<(Option<Arc<EncodedTail>>, EncodedTailLookupOutcome), Status> {
         let previous = self.load_full();
         if let Some(existing) = &previous
             && existing.satisfies(source, requested_floor)
         {
             self.0.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Some(existing.clone()));
+            return Ok((Some(existing.clone()), EncodedTailLookupOutcome::Hit));
         }
         // The view may have changed while this miss waited for the lock.
         if !source.is_current().await {
-            return Ok(None);
+            return Ok((None, EncodedTailLookupOutcome::Bypass));
         }
         check_cancel(source)?;
         if !fills(previous.as_deref(), source, requested) {
-            return Ok(None);
+            return Ok((None, EncodedTailLookupOutcome::Bypass));
         }
         // Another generation's rows are never reused: two admitted stores can
         // share block hashes while holding different compact bytes.
@@ -494,7 +571,7 @@ impl ShieldedTailBuffer {
             _ => (
                 build(
                     source,
-                    BlockHeightRange::inclusive(requested_floor, epoch.visible_tip_height),
+                    BlockHeightRange::inclusive(requested_floor, visible_tip_height),
                     max_tail_bytes,
                     catalog,
                 )
@@ -503,14 +580,15 @@ impl ShieldedTailBuffer {
                 true,
             ),
         };
-        Ok(self
-            .install_refreshed_tail(
-                source,
-                previous,
-                (updated, is_rebuild),
-                epoch.visible_tip_height,
-            )
-            .await)
+        let installed = self
+            .install_refreshed_tail(source, previous, (updated, is_rebuild), visible_tip_height)
+            .await;
+        let outcome = match (&installed, is_rebuild) {
+            (Some(_), true) => EncodedTailLookupOutcome::Rebuild,
+            (Some(_), false) => EncodedTailLookupOutcome::Prepend,
+            (None, _) => EncodedTailLookupOutcome::Bypass,
+        };
+        Ok((installed, outcome))
     }
 }
 

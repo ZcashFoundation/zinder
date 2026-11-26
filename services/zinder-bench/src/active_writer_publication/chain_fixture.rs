@@ -247,6 +247,8 @@ pub(crate) struct AdvancingChainSource {
     fetch_chain_segment_calls: Arc<AtomicU64>,
     fetch_chain_checkpoint_calls: Arc<AtomicU64>,
     fetch_subtree_roots_calls: Arc<AtomicU64>,
+    #[cfg(test)]
+    fail_at_height: Arc<AtomicU32>,
 }
 
 impl AdvancingChainSource {
@@ -260,7 +262,26 @@ impl AdvancingChainSource {
             fetch_chain_segment_calls: Arc::new(AtomicU64::new(0)),
             fetch_chain_checkpoint_calls: Arc::new(AtomicU64::new(0)),
             fetch_subtree_roots_calls: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            fail_at_height: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_at_height(self, height: u32) -> Self {
+        self.fail_at_height.store(height, Ordering::Release);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn check_injected_failure(&self, height: u32) -> Result<(), BenchError> {
+        let target = self.fail_at_height.load(Ordering::Acquire);
+        if target > 0 && height >= target {
+            return Err(BenchError::tip_replay(format!(
+                "injected test writer failure at height {height}"
+            )));
+        }
+        Ok(())
     }
 
     /// Reveals block `height` as the node's current tip.

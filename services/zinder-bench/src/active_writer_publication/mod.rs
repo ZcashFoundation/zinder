@@ -18,11 +18,11 @@ use std::{num::NonZeroU32, time::Duration};
 
 pub use report::{
     ACTIVE_WRITER_PUBLICATION_CONTRACT, ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION,
-    ActiveWriterPublicationReport, ByteParityReport, IngestStageMetrics, IoModeReport,
-    LatencySummaryMs, MempoolTierMetrics, ModeDifferential, ModeParityDigests, ModeReport,
-    NodeRpcCounts, ParityMismatch, ProjectorMetrics, ProtocolErrorCounts, PublisherMetrics,
-    RocksDbActivityReport, StoreTickerDelta, StreamLatencyReport, TailRefillMetrics,
-    WorkloadGeometryReport, WriterFsyncCounts, WriterMode,
+    ActiveWriterPublicationReport, ByteParityReport, DifferentialBaselines, IngestStageMetrics,
+    IoModeReport, LatencySummaryMs, MempoolTierMetrics, ModeDifferential, ModeParityDigests,
+    ModeReport, NodeRpcCounts, ParityMismatch, ProjectorMetrics, ProtocolErrorCounts,
+    PublisherMetrics, RocksDbActivityReport, StoreTickerDelta, StreamLatencyReport,
+    TailRefillMetrics, WorkloadGeometryReport, WriterFsyncCounts, WriterMode,
 };
 pub use runner::run_active_writer_publication;
 

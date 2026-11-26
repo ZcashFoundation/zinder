@@ -21,6 +21,7 @@ mod ping;
 mod published_range;
 mod sealed_history;
 pub use published_range::{
+    EncodedTailLookupEvent, EncodedTailLookupObserver, EncodedTailLookupOutcome,
     EncodedTailTelemetry, PublicationConcurrency, PublishedShieldedHistory,
     ShieldedCatalogPublisher,
 };

@@ -15,13 +15,13 @@ use zinder_bench::active_writer_publication::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary() -> Result<()> {
     let config = ActiveWriterPublicationConfig {
-        base_blocks: 4_092,
-        live_blocks: 14,
+        base_blocks: 4_098,
+        live_blocks: 24,
         reorg_window_blocks: 4,
         segment_blocks: NonZeroU32::new(4_096).unwrap_or(NonZeroU32::MIN),
         dense_block_cadence: 16,
         dense_txs_per_block: 1,
-        commit_interval: Duration::from_millis(6),
+        commit_interval: Duration::from_millis(15),
         slow_reader_frame_delay: Duration::from_millis(1),
         mempool_churn_sizes: vec![50, 500],
         quiescent_rounds: 4,
@@ -34,7 +34,7 @@ async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary
         ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION
     );
     assert_eq!(report.workload.crossed_segment_boundary_height, 4_096);
-    assert_eq!(report.workload.final_tip_height, 4_106);
+    assert_eq!(report.workload.final_tip_height, 4_122);
     assert!(report.workload.sparse_block_count > 0);
     assert!(report.workload.dense_block_count > 0);
     assert_eq!(report.modes.len(), 4);
@@ -50,6 +50,21 @@ async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary
     );
 
     assert_differential_baselines(&report.differentials_vs_quiescent);
+    assert!(
+        report
+            .published_quiescent_control
+            .catalog_range_published
+            .completion_ms
+            .samples
+            > 0
+    );
+    assert!(
+        report.modes[0]
+            .catalog_range_unpublished
+            .completion_ms
+            .samples
+            > 0
+    );
     assert_mode_report_invariants(&report.published_quiescent_control, &config)?;
     for mode_report in &report.modes {
         assert_mode_report_invariants(mode_report, &config)?;
@@ -59,6 +74,9 @@ async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary
 
 fn assert_differential_baselines(differentials: &[ModeDifferential]) {
     for diff in differentials {
+        assert!(diff.catalog_completion_p50_delta_ms.is_some());
+        assert!(diff.cold_tail_completion_p50_delta_ms.is_some());
+        assert!(diff.unpublished_catalog_completion_p50_delta_ms.is_some());
         match diff.mode {
             WriterMode::IngestActive | WriterMode::IngestAndProjector => {
                 assert_eq!(diff.baseline_label, "quiescent_control");
@@ -67,6 +85,7 @@ fn assert_differential_baselines(differentials: &[ModeDifferential]) {
             WriterMode::IngestProjectorAndPublisher => {
                 assert_eq!(diff.baseline_label, "published_quiescent_control");
                 assert!(diff.baseline_catalog_published);
+                assert!(diff.published_catalog_completion_p50_delta_ms.is_some());
             }
             WriterMode::QuiescentControl => {}
         }
@@ -97,10 +116,23 @@ fn assert_common_reader_invariants(mode_report: &ModeReport) {
             .samples
             > 0
     );
+    assert!(mode_report.tail_refill.warm_repeat.completion_ms.samples > 0);
     assert!(mode_report.tail_refill.encoded_tail_cache_fills > 0);
     assert!(mode_report.tail_refill.encoded_tail_cache_hits > 0);
     assert!(mode_report.slow_boundary_range.completion_ms.samples > 0);
     assert!(mode_report.tree_state_ms.samples > 0);
+}
+
+fn assert_active_mempool_overlap(mode_report: &ModeReport) {
+    for tier in &mode_report.mempool_churn {
+        assert!(
+            tier.writer_overlap_verified && tier.commits_observed_during_tier > 0,
+            "missing commit overlap for tier {} in {:?}: {:?}",
+            tier.batch_size,
+            mode_report.mode,
+            tier
+        );
+    }
 }
 
 fn assert_mode_report_invariants(
@@ -121,21 +153,27 @@ fn assert_mode_report_invariants(
             assert_eq!(mode_report.ingest.live_prepare_ms.samples, expected_live);
             assert_eq!(mode_report.ingest.live_commit_ms.samples, expected_live);
             assert_eq!(mode_report.commit_to_served_tip_ms.samples, expected_live);
+            assert!(mode_report.catalog_range_unpublished.completion_ms.samples > 0);
             assert!(mode_report.writer_fsyncs.canonical_wal_synced > 0);
             assert!(mode_report.node_rpcs.total > 0);
+            assert_active_mempool_overlap(mode_report);
         }
         WriterMode::IngestAndProjector => {
             assert_eq!(mode_report.ingest.blocks_committed, config.live_blocks);
             assert_eq!(mode_report.commit_to_served_tip_ms.samples, expected_live);
+            assert!(mode_report.catalog_range_unpublished.completion_ms.samples > 0);
             assert!(mode_report.projector.transitions_applied >= config.live_blocks);
             assert!(mode_report.writer_fsyncs.canonical_wal_synced > 0);
             assert!(mode_report.writer_fsyncs.wallet_wal_synced > 0);
             assert!(mode_report.io_modes.wallet_primary.is_some());
             assert!(mode_report.node_rpcs.total > 0);
+            assert_active_mempool_overlap(mode_report);
         }
         WriterMode::IngestProjectorAndPublisher => {
             assert_eq!(mode_report.ingest.blocks_committed, config.live_blocks);
             assert_eq!(mode_report.commit_to_served_tip_ms.samples, expected_live);
+            assert!(mode_report.catalog_range_unpublished.completion_ms.samples > 0);
+            assert!(mode_report.catalog_range_published.completion_ms.samples > 0);
             assert!(mode_report.projector.transitions_applied >= config.live_blocks);
             assert!(mode_report.publisher.segments_published >= 1);
             assert!(mode_report.publisher.catalog_refreshes >= 1);
@@ -144,6 +182,7 @@ fn assert_mode_report_invariants(
             assert!(mode_report.writer_fsyncs.canonical_wal_synced > 0);
             assert!(mode_report.writer_fsyncs.wallet_wal_synced > 0);
             assert!(mode_report.node_rpcs.total > 0);
+            assert_active_mempool_overlap(mode_report);
         }
     }
     Ok(())
@@ -166,6 +205,7 @@ async fn handles_slow_readers_and_mempool_churn_without_parity_loss() -> Result<
 
     let report = run_active_writer_publication(&config).await?;
     assert!(report.byte_parity.all_matched);
+    assert_differential_baselines(&report.differentials_vs_quiescent);
     assert_eq!(
         report
             .published_quiescent_control
@@ -182,7 +222,7 @@ async fn handles_slow_readers_and_mempool_churn_without_parity_loss() -> Result<
     );
 
     for mode_report in &report.modes {
-        assert_eq!(mode_report.errors.unexpected_grpc_errors, 0);
+        assert_mode_report_invariants(mode_report, &config)?;
         assert_eq!(mode_report.mempool_churn.len(), 2);
         assert_eq!(mode_report.mempool_churn[0].batch_size, 50);
         assert_eq!(mode_report.mempool_churn[1].batch_size, 500);
@@ -198,7 +238,6 @@ async fn handles_slow_readers_and_mempool_churn_without_parity_loss() -> Result<
                 .frames_delivered
                 > 0
         );
-        assert!(mode_report.slow_boundary_range.frames_delivered > 0);
     }
     Ok(())
 }
