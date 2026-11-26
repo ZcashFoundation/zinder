@@ -317,6 +317,40 @@ await_entrypoint_exit
 grep -q 'zinder-explorer rejected its configuration' "$work/case/stderr" \
   || test_failure "the rejected Explorer config was not logged"
 
+# deployment.profile cannot be combined with Explorer views, and light-wallet
+# is always rejected in single-volume images.
+for profile in wallet wallet-archive light-wallet; do
+  reset_case
+  wallet_mode=serve explorer_mode=serve start_entrypoint \
+    "ZINDER_DEPLOYMENT__PROFILE=$profile"
+  await_entrypoint_exit
+  [[ "$wrapper_status" -eq 1 ]] || test_failure "ZINDER_DEPLOYMENT__PROFILE=$profile with Explorer views exited $wrapper_status, expected 1"
+  [[ ! -e "$work/case/explorer-preflight.env" ]] || test_failure "Explorer preflight ran despite ZINDER_DEPLOYMENT__PROFILE=$profile"
+  [[ ! -e "$work/case/wallet.env" ]] || test_failure "wallet serving started despite ZINDER_DEPLOYMENT__PROFILE=$profile"
+done
+
+reset_case
+wallet_mode=serve explorer_mode=serve start_entrypoint \
+  ZINDER_INGEST__EXPLORER_VIEWS=false ZINDER_DEPLOYMENT__PROFILE=light-wallet
+await_entrypoint_exit
+[[ "$wrapper_status" -eq 1 ]] || test_failure "light-wallet with disabled Explorer views exited $wrapper_status, expected 1"
+[[ ! -e "$work/case/wallet.env" ]] || test_failure "wallet serving started with ZINDER_DEPLOYMENT__PROFILE=light-wallet"
+
+# With Explorer views explicitly turned off, wallet-archive is passed to wallet
+# serving and withheld from the Explorer.
+reset_case
+wallet_mode=serve explorer_mode=serve start_entrypoint \
+  STUB_ADMISSION=never ZINDER_INGEST__EXPLORER_VIEWS=false ZINDER_DEPLOYMENT__PROFILE=wallet-archive
+await_file "$work/case/explorer.env"
+grep -qxF 'ZINDER_DEPLOYMENT__PROFILE=wallet-archive' "$work/case/wallet.env" \
+  || test_failure "wallet serving did not receive ZINDER_DEPLOYMENT__PROFILE=wallet-archive"
+if grep -qi '^ZINDER_DEPLOYMENT__' "$work/case/explorer.env" || grep -qi '^ZINDER_DEPLOYMENT__' "$work/case/explorer-preflight.env"; then
+  test_failure "ZINDER_DEPLOYMENT__PROFILE reached the Explorer"
+fi
+kill -s TERM "$wrapper_pid"
+await_entrypoint_exit
+[[ "$wrapper_status" -eq 0 ]] || test_failure "SIGTERM with disabled views and wallet-archive exited $wrapper_status"
+
 # An Explorer that keeps exiting is restarted while wallet serving keeps
 # running, and SIGTERM still stops both cleanly.
 reset_case

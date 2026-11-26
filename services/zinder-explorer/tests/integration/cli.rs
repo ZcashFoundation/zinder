@@ -93,6 +93,22 @@ fn wallet_serving_explorer_image_config_resolves() -> eyre::Result<()> {
 }
 
 #[test]
+fn default_secondary_path_matches_wallet_serving_explorer_layout() -> eyre::Result<()> {
+    let output = zinder_explorer_command()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("secondary_path = \"/var/lib/zinder/explorer/secondary\""),
+        "{stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("materialized-view-invalid-token-store");

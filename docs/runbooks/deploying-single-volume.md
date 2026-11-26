@@ -7,7 +7,7 @@ Use this runbook when your platform attaches one persistent volume to one contai
 > - **Shared cgroup memory:** All four processes share one container memory ceiling (minimum 8 GB; count `ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES` 3x across projector, query, and compatibility).
 > - **All-in-one restarts:** Every redeploy or kernel OOM kill restarts all processes together (and restarts an unfinished first sync from scratch).
 > - **No signed history catalog:** `zinder-wallet-serving` and `zinder-wallet-serving-explorer` do **not** bundle `publish-shielded-history` or a signed `ZSHRNG01` catalog today; `GetBlockRange` serves from canonical storage and the live-tail buffer.
-> - **Mainnet deadline & blob defaults:** Default construction deadlines (`10800`s / `7200`s) are sized for Testnet and will kill a slow Mainnet build unless raised. The shipped image config (`deploy/config/wallet-serving/ingest.toml`) sets `raw_blob_policy = "transactions"` (+251 GiB on Mainnet) and `coverage = "wallet-serving"`, and the entrypoint currently strips `ZINDER_DEPLOYMENT__*`, so this image retains transaction blobs unless custom TOML configs are mounted (`ZINDER_STORAGE__RAW_BLOB_POLICY=none` without a profile fails startup).
+> - **Mainnet deadline & blob defaults:** Default construction deadlines (`10800`s / `7200`s) are sized for Testnet and will kill a slow Mainnet build unless raised. `zinder-wallet-serving` defaults `ZINDER_DEPLOYMENT__PROFILE` to `wallet` (`raw_blob_policy = "none"`, retaining no raw blobs locally and reading verified mined transaction bytes from `[node]`; set `ZINDER_DEPLOYMENT__PROFILE=wallet-archive` to retain all raw blocks and transactions locally). `light-wallet` is rejected because this container always starts `zinder-projector` and `zinder-query`, and any `deployment.profile` is rejected when Explorer views are enabled (`zinder-wallet-serving-explorer`, unless `ZINDER_INGEST__EXPLORER_VIEWS=false`). See [Deployment profiles](../reference/configuration.md#deployment-profiles) and [ADR-0023](../adrs/0023-deployment-profiles.md).
 
 ## Get the image
 
@@ -45,6 +45,8 @@ Attach one persistent volume at `/var/lib/zinder`, sized per [Size your host](de
 
 | Variable | Effect |
 | --- | --- |
+| `ZINDER_DEPLOYMENT__PROFILE` | `wallet` default when Explorer views and `ZINDER_STORAGE__RAW_BLOB_POLICY` are unset (`raw_blob_policy = "none"`, verified mined transaction reads from `[node]`). Set `wallet-archive` to retain all raw blocks and transactions locally; `light-wallet` and combinations with enabled Explorer views fail startup ([Deployment profiles](../reference/configuration.md#deployment-profiles)). |
+| `ZINDER_STORAGE__RAW_BLOB_POLICY` | Leave unset for new `wallet` or `wallet-archive` volumes. When upgrading an existing pre-profile volume created with `transactions` retention without rebuilding on a fresh volume, set `transactions` (with `ZINDER_DEPLOYMENT__PROFILE` unset) so the entrypoint skips profile injection and reopens the store in place; changing persisted retention requires rebuilding on a fresh volume. |
 | `ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS` | Chain-store build deadline in seconds. Default `10800` (3 h). Set at least `86400` (24 h) for Mainnet. |
 | `ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS` | Wallet-store build deadline in seconds. Default `7200` (2 h). Set at least `43200` (12 h) for Mainnet. |
 | `ZINDER_WALLET_SERVING__LIGHTWALLETD` | `false` disables compatibility and closes port `9067`. Default `true`. |

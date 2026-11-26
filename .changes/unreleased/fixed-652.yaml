@@ -1,0 +1,6 @@
+kind: fixed
+body: Default single-volume `wallet-serving` containers to `ZINDER_DEPLOYMENT__PROFILE=wallet` when Explorer views and `ZINDER_STORAGE__RAW_BLOB_POLICY` are unset (supporting `wallet-archive` and legacy profile-free `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions` upgrades while rejecting `light-wallet` and Explorer-view profile conflicts), switch packaged `wallet-serving` ingest to `zebra-indexer-grpc` without a hardcoded `raw_blob_policy`, align `zinder-explorer` default `storage.secondary_path` to `/var/lib/zinder/explorer/secondary`, update the `zinder-ingest` image `HEALTHCHECK` to probe `/readyz`, and update ADR-0023, the configuration reference, and the single-volume runbook.
+time: 2026-11-26T12:41:00Z
+custom:
+    Bump: patch
+    PR: "652"

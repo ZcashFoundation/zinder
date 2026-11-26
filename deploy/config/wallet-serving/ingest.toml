@@ -8,10 +8,9 @@ max_response_bytes = 67108864
 
 [storage]
 path = "/var/lib/zinder/canonical"
-raw_blob_policy = "transactions"
 
 [ingest]
-source = "zebra-json-rpc"
+source = "zebra-indexer-grpc"
 explorer_views = false
 reorg_window_blocks = 1000
 

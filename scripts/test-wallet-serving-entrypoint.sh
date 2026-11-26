@@ -49,6 +49,10 @@ for function_name in \
   start_runtime_process \
   require_positive_seconds \
   zinder_setting \
+  zinder_setting_is_set \
+  toml_setting \
+  ingest_config_disables_explorer_views \
+  resolve_deployment_profile \
   zinder_fallback_positions \
   require_fallback_indexer_endpoints \
   require_known_entrypoint_settings \
@@ -70,6 +74,10 @@ projector_config_paths="$(entrypoint_setting projector_config_paths)"
 query_config_paths="$(entrypoint_setting query_config_paths)"
 compat_config_paths="$(entrypoint_setting compat_config_paths)"
 entrypoint_config_paths="$(entrypoint_setting entrypoint_config_paths)"
+projector_config_path="$(entrypoint_setting projector_config_path)"
+query_config_path="$(entrypoint_setting query_config_path)"
+compat_config_path="$(entrypoint_setting compat_config_path)"
+lightwalletd_enabled=1
 ingest_ops_addr="$(entrypoint_setting ingest_ops_addr)"
 query_ops_addr="$(entrypoint_setting query_ops_addr)"
 compat_ops_addr="$(entrypoint_setting compat_ops_addr)"
@@ -974,9 +982,233 @@ ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://127.0.0.1:28232 \
   ZINDER_node_fallbacks__1__indexer_grpc_addr=http://127.0.0.1:28155 \
   require_fallback_indexer_endpoints \
   || test_failure "a mixed-case fallback indexer URL was rejected: $fail_message"
-[ "$(ZINDER_Node__Indexer_Grpc_Addr=http://127.0.0.1:18155 zinder_setting node.indexer_grpc_addr)" \
+  [ "$(ZINDER_Node__Indexer_Grpc_Addr=http://127.0.0.1:18155 zinder_setting node.indexer_grpc_addr)" \
   = http://127.0.0.1:18155 ] \
   || test_failure "a mixed-case [node] indexer URL was not found"
+
+# Deployment profile resolution defaults to wallet when ingest.toml has
+# explorer_views = false and ZINDER_INGEST__EXPLORER_VIEWS is not true, allows
+# wallet-archive, rejects light-wallet, and rejects combining a profile with
+# Explorer views.
+test_deployment_profile_resolution() {
+  local wallet_ingest_toml="$scoping_root/ingest-wallet.toml"
+  local explorer_ingest_toml="$scoping_root/ingest-explorer.toml"
+  local archive_ingest_toml="$scoping_root/ingest-archive.toml"
+  local test_projector_toml="$scoping_root/projector-test.toml"
+  local test_query_toml="$scoping_root/query-test.toml"
+  local test_compat_toml="$scoping_root/compat-test.toml"
+  cp "$repository_root/deploy/config/wallet-serving/ingest.toml" "$wallet_ingest_toml"
+  sed 's/^explorer_views = false$/explorer_views = true/' "$wallet_ingest_toml" >"$explorer_ingest_toml"
+  cp "$repository_root/deploy/config/wallet-serving/projector.toml" "$test_projector_toml"
+  cp "$repository_root/deploy/config/wallet-serving/query.toml" "$test_query_toml"
+  cp "$repository_root/deploy/config/wallet-serving/compat-lightwalletd.toml" "$test_compat_toml"
+
+  local saved_ingest_config_path="${ingest_config_path:-}"
+  local saved_projector_config_path="${projector_config_path:-}"
+  local saved_query_config_path="${query_config_path:-}"
+  local saved_compat_config_path="${compat_config_path:-}"
+  ingest_config_path="$wallet_ingest_toml"
+  projector_config_path="$test_projector_toml"
+  query_config_path="$test_query_toml"
+  compat_config_path="$test_compat_toml"
+
+  # Default is wallet when explorer_views = false in ingest.toml.
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "default profile failed: $fail_message"
+  [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "wallet" ] \
+    || test_failure "expected default ZINDER_DEPLOYMENT__PROFILE=wallet, got '${ZINDER_DEPLOYMENT__PROFILE:-}'"
+
+  # wallet and wallet-archive overrides succeed when Explorer views are off.
+  for valid_profile in wallet wallet-archive; do
+    unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+    export ZINDER_DEPLOYMENT__PROFILE="$valid_profile"
+    fail_message=""
+    resolve_deployment_profile \
+      || test_failure "profile $valid_profile failed: $fail_message"
+    [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "$valid_profile" ] \
+      || test_failure "expected ZINDER_DEPLOYMENT__PROFILE=$valid_profile, got '${ZINDER_DEPLOYMENT__PROFILE:-}'"
+  done
+
+  # light-wallet and invalid/empty profiles fail closed.
+  for rejected_profile in light-wallet "" unknown; do
+    unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+    fail_message=""
+    ZINDER_DEPLOYMENT__PROFILE="$rejected_profile" resolve_deployment_profile || true
+    [ -n "$fail_message" ] || test_failure "profile '$rejected_profile' was accepted"
+    if [ "$rejected_profile" = "light-wallet" ]; then
+      case "$fail_message" in
+        *zinder-projector*zinder-query*) ;;
+        *) test_failure "light-wallet rejection lacked operator guidance: '$fail_message'" ;;
+      esac
+    fi
+  done
+
+  # ZINDER_INGEST__EXPLORER_VIEWS=true leaves profile unset by default, and
+  # rejects explicit ZINDER_DEPLOYMENT__PROFILE.
+  for truthy_views in true TRUE 1 on yes; do
+    unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+    export ZINDER_INGEST__EXPLORER_VIEWS="$truthy_views"
+    fail_message=""
+    resolve_deployment_profile \
+      || test_failure "explorer_views=$truthy_views without profile failed: $fail_message"
+    [ -z "${ZINDER_DEPLOYMENT__PROFILE:-}" ] \
+      || test_failure "explorer_views=$truthy_views unexpectedly defaulted ZINDER_DEPLOYMENT__PROFILE to '$ZINDER_DEPLOYMENT__PROFILE'"
+
+    fail_message=""
+    ZINDER_DEPLOYMENT__PROFILE=wallet resolve_deployment_profile || true
+    case "$fail_message" in
+      *"cannot be combined with Explorer views"*) ;;
+      *) test_failure "explorer_views=$truthy_views with wallet profile was accepted: '$fail_message'" ;;
+    esac
+  done
+
+  # ZINDER_INGEST__EXPLORER_VIEWS=false still defaults to wallet on the
+  # wallet-serving ingest.toml.
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  export ZINDER_INGEST__EXPLORER_VIEWS=false
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "explorer_views=false failed: $fail_message"
+  [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "wallet" ] \
+    || test_failure "explorer_views=false did not default to wallet"
+
+  # Explorer image (ingest.toml has explorer_views = true) leaves profile unset
+  # and rejects explicit profiles unless Explorer views are disabled.
+  ingest_config_path="$explorer_ingest_toml"
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "explorer ingest.toml without profile failed: $fail_message"
+  [ -z "${ZINDER_DEPLOYMENT__PROFILE:-}" ] \
+    || test_failure "explorer ingest.toml unexpectedly defaulted profile to '$ZINDER_DEPLOYMENT__PROFILE'"
+
+  for rejected_profile in wallet wallet-archive light-wallet; do
+    fail_message=""
+    ZINDER_DEPLOYMENT__PROFILE="$rejected_profile" resolve_deployment_profile || true
+    [ -n "$fail_message" ] \
+      || test_failure "explorer ingest.toml accepted ZINDER_DEPLOYMENT__PROFILE=$rejected_profile"
+  done
+
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  export ZINDER_INGEST__EXPLORER_VIEWS=false
+  export ZINDER_DEPLOYMENT__PROFILE=wallet-archive
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "explorer ingest.toml with views=false and wallet-archive failed: $fail_message"
+
+  unset ZINDER_DEPLOYMENT__PROFILE
+  fail_message=""
+  ZINDER_DEPLOYMENT__PROFILE=light-wallet resolve_deployment_profile || true
+  case "$fail_message" in
+    *zinder-projector*zinder-query*) ;;
+    *) test_failure "explorer ingest.toml with views=false accepted light-wallet: '$fail_message'" ;;
+  esac
+
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS ZINDER_STORAGE__RAW_BLOB_POLICY
+  # Explicit transactions/all overrides leave ZINDER_DEPLOYMENT__PROFILE unset
+  # so existing pre-profile volumes reopen in place.
+  ingest_config_path="$wallet_ingest_toml"
+  for legacy_policy in transactions all; do
+    unset ZINDER_DEPLOYMENT__PROFILE
+    fail_message=""
+    ZINDER_STORAGE__RAW_BLOB_POLICY="$legacy_policy" resolve_deployment_profile \
+      || test_failure "ZINDER_STORAGE__RAW_BLOB_POLICY=$legacy_policy without profile failed: $fail_message"
+    [ -z "${ZINDER_DEPLOYMENT__PROFILE:-}" ] \
+      || test_failure "ZINDER_STORAGE__RAW_BLOB_POLICY=$legacy_policy unexpectedly injected ZINDER_DEPLOYMENT__PROFILE=$ZINDER_DEPLOYMENT__PROFILE"
+  done
+
+  for bad_policy in none "" unknown; do
+    unset ZINDER_DEPLOYMENT__PROFILE ZINDER_STORAGE__RAW_BLOB_POLICY
+    fail_message=""
+    ZINDER_STORAGE__RAW_BLOB_POLICY="$bad_policy" resolve_deployment_profile || true
+    [ -n "$fail_message" ] \
+      || test_failure "ZINDER_STORAGE__RAW_BLOB_POLICY='$bad_policy' without profile unexpectedly succeeded"
+  done
+
+  # Mounted TOML deployment.profile must not be overwritten by the wallet default.
+  {
+    printf '[deployment]\nprofile = "wallet-archive"\n\n'
+    cat "$wallet_ingest_toml"
+  } >"$archive_ingest_toml"
+  ingest_config_path="$archive_ingest_toml"
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS ZINDER_STORAGE__RAW_BLOB_POLICY
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "TOML wallet-archive profile failed: $fail_message"
+  [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "wallet-archive" ] \
+    || test_failure "TOML wallet-archive profile was overridden to '${ZINDER_DEPLOYMENT__PROFILE:-}'"
+
+  # Top-level dotted form also resolves cleanly.
+  {
+    printf 'deployment.profile = "wallet-archive"\n\n'
+    cat "$wallet_ingest_toml"
+  } >"$archive_ingest_toml"
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_STORAGE__RAW_BLOB_POLICY
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "dotted TOML wallet-archive profile failed: $fail_message"
+  [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "wallet-archive" ] \
+    || test_failure "dotted TOML wallet-archive profile was overridden to '${ZINDER_DEPLOYMENT__PROFILE:-}'"
+
+  # Conflicting TOML profiles across active runtimes fail closed when env is unset,
+  # whereas explicit env overrides TOML precedence.
+  printf '[deployment]\nprofile = "wallet"\n' >>"$test_query_toml"
+  unset ZINDER_DEPLOYMENT__PROFILE
+  fail_message=""
+  resolve_deployment_profile || true
+  [ -n "$fail_message" ] \
+    || test_failure "conflicting TOML deployment.profile values were accepted"
+  export ZINDER_DEPLOYMENT__PROFILE=wallet-archive
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "explicit env override over TOML failed: $fail_message"
+  [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "wallet-archive" ] \
+    || test_failure "env override lost value '${ZINDER_DEPLOYMENT__PROFILE:-}'"
+  cp "$repository_root/deploy/config/wallet-serving/query.toml" "$test_query_toml"
+
+  # TOML light-wallet or TOML profile + explorer_views = true fail closed.
+  {
+    printf '[deployment]\nprofile = "light-wallet"\n\n'
+    cat "$wallet_ingest_toml"
+  } >"$archive_ingest_toml"
+  unset ZINDER_DEPLOYMENT__PROFILE
+  fail_message=""
+  resolve_deployment_profile || true
+  [ -n "$fail_message" ] || test_failure "TOML light-wallet profile was accepted"
+
+  {
+    printf '[deployment]\nprofile = "wallet-archive"\n\n'
+    cat "$explorer_ingest_toml"
+  } >"$archive_ingest_toml"
+  unset ZINDER_DEPLOYMENT__PROFILE
+  fail_message=""
+  resolve_deployment_profile || true
+  [ -n "$fail_message" ] || test_failure "TOML wallet-archive with explorer_views=true was accepted"
+
+  # Mounted TOML storage.raw_blob_policy = "transactions" skips wallet injection and
+  # propagates across all four runtimes.
+  {
+    sed '/^path = /a raw_blob_policy = "transactions"' "$wallet_ingest_toml"
+  } >"$archive_ingest_toml"
+  ingest_config_path="$archive_ingest_toml"
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_STORAGE__RAW_BLOB_POLICY
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "TOML raw_blob_policy=transactions failed: $fail_message"
+  [ -z "${ZINDER_DEPLOYMENT__PROFILE:-}" ] \
+    || test_failure "TOML raw_blob_policy=transactions unexpectedly injected ZINDER_DEPLOYMENT__PROFILE=$ZINDER_DEPLOYMENT__PROFILE"
+  [ "${ZINDER_STORAGE__RAW_BLOB_POLICY:-}" = "transactions" ] \
+    || test_failure "TOML raw_blob_policy=transactions did not export ZINDER_STORAGE__RAW_BLOB_POLICY"
+
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS ZINDER_STORAGE__RAW_BLOB_POLICY
+  ingest_config_path="$saved_ingest_config_path"
+  projector_config_path="$saved_projector_config_path"
+  query_config_path="$saved_query_config_path"
+  compat_config_path="$saved_compat_config_path"
+}
+test_deployment_profile_resolution
 
 # Each process starts with the variables its binary accepts. A stub setpriv on
 # PATH records the environment variable names each process receives.
@@ -990,8 +1222,10 @@ STUB
 chmod +x "$scoping_root/bin/setpriv"
 
 # The subshell keeps the fixture environment out of the rest of this test.
+# shellcheck disable=SC2030,SC2031
 (
   export SCOPING_RECEIVED_DIR="$scoping_root/received"
+  export ZINDER_DEPLOYMENT__PROFILE=wallet-archive
   export ZINDER_NETWORK__NAME=zcash-testnet
   export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232
   export ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://127.0.0.1:28232
@@ -1043,6 +1277,8 @@ assert_received_by() {
   done
 }
 
+assert_received_by ZINDER_DEPLOYMENT__PROFILE \
+  zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
 assert_received_by ZINDER_NETWORK__NAME \
   zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
 assert_received_by ZINDER_NODE__JSON_RPC_ADDR zinder-ingest zinder-query zinder-compat-lightwalletd
@@ -1067,6 +1303,81 @@ assert_received_by ZINDER_WALLET_SERVING__LIGHTWALLETD
 assert_received_by ZINDER_EXPLORER__LISTEN_ADDR
 assert_received_by INGEST_CONTROL_BEARER_TOKEN
 assert_received_by CHECKPOINT_BEARER_TOKEN
+
+# Legacy pre-profile volumes override storage.raw_blob_policy directly and must
+# leave ZINDER_DEPLOYMENT__PROFILE unset while routing raw_blob_policy to all
+# four runtimes.
+rm -f "$scoping_root/received"/*
+# shellcheck disable=SC2030,SC2031
+(
+  export SCOPING_RECEIVED_DIR="$scoping_root/received"
+  ingest_config_path="$repository_root/deploy/config/wallet-serving/ingest.toml"
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  export ZINDER_STORAGE__RAW_BLOB_POLICY=transactions
+  resolve_deployment_profile
+  [ -z "${ZINDER_DEPLOYMENT__PROFILE:-}" ] \
+    || test_failure "legacy transactions override unexpectedly injected ZINDER_DEPLOYMENT__PROFILE"
+  export ZINDER_NETWORK__NAME=zcash-testnet
+  export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232
+  export ZINDER_WALLET__SECONDARY_PATH=/var/lib/zinder/query/wallet-secondary
+  export INGEST_CONTROL_BEARER_TOKEN=fixture-token
+  export CHECKPOINT_BEARER_TOKEN=fixture-token
+  stub_path="$scoping_root/bin:$PATH"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-ingest /etc/zinder/ingest.toml "$ingest_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-projector /etc/zinder/projector.toml "$projector_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-query /etc/zinder/query.toml "$query_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-compat-lightwalletd /etc/zinder/compat-lightwalletd.toml \
+    "$compat_config_paths"
+  wait
+)
+assert_received_by ZINDER_STORAGE__RAW_BLOB_POLICY \
+  zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
+assert_received_by ZINDER_DEPLOYMENT__PROFILE
+
+# Mounted TOML [deployment] profile = "wallet-archive" must not be clobbered by
+# the default wallet injection and must propagate consistently to all four runtimes.
+rm -f "$scoping_root/received"/*
+{
+  printf '[deployment]\nprofile = "wallet-archive"\n\n'
+  cat "$repository_root/deploy/config/wallet-serving/ingest.toml"
+} >"$scoping_root/mounted-archive-ingest.toml"
+cp "$repository_root/deploy/config/wallet-serving/projector.toml" "$scoping_root/mounted-projector.toml"
+cp "$repository_root/deploy/config/wallet-serving/query.toml" "$scoping_root/mounted-query.toml"
+cp "$repository_root/deploy/config/wallet-serving/compat-lightwalletd.toml" "$scoping_root/mounted-compat.toml"
+# shellcheck disable=SC2030,SC2031
+(
+  export SCOPING_RECEIVED_DIR="$scoping_root/received"
+  ingest_config_path="$scoping_root/mounted-archive-ingest.toml"
+  projector_config_path="$scoping_root/mounted-projector.toml"
+  query_config_path="$scoping_root/mounted-query.toml"
+  compat_config_path="$scoping_root/mounted-compat.toml"
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS ZINDER_STORAGE__RAW_BLOB_POLICY
+  resolve_deployment_profile
+  [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "wallet-archive" ] \
+    || test_failure "mounted TOML wallet-archive resolved '${ZINDER_DEPLOYMENT__PROFILE:-}'"
+  export ZINDER_NETWORK__NAME=zcash-testnet
+  export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232
+  export ZINDER_WALLET__SECONDARY_PATH=/var/lib/zinder/query/wallet-secondary
+  export INGEST_CONTROL_BEARER_TOKEN=fixture-token
+  export CHECKPOINT_BEARER_TOKEN=fixture-token
+  stub_path="$scoping_root/bin:$PATH"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-ingest "$ingest_config_path" "$ingest_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-projector "$projector_config_path" "$projector_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-query "$query_config_path" "$query_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-compat-lightwalletd "$compat_config_path" \
+    "$compat_config_paths"
+  wait
+)
+assert_received_by ZINDER_DEPLOYMENT__PROFILE \
+  zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
 
 unread_names="$(
   ZINDER_EXPLORER__LISTEN_ADDR=127.0.0.1:9068 \

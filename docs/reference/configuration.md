@@ -40,7 +40,7 @@ Other listeners, such as `ingest_control.listen_addr`, keep their loopback defau
 
 ## Deployment profiles
 
-Set `deployment.profile` on each participating standalone runtime. Matching explicit settings are accepted; conflicting settings fail configuration resolution. `--print-config` prints the profile and omits the settings it supplies.
+Set `deployment.profile` on each participating standalone runtime, or select it on Compose or the single-volume `zinder-wallet-serving` image (`wallet` default when Explorer views and explicit `storage.raw_blob_policy` overrides are unset, `wallet-archive` override; `light-wallet` and combinations with enabled Explorer views are rejected in the single-volume containers). Matching explicit settings are accepted; conflicting settings fail configuration resolution. `--print-config` prints the profile and omits the settings it supplies.
 
 | Profile | Canonical workload | Raw blobs | Serving |
 | --- | --- | --- | --- |
@@ -52,7 +52,7 @@ All profiles build complete canonical history, and changing retention requires a
 
 ## Light-wallet profile
 
-Set `deployment.profile = "light-wallet"` (or `ZINDER_DEPLOYMENT__PROFILE=light-wallet`) on standalone `zinder-ingest` and `zinder-compat-lightwalletd` (the bundled wallet-serving image starts a projector and native query and does not use this profile). Give both the same network, canonical primary path, and reorg window, plus a unique secondary path, `ingest_control.addr`, and one archive node with transparent address indexes.
+Set `deployment.profile = "light-wallet"` (or `ZINDER_DEPLOYMENT__PROFILE=light-wallet`) on standalone `zinder-ingest` and `zinder-compat-lightwalletd` (the bundled `zinder-wallet-serving` image starts `zinder-projector` and `zinder-query` and rejects `light-wallet`). Give both the same network, canonical primary path, and reorg window, plus a unique secondary path, `ingest_control.addr`, and one archive node with transparent address indexes.
 
 Compatibility requires complete block history and a complete subtree-root prefix, and also admits a store with retained blobs. Without the profile, setting `compat.serving = "light-wallet"` applies the same requirements against `storage.raw_blob_policy` (which defaults to `transactions`; set it to `none` explicitly to admit a lean store). See [Lightwalletd compatibility](lightwalletd-compatibility.md#runtime-serving-selection) and [Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads).
 
@@ -74,7 +74,7 @@ The loader enforces these rules:
 - `--print-config` prints the merged configuration as TOML without opening storage or binding. Passwords and inline cookies are redacted.
 - `ZINDER_TEST_*` variables never reach the loader. They are test-only knobs.
 - `RUST_LOG` sets the log filter and has no TOML field. Unset or blank means `info`. A value that does not parse fails startup.
-- The single-volume image entrypoints read `ZINDER_WALLET_SERVING__*` and the `ZINDER_NODE__INDEXER_TLS__*_PEM` forms themselves. The binaries refuse the `*_PEM` variables. See [single-volume deployment](../runbooks/deploying-single-volume.md).
+- The single-volume image entrypoints read `ZINDER_WALLET_SERVING__*` and the `ZINDER_NODE__INDEXER_TLS__*_PEM` forms themselves (the binaries refuse the `*_PEM` variables), and `zinder-wallet-serving` defaults `ZINDER_DEPLOYMENT__PROFILE` to `wallet` unless Explorer views are enabled or `ZINDER_STORAGE__RAW_BLOB_POLICY` is set explicitly for a pre-profile `transactions` volume. See [single-volume deployment](../runbooks/deploying-single-volume.md).
 
 [ADR-0021](../adrs/0021-shared-configuration-sections.md) records why sections such as `[node]`, `[ops]`, and `[security]` are shared by every runtime.
 
