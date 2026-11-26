@@ -5,7 +5,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage: build-release-binary-archive.sh \
   --binaries DIR --output DIR --version VERSION --tag TAG --commit SHA \
-  --target RUST_TARGET --source-date-epoch EPOCH
+  --target RUST_TARGET --source-date-epoch EPOCH [--pasta-asm 0|1]
 EOF
   exit 2
 }
@@ -18,7 +18,9 @@ release_tag=""
 commit=""
 rust_target=""
 source_date_epoch=""
+pasta_asm=1
 while [[ $# -gt 0 ]]; do
+  [[ $# -ge 2 ]] || usage
   case "$1" in
     --binaries) binaries_directory="$2"; shift 2 ;;
     --output) output_directory="$2"; shift 2 ;;
@@ -27,6 +29,7 @@ while [[ $# -gt 0 ]]; do
     --commit) commit="$2"; shift 2 ;;
     --target) rust_target="$2"; shift 2 ;;
     --source-date-epoch) source_date_epoch="$2"; shift 2 ;;
+    --pasta-asm) pasta_asm="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -35,15 +38,28 @@ done
 [[ -n "$version" && "$release_tag" == "v${version}" ]] || usage
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$source_date_epoch" =~ ^[0-9]+$ ]] || usage
+case "$pasta_asm" in
+  0|1) ;;
+  *)
+    echo >&2 "unsupported --pasta-asm value (expected 0 or 1): $pasta_asm"
+    exit 1
+    ;;
+esac
 
 case "$rust_target" in
   x86_64-unknown-linux-gnu)
     release_platform=x86_64-v3-unknown-linux-gnu
     cpu_baseline=x86-64-v3
+    if [[ "$pasta_asm" == "1" ]]; then
+      required_cpu_features='["adx","pclmulqdq"]'
+    else
+      required_cpu_features='["pclmulqdq"]'
+    fi
     ;;
   aarch64-unknown-linux-gnu)
     release_platform=aarch64-unknown-linux-gnu
     cpu_baseline=armv8-a
+    required_cpu_features='[]'
     ;;
   *)
     echo >&2 "unsupported release Rust target: $rust_target"
@@ -95,6 +111,7 @@ jq -n \
   --arg rust_target "$rust_target" \
   --arg release_platform "$release_platform" \
   --arg cpu_baseline "$cpu_baseline" \
+  --argjson required_cpu_features "$required_cpu_features" \
   --argjson source_date_epoch "$source_date_epoch" \
   --argjson binaries "$binary_inventory" \
   '{
@@ -111,6 +128,7 @@ jq -n \
       minimum_libstdcpp_symbol: "GLIBCXX_3.4.30"
     },
     cpu_baseline: $cpu_baseline,
+    required_cpu_features: $required_cpu_features,
     source_date_epoch: $source_date_epoch,
     binaries: $binaries
   }' > "$staging_root/BUILD-INFO.json"
