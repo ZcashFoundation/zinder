@@ -73,15 +73,19 @@ tree is still empty.
 The loader appends each block to the trees and writes it to the store in
 height order. Each stored checkpoint's canonical encoding must decode to
 exactly the appended frontier, and the root derived from that encoding must
-equal the root derived from the frontier. With `ingest.construction.tree_hashing_workers` above one, a block's
-pools are hashed concurrently. A pool that receives many commitments in one
-block hashes them as aligned complete subtrees in parallel and merges their
-roots into its frontier. The checkpoints and final roots of up to twice the
-worker count of blocks, at most 64, are derived on the workers while the loader
-appends and writes the blocks around them. Those blocks keep their preparation
-memory until the store has written them, so the preparation watermark still
-bounds the memory they hold. The stored trees, checkpoints, and subtree roots
-do not depend on the worker count.
+equal the root derived from the frontier. With
+`ingest.construction.tree_hashing_workers` above one, a dedicated tree-staging
+thread drains bounded batches of up to 64 prepared blocks, appends their note
+commitments across all worker threads (including parallel subtree hashing for
+dense commitment batches), and cross-checks only the distinct pool frontiers
+that changed across the batch in parallel while reusing unchanged pool
+checkpoints without re-encoding or re-deriving their depth-32 roots. Completed
+blocks — still holding their preparation memory permits — stream through a
+bounded one-batch queue to the `RocksDB` SST stager thread so SST encoding,
+hashing, and disk writes for batch `N` overlap with commitment-tree hashing for
+batch `N + 1`, while the preparation watermark still bounds total in-flight
+block memory. The stored trees, checkpoints, final roots, and subtree roots do
+not depend on the worker count.
 
 Before publishing, construction compares its derived tree state at the build
 tip, and every subtree root the loaded blocks complete, with the node's. A

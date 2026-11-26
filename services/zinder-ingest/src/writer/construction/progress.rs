@@ -132,6 +132,19 @@ impl ConstructionProgress {
         self.flush_pending();
     }
 
+    /// Extracts the progress tracker from an owner that also implements `Drop`.
+    pub(crate) fn take_finished_handle(&mut self) -> Self {
+        Self {
+            target_height: self.target_height,
+            loaded_height: self.loaded_height,
+            last_published_height: self.last_published_height,
+            last_published_at: self.last_published_at,
+            cadence: self.cadence,
+            loaded_height_gauge: self.loaded_height_gauge.clone(),
+            readiness: self.readiness.take(),
+        }
+    }
+
     fn publish(&mut self, now: Instant) {
         self.loaded_height_gauge.set(f64::from(self.loaded_height));
         if let Some(readiness) = &self.readiness {

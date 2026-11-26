@@ -129,12 +129,17 @@ pub(crate) struct PoolCommitments {
 
 /// Extracts per-pool note commitments from a [`SourceBlock`].
 pub(crate) fn pool_commitments(source_block: &SourceBlock) -> Result<PoolCommitments, DynError> {
-    let compact_block = prepare_canonical_block(
-        source_block,
-        &sample_regtest_upgrade_activations(),
-        RawBlobPolicy::Transactions,
-    )?
-    .partial_compact_block;
+    pool_commitments_with_activations(source_block, &sample_regtest_upgrade_activations())
+}
+
+/// Extracts per-pool note commitments using an explicit activation table.
+pub(crate) fn pool_commitments_with_activations(
+    source_block: &SourceBlock,
+    activations: &NetworkUpgradeActivations,
+) -> Result<PoolCommitments, DynError> {
+    let compact_block =
+        prepare_canonical_block(source_block, activations, RawBlobPolicy::Transactions)?
+            .partial_compact_block;
     let mut commitments = PoolCommitments::default();
     for transaction in compact_block.transactions() {
         commitments.sapling.extend(
@@ -245,28 +250,48 @@ pub(crate) fn chained_source_block(
         .get_mut(SERIALIZED_HEADER_PARENT_OFFSET..SERIALIZED_HEADER_PARENT_END)
         .ok_or("fixture block is too short to carry a parent hash")?
         .copy_from_slice(&parent_hash.as_bytes());
-    let block_time = raw_block_bytes
-        .get_mut(SERIALIZED_HEADER_TIME_OFFSET)
-        .ok_or("fixture block is too short to carry a block time")?;
-    *block_time = block_time.wrapping_add(time_nonce);
-    let height_byte = u8::try_from(height.value())?;
+    let height_val = height.value();
+    let delta_seconds = if height_val > u32::from(u8::MAX) && time_nonce == 0 {
+        height_val
+    } else {
+        u32::from(time_nonce)
+    };
+    let time_bytes = fixture
+        .block_time_seconds
+        .wrapping_add(delta_seconds)
+        .to_le_bytes();
+    raw_block_bytes
+        .get_mut(SERIALIZED_HEADER_TIME_OFFSET..SERIALIZED_HEADER_TIME_OFFSET + 4)
+        .ok_or("fixture block is too short to carry a block time")?
+        .copy_from_slice(&time_bytes);
     let coinbase_height_opcode = raw_block_bytes
         .get_mut(COINBASE_HEIGHT_OPCODE_OFFSET)
         .ok_or("fixture block is too short to carry a coinbase height")?;
-    if height_byte <= 16 {
-        *coinbase_height_opcode = 0x50_u8.saturating_add(height_byte);
-    } else {
-        assert!(
-            height_byte <= 127,
-            "fixture needs a one-byte positive script integer"
-        );
+    if height_val <= 16 {
+        *coinbase_height_opcode = 0x50_u8.saturating_add(u8::try_from(height_val)?);
+    } else if height_val <= 127 {
         *coinbase_height_opcode = 1;
-        raw_block_bytes.insert(COINBASE_HEIGHT_OPCODE_OFFSET + 1, height_byte);
+        raw_block_bytes.insert(COINBASE_HEIGHT_OPCODE_OFFSET + 1, u8::try_from(height_val)?);
         let script_length = raw_block_bytes
             .get_mut(COINBASE_SCRIPT_LENGTH_OFFSET)
             .ok_or("fixture block is too short to carry a coinbase script length")?;
         *script_length = script_length
             .checked_add(1)
+            .ok_or("fixture coinbase script is too long")?;
+    } else {
+        assert!(
+            height_val <= 32_767,
+            "fixture needs a two-byte positive script integer"
+        );
+        let le_bytes = u16::try_from(height_val)?.to_le_bytes();
+        *coinbase_height_opcode = 2;
+        let insert_at = COINBASE_HEIGHT_OPCODE_OFFSET + 1;
+        raw_block_bytes.splice(insert_at..insert_at, le_bytes);
+        let script_length = raw_block_bytes
+            .get_mut(COINBASE_SCRIPT_LENGTH_OFFSET)
+            .ok_or("fixture block is too short to carry a coinbase script length")?;
+        *script_length = script_length
+            .checked_add(2)
             .ok_or("fixture coinbase script is too long")?;
     }
     let mut block: ZebraBlock = raw_block_bytes.as_slice().zcash_deserialize_into()?;
@@ -334,7 +359,7 @@ impl MultiBlockConstructionSource {
                 chained_source_block(
                     BlockHeight::new(height_num),
                     parent_hash,
-                    u8::try_from(height_num)?,
+                    u8::try_from(height_num).unwrap_or(0),
                     extra_transactions(height_num)?,
                 )?
             };
@@ -352,7 +377,7 @@ impl MultiBlockConstructionSource {
             accumulator.cross_checked_frontiers()?,
         )];
         for block in &blocks {
-            let commitments = pool_commitments(block)?;
+            let commitments = pool_commitments_with_activations(block, activations)?;
             accumulator.append_block_commitments(
                 block.height,
                 &commitments.sapling,

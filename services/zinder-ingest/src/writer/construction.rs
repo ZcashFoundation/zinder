@@ -6,7 +6,7 @@ mod tree_hashing;
 pub(crate) mod watermark;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     num::{NonZeroU32, NonZeroU64},
     pin::Pin,
     sync::Arc,
@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BatchAppendedBlock, BatchPoolAppendDurations, BlockCommitmentBatchInput, BlockHeight, BlockId,
     ChainTipMetadata, CommitmentTreeAccumulator, CommitmentTreeAccumulatorError,
-    CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
+    CommitmentTreeCheckpoint, CommitmentTreeSnapshot, Network, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
@@ -54,7 +54,7 @@ use progress::ConstructionProgress;
 use source_fetch::{
     CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
 };
-use tree_hashing::{PendingBuildBlock, TreeHashers, TreeWork};
+use tree_hashing::{GuardedBuildBlock, PipelinedBuildBlocks, TreeHashers, final_roots};
 
 const CANONICAL_PREPARE_MEMORY_UNIT_BYTES: u64 = 1_024;
 const CANONICAL_PREPARE_RAW_BLOCK_MULTIPLIER: u64 = 16;
@@ -112,11 +112,12 @@ pub struct CanonicalPipelineLimits {
     pub block_prepare_memory_watermark_bytes: NonZeroU64,
     /// Threads that hash the ordered loader's commitment trees.
     ///
-    /// One hashes on the loader thread itself. More run each block's pool
-    /// appends and large commitment batches in parallel, and derive the
-    /// checkpoints of up to twice this many blocks while the loader writes
-    /// earlier ones. Blocks still reach the store in height order with the
-    /// same trees and checkpoints.
+    /// One hashes on the loader thread itself. More run each block batch's
+    /// commitment-tree appends and distinct pool frontier cross-checks in
+    /// parallel across all worker threads, while a bounded handoff queue lets
+    /// the next batch's tree hashing overlap with `RocksDB` SST staging.
+    /// Blocks still reach the store in height order with the same trees and
+    /// checkpoints.
     pub tree_hashing_workers: NonZeroU32,
 }
 
@@ -164,8 +165,9 @@ impl CanonicalPipelineLimits {
     /// spends most of its loader time hashing, so it defaults to this. Sparse
     /// construction keeps hashing on the loader thread, where extra threads
     /// slowed hosts with two cores. Eight is the most workers a full Mainnet
-    /// build has measured, including its peak memory: each worker lets two
-    /// more prepared blocks wait with their memory permits.
+    /// build has measured, with in-flight block memory bounded by
+    /// `block_prepare_memory_watermark_bytes` across tree hashing and SST
+    /// staging.
     #[must_use]
     pub fn with_checkpoint_hashing(self, detected_logical_cpus: Option<NonZeroU32>) -> Self {
         let ceiling =
@@ -494,10 +496,15 @@ where
     let progress = options
         .progress
         .unwrap_or_else(|| ConstructionProgress::start(&build_plan, None));
-    let block_queue_capacity =
+    let prepare_concurrency =
         usize::try_from(config.pipeline_limits.block_prepare_concurrency.get())
             .unwrap_or(usize::MAX)
             .max(1);
+    let block_queue_capacity = if config.pipeline_limits.tree_hashing_workers.get() > 1 {
+        prepare_concurrency.max(MAX_COMMITMENT_BATCH_BLOCKS)
+    } else {
+        prepare_concurrency
+    };
     let prepared_blocks = build_prepared_block_stream(
         source,
         &build_plan,
@@ -1172,9 +1179,11 @@ struct BlockLoaderSettings {
 }
 
 struct BuildBlockReceiverConfig {
+    runtime: tokio::runtime::Handle,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     checkpoint_selection: Option<TreeStateCheckpointSelection>,
     cancel: CancellationToken,
+    loader_stop: CancellationToken,
     progress: ConstructionProgress,
 }
 
@@ -1194,19 +1203,22 @@ where
         cancel,
         progress,
     } = settings;
-    let tree_hashers = TreeHashers::start(tree_hashing_workers, tokio::runtime::Handle::current())?;
+    let tree_hashers = TreeHashers::start(tree_hashing_workers)?;
+    let loader_stop = cancel.child_token();
     let (block_sender, block_receiver) = mpsc::channel(block_queue_capacity);
     let receiver_config = BuildBlockReceiverConfig {
+        runtime: tokio::runtime::Handle::current(),
         network_upgrade_activations,
         checkpoint_selection,
         cancel: cancel.clone(),
+        loader_stop: loader_stop.clone(),
         progress,
     };
     let loader_task = tokio::task::spawn_blocking(move || {
         run_block_loader(builder, block_receiver, tree_hashers, receiver_config)
     });
 
-    let forwarded = cancel
+    let forwarded = loader_stop
         .run_until_cancelled(forward_prepared_blocks(prepared_blocks, block_sender))
         .await
         .is_some();
@@ -1227,6 +1239,10 @@ where
     })?
 }
 
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "build_blocks and pipelined move by value into load_blocks_into_builder and finish_and_join"
+)]
 fn run_block_loader(
     mut builder: RocksDbCanonicalBuilder,
     block_receiver: mpsc::Receiver<Result<QueuedPreparedBlock, CanonicalConstructionError>>,
@@ -1246,8 +1262,11 @@ fn run_block_loader(
     })?;
     let workload = builder.workload();
     let build_tip_height = builder.build_plan().build_tip().height;
-    let mut build_blocks = CanonicalBuildBlockReceiver {
+    let build_blocks = CanonicalBuildBlockReceiver {
         receiver: block_receiver,
+        runtime: receiver_config.runtime,
+        ready: VecDeque::new(),
+        terminated_after_error: false,
         active_memory_permit: None,
         running_tree_sizes: CommitmentTreeSizes::from_tip_metadata(predecessor_tip_metadata),
         commitment_tree_accumulator,
@@ -1257,23 +1276,21 @@ fn run_block_loader(
         checkpoint_selection: receiver_config.checkpoint_selection,
         checkpoint_tree_sizes: predecessor_tip_metadata,
         cancel: receiver_config.cancel,
+        loader_stop: receiver_config.loader_stop,
         stage_timers: BlockLoaderStageTimers::register(workload),
         tree_hashers,
         in_flight_store_height: None,
-        progress: receiver_config.progress,
+        progress: None,
         #[cfg(test)]
         parallel_batch_sizes: Vec::new(),
     };
-    let evidence = builder
-        .bulk_load_blocks(
-            &receiver_config.network_upgrade_activations,
-            &mut build_blocks,
-        )
-        .map_err(canonical_build_error)?;
-    build_blocks.progress.finish();
+    let (evidence, mut derived_subtree_roots) = load_blocks_into_builder(
+        &mut builder,
+        &receiver_config.network_upgrade_activations,
+        build_blocks,
+        receiver_config.progress,
+    )?;
     builder.record_resource_gauges();
-    let mut derived_subtree_roots = std::mem::take(&mut build_blocks.derived_subtree_roots);
-    drop(build_blocks);
     // Blocks complete different pools' subtrees in any order, while the
     // node's ranges and the store's keys list one pool after another.
     derived_subtree_roots.sort_by_key(|root| (root.protocol.id(), root.subtree_index.value()));
@@ -1282,6 +1299,45 @@ fn run_block_loader(
         evidence,
         derived_subtree_roots,
     })
+}
+
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "finish_and_join consumes pipelined and drops its active memory permit before returning"
+)]
+fn load_blocks_into_builder(
+    builder: &mut RocksDbCanonicalBuilder,
+    activations: &NetworkUpgradeActivations,
+    mut build_blocks: CanonicalBuildBlockReceiver,
+    progress: ConstructionProgress,
+) -> Result<(CanonicalBlockLoadEvidence, Vec<CanonicalBuildSubtreeRoot>), CanonicalConstructionError>
+{
+    if build_blocks.tree_hashers.is_none() {
+        build_blocks.progress = Some(progress);
+        let load_outcome = builder.bulk_load_blocks(activations, &mut build_blocks);
+        build_blocks.loader_stop.cancel();
+        let evidence = load_outcome.map_err(canonical_build_error)?;
+        if let Some(tracked_progress) = &mut build_blocks.progress {
+            tracked_progress.finish();
+        }
+        let derived_subtree_roots = std::mem::take(&mut build_blocks.derived_subtree_roots);
+        return Ok((evidence, derived_subtree_roots));
+    }
+    let cancel = build_blocks.cancel.clone();
+    let loader_stop = build_blocks.loader_stop.clone();
+    let mut pipelined = PipelinedBuildBlocks::spawn(
+        build_blocks,
+        progress,
+        cancel,
+        loader_stop,
+        MAX_COMMITMENT_BATCH_BLOCKS,
+    )?;
+    let load_outcome = builder.bulk_load_blocks(activations, &mut pipelined);
+    let (mut tracked_progress, derived_subtree_roots) =
+        pipelined.finish_and_join(load_outcome.is_ok())?;
+    let evidence = load_outcome.map_err(canonical_build_error)?;
+    tracked_progress.finish();
+    Ok((evidence, derived_subtree_roots))
 }
 
 async fn forward_prepared_blocks<PreparedBlocks>(
@@ -1301,6 +1357,9 @@ async fn forward_prepared_blocks<PreparedBlocks>(
 
 struct CanonicalBuildBlockReceiver {
     receiver: mpsc::Receiver<Result<QueuedPreparedBlock, CanonicalConstructionError>>,
+    runtime: tokio::runtime::Handle,
+    ready: VecDeque<Result<GuardedBuildBlock, CanonicalConstructionError>>,
+    terminated_after_error: bool,
     active_memory_permit: Option<OwnedSemaphorePermit>,
     running_tree_sizes: CommitmentTreeSizes,
     commitment_tree_accumulator: CommitmentTreeAccumulator,
@@ -1310,26 +1369,26 @@ struct CanonicalBuildBlockReceiver {
     checkpoint_selection: Option<TreeStateCheckpointSelection>,
     checkpoint_tree_sizes: ChainTipMetadata,
     cancel: CancellationToken,
+    loader_stop: CancellationToken,
     stage_timers: BlockLoaderStageTimers,
     /// Hashing threads, or `None` when the loader hashes on its own thread.
     tree_hashers: Option<TreeHashers>,
     in_flight_store_height: Option<BlockHeight>,
-    progress: ConstructionProgress,
+    progress: Option<ConstructionProgress>,
     #[cfg(test)]
     parallel_batch_sizes: Vec<usize>,
 }
 
-/// Per-block durations of the serial loader, resolved once per construction.
+/// Stage durations of the canonical block loader, resolved once per construction.
 ///
-/// The stages do not overlap. `receive_wait` is time the loader spent idle
-/// waiting for a prepared block, so a high share means the source or
-/// preparation, not the loader, bounds construction. Every stage named
-/// `tree_hashing_*` is time the loader spent on commitment-tree hashing, so
-/// with one tree-hashing worker their sum is the serial hashing cost. With
-/// more workers, `tree_hashing_append` is the loader's wait for a block's
-/// parallel append, and `tree_hashing_checkpoint` and
-/// `tree_hashing_final_roots` are its wait for work the workers finished
-/// while it handled other blocks.
+/// `receive_wait` is time spent idle waiting for the next prepared block, so a
+/// high share means source fetch or block preparation bounds construction.
+/// Every stage named `tree_hashing_*` records commitment-tree hashing wall
+/// time on the tree-staging thread (or on the loader thread when
+/// `tree_hashing_workers == 1`): `tree_hashing_append` measures batch or
+/// per-block tree appends, `tree_hashing_checkpoint` measures pool frontier
+/// cross-checks, and `tree_hashing_final_roots` measures any remaining final
+/// root derivations for explorer builds.
 struct BlockLoaderStageTimers {
     receive_wait: Histogram,
     commitment_extract: Histogram,
@@ -1380,10 +1439,17 @@ struct PreparedBatchEntry {
     commitments: CompactBlockCommitments,
 }
 
-enum DrainedBatchTail {
-    ChannelIdleOrClosed,
-    BatchLimitReached,
-    Failed(CanonicalConstructionError),
+struct PositionedBatchEntry {
+    positioned: PositionedCanonicalBlock,
+    memory_permit: OwnedSemaphorePermit,
+    snapshot: CommitmentTreeSnapshot,
+    checkpoint_required: bool,
+}
+
+struct BatchCheckpointOutcome {
+    valid_prefix_len: usize,
+    checkpoints: Vec<Option<CommitmentTreeCheckpoint>>,
+    checkpoint_error: Option<CanonicalConstructionError>,
 }
 
 impl Iterator for CanonicalBuildBlockReceiver {
@@ -1391,28 +1457,19 @@ impl Iterator for CanonicalBuildBlockReceiver {
 
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "the received block's memory permit moves into queued_block and stays active through the store write"
+        reason = "the block's memory permit moves into active_memory_permit and stays held through the store write"
     )]
     fn next(&mut self) -> Option<Self::Item> {
         self.active_memory_permit = None;
         self.record_staged_block();
-        if self.tree_hashers.is_some() {
-            return self.next_hashed_ahead();
-        }
-        match self.receive(true) {
-            Received::Block(queued_block) => {
-                self.active_memory_permit = Some(queued_block.memory_permit);
-                let built = self.build_block(queued_block.prepared);
-                if let Ok(block) = &built {
-                    self.in_flight_store_height = Some(block.facts.block_header.height);
-                }
-                Some(built)
+        let next_guarded = self.next_guarded()?;
+        match next_guarded {
+            Ok(guarded) => {
+                self.active_memory_permit = Some(guarded.memory_permit);
+                self.in_flight_store_height = Some(guarded.block.facts.block_header.height);
+                Some(Ok(guarded.block))
             }
-            Received::Failed(source) => Some(Err(source)),
-            Received::Empty | Received::Closed => self
-                .cancel
-                .is_cancelled()
-                .then_some(Err(CanonicalConstructionError::Cancelled)),
+            Err(error) => Some(Err(error)),
         }
     }
 }
@@ -1432,8 +1489,9 @@ impl CanonicalBuildBlockReceiver {
     fn record_staged_block(&mut self) {
         if let Some(height) = self.in_flight_store_height.take()
             && !self.cancel.is_cancelled()
+            && let Some(progress) = &mut self.progress
         {
-            self.progress.record_loaded(height);
+            progress.record_loaded(height);
         }
     }
 
@@ -1446,10 +1504,20 @@ impl CanonicalBuildBlockReceiver {
                 Ok(received) => Some(received),
                 Err(TryRecvError::Disconnected) => None,
                 Err(TryRecvError::Empty) => {
-                    if !self.cancel.is_cancelled() {
-                        self.progress.flush_pending();
+                    if !self.cancel.is_cancelled()
+                        && let Some(progress) = &mut self.progress
+                    {
+                        progress.flush_pending();
                     }
-                    self.receiver.blocking_recv()
+                    let loader_stop = &self.loader_stop;
+                    let receiver = &mut self.receiver;
+                    self.runtime.block_on(async {
+                        tokio::select! {
+                            biased;
+                            () = loader_stop.cancelled() => None,
+                            next_msg = receiver.recv() => next_msg,
+                        }
+                    })
                 }
             };
             if matches!(received, Some(Ok(_))) {
@@ -1467,85 +1535,94 @@ impl CanonicalBuildBlockReceiver {
         };
         // A cancelled producer drops its sender, so a closed channel must not
         // read as a complete stream and start SST finalization.
-        match received.filter(|_| !self.cancel.is_cancelled()) {
+        match received.filter(|_| !self.cancel.is_cancelled() && !self.loader_stop.is_cancelled()) {
             Some(Ok(queued_block)) => Received::Block(Box::new(queued_block)),
             Some(Err(source)) => Received::Failed(source),
             None => Received::Closed,
         }
     }
 
-    /// Hands the store the oldest appended block once its tree work is done,
-    /// refilling at the low-water mark so backlogged sources keep taking
-    /// parallel multi-block batches.
-    fn next_hashed_ahead(
-        &mut self,
-    ) -> Option<Result<CanonicalBuildBlock, CanonicalConstructionError>> {
+    fn pop_ready(&mut self) -> Option<Result<GuardedBuildBlock, CanonicalConstructionError>> {
+        let ready_entry = self.ready.pop_front()?;
+        if ready_entry.is_err() {
+            self.terminated_after_error = true;
+            self.ready.clear();
+        }
+        Some(ready_entry)
+    }
+
+    /// Produces the next ordered canonical build block while retaining its
+    /// preparation memory permit.
+    fn next_guarded(&mut self) -> Option<Result<GuardedBuildBlock, CanonicalConstructionError>> {
         if self.cancel.is_cancelled() {
             return Some(Err(CanonicalConstructionError::Cancelled));
         }
-        if self
-            .tree_hashers
-            .as_ref()
-            .is_some_and(TreeHashers::wants_batch_refill)
-        {
-            while self
-                .tree_hashers
-                .as_ref()
-                .is_some_and(TreeHashers::wants_more)
-            {
-                let (batch, tail) = self.drain_prepared_batch();
-                if !batch.is_empty() {
-                    self.stage_prepared_batch(batch);
-                }
-                match tail {
-                    DrainedBatchTail::Failed(error) => {
-                        if let Some(tree_hashers) = self.tree_hashers.as_mut()
-                            && !tree_hashers.has_pending_error()
-                        {
-                            tree_hashers.push(Err(error));
-                        }
-                        break;
-                    }
-                    DrainedBatchTail::ChannelIdleOrClosed => break,
-                    DrainedBatchTail::BatchLimitReached => {}
-                }
-            }
+        if self.loader_stop.is_cancelled() {
+            return None;
         }
-        let Some(pending) = self.tree_hashers.as_mut().and_then(TreeHashers::pop) else {
-            return self
-                .cancel
-                .is_cancelled()
-                .then_some(Err(CanonicalConstructionError::Cancelled));
-        };
-        let built = pending.and_then(|pending| self.finish_block(pending));
-        if let Ok(block) = &built {
-            self.in_flight_store_height = Some(block.facts.block_header.height);
+        if self.tree_hashers.is_none() {
+            return match self.receive(true) {
+                Received::Block(queued_block) => {
+                    let QueuedPreparedBlock {
+                        prepared,
+                        memory_permit,
+                    } = *queued_block;
+                    Some(self.build_block(prepared).map(|block| GuardedBuildBlock {
+                        block,
+                        memory_permit,
+                    }))
+                }
+                Received::Failed(source) => Some(Err(source)),
+                Received::Empty | Received::Closed => self
+                    .cancel
+                    .is_cancelled()
+                    .then_some(Err(CanonicalConstructionError::Cancelled)),
+            };
         }
-        Some(built)
+        if let Some(ready_entry) = self.pop_ready() {
+            return Some(ready_entry);
+        }
+        if self.terminated_after_error {
+            return None;
+        }
+        self.fill_ready_batch();
+        if let Some(ready_entry) = self.pop_ready() {
+            return Some(ready_entry);
+        }
+        self.cancel
+            .is_cancelled()
+            .then_some(Err(CanonicalConstructionError::Cancelled))
     }
 
-    fn drain_prepared_batch(&mut self) -> (Vec<PreparedBatchEntry>, DrainedBatchTail) {
-        let remaining = self
-            .tree_hashers
-            .as_ref()
-            .map_or(0, TreeHashers::remaining_pending);
-        let block_limit = remaining.min(MAX_COMMITMENT_BATCH_BLOCKS);
+    fn fill_ready_batch(&mut self) {
+        let (batch, trailing_error) = self.drain_prepared_batch();
+        let batch_succeeded = if batch.is_empty() {
+            true
+        } else {
+            self.stage_prepared_batch(batch)
+        };
+        if batch_succeeded && let Some(error) = trailing_error {
+            self.ready.push_back(Err(error));
+        }
+    }
+
+    fn drain_prepared_batch(
+        &mut self,
+    ) -> (Vec<PreparedBatchEntry>, Option<CanonicalConstructionError>) {
         let mut batch = Vec::new();
         let mut total_commitments = 0_usize;
-        let mut tail = DrainedBatchTail::ChannelIdleOrClosed;
+        let mut trailing_error = None;
 
-        while batch.len() < block_limit {
-            // Waiting for a new block while earlier blocks hold memory permits
-            // could stall a source pipeline that needs those permits back.
-            let idle =
-                batch.is_empty() && self.tree_hashers.as_ref().is_some_and(TreeHashers::is_idle);
-            match self.receive(idle) {
+        while batch.len() < MAX_COMMITMENT_BATCH_BLOCKS {
+            // Block only when `batch` is empty so a tight memory watermark
+            // never waits for permits still held by earlier blocks in `batch`.
+            match self.receive(batch.is_empty()) {
                 Received::Block(queued_block) => {
                     let started_at = Instant::now();
                     let commitments = match compact_block_commitments(&queued_block.prepared) {
                         Ok(commitments) => commitments,
                         Err(error) => {
-                            tail = DrainedBatchTail::Failed(error);
+                            trailing_error = Some(error);
                             break;
                         }
                     };
@@ -1558,32 +1635,22 @@ impl CanonicalBuildBlockReceiver {
                         commitments,
                     });
                     if total_commitments >= MAX_COMMITMENT_BATCH_COMMITMENTS {
-                        tail = DrainedBatchTail::BatchLimitReached;
                         break;
                     }
                 }
                 Received::Failed(error) => {
-                    tail = DrainedBatchTail::Failed(error);
+                    trailing_error = Some(error);
                     break;
                 }
                 Received::Empty | Received::Closed => break,
             }
         }
-        if batch.len() == block_limit && matches!(tail, DrainedBatchTail::ChannelIdleOrClosed) {
-            tail = DrainedBatchTail::BatchLimitReached;
-        }
-        (batch, tail)
+        (batch, trailing_error)
     }
 
-    fn stage_prepared_batch(&mut self, batch: Vec<PreparedBatchEntry>) {
-        let can_batch_in_parallel = batch.len() >= 2
-            && self
-                .tree_hashers
-                .as_ref()
-                .is_some_and(TreeHashers::has_append_workers);
-        if !can_batch_in_parallel {
-            self.stage_batch_sequentially(batch);
-            return;
+    fn stage_prepared_batch(&mut self, batch: Vec<PreparedBatchEntry>) -> bool {
+        if batch.len() < 2 || self.tree_hashers.is_none() {
+            return self.stage_batch_sequentially(batch);
         }
         let batch_len = batch.len();
         let total_commitments: usize = batch
@@ -1612,8 +1679,7 @@ impl CanonicalBuildBlockReceiver {
         let Ok(outcome) = batch_outcome else {
             // Fall back block by block so valid prefix blocks still reach the
             // store before the first failing block ends construction.
-            self.stage_batch_sequentially(batch);
-            return;
+            return self.stage_batch_sequentially(batch);
         };
         #[cfg(test)]
         self.parallel_batch_sizes.push(batch_len);
@@ -1623,138 +1689,288 @@ impl CanonicalBuildBlockReceiver {
             .record(append_started_at.elapsed());
         self.stage_timers
             .record_pool_append_durations(outcome.pool_durations);
-        self.commit_staged_batch(batch, outcome.blocks);
+        self.commit_staged_batch(batch, outcome.blocks)
     }
 
-    fn stage_batch_sequentially(&mut self, batch: Vec<PreparedBatchEntry>) {
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "built moves directly into self.ready while retaining its preparation memory permit"
+    )]
+    fn stage_batch_sequentially(&mut self, batch: Vec<PreparedBatchEntry>) -> bool {
         for entry in batch {
-            let staged = self.stage_prepared_entry(entry);
-            let failed = staged.is_err();
-            if let Some(tree_hashers) = self.tree_hashers.as_mut() {
-                tree_hashers.push(staged);
-            } else {
-                drop(staged);
-            }
+            let PreparedBatchEntry {
+                queued,
+                commitments,
+            } = entry;
+            let built = self.stage_single_entry(queued, &commitments);
+            let failed = built.is_err();
+            self.ready.push_back(built);
             if failed {
-                break;
+                return false;
             }
         }
+        true
     }
 
-    fn stage_prepared_entry(
+    fn stage_single_entry(
         &mut self,
-        entry: PreparedBatchEntry,
-    ) -> Result<PendingBuildBlock, CanonicalConstructionError> {
-        let PreparedBatchEntry {
-            queued,
-            commitments,
-        } = entry;
-        let height = queued.prepared.facts.block_header.height;
-        self.append_commitments_to_accumulator(height, &commitments)?;
-        let positioned = self.position_block(queued.prepared)?;
-        let snapshot = self.commitment_tree_accumulator.snapshot();
-        Ok(self.enqueue_tree_work(positioned, queued.memory_permit, snapshot))
+        queued: QueuedPreparedBlock,
+        commitments: &CompactBlockCommitments,
+    ) -> Result<GuardedBuildBlock, CanonicalConstructionError> {
+        let QueuedPreparedBlock {
+            prepared,
+            memory_permit,
+        } = queued;
+        let height = prepared.facts.block_header.height;
+        let block_hash = prepared.facts.block_header.block_hash;
+        let block_time_seconds = prepared.partial_compact_block.time();
+        self.append_commitments_to_accumulator(height, commitments)?;
+        let positioned = self.position_block(prepared)?;
+        let positioned_at = Instant::now();
+        let checkpoint_required = self.select_checkpoint(height, positioned.tip_metadata);
+        let tree_state_checkpoint = checkpoint_required
+            .then(|| {
+                self.commitment_tree_accumulator
+                    .cross_checked_frontiers()
+                    .map(|frontiers| {
+                        CommitmentTreeCheckpoint::new(
+                            BlockId::new(height, block_hash),
+                            block_time_seconds,
+                            frontiers,
+                        )
+                    })
+            })
+            .transpose()
+            .map_err(|source| CanonicalConstructionError::CommitmentTreeState { height, source })?;
+        if checkpoint_required {
+            self.stage_timers
+                .tree_hashing_checkpoint
+                .record(positioned_at.elapsed());
+        }
+        let block_final_note_commitment_roots = self.block_final_note_commitment_roots(block_hash);
+        Ok(GuardedBuildBlock {
+            block: canonical_build_block(
+                positioned,
+                tree_state_checkpoint,
+                block_final_note_commitment_roots,
+            ),
+            memory_permit,
+        })
     }
 
     fn commit_staged_batch(
         &mut self,
         batch: Vec<PreparedBatchEntry>,
         appended_blocks: Vec<BatchAppendedBlock>,
+    ) -> bool {
+        let (positioned_entries, position_error) =
+            self.position_staged_batch(batch, appended_blocks);
+        let BatchCheckpointOutcome {
+            valid_prefix_len,
+            mut checkpoints,
+            checkpoint_error,
+        } = self.derive_batch_checkpoints(&positioned_entries);
+        let final_roots_list =
+            self.derive_batch_final_roots(&positioned_entries[..valid_prefix_len]);
+        for ((entry, checkpoint), block_roots) in positioned_entries
+            .into_iter()
+            .take(valid_prefix_len)
+            .zip(checkpoints.drain(..valid_prefix_len))
+            .zip(final_roots_list)
+        {
+            self.ready.push_back(Ok(GuardedBuildBlock {
+                block: canonical_build_block(entry.positioned, checkpoint, block_roots),
+                memory_permit: entry.memory_permit,
+            }));
+        }
+        if let Some(error) = checkpoint_error {
+            self.ready.push_back(Err(error));
+            return false;
+        }
+        if let Some(error) = position_error {
+            self.ready.push_back(Err(error));
+            return false;
+        }
+        true
+    }
+
+    fn position_staged_batch(
+        &mut self,
+        batch: Vec<PreparedBatchEntry>,
+        appended_blocks: Vec<BatchAppendedBlock>,
+    ) -> (
+        Vec<PositionedBatchEntry>,
+        Option<CanonicalConstructionError>,
     ) {
+        let mut positioned_entries = Vec::with_capacity(batch.len());
+        let mut position_error = None;
         for (entry, appended) in batch.into_iter().zip(appended_blocks) {
-            let staged = self.finalize_staged_batch_block(entry.queued, appended);
-            let failed = staged.is_err();
-            if let Some(tree_hashers) = self.tree_hashers.as_mut() {
-                tree_hashers.push(staged);
-            } else {
-                drop(staged);
-            }
-            if failed {
-                break;
+            self.derived_subtree_roots.extend(
+                appended
+                    .completed_subtree_roots
+                    .into_iter()
+                    .map(CanonicalBuildSubtreeRoot::from),
+            );
+            let accumulated = appended.snapshot.tip_metadata();
+            match self.position_block_against(entry.queued.prepared, accumulated) {
+                Ok(positioned) => {
+                    let height = positioned.facts.block_header.height;
+                    let checkpoint_required =
+                        self.select_checkpoint(height, positioned.tip_metadata);
+                    positioned_entries.push(PositionedBatchEntry {
+                        positioned,
+                        memory_permit: entry.queued.memory_permit,
+                        snapshot: appended.snapshot,
+                        checkpoint_required,
+                    });
+                }
+                Err(error) => {
+                    position_error = Some(error);
+                    break;
+                }
             }
         }
+        (positioned_entries, position_error)
     }
 
-    fn finalize_staged_batch_block(
-        &mut self,
-        queued: QueuedPreparedBlock,
-        appended: BatchAppendedBlock,
-    ) -> Result<PendingBuildBlock, CanonicalConstructionError> {
-        self.derived_subtree_roots.extend(
-            appended
-                .completed_subtree_roots
-                .into_iter()
-                .map(CanonicalBuildSubtreeRoot::from),
-        );
-        let accumulated = appended.snapshot.tip_metadata();
-        let positioned = self.position_block_against(queued.prepared, accumulated)?;
-        Ok(self.enqueue_tree_work(positioned, queued.memory_permit, appended.snapshot))
-    }
-
-    fn enqueue_tree_work(
-        &mut self,
-        positioned: PositionedCanonicalBlock,
-        memory_permit: OwnedSemaphorePermit,
-        snapshot: zinder_core::CommitmentTreeSnapshot,
-    ) -> PendingBuildBlock {
-        let height = positioned.facts.block_header.height;
-        let block = BlockId::new(height, positioned.facts.block_header.block_hash);
-        let block_time_seconds = positioned.compact_block.time();
-        let work = TreeWork {
-            checkpoint_required: self.select_checkpoint(height, positioned.tip_metadata),
-            final_roots_required: self.workload.derives_final_roots(),
-        };
-        let tree_work = (work.checkpoint_required || work.final_roots_required)
-            .then(|| {
-                self.tree_hashers.as_ref().map(|tree_hashers| {
-                    tree_hashers.spawn_tree_work(snapshot, block, block_time_seconds, work)
+    fn derive_batch_checkpoints(&self, entries: &[PositionedBatchEntry]) -> BatchCheckpointOutcome {
+        let mut checkpoint_indices = Vec::new();
+        let mut snapshot_refs = Vec::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            if entry.checkpoint_required {
+                checkpoint_indices.push(idx);
+                snapshot_refs.push(&entry.snapshot);
+            }
+        }
+        if snapshot_refs.is_empty() {
+            return BatchCheckpointOutcome {
+                valid_prefix_len: entries.len(),
+                checkpoints: vec![None; entries.len()],
+                checkpoint_error: None,
+            };
+        }
+        let started_at = Instant::now();
+        let batch_frontiers = self.tree_hashers.as_ref().map_or_else(
+            || CommitmentTreeSnapshot::cross_checked_frontiers_batch(&snapshot_refs),
+            |tree_hashers| {
+                tree_hashers.install(|| {
+                    CommitmentTreeSnapshot::cross_checked_frontiers_batch(&snapshot_refs)
                 })
-            })
-            .flatten();
-        PendingBuildBlock {
-            height,
-            positioned,
-            memory_permit,
-            work,
-            tree_work,
+            },
+        );
+        self.stage_timers
+            .tree_hashing_checkpoint
+            .record(started_at.elapsed());
+        match batch_frontiers {
+            Ok(frontiers_list) => {
+                let mut checkpoints = vec![None; entries.len()];
+                for (entry_idx, frontiers) in checkpoint_indices.into_iter().zip(frontiers_list) {
+                    if let Some(entry) = entries.get(entry_idx) {
+                        let header = &entry.positioned.facts.block_header;
+                        let block_id = BlockId::new(header.height, header.block_hash);
+                        checkpoints[entry_idx] = Some(CommitmentTreeCheckpoint::new(
+                            block_id,
+                            entry.positioned.compact_block.time(),
+                            frontiers,
+                        ));
+                    }
+                }
+                BatchCheckpointOutcome {
+                    valid_prefix_len: entries.len(),
+                    checkpoints,
+                    checkpoint_error: None,
+                }
+            }
+            Err((failed_slot, source)) => {
+                Self::recover_prefix_checkpoints(entries, &checkpoint_indices, failed_slot, source)
+            }
         }
     }
 
-    /// Waits for a staged block's tree work and builds the block the store
-    /// writes, keeping its memory permit until the store is done with it.
-    fn finish_block(
-        &mut self,
-        pending: PendingBuildBlock,
-    ) -> Result<CanonicalBuildBlock, CanonicalConstructionError> {
-        let PendingBuildBlock {
-            height,
-            positioned,
-            memory_permit,
-            work,
-            tree_work,
-        } = pending;
-        self.active_memory_permit = Some(memory_permit);
-        let Some(tree_work) = tree_work else {
-            return Ok(canonical_build_block(positioned, None, None));
-        };
-        let waited_at = Instant::now();
-        let output = tree_work.wait(&self.cancel)?;
-        if work.checkpoint_required {
-            self.stage_timers
-                .tree_hashing_checkpoint
-                .record(waited_at.elapsed());
-        } else if let Some(timer) = &self.stage_timers.tree_hashing_final_roots {
-            timer.record(waited_at.elapsed());
+    fn recover_prefix_checkpoints(
+        entries: &[PositionedBatchEntry],
+        checkpoint_indices: &[usize],
+        failed_slot: usize,
+        source: CommitmentTreeAccumulatorError,
+    ) -> BatchCheckpointOutcome {
+        let failed_entry_idx = checkpoint_indices
+            .get(failed_slot)
+            .copied()
+            .unwrap_or(entries.len());
+        let mut checkpoints = vec![None; failed_entry_idx];
+        for &entry_idx in checkpoint_indices.iter().take(failed_slot) {
+            let Some(entry) = entries.get(entry_idx) else {
+                break;
+            };
+            let header = &entry.positioned.facts.block_header;
+            match entry.snapshot.cross_checked_frontiers() {
+                Ok(frontiers) => {
+                    checkpoints[entry_idx] = Some(CommitmentTreeCheckpoint::new(
+                        BlockId::new(header.height, header.block_hash),
+                        entry.positioned.compact_block.time(),
+                        frontiers,
+                    ));
+                }
+                Err(earlier_source) => {
+                    return BatchCheckpointOutcome {
+                        valid_prefix_len: entry_idx,
+                        checkpoints,
+                        checkpoint_error: Some(CanonicalConstructionError::CommitmentTreeState {
+                            height: header.height,
+                            source: earlier_source,
+                        }),
+                    };
+                }
+            }
         }
-        let tree_state_checkpoint = output
-            .checkpoint
-            .transpose()
-            .map_err(|source| CanonicalConstructionError::CommitmentTreeState { height, source })?;
-        Ok(canonical_build_block(
-            positioned,
-            tree_state_checkpoint,
-            output.final_roots,
-        ))
+        let failed_height = entries
+            .get(failed_entry_idx)
+            .map_or(BlockHeight::new(0), |entry| {
+                entry.positioned.facts.block_header.height
+            });
+        BatchCheckpointOutcome {
+            valid_prefix_len: failed_entry_idx,
+            checkpoints,
+            checkpoint_error: Some(CanonicalConstructionError::CommitmentTreeState {
+                height: failed_height,
+                source,
+            }),
+        }
+    }
+
+    fn derive_batch_final_roots(
+        &self,
+        entries: &[PositionedBatchEntry],
+    ) -> Vec<Option<zinder_core::BlockFinalNoteCommitmentRoots>> {
+        if !self.workload.derives_final_roots() || entries.is_empty() {
+            return vec![None; entries.len()];
+        }
+        let started_at = Instant::now();
+        let unwarmed: Vec<&CommitmentTreeSnapshot> = entries
+            .iter()
+            .filter(|entry| !entry.checkpoint_required)
+            .map(|entry| &entry.snapshot)
+            .collect();
+        if !unwarmed.is_empty() {
+            if let Some(tree_hashers) = &self.tree_hashers {
+                tree_hashers.install(|| CommitmentTreeSnapshot::warm_final_roots_batch(&unwarmed));
+            } else {
+                CommitmentTreeSnapshot::warm_final_roots_batch(&unwarmed);
+            }
+        }
+        let roots: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                final_roots(
+                    &entry.snapshot,
+                    entry.positioned.facts.block_header.block_hash,
+                )
+            })
+            .collect();
+        if let Some(timer) = &self.stage_timers.tree_hashing_final_roots {
+            timer.record(started_at.elapsed());
+        }
+        roots
     }
 
     /// Positions an appended block against the accumulator's current tip sizes.
@@ -1874,16 +2090,14 @@ impl CanonicalBuildBlockReceiver {
         let accumulator = &mut self.commitment_tree_accumulator;
         let parallel_append = should_parallelize_append(commitments);
         match &self.tree_hashers {
-            Some(tree_hashers) if parallel_append && tree_hashers.has_append_workers() => {
-                tree_hashers.install(|| {
-                    accumulator.append_block_commitments_in_parallel(
-                        height,
-                        &commitments.sapling,
-                        &commitments.orchard,
-                        &commitments.ironwood,
-                    )
-                })
-            }
+            Some(tree_hashers) if parallel_append => tree_hashers.install(|| {
+                accumulator.append_block_commitments_in_parallel(
+                    height,
+                    &commitments.sapling,
+                    &commitments.orchard,
+                    &commitments.ironwood,
+                )
+            }),
             Some(_) | None => accumulator.append_block_commitments(
                 height,
                 &commitments.sapling,
@@ -2634,12 +2848,15 @@ mod tests {
                 &zinder_core::CommitmentTreeFrontiers::default(),
                 &activations,
             )?;
-        let tree_hashers = super::TreeHashers::start(
-            NonZeroU32::new(workers).ok_or("workers must be non-zero")?,
-            tokio::runtime::Handle::current(),
-        )?;
+        let tree_hashers =
+            super::TreeHashers::start(NonZeroU32::new(workers).ok_or("workers must be non-zero")?)?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loader_stop = cancel.child_token();
         Ok(super::CanonicalBuildBlockReceiver {
             receiver: block_receiver,
+            runtime: tokio::runtime::Handle::current(),
+            ready: std::collections::VecDeque::new(),
+            terminated_after_error: false,
             active_memory_permit: None,
             running_tree_sizes: crate::artifact_builder::CommitmentTreeSizes::from_tip_metadata(
                 zinder_core::ChainTipMetadata::default(),
@@ -2650,50 +2867,51 @@ mod tests {
             build_tip_height: zinder_core::BlockHeight::new(tip_height),
             checkpoint_selection: None,
             checkpoint_tree_sizes: zinder_core::ChainTipMetadata::default(),
-            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel,
+            loader_stop,
             stage_timers: BlockLoaderStageTimers::register(
                 zinder_store::CanonicalStoreWorkload::Wallet,
             ),
             tree_hashers,
             in_flight_store_height: None,
-            progress: super::ConstructionProgress::start(&build_plan, None),
+            progress: Some(super::ConstructionProgress::start(&build_plan, None)),
             parallel_batch_sizes: Vec::new(),
         })
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn backlogged_receiver_refills_multi_block_batches_at_low_water_mark()
+    async fn backlogged_receiver_drains_full_batches_up_to_batch_ceiling()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::mpsc::channel(64);
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
-        for height in 1_u32..=24 {
+        let (sender, receiver) = tokio::sync::mpsc::channel(160);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(160));
+        for height in 1_u32..=140 {
             sender
                 .try_send(Ok(test_queued_prepared_block(height, &semaphore)?))
                 .map_err(|_| "channel capacity exceeded")?;
         }
         drop(sender);
-        let mut build_blocks = test_build_receiver(receiver, 24, 4)?;
+        let mut build_blocks = test_build_receiver(receiver, 140, 4)?;
         let (emitted_heights, batch_sizes) = tokio::task::spawn_blocking(move || {
             let mut heights = Vec::new();
-            for item in &mut build_blocks {
-                let block = item?;
+            for next_entry in &mut build_blocks {
+                let block = next_entry?;
                 heights.push(block.facts.block_header.height.value());
             }
             Ok::<_, super::CanonicalConstructionError>((heights, build_blocks.parallel_batch_sizes))
         })
         .await??;
 
-        assert_eq!(emitted_heights, (1_u32..=24).collect::<Vec<_>>());
-        assert_eq!(batch_sizes, vec![8, 4, 4, 4, 4]);
+        assert_eq!(emitted_heights, (1_u32..=140).collect::<Vec<_>>());
+        assert_eq!(batch_sizes, vec![64, 64, 12]);
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn backlogged_receiver_preserves_trailing_channel_error_above_low_water()
+    async fn backlogged_receiver_preserves_trailing_channel_error_across_batches()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::mpsc::channel(64);
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
-        for height in 1_u32..=10 {
+        let (sender, receiver) = tokio::sync::mpsc::channel(80);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(80));
+        for height in 1_u32..=70 {
             sender
                 .try_send(Ok(test_queued_prepared_block(height, &semaphore)?))
                 .map_err(|_| "channel capacity exceeded")?;
@@ -2704,13 +2922,13 @@ mod tests {
             }))
             .map_err(|_| "channel capacity exceeded")?;
         drop(sender);
-        let mut build_blocks = test_build_receiver(receiver, 10, 4)?;
+        let mut build_blocks = test_build_receiver(receiver, 70, 4)?;
         let (emitted_heights, terminal_error, batch_sizes) =
             tokio::task::spawn_blocking(move || {
                 let mut heights = Vec::new();
                 let mut terminal_error = None;
-                for item in &mut build_blocks {
-                    match item {
+                for next_entry in &mut build_blocks {
+                    match next_entry {
                         Ok(block) => heights.push(block.facts.block_header.height.value()),
                         Err(error) => {
                             terminal_error = Some(error);
@@ -2722,13 +2940,76 @@ mod tests {
             })
             .await?;
 
-        assert_eq!(emitted_heights, (1_u32..=10).collect::<Vec<_>>());
-        assert_eq!(batch_sizes, vec![8, 2]);
+        assert_eq!(emitted_heights, (1_u32..=70).collect::<Vec<_>>());
+        assert_eq!(batch_sizes, vec![64, 6]);
         assert!(matches!(
             terminal_error,
             Some(super::CanonicalConstructionError::LoaderTaskFailed { ref reason })
                 if reason == "injected source error"
         ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the test transfers single-block permits across async and blocking tasks"
+    )]
+    async fn pipelined_build_blocks_makes_progress_under_single_block_permit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let mut build_blocks = test_build_receiver(receiver, 12, 4)?;
+        let progress = build_blocks
+            .progress
+            .take()
+            .ok_or("expected test progress")?;
+        let cancel = build_blocks.cancel.clone();
+        let loader_stop = build_blocks.loader_stop.clone();
+
+        let producer_sem = std::sync::Arc::clone(&semaphore);
+        let sender_task = tokio::spawn(async move {
+            for height in 1_u32..=12 {
+                let permit = std::sync::Arc::clone(&producer_sem)
+                    .acquire_owned()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let step_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                let mut queued = test_queued_prepared_block(height, &step_sem)
+                    .map_err(|error| error.to_string())?;
+                queued.memory_permit = permit;
+                sender
+                    .send(Ok(queued))
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<(), String>(())
+        });
+
+        let emitted_heights = tokio::task::spawn_blocking(move || {
+            let mut pipelined = super::PipelinedBuildBlocks::spawn(
+                build_blocks,
+                progress,
+                cancel,
+                loader_stop,
+                super::MAX_COMMITMENT_BATCH_BLOCKS,
+            )?;
+            let mut heights = Vec::new();
+            for next_entry in &mut pipelined {
+                heights.push(next_entry?.facts.block_header.height.value());
+            }
+            let _ = pipelined.finish_and_join(true)?;
+            Ok::<Vec<u32>, super::CanonicalConstructionError>(heights)
+        });
+
+        let (sent_outcome, consumed) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(sender_task, emitted_heights)
+            })
+            .await?;
+        sent_outcome?.map_err(std::io::Error::other)?;
+        assert_eq!(consumed??, (1_u32..=12).collect::<Vec<_>>());
+        assert_eq!(semaphore.available_permits(), 1);
         Ok(())
     }
 
