@@ -5,7 +5,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage: check-release-binary-archive.sh ARCHIVE \
   --version VERSION --tag TAG --commit SHA --target RUST_TARGET \
-  --source-date-epoch EPOCH
+  --source-date-epoch EPOCH [--pasta-asm 0|1]
 EOF
   exit 2
 }
@@ -18,28 +18,44 @@ release_tag=""
 commit=""
 rust_target=""
 source_date_epoch=""
+pasta_asm=1
 while [[ $# -gt 0 ]]; do
+  [[ $# -ge 2 ]] || usage
   case "$1" in
     --version) version="$2"; shift 2 ;;
     --tag) release_tag="$2"; shift 2 ;;
     --commit) commit="$2"; shift 2 ;;
     --target) rust_target="$2"; shift 2 ;;
     --source-date-epoch) source_date_epoch="$2"; shift 2 ;;
+    --pasta-asm) pasta_asm="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
 
 [[ -s "$archive_path" && -n "$version" && "$release_tag" == "v${version}" ]] || usage
 [[ "$commit" =~ ^[0-9a-f]{40}$ && "$source_date_epoch" =~ ^[0-9]+$ ]] || usage
+case "$pasta_asm" in
+  0|1) ;;
+  *)
+    echo >&2 "unsupported --pasta-asm value (expected 0 or 1): $pasta_asm"
+    exit 1
+    ;;
+esac
 case "$rust_target" in
   x86_64-unknown-linux-gnu)
     release_platform=x86_64-v3-unknown-linux-gnu
     cpu_baseline=x86-64-v3
+    if [[ "$pasta_asm" == "1" ]]; then
+      required_cpu_features='["adx","pclmulqdq"]'
+    else
+      required_cpu_features='["pclmulqdq"]'
+    fi
     elf_machine='Advanced Micro Devices X86-64'
     ;;
   aarch64-unknown-linux-gnu)
     release_platform=aarch64-unknown-linux-gnu
     cpu_baseline=armv8-a
+    required_cpu_features='[]'
     elf_machine=AArch64
     ;;
   *) usage ;;
@@ -168,6 +184,7 @@ jq -e \
   --arg rust_target "$rust_target" \
   --arg release_platform "$release_platform" \
   --arg cpu_baseline "$cpu_baseline" \
+  --argjson required_cpu_features "$required_cpu_features" \
   --argjson source_date_epoch "$source_date_epoch" '
     .schema_version == 1
     and .version == $version
@@ -176,6 +193,7 @@ jq -e \
     and .rust_target == $rust_target
     and .release_platform == $release_platform
     and .cpu_baseline == $cpu_baseline
+    and .required_cpu_features == $required_cpu_features
     and .libc.family == "glibc"
     and .libc.minimum_runtime_version == "2.34"
     and .libc.dynamic_libstdcpp == true

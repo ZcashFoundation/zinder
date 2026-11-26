@@ -1,0 +1,6 @@
+kind: changed
+body: Enabled `--features pasta_curves/asm` by default (`ZINDER_PASTA_ASM=1`) across `deploy/Dockerfile`, release binary archives, container images, and Compose definitions so x86-64 builds select the `BMI2 + ADX` assembly backend (with startup verification, explicit `required_cpu_features` metadata `["adx","pclmulqdq"]` validated in release archive `BUILD-INFO.json`, and `ZINDER_PASTA_ASM=0` fallback for pre-Broadwell/Haswell hosts) and AArch64 builds select ARMv8-A assembly.
+time: 2026-11-26T17:42:00Z
+custom:
+    Bump: minor
+    PR: "659"

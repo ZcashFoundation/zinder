@@ -50,6 +50,42 @@ ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
     --commit 0123456789abcdef0123456789abcdef01234567 \
     --target x86_64-unknown-linux-gnu \
     --source-date-epoch 1735689600
+jq -e '.required_cpu_features == ["adx","pclmulqdq"]' \
+  < <(tar -xOzf "$first_asset" "zinder-0.5.0-rc.1-x86_64-v3-unknown-linux-gnu/BUILD-INFO.json") \
+  >/dev/null || fail "default x86_64 archive did not record expected required_cpu_features"
+
+portable_output="$temporary_directory/portable-x86"
+mkdir -p "$portable_output"
+"$builder" \
+  --binaries "$fixture_binaries" \
+  --output "$portable_output" \
+  --version 0.5.0-rc.1 \
+  --tag v0.5.0-rc.1 \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --target x86_64-unknown-linux-gnu \
+  --source-date-epoch 1735689600 \
+  --pasta-asm 0
+portable_asset="$portable_output/$asset_name"
+jq -e '.required_cpu_features == ["pclmulqdq"]' \
+  < <(tar -xOzf "$portable_asset" "zinder-0.5.0-rc.1-x86_64-v3-unknown-linux-gnu/BUILD-INFO.json") \
+  >/dev/null || fail "portable x86_64 archive did not record expected required_cpu_features"
+ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
+  "$checker" "$portable_asset" \
+    --version 0.5.0-rc.1 \
+    --tag v0.5.0-rc.1 \
+    --commit 0123456789abcdef0123456789abcdef01234567 \
+    --target x86_64-unknown-linux-gnu \
+    --source-date-epoch 1735689600 \
+    --pasta-asm 0
+if ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
+  "$checker" "$portable_asset" \
+    --version 0.5.0-rc.1 \
+    --tag v0.5.0-rc.1 \
+    --commit 0123456789abcdef0123456789abcdef01234567 \
+    --target x86_64-unknown-linux-gnu \
+    --source-date-epoch 1735689600 >/dev/null 2>&1; then
+  fail "a portable x86_64 archive passed the default assembly check"
+fi
 
 arm_output="$temporary_directory/arm"
 mkdir -p "$arm_output"
@@ -63,6 +99,9 @@ mkdir -p "$arm_output"
   --source-date-epoch 1735689600
 arm_asset="$arm_output/zinder-0.5.0-rc.1-aarch64-unknown-linux-gnu.tar.gz"
 [[ -s "$arm_asset" ]] || fail "the aarch64 GNU asset was not created"
+jq -e '.required_cpu_features == []' \
+  < <(tar -xOzf "$arm_asset" "zinder-0.5.0-rc.1-aarch64-unknown-linux-gnu/BUILD-INFO.json") \
+  >/dev/null || fail "aarch64 archive did not record empty required_cpu_features"
 ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
   "$checker" "$arm_asset" \
     --version 0.5.0-rc.1 \
@@ -70,6 +109,28 @@ ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
     --commit 0123456789abcdef0123456789abcdef01234567 \
     --target aarch64-unknown-linux-gnu \
     --source-date-epoch 1735689600
+
+if "$builder" \
+  --binaries "$fixture_binaries" \
+  --output "$temporary_directory/invalid-pasta" \
+  --version 0.5.0-rc.1 \
+  --tag v0.5.0-rc.1 \
+  --commit 0123456789abcdef0123456789abcdef01234567 \
+  --target x86_64-unknown-linux-gnu \
+  --source-date-epoch 1735689600 \
+  --pasta-asm 2 >/dev/null 2>&1; then
+  fail "an archive build accepted invalid --pasta-asm 2"
+fi
+if ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
+  "$checker" "$first_asset" \
+    --version 0.5.0-rc.1 \
+    --tag v0.5.0-rc.1 \
+    --commit 0123456789abcdef0123456789abcdef01234567 \
+    --target x86_64-unknown-linux-gnu \
+    --source-date-epoch 1735689600 \
+    --pasta-asm 2 >/dev/null 2>&1; then
+  fail "archive checker accepted invalid --pasta-asm 2"
+fi
 
 cp "$fixture_binaries/zinder-ingest" "$fixture_binaries/zinder-bench"
 if "$builder" \
@@ -137,6 +198,51 @@ if ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
     --target x86_64-unknown-linux-gnu \
     --source-date-epoch 1735689600 >/dev/null 2>&1; then
   fail "an archive with the wrong CPU baseline was admitted"
+fi
+
+cpu_features_root="$temporary_directory/cpu-features"
+mkdir -p "$cpu_features_root"
+tar --extract --gzip --same-permissions --file "$first_asset" --directory "$cpu_features_root"
+root_name="$(find "$cpu_features_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')"
+jq '.required_cpu_features = ["pclmulqdq"]' \
+  "$cpu_features_root/$root_name/BUILD-INFO.json" \
+  > "$cpu_features_root/$root_name/BUILD-INFO.json.updated"
+mv \
+  "$cpu_features_root/$root_name/BUILD-INFO.json.updated" \
+  "$cpu_features_root/$root_name/BUILD-INFO.json"
+(
+  cd "$cpu_features_root/$root_name"
+  find bin -maxdepth 1 -type f -printf '%p\n' \
+    | LC_ALL=C sort \
+    | xargs sha256sum
+  printf '%s\n' BUILD-INFO.json LICENSE README.md \
+    | LC_ALL=C sort \
+    | xargs sha256sum
+) | LC_ALL=C sort -k2 > "$cpu_features_root/$root_name/SHA256SUMS"
+chmod 0644 \
+  "$cpu_features_root/$root_name/BUILD-INFO.json" \
+  "$cpu_features_root/$root_name/SHA256SUMS"
+find "$cpu_features_root/$root_name" -exec touch -h -d '@1735689600' {} +
+wrong_cpu_features_asset="$temporary_directory/wrong-cpu-features.tar.gz"
+LC_ALL=C tar \
+  --directory "$cpu_features_root" \
+  --sort=name \
+  --format=gnu \
+  --mtime='@1735689600' \
+  --owner=0 \
+  --group=0 \
+  --numeric-owner \
+  -cf - \
+  "$root_name" \
+  | gzip -n > "$wrong_cpu_features_asset"
+if ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
+  "$checker" "$wrong_cpu_features_asset" \
+    --version 0.5.0-rc.1 \
+    --tag v0.5.0-rc.1 \
+    --commit 0123456789abcdef0123456789abcdef01234567 \
+    --target x86_64-unknown-linux-gnu \
+    --source-date-epoch 1735689600 >/dev/null 2>&1; then
+  fail "an archive missing required_cpu_features was admitted"
 fi
 
 tamper_root="$temporary_directory/tamper"

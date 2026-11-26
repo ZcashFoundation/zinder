@@ -42,13 +42,13 @@ You need an archive Zebra or Zakura node on the same network. Ingest reads every
 
 ### Private or standard Mainnet VM
 
-- **CPU:** 8+ vCPUs (`x86-64-v3` or `AArch64`). Wallet accumulators select AVX-512F/VL at run time when available and AVX2 otherwise; both produce identical store bytes. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
+- **CPU:** 8+ vCPUs (Broadwell+/Zen+ `x86-64` supporting `x86-64-v3` + `ADX`, or `AArch64`). Published release binaries, images, and Compose builds enable the Pasta assembly backend by default (`ZINDER_PASTA_ASM=1`; pass `ZINDER_PASTA_ASM=0` only when building for pre-Broadwell/Haswell x86-64 hosts without `ADX`, checked at startup). Wallet accumulators select AVX-512F/VL at run time when available and AVX2 otherwise; both produce identical store bytes. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
 - **RAM:** 32 GiB RAM. Keep the shipped `4g` `ZINDER_COMPAT_MEMORY_LIMIT` as an OOM guardrail. The shipped Mainnet Compose env files set container ceilings of `14g` (ingest), `10g` (projector), `4g` (query), `4g` (history-publisher), `4g` (compat), and `4g` (optional explorer). Give single-volume containers at least 8 GB.
 - **Disk:** Fast local SSD/NVMe formatted **`ext4 -O verity`** (so `zinder-history-publisher` can protect settled segments with Linux fs-verity). Reserve **260+ GB free** for `wallet` (~123 GB steady-state total, which already includes the ~20.9 GB / ~19.5 GiB signed `ZSHRNG01` catalog across 877 segments at Mainnet height 3,593,347 and growing, plus ~130 GB temporary sort spill headroom during initial wallet construction), or **550+ GB free** when retaining raw transaction blobs (+251.1 GiB; `wallet-archive` with `raw_blob_policy = "all"` needs additional space for raw blocks).
 
 ### Public high-concurrency Mainnet endpoint
 
-- **CPU:** 8–16+ vCPUs. On Broadwell+/Zen+ `x86-64` (BMI2 + ADX) or `AArch64`, build images with `--build-arg ZINDER_PASTA_ASM=1` (or `ZINDER_PASTA_ASM=1` with Compose, or `--features pasta_curves/asm` with Cargo) for the faster Pasta field-arithmetic backend (~2–7% lower CPU and elapsed time on measured 2,000-block windows; the binary checks ADX at startup).
+- **CPU:** 8–16+ vCPUs (Broadwell+/Zen+ `x86-64` with `BMI2 + ADX`, or `AArch64`). Shipped release images and binary archives enable `pasta_curves/asm` by default (`ZINDER_PASTA_ASM=1`; pass `--features pasta_curves/asm` when compiling directly with Cargo), saving ~6.7–8.2% on Orchard Merkle hashing and canonical construction benchmarks while failing closed at startup if `ADX` is missing.
 - **RAM:** **64+ GiB RAM** and raise `ZINDER_COMPAT_MEMORY_LIMIT=32g` (or higher). Under cgroup v2, the `ZSHRNG01` signed-history catalog page cache (~20–21 GiB on Mainnet and growing) counts against the cgroup that first reads each page (`zinder-compat-lightwalletd` or `zinder-history-publisher`). Keeping compat's ceiling above the catalog plus working set avoids 5–7x page-cache thrashing and `wait_timeout` refusals under concurrent range syncs. Leave `ZINDER_QUERY_MEMORY_LIMIT` and `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` at `4g` (`zinder-query` uses `O_DIRECT` RocksDB and does not mount the catalog); validate cache residency with publisher activity included.
 - **Node feed:** Set `ZINDER_NODE__INDEXER_GRPC_ADDR` and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc` (in your Compose env file or exported for standalone binaries) to stream mempool events and fetch blocks as binary protobufs instead of polling the full mempool over JSON-RPC on every block.
 - **Edge proxy:** Put a TLS proxy with per-client connection, request, and stream limits in front of the listeners ([Exposing over TLS](exposing-over-tls.md)).
@@ -156,7 +156,7 @@ This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](h
 
 ### Build from source
 
-To run an unreleased checkout instead of published images, leave `ZINDER_VERSION` unset (optionally export `ZINDER_PASTA_ASM=1` on supported CPUs) and run:
+To run an unreleased checkout instead of published images, leave `ZINDER_VERSION` unset (export `ZINDER_PASTA_ASM=0` only if building for a pre-Broadwell/Haswell `x86-64` host without `ADX`) and run:
 
 ```bash
 docker compose --env-file deploy/.env.testnet \

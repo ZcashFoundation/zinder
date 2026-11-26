@@ -33,7 +33,7 @@ x-compat-image: &compat-image
     dockerfile: deploy/Dockerfile
     target: zinder-compat-lightwalletd
     args:
-      ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-0}
+      ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
 
 services:
   state-init:
@@ -71,7 +71,7 @@ services:
       dockerfile: deploy/Dockerfile
       target: zinder-ingest
       args:
-        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-0}
+        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
     restart: on-failure
     depends_on:
       state-init:
@@ -132,7 +132,7 @@ services:
       dockerfile: deploy/Dockerfile
       target: zinder-projector
       args:
-        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-0}
+        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
     restart: on-failure
     network_mode: "service:zinder-ingest"
     depends_on:
@@ -171,7 +171,7 @@ services:
       dockerfile: deploy/Dockerfile
       target: zinder-query
       args:
-        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-0}
+        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
     restart: on-failure
     network_mode: "service:zinder-ingest"
     # The shared network namespace needs only a started ingest container.

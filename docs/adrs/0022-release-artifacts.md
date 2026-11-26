@@ -17,8 +17,10 @@ the release claiming precision it does not have for native libraries.
 ## Decision
 
 1. **Every release tag produces two GNU/Linux archives.** One targets
-   `x86_64-v3-unknown-linux-gnu`, the other `aarch64-unknown-linux-gnu`
-   (Armv8-A). The x86 file name states the x86-64-v3 CPU requirement.
+   `x86_64-v3-unknown-linux-gnu` (`x86-64-v3` plus `BMI2`, `ADX`, and
+   `PCLMULQDQ` for `pasta_curves/asm` and pipelined CRC32C), the other
+   `aarch64-unknown-linux-gnu` (`Armv8-A`, which also enables
+   `pasta_curves/asm` within the baseline ISA). The x86 file name and `BUILD-INFO.json` preserve the `x86-64-v3` slug and `cpu_baseline` for schema compatibility, while `required_cpu_features` explicitly records `["adx","pclmulqdq"]` on default x86-64 assembly archives (and `[]` on AArch64) so compatibility checkers catch hosts lacking `ADX` or `PCLMULQDQ`.
 2. **An archive holds exactly the runtime catalog.** It contains the five
    executables listed in `deploy/release-images.json`: ingest, projector,
    query, lightwalletd compatibility, and the optional Explorer, plus build
@@ -66,7 +68,10 @@ The release procedure and how operators verify a download are in
 
 - Operators can run the full topology from native binaries without
   extracting a container image.
-- x86 hosts must support x86-64-v3, and hosts need glibc 2.34 or newer.
+- x86 hosts running published binaries must support `x86-64-v3` plus `ADX`
+  (Broadwell+ / Zen 1+ for `pasta_curves/asm`, checked at startup;
+  pre-Broadwell/Haswell hosts without `ADX` can rebuild from source with
+  `--build-arg ZINDER_PASTA_ASM=0`), and hosts need glibc 2.34 or newer.
 - A binary that fails to build, reproduce, or package stops the whole
   release before any crate, image, or GitHub Release is published.
 - Approval is requested only after the slowest build finishes, so release

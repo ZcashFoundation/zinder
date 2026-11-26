@@ -47,12 +47,12 @@ ARG RUST_IMAGE_DIGEST=sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798
 ARG DEBIAN_IMAGE_DIGEST=sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 ARG DISTROLESS_IMAGE_DIGEST=sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 ARG ZINDER_BINARIES_SOURCE=zinder-binaries
-# Opt-in Pasta assembly backend. Set to 1 to build the runtime binaries with
-# `--features pasta_curves/asm`, which selects the x86-64 (BMI2 + ADX) or
-# AArch64 assembly field arithmetic. The default 0 keeps the portable backend
-# so the shipped images run on every x86-64-v3 and AArch64 host. Any other
-# value fails the build instead of silently producing a portable binary.
-ARG ZINDER_PASTA_ASM=0
+# Pasta assembly backend. Enabled by default (`1`) so shipped images and
+# release archives build with `--features pasta_curves/asm` (x86-64 BMI2 + ADX,
+# verified at startup, or baseline AArch64 ARMv8-A). Set to `0` for a portable
+# build on pre-Broadwell/Haswell x86-64 hosts without ADX. Any other value
+# fails the build instead of silently falling back to portable arithmetic.
+ARG ZINDER_PASTA_ASM=1
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE}@${RUST_IMAGE_DIGEST} AS zinder-build-base
 
@@ -110,7 +110,7 @@ ARG RUST_VERSION
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG RELEASE_CACHE_SCOPE=shared
-ARG ZINDER_PASTA_ASM=0
+ARG ZINDER_PASTA_ASM=1
 
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
@@ -142,7 +142,7 @@ ARG RUST_VERSION
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG RELEASE_CACHE_SCOPE=shared
-ARG ZINDER_PASTA_ASM=0
+ARG ZINDER_PASTA_ASM=1
 
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
