@@ -1660,7 +1660,6 @@ fn warm_secondary_reopen_caches_live_epoch_and_event_history_across_l0_ssts()
         crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None);
     let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW)?;
 
-    let cold_started = std::time::Instant::now();
     let cold_secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
         &store_path,
         temporary.path().join("secondary-cold"),
@@ -1669,12 +1668,13 @@ fn warm_secondary_reopen_caches_live_epoch_and_event_history_across_l0_ssts()
         reorg_policy,
         &shared_resources,
     )?;
-    let cold_elapsed = cold_started.elapsed();
-    assert!(
-        cold_elapsed < std::time::Duration::from_millis(500),
-        "cold secondary open over 2,401 epochs took {cold_elapsed:?}"
-    );
     let mut ticker_snapshot = SecondaryCacheCounters::sample(&cold_secondary);
+    assert!(
+        ticker_snapshot.misses <= 512,
+        "cold secondary open over 2,401 epochs incurred {} block-cache data misses \
+         (expected bounded SST data-block reads instead of O(epochs * L0_files))",
+        ticker_snapshot.misses
+    );
     for step in 0_u32..3 {
         store = append_live_step_for_multi_epoch_test(store, &activations, step)?;
         verify_warm_secondary_step(
@@ -1766,7 +1766,6 @@ fn verify_warm_secondary_step(
     shared_resources: &SharedSecondaryResources,
     previous: &mut SecondaryCacheCounters,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let warm_started = std::time::Instant::now();
     let warm_secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
         store_path,
         secondary_path,
@@ -1775,17 +1774,12 @@ fn verify_warm_secondary_step(
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         shared_resources,
     )?;
-    let warm_elapsed = warm_started.elapsed();
     let after = SecondaryCacheCounters::sample(&warm_secondary);
     let delta_misses = after.misses - previous.misses;
     let delta_hits = after.hits - previous.hits;
     let delta_bytes_read = after.bytes_read - previous.bytes_read;
 
     assert_eq!(warm_secondary.event_fence(), store.event_fence());
-    assert!(
-        warm_elapsed < std::time::Duration::from_millis(500),
-        "warm secondary open took {warm_elapsed:?}"
-    );
     assert!(
         delta_misses <= 4,
         "warm secondary open incurred {delta_misses} block-cache data misses \

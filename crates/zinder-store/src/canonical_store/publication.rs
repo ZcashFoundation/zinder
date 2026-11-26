@@ -1008,6 +1008,12 @@ fn lowest_retained_height_since(
     previous: &CanonicalStoreReadyEvidence,
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<Option<BlockHeight>, CanonicalStoreError> {
+    if ready_evidence.visible_event_sequence < previous.visible_event_sequence {
+        return Ok(None);
+    }
+    if ready_evidence.visible_event_sequence == previous.visible_event_sequence {
+        return Ok(Some(previous.visible_tip.height));
+    }
     let tip_advance = ready_evidence
         .visible_tip
         .height
@@ -1016,16 +1022,31 @@ fn lowest_retained_height_since(
     if tip_advance > reorg_window_blocks {
         return Ok(None);
     }
-    let first_sequence = previous.visible_event_sequence.saturating_add(1);
-    if first_sequence > ready_evidence.visible_event_sequence {
-        return Ok(Some(previous.visible_tip.height));
-    }
+    let Some(first_sequence) = previous.visible_event_sequence.checked_add(1) else {
+        return Ok(None);
+    };
     let retention_floor = super::event_lifecycle::canonical_event_retention_floor_from_db(
         db,
         ready_evidence.visible_event_sequence,
     )?;
     if first_sequence < retention_floor {
         return Ok(None);
+    }
+    if first_sequence == ready_evidence.visible_event_sequence {
+        let encoded_event =
+            match read_family_row(db, CHAIN_EVENT_COLUMN_FAMILY, &first_sequence.to_be_bytes()) {
+                Ok(encoded) => encoded,
+                Err(CanonicalStoreError::PublicationRefused { .. }) => return Ok(None),
+                Err(other_error) => return Err(other_error),
+            };
+        let Ok(event) = decode_chain_event(&encoded_event) else {
+            return Ok(None);
+        };
+        return Ok(unchanged_height_through_event(
+            previous.visible_tip.height,
+            first_sequence,
+            &event,
+        ));
     }
     let mut event_cursor =
         CachedSequenceCursor::open_from_sequence(db, CHAIN_EVENT_COLUMN_FAMILY, first_sequence)?;
@@ -1036,20 +1057,30 @@ fn lowest_retained_height_since(
             Err(CanonicalStoreError::PublicationRefused { .. }) => return Ok(None),
             Err(other_error) => return Err(other_error),
         };
-        if event.resulting_epoch_id.value() != sequence {
-            return Ok(None);
-        }
-        let first_changed = event
-            .reverted_range
-            .map_or(event.committed_range.start, |reverted| {
-                reverted.start.min(event.committed_range.start)
-            });
-        let Some(unchanged_through) = first_changed.value().checked_sub(1) else {
+        let Some(next_retained) = unchanged_height_through_event(retained_height, sequence, &event)
+        else {
             return Ok(None);
         };
-        retained_height = retained_height.min(BlockHeight::new(unchanged_through));
+        retained_height = next_retained;
     }
     Ok(Some(retained_height))
+}
+
+fn unchanged_height_through_event(
+    retained_height: BlockHeight,
+    expected_sequence: u64,
+    event: &DecodedChainEvent,
+) -> Option<BlockHeight> {
+    if event.resulting_epoch_id.value() != expected_sequence {
+        return None;
+    }
+    let first_changed = event
+        .reverted_range
+        .map_or(event.committed_range.start, |reverted| {
+            reverted.start.min(event.committed_range.start)
+        });
+    let unchanged_through = first_changed.value().checked_sub(1)?;
+    Some(retained_height.min(BlockHeight::new(unchanged_through)))
 }
 
 fn validate_ready_settlement_window(

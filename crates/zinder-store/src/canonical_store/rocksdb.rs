@@ -2170,6 +2170,26 @@ mod tests {
         }
         secondary.try_catch_up()?;
         assert_eq!(secondary.event_fence(), store.event_fence());
+        let post_flush_summary = RocksDbCanonicalStore::read_ready_summary(&store_path)?
+            .ok_or("READY summary must exist across mixed filtered and unfiltered SSTs")?;
+        assert_eq!(post_flush_summary.visible_tip().height, BlockHeight::new(5));
+        for family_name in [CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY] {
+            let family = secondary
+                .bounded_open
+                .db
+                .cf_handle(family_name)
+                .ok_or("secondary family absent")?;
+            for sequence in [1_u64, 2_u64] {
+                assert!(
+                    secondary
+                        .bounded_open
+                        .db
+                        .get_cf(&family, sequence.to_be_bytes())?
+                        .is_some(),
+                    "{family_name} point lookup missed sequence {sequence}"
+                );
+            }
+        }
         Ok(())
     }
 
