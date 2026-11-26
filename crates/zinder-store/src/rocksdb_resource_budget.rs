@@ -98,6 +98,21 @@ impl RocksDbResourceBudget {
     /// memory.
     pub const MIN_MAX_OPEN_FILES: i32 = 32;
 
+    /// `RocksDB` `table_cache_numshardbits` applied to secondary and read-only
+    /// probe opens (`2^2 = 4` shards instead of `RocksDB`'s 64-shard default).
+    ///
+    /// `TableCache` capacity is an `SST` file count (`max_open_files - 10`),
+    /// not a byte budget. Splitting a 1,024–2,048-entry table cache across 64
+    /// shards leaves only 16–32 slots per shard, where hash skew evicts live
+    /// table readers while total capacity remains mostly unused. Four shards
+    /// keep per-shard capacity at 254–510 table readers while retaining
+    /// independent shard locks for concurrent reader threads.
+    pub const SECONDARY_TABLE_CACHE_SHARD_BITS: i32 = 2;
+
+    /// Non-table-cache file descriptors `RocksDB` reserves from
+    /// [`Self::max_open_files`] (`DBImpl` `table_cache_size = max_open_files - 10`).
+    pub const ROCKSDB_NON_TABLE_CACHE_OPEN_FILES: i32 = 10;
+
     /// Smallest accepted [`Self::write_buffer_bytes`]. Smaller values create
     /// flush churn and make high-throughput catch-up compaction-bound.
     pub const MIN_WRITE_BUFFER_BYTES: u64 = 4 * MIB;
@@ -185,18 +200,21 @@ impl RocksDbResourceBudget {
 
     /// Canonical-store reader defaults for secondary processes.
     ///
-    /// `128 MiB` block cache, `32 MiB` WAL ceiling, `128` open file handles,
+    /// `128 MiB` block cache, `32 MiB` WAL ceiling, `2048` open file handles
+    /// across 4 table-cache shards (`510` table readers per shard),
     /// `8 MiB x 2` write buffers per column family, and `16 MiB` total memtable
     /// budget. The uniform budget retains the primary-only background-job value
     /// at `2`, but secondary opens do not apply it. Secondary readers replay the
     /// writer's manifest and serve public traffic; their memory posture must
-    /// stay below the writer so readers cannot starve clean sync.
+    /// stay below the writer so readers cannot starve clean sync, while the
+    /// larger open-file cap keeps Mainnet and Testnet SST table readers open as
+    /// index and filter blocks stay inside the shared block cache.
     #[must_use]
     pub const fn canonical_reader_defaults() -> Self {
         Self {
             block_cache_bytes: 128 * MIB,
             max_wal_bytes: 32 * MIB,
-            max_open_files: 128,
+            max_open_files: 2048,
             write_buffer_bytes: 8 * MIB,
             max_write_buffer_count: 2,
             max_background_jobs: 2,
@@ -323,6 +341,30 @@ impl RocksDbResourceBudget {
         }
         Ok(())
     }
+
+    /// Number of `TableCache` shards configured on secondary and read-only
+    /// probe opens (`1 << SECONDARY_TABLE_CACHE_SHARD_BITS`).
+    #[must_use]
+    pub const fn secondary_table_cache_shards() -> usize {
+        1_usize << Self::SECONDARY_TABLE_CACHE_SHARD_BITS
+    }
+
+    /// Per-shard `TableCache` entry capacity (`ShardedCacheBase::ComputePerShardCapacity`)
+    /// when `self` is applied to a secondary or read-only probe open.
+    ///
+    /// Returns `usize::MAX` for negative (`-1`, unbounded) `max_open_files`.
+    #[must_use]
+    pub const fn secondary_table_cache_per_shard_capacity(self) -> usize {
+        if self.max_open_files < 0 {
+            return usize::MAX;
+        }
+        if self.max_open_files <= Self::ROCKSDB_NON_TABLE_CACHE_OPEN_FILES {
+            return 0;
+        }
+        let table_cache_entries = (self.max_open_files - Self::ROCKSDB_NON_TABLE_CACHE_OPEN_FILES)
+            .unsigned_abs() as usize;
+        table_cache_entries.div_ceil(Self::secondary_table_cache_shards())
+    }
 }
 
 /// `RocksDB` statistics collection gate applied at open.
@@ -441,6 +483,19 @@ mod tests {
                 ..RocksDbResourceBudget::materialized_view_writer_defaults()
             }
         );
+    }
+
+    #[test]
+    fn canonical_reader_defaults_raise_open_files_to_2048_across_four_shards() {
+        let budget = RocksDbResourceBudget::canonical_reader_defaults();
+        assert_eq!(budget.validate(), Ok(()));
+        assert_eq!(budget.max_open_files, 2048);
+        assert_eq!(RocksDbResourceBudget::secondary_table_cache_shards(), 4);
+        assert_eq!(budget.secondary_table_cache_per_shard_capacity(), 510);
+        // Accommodates 243 Mainnet SSTs even if all 243 land in a single shard,
+        // and >2x the 6-sigma per-shard bound (247) for 710 Testnet SSTs.
+        assert!(budget.secondary_table_cache_per_shard_capacity() >= 243);
+        assert!(budget.secondary_table_cache_per_shard_capacity() >= 247);
     }
 
     #[test]

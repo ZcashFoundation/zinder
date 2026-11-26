@@ -334,5 +334,5 @@ When supervising directly (for example with systemd units using `deploy/config/*
 - One filesystem for all stores, with matching `storage.path` / `wallet.path` and unique per-reader `secondary_path` directories.
 - The two control tokens, node endpoint/network/projector owner env vars, and read access to the node's mode-0600 cookie (run as the node's UID).
 - Startup order: `zinder-ingest`, then `zinder-projector`, then readers after each reports ready.
-- `LimitNOFILE=65536` in `zinder-compat-lightwalletd`'s `[Service]` unit when serving signed history.
+- `LimitNOFILE=65536` in each Zinder runtime's `[Service]` unit to match Compose, because readers keep up to 2,048 SST handles open per store generation alongside segment files and sockets.
 - A loopback listen address in `compat-lightwalletd.toml` (`127.0.0.1:9067`) if running behind a host proxy (the shipped file binds `0.0.0.0:9067` for Compose).

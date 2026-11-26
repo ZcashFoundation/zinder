@@ -1088,7 +1088,10 @@ fn build_primary_db_options(
 /// job limit is not applied. Secondary catch-up serializes table-handler loads
 /// because `RocksDB` otherwise creates and joins a fresh thread group for every
 /// column family on every catch-up. The block-cache and open-file caps still
-/// bound the secondary's open-time RAM peak as the store grows.
+/// bound the secondary's open-time RAM peak as the store grows, and the table
+/// cache uses [`RocksDbResourceBudget::SECONDARY_TABLE_CACHE_SHARD_BITS`] (4
+/// shards) so hash skew cannot evict live SST table readers while total
+/// table-cache capacity remains available.
 #[must_use]
 fn build_secondary_db_options(
     base: Option<&Options>,
@@ -1103,6 +1106,8 @@ fn build_secondary_db_options(
     db_options.create_if_missing(false);
     db_options.create_missing_column_families(false);
     db_options.set_max_open_files(rocksdb_resource_budget.max_open_files);
+    db_options
+        .set_table_cache_num_shard_bits(RocksDbResourceBudget::SECONDARY_TABLE_CACHE_SHARD_BITS);
     db_options.set_block_based_table_factory(&build_block_based_table_factory(cache));
     db_options
 }

@@ -230,6 +230,11 @@ expect_rejected "a wallet reader inheriting its open-file limits" --compose-cont
 jq '.services["zinder-compat-lightwalletd"].ulimits.nofile = {"soft":1024,"hard":524288}' \
   "$history_compose" > "$invalid_history_compose"
 expect_rejected "a wallet reader using the exhausted Mainnet soft limit" --compose-contract "$invalid_history_compose"
+jq 'del(.services["zinder-query"].ulimits.nofile)' "$history_compose" > "$invalid_history_compose"
+expect_rejected "the native query reader inheriting its open-file limits" --compose-contract "$invalid_history_compose"
+jq '.services["zinder-query"].ulimits.nofile = {"soft":1024,"hard":524288}' \
+  "$history_compose" > "$invalid_history_compose"
+expect_rejected "the native query reader using the exhausted Mainnet soft limit" --compose-contract "$invalid_history_compose"
 
 indexer_tls_directory="$temporary_directory/indexer-tls"
 mkdir -p "$indexer_tls_directory"
@@ -405,9 +410,18 @@ for deployment_env in "${deployment_env_names[@]}"; do
     --profile observability \
     config --format json > "$resolved_env_compose"
   bash "$validator" --compose-contract "$resolved_env_compose"
-  jq -e '.services["zinder-compat-lightwalletd"].ulimits.nofile == {"soft":65536,"hard":65536}' \
-    "$resolved_env_compose" >/dev/null \
-    || fail "the $deployment_env wallet reader does not have the expected soft and hard open-file limits"
+  jq -e '
+    [
+      "zinder-ingest",
+      "zinder-projector",
+      "zinder-query",
+      "zinder-history-publisher",
+      "zinder-compat-lightwalletd"
+    ] as $store_services
+    | .services as $services
+    | all($store_services[]; $services[.].ulimits.nofile == {"soft":65536,"hard":65536})
+  ' "$resolved_env_compose" >/dev/null \
+    || fail "the $deployment_env Zinder store-opening services do not have the expected soft and hard open-file limits"
   resolved_env_explorer_compose="$temporary_directory/resolved-$deployment_env-explorer-compose.json"
   ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
   docker compose \

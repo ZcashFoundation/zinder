@@ -375,7 +375,7 @@ flushes and secondary WAL replay.
 | Role | Block cache | WAL | Open files | Memtable budget |
 | --- | --- | --- | --- | --- |
 | Canonical writer | 512 MiB | 256 MiB | 512 | 256 MiB |
-| Canonical reader | 1/8 of the container memory limit, from 128 to 512 MiB | 32 MiB | 128 to 256, scaled with the block cache | 16 MiB |
+| Canonical reader | 1/8 of the container memory limit, from 128 to 512 MiB | 32 MiB | 1024 to 2048, scaled with the block cache (2048 without a limit) | 16 MiB |
 | Wallet writer | 256 MiB | 32 MiB | 512 | 512 MiB |
 | Wallet reader | 64 MiB | 16 MiB | 1024 | 16 MiB |
 | Materialized-view writer | 256 MiB | 256 MiB | 512 | 512 MiB |
@@ -383,10 +383,15 @@ flushes and secondary WAL replay.
 | Read-only admission probe | 4 MiB (or caller's shared cache) | — | 32 (or caller's budget) | — |
 
 The wallet writer caps its live WAL at 32 MiB so primary flushes bound WAL
-replay memtables across retained serving secondary generations. The wallet
-reader keeps up to 1,024 SST handles open so Mainnet point-lookup files stay
-open while partitioned index and filter blocks remain bounded in the shared
-block cache.
+replay memtables across retained serving secondary generations. Secondary and
+read-only probe opens shard each store's RocksDB table cache into four shards
+(`table_cache_numshardbits = 2` instead of RocksDB's 64-shard default) so hash
+skew does not evict live SST handles while total capacity remains free. The
+canonical reader keeps 1,024 to 2,048 SST handles open (2,048 without a
+container limit; 254 to 510 table readers per shard) and the wallet reader
+keeps up to 1,024 open (254 per shard), retaining Mainnet and Testnet SST files
+while index and filter blocks remain bounded in each store's shared block
+cache.
 
 Read-only admission probes open existing stores through the same bounded open
 path with single-threaded table-file opens, index and filter blocks charged to

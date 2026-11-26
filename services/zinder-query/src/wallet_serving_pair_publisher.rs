@@ -8201,8 +8201,8 @@ mod tests {
     /// Canonical blocks the table-file tests build before giving each
     /// canonical row a table file of its own.
     ///
-    /// With the test budget's 64 open files, a secondary keeps at most 77
-    /// table files open: a 54-entry table cache over 64 one-entry shards, plus
+    /// With the test budget's 64 open files, a secondary keeps at most 69
+    /// table files open: a 54-entry table cache over 4 fourteen-entry shards, plus
     /// up to 13 handles pinned at open. A range read over these blocks looks
     /// up only the compact-block row of each block, which sits in a level-0
     /// file of its own, so the read needs 96 files and must reopen one
