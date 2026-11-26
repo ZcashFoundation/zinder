@@ -14,9 +14,8 @@ use zinder_proto::{
 use zinder_store::{HeightOrder, ShieldedProjectionSelection};
 
 use super::{
-    EncodedTailLookupEvent, EncodedTailLookupObserver, EncodedTailLookupOutcome,
-    PublishedRangeSelection, PublishedShieldedCatalog,
-    tail::{EncodedTail, Fence, ShieldedTailBuffer, TailReadLimits},
+    PublishedShieldedCatalog,
+    tail::{EncodedTail, Fence, ShieldedTailBuffer, TailLookupOutcome, TailReadLimits},
 };
 use crate::{
     block_methods::{
@@ -32,9 +31,6 @@ use crate::{
 pub(crate) struct PublishedRangeRead {
     history: Option<Arc<PublishedShieldedCatalog>>,
     tail: ShieldedTailBuffer,
-    catalog_generation: u64,
-    catalog_end_height: Option<u32>,
-    observer: Option<EncodedTailLookupObserver>,
     limits: crate::block_range::BlockRangeStreamLimit,
     shape: CompactBlockShape,
     is_descending: bool,
@@ -100,14 +96,16 @@ impl RangeChunk for PrebatchedChunk {
 }
 
 impl PublishedBatchedRangeRead {
-    pub(crate) fn from_selection(
-        selection: PublishedRangeSelection,
+    pub(crate) fn new(
+        history: Option<Arc<PublishedShieldedCatalog>>,
+        tail: ShieldedTailBuffer,
         shape: CompactBlockShape,
         is_descending: bool,
         limits: crate::block_range::BlockRangeStreamLimit,
     ) -> Self {
-        Self(PublishedRangeRead::from_selection(
-            selection,
+        Self(PublishedRangeRead::new(
+            history,
+            tail,
             shape,
             is_descending,
             limits,
@@ -165,7 +163,6 @@ enum AnchorPlan {
 }
 
 impl PublishedRangeRead {
-    #[cfg(test)]
     pub(crate) fn new(
         history: Option<Arc<PublishedShieldedCatalog>>,
         tail: ShieldedTailBuffer,
@@ -173,47 +170,12 @@ impl PublishedRangeRead {
         is_descending: bool,
         limits: crate::block_range::BlockRangeStreamLimit,
     ) -> Self {
-        let catalog_end_height = history.as_ref().map(|catalog| catalog.bounds().end.value());
-        Self::from_selection(
-            PublishedRangeSelection {
-                history,
-                tail,
-                catalog_generation: 0,
-                catalog_end_height,
-                observer: None,
-            },
-            shape,
-            is_descending,
-            limits,
-        )
-    }
-
-    pub(crate) fn from_selection(
-        selection: PublishedRangeSelection,
-        shape: CompactBlockShape,
-        is_descending: bool,
-        limits: crate::block_range::BlockRangeStreamLimit,
-    ) -> Self {
         Self {
-            history: selection.history,
-            tail: selection.tail,
-            catalog_generation: selection.catalog_generation,
-            catalog_end_height: selection.catalog_end_height,
-            observer: selection.observer,
+            history,
+            tail,
             limits,
             shape,
             is_descending,
-        }
-    }
-
-    fn notify_tail_lookup(&self, epoch: ChainEpoch, outcome: EncodedTailLookupOutcome) {
-        if let Some(observer) = &self.observer {
-            observer(EncodedTailLookupEvent {
-                catalog_generation: self.catalog_generation,
-                catalog_end_height: self.catalog_end_height,
-                epoch_id: epoch.id.value(),
-                outcome,
-            });
         }
     }
 
@@ -570,7 +532,7 @@ impl PublishedRangeRead {
         let Some(window_floor) =
             ShieldedTailBuffer::window_floor(epoch, fence.1, catalog_end.map(|(end, _)| end))
         else {
-            self.notify_tail_lookup(epoch, EncodedTailLookupOutcome::Bypass);
+            super::tail::record_lookup(TailLookupOutcome::Bypass);
             return if catalog_end.is_some() && self.covers_selected_history(*chunk) {
                 AnchorPlan::UseEncoded(None)
             } else {
@@ -578,7 +540,7 @@ impl PublishedRangeRead {
             };
         };
         if chunk.end < window_floor {
-            self.notify_tail_lookup(epoch, EncodedTailLookupOutcome::Bypass);
+            super::tail::record_lookup(TailLookupOutcome::Bypass);
             return if catalog_end.is_some() && self.covers_selected_history(*chunk) {
                 AnchorPlan::UseEncoded(None)
             } else {
@@ -598,20 +560,27 @@ impl PublishedRangeRead {
             )
             .await
         {
-            Ok((live_opt, outcome)) => {
-                self.notify_tail_lookup(epoch, outcome);
-                live_opt.map_or_else(
-                    || AnchorPlan::FallbackNative,
-                    |live| {
-                        self.encoded_span(*chunk, self.order(), &live).map_or_else(
-                            || AnchorPlan::FallbackNative,
-                            |span| {
-                                *chunk = span;
-                                AnchorPlan::UseEncoded(Some(live))
-                            },
-                        )
+            Ok((Some(live), outcome)) => {
+                self.encoded_span(*chunk, self.order(), &live).map_or_else(
+                    || {
+                        super::tail::record_lookup(TailLookupOutcome::FallbackNative);
+                        AnchorPlan::FallbackNative
+                    },
+                    |span| {
+                        super::tail::record_lookup(outcome);
+                        *chunk = span;
+                        AnchorPlan::UseEncoded(Some(live))
                     },
                 )
+            }
+            Ok((None, outcome)) => {
+                let recorded = if outcome == TailLookupOutcome::Bypass {
+                    TailLookupOutcome::Bypass
+                } else {
+                    TailLookupOutcome::FallbackNative
+                };
+                super::tail::record_lookup(recorded);
+                AnchorPlan::FallbackNative
             }
             // Cancellation and an expired pin end this read as the native path
             // would. A tail that fails to build spans heights beyond this
@@ -621,6 +590,7 @@ impl PublishedRangeRead {
                 AnchorPlan::Failed(status)
             }
             Err(status) => {
+                super::tail::record_lookup(TailLookupOutcome::FallbackNative);
                 tracing::warn!(%status, "serving the uncovered tail from canonical storage");
                 AnchorPlan::FallbackNative
             }

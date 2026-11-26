@@ -1,1 +1,2 @@
+mod active_writer_tail_eviction;
 mod wallet_transition_discovery;

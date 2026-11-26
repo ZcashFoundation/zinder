@@ -5,7 +5,10 @@ use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, watch};
-use tokio_stream::{StreamExt as _, wrappers::BroadcastStream};
+use tokio_stream::{
+    StreamExt as _,
+    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
+};
 use zinder_compat_lightwalletd::{
     MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface, MempoolSurfaceError,
     MempoolTransactionLookup, SharedMempoolSurface, SharedTipChangeWatcher, WatchTipChangeWatcher,
@@ -58,8 +61,12 @@ impl BenchmarkMempoolSurface {
         round: u32,
         sample_raw_tx: &[u8],
     ) -> Result<usize, BenchError> {
+        // Construct entries outside the write lock so concurrent snapshot and
+        // transaction readers are never blocked on serialization work.
+        let epoch = self.state.read().chain_epoch;
+        let prepared_entries = prepare_batch_entries(epoch, batch_size, round, sample_raw_tx)?;
+
         let mut guard = self.state.write();
-        let epoch = guard.chain_epoch;
         let existing_keys: Vec<[u8; 32]> = guard.entries.keys().copied().collect();
         for key in existing_keys {
             if let Some(removed) = guard.entries.remove(&key) {
@@ -74,9 +81,7 @@ impl BenchmarkMempoolSurface {
                 let _ = self.events_tx.send(envelope);
             }
         }
-        for tx_ordinal in 0..batch_size {
-            let entry = synthetic_mempool_entry(epoch, round, tx_ordinal, sample_raw_tx)?;
-            let txid_bytes = entry.transaction_id().as_bytes();
+        for (txid_bytes, entry) in prepared_entries {
             let envelope = next_envelope(
                 &mut guard.next_event_sequence,
                 MempoolEvent::Added {
@@ -174,7 +179,10 @@ impl MempoolSurface for BenchmarkMempoolSurface {
             drop(guard);
             (replay, receiver)
         };
-        let live = BroadcastStream::new(receiver).filter_map(|outcome| outcome.ok().map(Ok));
+        let live = BroadcastStream::new(receiver).map(|outcome| match outcome {
+            Ok(envelope) => Ok(envelope),
+            Err(BroadcastStreamRecvError::Lagged(_)) => Err(MempoolSurfaceError::CursorExpired),
+        });
         let combined: Pin<
             Box<
                 dyn tokio_stream::Stream<Item = Result<MempoolEventEnvelope, MempoolSurfaceError>>
@@ -196,6 +204,21 @@ impl MempoolSurface for BenchmarkMempoolSurface {
             chain_epoch_id: guard.chain_epoch.id,
         })
     }
+}
+
+fn prepare_batch_entries(
+    epoch: ChainEpoch,
+    batch_size: u32,
+    round: u32,
+    sample_raw_tx: &[u8],
+) -> Result<Vec<([u8; 32], MempoolEntry)>, BenchError> {
+    let cap = usize::try_from(batch_size).unwrap_or(0);
+    let mut prepared = Vec::with_capacity(cap);
+    for tx_ordinal in 0..batch_size {
+        let entry = synthetic_mempool_entry(epoch, round, tx_ordinal, sample_raw_tx)?;
+        prepared.push((entry.transaction_id().as_bytes(), entry));
+    }
+    Ok(prepared)
 }
 
 fn next_envelope(sequence_slot: &mut u64, event: MempoolEvent) -> MempoolEventEnvelope {
@@ -260,13 +283,13 @@ mod tests {
     use std::{error::Error, sync::Arc, time::Duration};
 
     use tokio_stream::StreamExt as _;
-    use zinder_compat_lightwalletd::MempoolSurface as _;
+    use zinder_compat_lightwalletd::{MempoolSurface as _, MempoolSurfaceError};
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
         Network, UnixTimestampMillis,
     };
 
-    use super::BenchmarkMempoolSurface;
+    use super::{BenchmarkMempoolSurface, EVENT_CHANNEL_CAPACITY};
 
     fn sample_epoch() -> ChainEpoch {
         ChainEpoch {
@@ -320,11 +343,23 @@ mod tests {
                         break;
                     }
                 }
-                Ok::<(), zinder_compat_lightwalletd::MempoolSurfaceError>(())
+                Ok::<(), MempoolSurfaceError>(())
             })
             .await??;
             assert_eq!(observed, expected_sequences);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mempool_events_surfaces_cursor_expired_when_broadcast_lags()
+    -> Result<(), Box<dyn Error>> {
+        let surface = BenchmarkMempoolSurface::new(sample_epoch());
+        let mut stream = surface.mempool_events(None).await?;
+        let overflow_batch = u32::try_from(EVENT_CHANNEL_CAPACITY + 32)?;
+        surface.apply_churn_batch(overflow_batch, 1, &[0_u8; 16])?;
+        let item = stream.next().await.ok_or("expected stream error")?;
+        assert!(matches!(item, Err(MempoolSurfaceError::CursorExpired)));
         Ok(())
     }
 }

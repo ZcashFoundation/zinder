@@ -418,22 +418,12 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
         self.block_methods
             .await_range_tip(&self.slot, "get_encoded_block_range", &request)
             .await?;
-        let selection = self.published_history.as_ref().map_or_else(
-            || {
-                crate::published_range::PublishedRangeSelection::standalone(
-                    self.live_tail.clone(),
-                    None,
-                )
-            },
-            |history| history.encoded_range_selection(None),
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
         );
         self.block_methods
-            .published_block_range(
-                &self.slot,
-                &request,
-                selection,
-                CompactBlockShape::for_range,
-            )
+            .published_block_range(&self.slot, &request, range, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }
@@ -450,22 +440,12 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
         self.block_methods
             .await_range_tip(&self.slot, "get_encoded_block_range", &request)
             .await?;
-        let selection = self.published_history.as_ref().map_or_else(
-            || {
-                crate::published_range::PublishedRangeSelection::standalone(
-                    self.live_tail.clone(),
-                    None,
-                )
-            },
-            |history| history.encoded_range_selection(None),
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
         );
         self.block_methods
-            .published_block_range_frames(
-                &self.slot,
-                &request,
-                selection,
-                CompactBlockShape::for_range,
-            )
+            .published_block_range_frames(&self.slot, &request, range, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }

@@ -154,7 +154,6 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     block_methods: BlockMethods,
     published_history: Option<Arc<crate::PublishedShieldedHistory>>,
     live_tail: crate::published_range::ShieldedTailBuffer,
-    tail_lookup_observer: Option<crate::EncodedTailLookupObserver>,
     transparent_address_support: bool,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
@@ -190,28 +189,6 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
-    /// Attaches a request-scoped observer invoked for each live `EncodedTail` lookup.
-    #[must_use]
-    pub fn with_tail_lookup_observer(mut self, observer: crate::EncodedTailLookupObserver) -> Self {
-        self.tail_lookup_observer = Some(observer);
-        self
-    }
-
-    pub(super) fn published_range_selection(
-        &self,
-    ) -> crate::published_range::PublishedRangeSelection {
-        let observer = &self.tail_lookup_observer;
-        self.published_history.as_ref().map_or_else(
-            || {
-                crate::published_range::PublishedRangeSelection::standalone(
-                    self.live_tail.clone(),
-                    observer.clone(),
-                )
-            },
-            |history| history.encoded_range_selection(observer.clone()),
-        )
-    }
-
     /// Creates a lightwalletd-compatible gRPC adapter.
     ///
     /// `GetLightdInfo` derives `consensusBranchId`, `upgradeName`,
@@ -243,7 +220,6 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             block_methods: BlockMethods::default(),
             published_history: None,
             live_tail: crate::published_range::ShieldedTailBuffer::default(),
-            tail_lookup_observer: None,
             transparent_address_support: false,
             mempool_surface: None,
             tip_change_watcher: None,
@@ -1006,12 +982,15 @@ where
         self.block_methods
             .await_range_tip(&self.query_api, "get_encoded_block_range", &request)
             .await?;
-        let selection = self.published_range_selection();
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
         self.block_methods
             .published_block_range(
                 &self.query_api,
                 &request,
-                selection,
+                range,
                 CompactBlockShape::for_range,
             )
             .await
@@ -1030,12 +1009,15 @@ where
         self.block_methods
             .await_range_tip(&self.query_api, "get_encoded_block_range", &request)
             .await?;
-        let selection = self.published_range_selection();
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
         self.block_methods
             .published_block_range_frames(
                 &self.query_api,
                 &request,
-                selection,
+                range,
                 CompactBlockShape::for_range,
             )
             .await
@@ -1060,12 +1042,15 @@ where
                 &request,
             )
             .await?;
-        let selection = self.published_range_selection();
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
         self.block_methods
             .published_block_range(
                 &self.query_api,
                 &request,
-                selection,
+                range,
                 CompactBlockShape::for_nullifier_range,
             )
             .await
@@ -1088,12 +1073,15 @@ where
                 &request,
             )
             .await?;
-        let selection = self.published_range_selection();
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
         self.block_methods
             .published_block_range_frames(
                 &self.query_api,
                 &request,
-                selection,
+                range,
                 CompactBlockShape::for_nullifier_range,
             )
             .await

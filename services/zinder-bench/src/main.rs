@@ -13,7 +13,9 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use zinder_bench::{
     BenchError,
-    active_writer_publication::{ActiveWriterPublicationConfig, run_active_writer_publication},
+    active_writer_publication::{
+        ActiveWriterPublicationConfig, run_active_writer_publication, validate_config,
+    },
     canonical_fixture_replay::capture_canonical_fixture_replay_plan,
     canonical_fixture_transport_server::{
         CanonicalFixtureTransportServerConfig, run_canonical_fixture_transport_server,
@@ -24,6 +26,7 @@ use zinder_bench::{
 };
 use zinder_core::{BlockHeight, Network, wire::decode_zinder_native_chain_name};
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_store::RocksDbIoMode;
 
 mod build_provenance;
 #[path = "canonical_replay_storage/command.rs"]
@@ -161,6 +164,12 @@ struct ActiveWriterPublicationArgs {
     /// Synthetic V5 Orchard transactions attached to each dense block.
     #[arg(long = "dense-txs-per-block", default_value_t = 1)]
     dense_txs_per_block: u32,
+    /// Number of Orchard actions embedded in each dense shielded transaction.
+    #[arg(long = "dense-orchard-actions-per-tx", default_value_t = 2)]
+    dense_orchard_actions_per_tx: u32,
+    /// Width (in blocks) of descending `GetBlockRange(tip, floor)` uncovered-tail probes.
+    #[arg(long = "tail-probe-blocks", default_value_t = 24)]
+    tail_probe_blocks: u32,
     /// Milliseconds between consecutive live block commits.
     #[arg(long = "commit-interval-millis", default_value_t = 8)]
     commit_interval_millis: u64,
@@ -173,6 +182,18 @@ struct ActiveWriterPublicationArgs {
     /// Minimum request rounds for the `quiescent_control` baseline arm.
     #[arg(long = "quiescent-rounds", default_value_t = 6)]
     quiescent_rounds: u32,
+    /// Optional scratch directory parent for temporary benchmark stores.
+    #[arg(long = "scratch-dir")]
+    scratch_dir: Option<PathBuf>,
+    /// Requested `RocksDB` I/O mode (`direct` or `buffered`).
+    #[arg(long = "io-mode", default_value = "direct", value_parser = parse_io_mode)]
+    io_mode: RocksDbIoMode,
+    /// Optional worker count for signed-catalog publication.
+    #[arg(long = "publish-workers")]
+    publish_workers: Option<u32>,
+    /// Fail unless at least one arm triggers an `EncodedTail` `64 MiB` byte-cap eviction.
+    #[arg(long = "require-tail-eviction", default_value_t = false)]
+    require_tail_eviction: bool,
     /// Write the JSON report to this absent path instead of stdout.
     #[arg(long)]
     report: Option<PathBuf>,
@@ -393,10 +414,33 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
     }
 }
 
+fn parse_io_mode(text: &str) -> Result<RocksDbIoMode, String> {
+    match text {
+        "direct" => Ok(RocksDbIoMode::Direct),
+        "buffered" => Ok(RocksDbIoMode::Buffered),
+        _ => Err("expected direct or buffered".to_owned()),
+    }
+}
+
 async fn run_active_writer_publication_command(
     args: ActiveWriterPublicationArgs,
 ) -> Result<(), BenchError> {
+    if let Some(path) = args.report.as_deref()
+        && path.exists()
+    {
+        return Err(BenchError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "report output path already exists",
+            ),
+        ));
+    }
     let segment_blocks = require_nonzero_u32(args.segment_blocks, "segment-blocks")?;
+    let publish_workers = args
+        .publish_workers
+        .map(|workers| require_nonzero_u32(workers, "publish-workers"))
+        .transpose()?;
     let config = ActiveWriterPublicationConfig {
         base_blocks: args.base_blocks,
         live_blocks: args.live_blocks,
@@ -404,13 +448,21 @@ async fn run_active_writer_publication_command(
         segment_blocks,
         dense_block_cadence: args.dense_block_cadence,
         dense_txs_per_block: args.dense_txs_per_block,
+        dense_orchard_actions_per_tx: args.dense_orchard_actions_per_tx,
+        tail_probe_blocks: args.tail_probe_blocks,
         commit_interval: Duration::from_millis(args.commit_interval_millis),
         slow_reader_frame_delay: Duration::from_millis(args.slow_reader_frame_delay_millis),
         mempool_churn_sizes: args.mempool_churn_sizes,
         quiescent_rounds: args.quiescent_rounds,
+        scratch_dir: args.scratch_dir,
+        io_mode: args.io_mode,
+        publish_workers,
+        require_tail_eviction: args.require_tail_eviction,
     };
+    validate_config(&config)?;
     let report = run_active_writer_publication(&config).await?;
-    emit_report(&report, args.report.as_deref())
+    emit_report(&report, args.report.as_deref())?;
+    report.validate(&config)
 }
 
 async fn run_wallet_load_command(args: LightwalletdWalletLoadArgs) -> Result<(), BenchError> {
@@ -1102,6 +1154,65 @@ mod tests {
                     if args.mempool_churn_sizes == [50, 500]
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn active_writer_publication_parses_extended_flags() -> Result<(), Box<dyn Error>> {
+        let parsed = Cli::try_parse_from([
+            "zinder-bench",
+            "active-writer-publication",
+            "--scratch-dir",
+            "/tmp/zinder-bench-scratch",
+            "--io-mode",
+            "buffered",
+            "--tail-probe-blocks",
+            "64",
+            "--dense-orchard-actions-per-tx",
+            "16",
+            "--publish-workers",
+            "2",
+            "--require-tail-eviction",
+        ])?;
+        let Command::ActiveWriterPublication(args) = parsed.command else {
+            return Err("unexpected subcommand parsed".into());
+        };
+        assert_eq!(
+            args.scratch_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/zinder-bench-scratch"))
+        );
+        assert_eq!(args.io_mode, zinder_store::RocksDbIoMode::Buffered);
+        assert_eq!(args.tail_probe_blocks, 64);
+        assert_eq!(args.dense_orchard_actions_per_tx, 16);
+        assert_eq!(args.publish_workers, Some(2));
+        assert!(args.require_tail_eviction);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_writer_publication_rejects_existing_report_before_running()
+    -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let existing_report = dir.path().join("existing.json");
+        create_report_file(&existing_report, b"preexisting")?;
+        let parsed = Cli::try_parse_from([
+            "zinder-bench",
+            "active-writer-publication",
+            "--live-blocks",
+            "0",
+            "--report",
+            existing_report
+                .to_str()
+                .ok_or("temp report path must be utf8")?,
+        ])?;
+        let Command::ActiveWriterPublication(args) = parsed.command else {
+            return Err("unexpected subcommand parsed".into());
+        };
+        let err = super::run_active_writer_publication_command(args)
+            .await
+            .err()
+            .ok_or("existing report path must reject before config validation or execution")?;
+        assert!(err.to_string().contains("already exists"));
         Ok(())
     }
 }

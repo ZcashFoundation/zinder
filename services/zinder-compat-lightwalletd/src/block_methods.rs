@@ -510,15 +510,19 @@ impl BlockMethods {
         &self,
         reads: &Reads,
         request: &lightwalletd::BlockRange,
-        selection: impl Into<crate::published_range::PublishedRangeSelection>,
+        (history, live_tail): (
+            Option<Arc<crate::published_range::PublishedShieldedCatalog>>,
+            crate::published_range::ShieldedTailBuffer,
+        ),
         select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<lightwalletd::EncodedBlockRangeStream, Status> {
         let (range, is_descending) = block_range_from_request(request)?;
         let shape = select(&request.pool_types)?;
         let slot = self.block_range_streams.open().await?;
         let shape = resolve_published_shape(reads, shape, range.end).await;
-        let source = crate::published_range::PublishedRangeRead::from_selection(
-            selection.into(),
+        let source = crate::published_range::PublishedRangeRead::new(
+            history,
+            live_tail,
             shape,
             is_descending,
             self.block_range_streams.clone(),
@@ -530,15 +534,19 @@ impl BlockMethods {
         &self,
         reads: &Reads,
         request: &lightwalletd::BlockRange,
-        selection: impl Into<crate::published_range::PublishedRangeSelection>,
+        (history, live_tail): (
+            Option<Arc<crate::published_range::PublishedShieldedCatalog>>,
+            crate::published_range::ShieldedTailBuffer,
+        ),
         select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<lightwalletd::EncodedBlockFrameStream, Status> {
         let (range, is_descending) = block_range_from_request(request)?;
         let shape = select(&request.pool_types)?;
         let slot = self.block_range_streams.open().await?;
         let shape = resolve_published_shape(reads, shape, range.end).await;
-        let source = crate::published_range::PublishedBatchedRangeRead::from_selection(
-            selection.into(),
+        let source = crate::published_range::PublishedBatchedRangeRead::new(
+            history,
+            live_tail,
             shape,
             is_descending,
             self.block_range_streams.clone(),

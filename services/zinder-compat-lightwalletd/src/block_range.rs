@@ -351,6 +351,7 @@ impl BlockRangeStreamLimit {
         metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
         register_refusal_counter();
         crate::sealed_history::register_published_history_metrics();
+        crate::published_range::register_encoded_tail_metrics();
         Self {
             published_reads: Arc::new(Semaphore::new(PUBLISHED_READERS)),
             slots: Arc::new(Semaphore::new(permits)),
@@ -1911,6 +1912,41 @@ mod tests {
                 ),
                 Some(0.0),
                 "expected 0 sample for slab={slab} in:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("# HELP zinder_compat_encoded_tail_lookups_total "),
+            "missing # HELP for encoded tail lookups in:\n{rendered}"
+        );
+        for outcome in ["hit", "rebuild", "prepend", "fallback_native", "bypass"] {
+            assert_eq!(
+                rendered_sample(
+                    &rendered,
+                    &format!("zinder_compat_encoded_tail_lookups_total{{outcome=\"{outcome}\"}}"),
+                ),
+                Some(0.0),
+                "expected 0 sample for outcome={outcome} in:\n{rendered}"
+            );
+        }
+        for kind in ["rebuild", "prepend"] {
+            assert_eq!(
+                rendered_sample(
+                    &rendered,
+                    &format!("zinder_compat_encoded_tail_fills_total{{kind=\"{kind}\"}}"),
+                ),
+                Some(0.0),
+                "expected 0 sample for kind={kind} in:\n{rendered}"
+            );
+        }
+        for series in [
+            "zinder_compat_encoded_tail_byte_capped_fills_total",
+            "zinder_compat_encoded_tail_byte_cap_evictions_total",
+            "zinder_compat_encoded_tail_bytes",
+        ] {
+            assert_eq!(
+                rendered_sample(&rendered, series),
+                Some(0.0),
+                "expected 0 sample for {series} in:\n{rendered}"
             );
         }
     }

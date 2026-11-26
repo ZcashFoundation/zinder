@@ -1451,26 +1451,59 @@ zinder-bench active-writer-publication \
   --live-blocks 16 \
   --reorg-window-blocks 4 \
   --segment-blocks 4096 \
+  --io-mode direct \
+  --tail-probe-blocks 24 \
+  --dense-orchard-actions-per-tx 2 \
   --report ./reports/active-writer-publication.json
 ```
 
+To exercise `> 64 MiB` `EncodedTail` byte-cap evictions and RocksDB memtable
+flushes across descending tail refills on real NVMe or scratch storage:
+
+```bash
+zinder-bench active-writer-publication \
+  --scratch-dir ./.tmp/active-writer-scratch \
+  --io-mode direct \
+  --base-blocks 258 \
+  --live-blocks 210 \
+  --reorg-window-blocks 4 \
+  --segment-blocks 256 \
+  --dense-block-cadence 1 \
+  --dense-txs-per-block 2 \
+  --dense-orchard-actions-per-tx 900 \
+  --tail-probe-blocks 210 \
+  --commit-interval-millis 5 \
+  --slow-reader-frame-delay-millis 0 \
+  --quiescent-rounds 2 \
+  --mempool-churn-size 10,50 \
+  --require-tail-eviction \
+  --report ./.tmp/active-writer-eviction.json
+```
+
+Key command flags:
+
+- `--scratch-dir <PATH>`: optional parent directory for per-arm RocksDB stores (defaults to the system temporary directory).
+- `--io-mode <direct|buffered>`: requests `RocksDbIoMode::Direct` (with buffered fallback if the filesystem rejects direct I/O) or forces `Buffered` (default `direct`).
+- `--tail-probe-blocks <N>`: width in blocks of descending uncovered-tail `GetBlockRange(tip, floor)` probes (default `24`).
+- `--dense-orchard-actions-per-tx <N>`: Orchard actions synthesized per dense shielded transaction (default `2`).
+- `--publish-workers <N>`: worker count passed to `ShieldedHistoryPublisher::publish_available` (defaults to production clamping `1..=4`).
+- `--require-tail-eviction`: enforces that `report.validate(&config)` rejects any run that does not trigger `EncodedTail` `64 MiB` byte-cap evictions (`--report` is still written before returning failure when validation fails, and existing `--report` paths are rejected up front).
+
 The four matched modes are `quiescent_control`, `ingest_active`,
-`ingest_and_projector`, and `ingest_projector_and_publisher`. Alongside the
-unpublished `quiescent_control` baseline (used for `ingest_active` and
-`ingest_and_projector`), the report records `published_quiescent_control` with a
-sealed signed catalog at the settled boundary so settled-catalog and cold-tail
-deltas in `ModeDifferential` compare phase-matched serving paths
-(`catalog_range_unpublished` vs `quiescent_control`, `catalog_range_published`
-vs `published_quiescent_control`, returning `null` if zero qualifying
-concurrent samples exist). The JSON report records separate ingest prepare and
-commit latencies, commit-to-served-tip publication delay (`p50`, `p95`, `max`),
-range `first_frame` and `completion` latencies for settled catalog phases,
-concurrent cold-refill/warm live tail pairs (verified via request-scoped
-`EncodedTailLookupEvent` `Rebuild`/`Hit` outcomes and `catalog_generation`
-stability on a dedicated observed adapter without idle fallback or serializing
-other readers), and fixed-span slow
-boundary-crossing streams, mempool churn (`50` and `500` tx batches) with
-per-tier `writer_overlap_verified` accounting, writer WAL fsyncs (`wal.synced`),
-`NodeSource` RPC counts, per-role RocksDB flush/compaction and I/O modes
-(`direct` vs `buffered`), phase-matched stage differentials, and final-tip
-raw wire-byte SHA-256 reply parity.
+`ingest_and_projector`, and `ingest_projector_and_publisher` (plus
+`published_quiescent_control` with a sealed signed catalog covering the settled
+boundary as the matched baseline for `ingest_projector_and_publisher`). Wallet
+serving arms drive 4 bounded canonical/wallet secondary generations with retained
+epoch-pin lookup (`SwappableWalletQuery`, matching `WalletServingPairPublisher`),
+and canonical-only `ingest_active` drives 2 canonical secondary generations. All
+arms share a deterministic `WorkloadTrace` (`request_trace_digest`) plus unified Prometheus
+scraping (`zinder_compat_encoded_tail_*` fills, hits, fallback_native, bypass,
+byte_capped_fills, byte_cap_evictions, peak retained bytes) alongside unary
+`GetLatestBlock`, transparent wallet RPCs (`GetTaddressBalance`, `GetAddressUtxos`,
+`GetTransaction` via real coinbase spends), `GetTreeState`, slow boundary-crossing
+streams, descending uncovered-tail cold/warm probes, mempool churn (`writer_overlap_verified`),
+ingest prepare/commit histograms, writer WAL fsyncs, `NodeSource` RPC counts,
+per-role RocksDB tickers (`canonical_writer`, `reader_canonical_secondaries`,
+`reader_wallet_secondaries`, `wallet_writer`, `projector_secondary`, `publisher_secondary`),
+stage differentials (`ModeDifferential`), and final-tip raw wire-byte SHA-256 parity
+validated by `ActiveWriterPublicationReport::validate(&config)`.

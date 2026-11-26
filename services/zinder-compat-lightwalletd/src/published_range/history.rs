@@ -12,85 +12,38 @@ use zinder_core::BlockHeightRange;
 use zinder_query::CanonicalReader;
 use zinder_store::HeightOrder;
 
-use super::{
-    PublishedShieldedCatalog, ShieldedTailBuffer,
-    tail::{EncodedTailCounters, EncodedTailLookupObserver, EncodedTailTelemetry},
-};
+use super::{PublishedShieldedCatalog, ShieldedTailBuffer};
 use crate::sealed_history::{ChunkSpan, SealedBlock};
 use zinder_proto::compat::lightwalletd::EncodedBlockBatcher;
 
 /// The admitted shielded history shared by a listener and its catalog refresher.
 pub struct PublishedShieldedHistory {
     current: ArcSwap<HistorySnapshot>,
-    tail_counters: Arc<EncodedTailCounters>,
     manifest: PathBuf,
     publisher_directory: Option<PathBuf>,
     key: [u8; 32],
     require_fs_verity: bool,
 }
 
-/// Atomic snapshot of the active catalog/tail pair plus request-scoped telemetry.
-#[derive(Clone)]
-pub(crate) struct PublishedRangeSelection {
-    pub(crate) history: Option<Arc<PublishedShieldedCatalog>>,
-    pub(crate) tail: ShieldedTailBuffer,
-    pub(crate) catalog_generation: u64,
-    pub(crate) catalog_end_height: Option<u32>,
-    pub(crate) observer: Option<EncodedTailLookupObserver>,
-}
-
-impl PublishedRangeSelection {
-    pub(crate) fn standalone(
-        tail: ShieldedTailBuffer,
-        observer: Option<EncodedTailLookupObserver>,
-    ) -> Self {
-        Self {
-            history: None,
-            tail,
-            catalog_generation: 0,
-            catalog_end_height: None,
-            observer,
-        }
-    }
-}
-
-impl From<(Option<Arc<PublishedShieldedCatalog>>, ShieldedTailBuffer)> for PublishedRangeSelection {
-    fn from((history, tail): (Option<Arc<PublishedShieldedCatalog>>, ShieldedTailBuffer)) -> Self {
-        let catalog_end_height = history.as_ref().map(|catalog| catalog.bounds().end.value());
-        Self {
-            history,
-            tail,
-            catalog_generation: 0,
-            catalog_end_height,
-            observer: None,
-        }
-    }
-}
-
-pub(super) struct HistorySnapshot {
-    generation: u64,
-    state: HistoryState,
-}
-
-enum HistoryState {
+pub(super) enum HistorySnapshot {
     Bootstrap(ShieldedTailBuffer),
     Published(Arc<PublishedShieldedCatalog>),
 }
 
 impl HistorySnapshot {
     fn catalog(&self) -> Option<&Arc<PublishedShieldedCatalog>> {
-        match &self.state {
-            HistoryState::Bootstrap(_) => None,
-            HistoryState::Published(catalog) => Some(catalog),
+        match self {
+            Self::Bootstrap(_) => None,
+            Self::Published(catalog) => Some(catalog),
         }
     }
 
     pub(super) fn encoded_range(
         &self,
     ) -> (Option<Arc<PublishedShieldedCatalog>>, ShieldedTailBuffer) {
-        match &self.state {
-            HistoryState::Bootstrap(tail) => (None, tail.clone()),
-            HistoryState::Published(catalog) => (Some(catalog.clone()), catalog.tail()),
+        match self {
+            Self::Bootstrap(tail) => (None, tail.clone()),
+            Self::Published(catalog) => (Some(catalog.clone()), catalog.tail()),
         }
     }
 }
@@ -205,24 +158,11 @@ impl PublishedShieldedHistory {
             let source = capture();
             catalog.verify_source(source.borrow()).await?;
         }
-        let tail_counters = Arc::new(EncodedTailCounters::default());
-        let snapshot = catalog.map_or_else(
-            || HistorySnapshot {
-                generation: 0,
-                state: HistoryState::Bootstrap(ShieldedTailBuffer::empty_with_counters(
-                    Arc::clone(&tail_counters),
-                )),
-            },
-            |catalog| HistorySnapshot {
-                generation: 1,
-                state: HistoryState::Published(Arc::new(
-                    catalog.with_tail_counters(Arc::clone(&tail_counters)),
-                )),
-            },
-        );
         Ok(Self {
-            current: ArcSwap::from_pointee(snapshot),
-            tail_counters,
+            current: ArcSwap::from_pointee(catalog.map_or_else(
+                || HistorySnapshot::Bootstrap(ShieldedTailBuffer::default()),
+                |catalog| HistorySnapshot::Published(Arc::new(catalog)),
+            )),
             manifest: manifest.to_owned(),
             publisher_directory: publisher_directory.map(Path::to_owned),
             key,
@@ -243,24 +183,6 @@ impl PublishedShieldedHistory {
         Ok(())
     }
 
-    /// Returns read-only `EncodedTail` cache hit, fill, byte-cap, and catalog
-    /// snapshot generation telemetry from one consistent snapshot load.
-    #[must_use]
-    pub fn encoded_tail_telemetry(&self) -> EncodedTailTelemetry {
-        let snapshot = self.snapshot();
-        let mut telemetry = snapshot.encoded_range().1.telemetry();
-        telemetry.catalog_generation = snapshot.generation;
-        telemetry.catalog_end_height = snapshot
-            .catalog()
-            .map(|catalog| catalog.bounds().end.value());
-        telemetry
-    }
-
-    /// Drops any cached live `EncodedTail` rows without resetting monotonic telemetry counters.
-    pub fn clear_encoded_tail(&self) {
-        self.encoded_range().1.clear();
-    }
-
     pub(super) fn snapshot(&self) -> Arc<HistorySnapshot> {
         self.current.load_full()
     }
@@ -272,24 +194,6 @@ impl PublishedShieldedHistory {
         &self,
     ) -> (Option<Arc<PublishedShieldedCatalog>>, ShieldedTailBuffer) {
         self.current.load().encoded_range()
-    }
-
-    /// Captures the active catalog/tail pair together with its snapshot
-    /// generation and optional request-scoped tail lookup observer.
-    pub(crate) fn encoded_range_selection(
-        &self,
-        observer: Option<EncodedTailLookupObserver>,
-    ) -> PublishedRangeSelection {
-        let snapshot = self.snapshot();
-        let (history, tail) = snapshot.encoded_range();
-        let catalog_end_height = history.as_ref().map(|catalog| catalog.bounds().end.value());
-        PublishedRangeSelection {
-            history,
-            tail,
-            catalog_generation: snapshot.generation,
-            catalog_end_height,
-            observer,
-        }
     }
 
     /// Admits an extension of the active signed catalog against the current canonical source.
@@ -345,11 +249,7 @@ impl PublishedShieldedHistory {
         }
         candidate.verify_source(source.borrow()).await?;
         drop(source);
-        let candidate = candidate.with_tail_counters(Arc::clone(&self.tail_counters));
-        let next = Arc::new(HistorySnapshot {
-            generation: current.generation.saturating_add(1),
-            state: HistoryState::Published(Arc::new(candidate)),
-        });
+        let next = Arc::new(HistorySnapshot::Published(Arc::new(candidate)));
         let displaced = self.current.compare_and_swap(&current, next);
         Ok(Arc::ptr_eq(&current, &displaced))
     }
