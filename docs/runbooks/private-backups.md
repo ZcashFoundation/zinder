@@ -68,8 +68,9 @@ If interrupted before publication, repeat with the same paths. After publication
 
 1. Point `zinder-ingest` and `zinder-projector`'s canonical reader at `/srv/zinder/replacement/canonical`, `zinder-projector` at `/srv/zinder/replacement/wallet`, and `zinder-query` / `zinder-compat-lightwalletd` at both with unique `secondary_path` directories.
 2. Give the replacement its own node config, control tokens, and `projector.build_owner_hex` (restore releases old retention leases; mempool hydrates from the node).
-3. Start the replacement outside traffic, wait for catch-up, and compare block hashes and a wallet range against the node and reference before cutting traffic over.
-4. Keep the old deployment and off-host archive through your rollback window, then dispose of retired copies as private key material.
+3. Start the replacement outside traffic, wait for catch-up, and compare block hashes and a wallet range against the node and reference.
+4. At cutover, drain the old endpoint and stop its writers (`zinder-ingest` and `zinder-projector`) before exposing the replacement as the sole active deployment — both copies share the same `cursor_auth_key`, so running both active would let reconnecting clients switch between diverging event histories (clients whose cursor lies beyond the restored history must resume from a retained position or obtain a fresh head).
+5. Keep the old deployment and verified off-host archive through your rollback window. To roll back after cutover, drain the replacement and stop its writers first, start the previous deployment outside traffic, repeat the block-hash and wallet-range checks, and then route clients back; once retention expires, dispose of retired copies as private key material.
 
 Verification and restore refuse backups from another wallet schema before copying; rebuild from empty paths on a schema bump ([ADR-0004](../adrs/0004-storage-and-deployment-topologies.md)).
 
@@ -109,8 +110,12 @@ zinder-ingest --config /etc/zinder/ingest.toml bootstrap-from-snapshot \
 - Before writing or downloading payloads, bootstrap verifies the manifest signature, store config (`network`, `raw_blob_policy`, `reorg_window_blocks`, `checkpoint_height`), and file lengths/SHA-256 digests. After cold admission, it attests genesis, network-upgrade schedule, validator tip (at least `reorg_window_blocks` ahead of the snapshot), commitment roots, terminal subtrees, and spot-checked blocks against your validator, generates a fresh `cursor_auth_key`, and atomically publishes `storage.path`.
 
 > [!IMPORTANT]
->**Re-enable `fs-verity` when `require_fs_verity = true`.** Snapshot bundles copy opaque `sealed-history/` files without filesystem fs-verity metadata. If `zinder-compat-lightwalletd` sets `compat.shielded_history.require_fs_verity = true`, enable fs-verity on every destination segment file on an `ext4 -O verity` filesystem before starting compatibility:
+> **Re-enable `fs-verity` when `require_fs_verity = true`.** Snapshot bundles copy opaque `sealed-history/` files without filesystem fs-verity metadata. If `zinder-compat-lightwalletd` sets `compat.shielded_history.require_fs_verity = true`, enable fs-verity on every destination segment file on an `ext4 -O verity` filesystem before starting compatibility:
 >
->```bash for f in /srv/zinder-history/mainnet/key-1/catalog/*.bin; do fsverity enable --hash-alg sha256 --block-size 4096 "$f" done ```
+> ```bash
+> for f in /srv/zinder-history/mainnet/key-1/catalog/*.bin; do
+>   fsverity enable --hash-alg sha256 --block-size 4096 "$f"
+> done
+> ```
 
-After bootstrap succeeds, start `zinder-ingest` normally to follow from the snapshot tip, and start `zinder-projector` if running `wallet` or `wallet-archive` so it derives the local wallet store. If an interrupted bootstrap leaves `<storage.path>.bootstrap.staging`, `<storage.path>.bootstrap.download`, or `<sealed_history_output>.bootstrap.staging`, confirm no snapshot process is running, delete those scratch directories, and retry.
+After bootstrap succeeds, start `zinder-ingest` normally to follow from the snapshot tip, and start `zinder-projector` if running `wallet` or `wallet-archive` so it derives the local wallet store. If `bootstrap-from-snapshot` is interrupted, confirm no snapshot process is running and inspect both final destinations (`<storage.path>` and `<sealed_history_output>`) before retrying: if `<storage.path>` was already published, preserve it rather than re-running bootstrap; if `<sealed_history_output>` was published before `<storage.path>` could be renamed into place, move or remove that partial `<sealed_history_output>` directory alongside `<storage.path>.bootstrap.staging`, `<storage.path>.bootstrap.download`, and `<sealed_history_output>.bootstrap.staging` so the retry does not fail with `snapshot destination is occupied`.

@@ -3,11 +3,11 @@
 Use this runbook when your platform attaches one persistent volume to one container, such as Railway. The `zinder-wallet-serving` image supervises `zinder-ingest`, `zinder-projector`, `zinder-query` (port `9102`), and `zinder-compat-lightwalletd` (port `9067`) together in one container. Read [Deploying Zinder](deploying.md) first for host sizing and profile tradeoffs.
 
 > [!NOTE]
->**Key tradeoffs vs. the VM Compose topology:**
->- **Shared cgroup memory:** All four processes share one container memory ceiling (minimum 8 GB; count `ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES` 3x across projector, query, and compatibility).
->- **All-in-one restarts:** Every redeploy or kernel OOM kill restarts all processes together (and restarts an unfinished first sync from scratch).
->- **No signed history catalog:** `zinder-wallet-serving` and `zinder-wallet-serving-explorer` do **not** bundle `publish-shielded-history` or a signed `ZSHRNG01` catalog today; `GetBlockRange` serves from canonical storage and the live-tail buffer.
->- **Mainnet deadline & blob defaults:** Default construction deadlines (`10800`s / `7200`s) are sized for Testnet and will kill a slow Mainnet build unless raised. The shipped image config (`deploy/config/wallet-serving/ingest.toml`) sets `raw_blob_policy = "transactions"` (+251 GiB on Mainnet) and `coverage = "wallet-serving"`, and the entrypoint currently strips `ZINDER_DEPLOYMENT__*`, so this image retains transaction blobs unless custom TOML configs are mounted (`ZINDER_STORAGE__RAW_BLOB_POLICY=none` without a profile fails startup).
+> **Key tradeoffs vs. the VM Compose topology:**
+> - **Shared cgroup memory:** All four processes share one container memory ceiling (minimum 8 GB; count `ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES` 3x across projector, query, and compatibility).
+> - **All-in-one restarts:** Every redeploy or kernel OOM kill restarts all processes together (and restarts an unfinished first sync from scratch).
+> - **No signed history catalog:** `zinder-wallet-serving` and `zinder-wallet-serving-explorer` do **not** bundle `publish-shielded-history` or a signed `ZSHRNG01` catalog today; `GetBlockRange` serves from canonical storage and the live-tail buffer.
+> - **Mainnet deadline & blob defaults:** Default construction deadlines (`10800`s / `7200`s) are sized for Testnet and will kill a slow Mainnet build unless raised. The shipped image config (`deploy/config/wallet-serving/ingest.toml`) sets `raw_blob_policy = "transactions"` (+251 GiB on Mainnet) and `coverage = "wallet-serving"`, and the entrypoint currently strips `ZINDER_DEPLOYMENT__*`, so this image retains transaction blobs unless custom TOML configs are mounted (`ZINDER_STORAGE__RAW_BLOB_POLICY=none` without a profile fails startup).
 
 ## Get the image
 

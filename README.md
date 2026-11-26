@@ -1,7 +1,7 @@
 # Zinder
 
 > [!WARNING]
->**Zinder is alpha.** APIs, storage layouts, and deployment topology will change, and a tagged release is not a stability promise. Pin exact versions and expect breaking upgrades.
+> **Zinder is alpha.** APIs, storage layouts, and deployment topology will change, and a tagged release is not a stability promise. Pin exact versions and expect breaking upgrades.
 
 Zinder is a self-hosted Zcash indexer. It reads an archive [Zebra](https://github.com/ZcashFoundation/zebra) or [Zakura](https://github.com/zakura-core/zakura) node, stores one canonical index, and serves wallets, backends, and optional explorers from that consistent view. Keys, note scanning, and shielded balances stay in the wallet.
 

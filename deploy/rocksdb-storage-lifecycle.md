@@ -1,6 +1,6 @@
 # RocksDB storage lifecycle
 
->**Maintainer harness.** This procedure measures fresh canonical and wallet store construction against a synchronized Testnet Zebra node. Operators deploying Zinder should follow [Deploying Zinder](../docs/runbooks/deploying.md).
+> **Maintainer harness.** This procedure measures fresh canonical and wallet store construction against a synchronized Testnet Zebra node. Operators deploying Zinder should follow [Deploying Zinder](../docs/runbooks/deploying.md).
 
 This harness measures how long a fresh canonical store and then a fresh wallet store take to reach `READY`, then cold-opens both stores to verify that the wallet store reached the same canonical chain event. Continuous following, reorg recovery, query serving, and lightwalletd compatibility are outside its scope; the canonical runtime tracer in the [testing runbook](../docs/runbooks/testing.md) covers `zinder-ingest` composition, following, and restart.
 

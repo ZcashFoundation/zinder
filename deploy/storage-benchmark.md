@@ -1,6 +1,6 @@
 # Storage benchmark environment
 
->**Maintainer benchmark.** This harness compares RocksDB and PostgreSQL for canonical replay-record round trips. PostgreSQL is not a production Zinder storage backend. Operators deploying Zinder should follow [Deploying Zinder](../docs/runbooks/deploying.md).
+> **Maintainer benchmark.** This harness compares RocksDB and PostgreSQL for canonical replay-record round trips. PostgreSQL is not a production Zinder storage backend. Operators deploying Zinder should follow [Deploying Zinder](../docs/runbooks/deploying.md).
 
 `docker-compose.storage-benchmark.yml` compares RocksDB and PostgreSQL from one immutable `zinder-bench` image and one captured fixture. Each arm writes every `CanonicalBlockFacts` replay envelope, reads every row back, recomputes the ordered sequence digest, and writes a completion marker only after that check passes. Canonical construction, compact blocks, tree positions, chain events, reorgs, the wallet store, and query serving are outside its scope.
 
