@@ -8308,6 +8308,13 @@ mod tests {
             .await?;
         let stale_pair = slot.capture_ephemeral();
         let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        // Evict the tip `block_header` table reader that secondary admission
+        // opened so `served_tip_snapshot()` must reopen its table file without
+        // warming `stale_pair`'s cached tip block time or observing epoch pins.
+        stale_pair
+            .canonical()
+            .compact_blocks_in_range(split_block_range())
+            .await?;
         compact_away_table_files(&canonical_primary_path)?;
 
         let replace_the_marked_pair = async {

@@ -690,7 +690,7 @@ mod tests {
             mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
             mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
             mixed ^= mixed >> 31;
-            let shard_idx = usize::try_from(mixed).unwrap_or(0) & (shards - 1);
+            let shard_idx = usize::try_from(mixed & ((shards as u64) - 1)).unwrap_or(0);
             if let Some(slot) = counts.get_mut(shard_idx) {
                 *slot += 1;
             }
