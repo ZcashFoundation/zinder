@@ -314,7 +314,10 @@ services:
     image: prom/prometheus:v3.16.0
     mem_limit: ${ZINDER_PROMETHEUS_MEMORY_LIMIT:-1g}
     restart: unless-stopped
-    networks: [observability]
+    networks:
+      observability:
+        aliases:
+          - prometheus
     volumes:
       - prometheus:/prometheus
       - ../observability/prometheus/rules:/etc/prometheus/rules:ro

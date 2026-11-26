@@ -365,7 +365,8 @@ if [[ -n "$light_wallet_compose_contract" ]]; then
     and (($services["zinder-compat-lightwalletd"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
     and (($services | has("zinder-prometheus") | not)
       or (exact_read_only_bind("zinder-prometheus"; "/etc/prometheus/prometheus.yml"; "/deploy/observability/light-wallet/prometheus.yml")
-        and exact_read_only_bind("zinder-prometheus"; "/etc/prometheus/light-wallet/rules"; "/deploy/observability/light-wallet/rules")))
+        and exact_read_only_bind("zinder-prometheus"; "/etc/prometheus/light-wallet/rules"; "/deploy/observability/light-wallet/rules")
+        and (($services["zinder-prometheus"].networks.observability.aliases // []) | index("prometheus") != null)))
   ' "$light_wallet_compose_contract" >/dev/null || {
     cat >&2 <<'EOF'
 release admission rejected: resolved light-wallet Compose contract does not
@@ -508,6 +509,8 @@ if [[ -n "$compose_contract" ]]; then
     and ($services["zinder-compat-lightwalletd"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9107")
     and ($services["zinder-compat-lightwalletd"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
     and (($services["zinder-compat-lightwalletd"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
+    and (($services | has("zinder-prometheus") | not)
+      or (($services["zinder-prometheus"].networks.observability.aliases // []) | index("prometheus") != null))
   ' "$compose_contract" >/dev/null || {
     cat >&2 <<'EOF'
 release admission rejected: resolved Compose contract does not preserve the

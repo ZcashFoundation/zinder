@@ -645,6 +645,16 @@ jq '
 expect_rejected \
   "a light-wallet Compose bundle mounting the four-runtime Prometheus config" \
   --light-wallet-compose-contract "$invalid_light_wallet"
+jq 'del(.services["zinder-prometheus"].networks.observability.aliases)' \
+  "$resolved_light_wallet_observability" > "$invalid_light_wallet"
+expect_rejected \
+  "a light-wallet Compose bundle omitting the prometheus network alias for Grafana" \
+  --light-wallet-compose-contract "$invalid_light_wallet"
+jq 'del(.services["zinder-prometheus"].networks.observability.aliases)' \
+  "$resolved_compose" > "$invalid_history_compose"
+expect_rejected \
+  "a Compose contract omitting the prometheus network alias for Grafana" \
+  --compose-contract "$invalid_history_compose"
 
 # Legacy transactions-retention overlay clears any inherited profile and pins
 # transactions retention across writer and wallet-serving readers.
