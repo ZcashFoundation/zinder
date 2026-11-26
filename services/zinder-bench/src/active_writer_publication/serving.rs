@@ -584,8 +584,7 @@ pub(crate) struct TwoGenCanonicalPublisher {
 struct TwoGenCanonicalState {
     standby: Option<RocksDbCanonicalSecondary>,
     retired: Option<Arc<RocksDbCanonicalReader>>,
-    baselines: Vec<TickerCounterSnapshot>,
-    completed_delta: StoreTickerDelta,
+    baseline: TickerCounterSnapshot,
     generation_seq: u64,
 }
 
@@ -608,7 +607,6 @@ impl TwoGenCanonicalPublisher {
             CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions);
 
         let mut secondaries = Vec::with_capacity(TWO_GENERATION_SLOTS);
-        let mut baselines = Vec::with_capacity(TWO_GENERATION_SLOTS);
         let mut io_modes = Vec::with_capacity(TWO_GENERATION_SLOTS);
         for dir in &secondary_dirs[..TWO_GENERATION_SLOTS] {
             let sec = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
@@ -620,7 +618,6 @@ impl TwoGenCanonicalPublisher {
                 &resources,
             )?;
             io_modes.push(sec.io_mode().as_str().to_owned());
-            baselines.push(capture_canonical_sec_tickers(&sec));
             secondaries.push(sec);
         }
 
@@ -628,6 +625,7 @@ impl TwoGenCanonicalPublisher {
         let standby = secondaries.remove(0);
         let reader = RocksDbCanonicalReader::new(active_sec)
             .map_err(|err| BenchError::canonical_read(err.to_string()))?;
+        let baseline = capture_canonical_sec_tickers(reader.secondary());
         let slot = CanonicalReaderSlot::new(Arc::new(reader));
 
         Ok(Arc::new(Self {
@@ -636,8 +634,7 @@ impl TwoGenCanonicalPublisher {
             state: Mutex::new(TwoGenCanonicalState {
                 standby: Some(standby),
                 retired: None,
-                baselines,
-                completed_delta: StoreTickerDelta::default(),
+                baseline,
                 generation_seq: 1,
             }),
             invalidation_requested: AtomicBool::new(false),
@@ -676,29 +673,44 @@ impl TwoGenCanonicalPublisher {
             .map_err(|err| BenchError::tip_replay(err.to_string()))?
     }
 
-    /// Captures `RocksDB` ticker delta accumulated by both generations since init
-    /// and resets baselines to the current instant (e.g. strictly post-workload).
+    /// Swaps to a standby generation even at an unchanged epoch (used by
+    /// `canonical_quiescent_control` so cold tail refills start on a fresh
+    /// `CompactBlockSource`).
+    pub(crate) async fn rotate_generation_for_cold_tail(
+        self: &Arc<Self>,
+        cancel: &CancellationToken,
+    ) -> Result<(u32, ChainEpoch, u64), BenchError> {
+        let this = Arc::clone(self);
+        let stop = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            let start_seq = this.state.lock().generation_seq;
+            let mut last = {
+                let epoch = this.slot.capture().chain_epoch();
+                (epoch.visible_tip_height.value(), epoch, 0)
+            };
+            while !stop.is_cancelled() {
+                let res = this.catch_up_blocking(true)?;
+                if res.2 > start_seq {
+                    return Ok(res);
+                }
+                last = (res.0, res.1, 0);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(last)
+        })
+        .await
+        .map_err(|err| BenchError::tip_replay(err.to_string()))?
+    }
+
+    /// Captures the cumulative `RocksDB` ticker delta on the shared canonical
+    /// pool statistics and resets the baseline to the current instant.
     pub(crate) fn snapshot_and_reset_tickers(&self) -> StoreTickerDelta {
         let mut guard = self.state.lock();
         reclaim_canonical_retired(&mut guard);
-        let mut delta = guard.completed_delta;
-        guard.completed_delta = StoreTickerDelta::default();
         let active_reader = self.slot.capture();
-        let active_now = capture_canonical_sec_tickers(active_reader.secondary());
-        let slot_delta = active_now.delta_since(&guard.baselines[0]);
-        guard.baselines[0] = active_now;
-        delta = delta.saturating_add(slot_delta);
-        if let Some(standby) = guard.standby.as_ref() {
-            let standby_now = capture_canonical_sec_tickers(standby);
-            let s_delta = standby_now.delta_since(&guard.baselines[1]);
-            guard.baselines[1] = standby_now;
-            delta = delta.saturating_add(s_delta);
-        } else if let Some(retired) = guard.retired.as_ref() {
-            let retired_now = capture_canonical_sec_tickers(retired.secondary());
-            let r_delta = retired_now.delta_since(&guard.baselines[1]);
-            guard.baselines[1] = retired_now;
-            delta = delta.saturating_add(r_delta);
-        }
+        let now = capture_canonical_sec_tickers(active_reader.secondary());
+        let delta = now.delta_since(&guard.baseline);
+        guard.baseline = now;
         drop(guard);
         delta
     }
@@ -802,7 +814,6 @@ impl TwoGenCanonicalPublisher {
         self.invalidation_requested.store(false, Ordering::Release);
         let new_seq = {
             let mut guard = self.state.lock();
-            guard.baselines.swap(0, 1);
             guard.retired = Some(old_reader);
             reclaim_canonical_retired(&mut guard);
             guard.generation_seq = guard.generation_seq.saturating_add(1);
@@ -843,24 +854,20 @@ pub(crate) struct TwoGenWalletPairPublisher {
 struct StandbyPairHandles {
     canonical: RocksDbCanonicalSecondary,
     wallet: RocksDbWalletSecondary,
-    can_baseline: TickerCounterSnapshot,
-    wal_baseline: TickerCounterSnapshot,
 }
 
 struct ActiveOrRetiredWalletHandles {
     canonical: Arc<RocksDbCanonicalSecondary>,
     wallet: Arc<RocksDbWalletSecondary>,
     pair_weak: Weak<WalletServingReadPair>,
-    can_baseline: TickerCounterSnapshot,
-    wal_baseline: TickerCounterSnapshot,
 }
 
 struct TwoGenWalletPairState {
     active: Option<ActiveOrRetiredWalletHandles>,
     standby: VecDeque<StandbyPairHandles>,
     retired: VecDeque<ActiveOrRetiredWalletHandles>,
-    can_completed_delta: StoreTickerDelta,
-    wal_completed_delta: StoreTickerDelta,
+    can_baseline: TickerCounterSnapshot,
+    wal_baseline: TickerCounterSnapshot,
     generation_seq: u64,
 }
 
@@ -892,6 +899,8 @@ impl TwoGenWalletPairPublisher {
         let active_slot = opened.slots.remove(0);
         let active_can = Arc::new(active_slot.canonical);
         let active_wal = Arc::new(active_slot.wallet);
+        let can_baseline = capture_canonical_sec_tickers(&active_can);
+        let wal_baseline = capture_wallet_sec_tickers(&active_wal);
         let initial_pair = build_wallet_serving_pair(&active_can, &active_wal)?;
         let pair_weak = Arc::downgrade(&initial_pair);
         let initial_query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
@@ -907,13 +916,11 @@ impl TwoGenWalletPairPublisher {
                     canonical: active_can,
                     wallet: active_wal,
                     pair_weak,
-                    can_baseline: active_slot.can_baseline,
-                    wal_baseline: active_slot.wal_baseline,
                 }),
                 standby: VecDeque::from(opened.slots),
                 retired: VecDeque::new(),
-                can_completed_delta: StoreTickerDelta::default(),
-                wal_completed_delta: StoreTickerDelta::default(),
+                can_baseline,
+                wal_baseline,
                 generation_seq: 1,
             }),
             invalidation_requested: AtomicBool::new(false),
@@ -980,25 +987,26 @@ impl TwoGenWalletPairPublisher {
         .map_err(|err| BenchError::tip_replay(err.to_string()))?
     }
 
-    /// Captures and resets accumulated ticker deltas across active, standby,
-    /// and retired canonical and wallet secondary generations.
+    /// Captures and resets cumulative ticker deltas once per shared canonical
+    /// and wallet secondary resource pool.
     pub(crate) fn snapshot_and_reset_tickers(&self) -> (StoreTickerDelta, StoreTickerDelta) {
         let mut guard = self.state.lock();
         reclaim_wallet_retired(&mut guard);
-        let mut can_delta = guard.can_completed_delta;
-        let mut wal_delta = guard.wal_completed_delta;
-        guard.can_completed_delta = StoreTickerDelta::default();
-        guard.wal_completed_delta = StoreTickerDelta::default();
-
-        if let Some(active) = guard.active.as_mut() {
-            accumulate_retired_tickers(active, &mut can_delta, &mut wal_delta);
-        }
-        for standby in &mut guard.standby {
-            accumulate_standby_tickers(standby, &mut can_delta, &mut wal_delta);
-        }
-        for retired in &mut guard.retired {
-            accumulate_retired_tickers(retired, &mut can_delta, &mut wal_delta);
-        }
+        let (can_delta, wal_delta) = if let Some((can_now, wal_now)) =
+            guard.active.as_ref().map(|active| {
+                (
+                    capture_canonical_sec_tickers(&active.canonical),
+                    capture_wallet_sec_tickers(&active.wallet),
+                )
+            }) {
+            let cd = can_now.delta_since(&guard.can_baseline);
+            let wd = wal_now.delta_since(&guard.wal_baseline);
+            guard.can_baseline = can_now;
+            guard.wal_baseline = wal_now;
+            (cd, wd)
+        } else {
+            (StoreTickerDelta::default(), StoreTickerDelta::default())
+        };
         drop(guard);
         (can_delta, wal_delta)
     }
@@ -1094,8 +1102,6 @@ impl TwoGenWalletPairPublisher {
                     self.state.lock().standby.push_back(StandbyPairHandles {
                         canonical: can,
                         wallet: wal,
-                        can_baseline: standby.can_baseline,
-                        wal_baseline: standby.wal_baseline,
                     });
                 }
                 return Ok((
@@ -1127,8 +1133,6 @@ impl TwoGenWalletPairPublisher {
                 canonical: active_can,
                 wallet: active_wal,
                 pair_weak,
-                can_baseline: standby.can_baseline,
-                wal_baseline: standby.wal_baseline,
             }) {
                 guard.retired.push_back(prev_active);
             }
@@ -1187,8 +1191,6 @@ fn open_wallet_slots(
         canonical_io_modes.push(can.io_mode().as_str().to_owned());
         wallet_io_modes.push(wal.io_mode().as_str().to_owned());
         slots.push(StandbyPairHandles {
-            can_baseline: capture_canonical_sec_tickers(&can),
-            wal_baseline: capture_wallet_sec_tickers(&wal),
             canonical: can,
             wallet: wal,
         });
@@ -1198,34 +1200,6 @@ fn open_wallet_slots(
         canonical_io_modes,
         wallet_io_modes,
     })
-}
-
-fn accumulate_standby_tickers(
-    standby: &mut StandbyPairHandles,
-    can_delta: &mut StoreTickerDelta,
-    wal_delta: &mut StoreTickerDelta,
-) {
-    let can_now = capture_canonical_sec_tickers(&standby.canonical);
-    *can_delta = can_delta.saturating_add(can_now.delta_since(&standby.can_baseline));
-    standby.can_baseline = can_now;
-
-    let wal_now = capture_wallet_sec_tickers(&standby.wallet);
-    *wal_delta = wal_delta.saturating_add(wal_now.delta_since(&standby.wal_baseline));
-    standby.wal_baseline = wal_now;
-}
-
-fn accumulate_retired_tickers(
-    handles: &mut ActiveOrRetiredWalletHandles,
-    can_delta: &mut StoreTickerDelta,
-    wal_delta: &mut StoreTickerDelta,
-) {
-    let can_now = capture_canonical_sec_tickers(&handles.canonical);
-    *can_delta = can_delta.saturating_add(can_now.delta_since(&handles.can_baseline));
-    handles.can_baseline = can_now;
-
-    let wal_now = capture_wallet_sec_tickers(&handles.wallet);
-    *wal_delta = wal_delta.saturating_add(wal_now.delta_since(&handles.wal_baseline));
-    handles.wal_baseline = wal_now;
 }
 
 fn converge_aligned_standby(
@@ -1300,8 +1274,6 @@ fn reclaim_wallet_retired(guard: &mut TwoGenWalletPairState) {
                 guard.standby.push_back(StandbyPairHandles {
                     canonical: can,
                     wallet: wal,
-                    can_baseline: retired.can_baseline,
-                    wal_baseline: retired.wal_baseline,
                 });
             }
             (can_res, wal_res) => {
@@ -1311,8 +1283,6 @@ fn reclaim_wallet_retired(guard: &mut TwoGenWalletPairState) {
                     canonical: can,
                     wallet: wal,
                     pair_weak: retired.pair_weak,
-                    can_baseline: retired.can_baseline,
-                    wal_baseline: retired.wal_baseline,
                 });
             }
         }
@@ -1646,13 +1616,13 @@ mod tests {
     use std::{fs, num::NonZeroU32, path::PathBuf, time::Duration};
 
     use tokio_util::sync::CancellationToken;
-    use zinder_core::ChainEpoch;
-    use zinder_query::WalletQueryApi as _;
+    use zinder_core::{BlockHeight, BlockHeightRange, ChainEpoch, TransparentAddressScriptHash};
+    use zinder_query::{CanonicalReader as _, WalletQueryApi as _};
     use zinder_store::{RocksDbIoMode, RocksDbResourceBudget};
 
     use super::{
         EncodedTailMetricSnapshot, TwoGenCanonicalPublisher, TwoGenWalletPairPublisher,
-        WalletPairOpenConfig,
+        WalletPairOpenConfig, capture_canonical_sec_tickers, capture_wallet_sec_tickers,
     };
     use crate::{
         BenchError,
@@ -1800,5 +1770,120 @@ mod tests {
         assert!(query.compact_block_fence(initial_epoch).is_some());
         publisher.wait_reclaim_all().await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_shared_secondary_tickers_counted_once_across_rotation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let layout = setup_test_publishers().await?;
+        let publisher = TwoGenCanonicalPublisher::open(
+            &layout.can_dir,
+            &layout.sec_dirs,
+            layout.config.reorg_window_blocks,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let _ = publisher.snapshot_and_reset_tickers();
+        let before = capture_canonical_sec_tickers(publisher.capture_slot().capture().secondary());
+
+        let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(16));
+        let _ = publisher
+            .capture_slot()
+            .capture()
+            .compact_blocks_in_range(range)
+            .await?;
+        let cancel = CancellationToken::new();
+        let (_, _, seq) = publisher.rotate_generation_for_cold_tail(&cancel).await?;
+        assert!(seq > 1);
+        let rotated = publisher.capture_slot().capture();
+        let _ = rotated.compact_blocks_in_range(range).await?;
+
+        let after = capture_canonical_sec_tickers(rotated.secondary());
+        let expected = after.delta_since(&before);
+        let observed = publisher.snapshot_and_reset_tickers();
+        assert_eq!(observed, expected);
+        assert!(observed.bytes_read > 0);
+        publisher.wait_reclaim_all().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wallet_shared_secondary_tickers_counted_once_across_rotation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let layout = setup_test_publishers().await?;
+        let publisher = TwoGenWalletPairPublisher::open(WalletPairOpenConfig {
+            canonical_dir: &layout.can_dir,
+            wallet_dir: &layout.wal_dir,
+            secondary_dirs: &layout.sec_dirs,
+            wallet_secondary_dirs: &layout.wal_sec_dirs,
+            reorg_window_blocks: layout.config.reorg_window_blocks,
+            budget: RocksDbResourceBudget::for_local_tests(),
+        })?;
+        let _ = publisher.snapshot_and_reset_tickers();
+        let (before_can, before_wal) = wallet_publisher_raw_tickers(&publisher)?;
+
+        let mut spk = vec![0x76_u8, 0xa9, 0x14];
+        spk.extend_from_slice(&[0x42_u8; 19]);
+        spk.push(1);
+        spk.extend_from_slice(&[0x88_u8, 0xac]);
+        let script_hash = TransparentAddressScriptHash::of_script_pub_key(&spk);
+        let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(16));
+        let _ = publisher
+            .query()
+            .compact_blocks_in_range(range, None)
+            .await?;
+        let _ = publisher
+            .query()
+            .transparent_address_balance(vec![script_hash], None)
+            .await?;
+
+        let cancel = CancellationToken::new();
+        let (_, _, seq) = publisher.rotate_generation_for_cold_tail(&cancel).await?;
+        assert!(seq > 1);
+        let _ = publisher
+            .query()
+            .compact_blocks_in_range(range, None)
+            .await?;
+        let _ = publisher
+            .query()
+            .transparent_address_balance(vec![script_hash], None)
+            .await?;
+
+        let (after_can, after_wal) = wallet_publisher_raw_tickers(&publisher)?;
+        let expected = (
+            after_can.delta_since(&before_can),
+            after_wal.delta_since(&before_wal),
+        );
+        let observed = publisher.snapshot_and_reset_tickers();
+        assert_eq!(observed, expected);
+        assert!(observed.0.bytes_read > 0);
+        assert!(
+            observed.1.bytes_read > 0
+                || observed.1.block_cache_data_hit > 0
+                || observed.1.block_cache_data_miss > 0
+        );
+        publisher.wait_reclaim_all().await;
+        Ok(())
+    }
+
+    fn wallet_publisher_raw_tickers(
+        publisher: &TwoGenWalletPairPublisher,
+    ) -> Result<
+        (
+            super::super::report::TickerCounterSnapshot,
+            super::super::report::TickerCounterSnapshot,
+        ),
+        BenchError,
+    > {
+        let guard = publisher.state.lock();
+        let active = guard
+            .active
+            .as_ref()
+            .ok_or_else(|| BenchError::tip_replay("active wallet pair missing"))?;
+        let snapshots = (
+            capture_canonical_sec_tickers(&active.canonical),
+            capture_wallet_sec_tickers(&active.wallet),
+        );
+        drop(guard);
+        Ok(snapshots)
     }
 }

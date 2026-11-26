@@ -2,8 +2,9 @@
 //!
 //! Exercises identical advancing Zcash Regtest workloads across four matched
 //! writer/publication states (`quiescent_control`, `ingest_active`,
-//! `ingest_and_projector`, `ingest_projector_and_publisher`) plus a published
-//! quiescent control, crossing a configurable shielded segment boundary while
+//! `ingest_and_projector`, `ingest_projector_and_publisher`) plus matched
+//! `canonical_quiescent_control` (for canonical-only `ingest_active`) and
+//! `published_quiescent_control` baselines, crossing a configurable shielded segment boundary while
 //! concurrent lightwalletd compatibility readers measure publication
 //! visibility, range first-frame and completion latency, uncovered-tail cold
 //! refills and `64 MiB` byte-cap evictions, slow readers, transparent wallet
@@ -120,9 +121,9 @@ pub fn validate_config(config: &ActiveWriterPublicationConfig) -> Result<(), Ben
             "dense_orchard_actions_per_tx must be positive",
         ));
     }
-    if config.tail_probe_blocks == 0 {
+    if config.tail_probe_blocks < 2 {
         return Err(BenchError::invalid_argument(
-            "tail_probe_blocks must be positive",
+            "tail_probe_blocks must be at least 2 so descending uncovered-tail probes are strictly descending",
         ));
     }
     if config.quiescent_rounds == 0 {

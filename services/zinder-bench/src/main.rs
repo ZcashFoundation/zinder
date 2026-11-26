@@ -167,7 +167,7 @@ struct ActiveWriterPublicationArgs {
     /// Number of Orchard actions embedded in each dense shielded transaction.
     #[arg(long = "dense-orchard-actions-per-tx", default_value_t = 2)]
     dense_orchard_actions_per_tx: u32,
-    /// Width (in blocks) of descending `GetBlockRange(tip, floor)` uncovered-tail probes.
+    /// Width in blocks (>= 2) of descending `GetBlockRange(tip, floor)` uncovered-tail probes.
     #[arg(long = "tail-probe-blocks", default_value_t = 24)]
     tail_probe_blocks: u32,
     /// Milliseconds between consecutive live block commits.

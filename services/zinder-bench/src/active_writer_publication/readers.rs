@@ -26,7 +26,7 @@ use super::{
         LatencySummaryMs, MempoolTierMetrics, ProtocolErrorCounts, StreamLatencyReport,
         WalletRpcMetrics, WriterMode,
     },
-    serving::{EncodedTailMetricSnapshot, TwoGenWalletPairPublisher},
+    serving::EncodedTailMetricSnapshot,
     trace::WorkloadTrace,
 };
 use crate::BenchError;
@@ -71,6 +71,7 @@ impl ErrorCollector {
 #[derive(Clone)]
 pub(crate) struct ReaderFleetContext {
     pub(crate) mode: WriterMode,
+    pub(crate) wallet_serving: bool,
     pub(crate) trace: WorkloadTrace,
     pub(crate) sample_v5_tx: Arc<Vec<u8>>,
     pub(crate) served_rx: watch::Receiver<ServedState>,
@@ -80,7 +81,7 @@ pub(crate) struct ReaderFleetContext {
     pub(crate) error_collector: Arc<Mutex<ErrorCollector>>,
     pub(crate) prom_handle: PrometheusHandle,
     pub(crate) server_port: u16,
-    pub(crate) quiescent_rotator: Option<Arc<TwoGenWalletPairPublisher>>,
+    pub(crate) quiescent_rotator: Option<ModeServingHandle>,
     pub(crate) rotation_requester: Option<ModeServingHandle>,
 }
 
@@ -767,7 +768,7 @@ async fn run_wallet_rpc_reader(
     channel: AuthenticatedChannel,
     mut ctx: ReaderFleetContext,
 ) -> WalletRpcMetrics {
-    if !ctx.mode.has_wallet_serving() || ctx.trace.wallet_addresses.is_empty() {
+    if !ctx.wallet_serving || ctx.trace.wallet_addresses.is_empty() {
         return WalletRpcMetrics::default();
     }
     let client = streamer_client(channel);
@@ -1387,6 +1388,7 @@ mod tests {
         let trace = WorkloadTrace::build(&config, 16, Vec::new(), Vec::new(), Vec::new());
         Ok(ReaderFleetContext {
             mode: WriterMode::IngestActive,
+            wallet_serving: false,
             trace,
             sample_v5_tx: std::sync::Arc::new(vec![0_u8; 32]),
             served_rx,

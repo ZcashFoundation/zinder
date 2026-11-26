@@ -24,8 +24,8 @@ use super::{
     mempool::{BenchmarkMempoolSurface, as_mempool_surface, create_tip_watcher},
     parity::{ParityProbeRequest, collect_final_tip_parity},
     pipelines::{
-        ActiveOutcome, ActivePipelineArgs, ModePaths, ModeServingHandle, ServedState,
-        WriterProgress, drive_active_pipelines, pre_advance_quiescent_stores,
+        ActiveOutcome, ActivePipelineArgs, ModePaths, ModeServingHandle, QuiescentPreAdvance,
+        ServedState, WriterProgress, drive_active_pipelines, pre_advance_quiescent_stores,
         resolve_publish_workers,
     },
     readers::{ErrorCollector, ReaderFleetContext, ReaderFleetOutput, spawn_reader_fleet},
@@ -51,6 +51,7 @@ struct ModeRunSpec {
     mode: WriterMode,
     label: &'static str,
     publish_catalog: bool,
+    wallet_serving: bool,
 }
 
 /// Runs all matched writer/publication arms across one advancing Regtest chain.
@@ -64,14 +65,7 @@ pub async fn run_active_writer_publication(
 ) -> Result<ActiveWriterPublicationReport, BenchError> {
     validate_config(config)?;
     crate::recorder::install_tracing_subscriber();
-    let chain = GeneratedChain::build(ChainSpecConfig {
-        base_blocks: config.base_blocks,
-        live_blocks: config.live_blocks,
-        reorg_window_blocks: config.reorg_window_blocks,
-        dense_block_cadence: config.dense_block_cadence,
-        dense_txs_per_block: config.dense_txs_per_block,
-        dense_orchard_actions_per_tx: config.dense_orchard_actions_per_tx,
-    })?;
+    let chain = build_generated_chain(config)?;
     let template_stores = TemplateStores::build(&chain, config).await?;
     let segment_boundary = next_segment_boundary(config, &chain);
     let trace = WorkloadTrace::build(
@@ -82,29 +76,42 @@ pub async fn run_active_writer_publication(
         chain.live_txids.clone(),
     );
     let (prom_handle, _) = EncodedTailMetricSnapshot::install_and_capture()?;
+    let shared = (&chain, &template_stores, &trace, &prom_handle);
 
-    let (published_quiescent_control, published_parity) = run_single_mode(
+    let (canonical_quiescent_control, canonical_parity) = Box::pin(run_single_mode(
+        ModeRunSpec {
+            mode: WriterMode::QuiescentControl,
+            label: "canonical_quiescent_control",
+            publish_catalog: false,
+            wallet_serving: false,
+        },
+        config,
+        shared,
+    ))
+    .await?;
+    let (published_quiescent_control, published_parity) = Box::pin(run_single_mode(
         ModeRunSpec {
             mode: WriterMode::QuiescentControl,
             label: "published_quiescent_control",
             publish_catalog: true,
+            wallet_serving: true,
         },
         config,
-        (&chain, &template_stores, &trace, &prom_handle),
-    )
+        shared,
+    ))
     .await?;
-
-    let (mode_reports, mut parity_digests) = run_matched_modes(
+    let (mode_reports, mut parity_digests) = Box::pin(run_matched_modes(
         config,
-        (&chain, &template_stores, &trace, &prom_handle),
-        published_parity,
-    )
+        shared,
+        (canonical_parity, published_parity),
+    ))
     .await?;
 
     let unpublished_baseline = mode_reports
         .first()
         .ok_or_else(|| BenchError::tip_replay("quiescent_control report missing"))?;
     let differentials_vs_quiescent = build_matched_differentials(
+        &canonical_quiescent_control,
         unpublished_baseline,
         &published_quiescent_control,
         &mode_reports[1..],
@@ -116,10 +123,24 @@ pub async fn run_active_writer_publication(
         contract_identity: ACTIVE_WRITER_PUBLICATION_CONTRACT.to_owned(),
         report_format_version: ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION,
         workload,
+        canonical_quiescent_control,
         published_quiescent_control,
         modes: mode_reports,
         differentials_vs_quiescent,
         byte_parity,
+    })
+}
+
+fn build_generated_chain(
+    config: &ActiveWriterPublicationConfig,
+) -> Result<GeneratedChain, BenchError> {
+    GeneratedChain::build(ChainSpecConfig {
+        base_blocks: config.base_blocks,
+        live_blocks: config.live_blocks,
+        reorg_window_blocks: config.reorg_window_blocks,
+        dense_block_cadence: config.dense_block_cadence,
+        dense_txs_per_block: config.dense_txs_per_block,
+        dense_orchard_actions_per_tx: config.dense_orchard_actions_per_tx,
     })
 }
 
@@ -131,10 +152,11 @@ async fn run_matched_modes(
         &WorkloadTrace,
         &PrometheusHandle,
     ),
-    published_parity: ModeParityDigests,
+    (canonical_parity, published_parity): (ModeParityDigests, ModeParityDigests),
 ) -> Result<(Vec<ModeReport>, Vec<ModeParityDigests>), BenchError> {
     let mut mode_reports = Vec::with_capacity(4);
-    let mut parity_digests = Vec::with_capacity(5);
+    let mut parity_digests = Vec::with_capacity(6);
+    parity_digests.push(canonical_parity);
     parity_digests.push(published_parity);
 
     for run_spec in [
@@ -142,21 +164,25 @@ async fn run_matched_modes(
             mode: WriterMode::QuiescentControl,
             label: "quiescent_control",
             publish_catalog: false,
+            wallet_serving: true,
         },
         ModeRunSpec {
             mode: WriterMode::IngestActive,
             label: "ingest_active",
             publish_catalog: false,
+            wallet_serving: false,
         },
         ModeRunSpec {
             mode: WriterMode::IngestAndProjector,
             label: "ingest_and_projector",
             publish_catalog: false,
+            wallet_serving: true,
         },
         ModeRunSpec {
             mode: WriterMode::IngestProjectorAndPublisher,
             label: "ingest_projector_and_publisher",
             publish_catalog: true,
+            wallet_serving: true,
         },
     ] {
         let (mode_report, parity) = run_single_mode(run_spec, config, shared).await?;
@@ -167,6 +193,7 @@ async fn run_matched_modes(
 }
 
 fn build_matched_differentials(
+    canonical_baseline: &ModeReport,
     unpublished_baseline: &ModeReport,
     published_baseline: &ModeReport,
     active_modes: &[ModeReport],
@@ -174,15 +201,20 @@ fn build_matched_differentials(
     active_modes
         .iter()
         .map(|candidate| {
-            let (baseline_label, baseline_catalog_published) =
-                if candidate.mode == WriterMode::IngestProjectorAndPublisher {
-                    ("published_quiescent_control", true)
-                } else {
-                    ("quiescent_control", false)
-                };
+            let (baseline_label, baseline_catalog_published, unpublished) = match candidate.mode {
+                WriterMode::IngestActive => {
+                    ("canonical_quiescent_control", false, canonical_baseline)
+                }
+                WriterMode::IngestAndProjector | WriterMode::QuiescentControl => {
+                    ("quiescent_control", false, unpublished_baseline)
+                }
+                WriterMode::IngestProjectorAndPublisher => {
+                    ("published_quiescent_control", true, unpublished_baseline)
+                }
+            };
             ModeDifferential::between(
                 DifferentialBaselines {
-                    unpublished: unpublished_baseline,
+                    unpublished,
                     published: published_baseline,
                     baseline_label,
                     baseline_catalog_published,
@@ -245,7 +277,16 @@ async fn bootstrap_mode_runtime(
     let boundary_height = next_segment_boundary(config, chain);
 
     if run_spec.mode == WriterMode::QuiescentControl {
-        pre_advance_quiescent_stores(&paths, config, chain, run_spec.publish_catalog).await?;
+        pre_advance_quiescent_stores(
+            &paths,
+            config,
+            chain,
+            QuiescentPreAdvance {
+                publish_catalog: run_spec.publish_catalog,
+                advance_wallet: run_spec.wallet_serving,
+            },
+        )
+        .await?;
     }
 
     let publisher_opt = if run_spec.mode == WriterMode::QuiescentControl && run_spec.publish_catalog
@@ -318,7 +359,7 @@ fn open_mode_serving(
     paths: &ModePaths,
 ) -> Result<(ModeServingHandle, ChainEpoch), BenchError> {
     let budget = reader_budget(config.io_mode);
-    if run_spec.mode.has_wallet_serving() {
+    if run_spec.wallet_serving {
         let publisher = TwoGenWalletPairPublisher::open(WalletPairOpenConfig {
             canonical_dir: &paths.canonical_dir,
             wallet_dir: &paths.wallet_dir,
@@ -419,6 +460,7 @@ async fn run_single_mode(
         &ParityProbeRequest {
             mode: run_spec.mode,
             label: run_spec.label,
+            wallet_serving: run_spec.wallet_serving,
             base_tip_height: config.base_blocks,
             final_tip_height: chain.final_tip_height.value(),
             segment_boundary_height: boot.boundary_height,
@@ -477,17 +519,14 @@ async fn run_mode_workload_with_source(
     let (served_tx, served_rx) = watch::channel(initial_served);
     let commit_instants = Arc::new(Mutex::new(BTreeMap::new()));
     let error_collector = Arc::new(Mutex::new(ErrorCollector::default()));
-    let quiescent_rotator = (inputs.run_spec.mode == WriterMode::QuiescentControl)
-        .then(|| match &inputs.boot.serving {
-            ModeServingHandle::WalletPair(wal) => Some(Arc::clone(wal)),
-            ModeServingHandle::CanonicalOnly(_) => None,
-        })
-        .flatten();
+    let quiescent_rotator =
+        (inputs.run_spec.mode == WriterMode::QuiescentControl).then(|| inputs.boot.serving.clone());
 
     let fleet_handle = spawn_reader_fleet(
         inputs.boot.channel.clone(),
         ReaderFleetContext {
             mode: inputs.run_spec.mode,
+            wallet_serving: inputs.run_spec.wallet_serving,
             trace: inputs.trace.clone(),
             sample_v5_tx: Arc::clone(&inputs.chain.sample_v5_tx),
             served_rx,
@@ -678,8 +717,8 @@ mod tests {
     use super::{
         ActiveWriterPublicationConfig, AdvancingChainSource, ChainSpecConfig,
         EncodedTailMetricSnapshot, GeneratedChain, ModeRunSpec, TemplateStores, WorkloadTrace,
-        WriterMode, bootstrap_mode_runtime, next_segment_boundary, run_mode_workload_with_source,
-        shutdown_mode_runtime, validate_config,
+        WriterMode, bootstrap_mode_runtime, build_matched_differentials, next_segment_boundary,
+        run_mode_workload_with_source, shutdown_mode_runtime, validate_config,
     };
 
     #[test]
@@ -692,6 +731,102 @@ mod tests {
             ..ActiveWriterPublicationConfig::default()
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_tail_probe_blocks_below_two() {
+        for width in [0, 1] {
+            let config = ActiveWriterPublicationConfig {
+                base_blocks: 60,
+                live_blocks: 12,
+                reorg_window_blocks: 4,
+                segment_blocks: NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+                tail_probe_blocks: width,
+                ..ActiveWriterPublicationConfig::default()
+            };
+            assert!(validate_config(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn build_matched_differentials_pairs_ingest_active_with_canonical_quiescent_control()
+    -> Result<(), Box<dyn Error>> {
+        let report_template: super::ActiveWriterPublicationReport =
+            serde_json::from_str(&serde_json::to_string(&sample_report_fixture())?)?;
+        let diffs = build_matched_differentials(
+            &report_template.canonical_quiescent_control,
+            &report_template.modes[0],
+            &report_template.published_quiescent_control,
+            &report_template.modes[1..],
+        );
+        assert_eq!(diffs.len(), 3);
+        assert_eq!(diffs[0].mode, WriterMode::IngestActive);
+        assert_eq!(diffs[0].baseline_label, "canonical_quiescent_control");
+        assert!(!diffs[0].baseline_catalog_published);
+        assert_eq!(diffs[1].mode, WriterMode::IngestAndProjector);
+        assert_eq!(diffs[1].baseline_label, "quiescent_control");
+        assert_eq!(diffs[2].mode, WriterMode::IngestProjectorAndPublisher);
+        assert_eq!(diffs[2].baseline_label, "published_quiescent_control");
+        assert!(diffs[2].baseline_catalog_published);
+        Ok(())
+    }
+
+    fn sample_report_fixture() -> serde_json::Value {
+        let zero_lat =
+            serde_json::json!({ "samples": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0 });
+        let lat =
+            serde_json::json!({ "samples": 2, "p50": 4.0, "p95": 5.0, "max": 5.0, "mean": 4.0 });
+        let stream = serde_json::json!({ "first_frame_ms": lat, "completion_ms": lat, "frames_delivered": 2, "payload_bytes_delivered": 32 });
+        let zero_tick = serde_json::json!({ "wal_synced": 0, "wal_bytes": 0, "flush_write_bytes": 0, "compact_read_bytes": 0, "compact_write_bytes": 0, "bytes_read": 100, "bytes_written": 0, "block_cache_data_hit": 0, "block_cache_data_miss": 0, "stall_micros": 0 });
+        let tail = serde_json::json!({
+            "cold_after_advance": stream, "warm_repeat": stream,
+            "unpublished_cold_after_advance": stream, "unpublished_warm_repeat": stream,
+            "published_cold_after_advance": stream, "published_warm_repeat": stream,
+            "published_mismatched_span_pairs": 0, "peak_tail_response_bytes": 32,
+            "peak_encoded_tail_bytes": 32, "encoded_tail_byte_cap_evictions": 0,
+            "encoded_tail_byte_capped_fills": 0, "encoded_tail_cache_fills": 1,
+            "encoded_tail_cache_hits": 1, "encoded_tail_fallback_native": 0,
+            "encoded_tail_bypass": 0, "unpaired_tail_probes": 0, "byte_cap_exceeded": false
+        });
+        let arm = |mode: WriterMode, wallet: bool| {
+            let wal = if wallet { &lat } else { &zero_lat };
+            serde_json::json!({
+                "mode": mode, "workload_duration_ms": 10.0,
+                "io_modes": { "canonical_primary": None::<&str>, "canonical_secondaries": ["buffered"], "wallet_primary": None::<&str>, "wallet_secondaries": if wallet { vec!["buffered"] } else { vec![] }, "projector_secondary": None::<&str>, "publisher_secondary": None::<&str> },
+                "ingest": { "live_prepare_ms": zero_lat, "live_commit_ms": zero_lat, "blocks_committed": 0 },
+                "latest_block_rpc_ms": lat, "commit_to_served_tip_ms": zero_lat,
+                "catalog_range": stream, "catalog_range_unpublished": stream, "catalog_range_published": stream, "catalog_range_during_seal": stream,
+                "tail_refill": tail, "slow_boundary_range": stream, "tree_state_ms": lat,
+                "wallet_rpc_ms": { "taddress_balance_ms": wal, "address_utxos_ms": wal, "get_transaction_ms": wal },
+                "mempool_churn": [], "projector": { "apply_ms": zero_lat, "transitions_applied": 0 },
+                "publisher": { "total_ms": 0.0, "segment_publish_ms": zero_lat, "segments_published": 0, "catalog_refreshes": 0 },
+                "writer_fsyncs": { "canonical_wal_synced": 0, "canonical_wal_bytes": 0, "wallet_wal_synced": 0, "wallet_wal_bytes": 0 },
+                "node_rpcs": { "tip_id": 0, "fetch_block_at": 0, "fetch_chain_segment": 0, "fetch_chain_checkpoint": 0, "fetch_subtree_roots": 0, "total": 0 },
+                "rocksdb_activity": { "canonical_writer": zero_tick, "reader_canonical_secondaries": zero_tick, "reader_wallet_secondaries": zero_tick, "wallet_writer": zero_tick, "projector_secondary": zero_tick, "publisher_secondary": zero_tick },
+                "errors": { "unexpected_grpc_errors": 0, "unexpected_error_samples": [], "transient_retry_count": 0 }
+            })
+        };
+        serde_json::json!({
+            "contract_identity": "active-writer-publication",
+            "report_format_version": 2,
+            "workload": {
+                "network": "zcash-regtest", "base_blocks": 60, "live_blocks": 4, "final_tip_height": 64,
+                "reorg_window_blocks": 4, "segment_blocks": 64, "crossed_segment_boundary_height": 64,
+                "sparse_block_count": 50, "dense_block_count": 14, "dense_orchard_actions_per_tx": 2,
+                "transparent_spend_txs": 4, "tail_probe_blocks": 24, "requested_io_mode": "buffered",
+                "publish_workers": 1, "mempool_churn_sizes": [50], "request_trace_digest": "aa"
+            },
+            "canonical_quiescent_control": arm(WriterMode::QuiescentControl, false),
+            "published_quiescent_control": arm(WriterMode::QuiescentControl, true),
+            "modes": [
+                arm(WriterMode::QuiescentControl, true),
+                arm(WriterMode::IngestActive, false),
+                arm(WriterMode::IngestAndProjector, true),
+                arm(WriterMode::IngestProjectorAndPublisher, true)
+            ],
+            "differentials_vs_quiescent": [],
+            "byte_parity": { "all_matched": true, "digests": [], "mismatches": [] }
+        })
     }
 
     #[test]
@@ -772,6 +907,7 @@ mod tests {
             mode: WriterMode::IngestProjectorAndPublisher,
             label: "ingest_projector_and_publisher",
             publish_catalog: true,
+            wallet_serving: true,
         };
         let mut boot = bootstrap_mode_runtime(run_spec, &config, &chain, &template).await?;
         let source = AdvancingChainSource::new(&chain, chain.base_tip_height)

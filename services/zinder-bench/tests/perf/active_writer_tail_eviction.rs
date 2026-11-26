@@ -38,14 +38,18 @@ async fn encoded_tail_evicts_at_64mib_and_triggers_rocksdb_flushes() -> Result<(
     report.validate(&config)?;
 
     assert!(report.byte_parity.all_matched);
-    let evicted = std::iter::once(&report.published_quiescent_control)
-        .chain(report.modes.iter())
-        .any(|arm| {
-            arm.tail_refill.encoded_tail_byte_cap_evictions > 0
-                && arm.tail_refill.byte_cap_exceeded
-                && arm.tail_refill.encoded_tail_byte_capped_fills > 0
-                && arm.tail_refill.peak_encoded_tail_bytes > 0
-        });
+    let evicted = [
+        &report.canonical_quiescent_control,
+        &report.published_quiescent_control,
+    ]
+    .into_iter()
+    .chain(report.modes.iter())
+    .any(|arm| {
+        arm.tail_refill.encoded_tail_byte_cap_evictions > 0
+            && arm.tail_refill.byte_cap_exceeded
+            && arm.tail_refill.encoded_tail_byte_capped_fills > 0
+            && arm.tail_refill.peak_encoded_tail_bytes > 0
+    });
     assert!(
         evicted,
         "expected >64 MiB EncodedTail eviction in at least one arm"

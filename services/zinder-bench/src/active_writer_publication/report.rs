@@ -162,6 +162,9 @@ pub struct ActiveWriterPublicationReport {
     pub report_format_version: u32,
     /// Chain and workload geometry used across all matched arms.
     pub workload: WorkloadGeometryReport,
+    /// Baseline canonical-only quiescent arm with 2 secondary generations and no
+    /// wallet serving or wallet RPC fleet (matched baseline for `ingest_active`).
+    pub canonical_quiescent_control: ModeReport,
     /// Baseline quiescent arm with signed catalog published through `crossed_segment_boundary_height`
     /// (matched baseline for `ingest_projector_and_publisher`).
     pub published_quiescent_control: ModeReport,
@@ -172,6 +175,12 @@ pub struct ActiveWriterPublicationReport {
     pub differentials_vs_quiescent: Vec<ModeDifferential>,
     /// Byte-level reply parity comparison across all arms at the final tip.
     pub byte_parity: ByteParityReport,
+}
+
+#[derive(Clone, Copy)]
+struct ModeValidationExpectations {
+    published_catalog: bool,
+    wallet_serving: bool,
 }
 
 impl ActiveWriterPublicationReport {
@@ -208,22 +217,44 @@ impl ActiveWriterPublicationReport {
             ));
         }
 
-        validate_single_mode(&self.published_quiescent_control, true, config)?;
+        validate_single_mode(
+            &self.canonical_quiescent_control,
+            ModeValidationExpectations {
+                published_catalog: false,
+                wallet_serving: false,
+            },
+            config,
+        )?;
+        validate_single_mode(
+            &self.published_quiescent_control,
+            ModeValidationExpectations {
+                published_catalog: true,
+                wallet_serving: true,
+            },
+            config,
+        )?;
         for mode_report in &self.modes {
             validate_single_mode(
                 mode_report,
-                mode_report.mode == WriterMode::IngestProjectorAndPublisher,
+                ModeValidationExpectations {
+                    published_catalog: mode_report.mode == WriterMode::IngestProjectorAndPublisher,
+                    wallet_serving: mode_report.mode.has_wallet_serving(),
+                },
                 config,
             )?;
         }
 
         if config.require_tail_eviction {
-            let evicted = std::iter::once(&self.published_quiescent_control)
-                .chain(self.modes.iter())
-                .any(|report| {
-                    report.tail_refill.encoded_tail_byte_cap_evictions > 0
-                        && report.tail_refill.byte_cap_exceeded
-                });
+            let evicted = [
+                &self.canonical_quiescent_control,
+                &self.published_quiescent_control,
+            ]
+            .into_iter()
+            .chain(self.modes.iter())
+            .any(|report| {
+                report.tail_refill.encoded_tail_byte_cap_evictions > 0
+                    && report.tail_refill.byte_cap_exceeded
+            });
             if !evicted {
                 return Err(BenchError::acceptance_hard_limit_missed(
                     "encoded_tail_64mib_eviction_not_observed",
@@ -236,7 +267,7 @@ impl ActiveWriterPublicationReport {
 
 fn validate_single_mode(
     report: &ModeReport,
-    expect_published_catalog: bool,
+    expectations: ModeValidationExpectations,
     config: &ActiveWriterPublicationConfig,
 ) -> Result<(), BenchError> {
     if report.errors.unexpected_grpc_errors > 0 {
@@ -261,19 +292,30 @@ fn validate_single_mode(
             report.mode.as_str()
         )));
     }
-    if expect_published_catalog && report.catalog_range_published.completion_ms.samples == 0 {
+    if expectations.published_catalog && report.catalog_range_published.completion_ms.samples == 0 {
         return Err(BenchError::acceptance_telemetry_missing(format!(
             "{} missing published catalog samples",
             report.mode.as_str()
         )));
     }
-    if report.mode.has_wallet_serving()
-        && (report.wallet_rpc_ms.taddress_balance_ms.samples == 0
+    if expectations.wallet_serving {
+        if report.wallet_rpc_ms.taddress_balance_ms.samples == 0
             || report.wallet_rpc_ms.address_utxos_ms.samples == 0
-            || report.wallet_rpc_ms.get_transaction_ms.samples == 0)
+            || report.wallet_rpc_ms.get_transaction_ms.samples == 0
+            || report.io_modes.wallet_secondaries.is_empty()
+        {
+            return Err(BenchError::acceptance_telemetry_missing(format!(
+                "{} missing wallet projection RPC samples or wallet secondaries",
+                report.mode.as_str()
+            )));
+        }
+    } else if report.wallet_rpc_ms.taddress_balance_ms.samples > 0
+        || report.wallet_rpc_ms.address_utxos_ms.samples > 0
+        || report.wallet_rpc_ms.get_transaction_ms.samples > 0
+        || !report.io_modes.wallet_secondaries.is_empty()
     {
-        return Err(BenchError::acceptance_telemetry_missing(format!(
-            "{} missing wallet projection RPC samples",
+        return Err(BenchError::acceptance_completion_mismatch(format!(
+            "{} unexpectedly reported wallet serving activity on a canonical-only arm",
             report.mode.as_str()
         )));
     }
@@ -585,9 +627,9 @@ pub struct NodeRpcCounts {
 pub struct RocksDbActivityReport {
     /// Canonical writer store activity during live commits.
     pub canonical_writer: StoreTickerDelta,
-    /// Serving canonical secondaries activity during the reader run (across both generations).
+    /// Serving canonical secondaries activity during the reader run (deduplicated from shared pool statistics).
     pub reader_canonical_secondaries: StoreTickerDelta,
-    /// Serving wallet secondaries activity during the reader run (across both generations).
+    /// Serving wallet secondaries activity during the reader run (deduplicated from shared pool statistics).
     pub reader_wallet_secondaries: StoreTickerDelta,
     /// Wallet writer store activity during projector transitions.
     pub wallet_writer: StoreTickerDelta,
@@ -659,11 +701,12 @@ pub struct ModeReport {
 /// Matched quiescent baseline pair passed to [`ModeDifferential::between`].
 #[derive(Clone, Copy, Debug)]
 pub struct DifferentialBaselines<'a> {
-    /// Unpublished `quiescent_control` report (canonical storage baseline).
+    /// Unpublished control report (`"canonical_quiescent_control"` for canonical-only
+    /// `ingest_active`, or `"quiescent_control"` for wallet-serving arms).
     pub unpublished: &'a ModeReport,
     /// Published `published_quiescent_control` report (signed catalog baseline).
     pub published: &'a ModeReport,
-    /// Matched baseline label (`"quiescent_control"` or `"published_quiescent_control"`).
+    /// Matched baseline label (`"canonical_quiescent_control"`, `"quiescent_control"`, or `"published_quiescent_control"`).
     pub baseline_label: &'a str,
     /// Whether the candidate's primary comparison uses the published catalog baseline.
     pub baseline_catalog_published: bool,
@@ -674,7 +717,8 @@ pub struct DifferentialBaselines<'a> {
 pub struct ModeDifferential {
     /// Active writer mode being compared.
     pub mode: WriterMode,
-    /// Matched quiescent baseline identifier (`"quiescent_control"` or `"published_quiescent_control"`).
+    /// Matched quiescent baseline identifier (`"canonical_quiescent_control"`,
+    /// `"quiescent_control"`, or `"published_quiescent_control"`).
     pub baseline_label: String,
     /// Whether the matched quiescent baseline held a published signed catalog.
     pub baseline_catalog_published: bool,
@@ -1027,7 +1071,9 @@ impl ByteParityReport {
                 &candidate.tree_states_sha256,
                 &mut mismatches,
             );
-            if candidate.mode.has_wallet_serving() {
+            if candidate.mode.has_wallet_serving()
+                && candidate.label != "canonical_quiescent_control"
+            {
                 check_optional_surface(
                     candidate,
                     "wallet_taddress_balance",
@@ -1176,12 +1222,28 @@ mod tests {
         pub_cat_p50: f64,
         bytes_read: u64,
     ) -> Result<ModeReport, Box<dyn Error>> {
+        blank_mode_report_with_wallet(
+            mode,
+            mode.has_wallet_serving(),
+            unpub_cat_p50,
+            pub_cat_p50,
+            bytes_read,
+        )
+    }
+
+    fn blank_mode_report_with_wallet(
+        mode: WriterMode,
+        wallet_serving: bool,
+        unpub_cat_p50: f64,
+        pub_cat_p50: f64,
+        bytes_read: u64,
+    ) -> Result<ModeReport, Box<dyn Error>> {
         let zero_lat =
             serde_json::json!({ "samples": 0, "p50": 0.0, "p95": 0.0, "max": 0.0, "mean": 0.0 });
         let sample_lat =
             serde_json::json!({ "samples": 4, "p50": 1.0, "p95": 1.5, "max": 2.0, "mean": 1.1 });
         let zero_ticker = serde_json::json!({ "wal_synced": 0, "wal_bytes": 0, "flush_write_bytes": 0, "compact_read_bytes": 0, "compact_write_bytes": 0, "bytes_read": 0, "bytes_written": 0, "block_cache_data_hit": 0, "block_cache_data_miss": 0, "stall_micros": 0 });
-        let wallet_lat = if mode.has_wallet_serving() {
+        let wallet_lat = if wallet_serving {
             &sample_lat
         } else {
             &zero_lat
@@ -1192,14 +1254,24 @@ mod tests {
             mode,
             WriterMode::IngestAndProjector | WriterMode::IngestProjectorAndPublisher
         );
+        let can_secondaries = if wallet_serving {
+            vec!["buffered", "buffered", "buffered", "buffered"]
+        } else {
+            vec!["buffered", "buffered"]
+        };
+        let wal_secondaries = if wallet_serving {
+            vec!["buffered", "buffered", "buffered", "buffered"]
+        } else {
+            Vec::new()
+        };
         let base = serde_json::json!({
             "mode": mode,
             "workload_duration_ms": 100.0,
             "io_modes": {
                 "canonical_primary": if is_active { Some("buffered") } else { None::<&str> },
-                "canonical_secondaries": ["buffered"],
+                "canonical_secondaries": can_secondaries,
                 "wallet_primary": if has_projector { Some("buffered") } else { None::<&str> },
-                "wallet_secondaries": if mode.has_wallet_serving() { vec!["buffered"] } else { vec![] },
+                "wallet_secondaries": wal_secondaries,
                 "projector_secondary": if has_projector { Some("buffered") } else { None::<&str> },
                 "publisher_secondary": if mode == WriterMode::IngestProjectorAndPublisher { Some("buffered") } else { None::<&str> }
             },
@@ -1345,7 +1417,18 @@ mod tests {
             wallet_transactions_sha256: None,
             ..oracle.clone()
         };
-        assert!(ByteParityReport::evaluate(vec![oracle.clone(), ingest_only]).all_matched);
+        let canonical_only = ModeParityDigests {
+            mode: WriterMode::QuiescentControl,
+            label: "canonical_quiescent_control".to_owned(),
+            wallet_taddress_balance_sha256: None,
+            wallet_address_utxos_sha256: None,
+            wallet_transactions_sha256: None,
+            ..oracle.clone()
+        };
+        assert!(
+            ByteParityReport::evaluate(vec![oracle.clone(), canonical_only, ingest_only])
+                .all_matched
+        );
 
         let broken_wallet = ModeParityDigests {
             mode: WriterMode::IngestAndProjector,
@@ -1393,6 +1476,13 @@ mod tests {
                 mempool_churn_sizes: vec![50],
                 request_trace_digest: "deadbeef".to_owned(),
             },
+            canonical_quiescent_control: blank_mode_report_with_wallet(
+                WriterMode::QuiescentControl,
+                false,
+                1.0,
+                0.0,
+                10,
+            )?,
             published_quiescent_control: blank_mode_report(
                 WriterMode::QuiescentControl,
                 1.0,

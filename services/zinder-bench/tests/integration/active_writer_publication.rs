@@ -8,8 +8,8 @@ use std::{num::NonZeroU32, time::Duration};
 use eyre::Result;
 use zinder_bench::active_writer_publication::{
     ACTIVE_WRITER_PUBLICATION_CONTRACT, ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION,
-    ActiveWriterPublicationConfig, ByteParityReport, ModeDifferential, ModeReport, WriterMode,
-    run_active_writer_publication, validate_config,
+    ActiveWriterPublicationConfig, ActiveWriterPublicationReport, ByteParityReport,
+    ModeDifferential, ModeReport, WriterMode, run_active_writer_publication, validate_config,
 };
 use zinder_store::RocksDbIoMode;
 
@@ -48,8 +48,32 @@ async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary
 
     assert_wallet_enabled_parity(&report.byte_parity);
     assert_differential_baselines(&report.differentials_vs_quiescent);
+    assert_4096_boundary_baselines_and_modes(&report, &config)
+}
 
-    assert_mode_report_invariants(&report.published_quiescent_control, &config, None)?;
+fn assert_4096_boundary_baselines_and_modes(
+    report: &ActiveWriterPublicationReport,
+    config: &ActiveWriterPublicationConfig,
+) -> Result<()> {
+    assert_mode_report_invariants(&report.canonical_quiescent_control, config, None, false)?;
+    assert!(
+        report
+            .canonical_quiescent_control
+            .io_modes
+            .publisher_secondary
+            .is_none()
+    );
+    assert!(
+        report
+            .canonical_quiescent_control
+            .tail_refill
+            .unpublished_cold_after_advance
+            .completion_ms
+            .samples
+            > 0
+    );
+
+    assert_mode_report_invariants(&report.published_quiescent_control, config, None, true)?;
     assert!(
         report
             .published_quiescent_control
@@ -76,7 +100,12 @@ async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary
     );
     assert_eq!(report.modes.len(), 4);
     for mode_report in &report.modes {
-        assert_mode_report_invariants(mode_report, &config, None)?;
+        assert_mode_report_invariants(
+            mode_report,
+            config,
+            None,
+            mode_report.mode.has_wallet_serving(),
+        )?;
         if mode_report.mode == WriterMode::QuiescentControl {
             assert!(
                 mode_report
@@ -127,9 +156,25 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
     assert_differential_baselines(&report.differentials_vs_quiescent);
 
     assert_mode_report_invariants(
+        &report.canonical_quiescent_control,
+        &config,
+        Some("buffered"),
+        false,
+    )?;
+    assert!(
+        report
+            .canonical_quiescent_control
+            .tail_refill
+            .unpublished_cold_after_advance
+            .completion_ms
+            .samples
+            > 0
+    );
+    assert_mode_report_invariants(
         &report.published_quiescent_control,
         &config,
         Some("buffered"),
+        true,
     )?;
     assert!(
         report
@@ -141,7 +186,12 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
             > 0
     );
     for mode_report in &report.modes {
-        assert_mode_report_invariants(mode_report, &config, Some("buffered"))?;
+        assert_mode_report_invariants(
+            mode_report,
+            &config,
+            Some("buffered"),
+            mode_report.mode.has_wallet_serving(),
+        )?;
         if mode_report.mode == WriterMode::QuiescentControl {
             assert!(
                 mode_report
@@ -166,17 +216,19 @@ fn assert_wallet_enabled_parity(byte_parity: &ByteParityReport) {
         byte_parity.mismatches,
         [] as [zinder_bench::active_writer_publication::ParityMismatch; 0]
     );
-    assert_eq!(byte_parity.digests.len(), 5);
+    assert_eq!(byte_parity.digests.len(), 6);
 
     let wallet_armed_count = byte_parity
         .digests
         .iter()
-        .filter(|digest| digest.mode.has_wallet_serving())
+        .filter(|digest| digest.wallet_taddress_balance_sha256.is_some())
         .count();
     assert_eq!(wallet_armed_count, 4);
 
     for digest in &byte_parity.digests {
-        if digest.mode.has_wallet_serving() {
+        let expect_wallet =
+            digest.mode.has_wallet_serving() && digest.label != "canonical_quiescent_control";
+        if expect_wallet {
             assert!(digest.wallet_taddress_balance_sha256.is_some());
             assert!(digest.wallet_address_utxos_sha256.is_some());
             assert!(digest.wallet_transactions_sha256.is_some());
@@ -204,7 +256,11 @@ fn assert_differential_baselines(differentials: &[ModeDifferential]) {
             assert!(diff.wallet_get_transaction_p50_delta_ms.is_none());
         }
         match diff.mode {
-            WriterMode::IngestActive | WriterMode::IngestAndProjector => {
+            WriterMode::IngestActive => {
+                assert_eq!(diff.baseline_label, "canonical_quiescent_control");
+                assert!(!diff.baseline_catalog_published);
+            }
+            WriterMode::IngestAndProjector => {
                 assert_eq!(diff.baseline_label, "quiescent_control");
                 assert!(!diff.baseline_catalog_published);
             }
@@ -217,14 +273,14 @@ fn assert_differential_baselines(differentials: &[ModeDifferential]) {
     }
 }
 
-fn assert_mode_io_and_wallet_invariants(mode_report: &ModeReport, expected_io_mode: Option<&str>) {
+fn assert_mode_io_and_wallet_invariants(
+    mode_report: &ModeReport,
+    expected_io_mode: Option<&str>,
+    expect_wallet_serving: bool,
+) {
     assert_eq!(
         mode_report.io_modes.canonical_secondaries.len(),
-        if mode_report.mode.has_wallet_serving() {
-            4
-        } else {
-            2
-        }
+        if expect_wallet_serving { 4 } else { 2 }
     );
     if let Some(expected) = expected_io_mode {
         for mode in &mode_report.io_modes.canonical_secondaries {
@@ -243,7 +299,7 @@ fn assert_mode_io_and_wallet_invariants(mode_report: &ModeReport, expected_io_mo
             assert_eq!(publisher_sec, expected);
         }
     }
-    if mode_report.mode.has_wallet_serving() {
+    if expect_wallet_serving {
         assert_eq!(mode_report.io_modes.wallet_secondaries.len(), 4);
         assert!(mode_report.wallet_rpc_ms.taddress_balance_ms.samples > 0);
         assert!(mode_report.wallet_rpc_ms.address_utxos_ms.samples > 0);
@@ -260,6 +316,7 @@ fn assert_mode_report_invariants(
     mode_report: &ModeReport,
     config: &ActiveWriterPublicationConfig,
     expected_io_mode: Option<&str>,
+    expect_wallet_serving: bool,
 ) -> Result<()> {
     assert!(mode_report.workload_duration_ms > 0.0);
     assert_eq!(mode_report.errors.unexpected_grpc_errors, 0);
@@ -278,7 +335,7 @@ fn assert_mode_report_invariants(
     assert!(mode_report.tail_refill.warm_repeat.completion_ms.samples > 0);
     assert!(mode_report.tail_refill.encoded_tail_cache_fills > 0);
     assert!(mode_report.tail_refill.encoded_tail_cache_hits > 0);
-    assert_mode_io_and_wallet_invariants(mode_report, expected_io_mode);
+    assert_mode_io_and_wallet_invariants(mode_report, expected_io_mode, expect_wallet_serving);
 
     assert_eq!(
         mode_report.mempool_churn.len(),

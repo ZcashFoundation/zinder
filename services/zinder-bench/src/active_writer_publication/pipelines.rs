@@ -141,6 +141,16 @@ impl ModeServingHandle {
         }
     }
 
+    pub(crate) async fn rotate_generation_for_cold_tail(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<(u32, zinder_core::ChainEpoch, u64), BenchError> {
+        match self {
+            Self::CanonicalOnly(pub_ref) => pub_ref.rotate_generation_for_cold_tail(cancel).await,
+            Self::WalletPair(pub_ref) => pub_ref.rotate_generation_for_cold_tail(cancel).await,
+        }
+    }
+
     pub(crate) fn snapshot_and_reset_tickers(&self) -> (StoreTickerDelta, StoreTickerDelta) {
         match self {
             Self::CanonicalOnly(pub_ref) => (
@@ -268,13 +278,20 @@ fn write_ephemeral_signing_keys(priv_path: &Path, pub_path: &Path) -> Result<(),
     Ok(())
 }
 
-/// Pre-advances closed canonical and wallet stores (and optional catalog) for
-/// quiescent controls.
+/// Controls optional wallet replay and catalog sealing during quiescent baseline setup.
+#[derive(Clone, Copy)]
+pub(crate) struct QuiescentPreAdvance {
+    pub(crate) publish_catalog: bool,
+    pub(crate) advance_wallet: bool,
+}
+
+/// Pre-advances closed canonical and optional wallet stores (and optional catalog)
+/// for quiescent controls.
 pub(crate) async fn pre_advance_quiescent_stores(
     paths: &ModePaths,
     config: &ActiveWriterPublicationConfig,
     chain: &GeneratedChain,
-    publish_catalog: bool,
+    opts: QuiescentPreAdvance,
 ) -> Result<(), BenchError> {
     let reorg_policy = CanonicalReorgPolicy::new(chain.reorg_window_blocks)?;
     let source = AdvancingChainSource::new(chain, chain.final_tip_height);
@@ -304,6 +321,10 @@ pub(crate) async fn pre_advance_quiescent_stores(
     let canonical = follow_canonical_tip(canonical, follower).await?;
     drop(canonical);
 
+    if !opts.advance_wallet && !opts.publish_catalog {
+        return Ok(());
+    }
+
     let mut secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
         &paths.canonical_dir,
         &paths.publisher_sec_dir,
@@ -312,6 +333,25 @@ pub(crate) async fn pre_advance_quiescent_stores(
         reorg_policy,
         reader_budget(config.io_mode),
     )?;
+    if opts.advance_wallet {
+        advance_quiescent_wallet(paths, config, chain, reorg_policy, &mut secondary)?;
+    }
+
+    if opts.publish_catalog {
+        publish_quiescent_catalog(paths, config, secondary)?;
+    } else {
+        drop(secondary);
+    }
+    Ok(())
+}
+
+fn advance_quiescent_wallet(
+    paths: &ModePaths,
+    config: &ActiveWriterPublicationConfig,
+    chain: &GeneratedChain,
+    reorg_policy: CanonicalReorgPolicy,
+    secondary: &mut RocksDbCanonicalSecondary,
+) -> Result<(), BenchError> {
     let mut wallet = RocksDbWalletStore::open_ready_for_following(
         &paths.wallet_dir,
         chain.network,
@@ -322,7 +362,7 @@ pub(crate) async fn pre_advance_quiescent_stores(
     let mut unused_durations = Vec::new();
     let mut unused_transitions = 0_u32;
     while drain_projector_events(
-        &mut secondary,
+        secondary,
         &mut wallet,
         &mut unused_durations,
         &mut unused_transitions,
@@ -340,12 +380,6 @@ pub(crate) async fn pre_advance_quiescent_stores(
         )));
     }
     drop(wallet);
-
-    if publish_catalog {
-        publish_quiescent_catalog(paths, config, secondary)?;
-    } else {
-        drop(secondary);
-    }
     Ok(())
 }
 

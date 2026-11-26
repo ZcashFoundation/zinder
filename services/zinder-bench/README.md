@@ -1484,18 +1484,21 @@ Key command flags:
 
 - `--scratch-dir <PATH>`: optional parent directory for per-arm RocksDB stores (defaults to the system temporary directory).
 - `--io-mode <direct|buffered>`: requests `RocksDbIoMode::Direct` (with buffered fallback if the filesystem rejects direct I/O) or forces `Buffered` (default `direct`).
-- `--tail-probe-blocks <N>`: width in blocks of descending uncovered-tail `GetBlockRange(tip, floor)` probes (default `24`).
+- `--tail-probe-blocks <N>`: width in blocks (`>= 2`) of descending uncovered-tail `GetBlockRange(tip, floor)` probes (default `24`).
 - `--dense-orchard-actions-per-tx <N>`: Orchard actions synthesized per dense shielded transaction (default `2`).
 - `--publish-workers <N>`: worker count passed to `ShieldedHistoryPublisher::publish_available` (defaults to production clamping `1..=4`).
 - `--require-tail-eviction`: enforces that `report.validate(&config)` rejects any run that does not trigger `EncodedTail` `64 MiB` byte-cap evictions (`--report` is still written before returning failure when validation fails, and existing `--report` paths are rejected up front).
 
 The four matched modes are `quiescent_control`, `ingest_active`,
-`ingest_and_projector`, and `ingest_projector_and_publisher` (plus
-`published_quiescent_control` with a sealed signed catalog covering the settled
-boundary as the matched baseline for `ingest_projector_and_publisher`). Wallet
-serving arms drive 4 bounded canonical/wallet secondary generations with retained
-epoch-pin lookup (`SwappableWalletQuery`, matching `WalletServingPairPublisher`),
-and canonical-only `ingest_active` drives 2 canonical secondary generations. All
+`ingest_and_projector`, and `ingest_projector_and_publisher`, paired with
+`canonical_quiescent_control` (2 canonical secondary generations, canonical-only
+adapter, no wallet RPC reader — matched baseline for `ingest_active`) and
+`published_quiescent_control` (sealed signed catalog covering the settled boundary
+— matched baseline for `ingest_projector_and_publisher`). Wallet serving arms
+drive 4 bounded canonical/wallet secondary generations with retained epoch-pin
+lookup (`SwappableWalletQuery`, matching `WalletServingPairPublisher`), and
+canonical-only `canonical_quiescent_control` and `ingest_active` drive 2
+canonical secondary generations. All
 arms share a deterministic `WorkloadTrace` (`request_trace_digest`) plus unified Prometheus
 scraping (`zinder_compat_encoded_tail_*` fills, hits, fallback_native, bypass,
 byte_capped_fills, byte_cap_evictions, peak retained bytes) and request-scoped
@@ -1505,7 +1508,7 @@ byte_capped_fills, byte_cap_evictions, peak retained bytes) and request-scoped
 streams, descending uncovered-tail cold/warm probes (split across `unpublished_*` and
 span-matched `published_*` coverage), mempool churn (`writer_overlap_verified`),
 ingest prepare/commit histograms, writer WAL fsyncs, `NodeSource` RPC counts,
-per-role RocksDB tickers (`canonical_writer`, `reader_canonical_secondaries`,
+single shared-pool deduplicated RocksDB tickers (`canonical_writer`, `reader_canonical_secondaries`,
 `reader_wallet_secondaries`, `wallet_writer`, `projector_secondary`, `publisher_secondary`),
 stage differentials (`ModeDifferential`), and final-tip raw wire-byte SHA-256 parity
 validated by `ActiveWriterPublicationReport::validate(&config)`.

@@ -31,6 +31,7 @@ const GET_TRANSACTION_PATH: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/Get
 pub(crate) struct ParityProbeRequest<'a> {
     pub(crate) mode: WriterMode,
     pub(crate) label: &'a str,
+    pub(crate) wallet_serving: bool,
     pub(crate) base_tip_height: u32,
     pub(crate) final_tip_height: u32,
     pub(crate) segment_boundary_height: u32,
@@ -118,7 +119,7 @@ pub(crate) async fn collect_final_tip_parity(
     .await?;
 
     let (wallet_taddress_balance_sha256, wallet_address_utxos_sha256, wallet_transactions_sha256) =
-        if req.mode.has_wallet_serving() {
+        if req.wallet_serving {
             let balance_sha = hash_taddress_balances(&mut grpc, req.wallet_addresses).await?;
             let utxos_sha = hash_address_utxos(&mut grpc, req.wallet_addresses).await?;
             let txs_sha = hash_transactions(&mut grpc, req.probe_txids).await?;
