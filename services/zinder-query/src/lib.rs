@@ -85,7 +85,9 @@ pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
 pub use node_broadcast::OrderedBroadcaster;
-pub use ordered_transactions::{PendingTransaction, TransactionsInOrder};
+pub use ordered_transactions::{
+    CanonicalRefill, CompletedCanonicalRefill, PendingTransaction, TransactionsInOrder,
+};
 pub use rocksdb_serving_readers::MinedTransactionDigest;
 pub use rocksdb_serving_readers::{RocksDbCanonicalReader, RocksDbWalletReader};
 pub use serving_readers::{
@@ -353,11 +355,12 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// independent [`PendingTransaction`] futures charged to
     /// [`ForwardedReadKind::History`].
     ///
-    /// The default implementation starts [`Self::transaction`] futures on
-    /// demand as the caller polls [`TransactionsInOrder::next_batch`], so it
-    /// never materializes more transaction bodies than the caller's batch
-    /// capacity. An implementation that wraps another should forward this
-    /// method to keep batched canonical reads active.
+    /// The default implementation resolves the current visible epoch once when
+    /// `at_epoch_id` is `None` and starts [`Self::transaction`] futures pinned
+    /// to that single epoch on demand as the caller polls
+    /// [`TransactionsInOrder`], never materializing more transaction bodies than
+    /// the caller's batch capacity. An implementation that wraps another should
+    /// forward this method to keep batched canonical reads active.
     async fn transactions_in_order(
         &self,
         transaction_ids: Vec<TransactionId>,
@@ -366,10 +369,14 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     where
         Self: Sized + Clone,
     {
+        let resolved_epoch_id = match at_epoch_id {
+            Some(epoch_id) => epoch_id,
+            None => self.visible_tip_block(None).await?.chain_epoch.id,
+        };
         Ok(TransactionsInOrder::from_lazy_query(
             self.clone(),
             transaction_ids,
-            at_epoch_id,
+            resolved_epoch_id,
         ))
     }
 

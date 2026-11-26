@@ -1484,6 +1484,12 @@ struct TransparentHistory<QueryApi> {
 
 type HistoryPermit = tokio::sync::mpsc::OwnedPermit<Result<lightwalletd::RawTransaction, Status>>;
 
+struct HistoryPipeline {
+    in_flight: futures_util::stream::FuturesOrdered<PendingHistoryRow>,
+    refill: Option<zinder_query::CanonicalRefill>,
+    permits: Vec<HistoryPermit>,
+}
+
 struct PendingHistoryRow {
     permit: Option<HistoryPermit>,
     pending: PendingTransaction,
@@ -1581,29 +1587,34 @@ where
         &mut self,
         messages: tokio::sync::mpsc::Sender<Result<lightwalletd::RawTransaction, Status>>,
     ) {
-        let mut in_flight = futures_util::stream::FuturesOrdered::new();
-        let mut held_permit: Option<HistoryPermit> = None;
+        let mut pipeline = HistoryPipeline {
+            in_flight: futures_util::stream::FuturesOrdered::new(),
+            refill: None,
+            permits: Vec::with_capacity(TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY),
+        };
         loop {
-            if !self
-                .enqueue_available(&messages, &mut held_permit, &mut in_flight)
-                .await
+            let window_cap = self.max_window();
+            self.fill_window(&messages, window_cap, &mut pipeline);
+            if pipeline.in_flight.is_empty()
+                && pipeline.refill.is_none()
+                && !self.transactions.has_remaining()
             {
-                return;
-            }
-            if in_flight.is_empty() && !self.transactions.has_remaining() {
                 if !self.has_later_pages {
                     return;
                 }
-                if !self.advance_page(&messages, &mut held_permit).await {
+                if !self.advance_page(&messages, &mut pipeline.permits).await {
                     return;
                 }
                 continue;
             }
-            let can_reserve = self.transactions.has_remaining() && held_permit.is_none();
+            let need_permit = pipeline.in_flight.len() + pipeline.permits.len() < window_cap
+                && pipeline.permits.is_empty()
+                && (self.transactions.can_take_ready()
+                    || (pipeline.refill.is_none() && self.transactions.needs_refill()));
             tokio::select! {
                 biased;
                 () = messages.closed() => return,
-                completed = in_flight.next(), if !in_flight.is_empty() => {
+                completed = pipeline.in_flight.next(), if !pipeline.in_flight.is_empty() => {
                     if let Some((permit, message)) = completed {
                         let is_terminal = message.is_err();
                         permit.send(message);
@@ -1612,58 +1623,70 @@ where
                         }
                     }
                 }
-                reserved = messages.clone().reserve_owned(), if can_reserve => {
+                completed_refill = poll_optional_refill(&mut pipeline.refill), if pipeline.refill.is_some() => {
+                    self.transactions.apply_refill(completed_refill);
+                }
+                reserved = messages.clone().reserve_owned(), if need_permit => {
                     let Ok(permit) = reserved else {
                         return;
                     };
-                    held_permit = Some(permit);
+                    pipeline.permits.push(permit);
                 }
             }
         }
     }
 
-    async fn enqueue_available(
+    fn max_window(&self) -> usize {
+        if !self.transactions.has_remaining() {
+            return 0;
+        }
+        self.transactions
+            .max_in_flight()
+            .clamp(1, TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY)
+    }
+
+    fn fill_window(
         &mut self,
         messages: &tokio::sync::mpsc::Sender<Result<lightwalletd::RawTransaction, Status>>,
-        held_permit: &mut Option<HistoryPermit>,
-        in_flight: &mut futures_util::stream::FuturesOrdered<PendingHistoryRow>,
-    ) -> bool {
-        while self.transactions.has_remaining() {
-            let mut permits = Vec::with_capacity(TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY);
-            if let Some(permit) = held_permit.take() {
-                permits.push(permit);
+        window_cap: usize,
+        pipeline: &mut HistoryPipeline,
+    ) {
+        while pipeline.in_flight.len() < window_cap && self.transactions.has_remaining() {
+            while pipeline.in_flight.len() + pipeline.permits.len() < window_cap {
+                let Ok(permit) = messages.clone().try_reserve_owned() else {
+                    break;
+                };
+                pipeline.permits.push(permit);
             }
-            while let Ok(permit) = messages.clone().try_reserve_owned() {
-                permits.push(permit);
-            }
-            if permits.is_empty() {
+            if pipeline.permits.is_empty() {
                 break;
             }
-            let pending_batch = tokio::select! {
-                biased;
-                () = messages.closed() => return false,
-                batch = self.transactions.next_batch(permits.len()) => batch,
-            };
-            let started = pending_batch.len();
-            for (permit, pending) in permits.drain(..started).zip(pending_batch) {
-                in_flight.push_back(PendingHistoryRow::new(permit, pending));
+            let ready = self.transactions.take_ready(pipeline.permits.len());
+            if !ready.is_empty() {
+                let started = ready.len();
+                for (permit, pending) in pipeline.permits.drain(..started).zip(ready) {
+                    pipeline
+                        .in_flight
+                        .push_back(PendingHistoryRow::new(permit, pending));
+                }
+                continue;
             }
-            if self.has_later_pages && held_permit.is_none() {
-                *held_permit = permits.pop();
+            if pipeline.refill.is_none() && self.transactions.needs_refill() {
+                pipeline.refill = self.transactions.start_refill(pipeline.permits.len());
             }
-            if started == 0 {
-                break;
-            }
+            break;
         }
-        true
+        if !self.transactions.has_remaining() {
+            pipeline.permits.truncate(usize::from(self.has_later_pages));
+        }
     }
 
     async fn advance_page(
         &mut self,
         messages: &tokio::sync::mpsc::Sender<Result<lightwalletd::RawTransaction, Status>>,
-        held_permit: &mut Option<HistoryPermit>,
+        permits: &mut Vec<HistoryPermit>,
     ) -> bool {
-        let permit = if let Some(permit) = held_permit.take() {
+        let permit = if let Some(permit) = permits.pop() {
             permit
         } else {
             let Ok(permit) = messages.clone().reserve_owned().await else {
@@ -1678,7 +1701,7 @@ where
         };
         match page_outcome {
             Ok(()) => {
-                *held_permit = Some(permit);
+                permits.push(permit);
                 true
             }
             Err(status) => {
@@ -1688,6 +1711,17 @@ where
             }
         }
     }
+}
+
+async fn poll_optional_refill(
+    refill: &mut Option<zinder_query::CanonicalRefill>,
+) -> zinder_query::CompletedCanonicalRefill {
+    let Some(active) = refill.as_mut() else {
+        return std::future::pending().await;
+    };
+    let completed = active.await;
+    *refill = None;
+    completed
 }
 
 trait SubtreeRootReads: Send + Sync + 'static {

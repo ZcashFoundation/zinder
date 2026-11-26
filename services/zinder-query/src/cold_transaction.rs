@@ -60,6 +60,11 @@ impl ColdTransactionSource {
         self.reads.cached_transaction(mined)
     }
 
+    /// Returns the most `History` node calls this source may run at once.
+    pub(crate) fn history_max_concurrent(&self) -> usize {
+        usize::try_from(self.reads.max_concurrent(ForwardedReadKind::History).get()).unwrap_or(1)
+    }
+
     /// Returns the bytes the served chain mines at `location`, from the cache
     /// or verified against the node's containing block and the committed
     /// digest.

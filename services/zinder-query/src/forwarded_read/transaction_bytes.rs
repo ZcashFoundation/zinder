@@ -1,5 +1,6 @@
 //! Verified transaction bytes forwarded reads share: a byte-bounded LRU
-//! cache and one node fetch per transaction and digest at a time.
+//! cache and one node fetch per transaction, digest, and admission kind at a
+//! time.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -11,12 +12,14 @@ use futures_util::{
     future::{BoxFuture, Shared, WeakShared},
 };
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 use zinder_core::{SerializedBytesDigest, TransactionId};
 
-use super::{CACHE_LOOKUPS_COUNTER, ForwardedTransactionError};
+use super::{CACHE_LOOKUPS_COUNTER, ForwardedReadKind, ForwardedTransactionError};
 use crate::MinedTransactionDigest;
 
 type CacheKey = (TransactionId, SerializedBytesDigest);
+type FlightKey = (TransactionId, SerializedBytesDigest, ForwardedReadKind);
 type FetchOutcome = Result<Arc<[u8]>, ForwardedTransactionError>;
 pub(super) type Fetch = Shared<BoxFuture<'static, FetchOutcome>>;
 
@@ -24,21 +27,22 @@ pub(super) type Fetch = Shared<BoxFuture<'static, FetchOutcome>>;
 pub(super) enum Lookup {
     Cached(Arc<[u8]>),
     /// A node fetch to await, either just started or already running for
-    /// another caller.
+    /// another caller of the same admission kind.
     Fetch(Fetch),
 }
 
 pub(super) struct TransactionBytes {
     state: Arc<Mutex<State>>,
+    cache_populated: Arc<Notify>,
     capacity: usize,
 }
 
 #[derive(Default)]
 struct State {
     cache: TransactionCache,
-    /// Fetches in progress. A fetch every caller left is dropped with its
-    /// last caller and replaced by the next lookup.
-    flights: HashMap<CacheKey, (u64, WeakShared<BoxFuture<'static, FetchOutcome>>)>,
+    /// Fetches in progress, keyed by admission kind so a queued `History`
+    /// lookup never blocks a `Transaction` point lookup with reserved slots.
+    flights: HashMap<FlightKey, (u64, WeakShared<BoxFuture<'static, FetchOutcome>>)>,
     next_flight: u64,
 }
 
@@ -46,35 +50,57 @@ impl TransactionBytes {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             state: Arc::default(),
+            cache_populated: Arc::default(),
             capacity,
         }
     }
 
     pub(super) fn cached(&self, mined: &MinedTransactionDigest) -> Option<Arc<[u8]>> {
-        let bytes = self.state.lock().cache.get(key_of(mined))?;
+        let bytes = self.cached_without_metric(mined)?;
         record_lookup("hit");
         Some(bytes)
     }
 
-    /// Returns the cached bytes of `mined`, joins a fetch already running for
-    /// them, or starts `fetch`.
+    pub(super) fn cached_without_metric(
+        &self,
+        mined: &MinedTransactionDigest,
+    ) -> Option<Arc<[u8]>> {
+        self.state.lock().cache.get(key_of(mined))
+    }
+
+    pub(super) fn cache_populated(&self) -> &Notify {
+        &self.cache_populated
+    }
+
+    /// Returns the cached bytes of `mined`, joins a fetch of `kind` already
+    /// running for them, or starts `fetch`.
     ///
-    /// The started fetch caches verified bytes and leaves the running set
-    /// before it reports its outcome, so a later lookup either hits the cache
-    /// or starts a new fetch; a failure is never reused.
-    pub(super) fn lookup<Run, Started>(&self, mined: MinedTransactionDigest, fetch: Run) -> Lookup
+    /// The started fetch caches verified bytes across all kinds and leaves the
+    /// running set before it reports its outcome, so a later lookup either hits
+    /// the cache or starts a new fetch; a failure is never reused.
+    pub(super) fn lookup<Run, Started>(
+        &self,
+        mined: MinedTransactionDigest,
+        kind: ForwardedReadKind,
+        fetch: Run,
+    ) -> Lookup
     where
         Run: FnOnce() -> Started,
         Started: Future<Output = FetchOutcome> + Send + 'static,
     {
-        let key = key_of(&mined);
+        let cache_key = key_of(&mined);
+        let flight_key = (cache_key.0, cache_key.1, kind);
         let mut state = self.state.lock();
-        if let Some(bytes) = state.cache.get(key) {
+        if let Some(bytes) = state.cache.get(cache_key) {
             drop(state);
             record_lookup("hit");
             return Lookup::Cached(bytes);
         }
-        if let Some(running) = state.flights.get(&key).and_then(|(_, weak)| weak.upgrade()) {
+        if let Some(running) = state
+            .flights
+            .get(&flight_key)
+            .and_then(|(_, weak)| weak.upgrade())
+        {
             drop(state);
             record_lookup("coalesced");
             return Lookup::Fetch(running);
@@ -82,20 +108,28 @@ impl TransactionBytes {
         let flight = state.next_flight;
         state.next_flight += 1;
         let registry = Arc::clone(&self.state);
+        let cache_notify = Arc::clone(&self.cache_populated);
         let capacity = self.capacity;
         let started = fetch();
         let shared = async move {
             let outcome = started.await;
-            let mut state = registry.lock();
-            if let Ok(bytes) = &outcome {
-                state.cache.insert(key, Arc::clone(bytes), capacity);
-            }
-            if state
-                .flights
-                .get(&key)
-                .is_some_and(|(running, _)| *running == flight)
-            {
-                state.flights.remove(&key);
+            let inserted = {
+                let mut state = registry.lock();
+                let cached_now = outcome.as_ref().is_ok_and(|bytes| {
+                    state.cache.insert(cache_key, Arc::clone(bytes), capacity);
+                    capacity > 0 && bytes.len() <= capacity
+                });
+                if state
+                    .flights
+                    .get(&flight_key)
+                    .is_some_and(|(running, _)| *running == flight)
+                {
+                    state.flights.remove(&flight_key);
+                }
+                cached_now
+            };
+            if inserted {
+                cache_notify.notify_waiters();
             }
             outcome
         }
@@ -105,7 +139,7 @@ impl TransactionBytes {
             .flights
             .retain(|_, (_, weak)| weak.upgrade().is_some());
         if let Some(weak) = shared.downgrade() {
-            state.flights.insert(key, (flight, weak));
+            state.flights.insert(flight_key, (flight, weak));
         }
         drop(state);
         record_lookup("miss");

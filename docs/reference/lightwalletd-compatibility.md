@@ -93,7 +93,7 @@ A request that finds its kind's slots taken waits in arrival order for up to `co
 
 ### Verified transaction bytes
 
-Mined transaction bodies read from the node pass two checks. The node must report the transaction in the block the local `transaction_location` record names. The bytes must match the digest in that record. Verified bodies go into a cache of `compat.forwarded_transaction_cache_bytes` (64 MiB by default, 0 disables it), shared by `GetTransaction` and address history rows. A cached body is served without a node call or a slot. Concurrent lookups of the same transaction share one node call. A lookup that leaves does not cancel the call for the others. Failed lookups are never cached.
+Mined transaction bodies read from the node pass two checks. The node must report the transaction in the block the local `transaction_location` record names. The bytes must match the digest in that record. Verified bodies go into a cache of `compat.forwarded_transaction_cache_bytes` (64 MiB by default, 0 disables it), shared by `GetTransaction` and address history rows. A cached body is served without a node call or a slot. Concurrent lookups of the same transaction and admission kind share one node call, and a waiting lookup takes verified bytes another kind caches while it waits. A lookup that leaves does not cancel the call for the others. Failed lookups are never cached.
 
 ### Served-tip checks
 
@@ -383,7 +383,7 @@ Both methods resolve `range` the way lightwalletd does on Zebra:
 
 lightwalletd rejects a span wider than 10,000,000 blocks. Zinder clamps the end to the tip and serves it, because wallets such as WebZjs send `end = u64::MAX`.
 
-Wallet serving pins the history to one epoch. It reads 1,000 entries at a time and streams transactions in canonical order, overlapping up to 8 transaction reads ahead of the client. A stream still reading one minute after a new block replaces its epoch ends with `CHAIN_EPOCH_PIN_UNAVAILABLE`.
+Wallet serving pins the history to one epoch. It reads 1,000 entries at a time and streams transactions in canonical order, overlapping up to 8 transaction reads ahead of the client (capped at the `history` forwarded-read allowance when bodies are fetched from the node). A stream still reading one minute after a new block replaces its epoch ends with `CHAIN_EPOCH_PIN_UNAVAILABLE`.
 
 Light-wallet serving bounds forwarded history to the captured tip and releases the reader before the node calls. It checks the node's hash at that tip's height before and after each ID lookup. For each returned transaction, it reads the indexed `transaction_location` record first. The location must fall inside the page's height range and follow the previous row in canonical order. The body then comes from the verified cache or the node, checked against the record's block and digest. Rows need no tip check of their own, because each one is bound to the served view through its local record. The stream checks the tip once more before it ends. These checks validate returned rows. Completeness still depends on the node's address index, and a fork the node leaves and returns to between the two hash checks can go undetected. The stream is best-effort.
 

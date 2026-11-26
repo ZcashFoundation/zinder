@@ -553,6 +553,16 @@ impl ForwardedReadLimit {
         self.inner.config
     }
 
+    /// Returns the most node calls `kind` may hold at once under this budget.
+    #[must_use]
+    pub fn max_concurrent(&self, kind: ForwardedReadKind) -> NonZeroU32 {
+        self.inner
+            .node_calls
+            .share(kind.class())
+            .and_then(|share| NonZeroU32::new(share.cap))
+            .unwrap_or(NonZeroU32::MIN)
+    }
+
     /// Returns when a read starting now stops waiting for a slot.
     #[must_use]
     pub fn deadline(&self) -> Instant {
@@ -645,12 +655,14 @@ impl ForwardedReadLimit {
     /// block, verified against the digest ingest committed.
     ///
     /// Cached bytes are returned without contacting the node or taking a
-    /// slot. Otherwise concurrent callers for the same transaction and digest
-    /// share one node call, run under a `kind` slot that the first caller
-    /// waits for until `deadline`; a caller that joins it shares that wait,
-    /// and a caller that leaves does not cancel the call for the others.
-    /// `deadline` bounds only the wait for a slot, never the node call.
-    /// Verified bytes are cached, failures are not.
+    /// slot. Otherwise concurrent callers of the same `kind` for the same
+    /// transaction and digest share one node call, run under a `kind` slot
+    /// that the first caller waits for until `deadline`; a caller of `kind`
+    /// that joins it shares that wait, a caller that leaves does not cancel
+    /// the call for the others, and a waiting caller takes verified bytes
+    /// another kind caches while it waits. `deadline` bounds only the wait
+    /// for a slot, never the node call. Verified bytes are cached across all
+    /// kinds; failures are not.
     ///
     /// # Errors
     ///
@@ -666,7 +678,7 @@ impl ForwardedReadLimit {
         kind: ForwardedReadKind,
         deadline: Instant,
     ) -> Result<Arc<[u8]>, ForwardedTransactionError> {
-        let fetch = match self.inner.transactions.lookup(mined, || {
+        let fetch = match self.inner.transactions.lookup(mined, kind, || {
             let limit = self.clone();
             let node = node.clone();
             async move { limit.fetch_verified(&node, mined, kind, deadline).await }
@@ -684,14 +696,26 @@ impl ForwardedReadLimit {
         kind: ForwardedReadKind,
         deadline: Instant,
     ) -> Result<Arc<[u8]>, ForwardedTransactionError> {
+        let slot = match self.acquire_slot_or_cached(&mined, kind, deadline).await? {
+            Ok(slot) => slot,
+            Err(cached) => return Ok(cached),
+        };
         let location = mined.location;
-        let (block, bytes) = self
-            .node_call(
-                kind,
-                deadline,
-                node.fetch_mined_transaction_bytes(location.transaction_id),
+        let outcome = node
+            .fetch_mined_transaction_bytes(location.transaction_id)
+            .await;
+        drop(slot);
+        if let Err(error) = &outcome
+            && error.upstream_classification() == SourceFailureClass::NodeRateLimited
+        {
+            metrics::counter!(
+                REFUSALS_COUNTER,
+                "kind" => kind.label(),
+                "reason" => RefusalReason::NodeRateLimited.label(),
             )
-            .await?
+            .increment(1);
+        }
+        let (block, bytes) = outcome
             .map_err(|error| ForwardedTransactionError::Node(Arc::new(error)))?
             .ok_or(ForwardedTransactionError::OutsideServedView)?;
         if block != zinder_core::BlockId::new(location.block_height, location.block_hash) {
@@ -703,6 +727,32 @@ impl ForwardedReadLimit {
             return Err(ForwardedTransactionError::DigestMismatch);
         }
         Ok(Arc::from(bytes))
+    }
+
+    async fn acquire_slot_or_cached(
+        &self,
+        mined: &MinedTransactionDigest,
+        kind: ForwardedReadKind,
+        deadline: Instant,
+    ) -> Result<Result<PoolSlot, Arc<[u8]>>, ForwardedReadRefused> {
+        loop {
+            let notified = self.inner.transactions.cache_populated().notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(bytes) = self.inner.transactions.cached_without_metric(mined) {
+                return Ok(Err(bytes));
+            }
+            tokio::select! {
+                slot = self.node_call_slot(kind, deadline) => {
+                    let slot = slot?;
+                    if let Some(bytes) = self.inner.transactions.cached_without_metric(mined) {
+                        return Ok(Err(bytes));
+                    }
+                    return Ok(Ok(slot));
+                }
+                () = &mut notified => {}
+            }
+        }
     }
 }
 

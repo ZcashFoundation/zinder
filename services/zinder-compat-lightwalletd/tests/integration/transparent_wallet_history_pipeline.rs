@@ -51,6 +51,9 @@ use zinder_testkit::{ChainFixture, FixtureTransactionRows, WalletServingStoreFix
 
 use crate::common::verified_node::one_upgrade_per_height;
 
+#[path = "transparent_wallet_history_pipeline/gated_canonical.rs"]
+mod gated_canonical;
+
 pub(crate) type LeanWalletQuery =
     WalletServingQuery<Option<OrderedBroadcaster<ZebraJsonRpcSource>>>;
 pub(crate) type LeanWalletAdapter = LightwalletdGrpcAdapter<LeanWalletQuery>;
@@ -920,7 +923,7 @@ async fn default_transactions_in_order_fallback_starts_futures_on_demand() -> Re
     assert!(!fallback.has_remaining());
     assert!(fallback.next_batch(4).await.is_empty());
 
-    let mut lazy = DefaultOrderedFallback(query)
+    let mut lazy = DefaultOrderedFallback::single(query)
         .transactions_in_order(ids, Some(epoch_id))
         .await?;
     assert_eq!(node.peak_raw_tx.load(Ordering::SeqCst), 0);
@@ -934,61 +937,490 @@ async fn default_transactions_in_order_fallback_starts_futures_on_demand() -> Re
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn low_budget_zero_wait_cold_history_stream_completes_without_self_refusal() -> Result<()> {
+    const BLOCKS: u32 = 4;
+    const TXS: u32 = 24;
+    let mut fixture =
+        build_multi_block_cold_fixture(BLOCKS, 1, TXS, |_, _| Duration::from_millis(2))?;
+    let node = AsyncZebraNode::start(
+        &fixture.schedule,
+        fixture.tip_hash,
+        NodeBehavior {
+            entries: fixture.node_entries,
+            tampered_txid_hex: None,
+            stalled_txids: HashSet::new(),
+        },
+    )
+    .await?;
+    let low_budget = ForwardedReadLimit::new(ForwardedReadConfig::resolve(
+        Some(4),
+        Some(0),
+        Some(8),
+        Some(0),
+    )?);
+    let (_pair, _query, adapter) = build_lean_adapter(&mut fixture.store, node.url(), low_budget)?;
+    let filter = history_filter(fixture.addresses[0].clone(), 1, u64::from(BLOCKS));
+
+    for deprecated in [true, false] {
+        let mut stream = if deprecated {
+            adapter
+                .get_taddress_txids(Request::new(filter.clone()))
+                .await?
+                .into_inner()
+        } else {
+            adapter
+                .get_taddress_transactions(Request::new(filter.clone()))
+                .await?
+                .into_inner()
+        };
+        let mut received = Vec::with_capacity(usize::try_from(TXS)?);
+        while let Some(row) = stream.next().await {
+            received.push(row?);
+        }
+        assert_eq!(received, fixture.expected_per_address[0]);
+    }
+    assert!(
+        node.peak_raw_tx.load(Ordering::SeqCst) <= 2,
+        "expected History cap (2 at budget=4) to bound in-flight cold fetches, observed {}",
+        node.peak_raw_tx.load(Ordering::SeqCst),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_transactions_in_order_without_explicit_pin_locks_one_epoch_across_replacement()
+-> Result<()> {
+    let mut fixture_one = build_multi_block_cold_fixture(2, 1, 6, |_, _| Duration::ZERO)?;
+    let (pair_two, query_two, _store_two) = build_live_appended_second_epoch_query()?;
+    let node_one = AsyncZebraNode::start(
+        &fixture_one.schedule,
+        fixture_one.tip_hash,
+        NodeBehavior {
+            entries: fixture_one.node_entries,
+            tampered_txid_hex: None,
+            stalled_txids: HashSet::new(),
+        },
+    )
+    .await?;
+    let (pair_one, query_one, _) = build_lean_adapter(
+        &mut fixture_one.store,
+        node_one.url(),
+        ForwardedReadLimit::default(),
+    )?;
+    let epoch_one = pair_one.chain_epoch().id;
+    let epoch_two = pair_two.chain_epoch().id;
+    assert_ne!(epoch_one, epoch_two);
+
+    let wrapper = DefaultOrderedFallback::single(query_one.clone());
+    let ids: Vec<TransactionId> = (0..6).map(|seq| sequence_txid(0x40, seq)).collect();
+    let mut reader = wrapper.transactions_in_order(ids, None).await?;
+
+    for pending in reader.next_batch(2).await {
+        assert_eq!(pending.await?.chain_epoch.id, epoch_one);
+    }
+
+    wrapper.replace_retaining_previous(epoch_one, query_two);
+    for pending in reader.next_batch(2).await {
+        assert_eq!(
+            pending.await?.chain_epoch.id,
+            epoch_one,
+            "reader opened with None must stay pinned to its initial epoch across replacement"
+        );
+    }
+
+    wrapper.evict_retained();
+    let evicted = reader
+        .next_batch(2)
+        .await
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("expected third batch"))?
+        .await;
+    assert!(matches!(
+        evicted,
+        Err(zinder_query::QueryError::ChainEpochPinUnavailable { chain_epoch_id })
+            if chain_epoch_id == epoch_one
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gated_second_canonical_batch_does_not_stall_in_flight_delivery_or_cancellation()
+-> Result<()> {
+    assert_gated_second_batch_delivers_earlier_rows().await?;
+    assert_gated_second_batch_releases_slots_on_drop().await
+}
+
+async fn assert_gated_second_batch_delivers_earlier_rows() -> Result<()> {
+    const BLOCKS: u32 = 4;
+    const TXS: u32 = 24;
+    let mut fixture =
+        build_multi_block_cold_fixture(BLOCKS, 1, TXS, |_, _| Duration::from_millis(2))?;
+    let node = AsyncZebraNode::start(
+        &fixture.schedule,
+        fixture.tip_hash,
+        NodeBehavior {
+            entries: fixture.node_entries,
+            tampered_txid_hex: None,
+            stalled_txids: HashSet::new(),
+        },
+    )
+    .await?;
+    let uncached =
+        ForwardedReadLimit::new(ForwardedReadConfig::resolve(None, None, None, Some(0))?);
+    let gate = gated_canonical::BatchGate::holding_call(1);
+    let (_pair, adapter) =
+        build_gated_lean_adapter(&mut fixture.store, node.url(), uncached, gate.clone())?;
+
+    let second_batch_started = gate.started();
+    let mut stream = adapter
+        .get_taddress_txids(Request::new(history_filter(
+            fixture.addresses[0].clone(),
+            1,
+            u64::from(BLOCKS),
+        )))
+        .await?
+        .into_inner();
+    let mut received = Vec::with_capacity(usize::try_from(TXS)?);
+    for _ in 0..16 {
+        let row = timeout(Duration::from_secs(5), stream.next())
+            .await?
+            .ok_or_else(|| eyre!("expected first-batch row while second batch is gated"))??;
+        received.push(row);
+    }
+    timeout(Duration::from_secs(5), second_batch_started).await?;
+    assert_eq!(received.as_slice(), &fixture.expected_per_address[0][..16]);
+
+    gate.release();
+    while let Some(row) = timeout(Duration::from_secs(5), stream.next()).await? {
+        received.push(row?);
+    }
+    assert_eq!(received, fixture.expected_per_address[0]);
+    Ok(())
+}
+
+async fn assert_gated_second_batch_releases_slots_on_drop() -> Result<()> {
+    const BLOCKS: u32 = 4;
+    const TXS: u32 = 24;
+    let mut fixture = build_multi_block_cold_fixture(BLOCKS, 2, TXS, |_, _| Duration::ZERO)?;
+    let stalled_txids: HashSet<String> = (14..16)
+        .map(|seq| encode_rpc_transaction_id_hex(sequence_txid(0x40, seq)))
+        .collect();
+    let node = AsyncZebraNode::start(
+        &fixture.schedule,
+        fixture.tip_hash,
+        NodeBehavior {
+            entries: fixture.node_entries,
+            tampered_txid_hex: None,
+            stalled_txids,
+        },
+    )
+    .await?;
+    let tight_limit = ForwardedReadLimit::new(ForwardedReadConfig::resolve(
+        Some(6),
+        Some(40),
+        Some(8),
+        Some(0),
+    )?);
+    let gate = gated_canonical::BatchGate::holding_call(1);
+    let (pair, adapter) = build_gated_lean_adapter(
+        &mut fixture.store,
+        node.url(),
+        tight_limit.clone(),
+        gate.clone(),
+    )?;
+    let idle_owners = Arc::strong_count(&pair);
+
+    let second_batch_started = gate.started();
+    let node_stalled = node.gate_started.notified();
+    let mut stream = adapter
+        .get_taddress_txids(Request::new(history_filter(
+            fixture.addresses[0].clone(),
+            1,
+            u64::from(BLOCKS),
+        )))
+        .await?
+        .into_inner();
+    for _ in 0..14 {
+        let _ = timeout(Duration::from_secs(5), stream.next())
+            .await?
+            .ok_or_else(|| eyre!("expected unstalled prefix row"))??;
+    }
+    timeout(Duration::from_secs(5), second_batch_started).await?;
+    timeout(Duration::from_secs(5), node_stalled).await?;
+    assert!(Arc::strong_count(&pair) > idle_owners);
+
+    drop(stream);
+    wait_for_idle_pair(
+        &pair,
+        idle_owners,
+        "gated refill or stalled cold reads retained pair",
+    )
+    .await?;
+
+    let mut second_stream = adapter
+        .get_taddress_txids(Request::new(history_filter(
+            fixture.addresses[1].clone(),
+            1,
+            u64::from(BLOCKS),
+        )))
+        .await?
+        .into_inner();
+    let recovered = timeout(Duration::from_secs(5), second_stream.next())
+        .await?
+        .transpose()?
+        .ok_or_else(|| eyre!("expected second address row after slot release"))?;
+    assert_eq!(recovered, fixture.expected_per_address[1][0]);
+    drop(second_stream);
+    gate.release();
+    node.release_stalled();
+    Ok(())
+}
+
+fn build_gated_lean_adapter(
+    store: &mut WalletServingStoreFixture,
+    node_url: String,
+    reads: ForwardedReadLimit,
+    gate: Arc<gated_canonical::BatchGate>,
+) -> Result<(Arc<WalletServingReadPair>, LeanWalletAdapter)> {
+    let (canonical, wallet) = store.take_readers()?;
+    let gated = gated_canonical::GatedBatchCanonicalReader::new(
+        RocksDbCanonicalReader::new(canonical)?,
+        gate,
+    );
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(gated),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?);
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        node_url,
+        NodeAuth::None,
+        Duration::from_secs(10),
+    )?;
+    let query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::clone(&pair)))
+            .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
+            .with_verified_cold_transactions(reads);
+    Ok((
+        pair,
+        LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?,
+    ))
+}
+
+fn build_live_appended_second_epoch_query() -> Result<(
+    Arc<WalletServingReadPair>,
+    LeanWalletQuery,
+    WalletServingStoreFixture,
+)> {
+    let schedule = one_upgrade_per_height()?;
+    let mut chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(2);
+    let first_block = chain
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("missing block 1"))?
+        .clone();
+    for seq in 0..6_u32 {
+        chain = chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            sequence_txid(0x40, seq),
+            first_block.height,
+            first_block.hash,
+            seq,
+            sequence_payload(0x40, seq),
+        ));
+    }
+    let mut store = WalletServingStoreFixture::from_chain_after_live_append(&chain, &schedule)?;
+    let (canonical, wallet) = store.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?);
+    let query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::clone(&pair)))
+            .with_node_broadcast(None);
+    Ok((pair, query, store))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn point_get_transaction_succeeds_for_tx_queued_behind_saturated_history_slots() -> Result<()>
+{
+    const BLOCKS: u32 = 4;
+    const TXS: u32 = 12;
+    let mut fixture = build_multi_block_cold_fixture(BLOCKS, 2, TXS, |_, _| Duration::ZERO)?;
+    let stalled_txids: HashSet<String> = (1..TXS)
+        .map(|seq| encode_rpc_transaction_id_hex(sequence_txid(0x40, seq)))
+        .collect();
+    let node = AsyncZebraNode::start(
+        &fixture.schedule,
+        fixture.tip_hash,
+        NodeBehavior {
+            entries: fixture.node_entries,
+            tampered_txid_hex: None,
+            stalled_txids,
+        },
+    )
+    .await?;
+    let limit = ForwardedReadLimit::new(ForwardedReadConfig::resolve(
+        Some(4),
+        Some(250),
+        Some(8),
+        None,
+    )?);
+    let (_pair, _query, adapter) = build_lean_adapter(&mut fixture.store, node.url(), limit)?;
+
+    let stalled_notified = node.gate_started.notified();
+    let mut stalled_stream = adapter
+        .get_taddress_txids(Request::new(history_filter(
+            fixture.addresses[0].clone(),
+            1,
+            u64::from(BLOCKS),
+        )))
+        .await?
+        .into_inner();
+    let first = stalled_stream
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| eyre!("expected first row"))?;
+    assert_eq!(first, fixture.expected_per_address[0][0]);
+    timeout(Duration::from_secs(5), stalled_notified).await?;
+
+    let mut queued_stream = adapter
+        .get_taddress_txids(Request::new(history_filter(
+            fixture.addresses[1].clone(),
+            1,
+            u64::from(BLOCKS),
+        )))
+        .await?
+        .into_inner();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    let target_txid = sequence_txid(0x41, 0);
+    let point_reply = timeout(
+        Duration::from_secs(2),
+        adapter.get_transaction(Request::new(lightwalletd::TxFilter {
+            block: None,
+            index: 0,
+            hash: encode_internal_transaction_id(target_txid).to_vec(),
+        })),
+    )
+    .await??
+    .into_inner();
+    assert_eq!(point_reply.data, sequence_payload(0x41, 0));
+
+    let warmed_history_row = timeout(Duration::from_secs(2), queued_stream.next())
+        .await?
+        .transpose()?
+        .ok_or_else(|| eyre!("expected queued history row warmed by point lookup"))?;
+    assert_eq!(warmed_history_row, fixture.expected_per_address[1][0]);
+
+    drop((queued_stream, stalled_stream));
+    node.release_stalled();
+    Ok(())
+}
+
 #[derive(Clone)]
-struct DefaultOrderedFallback(LeanWalletQuery);
+struct DefaultOrderedFallback {
+    capabilities: zinder_query::NativeWalletEndpointCapabilities,
+    inner: Arc<parking_lot::Mutex<FallbackQueries>>,
+}
+
+struct FallbackQueries {
+    current: LeanWalletQuery,
+    retained: Option<(zinder_core::ChainEpochId, LeanWalletQuery)>,
+}
+
+impl DefaultOrderedFallback {
+    fn single(current: LeanWalletQuery) -> Self {
+        let capabilities = current.native_endpoint_capabilities().clone();
+        Self {
+            capabilities,
+            inner: Arc::new(parking_lot::Mutex::new(FallbackQueries {
+                current,
+                retained: None,
+            })),
+        }
+    }
+
+    fn replace_retaining_previous(
+        &self,
+        previous_epoch: zinder_core::ChainEpochId,
+        next_current: LeanWalletQuery,
+    ) {
+        let mut guard = self.inner.lock();
+        let previous = std::mem::replace(&mut guard.current, next_current);
+        guard.retained = Some((previous_epoch, previous));
+    }
+
+    fn evict_retained(&self) {
+        self.inner.lock().retained = None;
+    }
+
+    fn select_for(&self, ep: Option<zinder_core::ChainEpochId>) -> LeanWalletQuery {
+        let guard = self.inner.lock();
+        if let (Some(pinned), Some((retained_epoch, retained_query))) = (ep, &guard.retained)
+            && pinned == *retained_epoch
+        {
+            return retained_query.clone();
+        }
+        guard.current.clone()
+    }
+}
 
 #[async_trait::async_trait]
 impl zinder_query::WalletQueryApi for DefaultOrderedFallback {
     fn native_endpoint_capabilities(&self) -> &zinder_query::NativeWalletEndpointCapabilities {
-        self.0.native_endpoint_capabilities()
+        &self.capabilities
     }
     fn upstream_node_capabilities(&self) -> Option<zinder_query::UpstreamNodeCapabilities> {
-        self.0.upstream_node_capabilities()
+        self.inner.lock().current.upstream_node_capabilities()
     }
     async fn network_upgrade_activations(
         &self,
     ) -> Result<NetworkUpgradeActivations, zinder_query::QueryError> {
-        self.0.network_upgrade_activations().await
+        self.select_for(None).network_upgrade_activations().await
     }
     async fn visible_tip_block(
         &self,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::VisibleTipBlock, zinder_query::QueryError> {
-        self.0.visible_tip_block(ep).await
+        self.select_for(ep).visible_tip_block(ep).await
     }
     async fn settled_tip_block(
         &self,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::SettledTipBlock, zinder_query::QueryError> {
-        self.0.settled_tip_block(ep).await
+        self.select_for(ep).settled_tip_block(ep).await
     }
     async fn block_id_by_selector(
         &self,
         sel: zinder_core::BlockSelector,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::BlockIdAtEpoch, zinder_query::QueryError> {
-        self.0.block_id_by_selector(sel, ep).await
+        self.select_for(ep).block_id_by_selector(sel, ep).await
     }
     async fn block_header_by_selector(
         &self,
         sel: zinder_core::BlockSelector,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::BlockHeaderAtEpoch, zinder_query::QueryError> {
-        self.0.block_header_by_selector(sel, ep).await
+        self.select_for(ep).block_header_by_selector(sel, ep).await
     }
     async fn compact_block_at(
         &self,
         h: BlockHeight,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::CompactBlock, zinder_query::QueryError> {
-        self.0.compact_block_at(h, ep).await
+        self.select_for(ep).compact_block_at(h, ep).await
     }
     async fn compact_blocks_in_range(
         &self,
         r: zinder_core::BlockHeightRange,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::CompactBlockRange, zinder_query::QueryError> {
-        self.0.compact_blocks_in_range(r, ep).await
+        self.select_for(ep).compact_blocks_in_range(r, ep).await
     }
     async fn compact_blocks_in_range_up_to(
         &self,
@@ -997,28 +1429,30 @@ impl zinder_query::WalletQueryApi for DefaultOrderedFallback {
         max: usize,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::CompactBlockRange, zinder_query::QueryError> {
-        self.0.compact_blocks_in_range_up_to(r, ord, max, ep).await
+        self.select_for(ep)
+            .compact_blocks_in_range_up_to(r, ord, max, ep)
+            .await
     }
     async fn full_block_at(
         &self,
         h: BlockHeight,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::FullBlock, zinder_query::QueryError> {
-        self.0.full_block_at(h, ep).await
+        self.select_for(ep).full_block_at(h, ep).await
     }
     async fn full_blocks_in_range(
         &self,
         r: zinder_core::BlockHeightRange,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::FullBlockStream, zinder_query::QueryError> {
-        self.0.full_blocks_in_range(r, ep).await
+        self.select_for(ep).full_blocks_in_range(r, ep).await
     }
     async fn transaction(
         &self,
         id: TransactionId,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::TransactionStatus, zinder_query::QueryError> {
-        self.0.transaction(id, ep).await
+        self.select_for(ep).transaction(id, ep).await
     }
     async fn transaction_at_block_index(
         &self,
@@ -1026,84 +1460,96 @@ impl zinder_query::WalletQueryApi for DefaultOrderedFallback {
         idx: u64,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::Transaction, zinder_query::QueryError> {
-        self.0.transaction_at_block_index(h, idx, ep).await
+        self.select_for(ep)
+            .transaction_at_block_index(h, idx, ep)
+            .await
     }
     async fn raw_transaction(
         &self,
         id: TransactionId,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::RawTransaction, zinder_query::QueryError> {
-        self.0.raw_transaction(id, ep).await
+        self.select_for(ep).raw_transaction(id, ep).await
     }
     async fn transparent_address_unspent_outputs(
         &self,
         req: zinder_query::TransparentAddressUnspentOutputsRequest,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::TransparentAddressUnspentOutputs, zinder_query::QueryError> {
-        self.0.transparent_address_unspent_outputs(req, ep).await
+        self.select_for(ep)
+            .transparent_address_unspent_outputs(req, ep)
+            .await
     }
     async fn transparent_address_tx_ids_in_range(
         &self,
         req: zinder_query::TransparentAddressTxIdsInRangeRequest,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::TransparentAddressTxIds, zinder_query::QueryError> {
-        self.0.transparent_address_tx_ids_in_range(req, ep).await
+        self.select_for(ep)
+            .transparent_address_tx_ids_in_range(req, ep)
+            .await
     }
     async fn transparent_outpoint_spend_status(
         &self,
         ops: Vec<TransparentOutPoint>,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::TransparentOutpointSpendStatuses, zinder_query::QueryError> {
-        self.0.transparent_outpoint_spend_status(ops, ep).await
+        self.select_for(ep)
+            .transparent_outpoint_spend_status(ops, ep)
+            .await
     }
     async fn transparent_address_balance(
         &self,
         addrs: Vec<TransparentAddressScriptHash>,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_core::TransparentAddressBalance, zinder_query::QueryError> {
-        self.0.transparent_address_balance(addrs, ep).await
+        self.select_for(ep)
+            .transparent_address_balance(addrs, ep)
+            .await
     }
     async fn tree_state_at(
         &self,
         h: BlockHeight,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::TreeState, zinder_query::QueryError> {
-        self.0.tree_state_at(h, ep).await
+        self.select_for(ep).tree_state_at(h, ep).await
     }
     async fn latest_tree_state_checkpoint(
         &self,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::TreeState, zinder_query::QueryError> {
-        self.0.latest_tree_state_checkpoint(ep).await
+        self.select_for(ep).latest_tree_state_checkpoint(ep).await
     }
     async fn subtree_roots(
         &self,
         r: zinder_core::SubtreeRootRange,
         ep: Option<zinder_core::ChainEpochId>,
     ) -> Result<zinder_query::SubtreeRoots, zinder_query::QueryError> {
-        self.0.subtree_roots(r, ep).await
+        self.select_for(ep).subtree_roots(r, ep).await
     }
     async fn chain_events(
         &self,
         cur: Option<zinder_store::StreamCursorTokenV1>,
         fam: zinder_store::ChainEventStreamFamily,
     ) -> Result<zinder_query::ChainEvents, zinder_query::QueryError> {
-        self.0.chain_events(cur, fam).await
+        self.select_for(None).chain_events(cur, fam).await
     }
     async fn resolve_chain_events_start(
         &self,
         st: zinder_store::EventStreamStartPosition,
         fam: zinder_store::ChainEventStreamFamily,
     ) -> Result<zinder_store::ChainEventStreamResume, zinder_query::QueryError> {
-        self.0.resolve_chain_events_start(st, fam).await
+        self.select_for(None)
+            .resolve_chain_events_start(st, fam)
+            .await
     }
     async fn broadcast_transaction(
         &self,
         raw: zinder_core::RawTransactionBytes,
     ) -> Result<zinder_core::TransactionBroadcastOutcome, zinder_query::QueryError> {
-        self.0.broadcast_transaction(raw).await
+        self.select_for(None).broadcast_transaction(raw).await
     }
     async fn standard_fee(&self) -> Result<zinder_core::StandardFee, zinder_query::QueryError> {
-        self.0.standard_fee().await
+        self.select_for(None).standard_fee().await
     }
 }

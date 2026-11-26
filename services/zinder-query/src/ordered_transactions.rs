@@ -128,7 +128,7 @@ struct LazyQueryReader<QueryApi> {
     query_api: QueryApi,
     transaction_ids: Vec<TransactionId>,
     next_index: usize,
-    at_epoch_id: Option<ChainEpochId>,
+    at_epoch_id: ChainEpochId,
 }
 
 impl<QueryApi> LazyQuerySource for LazyQueryReader<QueryApi>
@@ -151,7 +151,9 @@ where
             .map(|transaction_id| {
                 let query_api = self.query_api.clone();
                 PendingTransaction::cold(async move {
-                    query_api.transaction(transaction_id, at_epoch_id).await
+                    query_api
+                        .transaction(transaction_id, Some(at_epoch_id))
+                        .await
                 })
             })
             .collect();
@@ -167,7 +169,48 @@ struct ServingOrderedTransactions {
     cold_transactions: Option<Arc<ColdTransactionSource>>,
     transaction_ids: Vec<TransactionId>,
     next_id_index: usize,
+    refill_in_flight: bool,
     prepared: VecDeque<PreparedTransaction>,
+}
+
+/// Completed canonical batch lookup ready to be applied to [`TransactionsInOrder`].
+pub struct CompletedCanonicalRefill {
+    outcome: Result<Vec<PreparedTransaction>, QueryError>,
+}
+
+impl fmt::Debug for CompletedCanonicalRefill {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletedCanonicalRefill")
+            .field("is_ok", &self.outcome.is_ok())
+            .finish()
+    }
+}
+
+/// In-flight canonical batch lookup started by [`TransactionsInOrder::start_refill`].
+///
+/// Polling this future alongside [`PendingTransaction`] futures lets a stream
+/// keep draining completed rows and observing cancellation while a canonical
+/// refill runs.
+pub struct CanonicalRefill {
+    future: BoxFuture<'static, Result<Vec<PreparedTransaction>, QueryError>>,
+}
+
+impl fmt::Debug for CanonicalRefill {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("CanonicalRefill").finish()
+    }
+}
+
+impl Future for CanonicalRefill {
+    type Output = CompletedCanonicalRefill;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.future
+            .as_mut()
+            .poll(context)
+            .map(|outcome| CompletedCanonicalRefill { outcome })
+    }
 }
 
 enum PreparedTransaction {
@@ -206,7 +249,7 @@ impl TransactionsInOrder {
     pub(crate) fn from_lazy_query<QueryApi>(
         query_api: QueryApi,
         transaction_ids: Vec<TransactionId>,
-        at_epoch_id: Option<ChainEpochId>,
+        at_epoch_id: ChainEpochId,
     ) -> Self
     where
         QueryApi: crate::WalletQueryApi + Clone + Send + Sync + 'static,
@@ -243,13 +286,35 @@ impl TransactionsInOrder {
                 cold_transactions,
                 transaction_ids,
                 next_id_index: 0,
+                refill_in_flight: false,
                 prepared: VecDeque::new(),
             })),
             ended_on_error: false,
         }
     }
 
-    /// Reports whether more transactions remain to be started.
+    /// Maximum [`PendingTransaction`] futures a caller should keep in flight at
+    /// once so a cold history stream never exceeds its configured
+    /// [`ForwardedReadKind::History`] allowance.
+    #[must_use]
+    pub fn max_in_flight(&self) -> usize {
+        match &self.source {
+            OrderedSource::Empty => 0,
+            OrderedSource::Fallback(_) => usize::MAX,
+            OrderedSource::Serving(serving) => {
+                if serving.retains_transaction_blobs {
+                    usize::MAX
+                } else {
+                    serving
+                        .cold_transactions
+                        .as_ref()
+                        .map_or(usize::MAX, |source| source.history_max_concurrent().max(1))
+                }
+            }
+        }
+    }
+
+    /// Reports whether more transactions remain to be started or refilled.
     #[must_use]
     pub fn has_remaining(&self) -> bool {
         if self.ended_on_error {
@@ -259,9 +324,75 @@ impl TransactionsInOrder {
             OrderedSource::Empty => false,
             OrderedSource::Fallback(reader) => reader.has_remaining(),
             OrderedSource::Serving(serving) => {
-                serving.next_id_index < serving.transaction_ids.len()
+                serving.refill_in_flight
+                    || serving.next_id_index < serving.transaction_ids.len()
                     || !serving.prepared.is_empty()
             }
+        }
+    }
+
+    /// Reports whether [`Self::take_ready`] can immediately start at least one
+    /// transaction without awaiting a canonical refill.
+    #[must_use]
+    pub fn can_take_ready(&self) -> bool {
+        if self.ended_on_error {
+            return false;
+        }
+        match &self.source {
+            OrderedSource::Empty => false,
+            OrderedSource::Fallback(reader) => reader.has_remaining(),
+            OrderedSource::Serving(serving) => !serving.prepared.is_empty(),
+        }
+    }
+
+    /// Reports whether the next transaction requires starting a canonical batch
+    /// refill via [`Self::start_refill`].
+    #[must_use]
+    pub fn needs_refill(&self) -> bool {
+        if self.ended_on_error {
+            return false;
+        }
+        match &self.source {
+            OrderedSource::Empty | OrderedSource::Fallback(_) => false,
+            OrderedSource::Serving(serving) => {
+                !serving.refill_in_flight
+                    && serving.prepared.is_empty()
+                    && serving.next_id_index < serving.transaction_ids.len()
+            }
+        }
+    }
+
+    /// Starts up to `max_count` already-prepared transactions in request order
+    /// without awaiting canonical storage.
+    pub fn take_ready(&mut self, max_count: usize) -> Vec<PendingTransaction> {
+        if max_count == 0 || !self.can_take_ready() {
+            return Vec::new();
+        }
+        match &mut self.source {
+            OrderedSource::Empty => Vec::new(),
+            OrderedSource::Fallback(reader) => reader.start_next(max_count),
+            OrderedSource::Serving(serving) => {
+                serving.take_prepared(max_count, &mut self.ended_on_error)
+            }
+        }
+    }
+
+    /// Starts the next bounded canonical multi-get refill when [`Self::needs_refill`]
+    /// is true.
+    pub fn start_refill(&mut self, needed_now: usize) -> Option<CanonicalRefill> {
+        if needed_now == 0 || !self.needs_refill() {
+            return None;
+        }
+        match &mut self.source {
+            OrderedSource::Empty | OrderedSource::Fallback(_) => None,
+            OrderedSource::Serving(serving) => serving.start_canonical_slice(needed_now),
+        }
+    }
+
+    /// Applies a completed canonical refill started by [`Self::start_refill`].
+    pub fn apply_refill(&mut self, completed: CompletedCanonicalRefill) {
+        if let OrderedSource::Serving(serving) = &mut self.source {
+            serving.finish_canonical_slice(completed.outcome);
         }
     }
 
@@ -270,36 +401,32 @@ impl TransactionsInOrder {
     /// Stops early after the first immediate error so no transaction past a
     /// terminal canonical failure is started.
     pub async fn next_batch(&mut self, max_count: usize) -> Vec<PendingTransaction> {
-        if max_count == 0 || !self.has_remaining() {
-            return Vec::new();
-        }
-        match &mut self.source {
-            OrderedSource::Empty => Vec::new(),
-            OrderedSource::Fallback(reader) => reader.start_next(max_count),
-            OrderedSource::Serving(serving) => {
-                serving
-                    .next_batch(max_count, &mut self.ended_on_error)
-                    .await
+        let mut batch = Vec::with_capacity(max_count);
+        while batch.len() < max_count && !self.ended_on_error {
+            let remaining_budget = max_count - batch.len();
+            let ready = self.take_ready(remaining_budget);
+            if !ready.is_empty() {
+                batch.extend(ready);
+                continue;
             }
+            let Some(refill) = self.start_refill(remaining_budget) else {
+                break;
+            };
+            let completed = refill.await;
+            self.apply_refill(completed);
         }
+        batch
     }
 }
 
 impl ServingOrderedTransactions {
-    async fn next_batch(
+    fn take_prepared(
         &mut self,
         max_count: usize,
         ended_on_error: &mut bool,
     ) -> Vec<PendingTransaction> {
-        let mut batch = Vec::with_capacity(max_count);
+        let mut batch = Vec::with_capacity(max_count.min(self.prepared.len()));
         while batch.len() < max_count && !*ended_on_error {
-            if self.prepared.is_empty() {
-                if self.next_id_index >= self.transaction_ids.len() {
-                    break;
-                }
-                self.prepare_next_canonical_slice(max_count - batch.len())
-                    .await;
-            }
             let Some(prepared) = self.prepared.pop_front() else {
                 break;
             };
@@ -313,7 +440,7 @@ impl ServingOrderedTransactions {
         batch
     }
 
-    async fn prepare_next_canonical_slice(&mut self, needed_now: usize) {
+    fn start_canonical_slice(&mut self, needed_now: usize) -> Option<CanonicalRefill> {
         let remaining = self.transaction_ids.len() - self.next_id_index;
         let target_len = if self.retains_transaction_blobs {
             needed_now.min(remaining)
@@ -321,45 +448,57 @@ impl ServingOrderedTransactions {
             needed_now.max(CANONICAL_LOCATION_BATCH_SIZE).min(remaining)
         };
         if target_len == 0 {
-            return;
+            return None;
         }
         let batch_ids =
             self.transaction_ids[self.next_id_index..self.next_id_index + target_len].to_vec();
         self.next_id_index += target_len;
+        self.refill_in_flight = true;
+        let slot = self.slot.clone();
         let epoch_id = self.chain_epoch.id;
         let has_cold_source = self.cold_transactions.is_some();
-        let pin = serving_read::SlotPin::new(&self.slot, Some(epoch_id));
-        let batch_read = serving_read::read_at(pin, move |pair| {
-            let ids = batch_ids.clone();
-            async move {
-                let chain_epoch = WalletServingQuery::<()>::chain_epoch(&pair, Some(epoch_id))?;
-                if pair.are_reads_revoked() {
-                    return Err(pair.revoked_read_error());
+        let future = async move {
+            let pin = serving_read::SlotPin::new(&slot, Some(epoch_id));
+            serving_read::read_at(pin, move |pair| {
+                let ids = batch_ids.clone();
+                async move {
+                    let chain_epoch = WalletServingQuery::<()>::chain_epoch(&pair, Some(epoch_id))?;
+                    if pair.are_reads_revoked() {
+                        return Err(pair.revoked_read_error());
+                    }
+                    let indexed = pair
+                        .canonical()
+                        .mined_transactions(&ids)
+                        .await
+                        .map_err(QueryError::canonical_read)?;
+                    if indexed.len() != ids.len() {
+                        return Err(QueryError::ArtifactCorrupt {
+                            family: ArtifactFamily::TransactionLocation,
+                            reason: format!(
+                                "canonical batch transaction lookup returned {} entries for {} requested ids",
+                                indexed.len(),
+                                ids.len(),
+                            ),
+                        });
+                    }
+                    Ok(classify_indexed_batch(
+                        &pair,
+                        chain_epoch,
+                        indexed,
+                        has_cold_source,
+                    ))
                 }
-                let indexed = pair
-                    .canonical()
-                    .mined_transactions(&ids)
-                    .await
-                    .map_err(QueryError::canonical_read)?;
-                if indexed.len() != ids.len() {
-                    return Err(QueryError::ArtifactCorrupt {
-                        family: ArtifactFamily::TransactionLocation,
-                        reason: format!(
-                            "canonical batch transaction lookup returned {} entries for {} requested ids",
-                            indexed.len(),
-                            ids.len(),
-                        ),
-                    });
-                }
-                Ok(classify_indexed_batch(
-                    &pair,
-                    chain_epoch,
-                    indexed,
-                    has_cold_source,
-                ))
-            }
+            })
+            .await
+        }
+        .in_current_span();
+        Some(CanonicalRefill {
+            future: Box::pin(future),
         })
-        .await;
+    }
+
+    fn finish_canonical_slice(&mut self, batch_read: Result<Vec<PreparedTransaction>, QueryError>) {
+        self.refill_in_flight = false;
         match batch_read {
             Ok(classified) => self.prepared.extend(classified),
             Err(error) => {
