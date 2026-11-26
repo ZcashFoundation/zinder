@@ -8,6 +8,7 @@
 //! binary is reading it.
 
 use std::{
+    fmt,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BearerToken,
-    config::{ConfigError, load_bearer_token, parse_socket_addr},
+    config::{ConfigError, parse_socket_addr, resolve_optional_bearer_token},
     sections::defaults::{
         DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT, DEFAULT_INGEST_CONTROL_LISTEN_ADDR,
         DEFAULT_INGEST_CONTROL_READER_URL,
@@ -26,10 +27,10 @@ use crate::{
 /// Raw `[ingest_control]` config section.
 ///
 /// The writer reads [`Self::listen_addr`]; the readers read
-/// [`Self::addr`]; both read [`Self::bearer_token_path`]. Fields the
-/// other side does not consume are ignored, so the same operator-supplied
-/// section serves both planes.
-#[derive(Clone, Debug, Default, Deserialize)]
+/// [`Self::addr`]; both read [`Self::bearer_token_path`] or
+/// [`Self::bearer_token`]. Fields the other side does not consume are
+/// ignored, so the same operator-supplied section serves both planes.
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IngestControlSection {
     /// Writer-side bind address for the `IngestControl` gRPC endpoint.
@@ -42,14 +43,46 @@ pub struct IngestControlSection {
     /// Shared-secret bearer token path enforced on every `IngestControl`
     /// request when auth is enabled (ADR-0011). The writer reads this
     /// file to verify; the readers read the same file to present.
+    /// Mutually exclusive with [`Self::bearer_token`].
     pub bearer_token_path: Option<PathBuf>,
+    /// Inline shared-secret bearer token for `IngestControl` requests.
+    /// Mutually exclusive with [`Self::bearer_token_path`].
+    pub bearer_token: Option<String>,
     /// File containing the capability token required only for canonical owner
     /// checkpoint creation. Reader-only compat processes must not receive it.
+    /// Mutually exclusive with [`Self::checkpoint_bearer_token`].
     pub checkpoint_bearer_token_path: Option<PathBuf>,
+    /// Inline capability token required only for canonical owner checkpoint
+    /// creation. Mutually exclusive with [`Self::checkpoint_bearer_token_path`].
+    pub checkpoint_bearer_token: Option<String>,
     /// Writer-owned directory below which canonical checkpoint candidates are
     /// staged. The checkpoint control RPC accepts opaque identifiers only and
     /// never accepts an arbitrary filesystem path.
     pub checkpoint_staging_root: Option<PathBuf>,
+}
+
+impl fmt::Debug for IngestControlSection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IngestControlSection")
+            .field("listen_addr", &self.listen_addr)
+            .field("addr", &self.addr)
+            .field("bearer_token_path", &self.bearer_token_path)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "checkpoint_bearer_token_path",
+                &self.checkpoint_bearer_token_path,
+            )
+            .field(
+                "checkpoint_bearer_token",
+                &self.checkpoint_bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("checkpoint_staging_root", &self.checkpoint_staging_root)
+            .finish()
+    }
 }
 
 /// Resolved writer-side ingest-control configuration.
@@ -103,9 +136,18 @@ pub fn resolve_ingest_control_writer(
             &listen_addr_text,
         )?)
     };
-    let bearer_token = load_bearer_token(section.bearer_token_path.as_deref())?;
-    let checkpoint_bearer_token =
-        load_bearer_token(section.checkpoint_bearer_token_path.as_deref())?;
+    let bearer_token = resolve_optional_bearer_token(
+        section.bearer_token_path.as_deref(),
+        section.bearer_token.as_deref(),
+        "ingest_control.bearer_token_path",
+        "ingest_control.bearer_token",
+    )?;
+    let checkpoint_bearer_token = resolve_optional_bearer_token(
+        section.checkpoint_bearer_token_path.as_deref(),
+        section.checkpoint_bearer_token.as_deref(),
+        "ingest_control.checkpoint_bearer_token_path",
+        "ingest_control.checkpoint_bearer_token",
+    )?;
     Ok(ResolvedIngestControlWriter {
         listen_addr,
         bearer_token_path: section.bearer_token_path,
@@ -136,7 +178,12 @@ pub fn resolve_ingest_control_reader(
             "ingest_control.addr {addr} is not a valid endpoint: {source}"
         ))
     })?;
-    let bearer_token = load_bearer_token(section.bearer_token_path.as_deref())?;
+    let bearer_token = resolve_optional_bearer_token(
+        section.bearer_token_path.as_deref(),
+        section.bearer_token.as_deref(),
+        "ingest_control.bearer_token_path",
+        "ingest_control.bearer_token",
+    )?;
     Ok(ResolvedIngestControlReader {
         addr,
         bearer_token_path: section.bearer_token_path,
@@ -155,16 +202,44 @@ pub struct IngestControlWriterToml {
     /// which file is in use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bearer_token_path: Option<String>,
+    /// Redacted placeholder when an inline bearer token is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<&'static str>,
     /// Checkpoint capability-token path, never token material.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_bearer_token_path: Option<String>,
+    /// Redacted placeholder when an inline checkpoint capability token is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_bearer_token: Option<&'static str>,
     /// Staging root used for canonical owner checkpoint candidates.
     pub checkpoint_staging_root: String,
 }
 
 impl IngestControlWriterToml {
+    /// Builds a writer-side TOML projection from a resolved writer config.
+    #[must_use]
+    pub fn from_writer(resolved: &ResolvedIngestControlWriter) -> Self {
+        Self {
+            listen_addr: resolved.listen_addr.map_or_default(|addr| addr.to_string()),
+            bearer_token_path: resolved
+                .bearer_token_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            bearer_token: (resolved.bearer_token.is_some() && resolved.bearer_token_path.is_none())
+                .then_some("[REDACTED]"),
+            checkpoint_bearer_token_path: resolved
+                .checkpoint_bearer_token_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            checkpoint_bearer_token: (resolved.checkpoint_bearer_token.is_some()
+                && resolved.checkpoint_bearer_token_path.is_none())
+            .then_some("[REDACTED]"),
+            checkpoint_staging_root: resolved.checkpoint_staging_root.display().to_string(),
+        }
+    }
+
     /// Builds a writer-side TOML projection from a resolved listen
-    /// address and the optional bearer-token path.
+    /// address and the optional bearer-token paths.
     #[must_use]
     pub fn from_resolved(
         listen_addr: Option<SocketAddr>,
@@ -175,8 +250,10 @@ impl IngestControlWriterToml {
         Self {
             listen_addr: listen_addr.map_or_default(|addr| addr.to_string()),
             bearer_token_path: bearer_token_path.map(|path| path.display().to_string()),
+            bearer_token: None,
             checkpoint_bearer_token_path: checkpoint_bearer_token_path
                 .map(|path| path.display().to_string()),
+            checkpoint_bearer_token: None,
             checkpoint_staging_root: checkpoint_staging_root.display().to_string(),
         }
     }
@@ -192,9 +269,26 @@ pub struct IngestControlReaderToml {
     /// which file is in use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bearer_token_path: Option<String>,
+    /// Redacted placeholder when an inline bearer token is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<&'static str>,
 }
 
 impl IngestControlReaderToml {
+    /// Builds a reader-side TOML projection from a resolved reader config.
+    #[must_use]
+    pub fn from_reader(resolved: &ResolvedIngestControlReader) -> Self {
+        Self {
+            addr: resolved.addr.clone(),
+            bearer_token_path: resolved
+                .bearer_token_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            bearer_token: (resolved.bearer_token.is_some() && resolved.bearer_token_path.is_none())
+                .then_some("[REDACTED]"),
+        }
+    }
+
     /// Builds a reader-side TOML projection from a resolved endpoint and
     /// the optional bearer-token path.
     #[must_use]
@@ -202,6 +296,7 @@ impl IngestControlReaderToml {
         Self {
             addr,
             bearer_token_path: bearer_token_path.map(|path| path.display().to_string()),
+            bearer_token: None,
         }
     }
 }

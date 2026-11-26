@@ -750,14 +750,16 @@ fn park_config(
     Ok(ProjectorConfig {
         profile: None,
         network: Network::ZcashRegtest,
+        storage_data_dir: None,
         canonical_path: root.join("canonical"),
         canonical_secondary_path: root.join("canonical-secondary"),
+        storage_full_blocks: None,
         expected_canonical_raw_blob_retention: RawBlobRetention::Transactions,
         wallet_path: root.join("wallet"),
         canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
         wallet_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
         reorg_window_blocks: REORG_WINDOW_BLOCKS,
-        build_owner: [0x42; 16],
+        build_owner: Some([0x42; 16]),
         lease_duration: LEASE_DURATION,
         fence_convergence_timeout: Duration::from_secs(5),
         build: ProjectorBuildConfig {

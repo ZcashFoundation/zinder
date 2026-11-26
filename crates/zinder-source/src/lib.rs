@@ -45,8 +45,8 @@ pub use node_source::{
 pub use node_target::{
     DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS, DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS,
     DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR, DEFAULT_NODE_MAX_CONCURRENT_REQUESTS,
-    DEFAULT_NODE_REQUEST_TIMEOUT_SECS, MAX_NODE_MAX_CONCURRENT_REQUESTS, NodeAuthSection,
-    NodeConfigError, NodeFallbackSections, NodeHealthConfig, NodeHealthSection,
+    DEFAULT_NODE_REQUEST_TIMEOUT_SECS, IndexerTlsMaterial, MAX_NODE_MAX_CONCURRENT_REQUESTS,
+    NodeAuthSection, NodeConfigError, NodeFallbackSections, NodeHealthConfig, NodeHealthSection,
     NodeIndexerClientIdentity, NodeIndexerTls, NodeIndexerTlsSection, NodeSection, NodeTarget,
     redact_endpoint_url,
 };

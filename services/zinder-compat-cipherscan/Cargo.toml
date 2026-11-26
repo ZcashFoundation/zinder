@@ -35,6 +35,7 @@ zinder-source.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
+tempfile.workspace = true
 tower.workspace = true
 zinder-testkit.workspace = true
 

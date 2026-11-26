@@ -286,3 +286,48 @@ fn path_str(path: &Path) -> eyre::Result<&str> {
     path.to_str()
         .ok_or_else(|| eyre::eyre!("path is not valid UTF-8: {}", path.display()))
 }
+
+#[test]
+fn data_dir_and_inline_bearer_token_work_with_redaction() -> eyre::Result<()> {
+    let scratch = tempfile::tempdir()?;
+    let custom_dir = scratch.path().join("zinder-root");
+    let output = zinder_explorer_command()
+        .args(["--print-config"])
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_STORAGE__DATA_DIR", &custom_dir)
+        .env("ZINDER_EXPLORER__BEARER_TOKEN", "explorer-inline-secret")
+        .env("ZINDER_INGEST__SOURCE", "zebra-json-rpc")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains(&format!(
+            "path = \"{}\"",
+            custom_dir.join("canonical").display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "secondary_path = \"{}\"",
+            custom_dir.join("explorer").display()
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("bearer_token = \"[REDACTED]\""), "{stdout}");
+    assert!(!stdout.contains("explorer-inline-secret"), "{stdout}");
+
+    let conflict = zinder_explorer_command()
+        .args(["--print-config"])
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env(
+            "ZINDER_EXPLORER__BEARER_TOKEN_PATH",
+            scratch.path().join("tok"),
+        )
+        .env("ZINDER_EXPLORER__BEARER_TOKEN", "explorer-inline-secret")
+        .output()?;
+    assert!(!conflict.status.success(), "{conflict:?}");
+    let stderr = String::from_utf8(conflict.stderr)?;
+    assert!(!stderr.contains("explorer-inline-secret"), "{stderr}");
+    Ok(())
+}

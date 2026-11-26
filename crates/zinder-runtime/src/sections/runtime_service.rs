@@ -12,6 +12,8 @@ use std::fmt;
 pub enum RuntimeService {
     /// `zinder-ingest`: writer plane.
     Ingest,
+    /// `zinder-projector`: wallet projection writer.
+    Projector,
     /// `zinder-query`: native wallet query reader.
     Query,
     /// `zinder-compat-lightwalletd`: lightwalletd-protocol compatibility reader.
@@ -29,6 +31,7 @@ impl RuntimeService {
     pub const fn binary_name(self) -> &'static str {
         match self {
             Self::Ingest => "zinder-ingest",
+            Self::Projector => "zinder-projector",
             Self::Query => "zinder-query",
             Self::CompatLightwalletd => "zinder-compat-lightwalletd",
             Self::CompatCipherscan => "zinder-compat-cipherscan",
@@ -51,6 +54,7 @@ mod tests {
     fn binary_name_matches_display() {
         for service in [
             RuntimeService::Ingest,
+            RuntimeService::Projector,
             RuntimeService::Query,
             RuntimeService::CompatLightwalletd,
             RuntimeService::CompatCipherscan,

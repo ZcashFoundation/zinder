@@ -29,11 +29,32 @@ fn every_variable_the_loader_accepts_is_documented() -> eyre::Result<()> {
 
 #[test]
 fn a_variable_outside_the_loader_schema_is_rejected() {
-    let outcome = probe().check_documented_variables_are_accepted(["ZINDER_STORAGE__PATH"]);
+    let outcome = probe().check_documented_variables_are_accepted(["ZINDER_UNKNOWN_SECTION__PATH"]);
     assert!(
         outcome.is_err(),
         "the loader must reject a section it does not define"
     );
+}
+
+#[test]
+fn sibling_service_variables_are_tolerated_in_shared_environment() -> eyre::Result<()> {
+    let scratch = tempfile::tempdir()?;
+    let output = std::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-cipherscan"))
+        .args(["--print-config"])
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env(
+            "ZINDER_STORAGE__DATA_DIR",
+            scratch.path().join("shared-data"),
+        )
+        .env(
+            "ZINDER_STORAGE__PATH",
+            scratch.path().join("shared-canonical"),
+        )
+        .env("ZINDER_INGEST__SOURCE", "zebra-json-rpc")
+        .env("ZINDER_DEPLOYMENT__PROFILE", "explorer")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    Ok(())
 }
 
 #[test]

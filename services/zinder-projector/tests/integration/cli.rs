@@ -513,10 +513,12 @@ lease_duration_seconds = 14400
     Ok(())
 }
 
-/// The projector reads the canonical writer's admitted schedule, so it
-/// accepts no node setting, fallback endpoints included, from any source.
+/// The projector ignores sibling `[node]` and `[node_fallbacks]` settings in
+/// shared environments, while still refusing the CLI `--node-json-rpc-addr`
+/// flag and unknown typo sections.
 #[test]
-fn node_settings_are_rejected() -> eyre::Result<()> {
+fn node_cli_flag_and_unknown_sections_are_rejected_while_sibling_node_is_tolerated()
+-> eyre::Result<()> {
     let flag = projector_command()
         .args([
             "--print-config",
@@ -530,25 +532,38 @@ fn node_settings_are_rejected() -> eyre::Result<()> {
         "the removed flag must be named in the refusal"
     );
 
-    let environment = projector_command()
-        .args(["--print-config", "--network", "zcash-regtest"])
+    let sibling = projector_command()
+        .env_clear()
+        .args([
+            "--print-config",
+            "--network",
+            "zcash-regtest",
+            "--lease-duration-seconds",
+            "14400",
+        ])
         .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
-        .output()?;
-    assert!(!environment.status.success(), "{environment:?}");
-    let stderr = String::from_utf8(environment.stderr)?;
-    assert!(stderr.contains("unknown field `node`"), "{stderr}");
-
-    let fallbacks = projector_command()
-        .args(["--print-config", "--network", "zcash-regtest"])
         .env(
             "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR",
             "http://127.0.0.1:28232",
         )
         .output()?;
-    assert!(!fallbacks.status.success(), "{fallbacks:?}");
-    let stderr = String::from_utf8(fallbacks.stderr)?;
+    assert!(sibling.status.success(), "{sibling:?}");
+
+    let typo = projector_command()
+        .env_clear()
+        .args([
+            "--print-config",
+            "--network",
+            "zcash-regtest",
+            "--lease-duration-seconds",
+            "14400",
+        ])
+        .env("ZINDER_UNKNOWN_SECTION__VALUE", "x")
+        .output()?;
+    assert!(!typo.status.success(), "{typo:?}");
+    let stderr = String::from_utf8(typo.stderr)?;
     assert!(
-        stderr.contains("unknown field `node_fallbacks`"),
+        stderr.contains("unknown field `unknown_section`"),
         "{stderr}"
     );
     Ok(())
@@ -567,7 +582,11 @@ fn path_str(path: &Path) -> eyre::Result<&str> {
 fn wallet_profiles_supply_omitted_retention_and_round_trip_printed_config() -> eyre::Result<()> {
     let directory = tempdir()?;
     let config_path = directory.path().join("projector.toml");
-    for profile in ["wallet", "wallet-archive"] {
+    for (profile, full_blocks) in [
+        ("wallet", None),
+        ("wallet", Some("true")),
+        ("explorer", None),
+    ] {
         let initial = || {
             let mut command = projector_command();
             command
@@ -582,12 +601,18 @@ fn wallet_profiles_supply_omitted_retention_and_round_trip_printed_config() -> e
                     "14400",
                 ])
                 .env("ZINDER_DEPLOYMENT__PROFILE", profile);
+            if let Some(full_blocks) = full_blocks {
+                command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+            }
             command
         };
         let output = initial().output()?;
         assert!(output.status.success(), "{output:?}");
         let rendered = String::from_utf8(output.stdout)?;
         assert!(rendered.contains(&format!("[deployment]\nprofile = \"{profile}\"")));
+        if full_blocks == Some("true") {
+            assert!(rendered.contains("full_blocks = true"), "{rendered}");
+        }
         assert!(!rendered.contains("raw_blob_policy ="));
         fs::write(&config_path, &rendered)?;
 
@@ -602,7 +627,7 @@ fn wallet_profiles_supply_omitted_retention_and_round_trip_printed_config() -> e
             .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
             .output()?;
         assert!(!conflict.status.success(), "{conflict:?}");
-        assert!(String::from_utf8(conflict.stderr)?.contains("requires storage.raw_blob_policy"));
+        assert!(String::from_utf8(conflict.stderr)?.contains("storage.raw_blob_policy"));
     }
     Ok(())
 }
@@ -664,6 +689,88 @@ fn startup_creates_nested_secondary_and_reports_missing_paths() -> eyre::Result<
     assert!(
         failure_stderr.contains(path_str(&uncreatable_secondary)?),
         "{failure_stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn data_dir_optional_build_owner_and_inline_bearer_tokens_work() -> eyre::Result<()> {
+    let scratch = tempdir()?;
+    let custom_dir = scratch.path().join("projector-root");
+    let expected_owner_file = custom_dir.join("wallet.build-owner");
+    let staging = scratch.path().join("staging");
+
+    let output = projector_command()
+        .env_clear()
+        .args([
+            "--print-config",
+            "--network",
+            "zcash-regtest",
+            "--lease-duration-seconds",
+            "14400",
+        ])
+        .env("ZINDER_STORAGE__DATA_DIR", &custom_dir)
+        .env("ZINDER_INGEST_CONTROL__BEARER_TOKEN", "proj-ingest-secret")
+        .env("ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR", "127.0.0.1:9109")
+        .env(
+            "ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN",
+            "proj-control-secret",
+        )
+        .env(
+            "ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT",
+            &staging,
+        )
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !expected_owner_file.exists(),
+        "--print-config must not create build-owner state on disk"
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains(&format!(
+            "canonical_path = \"{}\"",
+            custom_dir.join("canonical").display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "canonical_secondary_path = \"{}\"",
+            custom_dir.join("canonical-secondary/projector").display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "path = \"{}\"",
+            custom_dir.join("wallet").display()
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("build_owner_hex"), "{stdout}");
+    assert!(stdout.contains("bearer_token = \"[REDACTED]\""), "{stdout}");
+    assert!(!stdout.contains("proj-ingest-secret"), "{stdout}");
+    assert!(!stdout.contains("proj-control-secret"), "{stdout}");
+
+    fs::create_dir_all(&custom_dir)?;
+    fs::write(&expected_owner_file, "00112233445566778899aabbccddeeff")?;
+    let with_persisted = projector_command()
+        .env_clear()
+        .args([
+            "--print-config",
+            "--network",
+            "zcash-regtest",
+            "--lease-duration-seconds",
+            "14400",
+        ])
+        .env("ZINDER_STORAGE__DATA_DIR", &custom_dir)
+        .output()?;
+    assert!(with_persisted.status.success(), "{with_persisted:?}");
+    let persisted_stdout = String::from_utf8(with_persisted.stdout)?;
+    assert!(
+        persisted_stdout.contains("build_owner_hex = \"00112233445566778899aabbccddeeff\""),
+        "{persisted_stdout}"
     );
     Ok(())
 }

@@ -1,6 +1,9 @@
 //! Configuration loading for the `zinder-explorer` binary.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -9,9 +12,10 @@ use zinder_runtime::{
     BearerToken, BearerTokenError, ClientAddressSource, ConfigError, ConfigLoader, NetworkSection,
     NetworkToml, OpsSection, OpsServerError, OpsToml, ResolvedSecondaryStorage, RuntimeService,
     SecondaryStorageSection, SecondaryStorageToml, SecuritySection, SecurityToml,
-    guard_optional_serving_bind, guard_serving_bind, load_bearer_token, parse_socket_addr,
-    require_field, resolve_allow_public_bind, resolve_ops_listen_addr, resolve_secondary_storage,
-    section_defaults::DEFAULT_CANONICAL_PATH,
+    derive_canonical_path, derive_explorer_secondary_path, guard_optional_serving_bind,
+    guard_serving_bind, parse_socket_addr, require_field, resolve_allow_public_bind,
+    resolve_ops_listen_addr, resolve_optional_bearer_token, resolve_secondary_storage,
+    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 
@@ -88,12 +92,6 @@ pub(crate) fn load_explorer_config(
     overrides: ExplorerConfigOverrides,
 ) -> Result<ExplorerConfig, ExplorerConfigError> {
     let raw: ExplorerRawConfig = ConfigLoader::new()
-        // Explorer locates its materialized-view primary beneath the canonical root.
-        .with_default("storage.path", DEFAULT_CANONICAL_PATH)?
-        .with_default(
-            "storage.secondary_path",
-            "/var/lib/zinder/explorer/secondary",
-        )?
         .with_default("explorer.listen_addr", DEFAULT_LISTEN_ADDR)?
         .with_ops_section(RuntimeService::Explorer)?
         .with_security_section()?
@@ -138,13 +136,33 @@ struct ExplorerRawConfig {
     security: SecuritySection,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ExplorerSection {
     listen_addr: Option<String>,
     bearer_token_path: Option<PathBuf>,
+    bearer_token: Option<String>,
     wallet_query_endpoint: Option<String>,
     trust_proxy_client_address: Option<bool>,
+}
+
+impl std::fmt::Debug for ExplorerSection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExplorerSection")
+            .field("listen_addr", &self.listen_addr)
+            .field("bearer_token_path", &self.bearer_token_path)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("wallet_query_endpoint", &self.wallet_query_endpoint)
+            .field(
+                "trust_proxy_client_address",
+                &self.trust_proxy_client_address,
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +179,8 @@ struct ExplorerToml {
     listen_addr: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     bearer_token_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bearer_token: Option<&'static str>,
     wallet_query_endpoint: String,
     trust_proxy_client_address: bool,
 }
@@ -178,6 +198,8 @@ impl ExplorerConfigToml {
                     .bearer_token_path
                     .as_ref()
                     .map(|path| path.display().to_string()),
+                bearer_token: (config.bearer_token.is_some() && config.bearer_token_path.is_none())
+                    .then_some("[REDACTED]"),
                 wallet_query_endpoint: config.wallet_query_endpoint.clone().unwrap_or_default(),
                 trust_proxy_client_address: config
                     .client_address_source
@@ -187,13 +209,32 @@ impl ExplorerConfigToml {
     }
 }
 
-fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, ExplorerConfigError> {
+fn resolve_explorer_config(
+    mut raw: ExplorerRawConfig,
+) -> Result<ExplorerConfig, ExplorerConfigError> {
     let network = raw.network.resolve()?;
+    raw.storage.data_dir = validate_optional_data_dir(raw.storage.data_dir)?;
+    let data_dir = raw.storage.data_dir.as_deref();
+    let canonical_root = data_dir.unwrap_or_else(|| Path::new(DEFAULT_DATA_DIR));
+    raw.storage
+        .path
+        .get_or_insert_with(|| derive_canonical_path(canonical_root));
+    raw.storage.secondary_path.get_or_insert_with(|| {
+        data_dir.map_or_else(
+            || PathBuf::from("/var/lib/zinder/explorer/secondary"),
+            derive_explorer_secondary_path,
+        )
+    });
     let storage = resolve_secondary_storage(raw.storage)?;
     let listen_addr_text = require_field(raw.explorer.listen_addr, "explorer.listen_addr")?;
     let listen_addr = parse_socket_addr("explorer.listen_addr", &listen_addr_text)?;
     let bearer_token_path = raw.explorer.bearer_token_path;
-    let bearer_token = load_bearer_token(bearer_token_path.as_deref())?;
+    let bearer_token = resolve_optional_bearer_token(
+        bearer_token_path.as_deref(),
+        raw.explorer.bearer_token.as_deref(),
+        "explorer.bearer_token_path",
+        "explorer.bearer_token",
+    )?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
     let allow_public_bind = resolve_allow_public_bind(raw.security)?;
     guard_serving_bind("explorer.listen_addr", listen_addr, allow_public_bind)?;

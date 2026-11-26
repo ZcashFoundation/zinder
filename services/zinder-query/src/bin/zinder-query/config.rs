@@ -20,10 +20,12 @@ use zinder_runtime::{
     DeploymentToml, IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml,
     NodeFallbacksToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
     ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
-    parse_socket_addr, require_field, resolve_allow_public_bind,
-    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
-    resolve_wallet_projection_reader_rocksdb_budget,
+    RuntimeService, SecuritySection, SecurityToml, derive_canonical_path,
+    derive_canonical_secondary_path, derive_wallet_path, derive_wallet_secondary_path,
+    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
+    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
+    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{
@@ -65,14 +67,11 @@ pub(super) struct QueryConfig {
 
 impl QueryConfig {
     pub(super) fn canonical_requirements(&self) -> CanonicalStoreRequirements {
-        self.profile.map_or_else(
-            || {
-                CanonicalStoreRequirements::for_blob_retention(
-                    self.storage.expected_raw_blob_retention,
-                )
-            },
+        let requirements = self.profile.map_or_else(
+            CanonicalStoreRequirements::default,
             DeploymentProfile::canonical_requirement,
-        )
+        );
+        requirements.with_blob_retention(self.storage.expected_raw_blob_retention)
     }
 }
 
@@ -212,18 +211,60 @@ fn apply_deployment_profile(config: &mut QueryRawConfig) -> Result<(), ConfigErr
             ));
         }
         config.storage.raw_blob_policy =
-            Some(profile.resolve_raw_blob_retention(config.storage.raw_blob_policy)?);
-        if profile == DeploymentProfile::Wallet && config.node.is_none() {
-            return Err(ConfigError::invalid(
-                "the wallet profile requires [node] for verified mined transaction bytes",
-            ));
+            Some(profile.resolve_raw_blob_retention_with_full_blocks(
+                config.storage.full_blocks,
+                config.storage.raw_blob_policy,
+            )?);
+        if matches!(
+            profile,
+            DeploymentProfile::Wallet | DeploymentProfile::Explorer
+        ) && config.storage.full_blocks != Some(true)
+            && config.node.is_none()
+        {
+            return Err(ConfigError::invalid(format!(
+                "the {} profile requires [node] for verified mined transaction bytes",
+                profile.as_str(),
+            )));
         }
+    }
+    Ok(())
+}
+
+fn derive_query_storage_paths(config: &mut QueryRawConfig) -> Result<(), ConfigError> {
+    config.storage.data_dir = validate_optional_data_dir(config.storage.data_dir.take())?;
+    let all_paths_unset = config.storage.path.is_none()
+        && config.storage.secondary_path.is_none()
+        && config.wallet.path.is_none()
+        && config.wallet.secondary_path.is_none();
+    let effective_data_dir = config
+        .storage
+        .data_dir
+        .as_deref()
+        .or_else(|| all_paths_unset.then_some(Path::new(DEFAULT_DATA_DIR)));
+    if let Some(dir) = effective_data_dir {
+        config
+            .storage
+            .path
+            .get_or_insert_with(|| derive_canonical_path(dir));
+        config
+            .storage
+            .secondary_path
+            .get_or_insert_with(|| derive_canonical_secondary_path(dir, "query"));
+        config
+            .wallet
+            .path
+            .get_or_insert_with(|| derive_wallet_path(dir));
+        config
+            .wallet
+            .secondary_path
+            .get_or_insert_with(|| derive_wallet_secondary_path(dir, "query"));
     }
     Ok(())
 }
 
 fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
     apply_deployment_profile(&mut config)?;
+    derive_query_storage_paths(&mut config)?;
     let profile = config.deployment.profile;
     let network = config.network.resolve()?;
     let storage = resolve_canonical_secondary_storage(config.storage)?;
@@ -441,10 +482,11 @@ impl QueryConfigToml {
                 secondary_path: config.wallet_secondary_root.clone(),
                 rocksdb: RocksDbResourceBudgetToml::from_resolved(config.wallet_rocksdb_budget),
             },
-            ingest_control: IngestControlReaderToml::from_resolved(
-                config.ingest_control_addr.clone(),
-                config.ingest_control_bearer_token_path.as_deref(),
-            ),
+            ingest_control: IngestControlReaderToml::from_reader(&ResolvedIngestControlReader {
+                addr: config.ingest_control_addr.clone(),
+                bearer_token_path: config.ingest_control_bearer_token_path.clone(),
+                bearer_token: config.ingest_control_bearer_token.clone(),
+            }),
             query: QueryToml {
                 listen_addr: config.listen_addr.to_string(),
                 reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
