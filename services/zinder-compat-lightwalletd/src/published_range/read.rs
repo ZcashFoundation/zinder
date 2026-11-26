@@ -706,12 +706,199 @@ fn cancelled_outcome<Output>(
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use eyre::{Result, eyre};
+    use prost::Message as _;
     use tonic::Code;
     use zinder_core::{
-        ArtifactSchemaVersion, ChainEpochId, ChainTipMetadata, Network, UnixTimestampMillis,
+        ArtifactSchemaVersion, ChainEpochId, ChainTipMetadata, CompactChainMetadata,
+        CompactSaplingOutput, CompactShieldedAction, CompactTransaction, CompactTransactionData,
+        Network, TransactionId, UnixTimestampMillis,
     };
+    use zinder_proto::compat::lightwalletd::{BoundedChunkRetention, CompactBlock, PoolType};
 
     use super::*;
+    use crate::sealed_history::SealedSlab;
+
+    fn sample_orchard_action(seed: u8) -> CompactShieldedAction {
+        CompactShieldedAction {
+            nullifier: [seed; 32],
+            commitment: [seed.wrapping_add(1); 32],
+            ephemeral_key: [seed.wrapping_add(2); 32],
+            ciphertext: [seed.wrapping_add(3); 52],
+        }
+    }
+
+    fn sample_sapling_output(seed: u8) -> CompactSaplingOutput {
+        CompactSaplingOutput {
+            commitment: [seed; 32],
+            ephemeral_key: [seed.wrapping_add(1); 32],
+            ciphertext: [seed.wrapping_add(2); 52],
+        }
+    }
+
+    fn sample_artifact(
+        height_num: u32,
+        orchard_count: usize,
+        with_sapling: bool,
+    ) -> Result<CompactBlockArtifact> {
+        let txs = if orchard_count == 0 && !with_sapling {
+            Vec::new()
+        } else {
+            let mut raw_id = [0x42; 32];
+            raw_id[..4].copy_from_slice(&height_num.to_le_bytes());
+            let actions = (0..orchard_count)
+                .map(|idx| sample_orchard_action(u8::try_from(idx % 251).unwrap_or(0)))
+                .collect();
+            let sapling_outputs = if with_sapling {
+                vec![sample_sapling_output(0x7a)]
+            } else {
+                Vec::new()
+            };
+            vec![CompactTransaction {
+                index: 1,
+                transaction_id: TransactionId::from_bytes(raw_id),
+                data: CompactTransactionData {
+                    fee_zat: Some(10_000),
+                    sapling_outputs,
+                    orchard_actions: actions,
+                    ..Default::default()
+                },
+            }]
+        };
+        let hash_byte = u8::try_from(height_num).unwrap_or(1);
+        Ok(CompactBlockArtifact::new(
+            BlockId::new(
+                BlockHeight::new(height_num),
+                BlockHash::from_bytes([hash_byte; 32]),
+            ),
+            BlockHash::from_bytes([hash_byte.saturating_sub(1); 32]),
+            1_700_000_000 + height_num,
+            txs,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: u32::from(with_sapling),
+                orchard_commitment_tree_size: u32::try_from(orchard_count)?,
+                ironwood_commitment_tree_size: 0,
+            },
+        )?)
+    }
+
+    fn sealed_shielded_row(block: &CompactBlockArtifact) -> Result<SealedBlock> {
+        let message = CompactBlockShape::DEFAULT_RANGE
+            .encoded(block.clone())
+            .map_err(|status| eyre!(status.to_string()))?;
+        Ok(SealedBlock {
+            id: BlockId::new(block.height(), block.block_hash()),
+            parent: block.previous_block_hash(),
+            native_bytes: message.payload_len(),
+            message,
+        })
+    }
+
+    fn assert_projected_parity(
+        rows: &[SealedBlock],
+        artifacts: &[CompactBlockArtifact],
+        orchard_shape: CompactBlockShape,
+    ) -> Result<()> {
+        for (row, artifact) in rows.iter().zip(artifacts) {
+            let expected = orchard_shape
+                .encoded(artifact.clone())
+                .map_err(|status| eyre!(status.to_string()))?;
+            let frame = row.message.as_length_prefixed();
+            assert_eq!(frame, expected.as_length_prefixed());
+            assert_eq!(frame[0], 0);
+            let prefix_len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+            assert_eq!(prefix_len, row.message.payload_len());
+            assert_eq!(
+                CompactBlock::decode(row.message.payload())?,
+                CompactBlock::decode(expected.payload())?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn slab_packer_handles_32k_standalone_64k_rollover_and_passthrough_rows() -> Result<()> {
+        let orchard_shape = CompactBlockShape::for_range(&[PoolType::Orchard as i32])
+            .map_err(|status| eyre!(status.to_string()))?;
+        let projection = orchard_shape
+            .published_projection()
+            .ok_or_else(|| eyre!("expected orchard published projection"))?;
+        assert_eq!(projection.slab(), SealedSlab::Shielded);
+        let selection = projection
+            .selection()
+            .ok_or_else(|| eyre!("expected wire selection"))?;
+
+        let artifacts = [
+            sample_artifact(1, 205, true)?,
+            sample_artifact(2, 0, false)?,
+            sample_artifact(3, 205, true)?,
+            sample_artifact(4, 206, true)?,
+            sample_artifact(5, 0, false)?,
+            sample_artifact(6, 20, true)?,
+        ];
+        let mut step_rows: Vec<SealedBlock> = artifacts
+            .iter()
+            .map(sealed_shielded_row)
+            .collect::<Result<_>>()?;
+        let mut batch_rows = step_rows.clone();
+        let passthrough_first_ptr = step_rows[1].message.as_length_prefixed().as_ptr();
+        let passthrough_second_ptr = step_rows[4].message.as_length_prefixed().as_ptr();
+
+        let mut packer = ProjectedSlabPacker::new();
+        packer.project_row(&mut step_rows, 0, selection)?;
+        let len0 = packer.slab_bytes.len();
+        assert!((32_500..STANDALONE_PROJECTED_FRAME_BYTES).contains(&len0));
+        assert_eq!(
+            packer.slab_bytes.capacity(),
+            STANDALONE_PROJECTED_FRAME_BYTES
+        );
+        packer.project_row(&mut step_rows, 1, selection)?;
+        assert_eq!(packer.pending.len(), 1);
+        packer.project_row(&mut step_rows, 2, selection)?;
+        assert_eq!(packer.slab_bytes.len(), len0 * 2);
+        let slab1_alloc = packer.slab_bytes.capacity();
+        assert_eq!(slab1_alloc, PACKED_PROJECTION_SLAB_BYTES);
+        assert!(slab1_alloc <= BoundedChunkRetention::MAX_ALLOCATION_BYTES);
+
+        packer.project_row(&mut step_rows, 3, selection)?;
+        let len3 = step_rows[3].message.as_length_prefixed().len();
+        assert!(len3 >= STANDALONE_PROJECTED_FRAME_BYTES);
+        assert!(len3 <= BoundedChunkRetention::MAX_ALLOCATION_BYTES);
+        assert_eq!(packer.pending.len(), 2);
+        packer.project_row(&mut step_rows, 4, selection)?;
+        assert_eq!(packer.pending.len(), 2);
+
+        packer.project_row(&mut step_rows, 5, selection)?;
+        assert_eq!(packer.pending.len(), 1);
+        let len5 = packer.slab_bytes.len();
+        assert!(len0 * 2 + len5 > PACKED_PROJECTION_SLAB_BYTES);
+        let slab2_alloc = packer.slab_bytes.capacity();
+        assert_eq!(slab2_alloc, MIN_PACKED_PROJECTION_CAPACITY);
+        assert!(slab2_alloc <= BoundedChunkRetention::MAX_ALLOCATION_BYTES);
+        packer.flush(&mut step_rows)?;
+
+        project_sealed_blocks(&mut batch_rows, selection, None)?;
+        assert_projected_parity(&step_rows, &artifacts, orchard_shape)?;
+        assert_projected_parity(&batch_rows, &artifacts, orchard_shape)?;
+
+        let ptr0 = step_rows[0].message.as_length_prefixed().as_ptr();
+        let ptr2 = step_rows[2].message.as_length_prefixed().as_ptr();
+        let ptr3 = step_rows[3].message.as_length_prefixed().as_ptr();
+        let ptr5 = step_rows[5].message.as_length_prefixed().as_ptr();
+        assert!(std::ptr::eq(
+            step_rows[1].message.as_length_prefixed().as_ptr(),
+            passthrough_first_ptr
+        ));
+        assert!(std::ptr::eq(
+            step_rows[4].message.as_length_prefixed().as_ptr(),
+            passthrough_second_ptr
+        ));
+        assert_eq!(ptr0.wrapping_add(len0), ptr2);
+        let slab1_span = (ptr0 as usize)..(ptr0.wrapping_add(slab1_alloc) as usize);
+        assert!(!slab1_span.contains(&(ptr3 as usize)));
+        assert!(!slab1_span.contains(&(ptr5 as usize)));
+        Ok(())
+    }
 
     #[test]
     fn cancellation_after_catalog_read_skips_conversion() {
