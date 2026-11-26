@@ -588,7 +588,7 @@ impl ProjectedSlabPacker {
     }
 }
 
-pub(super) fn project_sealed_blocks(
+fn project_sealed_blocks(
     rows: &mut [SealedBlock],
     selection: ShieldedProjectionSelection,
     cancel: Option<&CancellationToken>,
@@ -638,9 +638,11 @@ impl PublishedRangeRead {
             return cancelled_outcome(Some(started.elapsed()));
         }
         let touches_disk = self.reads_published_files(chunk);
-        if !touches_disk && let Some(live) = tail.as_deref() {
-            let rows =
-                live.select_projected(projection, (chunk, order, max_bytes), (true, Some(&cancel)));
+        if !touches_disk
+            && projection.selection().is_none()
+            && let Some(live) = tail.as_deref()
+        {
+            let rows = Ok(live.select(projection.slab(), chunk, order, max_bytes, true));
             return finish_encoded_rows(epoch, Some(started.elapsed()), rows, &cancel, convert);
         }
         let source = self.clone();

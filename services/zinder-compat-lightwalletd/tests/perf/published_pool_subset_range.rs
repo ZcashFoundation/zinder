@@ -1,8 +1,16 @@
 //! Throughput and speedup benchmark for `[PoolType::Orchard]` `GetBlockRangeNullifiers`
 //! over published `ZSHRNG01` history plus live tail vs canonical `RocksDB` fallback.
 
-use std::{num::NonZeroU32, sync::Arc, time::Instant};
+use std::{
+    num::{NonZeroU16, NonZeroU32},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
+use async_trait::async_trait;
 use eyre::eyre;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
@@ -11,16 +19,29 @@ use zinder_compat_lightwalletd::{
     LightwalletdGrpcAdapter, PublishedShieldedHistory, ShieldedCatalogPublisher,
 };
 use zinder_core::{
-    BlockHeight, BlockId, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
-    CompactSaplingSpend, CompactShieldedAction, CompactTransaction, CompactTransactionData,
-    Network, TransactionId,
+    BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch, ChainEpochId,
+    CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput, CompactSaplingSpend,
+    CompactShieldedAction, CompactTransaction, CompactTransactionData, Network,
+    NetworkUpgradeActivations, RawTransactionBytes, StandardFee, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentOutPoint,
 };
 use zinder_proto::compat::lightwalletd::{
     self, PoolType, compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_query::{
-    RocksDbCanonicalReader, RocksDbWalletReader, WalletServingPairSlot, WalletServingQuery,
-    WalletServingReadPair,
+    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockFence,
+    CompactBlockRange, CompactBlockStream, FullBlock, FullBlockStream,
+    NativeWalletEndpointCapabilities, QueryError, RawTransaction, RocksDbCanonicalReader,
+    RocksDbWalletReader, ServedTipSnapshot, SettledTipBlock, SubtreeRoots, Transaction,
+    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
+    TransparentOutpointSpendStatuses, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
+    WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+};
+use zinder_store::{
+    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
+    StreamCursorTokenV1,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, sample_regtest_upgrade_activations,
@@ -34,6 +55,304 @@ const SEGMENT_BLOCKS: u32 = 1_000;
 const MAX_PUBLISHED_ORCHARD_SCAN_MS: u128 = 5_000;
 #[cfg(not(debug_assertions))]
 const MAX_PUBLISHED_ORCHARD_SCAN_MS: u128 = 500;
+
+/// Delegates to [`WalletServingQuery`] while withholding `compact_block_fence`
+/// so the baseline adapter cannot admit or reuse cached live-tail rows.
+#[derive(Clone)]
+struct CanonicalFallbackQuery {
+    inner: WalletServingQuery<()>,
+    canonical_blocks_read: Arc<AtomicUsize>,
+}
+
+impl CanonicalFallbackQuery {
+    fn new(inner: WalletServingQuery<()>) -> Self {
+        Self {
+            inner,
+            canonical_blocks_read: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn take_canonical_blocks_read(&self) -> usize {
+        self.canonical_blocks_read.swap(0, Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl WalletQueryApi for CanonicalFallbackQuery {
+    fn compact_block_fence(&self, _epoch: ChainEpoch) -> Option<CompactBlockFence> {
+        None
+    }
+
+    fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        self.inner.subscribe_publications()
+    }
+
+    fn current_visible_tip_height(&self) -> Option<BlockHeight> {
+        self.inner.current_visible_tip_height()
+    }
+
+    fn current_chain_epoch(&self) -> Option<ChainEpoch> {
+        self.inner.current_chain_epoch()
+    }
+
+    fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
+        self.inner.native_endpoint_capabilities()
+    }
+
+    fn upstream_node_capabilities(&self) -> Option<UpstreamNodeCapabilities> {
+        self.inner.upstream_node_capabilities()
+    }
+
+    async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
+        self.inner.network_upgrade_activations().await
+    }
+
+    async fn visible_tip_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<VisibleTipBlock, QueryError> {
+        self.inner.visible_tip_block(at_epoch_id).await
+    }
+
+    async fn served_tip_snapshot(&self) -> Result<ServedTipSnapshot, QueryError> {
+        self.inner.served_tip_snapshot().await
+    }
+
+    async fn settled_tip_block(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<SettledTipBlock, QueryError> {
+        self.inner.settled_tip_block(at_epoch_id).await
+    }
+
+    async fn block_id_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockIdAtEpoch, QueryError> {
+        self.inner.block_id_by_selector(selector, at_epoch_id).await
+    }
+
+    async fn block_header_by_selector(
+        &self,
+        selector: BlockSelector,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<BlockHeaderAtEpoch, QueryError> {
+        self.inner
+            .block_header_by_selector(selector, at_epoch_id)
+            .await
+    }
+
+    async fn compact_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlock, QueryError> {
+        self.canonical_blocks_read.fetch_add(1, Ordering::SeqCst);
+        self.inner.compact_block_at(height, at_epoch_id).await
+    }
+
+    async fn compact_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockRange, QueryError> {
+        let served = self
+            .inner
+            .compact_blocks_in_range(block_range, at_epoch_id)
+            .await?;
+        self.canonical_blocks_read
+            .fetch_add(served.compact_blocks.len(), Ordering::SeqCst);
+        Ok(served)
+    }
+
+    async fn compact_block_stream(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockStream, QueryError> {
+        self.inner
+            .compact_block_stream(block_range, at_epoch_id)
+            .await
+    }
+
+    async fn compact_blocks_in_range_up_to(
+        &self,
+        block_range: BlockHeightRange,
+        order: HeightOrder,
+        max_bytes: usize,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockRange, QueryError> {
+        let served = self
+            .inner
+            .compact_blocks_in_range_up_to(block_range, order, max_bytes, at_epoch_id)
+            .await?;
+        self.canonical_blocks_read
+            .fetch_add(served.compact_blocks.len(), Ordering::SeqCst);
+        Ok(served)
+    }
+
+    async fn compact_block_rows_with_lengths(
+        &self,
+        _block_range: BlockHeightRange,
+        _max_bytes: usize,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
+        Ok(None)
+    }
+
+    async fn full_block_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<FullBlock, QueryError> {
+        self.inner.full_block_at(height, at_epoch_id).await
+    }
+
+    async fn full_blocks_in_range(
+        &self,
+        block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<FullBlockStream, QueryError> {
+        self.inner
+            .full_blocks_in_range(block_range, at_epoch_id)
+            .await
+    }
+
+    async fn transaction(
+        &self,
+        transaction_id: TransactionId,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransactionStatus, QueryError> {
+        self.inner.transaction(transaction_id, at_epoch_id).await
+    }
+
+    async fn transaction_at_block_index(
+        &self,
+        height: BlockHeight,
+        tx_index: u64,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Transaction, QueryError> {
+        self.inner
+            .transaction_at_block_index(height, tx_index, at_epoch_id)
+            .await
+    }
+
+    async fn raw_transaction(
+        &self,
+        transaction_id: TransactionId,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<RawTransaction, QueryError> {
+        self.inner
+            .raw_transaction(transaction_id, at_epoch_id)
+            .await
+    }
+
+    async fn transparent_address_unspent_outputs(
+        &self,
+        request: TransparentAddressUnspentOutputsRequest,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        self.inner
+            .transparent_address_unspent_outputs(request, at_epoch_id)
+            .await
+    }
+
+    async fn transparent_address_unspent_outputs_on_demand(
+        &self,
+        request: TransparentAddressUnspentOutputsRequest,
+        first_page_size: NonZeroU16,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        self.inner
+            .transparent_address_unspent_outputs_on_demand(request, first_page_size, at_epoch_id)
+            .await
+    }
+
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        request: TransparentAddressTxIdsInRangeRequest,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressTxIds, QueryError> {
+        self.inner
+            .transparent_address_tx_ids_in_range(request, at_epoch_id)
+            .await
+    }
+
+    async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutpointSpendStatuses, QueryError> {
+        self.inner
+            .transparent_outpoint_spend_status(outpoints, at_epoch_id)
+            .await
+    }
+
+    async fn transparent_address_balance(
+        &self,
+        addresses: Vec<TransparentAddressScriptHash>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressBalance, QueryError> {
+        self.inner
+            .transparent_address_balance(addresses, at_epoch_id)
+            .await
+    }
+
+    async fn tree_state_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TreeState, QueryError> {
+        self.inner.tree_state_at(height, at_epoch_id).await
+    }
+
+    async fn latest_tree_state_checkpoint(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TreeState, QueryError> {
+        self.inner.latest_tree_state_checkpoint(at_epoch_id).await
+    }
+
+    async fn subtree_roots(
+        &self,
+        subtree_root_range: SubtreeRootRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<SubtreeRoots, QueryError> {
+        self.inner
+            .subtree_roots(subtree_root_range, at_epoch_id)
+            .await
+    }
+
+    async fn chain_events(
+        &self,
+        from_cursor: Option<StreamCursorTokenV1>,
+        family: ChainEventStreamFamily,
+    ) -> Result<ChainEvents, QueryError> {
+        self.inner.chain_events(from_cursor, family).await
+    }
+
+    async fn resolve_chain_events_start(
+        &self,
+        start: EventStreamStartPosition,
+        requested_family: ChainEventStreamFamily,
+    ) -> Result<ChainEventStreamResume, QueryError> {
+        self.inner
+            .resolve_chain_events_start(start, requested_family)
+            .await
+    }
+
+    async fn broadcast_transaction(
+        &self,
+        raw_transaction: RawTransactionBytes,
+    ) -> Result<TransactionBroadcastOutcome, QueryError> {
+        self.inner.broadcast_transaction(raw_transaction).await
+    }
+
+    async fn standard_fee(&self) -> Result<StandardFee, QueryError> {
+        self.inner.standard_fee().await
+    }
+}
 
 fn perf_commitment(seed: u8) -> [u8; 32] {
     let mut cmx = [0; 32];
@@ -160,8 +479,8 @@ fn block_range_for_pools(pool_types: Vec<i32>) -> lightwalletd::BlockRange {
     }
 }
 
-async fn drain_encoded_nullifier_range(
-    adapter: &LightwalletdGrpcAdapter<WalletServingQuery<()>>,
+async fn drain_encoded_nullifier_range<QueryApi: WalletQueryApi + Clone>(
+    adapter: &LightwalletdGrpcAdapter<QueryApi>,
     pool_types: Vec<i32>,
 ) -> eyre::Result<(usize, usize)> {
     use zinder_proto::compat::lightwalletd::EncodedBlockRangeNullifiers as _;
@@ -201,8 +520,8 @@ async fn drain_nullifier_range(
     Ok((block_count, tx_count))
 }
 
-async fn start_perf_endpoint(
-    adapter: LightwalletdGrpcAdapter<WalletServingQuery<()>>,
+async fn start_perf_endpoint<QueryApi: WalletQueryApi + Clone>(
+    adapter: LightwalletdGrpcAdapter<QueryApi>,
 ) -> eyre::Result<(
     CompactTxStreamerClient<Channel>,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
@@ -218,13 +537,14 @@ async fn start_perf_endpoint(
     Ok((client, handle))
 }
 
-async fn setup_perf_adapters(
-    dir: &std::path::Path,
-) -> eyre::Result<(
-    LightwalletdGrpcAdapter<WalletServingQuery<()>>,
-    LightwalletdGrpcAdapter<WalletServingQuery<()>>,
-    zinder_testkit::WalletServingStoreFixture,
-)> {
+struct PerfAdapters {
+    published: LightwalletdGrpcAdapter<WalletServingQuery<()>>,
+    canonical: LightwalletdGrpcAdapter<CanonicalFallbackQuery>,
+    canonical_query: CanonicalFallbackQuery,
+    _paths: zinder_testkit::WalletServingStoreFixture,
+}
+
+async fn setup_perf_adapters(dir: &std::path::Path) -> eyre::Result<PerfAdapters> {
     let chain = build_perf_chain()?;
     let writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(SETTLED_TIP)),
@@ -255,44 +575,126 @@ async fn setup_perf_adapters(
     );
     let pub_adapter =
         LightwalletdGrpcAdapter::new(query.clone()).with_published_shielded_history(history);
-    let can_adapter = LightwalletdGrpcAdapter::new(query);
-    Ok((pub_adapter, can_adapter, paths))
+    let canonical_query = CanonicalFallbackQuery::new(query);
+    let canonical_adapter = LightwalletdGrpcAdapter::new(canonical_query.clone());
+    Ok(PerfAdapters {
+        published: pub_adapter,
+        canonical: canonical_adapter,
+        canonical_query,
+        _paths: paths,
+    })
+}
+
+struct PerfScanCounts {
+    srv_can_blocks: usize,
+    srv_can_bytes: usize,
+    srv_def_blocks: usize,
+    srv_def_bytes: usize,
+    srv_orc_blocks: usize,
+    srv_orc_bytes: usize,
+    can_blocks: usize,
+    can_txs: usize,
+    def_blocks: usize,
+    def_txs: usize,
+    orc_blocks: usize,
+    orc_txs: usize,
+}
+
+fn assert_perf_counts(counts: &PerfScanCounts, total_blocks: usize) {
+    assert_eq!(counts.srv_can_blocks, total_blocks);
+    assert_eq!(counts.srv_def_blocks, total_blocks);
+    assert_eq!(counts.srv_orc_blocks, total_blocks);
+    assert_eq!(counts.srv_orc_bytes, counts.srv_can_bytes);
+    assert!(counts.srv_orc_bytes < counts.srv_def_bytes);
+    assert_eq!(counts.can_blocks, total_blocks);
+    assert_eq!(counts.def_blocks, total_blocks);
+    assert_eq!(counts.orc_blocks, total_blocks);
+    assert_eq!(counts.orc_txs, counts.can_txs);
+    assert!(counts.orc_txs < counts.def_txs);
+}
+
+struct ServerPerfTimings {
+    canonical_us: u128,
+    default_us: u128,
+    orchard_us: u128,
+    can_blocks: usize,
+    can_bytes: usize,
+    def_blocks: usize,
+    def_bytes: usize,
+    orc_blocks: usize,
+    orc_bytes: usize,
+}
+
+async fn measure_server_scans(
+    adapters: &PerfAdapters,
+    total_blocks: usize,
+    orchard_pools: &[i32],
+) -> eyre::Result<ServerPerfTimings> {
+    let _ = drain_encoded_nullifier_range(&adapters.published, Vec::new()).await?;
+    let _ = drain_encoded_nullifier_range(&adapters.canonical, orchard_pools.to_vec()).await?;
+    assert_eq!(
+        adapters.canonical_query.take_canonical_blocks_read(),
+        total_blocks
+    );
+
+    let started_can = Instant::now();
+    let (can_blocks, can_bytes) =
+        drain_encoded_nullifier_range(&adapters.canonical, orchard_pools.to_vec()).await?;
+    let canonical_us = started_can.elapsed().as_micros();
+    assert_eq!(
+        adapters.canonical_query.take_canonical_blocks_read(),
+        total_blocks
+    );
+
+    let started_def = Instant::now();
+    let (def_blocks, def_bytes) =
+        drain_encoded_nullifier_range(&adapters.published, Vec::new()).await?;
+    let default_us = started_def.elapsed().as_micros();
+
+    let started_orc = Instant::now();
+    let (orc_blocks, orc_bytes) =
+        drain_encoded_nullifier_range(&adapters.published, orchard_pools.to_vec()).await?;
+    let orchard_us = started_orc.elapsed().as_micros();
+
+    Ok(ServerPerfTimings {
+        canonical_us,
+        default_us,
+        orchard_us,
+        can_blocks,
+        can_bytes,
+        def_blocks,
+        def_bytes,
+        orc_blocks,
+        orc_bytes,
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn orchard_nullifier_range_scan_over_published_history_and_tail_beats_canonical_fallback()
 -> eyre::Result<()> {
     let dir = tempfile::tempdir()?;
-    let (pub_adapter, can_adapter, _paths) = setup_perf_adapters(dir.path()).await?;
+    let adapters = setup_perf_adapters(dir.path()).await?;
+    let total_blocks = usize::try_from(TOTAL_BLOCKS)?;
     let orchard_pools = vec![PoolType::Orchard as i32];
+    let srv = measure_server_scans(&adapters, total_blocks, &orchard_pools).await?;
 
-    let _ = drain_encoded_nullifier_range(&pub_adapter, Vec::new()).await?;
-    let _ = drain_encoded_nullifier_range(&can_adapter, orchard_pools.clone()).await?;
-
-    let started_srv_can = Instant::now();
-    let (srv_can_blocks, srv_can_bytes) =
-        drain_encoded_nullifier_range(&can_adapter, orchard_pools.clone()).await?;
-    let srv_canonical_us = started_srv_can.elapsed().as_micros();
-
-    let started_srv_def = Instant::now();
-    let (srv_def_blocks, srv_def_bytes) =
-        drain_encoded_nullifier_range(&pub_adapter, Vec::new()).await?;
-    let srv_default_us = started_srv_def.elapsed().as_micros();
-
-    let started_srv_orc = Instant::now();
-    let (srv_orc_blocks, srv_orc_bytes) =
-        drain_encoded_nullifier_range(&pub_adapter, orchard_pools.clone()).await?;
-    let srv_orchard_us = started_srv_orc.elapsed().as_micros();
-
-    let (mut pub_client, pub_server) = start_perf_endpoint(pub_adapter).await?;
-    let (mut can_client, can_server) = start_perf_endpoint(can_adapter).await?;
+    let (mut pub_client, pub_server) = start_perf_endpoint(adapters.published).await?;
+    let (mut can_client, can_server) = start_perf_endpoint(adapters.canonical).await?;
     let _ = drain_nullifier_range(&mut pub_client, Vec::new()).await?;
     let _ = drain_nullifier_range(&mut can_client, orchard_pools.clone()).await?;
+    assert_eq!(
+        adapters.canonical_query.take_canonical_blocks_read(),
+        total_blocks
+    );
 
     let started_canonical = Instant::now();
     let (can_blocks, can_txs) =
         drain_nullifier_range(&mut can_client, orchard_pools.clone()).await?;
     let canonical_micros = started_canonical.elapsed().as_micros();
+    assert_eq!(
+        adapters.canonical_query.take_canonical_blocks_read(),
+        total_blocks
+    );
 
     let started_default = Instant::now();
     let (def_blocks, def_txs) = drain_nullifier_range(&mut pub_client, Vec::new()).await?;
@@ -306,16 +708,23 @@ async fn orchard_nullifier_range_scan_over_published_history_and_tail_beats_cano
     pub_server.abort();
     can_server.abort();
 
-    assert_eq!(srv_can_blocks, usize::try_from(TOTAL_BLOCKS)?);
-    assert_eq!(srv_def_blocks, usize::try_from(TOTAL_BLOCKS)?);
-    assert_eq!(srv_orc_blocks, usize::try_from(TOTAL_BLOCKS)?);
-    assert_eq!(srv_orc_bytes, srv_can_bytes);
-    assert!(srv_orc_bytes < srv_def_bytes);
-    assert_eq!(can_blocks, usize::try_from(TOTAL_BLOCKS)?);
-    assert_eq!(def_blocks, usize::try_from(TOTAL_BLOCKS)?);
-    assert_eq!(orc_blocks, usize::try_from(TOTAL_BLOCKS)?);
-    assert_eq!(orc_txs, can_txs);
-    assert!(orc_txs < def_txs);
+    assert_perf_counts(
+        &PerfScanCounts {
+            srv_can_blocks: srv.can_blocks,
+            srv_can_bytes: srv.can_bytes,
+            srv_def_blocks: srv.def_blocks,
+            srv_def_bytes: srv.def_bytes,
+            srv_orc_blocks: srv.orc_blocks,
+            srv_orc_bytes: srv.orc_bytes,
+            can_blocks,
+            can_txs,
+            def_blocks,
+            def_txs,
+            orc_blocks,
+            orc_txs,
+        },
+        total_blocks,
+    );
 
     #[allow(
         clippy::print_stderr,
@@ -323,7 +732,8 @@ async fn orchard_nullifier_range_scan_over_published_history_and_tail_beats_cano
     )]
     {
         eprintln!(
-            "compat_orchard_nullifier_perf blocks={TOTAL_BLOCKS} orchard_txs={orc_txs} default_txs={def_txs} server_canonical_us={srv_canonical_us} server_published_orchard_us={srv_orchard_us} server_published_default_us={srv_default_us} grpc_canonical_us={canonical_micros} grpc_published_orchard_us={orchard_micros} grpc_published_default_us={default_micros}"
+            "compat_orchard_nullifier_perf blocks={TOTAL_BLOCKS} orchard_txs={orc_txs} default_txs={def_txs} server_canonical_us={} server_published_orchard_us={} server_published_default_us={} grpc_canonical_us={canonical_micros} grpc_published_orchard_us={orchard_micros} grpc_published_default_us={default_micros}",
+            srv.canonical_us, srv.orchard_us, srv.default_us
         );
     }
 
