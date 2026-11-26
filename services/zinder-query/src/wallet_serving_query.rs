@@ -1389,7 +1389,10 @@ where
         &self,
         transaction_ids: Vec<TransactionId>,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<crate::TransactionsInOrder, QueryError> {
+    ) -> Result<crate::TransactionsInOrder, QueryError>
+    where
+        Self: Sized + Clone,
+    {
         serving_read::record("transactions_in_order", None, async {
             let pair = self.serving_pair_slot.capture_at(at_epoch_id);
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;

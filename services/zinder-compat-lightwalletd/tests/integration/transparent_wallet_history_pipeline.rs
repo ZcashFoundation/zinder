@@ -51,31 +51,32 @@ use zinder_testkit::{ChainFixture, FixtureTransactionRows, WalletServingStoreFix
 
 use crate::common::verified_node::one_upgrade_per_height;
 
-type LeanWalletQuery = WalletServingQuery<Option<OrderedBroadcaster<ZebraJsonRpcSource>>>;
-type LeanWalletAdapter = LightwalletdGrpcAdapter<LeanWalletQuery>;
+pub(crate) type LeanWalletQuery =
+    WalletServingQuery<Option<OrderedBroadcaster<ZebraJsonRpcSource>>>;
+pub(crate) type LeanWalletAdapter = LightwalletdGrpcAdapter<LeanWalletQuery>;
 
 #[derive(Clone)]
-struct StoredTxEntry {
-    height: BlockHeight,
-    block_hash: BlockHash,
-    raw_hex: String,
-    delay: Duration,
+pub(crate) struct StoredTxEntry {
+    pub(crate) height: BlockHeight,
+    pub(crate) block_hash: BlockHash,
+    pub(crate) raw_hex: String,
+    pub(crate) delay: Duration,
 }
 
-struct AsyncZebraNode {
+pub(crate) struct AsyncZebraNode {
     address: SocketAddr,
     active_raw_tx: Arc<AtomicUsize>,
-    peak_raw_tx: Arc<AtomicUsize>,
+    pub(crate) peak_raw_tx: Arc<AtomicUsize>,
     gate_started: Arc<Notify>,
     gate_release: Arc<Semaphore>,
     timer: Arc<PreciseTimer>,
     shutdown: tokio_util::sync::CancellationToken,
 }
 
-struct NodeBehavior {
-    entries: HashMap<String, StoredTxEntry>,
-    tampered_txid_hex: Option<String>,
-    stalled_txids: HashSet<String>,
+pub(crate) struct NodeBehavior {
+    pub(crate) entries: HashMap<String, StoredTxEntry>,
+    pub(crate) tampered_txid_hex: Option<String>,
+    pub(crate) stalled_txids: HashSet<String>,
 }
 
 struct PreciseTimer {
@@ -153,7 +154,7 @@ impl PreciseTimer {
 }
 
 impl AsyncZebraNode {
-    async fn start(
+    pub(crate) async fn start(
         schedule: &NetworkUpgradeActivations,
         tip_hash: BlockHash,
         behavior: NodeBehavior,
@@ -202,7 +203,7 @@ impl AsyncZebraNode {
         })
     }
 
-    fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         format!("http://{}", self.address)
     }
 
@@ -388,7 +389,7 @@ fn regtest_address(seed: u8) -> ZebraTransparentAddress {
     ZebraTransparentAddress::from_pub_key_hash(ZebraNetworkKind::Regtest, [seed; 20])
 }
 
-fn sequence_txid(address_seed: u8, sequence: u32) -> TransactionId {
+pub(crate) fn sequence_txid(address_seed: u8, sequence: u32) -> TransactionId {
     let mut bytes = [address_seed; 32];
     bytes[28..].copy_from_slice(&sequence.to_be_bytes());
     TransactionId::from_bytes(bytes)
@@ -398,7 +399,7 @@ fn sequence_payload(address_seed: u8, sequence: u32) -> Vec<u8> {
     format!("cold-history-addr-{address_seed:02x}-seq-{sequence:05}").into_bytes()
 }
 
-fn history_filter(
+pub(crate) fn history_filter(
     address: String,
     start_height: u64,
     end_height: u64,
@@ -419,16 +420,16 @@ fn history_filter(
     }
 }
 
-struct MultiBlockFixture {
-    store: WalletServingStoreFixture,
-    schedule: NetworkUpgradeActivations,
-    tip_hash: BlockHash,
-    addresses: Vec<String>,
-    expected_per_address: Vec<Vec<lightwalletd::RawTransaction>>,
-    node_entries: HashMap<String, StoredTxEntry>,
+pub(crate) struct MultiBlockFixture {
+    pub(crate) store: WalletServingStoreFixture,
+    pub(crate) schedule: NetworkUpgradeActivations,
+    pub(crate) tip_hash: BlockHash,
+    pub(crate) addresses: Vec<String>,
+    pub(crate) expected_per_address: Vec<Vec<lightwalletd::RawTransaction>>,
+    pub(crate) node_entries: HashMap<String, StoredTxEntry>,
 }
 
-fn build_multi_block_cold_fixture(
+pub(crate) fn build_multi_block_cold_fixture(
     block_count: u32,
     addresses_count: u8,
     txs_per_address: u32,
@@ -512,7 +513,7 @@ fn build_multi_block_cold_fixture(
     })
 }
 
-fn build_lean_adapter(
+pub(crate) fn build_lean_adapter(
     store: &mut WalletServingStoreFixture,
     node_url: String,
     reads: ForwardedReadLimit,
@@ -896,12 +897,9 @@ async fn mid_stream_cold_failure_cancels_stalled_sibling_reads_and_releases_pair
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn busy_address_cold_history_pipeline_beats_serial_round_trips() -> Result<()> {
-    const BLOCKS: u32 = 17;
-    const BUSY_TXS: u32 = 340;
-    const RPC_LATENCY: Duration = Duration::from_millis(1);
-    let mut fixture = build_multi_block_cold_fixture(BLOCKS, 1, BUSY_TXS, |_, _| RPC_LATENCY)?;
+#[tokio::test]
+async fn default_transactions_in_order_fallback_starts_futures_on_demand() -> Result<()> {
+    let mut fixture = build_multi_block_cold_fixture(4, 1, 24, |_, _| Duration::from_millis(5))?;
     let node = AsyncZebraNode::start(
         &fixture.schedule,
         fixture.tip_hash,
@@ -912,90 +910,200 @@ async fn busy_address_cold_history_pipeline_beats_serial_round_trips() -> Result
         },
     )
     .await?;
-    let uncached_reads =
+    let uncached =
         ForwardedReadLimit::new(ForwardedReadConfig::resolve(None, None, None, Some(0))?);
-    let (pair, query, adapter) =
-        build_lean_adapter(&mut fixture.store, node.url(), uncached_reads)?;
+    let (pair, query, _) = build_lean_adapter(&mut fixture.store, node.url(), uncached)?;
     let epoch_id = pair.chain_epoch().id;
+    let ids: Vec<TransactionId> = (0..24).map(|seq| sequence_txid(0x40, seq)).collect();
 
-    // Warm node schedule/capability verification and HTTP keep-alive connection pool.
-    let warm_filter = history_filter(fixture.addresses[0].clone(), 1, 1);
-    let mut warm_stream = adapter
-        .get_taddress_txids(Request::new(warm_filter))
-        .await?
-        .into_inner();
-    while warm_stream.next().await.transpose()?.is_some() {}
+    let mut fallback = zinder_query::TransactionsInOrder::empty();
+    assert!(!fallback.has_remaining());
+    assert!(fallback.next_batch(4).await.is_empty());
 
-    let serial_started = Instant::now();
-    for seq in 0..BUSY_TXS {
-        let status = query
-            .transaction(sequence_txid(0x40, seq), Some(epoch_id))
-            .await?;
-        assert!(matches!(status.status, zinder_core::TxStatus::Mined(_)));
+    let mut lazy = DefaultOrderedFallback(query)
+        .transactions_in_order(ids, Some(epoch_id))
+        .await?;
+    assert_eq!(node.peak_raw_tx.load(Ordering::SeqCst), 0);
+    let first_batch = lazy.next_batch(3).await;
+    assert_eq!(first_batch.len(), 3);
+    for pending in first_batch {
+        let resolved = pending.await?;
+        assert!(matches!(resolved.status, zinder_core::TxStatus::Mined(_)));
     }
-    let serial_elapsed = serial_started.elapsed();
-
-    let pipelined_started = Instant::now();
-    let mut stream = adapter
-        .get_taddress_txids(Request::new(history_filter(
-            fixture.addresses[0].clone(),
-            1,
-            u64::from(BLOCKS),
-        )))
-        .await?
-        .into_inner();
-    let mut received = Vec::with_capacity(usize::try_from(BUSY_TXS)?);
-    while let Some(row) = stream.next().await {
-        received.push(row?);
-    }
-    let pipelined_elapsed = pipelined_started.elapsed();
-    record_bench_report(
-        BUSY_TXS,
-        serial_elapsed,
-        pipelined_elapsed,
-        node.peak_raw_tx.load(Ordering::SeqCst),
-    )?;
-
-    assert_eq!(received, fixture.expected_per_address[0]);
-    assert!(
-        serial_elapsed >= Duration::from_millis(340),
-        "expected 340 serial 1ms RPCs to take >= 340ms, took {serial_elapsed:?}",
-    );
-    let max_pipelined = if cfg!(debug_assertions) {
-        Duration::from_millis(200)
-    } else {
-        Duration::from_millis(65)
-    };
-    assert!(
-        pipelined_elapsed < max_pipelined && pipelined_elapsed * 4 < serial_elapsed,
-        "expected pipelined 340 cold txs (< {max_pipelined:?} and > 4x faster than serial {serial_elapsed:?}), took {pipelined_elapsed:?}",
-    );
+    assert!(node.peak_raw_tx.load(Ordering::SeqCst) <= 3);
     Ok(())
 }
 
-fn record_bench_report(
-    busy_txs: u32,
-    serial_elapsed: Duration,
-    pipelined_elapsed: Duration,
-    peak_in_flight: usize,
-) -> Result<()> {
-    tracing::info!(
-        busy_txs,
-        ?serial_elapsed,
-        ?pipelined_elapsed,
-        peak_in_flight,
-        "busy-address cold transparent history benchmark completed"
-    );
-    if let Ok(report_path) = std::env::var("ZINDER_TEST_BENCH_REPORT_PATH") {
-        std::fs::write(
-            report_path,
-            format!(
-                "busy_txs={busy_txs}\nserial_ms={:.3}\npipelined_ms={:.3}\nspeedup_x={:.2}\npeak_in_flight={peak_in_flight}\n",
-                serial_elapsed.as_secs_f64() * 1_000.0,
-                pipelined_elapsed.as_secs_f64() * 1_000.0,
-                serial_elapsed.as_secs_f64() / pipelined_elapsed.as_secs_f64(),
-            ),
-        )?;
+#[derive(Clone)]
+struct DefaultOrderedFallback(LeanWalletQuery);
+
+#[async_trait::async_trait]
+impl zinder_query::WalletQueryApi for DefaultOrderedFallback {
+    fn native_endpoint_capabilities(&self) -> &zinder_query::NativeWalletEndpointCapabilities {
+        self.0.native_endpoint_capabilities()
     }
-    Ok(())
+    fn upstream_node_capabilities(&self) -> Option<zinder_query::UpstreamNodeCapabilities> {
+        self.0.upstream_node_capabilities()
+    }
+    async fn network_upgrade_activations(
+        &self,
+    ) -> Result<NetworkUpgradeActivations, zinder_query::QueryError> {
+        self.0.network_upgrade_activations().await
+    }
+    async fn visible_tip_block(
+        &self,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::VisibleTipBlock, zinder_query::QueryError> {
+        self.0.visible_tip_block(ep).await
+    }
+    async fn settled_tip_block(
+        &self,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::SettledTipBlock, zinder_query::QueryError> {
+        self.0.settled_tip_block(ep).await
+    }
+    async fn block_id_by_selector(
+        &self,
+        sel: zinder_core::BlockSelector,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::BlockIdAtEpoch, zinder_query::QueryError> {
+        self.0.block_id_by_selector(sel, ep).await
+    }
+    async fn block_header_by_selector(
+        &self,
+        sel: zinder_core::BlockSelector,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::BlockHeaderAtEpoch, zinder_query::QueryError> {
+        self.0.block_header_by_selector(sel, ep).await
+    }
+    async fn compact_block_at(
+        &self,
+        h: BlockHeight,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::CompactBlock, zinder_query::QueryError> {
+        self.0.compact_block_at(h, ep).await
+    }
+    async fn compact_blocks_in_range(
+        &self,
+        r: zinder_core::BlockHeightRange,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::CompactBlockRange, zinder_query::QueryError> {
+        self.0.compact_blocks_in_range(r, ep).await
+    }
+    async fn compact_blocks_in_range_up_to(
+        &self,
+        r: zinder_core::BlockHeightRange,
+        ord: zinder_store::HeightOrder,
+        max: usize,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::CompactBlockRange, zinder_query::QueryError> {
+        self.0.compact_blocks_in_range_up_to(r, ord, max, ep).await
+    }
+    async fn full_block_at(
+        &self,
+        h: BlockHeight,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::FullBlock, zinder_query::QueryError> {
+        self.0.full_block_at(h, ep).await
+    }
+    async fn full_blocks_in_range(
+        &self,
+        r: zinder_core::BlockHeightRange,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::FullBlockStream, zinder_query::QueryError> {
+        self.0.full_blocks_in_range(r, ep).await
+    }
+    async fn transaction(
+        &self,
+        id: TransactionId,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::TransactionStatus, zinder_query::QueryError> {
+        self.0.transaction(id, ep).await
+    }
+    async fn transaction_at_block_index(
+        &self,
+        h: BlockHeight,
+        idx: u64,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::Transaction, zinder_query::QueryError> {
+        self.0.transaction_at_block_index(h, idx, ep).await
+    }
+    async fn raw_transaction(
+        &self,
+        id: TransactionId,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::RawTransaction, zinder_query::QueryError> {
+        self.0.raw_transaction(id, ep).await
+    }
+    async fn transparent_address_unspent_outputs(
+        &self,
+        req: zinder_query::TransparentAddressUnspentOutputsRequest,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::TransparentAddressUnspentOutputs, zinder_query::QueryError> {
+        self.0.transparent_address_unspent_outputs(req, ep).await
+    }
+    async fn transparent_address_tx_ids_in_range(
+        &self,
+        req: zinder_query::TransparentAddressTxIdsInRangeRequest,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::TransparentAddressTxIds, zinder_query::QueryError> {
+        self.0.transparent_address_tx_ids_in_range(req, ep).await
+    }
+    async fn transparent_outpoint_spend_status(
+        &self,
+        ops: Vec<TransparentOutPoint>,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::TransparentOutpointSpendStatuses, zinder_query::QueryError> {
+        self.0.transparent_outpoint_spend_status(ops, ep).await
+    }
+    async fn transparent_address_balance(
+        &self,
+        addrs: Vec<TransparentAddressScriptHash>,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_core::TransparentAddressBalance, zinder_query::QueryError> {
+        self.0.transparent_address_balance(addrs, ep).await
+    }
+    async fn tree_state_at(
+        &self,
+        h: BlockHeight,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::TreeState, zinder_query::QueryError> {
+        self.0.tree_state_at(h, ep).await
+    }
+    async fn latest_tree_state_checkpoint(
+        &self,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::TreeState, zinder_query::QueryError> {
+        self.0.latest_tree_state_checkpoint(ep).await
+    }
+    async fn subtree_roots(
+        &self,
+        r: zinder_core::SubtreeRootRange,
+        ep: Option<zinder_core::ChainEpochId>,
+    ) -> Result<zinder_query::SubtreeRoots, zinder_query::QueryError> {
+        self.0.subtree_roots(r, ep).await
+    }
+    async fn chain_events(
+        &self,
+        cur: Option<zinder_store::StreamCursorTokenV1>,
+        fam: zinder_store::ChainEventStreamFamily,
+    ) -> Result<zinder_query::ChainEvents, zinder_query::QueryError> {
+        self.0.chain_events(cur, fam).await
+    }
+    async fn resolve_chain_events_start(
+        &self,
+        st: zinder_store::EventStreamStartPosition,
+        fam: zinder_store::ChainEventStreamFamily,
+    ) -> Result<zinder_store::ChainEventStreamResume, zinder_query::QueryError> {
+        self.0.resolve_chain_events_start(st, fam).await
+    }
+    async fn broadcast_transaction(
+        &self,
+        raw: zinder_core::RawTransactionBytes,
+    ) -> Result<zinder_core::TransactionBroadcastOutcome, zinder_query::QueryError> {
+        self.0.broadcast_transaction(raw).await
+    }
+    async fn standard_fee(&self) -> Result<zinder_core::StandardFee, zinder_query::QueryError> {
+        self.0.standard_fee().await
+    }
 }

@@ -3897,7 +3897,10 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         &self,
         transaction_ids: Vec<TransactionId>,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<zinder_query::TransactionsInOrder, QueryError> {
+    ) -> Result<zinder_query::TransactionsInOrder, QueryError>
+    where
+        Self: Sized + Clone,
+    {
         self.record(at_epoch_id);
         self.inner
             .transactions_in_order(transaction_ids, at_epoch_id)

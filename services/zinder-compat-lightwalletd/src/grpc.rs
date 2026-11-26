@@ -1522,7 +1522,7 @@ impl Future for PendingHistoryRow {
 
 impl<QueryApi> TransparentHistory<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
     async fn start(
         query_api: QueryApi,

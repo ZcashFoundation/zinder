@@ -20,8 +20,8 @@ use std::{
 use futures_util::future::BoxFuture;
 use tracing::Instrument as _;
 use zinder_core::{
-    BlockHeight, ChainEpoch, MinedTransaction, MinedTransactionChainContext, TransactionId,
-    TransactionLocation, TxStatus,
+    BlockHeight, ChainEpoch, ChainEpochId, MinedTransaction, MinedTransactionChainContext,
+    TransactionId, TransactionLocation, TxStatus,
 };
 use zinder_store::ArtifactFamily;
 
@@ -115,8 +115,49 @@ pub struct TransactionsInOrder {
 
 enum OrderedSource {
     Empty,
-    Preloaded(VecDeque<Result<TransactionStatus, QueryError>>),
+    Fallback(Box<dyn LazyQuerySource>),
     Serving(Box<ServingOrderedTransactions>),
+}
+
+trait LazyQuerySource: Send + Sync {
+    fn has_remaining(&self) -> bool;
+    fn start_next(&mut self, max_count: usize) -> Vec<PendingTransaction>;
+}
+
+struct LazyQueryReader<QueryApi> {
+    query_api: QueryApi,
+    transaction_ids: Vec<TransactionId>,
+    next_index: usize,
+    at_epoch_id: Option<ChainEpochId>,
+}
+
+impl<QueryApi> LazyQuerySource for LazyQueryReader<QueryApi>
+where
+    QueryApi: crate::WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    fn has_remaining(&self) -> bool {
+        self.next_index < self.transaction_ids.len()
+    }
+
+    fn start_next(&mut self, max_count: usize) -> Vec<PendingTransaction> {
+        let end = self
+            .next_index
+            .saturating_add(max_count)
+            .min(self.transaction_ids.len());
+        let at_epoch_id = self.at_epoch_id;
+        let batch = self.transaction_ids[self.next_index..end]
+            .iter()
+            .copied()
+            .map(|transaction_id| {
+                let query_api = self.query_api.clone();
+                PendingTransaction::cold(async move {
+                    query_api.transaction(transaction_id, at_epoch_id).await
+                })
+            })
+            .collect();
+        self.next_index = end;
+        batch
+    }
 }
 
 struct ServingOrderedTransactions {
@@ -162,11 +203,24 @@ impl TransactionsInOrder {
         }
     }
 
-    pub(crate) fn from_preloaded(
-        outcomes: VecDeque<Result<TransactionStatus, QueryError>>,
-    ) -> Self {
+    pub(crate) fn from_lazy_query<QueryApi>(
+        query_api: QueryApi,
+        transaction_ids: Vec<TransactionId>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Self
+    where
+        QueryApi: crate::WalletQueryApi + Clone + Send + Sync + 'static,
+    {
+        if transaction_ids.is_empty() {
+            return Self::empty();
+        }
         Self {
-            source: OrderedSource::Preloaded(outcomes),
+            source: OrderedSource::Fallback(Box::new(LazyQueryReader {
+                query_api,
+                transaction_ids,
+                next_index: 0,
+                at_epoch_id,
+            })),
             ended_on_error: false,
         }
     }
@@ -203,7 +257,7 @@ impl TransactionsInOrder {
         }
         match &self.source {
             OrderedSource::Empty => false,
-            OrderedSource::Preloaded(outcomes) => !outcomes.is_empty(),
+            OrderedSource::Fallback(reader) => reader.has_remaining(),
             OrderedSource::Serving(serving) => {
                 serving.next_id_index < serving.transaction_ids.len()
                     || !serving.prepared.is_empty()
@@ -221,9 +275,7 @@ impl TransactionsInOrder {
         }
         match &mut self.source {
             OrderedSource::Empty => Vec::new(),
-            OrderedSource::Preloaded(outcomes) => {
-                take_preloaded_batch(outcomes, max_count, &mut self.ended_on_error)
-            }
+            OrderedSource::Fallback(reader) => reader.start_next(max_count),
             OrderedSource::Serving(serving) => {
                 serving
                     .next_batch(max_count, &mut self.ended_on_error)
@@ -231,26 +283,6 @@ impl TransactionsInOrder {
             }
         }
     }
-}
-
-fn take_preloaded_batch(
-    outcomes: &mut VecDeque<Result<TransactionStatus, QueryError>>,
-    max_count: usize,
-    ended_on_error: &mut bool,
-) -> Vec<PendingTransaction> {
-    let mut batch = Vec::with_capacity(max_count.min(outcomes.len()));
-    while batch.len() < max_count {
-        let Some(outcome) = outcomes.pop_front() else {
-            break;
-        };
-        let failed = outcome.is_err();
-        batch.push(PendingTransaction::ready(outcome));
-        if failed {
-            *ended_on_error = true;
-            break;
-        }
-    }
-    batch
 }
 
 impl ServingOrderedTransactions {

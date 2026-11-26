@@ -353,25 +353,24 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// independent [`PendingTransaction`] futures charged to
     /// [`ForwardedReadKind::History`].
     ///
-    /// The default implementation resolves `transaction_ids` in order with
-    /// [`Self::transaction`], stopping at the first error. An implementation
-    /// that wraps another should forward this method to keep batched reads and
-    /// concurrent cold fetches active.
+    /// The default implementation starts [`Self::transaction`] futures on
+    /// demand as the caller polls [`TransactionsInOrder::next_batch`], so it
+    /// never materializes more transaction bodies than the caller's batch
+    /// capacity. An implementation that wraps another should forward this
+    /// method to keep batched canonical reads active.
     async fn transactions_in_order(
         &self,
         transaction_ids: Vec<TransactionId>,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransactionsInOrder, QueryError> {
-        let mut outcomes = std::collections::VecDeque::with_capacity(transaction_ids.len());
-        for transaction_id in transaction_ids {
-            let outcome = self.transaction(transaction_id, at_epoch_id).await;
-            let failed = outcome.is_err();
-            outcomes.push_back(outcome);
-            if failed {
-                break;
-            }
-        }
-        Ok(TransactionsInOrder::from_preloaded(outcomes))
+    ) -> Result<TransactionsInOrder, QueryError>
+    where
+        Self: Sized + Clone,
+    {
+        Ok(TransactionsInOrder::from_lazy_query(
+            self.clone(),
+            transaction_ids,
+            at_epoch_id,
+        ))
     }
 
     /// Verifies the node that supplies this query's transaction bytes against
