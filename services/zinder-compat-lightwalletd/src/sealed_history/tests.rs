@@ -1347,3 +1347,54 @@ fn append_frames_coalesces_short_slabs_and_isolates_large_rows_in_both_orders() 
     }
     Ok(())
 }
+
+#[test]
+fn append_frames_records_published_history_read_metrics_for_both_slabs() -> eyre::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("encoded-telemetry");
+    let identity = publish(&path, 1, 4)?;
+    let history = open_portable(&path, identity)?;
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    register_published_history_metrics();
+
+    for slab in [SealedSlab::Shielded, SealedSlab::Nullifier] {
+        let mut scratch = WireProjectionScratch::default();
+        let mut batcher = EncodedBlockBatcher::new(true);
+        let span = history
+            .append_frames(
+                PublishedProjection::ZeroCopy(slab),
+                (range(1, 4), HeightOrder::Ascending),
+                (usize::MAX, true),
+                (&mut scratch, &mut batcher),
+            )?
+            .ok_or_else(|| eyre::eyre!("expected non-empty span"))?;
+        assert_eq!(span.kept_blocks, 4);
+        assert_ne!(batcher.finish().len(), 0);
+    }
+
+    let rendered = handle.render();
+    for slab in ["shielded", "nullifier"] {
+        let bytes_prefix =
+            format!("zinder_compat_published_history_read_bytes_total{{slab=\"{slab}\"}} ");
+        let bytes_read: u64 = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&bytes_prefix))
+            .ok_or_else(|| eyre::eyre!("missing bytes counter for slab={slab} in:\n{rendered}"))?
+            .parse()?;
+        assert!(
+            bytes_read > 0,
+            "expected positive bytes counter for slab={slab}, got {bytes_read}"
+        );
+        let count_line = format!(
+            "zinder_compat_published_history_read_duration_seconds_count{{slab=\"{slab}\"}} 1"
+        );
+        assert!(
+            rendered.contains(&count_line),
+            "missing duration count `{count_line}` in:\n{rendered}"
+        );
+    }
+    Ok(())
+}

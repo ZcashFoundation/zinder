@@ -1009,10 +1009,16 @@ impl SealedHistory {
         if order == HeightOrder::Descending {
             plan.reverse();
         }
+        let mut total_bytes_read = 0_u64;
+        let mut read_duration = std::time::Duration::ZERO;
         for (rows, offset, len) in plan {
+            let read_started_at = std::time::Instant::now();
             let slab_bytes = read_slab_at(&self.file, len, offset)?;
+            read_duration += read_started_at.elapsed();
+            total_bytes_read = total_bytes_read.saturating_add(len as u64);
             self.append_slab_frames(projection, (order, rows), slab_bytes, (scratch, batcher))?;
         }
+        record_published_history_read(slab, total_bytes_read, read_duration);
         Ok(Some(span))
     }
 
