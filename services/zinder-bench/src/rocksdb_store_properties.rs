@@ -21,6 +21,7 @@ pub(crate) struct StoreProperties {
     report_format_version: u16,
     #[serde(flatten)]
     environment: ReadEnvironment,
+    io_mode: &'static str,
     ready_fence: ReadyFenceSummary,
     column_families: BTreeMap<String, FamilyProperties>,
 }
@@ -67,6 +68,7 @@ pub(crate) fn run(args: &ReadStoreArgs) -> Result<StoreProperties, BenchError> {
     Ok(StoreProperties {
         contract_identity: "rocksdb-store-properties",
         report_format_version: 1,
+        io_mode: secondary.io_mode().as_str(),
         ready_fence: secondary.ready_evidence().into(),
         environment,
         column_families,

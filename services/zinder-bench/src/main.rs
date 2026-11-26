@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn rocksdb_compact_block_range_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
-        let cli = Cli::try_parse_from([
+        let base = [
             "zinder-bench",
             "rocksdb-compact-block-range",
             "--fixture",
@@ -698,9 +698,29 @@ mod tests {
             "secondary",
             "--software-revision",
             "5079515",
-        ])?;
-
+        ];
+        let cli = Cli::try_parse_from(base)?;
         assert!(matches!(cli.command, Command::RocksDbCompactBlockRange(_)));
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--canonical-io-mode",
+                "direct",
+                "--evict-page-cache"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--canonical-io-mode",
+                "buffered",
+                "--evict-page-cache"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--canonical-io-mode", "invalid"]))
+                .is_err()
+        );
         Ok(())
     }
 

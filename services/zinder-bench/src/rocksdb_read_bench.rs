@@ -20,7 +20,7 @@ use zinder_core::NetworkUpgradeActivations;
 use zinder_query::RocksDbCanonicalReader;
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbCanonicalSecondary, RocksDbResourceBudget, RocksDbStatisticsLevel,
+    RocksDbCanonicalSecondary, RocksDbIoMode, RocksDbResourceBudget, RocksDbStatisticsLevel,
 };
 
 use crate::build_provenance::BuildProvenance;
@@ -51,9 +51,41 @@ pub(crate) struct ReadStoreArgs {
     /// Collect engine statistics at off, tickers, or full (including histograms).
     #[arg(long, default_value = "tickers", value_parser = parse_statistics_level)]
     rocksdb_statistics_level: RocksDbStatisticsLevel,
+    /// I/O mode of the canonical secondary: `direct` tries direct reads, as
+    /// production does, and falls back to buffered reads when the filesystem
+    /// rejects them; `buffered` skips the direct attempt.
+    #[arg(
+        long = "canonical-io-mode",
+        default_value = "direct",
+        value_parser = parse_io_mode
+    )]
+    canonical_io_mode: RocksDbIoMode,
+    /// Evict the canonical store's regular files from the OS page cache with
+    /// `posix_fadvise(POSIX_FADV_DONTNEED)` before each cold secondary open
+    /// (Linux only), so buffered-mode cold reads start without cached pages.
+    #[arg(long = "evict-page-cache")]
+    evict_page_cache: bool,
     /// Write JSON to a new file outside the primary instead of stdout.
     #[arg(long)]
     pub(crate) report: Option<PathBuf>,
+}
+
+fn parse_io_mode(text: &str) -> Result<RocksDbIoMode, String> {
+    match text {
+        "direct" => Ok(RocksDbIoMode::Direct),
+        "buffered" => Ok(RocksDbIoMode::Buffered),
+        _ => Err("expected direct or buffered".to_owned()),
+    }
+}
+
+fn page_cache_eviction_label(evict_page_cache: bool) -> &'static str {
+    if !evict_page_cache {
+        "not-requested"
+    } else if cfg!(target_os = "linux") {
+        "evicted-before-open"
+    } else {
+        "unsupported"
+    }
 }
 
 fn parse_workload(text: &str) -> Result<CanonicalStoreWorkload, String> {
@@ -76,6 +108,7 @@ pub(crate) struct ReadStore {
     pub(crate) raw_blob_retention: RawBlobRetention,
     pub(crate) reorg_policy: CanonicalReorgPolicy,
     pub(crate) budget: RocksDbResourceBudget,
+    pub(crate) evict_page_cache: bool,
 }
 
 #[derive(Serialize)]
@@ -86,6 +119,8 @@ pub(crate) struct ReadEnvironment {
     build: BuildProvenance,
     host_cpu_model: Option<String>,
     statistics_level: &'static str,
+    preferred_io_mode: &'static str,
+    page_cache_eviction: &'static str,
     block_cache_bytes: u64,
 }
 
@@ -112,8 +147,10 @@ impl ReadStoreArgs {
             reorg_policy: CanonicalReorgPolicy::new(self.supported_reorg_depth)?,
             budget: RocksDbResourceBudget {
                 statistics_level: self.rocksdb_statistics_level,
+                preferred_io_mode: self.canonical_io_mode,
                 ..RocksDbResourceBudget::canonical_reader_defaults()
             },
+            evict_page_cache: self.evict_page_cache,
         };
         let environment = ReadEnvironment {
             software_revision: self.software_revision.clone(),
@@ -130,6 +167,8 @@ impl ReadStoreArgs {
                         .map(|(_, model)| model.trim().to_owned())
                 }),
             statistics_level: self.rocksdb_statistics_level.as_str(),
+            preferred_io_mode: self.canonical_io_mode.as_str(),
+            page_cache_eviction: page_cache_eviction_label(self.evict_page_cache),
             block_cache_bytes: store.budget.block_cache_bytes,
         };
         fs::create_dir(&store.secondary_root)
@@ -163,6 +202,9 @@ impl ReadStore {
         name: &str,
         fence: Option<&CanonicalStoreReadyEvidence>,
     ) -> Result<(RocksDbCanonicalSecondary, f64), BenchError> {
+        if self.evict_page_cache {
+            evict_directory_page_cache(&self.primary)?;
+        }
         let start = Instant::now();
         let secondary = RocksDbCanonicalSecondary::open_ready(
             &self.primary,
@@ -189,6 +231,33 @@ impl ReadStore {
         }
         Ok((secondary, seconds))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn evict_directory_page_cache(directory: &Path) -> Result<(), BenchError> {
+    for entry in fs::read_dir(directory).map_err(|source| BenchError::io(directory, source))? {
+        let entry = entry.map_err(|source| BenchError::io(directory, source))?;
+        let entry_path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|source| BenchError::io(&entry_path, source))?;
+        if file_type.is_dir() {
+            evict_directory_page_cache(&entry_path)?;
+        } else if file_type.is_file() {
+            let file = fs::File::open(&entry_path)
+                .map_err(|source| BenchError::io(&entry_path, source))?;
+            file.sync_all()
+                .map_err(|source| BenchError::io(&entry_path, source))?;
+            rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)
+                .map_err(|source| BenchError::io(&entry_path, source.into()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn evict_directory_page_cache(_directory: &Path) -> Result<(), BenchError> {
+    Ok(())
 }
 
 const TICKERS: [Ticker; 17] = [
@@ -424,6 +493,7 @@ mod tests {
                 statistics_level: level,
                 ..RocksDbResourceBudget::canonical_reader_defaults()
             },
+            evict_page_cache: false,
         };
         let range = BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(3));
         let (direct, _) = store.open("direct", None)?;
