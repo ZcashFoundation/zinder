@@ -13,6 +13,7 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use zinder_bench::{
     BenchError,
+    active_writer_publication::{ActiveWriterPublicationConfig, run_active_writer_publication},
     canonical_fixture_replay::capture_canonical_fixture_replay_plan,
     canonical_fixture_transport_server::{
         CanonicalFixtureTransportServerConfig, run_canonical_fixture_transport_server,
@@ -135,6 +136,46 @@ enum Command {
     /// Verify raw `GetBlockRange` frames against an oracle and time them.
     #[command(name = "raw-range-probe")]
     RawRangeProbe(RawRangeProbeArgs),
+    /// Benchmark reader publication across four matched active-writer states.
+    #[command(name = "active-writer-publication")]
+    ActiveWriterPublication(ActiveWriterPublicationArgs),
+}
+
+#[derive(Args)]
+struct ActiveWriterPublicationArgs {
+    /// Number of pre-built base blocks before live commits begin.
+    #[arg(long = "base-blocks", default_value_t = 4_092)]
+    base_blocks: u32,
+    /// Number of live blocks committed while readers are active.
+    #[arg(long = "live-blocks", default_value_t = 16)]
+    live_blocks: u32,
+    /// Settlement reorg window depth in blocks.
+    #[arg(long = "reorg-window-blocks", default_value_t = 4)]
+    reorg_window_blocks: u32,
+    /// Settled shielded catalog segment size in blocks.
+    #[arg(long = "segment-blocks", default_value_t = 4_096)]
+    segment_blocks: u32,
+    /// Cadence (in blocks) for commitment-dense shielded blocks.
+    #[arg(long = "dense-block-cadence", default_value_t = 4)]
+    dense_block_cadence: u32,
+    /// Synthetic V5 Orchard transactions attached to each dense block.
+    #[arg(long = "dense-txs-per-block", default_value_t = 1)]
+    dense_txs_per_block: u32,
+    /// Milliseconds between consecutive live block commits.
+    #[arg(long = "commit-interval-millis", default_value_t = 8)]
+    commit_interval_millis: u64,
+    /// Milliseconds slept per frame by the slow boundary-crossing reader.
+    #[arg(long = "slow-reader-frame-delay-millis", default_value_t = 3)]
+    slow_reader_frame_delay_millis: u64,
+    /// Mempool churn transaction counts (comma-separated or repeated).
+    #[arg(long = "mempool-churn-size", default_values_t = vec![50, 500])]
+    mempool_churn_sizes: Vec<u32>,
+    /// Minimum request rounds for the `quiescent_control` baseline arm.
+    #[arg(long = "quiescent-rounds", default_value_t = 6)]
+    quiescent_rounds: u32,
+    /// Write the JSON report to this absent path instead of stdout.
+    #[arg(long)]
+    report: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -348,7 +389,28 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::RocksDbTipReorg(args) => run_rocksdb_tip_reorg(args).await,
         Command::LightwalletdWalletLoad(args) => run_wallet_load_command(args).await,
         Command::RawRangeProbe(args) => run_raw_range_probe_command(args).await,
+        Command::ActiveWriterPublication(args) => run_active_writer_publication_command(args).await,
     }
+}
+
+async fn run_active_writer_publication_command(
+    args: ActiveWriterPublicationArgs,
+) -> Result<(), BenchError> {
+    let segment_blocks = require_nonzero_u32(args.segment_blocks, "segment-blocks")?;
+    let config = ActiveWriterPublicationConfig {
+        base_blocks: args.base_blocks,
+        live_blocks: args.live_blocks,
+        reorg_window_blocks: args.reorg_window_blocks,
+        segment_blocks,
+        dense_block_cadence: args.dense_block_cadence,
+        dense_txs_per_block: args.dense_txs_per_block,
+        commit_interval: Duration::from_millis(args.commit_interval_millis),
+        slow_reader_frame_delay: Duration::from_millis(args.slow_reader_frame_delay_millis),
+        mempool_churn_sizes: args.mempool_churn_sizes,
+        quiescent_rounds: args.quiescent_rounds,
+    };
+    let report = run_active_writer_publication(&config).await?;
+    emit_report(&report, args.report.as_deref())
 }
 
 async fn run_wallet_load_command(args: LightwalletdWalletLoadArgs) -> Result<(), BenchError> {
@@ -992,6 +1054,25 @@ mod tests {
 
         assert!(create_report_file(&report_path, b"second").is_err());
         assert_eq!(std::fs::read(&report_path)?, b"first");
+        Ok(())
+    }
+
+    #[test]
+    fn active_writer_publication_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
+        let parsed = Cli::try_parse_from([
+            "zinder-bench",
+            "active-writer-publication",
+            "--base-blocks",
+            "4092",
+            "--live-blocks",
+            "16",
+            "--report",
+            "publication.json",
+        ])?;
+        assert!(matches!(
+            parsed.command,
+            Command::ActiveWriterPublication(_)
+        ));
         Ok(())
     }
 }

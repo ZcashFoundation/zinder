@@ -6176,6 +6176,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "prost",
  "rcgen",
+ "ring",
  "rust-rocksdb",
  "rustix",
  "rustls",

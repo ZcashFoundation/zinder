@@ -1,0 +1,253 @@
+//! In-process mempool surface and tip-change signal for compatibility readers.
+
+use std::{collections::BTreeMap, pin::Pin, sync::Arc};
+
+use async_trait::async_trait;
+use parking_lot::RwLock;
+use tokio::sync::{broadcast, watch};
+use tokio_stream::{StreamExt as _, wrappers::BroadcastStream};
+use zinder_compat_lightwalletd::{
+    MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface, MempoolSurfaceError,
+    MempoolTransactionLookup, SharedMempoolSurface, SharedTipChangeWatcher, WatchTipChangeWatcher,
+};
+use zinder_core::{
+    ChainEpoch, ChainEpochId, CompactShieldedAction, CompactTransactionData, MempoolEntry,
+    MempoolEvictionReason, MempoolObservation, RawTransactionBytes, TransactionId,
+    UnixTimestampMillis,
+};
+use zinder_store::{MempoolEvent, MempoolEventEnvelope, StreamCursorTokenV1};
+
+use crate::BenchError;
+
+const EVENT_CHANNEL_CAPACITY: usize = 2_048;
+
+struct MempoolState {
+    chain_epoch: ChainEpoch,
+    next_event_sequence: u64,
+    entries: BTreeMap<[u8; 32], MempoolEntry>,
+    events: Vec<MempoolEventEnvelope>,
+}
+
+/// Deterministic in-memory mempool surface driving `GetMempoolTx` and
+/// `GetMempoolStream` during concurrent tip commits.
+pub(crate) struct BenchmarkMempoolSurface {
+    state: RwLock<MempoolState>,
+    events_tx: broadcast::Sender<MempoolEventEnvelope>,
+}
+
+impl BenchmarkMempoolSurface {
+    /// Creates an empty mempool surface anchored at `initial_epoch`.
+    pub(crate) fn new(initial_epoch: ChainEpoch) -> Arc<Self> {
+        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        Arc::new(Self {
+            state: RwLock::new(MempoolState {
+                chain_epoch: initial_epoch,
+                next_event_sequence: 1,
+                entries: BTreeMap::new(),
+                events: Vec::new(),
+            }),
+            events_tx,
+        })
+    }
+
+    /// Replaces active mempool contents with `batch_size` synthetic V5
+    /// transactions and broadcasts `Added` / `Invalidated` transitions.
+    pub(crate) fn apply_churn_batch(
+        &self,
+        batch_size: u32,
+        round: u32,
+        sample_raw_tx: &[u8],
+    ) -> Result<usize, BenchError> {
+        let mut guard = self.state.write();
+        let epoch = guard.chain_epoch;
+        let existing_keys: Vec<[u8; 32]> = guard.entries.keys().copied().collect();
+        for key in existing_keys {
+            if let Some(removed) = guard.entries.remove(&key) {
+                let envelope = next_envelope(
+                    &mut guard.next_event_sequence,
+                    MempoolEvent::Invalidated {
+                        transaction_id: removed.transaction_id(),
+                        reason: MempoolEvictionReason::Expired,
+                    },
+                );
+                guard.events.push(envelope.clone());
+                let _ = self.events_tx.send(envelope);
+            }
+        }
+        for tx_ordinal in 0..batch_size {
+            let entry = synthetic_mempool_entry(epoch, round, tx_ordinal, sample_raw_tx)?;
+            let txid_bytes = entry.transaction_id().as_bytes();
+            let envelope = next_envelope(
+                &mut guard.next_event_sequence,
+                MempoolEvent::Added {
+                    entry: entry.clone(),
+                },
+            );
+            guard.entries.insert(txid_bytes, entry);
+            guard.events.push(envelope.clone());
+            let _ = self.events_tx.send(envelope);
+        }
+        if guard.events.len() > EVENT_CHANNEL_CAPACITY {
+            let trim = guard.events.len() - EVENT_CHANNEL_CAPACITY;
+            guard.events.drain(..trim);
+        }
+        Ok(guard.entries.len())
+    }
+
+    /// Advances the coherent chain epoch observed by mempool lookups.
+    pub(crate) fn advance_epoch(&self, chain_epoch: ChainEpoch) {
+        self.state.write().chain_epoch = chain_epoch;
+    }
+}
+
+/// Converts a shared [`BenchmarkMempoolSurface`] to the trait object expected by
+/// [`zinder_compat_lightwalletd::LightwalletdGrpcAdapter`].
+pub(crate) fn as_mempool_surface(surface: Arc<BenchmarkMempoolSurface>) -> SharedMempoolSurface {
+    surface
+}
+
+/// Builds a [`WatchTipChangeWatcher`] and its driving sender.
+pub(crate) fn create_tip_watcher(
+    initial_epoch_id: ChainEpochId,
+) -> (watch::Sender<u64>, SharedTipChangeWatcher) {
+    let (sender, receiver) = watch::channel(initial_epoch_id.value());
+    (sender, Arc::new(WatchTipChangeWatcher::new(receiver)))
+}
+
+#[async_trait]
+impl MempoolSurface for BenchmarkMempoolSurface {
+    async fn mempool_snapshot_page(
+        &self,
+        max_entries: u32,
+        from_cursor: Option<Vec<u8>>,
+    ) -> Result<MempoolSnapshotPage, MempoolSurfaceError> {
+        let guard = self.state.read();
+        let limit = usize::try_from(max_entries).unwrap_or(usize::MAX).max(1);
+        let after_key: Option<[u8; 32]> = from_cursor
+            .as_deref()
+            .and_then(|cursor| <[u8; 32]>::try_from(cursor).ok());
+        let mut selected = Vec::with_capacity(limit.min(guard.entries.len()));
+        let mut next_cursor = None;
+        for (key, entry) in &guard.entries {
+            if let Some(boundary) = after_key
+                && *key <= boundary
+            {
+                continue;
+            }
+            if selected.len() < limit {
+                selected.push(entry.clone());
+            } else {
+                next_cursor = selected.last().map(|last| {
+                    zinder_core::wire::encode_internal_transaction_id(last.transaction_id())
+                        .to_vec()
+                });
+                break;
+            }
+        }
+        let events_resume_cursor = guard.events.last().map(|event| event.cursor.clone());
+        Ok(MempoolSnapshotPage {
+            chain_epoch_id: guard.chain_epoch.id,
+            events_resume_cursor,
+            entries: selected,
+            next_cursor,
+        })
+    }
+
+    async fn mempool_events(
+        &self,
+        from_cursor: Option<StreamCursorTokenV1>,
+    ) -> Result<MempoolEventEnvelopeStream, MempoolSurfaceError> {
+        let after_sequence = from_cursor
+            .as_ref()
+            .and_then(|token| <[u8; 8]>::try_from(token.as_bytes()).ok())
+            .map_or(0, u64::from_be_bytes);
+        let mut replay = Vec::new();
+        {
+            let guard = self.state.read();
+            for event in &guard.events {
+                if event.event_sequence > after_sequence {
+                    replay.push(Ok(event.clone()));
+                }
+            }
+        }
+        let receiver = self.events_tx.subscribe();
+        let live = BroadcastStream::new(receiver).filter_map(|outcome| outcome.ok().map(Ok));
+        let combined: Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<MempoolEventEnvelope, MempoolSurfaceError>>
+                    + Send,
+            >,
+        > = Box::pin(tokio_stream::iter(replay).chain(live));
+        Ok(combined)
+    }
+
+    async fn mempool_transaction(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
+        let guard = self.state.read();
+        if let Some(entry) = guard.entries.get(&transaction_id.as_bytes()) {
+            return Ok(MempoolTransactionLookup::Pending(Box::new(entry.clone())));
+        }
+        Ok(MempoolTransactionLookup::Absent {
+            chain_epoch_id: guard.chain_epoch.id,
+        })
+    }
+}
+
+fn next_envelope(sequence_slot: &mut u64, event: MempoolEvent) -> MempoolEventEnvelope {
+    let seq = *sequence_slot;
+    *sequence_slot = sequence_slot.saturating_add(1);
+    MempoolEventEnvelope {
+        cursor: StreamCursorTokenV1::from_bytes(seq.to_be_bytes().to_vec()),
+        event_sequence: seq,
+        source_observed_unix_millis: 1_783_933_200_000,
+        event,
+    }
+}
+
+fn synthetic_mempool_entry(
+    chain_epoch: ChainEpoch,
+    round: u32,
+    ordinal: u32,
+    sample_raw_tx: &[u8],
+) -> Result<MempoolEntry, BenchError> {
+    let mut raw = sample_raw_tx.to_vec();
+    if raw.len() >= 16 {
+        raw[12..16].copy_from_slice(&(round ^ ordinal.rotate_left(13)).to_le_bytes());
+    }
+    let mut txid_bytes = [0_u8; 32];
+    txid_bytes[..4].copy_from_slice(&round.to_be_bytes());
+    txid_bytes[4..8].copy_from_slice(&ordinal.to_be_bytes());
+    let transaction_id = TransactionId::from_bytes(txid_bytes);
+    let mut nullifier = [0_u8; 32];
+    nullifier[..4].copy_from_slice(&round.to_be_bytes());
+    nullifier[4..8].copy_from_slice(&ordinal.to_be_bytes());
+    nullifier[31] = 0x11;
+    let mut commitment = nullifier;
+    commitment[31] = 0x22;
+    let mut ephemeral_key = nullifier;
+    ephemeral_key[31] = 0x33;
+    let mut ciphertext = [0_u8; 52];
+    ciphertext[..8].copy_from_slice(&nullifier[..8]);
+    let compact_data = CompactTransactionData {
+        orchard_actions: vec![CompactShieldedAction {
+            nullifier,
+            commitment,
+            ephemeral_key,
+            ciphertext,
+        }],
+        ..CompactTransactionData::default()
+    };
+    MempoolEntry::new(
+        transaction_id,
+        None,
+        RawTransactionBytes::new(raw),
+        compact_data,
+        MempoolObservation {
+            first_seen_unix_millis: UnixTimestampMillis::new(1_783_933_200_000),
+            first_seen_chain_epoch: chain_epoch,
+        },
+    )
+    .map_err(|err| BenchError::tip_replay(err.to_string()))
+}

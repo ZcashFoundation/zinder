@@ -1032,6 +1032,12 @@ impl RocksDbCanonicalStore {
     pub const fn io_mode(&self) -> RocksDbIoMode {
         self.bounded_open.io_mode
     }
+
+    /// Returns one DB-wide `RocksDB` statistics ticker count for this canonical writer.
+    #[must_use]
+    pub fn rocksdb_ticker_count(&self, ticker: rust_rocksdb::statistics::Ticker) -> u64 {
+        self.bounded_open.statistics.get_ticker_count(ticker)
+    }
 }
 
 fn require_absent_checkpoint_target(path: &Path) -> Result<(), CanonicalStoreError> {

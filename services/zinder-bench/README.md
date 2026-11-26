@@ -1437,3 +1437,29 @@ roots, and complete report-window coverage for every component.
   prove the session's authentication method. `NoTls` is limited to the isolated
   benchmark network; production remote transport still requires a
   certificate-validated TLS connector.
+
+## Active-writer publication benchmark (`active-writer-publication`)
+
+`zinder-bench active-writer-publication` drives four matched writer/publication
+arms against an identical synthetic Regtest chain crossing at least one
+4,096-block shielded catalog segment boundary while concurrent lightwalletd
+compatibility readers measure live serving visibility and throughput:
+
+```bash
+zinder-bench active-writer-publication \
+  --base-blocks 4092 \
+  --live-blocks 16 \
+  --reorg-window-blocks 4 \
+  --segment-blocks 4096 \
+  --report ./reports/active-writer-publication.json
+```
+
+The four matched modes are `quiescent_control`, `ingest_active`,
+`ingest_and_projector`, and `ingest_projector_and_publisher`. The JSON report
+records separate ingest prepare and commit latencies, commit-to-served-tip
+publication delay (`p50`, `p95`, `max`), range `first_frame` and `completion`
+latencies for settled catalog, cold-refill/warm live tail, and slow
+boundary-crossing streams, mempool churn (`50` and `500` tx batches), writer WAL
+fsyncs (`wal.synced`), `NodeSource` RPC counts, per-role RocksDB flush/compaction
+and I/O modes (`direct` vs `buffered`), stage differentials against
+`quiescent_control`, and final-tip byte-level reply parity.
