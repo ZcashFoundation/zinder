@@ -7,6 +7,36 @@ use zinder_core::{
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
+use zinder_store::ShieldedProjectionSelection;
+
+use crate::sealed_history::SealedSlab;
+
+/// How published history and the live tail serve a [`CompactBlockShape`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublishedProjection {
+    /// Zero-copy slice directly from the stored slab frame.
+    ZeroCopy(SealedSlab),
+    /// Protobuf wire projection over an authenticated stored slab frame.
+    WireProjected {
+        slab: SealedSlab,
+        selection: ShieldedProjectionSelection,
+    },
+}
+
+impl PublishedProjection {
+    pub(crate) const fn slab(self) -> SealedSlab {
+        match self {
+            Self::ZeroCopy(slab) | Self::WireProjected { slab, .. } => slab,
+        }
+    }
+
+    pub(crate) const fn selection(self) -> Option<ShieldedProjectionSelection> {
+        match self {
+            Self::ZeroCopy(_) => None,
+            Self::WireProjected { selection, .. } => Some(selection),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Payload {
@@ -256,10 +286,57 @@ impl CompactBlockShape {
                     || (self.payload != Payload::Mempool && !scan.transparent_inputs.is_empty())))
     }
 
+    /// Classifies how published history and the live tail serve this shape, or
+    /// returns `None` when the shape requires canonical storage (such as
+    /// transparent transaction inputs/outputs, unary full/nullifier blocks, or
+    /// mempool filtering).
+    pub(crate) const fn published_projection(self) -> Option<PublishedProjection> {
+        if self.transparent || !matches!(self.payload, Payload::SelectedPools | Payload::Nullifiers)
+        {
+            return None;
+        }
+        let nullifiers_only = self.payload.is_nullifiers_only();
+        if self.sapling && self.orchard && self.ironwood {
+            return Some(PublishedProjection::ZeroCopy(if nullifiers_only {
+                SealedSlab::Nullifier
+            } else {
+                SealedSlab::Shielded
+            }));
+        }
+        // Sapling-omitting nullifier subsets (including `[Orchard]`) project
+        // `SealedSlab::Nullifier` directly, avoiding reading outputs and
+        // ciphertexts from `SealedSlab::Shielded`. Subsets that select Sapling
+        // read `SealedSlab::Shielded` so cross-pool Sapling output-only
+        // deposit shells remain distinguishable from non-Sapling transactions.
+        let slab = if nullifiers_only && !self.sapling {
+            SealedSlab::Nullifier
+        } else {
+            SealedSlab::Shielded
+        };
+        Some(PublishedProjection::WireProjected {
+            slab,
+            selection: ShieldedProjectionSelection::new(
+                self.sapling,
+                self.orchard,
+                self.ironwood,
+                nullifiers_only,
+            ),
+        })
+    }
+
+    /// Returns whether published history and the live tail serve this shape.
+    pub(crate) const fn uses_published_range(self) -> bool {
+        self.published_projection().is_some()
+    }
+
     /// Returns whether this shape is one of the two default projections the
-    /// signed history stores as pre-encoded frames and the live tail caches.
-    pub(crate) fn is_published_shape(self) -> bool {
-        self == Self::DEFAULT_RANGE || self == Self::DEFAULT_NULLIFIER_RANGE
+    /// signed history stores as pre-encoded zero-copy frames and the live tail
+    /// caches directly.
+    pub(crate) const fn is_zero_copy_published(self) -> bool {
+        matches!(
+            self.published_projection(),
+            Some(PublishedProjection::ZeroCopy(_))
+        )
     }
 
     /// Returns the published shape whose stored frames carry exactly the
@@ -434,12 +511,65 @@ mod tests {
             CompactBlockShape::for_nullifier_range(&[])?,
             CompactBlockShape::DEFAULT_NULLIFIER_RANGE
         );
-        assert!(CompactBlockShape::DEFAULT_NULLIFIER_RANGE.is_published_shape());
-        assert!(CompactBlockShape::DEFAULT_RANGE.is_published_shape());
-        assert!(!CompactBlockShape::BLOCK_NULLIFIERS.is_published_shape());
+        assert_eq!(
+            CompactBlockShape::DEFAULT_NULLIFIER_RANGE.published_projection(),
+            Some(PublishedProjection::ZeroCopy(SealedSlab::Nullifier))
+        );
+        assert_eq!(
+            CompactBlockShape::DEFAULT_RANGE.published_projection(),
+            Some(PublishedProjection::ZeroCopy(SealedSlab::Shielded))
+        );
+        assert!(CompactBlockShape::DEFAULT_NULLIFIER_RANGE.is_zero_copy_published());
+        assert!(CompactBlockShape::DEFAULT_RANGE.is_zero_copy_published());
+        assert!(!CompactBlockShape::BLOCK_NULLIFIERS.uses_published_range());
+        assert!(!CompactBlockShape::FULL_BLOCK.uses_published_range());
         assert!(
-            !CompactBlockShape::for_range(&[lightwalletd::PoolType::Orchard as i32])?
-                .is_published_shape()
+            !CompactBlockShape::for_mempool(&[lightwalletd::PoolType::Orchard as i32])?
+                .uses_published_range()
+        );
+        assert!(
+            !CompactBlockShape::for_range(&[
+                lightwalletd::PoolType::Transparent as i32,
+                lightwalletd::PoolType::Orchard as i32,
+            ])?
+            .uses_published_range()
+        );
+        let orchard_range =
+            CompactBlockShape::for_range(&[lightwalletd::PoolType::Orchard as i32])?;
+        assert!(!orchard_range.is_zero_copy_published());
+        assert_eq!(
+            orchard_range.published_projection(),
+            Some(PublishedProjection::WireProjected {
+                slab: SealedSlab::Shielded,
+                selection: ShieldedProjectionSelection::new(false, true, false, false),
+            })
+        );
+        let orchard_nullifiers =
+            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Orchard as i32])?;
+        assert!(!orchard_nullifiers.is_zero_copy_published());
+        assert_eq!(
+            orchard_nullifiers.published_projection(),
+            Some(PublishedProjection::WireProjected {
+                slab: SealedSlab::Nullifier,
+                selection: ShieldedProjectionSelection::new(false, true, false, true),
+            })
+        );
+        let sapling_nullifiers =
+            CompactBlockShape::for_nullifier_range(&[lightwalletd::PoolType::Sapling as i32])?;
+        assert_eq!(
+            sapling_nullifiers.published_projection(),
+            Some(PublishedProjection::WireProjected {
+                slab: SealedSlab::Shielded,
+                selection: ShieldedProjectionSelection::new(true, false, false, true),
+            })
+        );
+        let empty_nullifiers = CompactBlockShape::for_nullifier_range(&[99])?;
+        assert_eq!(
+            empty_nullifiers.published_projection(),
+            Some(PublishedProjection::WireProjected {
+                slab: SealedSlab::Nullifier,
+                selection: ShieldedProjectionSelection::new(false, false, false, true),
+            })
         );
         Ok(())
     }

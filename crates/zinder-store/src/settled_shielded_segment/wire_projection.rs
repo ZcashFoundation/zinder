@@ -141,14 +141,88 @@ pub(super) fn synthesize_empty_nullifier_block(
 
 /// Projects one `Slab 0` `CompactBlock` protobuf payload into a gRPC-framed
 /// message according to `selection`, clearing `out` first.
+///
+/// # Errors
+///
+/// Returns [`SettledShieldedSegmentError::PayloadIntegrity`] on malformed wire
+/// fields or unexpected transparent tags, or
+/// [`SettledShieldedSegmentError::InvalidFormat`] if the framed message exceeds
+/// the 4 GiB gRPC length prefix.
 pub fn project_shielded_block_wire(
     raw_payload: &[u8],
     selection: ShieldedProjectionSelection,
     out: &mut Vec<u8>,
 ) -> Result<(), SettledShieldedSegmentError> {
-    out.clear();
     let mut tx_scratch = Vec::new();
-    project_shielded_block_wire_into(raw_payload, selection, out, &mut tx_scratch)
+    project_shielded_block_wire_with_scratch(raw_payload, selection, out, &mut tx_scratch)
+}
+
+/// Projects one `CompactBlock` protobuf payload into a gRPC-framed message in
+/// `out` using caller-supplied `tx_scratch`, clearing `out` first.
+///
+/// # Errors
+///
+/// Returns [`SettledShieldedSegmentError::PayloadIntegrity`] on malformed wire
+/// fields or unexpected transparent tags, or
+/// [`SettledShieldedSegmentError::InvalidFormat`] if the framed message exceeds
+/// the 4 GiB gRPC length prefix.
+pub fn project_shielded_block_wire_with_scratch(
+    raw_payload: &[u8],
+    selection: ShieldedProjectionSelection,
+    out: &mut Vec<u8>,
+    tx_scratch: &mut Vec<u8>,
+) -> Result<(), SettledShieldedSegmentError> {
+    out.clear();
+    project_shielded_block_wire_into(raw_payload, selection, out, tx_scratch)
+}
+
+/// Returns `Ok(true)` when `raw_payload` is a valid `CompactBlock` wire payload
+/// with no `vtx` entries whose projected output under `selection` is
+/// byte-for-byte identical to `raw_payload`.
+///
+/// # Errors
+///
+/// Returns [`SettledShieldedSegmentError::PayloadIntegrity`] if any visited
+/// wire tag, varint, or length-delimited field in `raw_payload` is malformed.
+pub fn is_passthrough_shielded_block_wire(
+    raw_payload: &[u8],
+    selection: ShieldedProjectionSelection,
+) -> Result<bool, SettledShieldedSegmentError> {
+    let mut cursor = raw_payload;
+    let mut nullifier_meta_at_end = false;
+    let mut chain_metadata_count = 0_usize;
+    while !cursor.is_empty() {
+        let field_start = cursor;
+        let (tag, wire_type) = decode_key(&mut cursor).map_err(|err| wire_error(&err))?;
+        match tag {
+            COMPACT_BLOCK_TAG_HEIGHT | COMPACT_BLOCK_TAG_TIME => {
+                expect_wire_type(wire_type, WireType::Varint, "CompactBlock scalar")?;
+                decode_varint(&mut cursor).map_err(|err| wire_error(&err))?;
+                nullifier_meta_at_end = false;
+            }
+            COMPACT_BLOCK_TAG_HASH | COMPACT_BLOCK_TAG_PREV_HASH | COMPACT_BLOCK_TAG_HEADER => {
+                expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock bytes")?;
+                let _bytes = take_length_delimited(&mut cursor)?;
+                nullifier_meta_at_end = false;
+            }
+            COMPACT_BLOCK_TAG_CHAIN_METADATA => {
+                expect_wire_type(wire_type, WireType::LengthDelimited, "chain_metadata")?;
+                let meta_bytes = take_length_delimited(&mut cursor)?;
+                validate_chain_metadata_wire(meta_bytes)?;
+                chain_metadata_count += 1;
+                let consumed = field_start.len() - cursor.len();
+                nullifier_meta_at_end =
+                    cursor.is_empty() && field_start[..consumed] == EMPTY_CHAIN_METADATA_WIRE;
+            }
+            // COMPACT_BLOCK_TAG_VTX (tag 7) or any unknown field requires full projection.
+            _ => return Ok(false),
+        }
+    }
+    if selection.nullifiers_only {
+        Ok(chain_metadata_count == 1 && nullifier_meta_at_end)
+    } else {
+        Ok(true)
+    }
 }
 
 /// Appends one gRPC-framed projected `CompactBlock` into `out`, reusing `tx_scratch`.

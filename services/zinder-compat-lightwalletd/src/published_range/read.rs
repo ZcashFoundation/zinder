@@ -7,7 +7,7 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, CompactBlockArtifact,
 };
 use zinder_proto::{ZINDER_ERROR_DOMAIN, compat::lightwalletd::EncodedBlock, v1::ops::ErrorReason};
-use zinder_store::HeightOrder;
+use zinder_store::{HeightOrder, ShieldedProjectionSelection};
 
 use super::{
     PublishedShieldedCatalog,
@@ -19,8 +19,8 @@ use crate::{
         RangeSource, view_reaches,
     },
     block_range::RangeBlock,
-    compact_block_messages::CompactBlockShape,
-    sealed_history::{SealedBlock, SealedSlab},
+    compact_block_messages::{CompactBlockShape, PublishedProjection},
+    sealed_history::SealedBlock,
 };
 
 #[derive(Clone)]
@@ -101,7 +101,7 @@ impl PublishedRangeRead {
     /// Checks the whole offer. A descending offer that starts below the
     /// catalog can join it only from a live tail above the catalog.
     fn reads_published_files(&self, chunk: BlockHeightRange) -> bool {
-        self.shape.is_published_shape()
+        self.shape.uses_published_range()
             && self.history.as_ref().is_some_and(|catalog| {
                 let coverage = catalog.bounds();
                 (coverage.start..=coverage.end).contains(&chunk.start)
@@ -151,12 +151,24 @@ impl PublishedRangeRead {
 
     fn encoded_rows(
         &self,
-        span: BlockHeightRange,
-        order: HeightOrder,
-        max_bytes: usize,
+        projection: PublishedProjection,
+        (span, order, max_bytes): (BlockHeightRange, HeightOrder, usize),
         (tail, cancel): (Option<&EncodedTail>, &CancellationToken),
     ) -> std::io::Result<Vec<SealedBlock>> {
-        let slab = sealed_slab(self.shape);
+        let mut rows =
+            self.raw_slab_rows(projection.slab(), (span, order, max_bytes), (tail, cancel))?;
+        if let Some(selection) = projection.selection() {
+            project_sealed_blocks(&mut rows, selection, Some(cancel))?;
+        }
+        Ok(rows)
+    }
+
+    fn raw_slab_rows(
+        &self,
+        slab: crate::sealed_history::SealedSlab,
+        (span, order, max_bytes): (BlockHeightRange, HeightOrder, usize),
+        (tail, cancel): (Option<&EncodedTail>, &CancellationToken),
+    ) -> std::io::Result<Vec<SealedBlock>> {
         if cancel.is_cancelled() {
             return Err(std::io::Error::new(
                 ErrorKind::Interrupted,
@@ -211,7 +223,7 @@ impl PublishedRangeRead {
         let coverage = history.bounds();
         coverage.start <= chunk.start
             && chunk.end <= coverage.end
-            && self.shape.is_published_shape()
+            && self.shape.uses_published_range()
     }
 
     async fn resolve_plan<Reads: CompactBlockReads>(
@@ -437,12 +449,9 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         if read.cancel.is_cancelled() {
             return cancelled_outcome(None);
         }
-        // Equivalence for a pool selection that omits only Ironwood was
-        // resolved when the stream was admitted; an unresolved selection
-        // reads canonical storage.
-        if !self.shape.is_published_shape() {
+        let Some(projection) = self.shape.published_projection() else {
             return native_chunk(reads, read, convert).await;
-        }
+        };
         let (epoch, started, plan) = {
             let current;
             let view = match &read.view {
@@ -487,7 +496,7 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
         };
         drop(read.view);
         self.finish_encoded_read(
-            (epoch, started),
+            (epoch, started, projection),
             (read.chunk, read.order, read.max_bytes, read.cancel),
             tail,
             convert,
@@ -496,19 +505,120 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for PublishedRangeRead {
     }
 }
 
-/// The sealed slab that stores a published shape's frames.
-fn sealed_slab(shape: CompactBlockShape) -> SealedSlab {
-    if shape == CompactBlockShape::DEFAULT_NULLIFIER_RANGE {
-        SealedSlab::Nullifier
-    } else {
-        SealedSlab::Shielded
+const PACKED_PROJECTION_SLAB_BYTES: usize = 64 * 1024;
+const STANDALONE_PROJECTED_FRAME_BYTES: usize = 32 * 1024;
+const MIN_PACKED_PROJECTION_CAPACITY: usize = 4 * 1024;
+
+struct ProjectedSlabPacker {
+    frame_scratch: Vec<u8>,
+    tx_scratch: Vec<u8>,
+    slab_bytes: Vec<u8>,
+    pending: Vec<(usize, std::ops::Range<usize>)>,
+}
+
+impl ProjectedSlabPacker {
+    const fn new() -> Self {
+        Self {
+            frame_scratch: Vec::new(),
+            tx_scratch: Vec::new(),
+            slab_bytes: Vec::new(),
+            pending: Vec::new(),
+        }
     }
+
+    fn project_row(
+        &mut self,
+        rows: &mut [SealedBlock],
+        row_index: usize,
+        selection: ShieldedProjectionSelection,
+    ) -> std::io::Result<()> {
+        let payload = rows[row_index].message.payload();
+        if zinder_store::is_passthrough_shielded_block_wire(&payload, selection)
+            .map_err(projection_io_error)?
+        {
+            return Ok(());
+        }
+        zinder_store::project_shielded_block_wire_with_scratch(
+            &payload,
+            selection,
+            &mut self.frame_scratch,
+            &mut self.tx_scratch,
+        )
+        .map_err(projection_io_error)?;
+        let frame_len = self.frame_scratch.len();
+        if frame_len >= STANDALONE_PROJECTED_FRAME_BYTES {
+            let standalone = prost::bytes::Bytes::copy_from_slice(&self.frame_scratch);
+            rows[row_index].message = EncodedBlock::from_length_prefixed_in(standalone, frame_len)
+                .map_err(|_| invalid_projected_frame())?;
+            return Ok(());
+        }
+        if !self.slab_bytes.is_empty()
+            && self.slab_bytes.len() + frame_len > PACKED_PROJECTION_SLAB_BYTES
+        {
+            self.flush(rows)?;
+        }
+        if self.slab_bytes.capacity() == 0 {
+            let initial = frame_len
+                .max(MIN_PACKED_PROJECTION_CAPACITY)
+                .next_power_of_two()
+                .min(PACKED_PROJECTION_SLAB_BYTES);
+            self.slab_bytes = Vec::with_capacity(initial);
+        }
+        let start = self.slab_bytes.len();
+        self.slab_bytes.extend_from_slice(&self.frame_scratch);
+        self.pending.push((row_index, start..start + frame_len));
+        Ok(())
+    }
+
+    fn flush(&mut self, rows: &mut [SealedBlock]) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let packed_vec = std::mem::take(&mut self.slab_bytes);
+        let allocation_len = packed_vec.capacity();
+        let packed = prost::bytes::Bytes::from(packed_vec);
+        for (row_index, span) in self.pending.drain(..) {
+            rows[row_index].message =
+                EncodedBlock::from_length_prefixed_in(packed.slice(span), allocation_len)
+                    .map_err(|_| invalid_projected_frame())?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn project_sealed_blocks(
+    rows: &mut [SealedBlock],
+    selection: ShieldedProjectionSelection,
+    cancel: Option<&CancellationToken>,
+) -> std::io::Result<()> {
+    let mut packer = ProjectedSlabPacker::new();
+    for row_index in 0..rows.len() {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "block-range stream cancelled",
+            ));
+        }
+        packer.project_row(rows, row_index, selection)?;
+    }
+    packer.flush(rows)
+}
+
+fn projection_io_error(error: zinder_store::SettledShieldedSegmentError) -> std::io::Error {
+    std::io::Error::new(ErrorKind::InvalidData, error)
+}
+
+fn invalid_projected_frame() -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::InvalidData,
+        "projected shielded frame is not a valid gRPC message",
+    )
 }
 
 impl PublishedRangeRead {
     async fn finish_encoded_read<Output, Convert>(
         &self,
-        (epoch, started): (ChainEpoch, Instant),
+        (epoch, started, projection): (ChainEpoch, Instant, PublishedProjection),
         (chunk, order, max_bytes, cancel): (
             BlockHeightRange,
             HeightOrder,
@@ -527,15 +637,20 @@ impl PublishedRangeRead {
         }
         let touches_disk = self.reads_published_files(chunk);
         if !touches_disk && let Some(live) = tail.as_deref() {
-            let rows = live.select(sealed_slab(self.shape), chunk, order, max_bytes, true);
-            return finish_encoded_rows(epoch, Some(started.elapsed()), Ok(rows), &cancel, convert);
+            let rows =
+                live.select_projected(projection, (chunk, order, max_bytes), (true, Some(&cancel)));
+            return finish_encoded_rows(epoch, Some(started.elapsed()), rows, &cancel, convert);
         }
         let source = self.clone();
         tokio::task::spawn_blocking(move || {
             if cancel.is_cancelled() {
                 return cancelled_outcome(Some(started.elapsed()));
             }
-            let rows = source.encoded_rows(chunk, order, max_bytes, (tail.as_deref(), &cancel));
+            let rows = source.encoded_rows(
+                projection,
+                (chunk, order, max_bytes),
+                (tail.as_deref(), &cancel),
+            );
             finish_encoded_rows(epoch, Some(started.elapsed()), rows, &cancel, convert)
         })
         .await

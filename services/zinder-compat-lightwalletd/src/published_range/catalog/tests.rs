@@ -1939,7 +1939,8 @@ async fn an_ironwood_omitting_selection_serves_stored_frames_below_activation() 
     assert_eq!(omitting, default_frames);
     assert!(reads.native.lock().is_empty());
 
-    // Above activation the selection is not equivalent, so it reads native.
+    // Above activation the selection is wire-projected from published history
+    // and the live tail without reading canonical chunks natively.
     let native = native_frames(
         &methods,
         &reads,
@@ -1957,7 +1958,7 @@ async fn an_ironwood_omitting_selection_serves_stored_frames_below_activation() 
     )
     .await?;
     assert_eq!(frames, native);
-    assert!(!reads.native.lock().is_empty());
+    assert!(reads.native.lock().is_empty());
     Ok(())
 }
 
@@ -1970,7 +1971,7 @@ struct Contended {
         Option<Arc<PublishedShieldedCatalog>>,
         super::super::tail::ShieldedTailBuffer,
     ),
-    _held: Vec<tokio::sync::OwnedSemaphorePermit>,
+    held: Vec<tokio::sync::OwnedSemaphorePermit>,
     _fixture: Fixture,
     _store: WalletServingStoreFixture,
 }
@@ -2004,7 +2005,7 @@ impl Contended {
             reads,
             methods,
             history: (Some(catalog.clone()), catalog.tail()),
-            _held: held,
+            held,
             _fixture: fixture,
             _store: store,
         })
@@ -2015,27 +2016,35 @@ impl Contended {
         vec![PoolType::Sapling as i32, PoolType::Orchard as i32]
     }
 
-    /// Streams `first..=last` with the two shielded pools while every signed
-    /// read is busy.
-    async fn stream(&self, first: u64, last: u64) -> Result<Vec<Vec<u8>>> {
+    fn transparent_orchard() -> Vec<i32> {
+        use zinder_proto::compat::lightwalletd::PoolType;
+        vec![PoolType::Transparent as i32, PoolType::Orchard as i32]
+    }
+
+    /// Streams `first..=last` with `pool_types` while every signed read is busy.
+    async fn stream_pools(
+        &self,
+        first: u64,
+        last: u64,
+        pool_types: Vec<i32>,
+    ) -> Result<Vec<Vec<u8>>> {
         let frames = published_frames(
             &self.methods,
             &self.reads,
             self.history.clone(),
-            (first, last, Self::sapling_orchard()),
+            (first, last, pool_types),
             crate::compact_block_messages::CompactBlockShape::for_range,
         );
         tokio::time::timeout(Self::PROMPT, frames).await?
     }
 
-    /// Whether the same request is still waiting for a permit after a short
-    /// time.
-    async fn queues(&self, first: u64, last: u64) -> bool {
+    /// Whether `pool_types` is still waiting for a signed-read permit after a short time.
+    async fn queues_pools(&self, first: u64, last: u64, pool_types: Vec<i32>) -> bool {
         let frames = published_frames(
             &self.methods,
             &self.reads,
             self.history.clone(),
-            (first, last, Self::sapling_orchard()),
+            (first, last, pool_types),
             crate::compact_block_messages::CompactBlockShape::for_range,
         );
         tokio::time::timeout(std::time::Duration::from_millis(200), frames)
@@ -2045,10 +2054,18 @@ impl Contended {
 }
 
 #[tokio::test]
-async fn an_unreadable_activation_schedule_serves_the_explicit_pools_natively() -> Result<()> {
-    let contended = Contended::new(ActivationSchedule::Withheld)?;
-    // With no schedule to prove equivalence, a covered range reads canonical
-    // storage and never waits for the busy signed reads.
+async fn an_unreadable_activation_schedule_projects_published_frames_without_native_reads()
+-> Result<()> {
+    let mut contended = Contended::new(ActivationSchedule::Withheld)?;
+    // Even without an activation schedule to prove zero-copy equivalence,
+    // `[Sapling, Orchard]` serves wire-projected signed files, so it queues
+    // while permits are held and serves with zero native reads once released.
+    assert!(
+        contended
+            .queues_pools(1, 100, Contended::sapling_orchard())
+            .await
+    );
+    contended.held.clear();
     let native = native_frames(
         &contended.methods,
         &contended.reads,
@@ -2057,41 +2074,62 @@ async fn an_unreadable_activation_schedule_serves_the_explicit_pools_natively() 
     )
     .await?;
     contended.reads.native.lock().clear();
-    assert_eq!(contended.stream(1, 100).await?, native);
+    assert_eq!(
+        contended
+            .stream_pools(1, 100, Contended::sapling_orchard())
+            .await?,
+        native
+    );
     assert!(
-        !contended.reads.native.lock().is_empty(),
-        "the explicit selection must read canonical storage"
+        contended.reads.native.lock().is_empty(),
+        "wire-projected shielded subset must not read canonical storage natively"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn sapling_orchard_ranges_route_by_the_request_end_under_signed_read_contention() -> Result<()>
-{
-    // Ironwood activates inside the catalog's coverage.
+async fn shielded_subsets_queue_for_signed_reads_while_transparent_subsets_bypass_contention()
+-> Result<()> {
+    use zinder_proto::compat::lightwalletd::PoolType;
     const ACTIVATION: u32 = 1_500;
     let contended = Contended::new(ActivationSchedule::IronwoodAt(ACTIVATION))?;
 
-    // Control: a covered range below activation is a signed read, so it waits
-    // for a permit.
-    assert!(contended.queues(1, 100).await);
-
-    // A covered range above activation reads canonical storage.
-    let covered = contended.stream(1_520, 1_590).await?;
-    assert_eq!(covered.len(), 71);
-
-    // A range that crosses activation reads canonical storage from its first
-    // chunk, whichever way it runs. Its ascending first chunk, 1..=1000, and
-    // its descending last chunk, 1..=700, sit wholly below activation, so
-    // routing each chunk by its own heights would queue for a permit.
-    contended.reads.native.lock().clear();
-    assert_eq!(contended.stream(1, 1_700).await?.len(), 1_700);
-    assert_eq!(contended.stream(1_700, 1).await?.len(), 1_700);
-    let native = contended.reads.native.lock().clone();
+    // Every non-transparent shielded subset reads signed files across and above
+    // Ironwood activation, so each waits for a signed-read permit.
     assert!(
-        native.iter().any(|chunk| chunk.end.value() < ACTIVATION),
-        "a chunk wholly below activation must still read canonical storage: {native:?}"
+        contended
+            .queues_pools(1, 100, Contended::sapling_orchard())
+            .await
     );
+    assert!(
+        contended
+            .queues_pools(1_520, 1_590, Contended::sapling_orchard())
+            .await
+    );
+    assert!(
+        contended
+            .queues_pools(1, 1_700, vec![PoolType::Orchard as i32])
+            .await
+    );
+
+    // A selection that includes Transparent cannot be served from signed files,
+    // so it bypasses the busy signed-read permits in either direction.
+    contended.reads.native.lock().clear();
+    assert_eq!(
+        contended
+            .stream_pools(1, 1_700, Contended::transparent_orchard())
+            .await?
+            .len(),
+        1_700
+    );
+    assert_eq!(
+        contended
+            .stream_pools(1_700, 1, Contended::transparent_orchard())
+            .await?
+            .len(),
+        1_700
+    );
+    assert!(!contended.reads.native.lock().is_empty());
     drop(contended);
     Ok(())
 }
@@ -2439,5 +2477,464 @@ fn parallel_publication_converts_worker_panic_into_io_error() -> Result<()> {
         err.to_string().contains("range builder worker panicked"),
         "{err}"
     );
+    Ok(())
+}
+
+fn all_shielded_pool_subsets() -> Vec<Vec<i32>> {
+    use zinder_proto::compat::lightwalletd::PoolType;
+    let sap = PoolType::Sapling as i32;
+    let orc = PoolType::Orchard as i32;
+    let irw = PoolType::Ironwood as i32;
+    vec![
+        Vec::new(),
+        vec![99],
+        vec![sap],
+        vec![orc],
+        vec![irw],
+        vec![sap, orc],
+        vec![sap, irw],
+        vec![orc, irw],
+        vec![sap, orc, irw],
+    ]
+}
+
+fn subset_commitment(seed: u8) -> [u8; 32] {
+    let mut cmx = [0; 32];
+    cmx[0] = seed;
+    cmx
+}
+
+fn subset_action(seed: u8) -> zinder_core::CompactShieldedAction {
+    zinder_core::CompactShieldedAction {
+        nullifier: [seed; 32],
+        commitment: subset_commitment(seed.wrapping_add(1)),
+        ephemeral_key: [seed.wrapping_add(2); 32],
+        ciphertext: [seed.wrapping_add(3); 52],
+    }
+}
+
+fn subset_sapling_output(seed: u8) -> zinder_core::CompactSaplingOutput {
+    zinder_core::CompactSaplingOutput {
+        commitment: subset_commitment(seed),
+        ephemeral_key: [seed.wrapping_add(1); 32],
+        ciphertext: [seed.wrapping_add(2); 52],
+    }
+}
+
+fn subset_tx_for_height(
+    height: u32,
+) -> Vec<(
+    u64,
+    zinder_core::TransactionId,
+    zinder_core::CompactTransactionData,
+)> {
+    if height <= 5 {
+        subset_early_tx_for_height(height)
+    } else {
+        subset_late_tx_for_height(height)
+    }
+}
+
+fn subset_early_tx_for_height(
+    height: u32,
+) -> Vec<(
+    u64,
+    zinder_core::TransactionId,
+    zinder_core::CompactTransactionData,
+)> {
+    use zinder_core::{
+        CompactSaplingSpend, CompactTransactionData, CompactTransparentInput,
+        CompactTransparentOutput, TransactionId,
+    };
+    let tid = |tag: u8| TransactionId::from_bytes([tag; 32]);
+    match height {
+        2 => vec![(
+            0,
+            tid(20),
+            CompactTransactionData {
+                fee_zat: Some(1_000),
+                transparent_inputs: vec![CompactTransparentInput {
+                    previous_transaction_id: tid(1),
+                    previous_output_index: 0,
+                }],
+                transparent_outputs: vec![CompactTransparentOutput {
+                    value_zat: 5_000,
+                    script_pub_key: vec![0x51],
+                }],
+                ..Default::default()
+            },
+        )],
+        3 => vec![(
+            1,
+            tid(30),
+            CompactTransactionData {
+                fee_zat: Some(2_000),
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: [0x31; 32],
+                }],
+                sapling_outputs: vec![subset_sapling_output(0x32)],
+                ..Default::default()
+            },
+        )],
+        // Sapling output-only deposit shell (0 spends).
+        4 => vec![(
+            0,
+            tid(40),
+            CompactTransactionData {
+                fee_zat: Some(3_000),
+                sapling_outputs: vec![subset_sapling_output(0x41)],
+                ..Default::default()
+            },
+        )],
+        // Cross-pool Orchard spend + Sapling output-only deposit (0 Sapling spends).
+        5 => vec![(
+            2,
+            tid(50),
+            CompactTransactionData {
+                fee_zat: Some(4_000),
+                sapling_outputs: vec![subset_sapling_output(0x51)],
+                orchard_actions: vec![subset_action(0x52)],
+                ..Default::default()
+            },
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn subset_late_tx_for_height(
+    height: u32,
+) -> Vec<(
+    u64,
+    zinder_core::TransactionId,
+    zinder_core::CompactTransactionData,
+)> {
+    use zinder_core::{CompactSaplingSpend, CompactTransactionData, TransactionId};
+    let tid = |tag: u8| TransactionId::from_bytes([tag; 32]);
+    match height {
+        6 => vec![(
+            1,
+            tid(60),
+            CompactTransactionData {
+                fee_zat: Some(5_000),
+                orchard_actions: vec![subset_action(0x61), subset_action(0x65)],
+                ..Default::default()
+            },
+        )],
+        7 => vec![(
+            0,
+            tid(70),
+            CompactTransactionData {
+                fee_zat: Some(6_000),
+                ironwood_actions: vec![subset_action(0x71), subset_action(0x75)],
+                ..Default::default()
+            },
+        )],
+        // Cross-pool Ironwood action + Sapling output-only deposit.
+        8 => vec![(
+            3,
+            tid(80),
+            CompactTransactionData {
+                fee_zat: Some(7_000),
+                sapling_outputs: vec![subset_sapling_output(0x81)],
+                ironwood_actions: vec![subset_action(0x82)],
+                ..Default::default()
+            },
+        )],
+        9 => subset_mixed_block_txs(),
+        10 => vec![(
+            0,
+            tid(100),
+            CompactTransactionData {
+                fee_zat: Some(0),
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: [0xa1; 32],
+                }],
+                ..Default::default()
+            },
+        )],
+        11 => vec![(
+            1,
+            tid(110),
+            CompactTransactionData {
+                fee_zat: Some(9_000),
+                orchard_actions: vec![subset_action(0xb1)],
+                ironwood_actions: vec![subset_action(0xb5)],
+                ..Default::default()
+            },
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn subset_mixed_block_txs() -> Vec<(
+    u64,
+    zinder_core::TransactionId,
+    zinder_core::CompactTransactionData,
+)> {
+    use zinder_core::{
+        CompactSaplingSpend, CompactTransactionData, CompactTransparentOutput, TransactionId,
+    };
+    let tid = |tag: u8| TransactionId::from_bytes([tag; 32]);
+    vec![
+        (
+            0,
+            tid(90),
+            CompactTransactionData {
+                transparent_outputs: vec![CompactTransparentOutput {
+                    value_zat: 500,
+                    script_pub_key: vec![0x51],
+                }],
+                ..Default::default()
+            },
+        ),
+        (
+            2,
+            tid(91),
+            CompactTransactionData {
+                fee_zat: Some(1_500),
+                sapling_outputs: vec![subset_sapling_output(0x91)],
+                ..Default::default()
+            },
+        ),
+        (
+            4,
+            tid(92),
+            CompactTransactionData {
+                fee_zat: Some(2_500),
+                orchard_actions: vec![subset_action(0x92)],
+                ..Default::default()
+            },
+        ),
+        (
+            5,
+            tid(93),
+            CompactTransactionData {
+                fee_zat: Some(3_500),
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: [0x93; 32],
+                }],
+                sapling_outputs: vec![subset_sapling_output(0x94)],
+                orchard_actions: vec![subset_action(0x95)],
+                ironwood_actions: vec![subset_action(0x96)],
+                ..Default::default()
+            },
+        ),
+    ]
+}
+
+fn subset_activations(ironwood_height: u32) -> Result<zinder_core::NetworkUpgradeActivations> {
+    let entries = sample_regtest_upgrade_activations()
+        .activations()
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            if entry.name == "NU6.3" {
+                entry.activation_height = BlockHeight::new(ironwood_height);
+            }
+            entry
+        })
+        .collect();
+    Ok(zinder_core::NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        entries,
+    )?)
+}
+
+fn attach_subset_tx_rows(
+    mut chain: ChainFixture,
+    header: &zinder_testkit::FixtureBlock,
+    txs: &[zinder_core::CompactTransaction],
+) -> Result<ChainFixture> {
+    let Some(max_index) = txs.iter().map(|tx| tx.index).max() else {
+        return Ok(chain);
+    };
+    for idx in 0..=max_index {
+        let tx_id = txs.iter().find(|tx| tx.index == idx).map_or_else(
+            || {
+                let mut raw_id = [0xfd; 32];
+                raw_id[0..4].copy_from_slice(&header.height.value().to_le_bytes());
+                raw_id[4..12].copy_from_slice(&idx.to_le_bytes());
+                zinder_core::TransactionId::from_bytes(raw_id)
+            },
+            |found| found.transaction_id,
+        );
+        chain = chain.with_transaction_rows(
+            zinder_testkit::FixtureTransactionRows::from_raw_transaction(
+                tx_id,
+                header.height,
+                header.hash,
+                u32::try_from(idx)?,
+                b"subset-fixture-tx".as_slice(),
+            ),
+        );
+    }
+    Ok(chain)
+}
+
+fn rich_subset_chain() -> Result<(ChainFixture, Vec<zinder_core::CompactBlockArtifact>)> {
+    use zinder_core::{BlockId, CompactBlockArtifact, CompactChainMetadata, CompactTransaction};
+    let mut chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(12);
+    let mut artifacts = Vec::with_capacity(12);
+    let mut sapling_tree_size = 0_u32;
+    let mut orchard_tree_size = 0_u32;
+    let mut ironwood_tree_size = 0_u32;
+    for height_num in 1_u32..=12 {
+        let header = chain
+            .blocks()
+            .iter()
+            .find(|blk| blk.height == BlockHeight::new(height_num))
+            .cloned()
+            .ok_or_else(|| eyre!("missing block {height_num}"))?;
+        let txs: Vec<CompactTransaction> = subset_tx_for_height(height_num)
+            .into_iter()
+            .map(|(index, transaction_id, scan)| CompactTransaction {
+                index,
+                transaction_id,
+                data: scan,
+            })
+            .collect();
+        for tx in &txs {
+            sapling_tree_size += u32::try_from(tx.data.sapling_outputs.len())?;
+            orchard_tree_size += u32::try_from(tx.data.orchard_actions.len())?;
+            ironwood_tree_size += u32::try_from(tx.data.ironwood_actions.len())?;
+        }
+        chain = attach_subset_tx_rows(chain, &header, &txs)?;
+        let parent_hash = if height_num == 1 {
+            Network::ZcashRegtest.genesis_hash()
+        } else {
+            header.parent_hash
+        };
+        let artifact = CompactBlockArtifact::new(
+            BlockId::new(header.height, header.hash),
+            parent_hash,
+            header.block_time_seconds,
+            txs,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: sapling_tree_size,
+                orchard_commitment_tree_size: orchard_tree_size,
+                ironwood_commitment_tree_size: ironwood_tree_size,
+            },
+        )?;
+        artifacts.push(artifact.clone());
+        chain = chain.with_compact_block_artifact(artifact);
+    }
+    Ok((chain, artifacts))
+}
+
+async fn assert_schedule_subset_parity(
+    methods: &crate::block_methods::BlockMethods,
+    source: &Arc<RocksDbCanonicalReader>,
+    catalog: &Arc<PublishedShieldedCatalog>,
+    artifacts: &[zinder_core::CompactBlockArtifact],
+    schedule: ActivationSchedule,
+) -> Result<()> {
+    use crate::compact_block_messages::CompactBlockShape;
+    let mut reads = RecordedSlot::new(crate::CanonicalReaderSlot::new(source.clone()));
+    reads.schedule = schedule;
+    let spans_for_schedule: &[(u64, u64)] = match schedule {
+        ActivationSchedule::IronwoodAt(500) => &[(1, 6), (6, 1)],
+        ActivationSchedule::Admitted
+        | ActivationSchedule::Withheld
+        | ActivationSchedule::IronwoodAt(_) => {
+            &[(1, 6), (6, 1), (7, 12), (12, 7), (1, 12), (12, 1)]
+        }
+    };
+    for pools in all_shielded_pool_subsets() {
+        for select in [
+            CompactBlockShape::for_range as Select,
+            CompactBlockShape::for_nullifier_range as Select,
+        ] {
+            let shape = select(&pools)?;
+            for &(first, last) in spans_for_schedule {
+                reads.native.lock().clear();
+                reads.rows.lock().clear();
+                let served = published_frames(
+                    methods,
+                    &reads,
+                    (Some(catalog.clone()), catalog.tail()),
+                    (first, last, pools.clone()),
+                    select,
+                )
+                .await?;
+                assert!(
+                    reads.native.lock().is_empty(),
+                    "unexpected canonical read for pools={pools:?} {first}..={last}"
+                );
+                assert!(
+                    reads.rows.lock().is_empty(),
+                    "unexpected tail refill for pools={pools:?} {first}..={last}"
+                );
+                let lo = usize::try_from(first.min(last))?;
+                let hi = usize::try_from(first.max(last))?;
+                let mut expected: Vec<Vec<u8>> = artifacts[lo - 1..hi]
+                    .iter()
+                    .cloned()
+                    .map(|blk| Ok::<_, tonic::Status>(shape.encoded(blk)?.payload().to_vec()))
+                    .collect::<std::result::Result<_, _>>()?;
+                if first > last {
+                    expected.reverse();
+                }
+                assert_eq!(
+                    served, expected,
+                    "wire parity mismatch for pools={pools:?} {first}..={last}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_shielded_pool_subset_matches_shape_wire_bytes_with_zero_native_reads() -> Result<()>
+{
+    use crate::compact_block_messages::CompactBlockShape;
+    use zinder_proto::compat::lightwalletd::PoolType;
+
+    let (chain, artifacts) = rich_subset_chain()?;
+    let mut store =
+        CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &subset_activations(7)?)?
+            .into_serving_store_fixture()?;
+    let source = Arc::new(RocksDbCanonicalReader::new(store.take_readers()?.0)?);
+    let fixture = Fixture::new()?;
+    let mut publisher = fixture.publisher()?;
+    // Publish 4 two-block segments covering 1..=8 (1..=6 pre-Ironwood, 7..=8 post-Ironwood);
+    // heights 9..=12 remain in the live tail.
+    for _ in 0..4 {
+        assert!(publisher.publish_next(source.as_ref())?);
+    }
+    let catalog = Arc::new(fixture.catalog(None)?);
+    assert_eq!(catalog.bounds(), test_span(1, 8));
+    fill_tail(&catalog, &source, test_span(9, 12)).await?;
+    let methods = crate::block_methods::BlockMethods::default();
+
+    for schedule in [
+        ActivationSchedule::IronwoodAt(500),
+        ActivationSchedule::IronwoodAt(7),
+        ActivationSchedule::Withheld,
+    ] {
+        assert_schedule_subset_parity(&methods, &source, &catalog, &artifacts, schedule).await?;
+    }
+
+    // Transparent + Orchard on GetBlockRange must still fall back to canonical reads cleanly.
+    let reads = RecordedSlot::new(crate::CanonicalReaderSlot::new(source));
+    let transparent_orchard = vec![PoolType::Transparent as i32, PoolType::Orchard as i32];
+    let expected = native_frames(
+        &methods,
+        &reads,
+        (1, 12, transparent_orchard.clone()),
+        CompactBlockShape::for_range,
+    )
+    .await?;
+    reads.native.lock().clear();
+    let served = published_frames(
+        &methods,
+        &reads,
+        (Some(catalog.clone()), catalog.tail()),
+        (1, 12, transparent_orchard),
+        CompactBlockShape::for_range,
+    )
+    .await?;
+    assert_eq!(served, expected);
+    assert!(!reads.native.lock().is_empty());
     Ok(())
 }

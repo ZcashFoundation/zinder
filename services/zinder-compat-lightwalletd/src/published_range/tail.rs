@@ -13,7 +13,7 @@ use zinder_store::{CanonicalEventFence, HeightOrder};
 
 use crate::{
     block_methods::CompactBlockReads,
-    compact_block_messages::CompactBlockShape,
+    compact_block_messages::{CompactBlockShape, PublishedProjection},
     sealed_history::{SealedBlock, SealedSlab},
 };
 
@@ -465,6 +465,19 @@ impl EncodedTail {
             selected.reverse();
         }
         selected
+    }
+
+    pub(super) fn select_projected(
+        &self,
+        projection: PublishedProjection,
+        (span, order, budget): (BlockHeightRange, HeightOrder, usize),
+        (allow_first, cancel): (bool, Option<&CancellationToken>),
+    ) -> std::io::Result<Vec<SealedBlock>> {
+        let mut selected = self.select(projection.slab(), span, order, budget, allow_first);
+        if let Some(selection) = projection.selection() {
+            super::read::project_sealed_blocks(&mut selected, selection, cancel)?;
+        }
+        Ok(selected)
     }
 
     /// Appends `row`, evicting the lowest rows past `max_tail_bytes`. The
