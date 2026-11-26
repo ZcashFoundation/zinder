@@ -135,3 +135,86 @@ async fn visible_tip_block_stays_under_budget() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sixteen_concurrent_cached_hex_tree_state_tasks_stay_under_budget() -> eyre::Result<()> {
+    use zinder_testkit::{CanonicalBaseline, CanonicalWriterFixture, with_note_commitments};
+
+    const TASKS: usize = 16;
+    const ITERATIONS_PER_TASK: usize = 500;
+    const CONCURRENT_HEX_BUDGET: Duration = Duration::from_secs(3);
+
+    let activations = sample_regtest_upgrade_activations();
+    let chain = with_note_commitments(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(130),
+        &activations,
+    )?;
+    let baseline = CanonicalBaseline::new(&chain)
+        .through(BlockHeight::new(130))
+        .with_settled_tip(BlockHeight::new(105));
+    let mut store_fixture =
+        CanonicalWriterFixture::publish(&baseline, &activations)?.into_serving_store_fixture()?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?);
+    let slot = WalletServingPairSlot::new(pair);
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(slot);
+
+    let settled_checkpoint = BlockHeight::new(100);
+    let settled_replayed = BlockHeight::new(57);
+    let visible_tip = BlockHeight::new(130);
+    let expected_latest = wallet_query.latest_tree_state_checkpoint_hex(None).await?;
+    let expected_settled_checkpoint = wallet_query
+        .tree_state_hex_at(settled_checkpoint, None)
+        .await?;
+    let expected_settled_replayed = wallet_query
+        .tree_state_hex_at(settled_replayed, None)
+        .await?;
+    let expected_tip = wallet_query.tree_state_hex_at(visible_tip, None).await?;
+    assert_eq!(expected_latest, expected_tip);
+
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(TASKS);
+    for task_index in 0..TASKS {
+        let query = wallet_query.clone();
+        let expected_latest = expected_latest.clone();
+        let expected_settled_checkpoint = expected_settled_checkpoint.clone();
+        let expected_settled_replayed = expected_settled_replayed.clone();
+        let expected_tip = expected_tip.clone();
+        handles.push(tokio::spawn(async move {
+            for step in 0..ITERATIONS_PER_TASK {
+                match (task_index + step) & 3 {
+                    0 => {
+                        let latest = query.latest_tree_state_checkpoint_hex(None).await?;
+                        assert_eq!(latest, expected_latest);
+                    }
+                    1 => {
+                        let tip = query.tree_state_hex_at(visible_tip, None).await?;
+                        assert_eq!(tip, expected_tip);
+                    }
+                    2 => {
+                        let checkpoint = query.tree_state_hex_at(settled_checkpoint, None).await?;
+                        assert_eq!(checkpoint, expected_settled_checkpoint);
+                    }
+                    _ => {
+                        let replayed = query.tree_state_hex_at(settled_replayed, None).await?;
+                        assert_eq!(replayed, expected_settled_replayed);
+                    }
+                }
+            }
+            Ok::<(), eyre::Report>(())
+        }));
+    }
+    for handle in handles {
+        handle.await??;
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed <= CONCURRENT_HEX_BUDGET,
+        "16 concurrent tasks x {ITERATIONS_PER_TASK} warm hex tree-state reads took {elapsed:?}, budget is {CONCURRENT_HEX_BUDGET:?}"
+    );
+
+    Ok(())
+}

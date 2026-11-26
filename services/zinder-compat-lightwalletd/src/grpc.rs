@@ -1224,26 +1224,38 @@ where
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
-        if let RequestedBlock::Height(height) = block {
-            self.block_methods
-                .await_tip(&self.query_api, "get_tree_state", height)
-                .await?;
-        }
-        let view = self.query_api.capture_view().await?;
-        reject_genesis_tree_state(block, view.network)?;
-        let height = resolve_block_height(&self.query_api, &view, block)
-            .await
-            .map_err(|error| tree_state_block_lookup_status(&error))?;
-        reject_future_tree_state_height(height, view.visible_tip_height)?;
-        let tree_state = self
-            .query_api
-            .tree_state_at(height, Some(view.id))
-            .await
-            .map_err(|error| tree_state_status(&error))?;
+        let tree_state = match block {
+            RequestedBlock::Height(height) => {
+                self.block_methods
+                    .await_tip(&self.query_api, "get_tree_state", height)
+                    .await?;
+                let view = self.query_api.capture_ephemeral_view().await?;
+                reject_future_tree_state_height(height, view.visible_tip_height)?;
+                match self.query_api.tree_state_hex_at(height, None).await {
+                    Ok(tree_state) => tree_state,
+                    Err(QueryError::BlockNotInBestChain) => {
+                        let latest_view = self.query_api.capture_ephemeral_view().await?;
+                        reject_future_tree_state_height(height, latest_view.visible_tip_height)?;
+                        return Err(tree_state_status(&QueryError::BlockNotInBestChain));
+                    }
+                    Err(error) => return Err(tree_state_status(&error)),
+                }
+            }
+            RequestedBlock::Hash(_) => {
+                let view = self.query_api.capture_view().await?;
+                reject_genesis_tree_state(block, view.network)?;
+                let height = resolve_block_height(&self.query_api, &view, block)
+                    .await
+                    .map_err(|error| tree_state_block_lookup_status(&error))?;
+                reject_future_tree_state_height(height, view.visible_tip_height)?;
+                self.query_api
+                    .tree_state_hex_at(height, Some(view.id))
+                    .await
+                    .map_err(|error| tree_state_status(&error))?
+            }
+        };
 
-        require_sapling_tree_state(&tree_state)?;
-
-        Ok(Response::new(lightwalletd_tree_state(&tree_state)))
+        lightwalletd_tree_state_from_hex(tree_state).map(Response::new)
     }
 
     async fn get_latest_tree_state(
@@ -1252,13 +1264,11 @@ where
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let tree_state = self
             .query_api
-            .latest_tree_state_checkpoint(None)
+            .latest_tree_state_checkpoint_hex(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
-        require_sapling_tree_state(&tree_state)?;
-
-        Ok(Response::new(lightwalletd_tree_state(&tree_state)))
+        lightwalletd_tree_state_from_hex(tree_state).map(Response::new)
     }
 
     type GetSubtreeRootsStream = GrpcStream<lightwalletd::SubtreeRoot>;

@@ -6,7 +6,7 @@
 //! tip from the leading reader and asks the lagging reader for it, as it does
 //! when a load balancer routes each request on its own.
 
-mod published_query;
+pub(super) mod published_query;
 
 use std::{
     future::Future,

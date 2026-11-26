@@ -21,10 +21,11 @@ use zinder_query::{
     BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockFence,
     CompactBlockRange, CompactBlockStream, FullBlock, FullBlockStream,
     NativeWalletEndpointCapabilities, QueryError, RawTransaction, ServedTipSnapshot,
-    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
-    UpstreamNodeCapabilities, VisibleTipBlock, WalletQueryApi, WalletServingQuery,
+    ServedTreeStateHex, SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
+    TransparentOutpointSpendStatuses, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
+    WalletQueryApi, WalletServingQuery,
 };
 use zinder_store::{
     ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
@@ -32,7 +33,7 @@ use zinder_store::{
 };
 
 #[derive(Clone)]
-pub(super) struct PublishedQuery {
+pub(in crate::integration::lightwalletd_grpc) struct PublishedQuery {
     /// The first query, whose structural capabilities every later one shares.
     first: WalletServingQuery<()>,
     current: Arc<Mutex<WalletServingQuery<()>>>,
@@ -40,7 +41,7 @@ pub(super) struct PublishedQuery {
 }
 
 impl PublishedQuery {
-    pub(super) fn new(first: WalletServingQuery<()>) -> Self {
+    pub(in crate::integration::lightwalletd_grpc) fn new(first: WalletServingQuery<()>) -> Self {
         Self {
             current: Arc::new(Mutex::new(first.clone())),
             first,
@@ -49,7 +50,7 @@ impl PublishedQuery {
     }
 
     /// Serves `next` from now on and wakes every subscriber.
-    pub(super) fn publish(&self, next: WalletServingQuery<()>) {
+    pub(in crate::integration::lightwalletd_grpc) fn publish(&self, next: WalletServingQuery<()>) {
         *self.current.lock() = next;
         self.publications.send_replace(());
     }
@@ -67,6 +68,14 @@ impl WalletQueryApi for PublishedQuery {
 
     fn subscribe_publications(&self) -> Option<watch::Receiver<()>> {
         Some(self.publications.subscribe())
+    }
+
+    fn current_visible_tip_height(&self) -> Option<BlockHeight> {
+        self.now().current_visible_tip_height()
+    }
+
+    fn current_chain_epoch(&self) -> Option<ChainEpoch> {
+        self.now().current_chain_epoch()
     }
 
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
@@ -278,11 +287,28 @@ impl WalletQueryApi for PublishedQuery {
         self.now().tree_state_at(height, at_epoch_id).await
     }
 
+    async fn tree_state_hex_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        self.now().tree_state_hex_at(height, at_epoch_id).await
+    }
+
     async fn latest_tree_state_checkpoint(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         self.now().latest_tree_state_checkpoint(at_epoch_id).await
+    }
+
+    async fn latest_tree_state_checkpoint_hex(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        self.now()
+            .latest_tree_state_checkpoint_hex(at_epoch_id)
+            .await
     }
 
     async fn subtree_roots(

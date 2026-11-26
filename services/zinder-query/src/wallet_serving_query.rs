@@ -40,8 +40,8 @@ use crate::{
     DEFAULT_MAX_FULL_BLOCK_RANGE, FULL_BLOCK_STREAM_CHANNEL_CAPACITY,
     FULL_BLOCK_STREAM_SUB_READ_BLOCKS, FullBlock, FullBlockStream,
     NativeWalletEndpointCapabilities, OrderedBroadcaster, QueryError, RawTransaction,
-    ServedTipSnapshot, SettledTipBlock, SpendStatusReadEnd, SubtreeRoots, Transaction,
-    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    ServedTipSnapshot, ServedTreeStateHex, SettledTipBlock, SpendStatusReadEnd, SubtreeRoots,
+    Transaction, TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
     TransparentOutpointSpendStatuses, TreeState, TreeStateFrontiers, UpstreamNodeCapabilities,
     VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
@@ -50,8 +50,8 @@ use crate::{
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
-        DEFAULT_TREE_STATE_REPLAY_WAIT, ReaderGeneration, ReplayKey, Selection,
-        TreeStateReplayLimit, read_missing_height,
+        DEFAULT_TREE_STATE_REPLAY_WAIT, ReaderGeneration, ReadyState, ReplayKey, ReplayedState,
+        Selection, TreeStateReplayLimit, read_missing_height,
     },
     validate_block_range, validate_subtree_root_range,
 };
@@ -642,9 +642,8 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
     /// current pair only for the call.
     fn track_broadcast_height(&self) {
         if let Some(node_verifications) = &self.node_verifications {
-            let pair = self.capture_pair();
-            node_verifications.track_broadcast_height(&pair);
-            drop(pair);
+            self.serving_pair_slot
+                .with_ephemeral(|pair| node_verifications.track_broadcast_height(pair));
         }
     }
 
@@ -652,6 +651,12 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
     /// current pair when the read is unpinned.
     fn pin(&self, at_epoch_id: Option<ChainEpochId>) -> serving_read::SlotPin<'_> {
         serving_read::SlotPin::new(&self.serving_pair_slot, at_epoch_id)
+    }
+
+    /// Selects an ephemeral pair when unpinned (`None`), or pins to `Some(id)`
+    /// when a multi-step caller bound the read to a specific epoch.
+    fn ephemeral_pin(&self, at_epoch_id: Option<ChainEpochId>) -> serving_read::SlotPin<'_> {
+        serving_read::SlotPin::ephemeral_unless_pinned(&self.serving_pair_slot, at_epoch_id)
     }
 
     async fn resolve_tree_state_at<Ready, ReadyFuture>(
@@ -673,82 +678,115 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
             + Clone
             + Send
             + Sync,
-        ReadyFuture: Future<Output = Result<Option<crate::tree_state_replay_limit::ReadyState>, QueryError>>
-            + Send,
+        ReadyFuture: Future<Output = Result<Option<ReadyState>, QueryError>> + Send,
     {
-        use std::ops::ControlFlow;
-
         serving_read::record("tree_state_at", None, async {
-            let deadline = std::sync::OnceLock::new();
-            let mut carried = None;
-            loop {
-                let deadline_ref = &deadline;
-                let step = ready_step.clone();
-                let selected =
-                    serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
-                        let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                        if let Some(ready) = self.tree_state_replays.cached_for_reader(
-                            height,
-                            epoch.visible_tip_height,
-                            &pair,
-                        ) {
-                            return Ok(ControlFlow::Break((epoch, ready)));
-                        }
-                        let req_deadline =
-                            *deadline_ref.get_or_init(|| self.tree_state_replays.deadline());
-                        let key = ReplayKey::new(height, pair.canonical());
-                        let generation = Arc::downgrade(&pair);
-                        let slot = self.serving_pair_slot.clone();
-                        let weak = generation.clone();
-                        let cache_gen = ReaderGeneration::live(&generation, move || {
-                            slot.is_current_weak(&weak)
-                        });
-                        if let Some(ready) = step(
-                            self.tree_state_replays.clone(),
-                            key,
-                            cache_gen.clone(),
-                            pair.canonical_arc(),
-                            req_deadline,
-                        )
-                        .await?
-                        {
-                            return Ok(ControlFlow::Break((epoch, ready)));
-                        }
-                        Ok(ControlFlow::Continue((
-                            epoch,
-                            key,
-                            generation,
-                            cache_gen,
-                            req_deadline,
-                        )))
-                    })
-                    .await?;
-                let (epoch, key, generation, cache_gen, req_deadline) = match selected {
-                    ControlFlow::Break((epoch, ready)) => {
-                        return Ok(tree_state_response(epoch, ready.serve()));
-                    }
-                    ControlFlow::Continue(missing) => missing,
-                };
-                match self
-                    .replay_missing_tree_state(
-                        (height, at_epoch_id, epoch),
-                        (&key, &generation, &cache_gen),
-                        req_deadline,
-                        carried.take(),
-                    )
-                    .await?
-                {
-                    ControlFlow::Break(state) => return Ok(state),
-                    ControlFlow::Continue(slot) => carried = slot,
-                }
-            }
+            let (epoch, served) = self
+                .read_tree_state_at(self.pin(at_epoch_id), (height, at_epoch_id), ready_step)
+                .await?;
+            Ok(served.into_tree_state(epoch))
         })
         .await
     }
 
+    async fn read_tree_state_at<Ready, ReadyFuture>(
+        &self,
+        pin: serving_read::SlotPin<'_>,
+        (height, at_epoch_id): (BlockHeight, Option<ChainEpochId>),
+        ready_step: Ready,
+    ) -> Result<(ChainEpoch, ServedState), QueryError>
+    where
+        Broadcaster: Send + Sync,
+        NativeIngest: Send + Sync,
+        Ready: Fn(
+                TreeStateReplayLimit,
+                ReplayKey,
+                ReaderGeneration,
+                Arc<dyn crate::CanonicalReader>,
+                tokio::time::Instant,
+            ) -> ReadyFuture
+            + Clone
+            + Send
+            + Sync,
+        ReadyFuture: Future<Output = Result<Option<ReadyState>, QueryError>> + Send,
+    {
+        use std::ops::ControlFlow;
+
+        let deadline = std::sync::OnceLock::new();
+        let mut carried = None;
+        loop {
+            let deadline_ref = &deadline;
+            let step = ready_step.clone();
+            let selected = serving_read::read_at(pin, move |pair| async move {
+                let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                if let Some(ready) = pair.cached_latest_tree_state_at(height).or_else(|| {
+                    self.tree_state_replays.cached_for_reader(
+                        height,
+                        epoch.visible_tip_height,
+                        &pair,
+                    )
+                }) {
+                    return Ok(ControlFlow::Break((epoch, ready)));
+                }
+                let req_deadline = *deadline_ref.get_or_init(|| self.tree_state_replays.deadline());
+                let key = ReplayKey::new(height, pair.canonical());
+                let generation = Arc::downgrade(&pair);
+                let slot = self.serving_pair_slot.clone();
+                let weak = generation.clone();
+                let cache_gen =
+                    ReaderGeneration::live(&generation, move || slot.is_current_weak(&weak));
+                if let Some(ready) = step(
+                    self.tree_state_replays.clone(),
+                    key,
+                    cache_gen.clone(),
+                    pair.canonical_arc(),
+                    req_deadline,
+                )
+                .await?
+                {
+                    return Ok(ControlFlow::Break((
+                        epoch,
+                        pair.remember_tip_ready_state(ready),
+                    )));
+                }
+                Ok(ControlFlow::Continue((
+                    epoch,
+                    key,
+                    generation,
+                    cache_gen,
+                    req_deadline,
+                )))
+            })
+            .await?;
+            let (epoch, key, generation, cache_gen, req_deadline) = match selected {
+                ControlFlow::Break((epoch, ready)) => {
+                    return Ok((epoch, ServedState::Ready(ready)));
+                }
+                ControlFlow::Continue(missing) => missing,
+            };
+            match self
+                .replay_missing_tree_state(
+                    (pin, height, at_epoch_id, epoch),
+                    (&key, &generation, &cache_gen),
+                    req_deadline,
+                    carried.take(),
+                )
+                .await?
+            {
+                ControlFlow::Break(served) => return Ok(served),
+                ControlFlow::Continue(slot) => carried = slot,
+            }
+        }
+    }
+
     async fn replay_missing_tree_state(
         &self,
-        (height, at_epoch_id, epoch): (BlockHeight, Option<ChainEpochId>, ChainEpoch),
+        (pin, height, at_epoch_id, epoch): (
+            serving_read::SlotPin<'_>,
+            BlockHeight,
+            Option<ChainEpochId>,
+            ChainEpoch,
+        ),
         (key, generation, cache_gen): (
             &ReplayKey,
             &std::sync::Weak<WalletServingReadPair>,
@@ -757,7 +795,10 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
         req_deadline: tokio::time::Instant,
         carried: Option<crate::tree_state_replay_limit::TakeReplayPermit>,
     ) -> Result<
-        std::ops::ControlFlow<TreeState, Option<crate::tree_state_replay_limit::TakeReplayPermit>>,
+        std::ops::ControlFlow<
+            (ChainEpoch, ServedState),
+            Option<crate::tree_state_replay_limit::TakeReplayPermit>,
+        >,
         QueryError,
     >
     where
@@ -772,27 +813,24 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
                 .select(key, cache_gen, req_deadline, carried)?
             {
                 Selection::Ready(state) => {
-                    return Ok(ControlFlow::Break(tree_state_response(
-                        epoch,
-                        state.serve(),
-                    )));
+                    return Ok(ControlFlow::Break((epoch, ServedState::Ready(state))));
                 }
                 Selection::Waiting(subscription) => subscription,
             };
         let slot = subscription.admit(&self.tree_state_replays).await?;
         let generation = generation.clone();
-        serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
+        serving_read::read_at(pin, move |pair| async move {
             let epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             if !generation.ptr_eq(&Arc::downgrade(&pair)) {
                 return Ok(ControlFlow::Continue(subscription.carry(&slot)));
             }
-            let state = subscription
-                .replay(slot, |cancelled| async move {
+            let replayed = subscription
+                .replay_shared(slot, |cancelled| async move {
                     read_missing_height(pair.canonical(), height, cancelled).await
                 })
                 .await?;
-            Ok(state.map_or(ControlFlow::Continue(None), |state| {
-                ControlFlow::Break(tree_state_response(epoch, state))
+            Ok(replayed.map_or(ControlFlow::Continue(None), |replayed| {
+                ControlFlow::Break((epoch, ServedState::Replayed(replayed)))
             }))
         })
         .await
@@ -807,7 +845,8 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
     /// value without turning later readiness changes into discovery mutations.
     #[must_use]
     pub fn admitted_raw_blob_retention(&self) -> RawBlobRetention {
-        self.capture_pair().canonical().raw_blob_retention()
+        self.serving_pair_slot
+            .with_ephemeral(|pair| pair.canonical().raw_blob_retention())
     }
 
     /// Returns the epoch `pair` serves when it answers `requested`, the
@@ -899,14 +938,15 @@ where
     fn current_visible_tip_height(&self) -> Option<BlockHeight> {
         Some(
             self.serving_pair_slot
-                .capture_ephemeral()
-                .chain_epoch()
-                .visible_tip_height,
+                .with_ephemeral(|pair| pair.chain_epoch().visible_tip_height),
         )
     }
 
     fn current_chain_epoch(&self) -> Option<ChainEpoch> {
-        Some(self.serving_pair_slot.capture_ephemeral().chain_epoch())
+        Some(
+            self.serving_pair_slot
+                .with_ephemeral(|pair| pair.chain_epoch()),
+        )
     }
 
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
@@ -920,7 +960,9 @@ where
     }
 
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
-        let activations = self.capture_pair().network_upgrade_activations().clone();
+        let activations = self
+            .serving_pair_slot
+            .with_ephemeral(|pair| pair.network_upgrade_activations().clone());
         serving_read::record("network_upgrade_activations", None, ready(Ok(activations))).await
     }
 
@@ -949,6 +991,17 @@ where
 
     async fn served_tip_snapshot(&self) -> Result<ServedTipSnapshot, QueryError> {
         serving_read::record("visible_tip_block", None, async {
+            if let Some(snapshot) = self.serving_pair_slot.with_ephemeral(|pair| {
+                (!pair.has_missing_table_file())
+                    .then(|| pair.cached_tip_block_time())
+                    .flatten()
+                    .map(|block_time_unix_seconds| ServedTipSnapshot {
+                        chain_epoch: pair.chain_epoch(),
+                        block_time_unix_seconds,
+                    })
+            }) {
+                return Ok(snapshot);
+            }
             let pair = self.serving_pair_slot.capture_ephemeral();
             serving_read::read_ephemeral_pair(&self.serving_pair_slot, pair, |pair| async move {
                 Ok(ServedTipSnapshot {
@@ -1594,6 +1647,47 @@ where
         .await
     }
 
+    async fn tree_state_hex_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        serving_read::record("tree_state_at", None, async {
+            if at_epoch_id.is_none()
+                && let Some(hex) = self.serving_pair_slot.with_ephemeral(|pair| {
+                    if pair.has_missing_table_file() {
+                        return None;
+                    }
+                    let epoch = pair.chain_epoch();
+                    pair.cached_latest_tree_state_at(height)
+                        .or_else(|| {
+                            self.tree_state_replays.cached_for_reader(
+                                height,
+                                epoch.visible_tip_height,
+                                pair,
+                            )
+                        })
+                        .map(|ready| ready.serve_hex(epoch.network))
+                })
+            {
+                return Ok(hex);
+            }
+            let (epoch, served) = self
+                .read_tree_state_at(
+                    self.ephemeral_pin(at_epoch_id),
+                    (height, at_epoch_id),
+                    |replays, key, cache_gen, reader, req_deadline| async move {
+                        replays
+                            .ready_state(&key, &cache_gen, &reader, req_deadline)
+                            .await
+                    },
+                )
+                .await?;
+            Ok(served.into_hex(epoch.network))
+        })
+        .await
+    }
+
     async fn latest_tree_state_checkpoint(
         &self,
         at_epoch_id: Option<ChainEpochId>,
@@ -1603,20 +1697,35 @@ where
             self.pin(at_epoch_id),
             move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                let checkpoint = pair
-                    .canonical()
-                    .tree_state_checkpoint_at_or_before(chain_epoch.visible_tip_height)
-                    .await
-                    .map_err(QueryError::canonical_read)?
-                    .ok_or_else(|| {
-                        artifact_unavailable(
-                            ArtifactFamily::TreeState,
-                            chain_epoch.visible_tip_height,
-                        )
-                    })?;
-                Ok(tree_state_response(chain_epoch, checkpoint))
+                let cached = pair.latest_tree_state_checkpoint().await?;
+                Ok(tree_state_response(chain_epoch, cached.state().clone()))
             },
         )
+        .await
+    }
+
+    async fn latest_tree_state_checkpoint_hex(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        serving_read::record("latest_tree_state_checkpoint", None, async {
+            if at_epoch_id.is_none()
+                && let Some(hex) = self.serving_pair_slot.with_ephemeral(|pair| {
+                    (!pair.has_missing_table_file())
+                        .then(|| pair.cached_latest_tree_state_checkpoint())
+                        .flatten()
+                        .map(|cached| cached.to_hex(pair.chain_epoch().network))
+                })
+            {
+                return Ok(hex);
+            }
+            serving_read::read_at(self.ephemeral_pin(at_epoch_id), move |pair| async move {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let cached = pair.latest_tree_state_checkpoint().await?;
+                Ok(cached.to_hex(chain_epoch.network))
+            })
+            .await
+        })
         .await
     }
 
@@ -2009,6 +2118,31 @@ pub(crate) async fn canonical_subtree_roots(
         start_index: subtree_root_range.start_index,
         subtree_roots,
     })
+}
+
+enum ServedState {
+    Ready(ReadyState),
+    Replayed(ReplayedState),
+}
+
+impl ServedState {
+    fn into_tree_state(self, epoch: ChainEpoch) -> TreeState {
+        let served = match self {
+            Self::Ready(ready) => ready.serve(),
+            Self::Replayed(replayed) => replayed.into_served(),
+        };
+        tree_state_response(epoch, served)
+    }
+
+    fn into_hex(self, network: zinder_core::Network) -> ServedTreeStateHex {
+        match self {
+            Self::Ready(ready) => ready.serve_hex(network),
+            Self::Replayed(ReplayedState::Cached(cached)) => cached.to_hex(network),
+            Self::Replayed(ReplayedState::Uncached(state)) => {
+                ServedTreeStateHex::from_served(network, &state)
+            }
+        }
+    }
 }
 
 pub(crate) fn tree_state_response(
@@ -2806,6 +2940,135 @@ mod tree_state_replay_limit_tests {
         assert_eq!(
             elapsed, wait_budget,
             "reader invalidation must not extend the request's wait budget"
+        );
+        Ok(())
+    }
+
+    struct ObservedPairFixture {
+        _store: WalletServingStoreFixture,
+        reader: Arc<ObservedCanonicalReader>,
+        pair: Arc<WalletServingReadPair>,
+    }
+
+    fn observed_serving_pair(
+        chain: &ChainFixture,
+        through: u32,
+        settled: u32,
+    ) -> Result<ObservedPairFixture, Box<dyn Error>> {
+        let baseline = CanonicalBaseline::new(chain)
+            .through(BlockHeight::new(through))
+            .with_settled_tip(BlockHeight::new(settled));
+        let mut store =
+            CanonicalWriterFixture::publish(&baseline, &sample_regtest_upgrade_activations())?
+                .into_serving_store_fixture()?;
+        let (canonical, wallet) = store.take_readers()?;
+        let reader = Arc::new(ObservedCanonicalReader::new(RocksDbCanonicalReader::new(
+            canonical,
+        )?));
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::<ObservedCanonicalReader>::clone(&reader),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?);
+        Ok(ObservedPairFixture {
+            _store: store,
+            reader,
+            pair,
+        })
+    }
+
+    #[tokio::test]
+    async fn warm_latest_and_tip_hex_tree_states_perform_zero_storage_reads_and_follow_publications()
+    -> Result<(), Box<dyn Error>> {
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(6);
+        let first = observed_serving_pair(&chain, 5, 2)?;
+        let next = observed_serving_pair(&chain, 6, 3)?;
+        let first_weak = Arc::downgrade(&first.pair);
+        let slot = WalletServingPairSlot::new(first.pair);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+
+        assert_eq!(first.reader.reads(), 0);
+        let cold_latest = query.latest_tree_state_checkpoint_hex(None).await?;
+        assert_eq!(cold_latest.height, BlockHeight::new(5));
+        assert_eq!(first.reader.reads(), 1);
+        assert!(
+            !slot.capture_ephemeral().is_observed_for_epoch_pin(),
+            "unpinned hex tree-state reads must not retain replaced pairs for epoch pins"
+        );
+
+        let warm_latest = query.latest_tree_state_checkpoint_hex(None).await?;
+        let warm_tip = query.tree_state_hex_at(BlockHeight::new(5), None).await?;
+        assert_eq!(warm_latest, cold_latest);
+        assert_eq!(warm_tip, cold_latest);
+        assert_eq!(
+            first.reader.reads(),
+            1,
+            "warm latest and tip hex reads must perform zero storage reads"
+        );
+        assert!(!slot.capture_ephemeral().is_observed_for_epoch_pin());
+
+        let native_tip = query.tree_state_at(BlockHeight::new(5), None).await?;
+        assert_eq!(
+            crate::ServedTreeStateHex::from_tree_state(&native_tip),
+            warm_tip
+        );
+        assert_eq!(first.reader.reads(), 1);
+        slot.capture_ephemeral().clear_observation_for_test();
+
+        slot.publish_for_test(next.pair);
+        assert!(
+            first_weak.upgrade().is_none(),
+            "unobserved pair must release immediately on publication"
+        );
+        let advanced_tip = query.tree_state_hex_at(BlockHeight::new(6), None).await?;
+        let advanced_latest = query.latest_tree_state_checkpoint_hex(None).await?;
+        assert_eq!(advanced_tip.height, BlockHeight::new(6));
+        assert_eq!(advanced_latest, advanced_tip);
+        assert_eq!(
+            next.reader.reads(),
+            1,
+            "tip read populates the pair checkpoint cache for subsequent latest reads"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalidated_latest_checkpoint_reader_is_never_cached_and_recovers_ephemerally()
+    -> Result<(), Box<dyn Error>> {
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(5);
+        let stale = observed_serving_pair(&chain, 5, 2)?;
+        let replacement = observed_serving_pair(&chain, 5, 2)?;
+        stale.reader.fail_next_latest_checkpoint();
+        let stale_pair = Arc::clone(&stale.pair);
+        let replacement_pair = Arc::clone(&replacement.pair);
+        let slot = WalletServingPairSlot::new(stale.pair);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+
+        let publish_replacement = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !stale_pair.has_missing_table_file() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert!(
+                stale_pair.cached_latest_tree_state_checkpoint().is_none(),
+                "invalidated storage read must never poison the pair checkpoint cache"
+            );
+            slot.publish_for_test(Arc::clone(&replacement_pair));
+            Ok::<(), Box<dyn Error>>(())
+        };
+        let (hex, published) = tokio::join!(
+            query.latest_tree_state_checkpoint_hex(None),
+            publish_replacement
+        );
+        published?;
+        let hex = hex?;
+        assert_eq!(hex.height, BlockHeight::new(5));
+        assert_eq!(stale.reader.reads(), 1);
+        assert_eq!(replacement.reader.reads(), 1);
+        assert!(
+            !replacement_pair.is_observed_for_epoch_pin(),
+            "ephemeral recovery must not observe the replacement pair"
         );
         Ok(())
     }

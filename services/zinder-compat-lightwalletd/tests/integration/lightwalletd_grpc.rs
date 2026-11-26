@@ -5865,6 +5865,288 @@ async fn tree_state_methods_serve_first_checkpoint_above_retained_history_floor(
     Ok(())
 }
 
+fn reference_encoded_tree_state(tree_state: &zinder_query::TreeState) -> Vec<u8> {
+    use prost::Message as _;
+    use zinder_core::wire::encode_bip70_chain_name;
+
+    lightwalletd::TreeState {
+        network: encode_bip70_chain_name(tree_state.chain_epoch.network).to_owned(),
+        height: u64::from(tree_state.height.value()),
+        hash: encode_rpc_block_hash_hex(tree_state.block_hash),
+        time: tree_state.block_time_seconds,
+        sapling_tree: tree_state
+            .frontiers
+            .sapling_final_state
+            .as_deref()
+            .map_or_default(hex::encode),
+        orchard_tree: tree_state
+            .frontiers
+            .orchard_final_state
+            .as_deref()
+            .map_or_default(hex::encode),
+        ironwood_tree: tree_state
+            .frontiers
+            .ironwood_final_state
+            .as_deref()
+            .map_or_default(hex::encode),
+    }
+    .encode_to_vec()
+}
+
+fn three_pool_regtest_activations() -> eyre::Result<NetworkUpgradeActivations> {
+    let sample = sample_regtest_upgrade_activations();
+    let activations = sample
+        .activations()
+        .iter()
+        .map(|activation| {
+            let activation_height = match activation.name.as_str() {
+                "NU5" | "NU6" | "NU6.1" | "NU6.2" => BlockHeight::new(2),
+                "NU6.3" | "NU7" => BlockHeight::new(3),
+                _ => activation.activation_height,
+            };
+            zinder_core::NetworkUpgradeActivation {
+                activation_height,
+                ..activation.clone()
+            }
+        })
+        .collect();
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        activations,
+    )?)
+}
+
+fn pair_at(
+    chain: &ChainFixture,
+    activations: &NetworkUpgradeActivations,
+    through: u32,
+    settled: u32,
+) -> eyre::Result<(WalletServingStoreFixture, Arc<WalletServingReadPair>)> {
+    let baseline = CanonicalBaseline::new(chain)
+        .through(BlockHeight::new(through))
+        .with_settled_tip(BlockHeight::new(settled));
+    let mut store =
+        CanonicalWriterFixture::publish(&baseline, activations)?.into_serving_store_fixture()?;
+    let (canonical, wallet) = store.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?);
+    Ok((store, pair))
+}
+
+#[tokio::test]
+async fn wallet_cached_hex_tree_states_are_byte_identical_across_selectors() -> eyre::Result<()> {
+    use prost::Message as _;
+
+    let activations = three_pool_regtest_activations()?;
+    let chain = with_note_commitments(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(125),
+        &activations,
+    )?;
+    let (_store, pair) = pair_at(&chain, &activations, 125, 105)?;
+    let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
+    let adapter = LightwalletdGrpcAdapter::new(query.clone());
+
+    for height in [57_u32, 100, 112, 125] {
+        let native = query.tree_state_at(BlockHeight::new(height), None).await?;
+        let expected_bytes = reference_encoded_tree_state(&native);
+        for _ in 0..2 {
+            let by_height = adapter
+                .get_tree_state(Request::new(lightwalletd::BlockId {
+                    height: u64::from(height),
+                    hash: Vec::new(),
+                }))
+                .await?
+                .into_inner();
+            let by_hash = adapter
+                .get_tree_state(Request::new(lightwalletd::BlockId {
+                    height: 0,
+                    hash: encode_rpc_block_hash_bytes(native.block_hash).to_vec(),
+                }))
+                .await?
+                .into_inner();
+            assert_eq!(by_height.encode_to_vec(), expected_bytes, "height {height}");
+            assert_eq!(by_hash.encode_to_vec(), expected_bytes, "hash at {height}");
+        }
+    }
+    let expected_latest =
+        reference_encoded_tree_state(&query.latest_tree_state_checkpoint(None).await?);
+    for _ in 0..2 {
+        let latest = adapter
+            .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+            .await?
+            .into_inner();
+        assert_eq!(latest.encode_to_vec(), expected_latest);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wallet_cached_hex_tree_states_follow_live_appends_and_reorgs() -> eyre::Result<()> {
+    use prost::Message as _;
+
+    let activations = three_pool_regtest_activations()?;
+    let base = ChainFixture::new(Network::ZcashRegtest).extend_blocks(126);
+    let chain = with_note_commitments(&base, &activations)?;
+    let reorg_fork = with_note_commitments(
+        &base.fork_at(BlockHeight::new(110))?.extend_blocks(15),
+        &activations,
+    )?;
+    let (_s1, initial_pair) = pair_at(&chain, &activations, 125, 105)?;
+    let (_s2, appended_pair) = pair_at(&chain, &activations, 126, 106)?;
+    let (_s3, reorged_pair) = pair_at(&reorg_fork, &activations, 124, 105)?;
+    let published = tip_wait::published_query::PublishedQuery::new(
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(initial_pair)),
+    );
+    let adapter = LightwalletdGrpcAdapter::new(published.clone());
+
+    assert_eq!(
+        adapter
+            .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+            .await?
+            .into_inner()
+            .height,
+        125
+    );
+    published.publish(WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(appended_pair),
+    ));
+    assert_eq!(
+        adapter
+            .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+            .await?
+            .into_inner()
+            .height,
+        126
+    );
+
+    let reorg_query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(reorged_pair));
+    published.publish(reorg_query.clone());
+    let reorg_latest = adapter
+        .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    assert_eq!(reorg_latest.height, 124);
+    assert_eq!(
+        reorg_latest.encode_to_vec(),
+        reference_encoded_tree_state(&reorg_query.latest_tree_state_checkpoint(None).await?)
+    );
+    let reorg_112 = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 112,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(
+        reorg_112.encode_to_vec(),
+        reference_encoded_tree_state(
+            &reorg_query
+                .tree_state_at(BlockHeight::new(112), None)
+                .await?
+        )
+    );
+    let displaced_125 = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 125,
+            hash: Vec::new(),
+        }))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("height 125 above reorged tip 124 succeeded"))?;
+    assert_eq!(displaced_125.code(), Code::InvalidArgument);
+    assert_eq!(
+        displaced_125.message(),
+        "tree state height 125 is newer than latest block 124"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sixteen_concurrent_wallet_tree_state_tasks_serve_warm_hex_without_contention()
+-> eyre::Result<()> {
+    let activations = three_pool_regtest_activations()?;
+    let chain = with_note_commitments(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(130),
+        &activations,
+    )?;
+    let (_store, pair) = pair_at(&chain, &activations, 130, 105)?;
+    let adapter = LightwalletdGrpcAdapter::new(WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(pair),
+    ));
+
+    let expected_latest = adapter
+        .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    let expected_settled = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 100,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let expected_replayed = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 57,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+
+    let mut handles = Vec::with_capacity(16);
+    for worker in 0..16_usize {
+        let adapter = adapter.clone();
+        let expected_latest = expected_latest.clone();
+        let expected_settled = expected_settled.clone();
+        let expected_replayed = expected_replayed.clone();
+        handles.push(tokio::spawn(async move {
+            for round in 0..100_usize {
+                let actual = match (worker + round) & 3 {
+                    0 => adapter
+                        .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+                        .await?
+                        .into_inner(),
+                    1 => adapter
+                        .get_tree_state(Request::new(lightwalletd::BlockId {
+                            height: 130,
+                            hash: Vec::new(),
+                        }))
+                        .await?
+                        .into_inner(),
+                    2 => adapter
+                        .get_tree_state(Request::new(lightwalletd::BlockId {
+                            height: 100,
+                            hash: Vec::new(),
+                        }))
+                        .await?
+                        .into_inner(),
+                    _ => adapter
+                        .get_tree_state(Request::new(lightwalletd::BlockId {
+                            height: 57,
+                            hash: Vec::new(),
+                        }))
+                        .await?
+                        .into_inner(),
+                };
+                let expected = match (worker + round) & 3 {
+                    0 | 1 => &expected_latest,
+                    2 => &expected_settled,
+                    _ => &expected_replayed,
+                };
+                assert_eq!(&actual, expected);
+            }
+            Ok::<(), eyre::Report>(())
+        }));
+    }
+    for handle in handles {
+        handle.await??;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction() -> eyre::Result<()>
 {
