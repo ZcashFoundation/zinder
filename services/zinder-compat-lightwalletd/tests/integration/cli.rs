@@ -666,7 +666,7 @@ const FORWARDED_READ_SETTINGS: [(&str, &str, &str, &str, &str); 4] = [
         "FORWARDED_READ_WAITERS_PER_SLOT",
         "forwarded_read_waiters_per_slot",
         "64",
-        "1",
+        "256",
         "257",
     ),
     (

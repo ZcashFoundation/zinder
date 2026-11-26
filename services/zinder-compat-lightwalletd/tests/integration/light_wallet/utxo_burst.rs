@@ -259,6 +259,8 @@ async fn vizor_burst_of_512_utxo_streams_completes_without_unavailable_and_caps_
     let (fixture, counter) = burst_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
+    // Widen per-IP gRPC receive slots from 32 to 512 so 256 barrier-synchronized
+    // loopback tasks test ForwardedReadLimit admission rather than per-IP throttling.
     let receive_slots =
         NonZeroUsize::new(CONCURRENT_UTXO_CALLS).ok_or_else(|| eyre!("zero burst size"))?;
     let server = public_grpc_server_with(
@@ -347,7 +349,7 @@ async fn single_row_utxo_stream_releases_response_permit_upon_yielding_final_row
 async fn stalled_large_utxo_streams_bound_buffered_responses_and_fail_closed() -> Result<()> {
     let two = NonZeroU32::MIN.saturating_add(1);
     let reads = ForwardedReadLimit::new(
-        ForwardedReadConfig::resolve(None, Some(120), Some(2), None)?.with_response_limit(
+        ForwardedReadConfig::resolve(None, Some(400), Some(2), None)?.with_response_limit(
             ForwardedResponseKind::UtxoResponse,
             two,
             2,
@@ -423,7 +425,7 @@ async fn stalled_upstream_node_fails_closed_at_wait_deadline_without_leaking_per
     let rpc_counter = Arc::clone(&counter);
     let reads = ForwardedReadLimit::new(ForwardedReadConfig::resolve(
         Some(3),
-        Some(120),
+        Some(400),
         Some(2),
         None,
     )?);

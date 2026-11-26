@@ -163,7 +163,7 @@ data may be corrupt.
 | --- | --- |
 | `TREE_STATE_REPLAY_LIMIT_REACHED` | `TreeStateAtHeight` named a height without a stored checkpoint while the server was already rebuilding one tree state per CPU, and either no rebuild slot freed within the wait (2 seconds by default) or every waiting place was already taken (64 per slot by default), in which case the request is refused at once. A height with a stored checkpoint is never refused this way. |
 | `COMPACT_BLOCK_STREAM_LIMIT_REACHED` | Native `CompactBlocksInRange` was refused because the server already serves its limit of open streams (100 by default). A slot frees when an open stream ends or the client drops it and its outstanding read finishes. The lightwalletd `GetBlockRange` has its own limit and does not carry this reason. |
-| `FORWARDED_READ_LIMIT_REACHED` | A wallet read the server forwards to its node, such as a mined transaction body the store omits, found every slot of its kind taken, and either no slot freed within `query.forwarded_read_wait_ms` (10 seconds by default) or every waiting place was already taken (16 per slot by default), in which case the request is refused at once. The lightwalletd surface refuses the same reads with `UNAVAILABLE` and no reason. |
+| `FORWARDED_READ_LIMIT_REACHED` | A wallet read the server forwards to its node, such as a mined transaction body the store omits, found every slot of its kind taken, and either no slot freed within `query.forwarded_read_wait_ms` (10 seconds by default) or every waiting place was already taken (64 per slot by default), in which case the request is refused at once. The lightwalletd surface refuses the same reads with `UNAVAILABLE` and no reason. |
 
 ### `UNAVAILABLE`
 
