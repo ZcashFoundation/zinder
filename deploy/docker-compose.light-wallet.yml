@@ -117,6 +117,10 @@ services:
   zinder-history-publisher:
     <<: *compat-image
     mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-4g}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     network_mode: none
     restart: unless-stopped
     depends_on:
@@ -217,7 +221,8 @@ services:
     volumes:
       - prometheus:/prometheus
       - ../observability/prometheus/rules:/etc/prometheus/rules:ro
-      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/light-wallet/rules:/etc/prometheus/light-wallet/rules:ro
+      - ./observability/light-wallet/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"

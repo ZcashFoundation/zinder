@@ -19,7 +19,7 @@ services:
 
   zinder-ingest:
     environment:
-      ZINDER_DEPLOYMENT__PROFILE: null
+      ZINDER_DEPLOYMENT__PROFILE: !reset null
       ZINDER_INGEST__EXPLORER_VIEWS: "true"
     ports:
       - "127.0.0.1:${ZINDER_EXPLORER_HOST_PORT:-9068}:9068"
@@ -27,15 +27,15 @@ services:
 
   zinder-projector:
     environment:
-      ZINDER_DEPLOYMENT__PROFILE: null
+      ZINDER_DEPLOYMENT__PROFILE: !reset null
 
   zinder-query:
     environment:
-      ZINDER_DEPLOYMENT__PROFILE: null
+      ZINDER_DEPLOYMENT__PROFILE: !reset null
 
   zinder-compat-lightwalletd:
     environment:
-      ZINDER_DEPLOYMENT__PROFILE: null
+      ZINDER_DEPLOYMENT__PROFILE: !reset null
 
   zinder-explorer:
     image: ${ZINDER_EXPLORER_IMAGE:-ghcr.io/zcashfoundation/zinder-explorer:${ZINDER_VERSION:-local}}

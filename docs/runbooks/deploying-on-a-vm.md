@@ -63,8 +63,8 @@ Check these required variables in `/etc/zinder/env`:
 | `ZINDER_PROJECTOR_BUILD_OWNER_HEX` | Stable 32-character hex projector identity. |
 | `ZINDER_CONTROL_SECRETS_DIR` | Control secrets directory from step 2. |
 
-- **Raw-blob policy (`wallet` vs `wallet-archive`):** Shipped `deploy/config/*.toml` files pin `raw_blob_policy = "transactions"` (+251 GiB on Mainnet). To run the recommended `wallet` profile without local raw blobs, edit the mounted `deploy/config/*.toml` files (`ingest.toml`, `projector.toml`, `query.toml`, `compat-lightwalletd.toml`) to set `deployment.profile = "wallet"` and remove `storage.raw_blob_policy`, `ingest.run_overrides.coverage`, and `compat.serving` before first sync (passing `ZINDER_DEPLOYMENT__PROFILE=wallet` or `ZINDER_STORAGE__RAW_BLOB_POLICY=none` alone over the unmodified shipped TOMLs fails startup).
-- **Streaming mempool & binary block fetch:** Set `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` in Z3's `.env`, restart Z3, set `ZINDER_NODE__INDEXER_GRPC_ADDR=http://zebra:8155` in `/etc/zinder/env`, and set `source = "zebra-indexer-grpc"` in `deploy/config/ingest.toml` (because `deploy/docker-compose.yml` does not pass `ZINDER_INGEST__SOURCE` into `zinder-ingest`; for standalone binaries, export `ZINDER_INGEST__SOURCE=zebra-indexer-grpc`).
+- **Raw-blob policy (`wallet`, `wallet-archive`, and legacy `transactions` upgrades):** `deploy/docker-compose.yml` defaults `ZINDER_DEPLOYMENT__PROFILE=wallet` (`raw_blob_policy = "none"`). Set `ZINDER_DEPLOYMENT__PROFILE=wallet-archive` in `/etc/zinder/env` to retain all raw blocks and transactions locally, or run `deploy/docker-compose.light-wallet.yml` for the projector-free `light-wallet` topology. Changing persisted retention requires rebuilding on fresh volumes; when upgrading a pre-profile Compose store created with `raw_blob_policy = "transactions"` in place, merge `-f deploy/docker-compose.transactions.yml` ([Upgrade, restart, and roll back](#upgrade-restart-and-roll-back)).
+- **Streaming mempool & binary block fetch:** Set `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` in Z3's `.env`, restart Z3, and set `ZINDER_NODE__INDEXER_GRPC_ADDR=http://zebra:8155` and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc` in `/etc/zinder/env` (or export `ZINDER_INGEST__SOURCE=zebra-indexer-grpc` for standalone binaries).
 - **High-concurrency Mainnet endpoints:** On 64+ GiB hosts, raise `ZINDER_COMPAT_MEMORY_LIMIT=32g` (or higher) in `/etc/zinder/env`; see [Size your host](deploying.md#what-you-need).
 - Leave `ZINDER_VERSION` unset to build `:local` from the checkout instead of pulling release images, or override individual images with `ZINDER_<SERVICE>_IMAGE` (for example, pinned by digest).
 
@@ -87,7 +87,7 @@ Check `/readyz` and run the `ServerInfo` and `GetLightdInfo` smoke calls from st
 
 ### 6. Supervise with systemd
 
-Install the unit **after** the first sync finishes (`ExecStartPre` runs `docker compose down`, which would discard an in-progress build):
+Install the unit **after** the first sync finishes:
 
 ```bash
 sudo cp /opt/zinder/deploy/systemd/zinder.service /etc/systemd/system/zinder.service
@@ -96,14 +96,12 @@ sudo systemctl enable --now zinder
 sudo journalctl -u zinder.service -f
 ```
 
-If you merge overlays (such as `docker-compose.explorer.yml`, `docker-compose.node-fallback.yml`, or `docker-compose.indexer-tls.yml`), override `ExecStartPre`, `ExecStart`, and `ExecStop` with `sudo systemctl edit zinder` so restarts keep them:
+`zinder.service` runs `docker compose ... up --no-build` with `Restart=on-failure` and tears down only on explicit `ExecStop` so failed restarts do not discard an active sync or build images unintentionally. If you merge overlays (such as `docker-compose.transactions.yml`, `docker-compose.explorer.yml`, `docker-compose.node-fallback.yml`, or `docker-compose.indexer-tls.yml`), override `ExecStart` and `ExecStop` with `sudo systemctl edit zinder` so restarts keep them:
 
 ```ini
 [Service]
-ExecStartPre=
-ExecStartPre=-/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml -f docker-compose.indexer-tls.yml down --remove-orphans
 ExecStart=
-ExecStart=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml -f docker-compose.indexer-tls.yml up
+ExecStart=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml -f docker-compose.indexer-tls.yml up --no-build
 ExecStop=
 ExecStop=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml -f docker-compose.indexer-tls.yml down
 ```
@@ -244,6 +242,11 @@ Views live under `/var/lib/zinder/canonical/materialized-views` and pause automa
 ## Upgrade, restart, and roll back
 
 Check release notes for store layout changes before upgrading. A layout change requires fresh empty store paths ([Schema admission](../architecture/storage-backend.md#schema-admission)). If replacing a canonical store in place changes workload, raw-blob retention, first retained height, or subtree-root coverage, restart the readers ([Canonical store replacement](../reference/readiness.md#canonical-store-replacement)). Keep previous binaries/images and their separate store if you need rollback.
+
+**Upgrading an existing `transactions`-retaining store.** Volumes created by earlier releases with `raw_blob_policy = "transactions"` fail writer and reader admission under the new `wallet` default (`none`) or `wallet-archive` (`all`), because changing persisted retention requires rebuilding the store. Either:
+
+- Keep the existing store in place by merging `-f deploy/docker-compose.transactions.yml` into your `docker compose` commands and `zinder.service` overrides (which resets `ZINDER_DEPLOYMENT__PROFILE` and sets `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`); or
+- Reclaim ~251.1 GiB on Mainnet by stopping the stack, replacing `data` and `checkpoint-staging` with fresh empty volumes, and resyncing under the default `wallet` profile.
 
 1. Fetch tags, check out the release, and update `ZINDER_VERSION` in `/etc/zinder/env`:
 

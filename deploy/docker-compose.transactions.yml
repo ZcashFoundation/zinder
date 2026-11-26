@@ -1,0 +1,36 @@
+# Legacy transactions-retention overlay for upgrading existing pre-profile
+# Compose stores created with `raw_blob_policy = "transactions"` in place
+# without rebuilding on fresh volumes:
+#
+#   docker compose \
+#     --env-file /etc/zinder/env \
+#     -f deploy/docker-compose.yml \
+#     -f deploy/docker-compose.transactions.yml \
+#     up -d --no-build
+#
+# Clears `ZINDER_DEPLOYMENT__PROFILE` (even when exported in the caller's
+# environment) and configures `raw_blob_policy = "transactions"` on ingest and
+# the wallet-serving readers so canonical admission matches persisted storage.
+# To reclaim raw transaction blob space instead, rebuild on fresh volumes under
+# the default `wallet` profile (`docs/runbooks/deploying-on-a-vm.md`).
+
+services:
+  zinder-ingest:
+    environment:
+      ZINDER_DEPLOYMENT__PROFILE: !reset null
+      ZINDER_STORAGE__RAW_BLOB_POLICY: transactions
+
+  zinder-projector:
+    environment:
+      ZINDER_DEPLOYMENT__PROFILE: !reset null
+      ZINDER_STORAGE__RAW_BLOB_POLICY: transactions
+
+  zinder-query:
+    environment:
+      ZINDER_DEPLOYMENT__PROFILE: !reset null
+      ZINDER_STORAGE__RAW_BLOB_POLICY: transactions
+
+  zinder-compat-lightwalletd:
+    environment:
+      ZINDER_DEPLOYMENT__PROFILE: !reset null
+      ZINDER_STORAGE__RAW_BLOB_POLICY: transactions

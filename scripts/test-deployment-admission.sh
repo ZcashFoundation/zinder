@@ -85,6 +85,7 @@ env_file_value() {
 if grep -Eiq 'JSON_RPC_ADDR:?-|INDEXER_GRPC_ADDR:?-[^}]|//(zebra|zakura)\b|z3-|:1?8232\b|:8230\b|:8155\b' \
   "$repository_root/deploy/docker-compose.yml" \
   "$repository_root/deploy/docker-compose.explorer.yml" \
+  "$repository_root/deploy/docker-compose.transactions.yml" \
   "$repository_root/deploy/docker-compose.light-wallet.yml" \
   "$repository_root"/deploy/config/{ingest,projector,query,compat-lightwalletd,explorer}.toml \
   "$repository_root"/deploy/config/light-wallet/{ingest,compat-lightwalletd}.toml; then
@@ -365,6 +366,7 @@ fi
 
 resolved_explorer_compose="$temporary_directory/resolved-explorer-compose.json"
 ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_DEPLOYMENT__PROFILE=wallet-archive \
 docker compose \
   --env-file "$repository_root/deploy/.env.testnet" \
   -f "$repository_root/deploy/docker-compose.yml" \
@@ -393,7 +395,7 @@ jq -e '
       "zinder-query",
       "zinder-compat-lightwalletd"
     ] | all(. as $service
-      | ($services_root.services[$service].environment.ZINDER_DEPLOYMENT__PROFILE == null)))
+      | (($services_root.services[$service].environment // {}) | has("ZINDER_DEPLOYMENT__PROFILE") | not)))
   and .services["zinder-explorer"].environment.ZINDER_EXPLORER__LISTEN_ADDR == "[::]:9068"
   and .services["zinder-explorer"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9069"
   and (.services["zinder-ingest"].networks.node.aliases | index("zinder-testnet-explorer")) != null
@@ -633,6 +635,42 @@ jq '.services["zinder-compat-lightwalletd"].volumes += [
 expect_rejected \
   "a light-wallet Compose bundle exposing checkpoint.token to compat" \
   --light-wallet-compose-contract "$invalid_light_wallet"
+jq '
+  .services["zinder-prometheus"].volumes |= map(
+    if .target == "/etc/prometheus/prometheus.yml" then
+      .source |= sub("/deploy/observability/light-wallet/prometheus\\.yml$"; "/deploy/observability/prometheus.yml")
+    else . end
+  )
+' "$resolved_light_wallet_observability" > "$invalid_light_wallet"
+expect_rejected \
+  "a light-wallet Compose bundle mounting the four-runtime Prometheus config" \
+  --light-wallet-compose-contract "$invalid_light_wallet"
+
+# Legacy transactions-retention overlay clears any inherited profile and pins
+# transactions retention across writer and wallet-serving readers.
+resolved_transactions_compose="$temporary_directory/resolved-transactions-compose.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_DEPLOYMENT__PROFILE=wallet \
+docker compose \
+  --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  -f "$repository_root/deploy/docker-compose.transactions.yml" \
+  config --format json > "$resolved_transactions_compose"
+bash "$validator" --compose-contract "$resolved_transactions_compose"
+jq -e '
+  .services as $services
+  | [
+      "zinder-ingest",
+      "zinder-projector",
+      "zinder-query",
+      "zinder-compat-lightwalletd"
+    ]
+  | all(
+      (($services[.].environment // {}) | has("ZINDER_DEPLOYMENT__PROFILE") | not)
+      and $services[.].environment.ZINDER_STORAGE__RAW_BLOB_POLICY == "transactions"
+    )
+' "$resolved_transactions_compose" >/dev/null \
+  || fail "the transactions Compose overlay does not clear ZINDER_DEPLOYMENT__PROFILE and set raw_blob_policy=transactions across all runtimes"
 
 # systemd unit must keep active syncs intact on restart and avoid unintended builds.
 systemd_unit="$repository_root/deploy/systemd/zinder.service"

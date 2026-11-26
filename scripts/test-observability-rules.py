@@ -21,14 +21,17 @@ def promql_labels(labels):
 
 
 def rule_test(rule_files, targets, panel):
-    query = next(labels for labels in targets if labels["service"] == "zinder-query")
+    target = next(
+        (labels for labels in targets if labels["service"] == "zinder-query"),
+        next(labels for labels in targets if labels["service"] == "zinder-compat-lightwalletd"),
+    )
     inputs = [
         {"series": "up" + promql_labels(labels),
-         "values": "1 0 0 0 0 stale _ _ _ _ 1" if labels == query else "1+0x10"}
+         "values": "1 0 0 0 0 stale _ _ _ _ 1" if labels == target else "1+0x10"}
         for labels in targets
     ]
     # A scrape for a different instance cannot hide the expected target's disappearance.
-    inputs.append({"series": "up" + promql_labels(query | {"instance": "unexpected:9106"}),
+    inputs.append({"series": "up" + promql_labels(target | {"instance": "unexpected:9999"}),
                    "values": "1+0x10"})
     checks = []
     for instant, status, alert in [
@@ -36,7 +39,7 @@ def rule_test(rule_files, targets, panel):
         ("2m", -1, "ZinderTargetMissing"), ("150s", 1, None),
     ]:
         samples = [
-            {"labels": promql_labels(labels), "value": status if labels == query else 1}
+            {"labels": promql_labels(labels), "value": status if labels == target else 1}
             for labels in targets
         ]
         # Arithmetic drops the recording name so this also checks a raw panel expression.
@@ -45,7 +48,7 @@ def rule_test(rule_files, targets, panel):
             "expr": 'ALERTS{alertname=~"ZinderTargetDown|ZinderTargetMissing",alertstate="firing"}',
             "eval_time": instant,
             "exp_samples": ([{"labels": "ALERTS" + promql_labels(
-                query | {"alertname": alert, "alertstate": "firing", "severity": "critical"}),
+                target | {"alertname": alert, "alertstate": "firing", "severity": "critical"}),
                               "value": 1}] if alert else []),
         })
     # Removing a whole job on reload can leave its last good sample within
@@ -54,7 +57,7 @@ def rule_test(rule_files, targets, panel):
     for last_up in (0, 1):
         removed = [
             {"series": "up" + promql_labels(labels),
-             "values": f"{last_up} _x8 1" if labels == query else "1+0x10"}
+             "values": f"{last_up} _x8 1" if labels == target else "1+0x10"}
             for labels in targets
         ]
         tests.append({"interval": "15s", "input_series": removed,
@@ -99,4 +102,9 @@ if __name__ == "__main__":
     check(compose, "zinder-prometheus", ROLES, panel)
     check(compose + ["-f", "deploy/docker-compose.explorer.yml"], "zinder-prometheus",
           ROLES + ["zinder-explorer"], panel)
+    check([
+        "--env-file", "deploy/.env.regtest",
+        "-f", "deploy/docker-compose.light-wallet.yml",
+        "--profile", "observability",
+    ], "zinder-prometheus", ["zinder-ingest", "zinder-compat-lightwalletd"], panel)
     check(["-f", "docker-compose.observability.yml"], "prometheus", ROLES, panel)
