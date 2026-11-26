@@ -1,0 +1,6 @@
+kind: changed
+body: Raised the default canonical-store RocksDB reader open-file limit (`storage.canonical.rocksdb.max_open_files`) to `1024`–`2048` based on detected container memory (`2048` without a limit), configured secondary RocksDB table caches with 4 shards (`table_cache_numshardbits = 2`) to prevent per-shard table-reader eviction on Mainnet and Testnet stores, and set `65,536` soft and hard `nofile` limits across all Zinder store-opening Compose services.
+time: 2026-11-25T21:02:00Z
+custom:
+    Bump: patch
+    PR: "615"

@@ -267,6 +267,7 @@ fn wallet_serving_image_config_resolves() -> eyre::Result<()> {
         "path = \"/var/lib/zinder/canonical\"",
         "secondary_path = \"/var/lib/zinder/compat/canonical-secondary\"",
         "block_cache_bytes = 268435456",
+        "max_open_files = 1024",
         "path = \"/var/lib/zinder/wallet\"",
         "secondary_path = \"/var/lib/zinder/compat/wallet-secondary\"",
         "addr = \"http://127.0.0.1:9100\"",

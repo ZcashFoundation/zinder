@@ -152,17 +152,23 @@ fn canonical_reader_block_cache_bytes_for(budget: Option<u64>) -> u64 {
 
 /// Derives the canonical reader's open-file budget from its default block cache.
 ///
-/// Each full 128 MiB allows 64 open files, with a floor of 128 files.
-/// The 512 MiB cache ceiling gives a maximum default of 256 files.
+/// Each full 128 MiB allows 512 open files, floored at 1024 files and capped at
+/// 2048 files (matching the 512 MiB cache ceiling). Combined with the secondary
+/// open path's 4-shard table cache (`table_cache_numshardbits = 2`), the 1024
+/// floor provides 254 table-reader slots per shard and the 2048 ceiling
+/// provides 510 per shard, retaining both Mainnet (243 SSTs) and Testnet
+/// (~710 SSTs) layouts without per-shard eviction. When no cgroup limit is
+/// detectable, defaults to 2048 files, matching
+/// `RocksDbResourceBudget::canonical_reader_defaults`.
 #[must_use]
 pub fn canonical_reader_max_open_files() -> i32 {
     canonical_reader_max_open_files_for(container_memory_budget_bytes())
 }
 
 fn canonical_reader_max_open_files_for(budget: Option<u64>) -> i32 {
-    const FLOOR: i32 = 128;
-    const CAP: i32 = 1024;
-    const PER_128_MIB: i32 = 64;
+    const FLOOR: i32 = 1024;
+    const CAP: i32 = 2048;
+    const PER_128_MIB: i32 = 512;
 
     let files = budget
         .and_then(|bytes| {
@@ -170,7 +176,7 @@ fn canonical_reader_max_open_files_for(budget: Option<u64>) -> i32 {
             let units = i32::try_from(cache / (128 * MIB)).ok()?;
             Some((units * PER_128_MIB).max(FLOOR))
         })
-        .unwrap_or(FLOOR);
+        .unwrap_or(CAP);
     files.min(CAP)
 }
 
@@ -639,25 +645,102 @@ mod tests {
     }
 
     #[test]
-    fn open_files_floor_is_128_when_cgroup_absent() -> Result<(), Box<dyn Error>> {
+    fn open_files_defaults_to_2048_when_cgroup_absent() -> Result<(), Box<dyn Error>> {
         let tempdir = tempdir()?;
         let absent_budget = cgroup_memory_budget_bytes_in(
             &tempdir.path().join("missing-cgroup"),
             &tempdir.path().join("missing-proc-cgroup"),
         );
-        assert_eq!(canonical_reader_max_open_files_for(absent_budget), 128);
+        assert_eq!(canonical_reader_max_open_files_for(absent_budget), 2048);
         Ok(())
     }
 
     #[test]
     fn open_files_rises_with_budget() {
-        // 4 GiB budget => 512 MiB cache => 4 * 64 = 256 files
+        // 4 GiB budget => 512 MiB cache => 4 * 512 = 2048 files
         assert_eq!(
             canonical_reader_max_open_files_for(Some(4 * 1024 * MIB)),
-            256
+            2048
         );
-        // 1 GiB budget => 128 MiB cache => 1 * 64 = 64, floored at 128
-        assert_eq!(canonical_reader_max_open_files_for(Some(1024 * MIB)), 128);
+        // 3 GiB budget => 384 MiB cache => 3 * 512 = 1536 files
+        assert_eq!(
+            canonical_reader_max_open_files_for(Some(3 * 1024 * MIB)),
+            1536
+        );
+        // 2 GiB budget => 256 MiB cache => 2 * 512 = 1024 files
+        assert_eq!(
+            canonical_reader_max_open_files_for(Some(2 * 1024 * MIB)),
+            1024
+        );
+        // 1 GiB budget => 128 MiB cache => 1 * 512 = 512, floored at 1024
+        assert_eq!(canonical_reader_max_open_files_for(Some(1024 * MIB)), 1024);
+        // 512 MiB budget => 64 MiB raw eighth => 0 * 512 = 0, floored at 1024
+        assert_eq!(canonical_reader_max_open_files_for(Some(512 * MIB)), 1024);
+    }
+
+    fn max_deterministic_shard_load(
+        live_ssts: usize,
+        base_file_number: u64,
+        shards: usize,
+    ) -> usize {
+        let mut counts = vec![0_usize; shards];
+        for offset in 0..live_ssts {
+            let file_number = base_file_number + (offset as u64);
+            let mut mixed = file_number.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            mixed ^= mixed >> 31;
+            let shard_idx = usize::try_from(mixed & ((shards as u64) - 1)).unwrap_or(0);
+            if let Some(slot) = counts.get_mut(shard_idx) {
+                *slot += 1;
+            }
+        }
+        counts.into_iter().max().unwrap_or(0)
+    }
+
+    #[test]
+    fn resolved_reader_cap_accommodates_mainnet_243_and_testnet_710_ssts_per_shard() {
+        const MAINNET_LIVE_SSTS: usize = 243;
+        const TESTNET_LIVE_SSTS: usize = 710;
+        // 6-sigma multinomial shard bound for N=710 across 4 shards:
+        // ceil(177.5 + 6 * sqrt(710 * 0.25 * 0.75)) = 247.
+        const TESTNET_SIX_SIGMA_PER_SHARD: usize = 247;
+
+        let shards = zinder_store::RocksDbResourceBudget::secondary_table_cache_shards();
+        assert_eq!(shards, 4);
+
+        for cgroup_budget in [
+            None,
+            Some(512 * MIB),
+            Some(1024 * MIB),
+            Some(2 * 1024 * MIB),
+            Some(3 * 1024 * MIB),
+            Some(4 * 1024 * MIB),
+            Some(16 * 1024 * MIB),
+        ] {
+            let mut budget = zinder_store::RocksDbResourceBudget::canonical_reader_defaults();
+            budget.max_open_files = canonical_reader_max_open_files_for(cgroup_budget);
+            assert_eq!(budget.validate(), Ok(()));
+
+            let per_shard = budget.secondary_table_cache_per_shard_capacity();
+            assert!(per_shard * shards > TESTNET_LIVE_SSTS);
+            assert!(
+                per_shard >= MAINNET_LIVE_SSTS,
+                "cgroup_budget={cgroup_budget:?} per_shard={per_shard}"
+            );
+            assert!(
+                per_shard >= TESTNET_SIX_SIGMA_PER_SHARD,
+                "cgroup_budget={cgroup_budget:?} per_shard={per_shard}"
+            );
+            for (live_ssts, base) in [
+                (MAINNET_LIVE_SSTS, 1_u64),
+                (MAINNET_LIVE_SSTS, 50_000_u64),
+                (TESTNET_LIVE_SSTS, 1_u64),
+                (TESTNET_LIVE_SSTS, 250_000_u64),
+            ] {
+                assert!(max_deterministic_shard_load(live_ssts, base, shards) <= per_shard);
+            }
+        }
     }
 
     #[test]

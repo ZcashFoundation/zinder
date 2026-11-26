@@ -124,8 +124,8 @@ fn secondary_observes_a_live_append_only_after_explicit_catch_up()
 
 /// Heights whose compact-block rows each get a table file of their own.
 ///
-/// With the test budget's 64 open files, a secondary keeps at most 77 table
-/// files open: a 54-entry table cache spread over 64 one-entry shards, plus
+/// With the test budget's 64 open files, a secondary keeps at most 69 table
+/// files open: a 54-entry table cache spread over 4 fourteen-entry shards, plus
 /// up to 13 handles pinned at open. Reading every one of these rows must
 /// therefore reopen at least one file, whatever the cache's hash seed.
 const SPLIT_HEIGHTS: u32 = 96;

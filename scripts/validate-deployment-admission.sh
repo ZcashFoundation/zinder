@@ -159,10 +159,19 @@ if [[ -n "$compose_contract" ]]; then
   }
 
   jq -e '
-    .services["zinder-compat-lightwalletd"].ulimits.nofile
-    | [.soft, .hard] | all(type == "number" and . >= 65536)
+    [
+      "zinder-ingest",
+      "zinder-projector",
+      "zinder-query",
+      "zinder-history-publisher",
+      "zinder-compat-lightwalletd"
+    ] as $store_services
+    | .services as $services
+    | all($store_services[];
+        $services[.].ulimits.nofile
+        | [.soft, .hard] | all(type == "number" and . >= 65536))
   ' "$compose_contract" >/dev/null || {
-    echo "release admission rejected: the signed-history reader profile requires soft and hard open-file limits of at least 65536" >&2
+    echo "release admission rejected: every Zinder store-opening service in Compose requires soft and hard open-file limits of at least 65536" >&2
     exit 1
   }
 

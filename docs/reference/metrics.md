@@ -97,6 +97,12 @@ Other signals that need attention when they keep rising:
 - `zinder_wallet_serving_missing_table_file_pairs_total` rising with most
   publications: store files are replaced faster than serving pairs, as during
   a manual compaction.
+- `zinder_store_rocksdb_ticker{store_role="canonical_secondary",ticker="rocksdb.no.file.opens"}`
+  (or `store_role="wallet_secondary"`) rising while the served fence is
+  unchanged: SST table readers are being evicted and reopened. Under direct
+  reads, each reopen prefetches the SST tail (~0.4 MB) outside the block cache
+  and its miss counters. Zero steady-state growth after warm-up is the healthy
+  baseline.
 
 ## Every runtime
 
@@ -601,7 +607,7 @@ The store's `statistics_level` must be `tickers` or `full`.
 
 | To measure | Tickers |
 | --- | --- |
-| File opens and errors | `rocksdb.no.file.opens`, `rocksdb.no.file.errors` |
+| File opens and errors | `rocksdb.no.file.opens`, `rocksdb.no.file.errors` (on `canonical_secondary` and `wallet_secondary`, `rocksdb.no.file.opens` climbs during cold warm-up and catch-up of newly published SSTs; zero steady-state growth at an unchanged fence is the healthy baseline showing no table-reader churn) |
 | Bytes served from cache | `rocksdb.block.cache.bytes.read` |
 | Where point reads hit | `rocksdb.memtable.hit`, `rocksdb.l0.hit`, `rocksdb.l1.hit`, `rocksdb.l2andup.hit` |
 | Iterator work | `rocksdb.number.db.seek`, `rocksdb.number.db.next`, `rocksdb.db.iter.bytes.read` |

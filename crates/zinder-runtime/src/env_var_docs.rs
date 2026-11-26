@@ -1046,8 +1046,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Canonical-store RocksDB open SST file cap. Defaults to 512 for writers. \
-                      Readers default to 128 to 256 based on the detected container memory limit, \
-                      or 128 without a limit.",
+                      Readers default to 1024 to 2048 based on the detected container memory limit, \
+                      or 2048 without a limit.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__WRITE_BUFFER_BYTES",
