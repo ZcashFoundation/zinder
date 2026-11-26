@@ -1634,6 +1634,8 @@ fn passthrough_wire_check_matches_full_projection_and_rejects_corrupt_tags() -> 
         orchard_nf
     )?);
 
+    assert!(!is_passthrough_shielded_block_wire(&[], orchard_range)?);
+    assert!(!is_passthrough_shielded_block_wire(&[], orchard_nf)?);
     assert!(matches!(
         is_passthrough_shielded_block_wire(&[0x10, 0x80], orchard_nf),
         Err(SettledShieldedSegmentError::PayloadIntegrity(_))

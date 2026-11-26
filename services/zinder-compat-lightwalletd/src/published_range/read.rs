@@ -557,12 +557,14 @@ impl ProjectedSlabPacker {
         {
             self.flush(rows)?;
         }
-        if self.slab_bytes.capacity() == 0 {
-            let initial = frame_len
+        let needed = self.slab_bytes.len() + frame_len;
+        if needed > self.slab_bytes.capacity() {
+            let target = needed
                 .max(MIN_PACKED_PROJECTION_CAPACITY)
                 .next_power_of_two()
                 .min(PACKED_PROJECTION_SLAB_BYTES);
-            self.slab_bytes = Vec::with_capacity(initial);
+            self.slab_bytes
+                .reserve_exact(target - self.slab_bytes.len());
         }
         let start = self.slab_bytes.len();
         self.slab_bytes.extend_from_slice(&self.frame_scratch);

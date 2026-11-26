@@ -64,6 +64,7 @@ Several optional fields, such as a fee that needs resolved inputs or a raw trans
 
 ## Revision history
 
+- 2026-11-26. Decision 8 extends signed-segment and live-tail range serving to wire-projected non-transparent shielded pool subsets over `Slab 0` and `Slab 1`.
 - 2026-11-24. Decision 8 notes per-segment artifact schema versioning for pre-v7 and ZIP-231 coexistence.
 - 2026-11-24. Decision 8 extends the adapter's owned projection to the nullifier range RPC: the signed `ZSHRNG01` segments store a shielded and a nullifier slab, the live tail caches both of each row's frames, and an Ironwood-omitting pool selection serves the stored frames below Ironwood activation.
 - 2026-11-24. Decision 4 allows verified mined transaction bytes in lean wallet serving.

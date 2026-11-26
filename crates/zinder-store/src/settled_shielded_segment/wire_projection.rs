@@ -139,8 +139,8 @@ pub(super) fn synthesize_empty_nullifier_block(
     patch_frame_prefix(out, frame_start)
 }
 
-/// Projects one `Slab 0` `CompactBlock` protobuf payload into a gRPC-framed
-/// message according to `selection`, clearing `out` first.
+/// Projects one `CompactBlock` protobuf payload into a gRPC-framed message
+/// according to `selection`, clearing `out` first.
 ///
 /// # Errors
 ///
@@ -188,6 +188,11 @@ pub fn is_passthrough_shielded_block_wire(
     raw_payload: &[u8],
     selection: ShieldedProjectionSelection,
 ) -> Result<bool, SettledShieldedSegmentError> {
+    if raw_payload.is_empty()
+        || raw_payload.len() > super::SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES
+    {
+        return Ok(false);
+    }
     let mut cursor = raw_payload;
     let mut nullifier_meta_at_end = false;
     let mut chain_metadata_count = 0_usize;
