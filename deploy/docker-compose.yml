@@ -92,6 +92,8 @@ services:
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-wallet}
+      ZINDER_INGEST__SOURCE: ${ZINDER_INGEST__SOURCE:-zebra-json-rpc}
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
       # Empty selects JSON-RPC mempool polling. Env files set the indexer URL
@@ -144,6 +146,7 @@ services:
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-wallet}
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
       ZINDER_PROJECTOR__BUILD_OWNER_HEX: ${ZINDER_PROJECTOR_BUILD_OWNER_HEX:?set a stable 32-character hexadecimal projector owner}
       ZINDER_OPS__LISTEN_ADDR: "[::]:9110"
@@ -187,6 +190,7 @@ services:
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-wallet}
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
@@ -220,6 +224,8 @@ services:
         condition: service_healthy
     healthcheck:
       disable: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
     command:
       - --config
       - /etc/zinder/publisher.toml
@@ -228,6 +234,8 @@ services:
       - /var/lib/zinder-history
       - --signing-key
       - /run/zinder-history/publisher.pk8
+      - --workers
+      - "${ZINDER_HISTORY_PUBLISHER_WORKERS:-1}"
       - --follow-interval-secs
       - "60"
     environment:
@@ -284,6 +292,7 @@ services:
           create_host_path: false
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-wallet}
       ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY: /var/lib/zinder-history
       ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY: /run/zinder-history/publisher.pub
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}

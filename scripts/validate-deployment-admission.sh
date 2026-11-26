@@ -9,6 +9,7 @@ Usage:
   validate-deployment-admission.sh --build-images-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH] [--dockerfile PATH]
   validate-deployment-admission.sh --prometheus-config PATH
   validate-deployment-admission.sh --compose-contract RESOLVED_COMPOSE_JSON
+  validate-deployment-admission.sh --light-wallet-compose-contract RESOLVED_COMPOSE_JSON
 
 CLASS is one of production, canary, or diagnostic.
 EOF
@@ -27,6 +28,7 @@ image_packager="$repository_root/scripts/package-release-images.sh"
 release_inputs_explicit=false
 prometheus_config=""
 compose_contract=""
+light_wallet_compose_contract=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -82,6 +84,11 @@ while [[ $# -gt 0 ]]; do
     --compose-contract)
       [[ $# -ge 2 ]] || usage
       compose_contract="$2"
+      shift 2
+      ;;
+    --light-wallet-compose-contract)
+      [[ $# -ge 2 ]] || usage
+      light_wallet_compose_contract="$2"
       shift 2
       ;;
     *)
@@ -151,12 +158,8 @@ EOF
   done < <(jq -r '.[]' "$single_volume_images_catalog")
 }
 
-if [[ -n "$compose_contract" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_inputs_explicit" = false && -z "$prometheus_config" ]] || usage
-  [[ -r "$compose_contract" ]] || {
-    echo "release admission rejected: cannot read resolved Compose contract $compose_contract" >&2
-    exit 1
-  }
+validate_signed_history_compose_contract() {
+  local contract_file="$1"
 
   jq -e '
     [
@@ -167,10 +170,10 @@ if [[ -n "$compose_contract" ]]; then
       "zinder-compat-lightwalletd"
     ] as $store_services
     | .services as $services
-    | all($store_services[];
+    | all($store_services[] | select($services | has(.));
         $services[.].ulimits.nofile
         | [.soft, .hard] | all(type == "number" and . >= 65536))
-  ' "$compose_contract" >/dev/null || {
+  ' "$contract_file" >/dev/null || {
     echo "release admission rejected: every Zinder store-opening service in Compose requires soft and hard open-file limits of at least 65536" >&2
     exit 1
   }
@@ -229,7 +232,10 @@ if [[ -n "$compose_contract" ]]; then
                then $readonly == true else true end);
       ($generation | host_path) as $dir
       | $dir != "/" and $publisher.network_mode == "none" and $publisher.image == $reader.image
-      and ($publisher.command | index("publish-shielded-history") != null and index("--follow-interval-secs") != null)
+      and ($publisher.command | index("publish-shielded-history") != null
+        and index("--follow-interval-secs") != null
+        and index("--workers") != null)
+      and (($publisher.tmpfs // []) | any(. == "/tmp:rw,noexec,nosuid,size=512m"))
       and ($publisher | any(.volumes[]?; .type == "volume" and .source == "data" and .target == "/var/lib/zinder" and .read_only))
       and ($publisher | binds($generation + "/publisher.pk8"; $private_key; true))
       and ($publisher | binds($generation + "/catalog"; $catalog; false))
@@ -242,10 +248,158 @@ if [[ -n "$compose_contract" ]]; then
         and all(.volumes[]?; . as $mount | all(backing_paths($mount); permitted_source($dir; $mount.read_only)))
         and all((.configs[]? | granted_file($compose.configs)), (.secrets[]? | granted_file($compose.secrets));
           permitted_source($dir; true)))
-  ' "$compose_contract" >/dev/null || {
+  ' "$contract_file" >/dev/null || {
     echo "release admission rejected: invalid signed wallet history publication or reader mounts" >&2
     exit 1
   }
+}
+
+toml_section_value() {
+  local config_path="$1"
+  local section="$2"
+  local key="$3"
+  awk -v heading="[$section]" -v key="$key" '
+    $0 == heading { in_section = 1; next }
+    /^\[/ { in_section = 0 }
+    in_section && $1 == key {
+      value = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", value)
+      sub(/".*$/, "", value)
+      print value
+      exit
+    }
+  ' "$config_path"
+}
+
+if [[ -n "$light_wallet_compose_contract" ]]; then
+  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_inputs_explicit" = false && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
+  [[ -r "$light_wallet_compose_contract" ]] || {
+    echo "release admission rejected: cannot read resolved light-wallet Compose contract $light_wallet_compose_contract" >&2
+    exit 1
+  }
+
+  validate_signed_history_compose_contract "$light_wallet_compose_contract"
+
+  jq -e '
+    .services as $services
+    |
+    def exact_healthcheck($binary; $start_period):
+      .test == ["CMD", $binary, "healthcheck"]
+      and .interval == "30s"
+      and .timeout == "5s"
+      and .start_period == $start_period
+      and .retries == 3;
+    def volume_mounts_at($service; $target):
+      [ $services[$service].volumes[]? | select(.type == "volume" and .target == $target) ];
+    def resolved_volume_name($source):
+      (.volumes[$source].name // $source);
+    def exact_read_only_bind($service; $target; $source_suffix):
+      ([ $services[$service].volumes[]?
+        | select(
+            .type == "bind"
+            and .target == $target
+            and .read_only == true
+            and (.source | endswith($source_suffix))
+          )
+      ] | length) == 1;
+    def has_checkpoint_secret_source($service):
+      [ $services[$service].volumes[]?
+        | select(.type == "bind" and (.source | endswith("/checkpoint.token")))
+      ] | length > 0;
+    volume_mounts_at("state-init"; "/var/lib/zinder") as $state_data
+    | volume_mounts_at("state-init"; "/var/lib/zinder/checkpoints") as $state_checkpoint
+    | volume_mounts_at("zinder-ingest"; "/var/lib/zinder/checkpoints") as $ingest_checkpoint
+    | volume_mounts_at("zinder-compat-lightwalletd"; "/var/lib/zinder/checkpoints") as $compat_checkpoint
+    | ($services | has("state-init"))
+    and ($services | has("zinder-ingest"))
+    and ($services | has("zinder-compat-lightwalletd"))
+    and ($services | has("zinder-history-publisher"))
+    and ($services | has("zinder-projector") | not)
+    and ($services | has("zinder-query") | not)
+    and ($services["state-init"].user == "0:0")
+    and ($services["state-init"].network_mode == "none")
+    and ($services["state-init"].restart == "no")
+    and ($services["state-init"].command == [
+      "sh",
+      "-c",
+      "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/compat/canonical-secondary && chown -R 10001:10001 /var/lib/zinder"
+    ])
+    and ($state_data | length == 1)
+    and ($state_checkpoint | length == 1)
+    and ($ingest_checkpoint | length == 1)
+    and ($compat_checkpoint | length == 0)
+    and ($state_data[0].source != $state_checkpoint[0].source)
+    and (resolved_volume_name($state_data[0].source) != resolved_volume_name($state_checkpoint[0].source))
+    and ($state_checkpoint[0].source == $ingest_checkpoint[0].source)
+    and ($services["zinder-ingest"].depends_on["state-init"].condition == "service_completed_successfully")
+    and ($services["zinder-ingest"].ulimits.nofile | [.soft, .hard] | all(type == "number" and . >= 65536))
+    and ($services["zinder-compat-lightwalletd"].network_mode == "service:zinder-ingest")
+    and ($services["zinder-compat-lightwalletd"].depends_on["zinder-ingest"].condition == "service_healthy")
+    and (($services["zinder-ingest"].ports // []) | length == 3)
+    and (($services["zinder-ingest"].ports // [])
+      | all(.host_ip == "127.0.0.1" and .protocol == "tcp" and .mode == "ingress"))
+    and (($services["zinder-ingest"].ports | map(.published) | unique | length) == 3)
+    and (($services["zinder-ingest"].ports | map(.target) | sort) == [9067, 9105, 9107])
+    and ([ $services[] | (.ports // [])[] ] | all(.host_ip == "127.0.0.1"))
+    and ([ $services[] | (.ports // [])[] | .target ] | index(9100) == null)
+    and (($services["zinder-ingest"].volumes // [])
+      | any(.target == "/var/run/zinder-checkpoint/checkpoint.token" and .read_only == true))
+    and (($services["zinder-compat-lightwalletd"].volumes // [])
+      | all(.target != "/var/run/zinder-checkpoint/checkpoint.token"))
+    and (has_checkpoint_secret_source("zinder-compat-lightwalletd") | not)
+    and exact_read_only_bind("zinder-ingest"; "/etc/zinder/config.toml"; "/deploy/config/light-wallet/ingest.toml")
+    and exact_read_only_bind("zinder-compat-lightwalletd"; "/etc/zinder/config.toml"; "/deploy/config/light-wallet/compat-lightwalletd.toml")
+    and exact_read_only_bind("zinder-ingest"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
+    and exact_read_only_bind("zinder-compat-lightwalletd"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
+    and ($services["zinder-ingest"].healthcheck | exact_healthcheck("zinder-ingest"; "3h0m0s"))
+    and ($services["zinder-compat-lightwalletd"].healthcheck | exact_healthcheck("zinder-compat-lightwalletd"; "5m0s"))
+    and ($services["zinder-ingest"].environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet")
+    and (($services["zinder-ingest"].environment.ZINDER_INGEST__SOURCE | type) == "string"
+      and ($services["zinder-ingest"].environment.ZINDER_INGEST__SOURCE | length) > 0)
+    and ($services["zinder-ingest"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9105")
+    and ($services["zinder-ingest"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
+    and ($services["zinder-compat-lightwalletd"].environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet")
+    and ($services["zinder-compat-lightwalletd"].environment.ZINDER_COMPAT__LISTEN_ADDR == "[::]:9067")
+    and ($services["zinder-compat-lightwalletd"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9107")
+    and ($services["zinder-compat-lightwalletd"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
+    and (($services["zinder-compat-lightwalletd"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
+  ' "$light_wallet_compose_contract" >/dev/null || {
+    cat >&2 <<'EOF'
+release admission rejected: resolved light-wallet Compose contract does not
+preserve the root-owned data and isolated checkpoint-volume initialization,
+projector-free two-runtime shared namespace, exact readiness probes, explicit
+container listener opt-ins, loopback-only host publications, private control
+port, light-wallet profile settings, or ingest-only checkpoint capability and
+staging mounts.
+EOF
+    exit 1
+  }
+
+  light_wallet_compat_config_source="$(jq -r '
+    .services["zinder-compat-lightwalletd"].volumes[]
+    | select(.target == "/etc/zinder/config.toml")
+    | .source
+  ' "$light_wallet_compose_contract")"
+  light_wallet_secondary_path="$(toml_section_value "$light_wallet_compat_config_source" storage secondary_path)"
+  if [[ -z "$light_wallet_secondary_path" ]] \
+    || grep -Eq '^\[wallet(\.|\])' "$light_wallet_compat_config_source"; then
+    cat >&2 <<'EOF'
+release admission rejected: light-wallet compatibility config must configure a
+canonical secondary root and omit the [wallet] section.
+EOF
+    exit 1
+  fi
+  exit 0
+fi
+
+if [[ -n "$compose_contract" ]]; then
+  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_inputs_explicit" = false && -z "$prometheus_config" && -z "$light_wallet_compose_contract" ]] || usage
+  [[ -r "$compose_contract" ]] || {
+    echo "release admission rejected: cannot read resolved Compose contract $compose_contract" >&2
+    exit 1
+  }
+
+  validate_signed_history_compose_contract "$compose_contract"
 
   jq -e '
     .services as $services
@@ -338,14 +492,19 @@ if [[ -n "$compose_contract" ]]; then
     and ($services["zinder-query"].depends_on["zinder-projector"].condition == "service_healthy")
     and ($services["zinder-ingest"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9105")
     and ($services["zinder-ingest"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
+    and (($services["zinder-ingest"].environment.ZINDER_INGEST__SOURCE | type) == "string"
+      and ($services["zinder-ingest"].environment.ZINDER_INGEST__SOURCE | length) > 0)
     and ($services["zinder-projector"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9110")
     and ($services["zinder-projector"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
+    and (($services["zinder-projector"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
     and ($services["zinder-query"].environment.ZINDER_QUERY__LISTEN_ADDR == "[::]:9102")
     and ($services["zinder-query"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9106")
     and ($services["zinder-query"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
+    and (($services["zinder-query"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
     and ($services["zinder-compat-lightwalletd"].environment.ZINDER_COMPAT__LISTEN_ADDR == "[::]:9067")
     and ($services["zinder-compat-lightwalletd"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9107")
     and ($services["zinder-compat-lightwalletd"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
+    and (($services["zinder-compat-lightwalletd"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
   ' "$compose_contract" >/dev/null || {
     cat >&2 <<'EOF'
 release admission rejected: resolved Compose contract does not preserve the
@@ -355,23 +514,6 @@ loopback-only host publications, private control port, distinct native and
 compatibility readers, or the ingest/projector-only checkpoint capability and staging mounts.
 EOF
     exit 1
-  }
-
-  toml_section_value() {
-    local config_path="$1"
-    local section="$2"
-    local key="$3"
-    awk -v heading="[$section]" -v key="$key" '
-      $0 == heading { in_section = 1; next }
-      /^\[/ { in_section = 0 }
-      in_section && $1 == key {
-        value = $0
-        sub(/^[^=]*=[[:space:]]*"/, "", value)
-        sub(/".*$/, "", value)
-        print value
-        exit
-      }
-    ' "$config_path"
   }
 
   query_config_source="$(jq -r '
@@ -427,7 +569,7 @@ EOF
 fi
 
 if [[ -n "$build_images_workflow" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$prometheus_config" && -z "$compose_contract" && -z "$light_wallet_compose_contract" ]] || usage
   [[ -r "$build_images_workflow" ]] || {
     echo "release admission rejected: cannot read build image workflow $build_images_workflow" >&2
     exit 1
@@ -471,7 +613,7 @@ EOF
 fi
 
 if [[ -n "$prometheus_config" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_inputs_explicit" = false && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_inputs_explicit" = false && -z "$compose_contract" && -z "$light_wallet_compose_contract" ]] || usage
   [[ -r "$prometheus_config" ]] || {
     echo "release admission rejected: cannot read Prometheus config $prometheus_config" >&2
     exit 1
@@ -498,7 +640,7 @@ EOF
 fi
 
 if [[ -n "$release_workflow" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && -z "$build_images_workflow" && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && -z "$build_images_workflow" && -z "$prometheus_config" && -z "$compose_contract" && -z "$light_wallet_compose_contract" ]] || usage
   [[ -r "$release_workflow" ]] || {
     echo "release admission rejected: cannot read release workflow $release_workflow" >&2
     exit 1

@@ -1,0 +1,270 @@
+# Single-host light-wallet topology (no wallet projection).
+#
+# zinder-ingest is the only canonical writer, zinder-compat-lightwalletd serves
+# the lightwalletd compatibility protocol directly from the canonical store with
+# node-backed reads for transparent and raw-transaction queries, and
+# zinder-history-publisher signs ranges of settled shielded blocks.
+# zinder-compat-lightwalletd shares ingest's network namespace so the
+# authenticated control plane remains loopback-only.
+#
+# ZINDER_VERSION=vX.Y.Z pulls the signed release images of that tag; use the
+# Compose file from the same tag. Without it, `up -d --build` builds the
+# images from this checkout and tags them `:local`. Each image variable, such
+# as ZINDER_INGEST_IMAGE, replaces one whole reference, for example with a
+# digest-pinned one.
+#
+# The node is external to this project. Select it with one of the env files in
+# this directory: each names the node's Docker network, its cookie volume, and
+# its JSON-RPC and optional indexer endpoints. No node address has a default.
+name: zinder-${ZINDER_DEPLOY_NETWORK:?set ZINDER_DEPLOY_NETWORK to mainnet, testnet, or regtest}
+
+networks:
+  node:
+    external: true
+    name: ${ZINDER_SOURCE_NETWORK_NAME:?set the node's external Docker network name}
+  observability:
+    name: ${ZINDER_OBSERVABILITY_NETWORK_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-observability}
+
+x-compat-image: &compat-image
+  image: ${ZINDER_COMPAT_IMAGE:-ghcr.io/zcashfoundation/zinder-compat-lightwalletd:${ZINDER_VERSION:-local}}
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    target: zinder-compat-lightwalletd
+    args:
+      ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-0}
+
+services:
+  state-init:
+    image: debian:bookworm-slim
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/compat/canonical-secondary && chown -R 10001:10001 /var/lib/zinder",
+      ]
+    volumes:
+      - type: volume
+        source: data
+        target: /var/lib/zinder
+        volume:
+          nocopy: true
+      - type: volume
+        source: checkpoint-staging
+        target: /var/lib/zinder/checkpoints
+        volume:
+          nocopy: true
+
+  zinder-ingest:
+    image: ${ZINDER_INGEST_IMAGE:-ghcr.io/zcashfoundation/zinder-ingest:${ZINDER_VERSION:-local}}
+    mem_limit: ${ZINDER_INGEST_MEMORY_LIMIT:-14g}
+    ulimits:
+      nofile:
+        soft: ${ZINDER_INGEST_NOFILE_SOFT_LIMIT:-65536}
+        hard: ${ZINDER_INGEST_NOFILE_HARD_LIMIT:-65536}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: zinder-ingest
+      args:
+        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-0}
+    restart: on-failure
+    depends_on:
+      state-init:
+        condition: service_completed_successfully
+    networks:
+      node:
+        aliases:
+          - zinder-${ZINDER_DEPLOY_NETWORK}-ingest
+      observability:
+    volumes:
+      - data:/var/lib/zinder
+      - checkpoint-staging:/var/lib/zinder/checkpoints
+      - ./config/light-wallet/ingest.toml:/etc/zinder/config.toml:ro
+      - node-cookie:/var/run/auth:ro
+      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
+      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
+    command: ["--config", "/etc/zinder/config.toml"]
+    environment:
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-light-wallet}
+      ZINDER_INGEST__SOURCE: ${ZINDER_INGEST__SOURCE:-zebra-json-rpc}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
+      # Empty selects JSON-RPC mempool polling. Env files set the indexer URL
+      # only when the node exposes its indexer gRPC listener to this network.
+      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR-}
+      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
+      # Namespace-wide binds are explicit deployment opt-ins. Host publication
+      # below remains loopback-only, while Prometheus reaches ops internally.
+      ZINDER_OPS__LISTEN_ADDR: "[::]:9105"
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
+    ports:
+      - "127.0.0.1:${ZINDER_INGEST_OPS_HOST_PORT:-9105}:9105"
+      - "127.0.0.1:${ZINDER_COMPAT_HOST_PORT:-9067}:9067"
+      - "127.0.0.1:${ZINDER_COMPAT_OPS_HOST_PORT:-9107}:9107"
+    healthcheck:
+      test: ["CMD", "zinder-ingest", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      # Fresh canonical construction has a three-hour production hard gate.
+      # Keep expected bootstrap failures in Docker's starting state until then.
+      start_period: 3h
+      retries: 3
+
+  zinder-history-publisher:
+    <<: *compat-image
+    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-4g}
+    network_mode: none
+    restart: unless-stopped
+    depends_on:
+      zinder-ingest:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    command:
+      - --config
+      - /etc/zinder/publisher.toml
+      - publish-shielded-history
+      - --directory
+      - /var/lib/zinder-history
+      - --signing-key
+      - /run/zinder-history/publisher.pk8
+      - --workers
+      - "${ZINDER_HISTORY_PUBLISHER_WORKERS:-1}"
+      - --follow-interval-secs
+      - "60"
+    environment:
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+    volumes:
+      - data:/var/lib/zinder:ro
+      - ./config/history-publisher.toml:/etc/zinder/publisher.toml:ro
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/publisher.pk8
+        target: /run/zinder-history/publisher.pk8
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/catalog
+        target: /var/lib/zinder-history
+        bind:
+          create_host_path: false
+
+  zinder-compat-lightwalletd:
+    <<: *compat-image
+    # Under cgroup v2, ZSHRNG01 shielded-history page cache counts toward mem_limit;
+    # keep 4g for self-hosted VMs and raise ZINDER_COMPAT_MEMORY_LIMIT (for example 32g+) on
+    # 64+ GiB public Mainnet endpoints (see docs/runbooks/deploying.md).
+    mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-4g}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    restart: on-failure
+    network_mode: "service:zinder-ingest"
+    depends_on:
+      zinder-ingest:
+        condition: service_healthy
+    volumes:
+      - data:/var/lib/zinder
+      - ./config/light-wallet/compat-lightwalletd.toml:/etc/zinder/config.toml:ro
+      - node-cookie:/var/run/auth:ro
+      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/publisher.pub
+        target: /run/zinder-history/publisher.pub
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/catalog
+        target: /var/lib/zinder-history
+        read_only: true
+        bind:
+          create_host_path: false
+    command: ["--config", "/etc/zinder/config.toml"]
+    environment:
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-light-wallet}
+      ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY: /var/lib/zinder-history
+      ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY: /run/zinder-history/publisher.pub
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
+      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
+      ZINDER_COMPAT__LISTEN_ADDR: "[::]:9067"
+      ZINDER_OPS__LISTEN_ADDR: "[::]:9107"
+      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
+      # Same trust rule as ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS in
+      # docker-compose.yml.
+      ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS:-false}
+    healthcheck:
+      test: ["CMD", "zinder-compat-lightwalletd", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5m
+      retries: 3
+
+  zinder-prometheus:
+    image: prom/prometheus:v3.16.0
+    mem_limit: ${ZINDER_PROMETHEUS_MEMORY_LIMIT:-1g}
+    restart: unless-stopped
+    profiles: [observability]
+    networks: [observability]
+    volumes:
+      - prometheus:/prometheus
+      - ../observability/prometheus/rules:/etc/prometheus/rules:ro
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${ZINDER_PROMETHEUS_RETENTION:-30d}"
+      - "--web.enable-lifecycle"
+    ports:
+      - "127.0.0.1:${ZINDER_PROMETHEUS_HOST_PORT:-9095}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  zinder-grafana:
+    image: grafana/grafana:13.3.1
+    mem_limit: ${ZINDER_GRAFANA_MEMORY_LIMIT:-512m}
+    restart: unless-stopped
+    profiles: [observability]
+    networks: [observability]
+    depends_on:
+      zinder-prometheus:
+        condition: service_healthy
+    volumes:
+      - grafana:/var/lib/grafana
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${ZINDER_GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_DEFAULT_THEME: light
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/zinder-overview.json
+    ports:
+      - "127.0.0.1:${ZINDER_GRAFANA_HOST_PORT:-3002}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  data:
+    name: ${ZINDER_SINGLE_HOST_DATA_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-data}
+  checkpoint-staging:
+    name: ${ZINDER_CHECKPOINT_STAGING_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-checkpoints}
+  prometheus:
+    name: ${ZINDER_PROMETHEUS_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-prometheus}
+  grafana:
+    name: ${ZINDER_GRAFANA_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-grafana}
+  node-cookie:
+    external: true
+    name: ${ZINDER_SOURCE_COOKIE_VOLUME_NAME:?set the node's external cookie volume name}
