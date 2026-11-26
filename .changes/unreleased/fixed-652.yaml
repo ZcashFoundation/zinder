@@ -1,0 +1,6 @@
+kind: fixed
+body: Default single-volume `wallet-serving` containers to `ZINDER_DEPLOYMENT__PROFILE=wallet` when Explorer views are disabled and reject incompatible profile/view combinations, switch packaged `wallet-serving` ingest to `zebra-indexer-grpc` without hardcoded `raw_blob_policy` or RocksDB `max_open_files` caps, align `zinder-explorer` default `storage.secondary_path` to `/var/lib/zinder/explorer/secondary`, and update the `zinder-ingest` image `HEALTHCHECK` to probe `/readyz`.
+time: 2026-11-26T12:41:00Z
+custom:
+    Bump: patch
+    PR: "652"
