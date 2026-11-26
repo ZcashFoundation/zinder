@@ -12,13 +12,17 @@ use zinder_core::BlockHeightRange;
 use zinder_query::CanonicalReader;
 use zinder_store::HeightOrder;
 
-use super::{PublishedShieldedCatalog, ShieldedTailBuffer};
+use super::{
+    PublishedShieldedCatalog, ShieldedTailBuffer,
+    tail::{EncodedTailCounters, EncodedTailTelemetry},
+};
 use crate::sealed_history::{ChunkSpan, SealedBlock};
 use zinder_proto::compat::lightwalletd::EncodedBlockBatcher;
 
 /// The admitted shielded history shared by a listener and its catalog refresher.
 pub struct PublishedShieldedHistory {
     current: ArcSwap<HistorySnapshot>,
+    tail_counters: Arc<EncodedTailCounters>,
     manifest: PathBuf,
     publisher_directory: Option<PathBuf>,
     key: [u8; 32],
@@ -158,11 +162,22 @@ impl PublishedShieldedHistory {
             let source = capture();
             catalog.verify_source(source.borrow()).await?;
         }
+        let tail_counters = Arc::new(EncodedTailCounters::default());
+        let snapshot = catalog.map_or_else(
+            || {
+                HistorySnapshot::Bootstrap(ShieldedTailBuffer::empty_with_counters(Arc::clone(
+                    &tail_counters,
+                )))
+            },
+            |catalog| {
+                HistorySnapshot::Published(Arc::new(
+                    catalog.with_tail_counters(Arc::clone(&tail_counters)),
+                ))
+            },
+        );
         Ok(Self {
-            current: ArcSwap::from_pointee(catalog.map_or_else(
-                || HistorySnapshot::Bootstrap(ShieldedTailBuffer::default()),
-                |catalog| HistorySnapshot::Published(Arc::new(catalog)),
-            )),
+            current: ArcSwap::from_pointee(snapshot),
+            tail_counters,
             manifest: manifest.to_owned(),
             publisher_directory: publisher_directory.map(Path::to_owned),
             key,
@@ -181,6 +196,17 @@ impl PublishedShieldedHistory {
             catalog.verify_source(source).await?;
         }
         Ok(())
+    }
+
+    /// Returns read-only `EncodedTail` cache hit, fill, and byte-cap telemetry.
+    #[must_use]
+    pub fn encoded_tail_telemetry(&self) -> EncodedTailTelemetry {
+        self.encoded_range().1.telemetry()
+    }
+
+    /// Drops any cached live `EncodedTail` rows without resetting monotonic telemetry counters.
+    pub fn clear_encoded_tail(&self) {
+        self.encoded_range().1.clear();
     }
 
     pub(super) fn snapshot(&self) -> Arc<HistorySnapshot> {
@@ -249,6 +275,7 @@ impl PublishedShieldedHistory {
         }
         candidate.verify_source(source.borrow()).await?;
         drop(source);
+        let candidate = candidate.with_tail_counters(Arc::clone(&self.tail_counters));
         let next = Arc::new(HistorySnapshot::Published(Arc::new(candidate)));
         let displaced = self.current.compare_and_swap(&current, next);
         Ok(Arc::ptr_eq(&current, &displaced))

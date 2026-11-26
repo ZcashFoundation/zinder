@@ -10,6 +10,7 @@ pub(crate) use catalog::PublishedShieldedCatalog;
 pub use catalog::{PublicationConcurrency, ShieldedCatalogPublisher};
 pub use history::PublishedShieldedHistory;
 pub(crate) use read::{PublishedBatchedRangeRead, PublishedRangeRead};
+pub use tail::EncodedTailTelemetry;
 pub(crate) use tail::ShieldedTailBuffer;
 
 use std::{collections::VecDeque, io, path::Path};

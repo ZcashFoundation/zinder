@@ -164,6 +164,14 @@ impl PublishedShieldedCatalog {
         self.tail.clone()
     }
 
+    pub(super) fn with_tail_counters(
+        mut self,
+        counters: Arc<super::tail::EncodedTailCounters>,
+    ) -> Self {
+        self.tail = self.tail.with_counters(counters);
+        self
+    }
+
     /// Verifies the linked catalog's terminal against a captured canonical reader.
     ///
     /// # Errors

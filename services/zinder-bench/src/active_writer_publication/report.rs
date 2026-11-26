@@ -148,13 +148,17 @@ pub struct ActiveWriterPublicationReport {
     pub contract_identity: String,
     /// Report schema format version.
     pub report_format_version: u32,
-    /// Chain and workload geometry used across all four matched arms.
+    /// Chain and workload geometry used across all matched arms.
     pub workload: WorkloadGeometryReport,
-    /// Per-mode measurement records in canonical execution order.
+    /// Baseline quiescent arm with signed catalog published through `crossed_segment_boundary_height`
+    /// (matched baseline for `ingest_projector_and_publisher`).
+    pub published_quiescent_control: ModeReport,
+    /// Per-mode measurement records in canonical execution order (`quiescent_control`,
+    /// `ingest_active`, `ingest_and_projector`, `ingest_projector_and_publisher`).
     pub modes: Vec<ModeReport>,
-    /// Stage differentials comparing each active mode against `quiescent_control`.
+    /// Stage differentials comparing each active mode against its matched quiescent control.
     pub differentials_vs_quiescent: Vec<ModeDifferential>,
-    /// Byte-level reply parity comparison across all four modes at the final tip.
+    /// Byte-level reply parity comparison across all arms at the final tip.
     pub byte_parity: ByteParityReport,
 }
 
@@ -278,13 +282,23 @@ pub struct PublisherMetrics {
 /// Encoded tail fill/refill timing and `64 MiB` byte-cap observation.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct TailRefillMetrics {
-    /// First tail `GetBlockRange` immediately following a tip publication.
+    /// First tail `GetBlockRange` after a tip publication that triggered an `EncodedTail` fill.
     pub cold_after_advance: StreamLatencyReport,
-    /// Immediate repeat tail `GetBlockRange` at the same published fence.
+    /// Immediate repeat tail `GetBlockRange` verified as a same-generation cache hit.
     pub warm_repeat: StreamLatencyReport,
     /// Peak payload bytes observed across a single uncovered-tail range response.
     pub peak_tail_response_bytes: u64,
-    /// Whether any single uncovered-tail pass exceeded the 64 MiB `EncodedTail` cap.
+    /// Peak retained bytes reported by `EncodedTail` telemetry across tail builds.
+    pub peak_encoded_tail_bytes: u64,
+    /// Cumulative rows evicted by `EncodedTail`'s 64 MiB byte cap during this mode run.
+    pub encoded_tail_byte_cap_evictions: u64,
+    /// Count of `EncodedTail` builds/prepends observed during this mode run.
+    pub encoded_tail_cache_fills: u64,
+    /// Count of `EncodedTail` cache hits observed during this mode run.
+    pub encoded_tail_cache_hits: u64,
+    /// Pairs excluded because a catalog publication or generation advance crossed the pair.
+    pub excluded_cross_epoch_pairs: u64,
+    /// Whether `EncodedTail` reported any byte-capped fill or byte-cap eviction.
     pub byte_cap_exceeded: bool,
 }
 
@@ -404,11 +418,15 @@ pub struct ModeReport {
     pub errors: ProtocolErrorCounts,
 }
 
-/// Latency and activity deltas for one active mode compared to `quiescent_control`.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// Latency and activity deltas for one active mode compared to its matched quiescent baseline.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModeDifferential {
-    /// Active writer mode being compared against `quiescent_control`.
+    /// Active writer mode being compared.
     pub mode: WriterMode,
+    /// Matched quiescent baseline identifier (`"quiescent_control"` or `"published_quiescent_control"`).
+    pub baseline_label: String,
+    /// Whether the matched quiescent baseline held a published signed catalog.
+    pub baseline_catalog_published: bool,
     /// Change in settled catalog `GetBlockRange` completion p50 (ms).
     pub catalog_completion_p50_delta_ms: f64,
     /// Change in settled catalog `GetBlockRange` completion p95 (ms).
@@ -421,16 +439,23 @@ pub struct ModeDifferential {
     pub slow_boundary_completion_p50_delta_ms: f64,
     /// Change in `GetTreeState` p95 (ms).
     pub tree_state_p95_delta_ms: f64,
-    /// Change in reader secondary read bytes compared to quiescent baseline.
+    /// Change in reader secondary read bytes compared to matched quiescent baseline.
     pub reader_bytes_read_delta: i64,
 }
 
 impl ModeDifferential {
     /// Computes stage latency and secondary-read deltas relative to `baseline`.
     #[must_use]
-    pub fn between(baseline: &ModeReport, candidate: &ModeReport) -> Self {
+    pub fn between(
+        baseline: &ModeReport,
+        baseline_label: &str,
+        baseline_catalog_published: bool,
+        candidate: &ModeReport,
+    ) -> Self {
         Self {
             mode: candidate.mode,
+            baseline_label: baseline_label.to_owned(),
+            baseline_catalog_published,
             catalog_completion_p50_delta_ms: candidate.catalog_range.completion_ms.p50
                 - baseline.catalog_range.completion_ms.p50,
             catalog_completion_p95_delta_ms: candidate.catalog_range.completion_ms.p95
@@ -463,6 +488,8 @@ impl ModeDifferential {
 pub struct ModeParityDigests {
     /// Mode that produced these finalized-tip digests.
     pub mode: WriterMode,
+    /// Matched arm identifier (`"quiescent_control"`, `"published_quiescent_control"`, etc.).
+    pub label: String,
     /// SHA-256 hex over concatenated protobuf frames of settled catalog range.
     pub settled_catalog_range_sha256: String,
     /// SHA-256 hex over concatenated protobuf frames of boundary-crossing range.
@@ -473,11 +500,13 @@ pub struct ModeParityDigests {
     pub tree_states_sha256: String,
 }
 
-/// Comparison of one active mode against the `quiescent_control` byte oracle.
+/// Comparison of one arm against the `quiescent_control` byte oracle.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParityMismatch {
     /// Mode whose bytes diverged.
     pub mode: WriterMode,
+    /// Matched arm identifier that diverged.
+    pub label: String,
     /// Logical probe surface that diverged.
     pub surface: String,
     /// Hex digest observed in `quiescent_control`.
@@ -489,7 +518,7 @@ pub struct ParityMismatch {
 /// Cross-mode exact byte-level reply parity report.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ByteParityReport {
-    /// True iff every active mode returned identical protobuf bytes to `quiescent_control`.
+    /// True iff every mode returned identical protobuf bytes to `quiescent_control`.
     pub all_matched: bool,
     /// Per-mode digests collected after convergence at `final_tip_height`.
     pub digests: Vec<ModeParityDigests>,
@@ -503,7 +532,12 @@ impl ByteParityReport {
     pub fn evaluate(digests: Vec<ModeParityDigests>) -> Self {
         let Some(oracle) = digests
             .iter()
-            .find(|digest| digest.mode == WriterMode::QuiescentControl)
+            .find(|digest| digest.label == "quiescent_control")
+            .or_else(|| {
+                digests
+                    .iter()
+                    .find(|digest| digest.mode == WriterMode::QuiescentControl)
+            })
         else {
             return Self {
                 all_matched: false,
@@ -513,32 +547,32 @@ impl ByteParityReport {
         };
         let mut mismatches = Vec::new();
         for candidate in &digests {
-            if candidate.mode == WriterMode::QuiescentControl {
+            if candidate.label == oracle.label && candidate.mode == oracle.mode {
                 continue;
             }
             check_surface(
-                candidate.mode,
+                candidate,
                 "settled_catalog_range",
                 &oracle.settled_catalog_range_sha256,
                 &candidate.settled_catalog_range_sha256,
                 &mut mismatches,
             );
             check_surface(
-                candidate.mode,
+                candidate,
                 "boundary_crossing_range",
                 &oracle.boundary_crossing_range_sha256,
                 &candidate.boundary_crossing_range_sha256,
                 &mut mismatches,
             );
             check_surface(
-                candidate.mode,
+                candidate,
                 "uncovered_tail_range",
                 &oracle.uncovered_tail_range_sha256,
                 &candidate.uncovered_tail_range_sha256,
                 &mut mismatches,
             );
             check_surface(
-                candidate.mode,
+                candidate,
                 "tree_states",
                 &oracle.tree_states_sha256,
                 &candidate.tree_states_sha256,
@@ -561,7 +595,7 @@ pub(crate) fn update_length_prefixed_digest(hasher: &mut Sha256, bytes: &[u8]) {
 }
 
 fn check_surface(
-    mode: WriterMode,
+    candidate: &ModeParityDigests,
     surface: &str,
     expected: &str,
     observed: &str,
@@ -569,7 +603,8 @@ fn check_surface(
 ) {
     if expected != observed {
         mismatches.push(ParityMismatch {
-            mode,
+            mode: candidate.mode,
+            label: candidate.label.clone(),
             surface: surface.to_owned(),
             expected_sha256: expected.to_owned(),
             observed_sha256: observed.to_owned(),
@@ -652,6 +687,11 @@ mod tests {
                     "payload_bytes_delivered": 100
                 },
                 "peak_tail_response_bytes": 100,
+                "peak_encoded_tail_bytes": 200,
+                "encoded_tail_byte_cap_evictions": 0,
+                "encoded_tail_cache_fills": 1,
+                "encoded_tail_cache_hits": 1,
+                "excluded_cross_epoch_pairs": 0,
                 "byte_cap_exceeded": false
             },
             "slow_boundary_range": {
@@ -701,7 +741,9 @@ mod tests {
     fn differential_reports_signed_stage_and_read_byte_changes() -> Result<(), Box<dyn Error>> {
         let baseline = blank_mode_report(WriterMode::QuiescentControl, 5.0, 2_000)?;
         let candidate = blank_mode_report(WriterMode::IngestActive, 8.5, 1_500)?;
-        let diff = ModeDifferential::between(&baseline, &candidate);
+        let diff = ModeDifferential::between(&baseline, "quiescent_control", false, &candidate);
+        assert_eq!(diff.baseline_label, "quiescent_control");
+        assert!(!diff.baseline_catalog_published);
         assert!((diff.catalog_completion_p50_delta_ms - 3.5).abs() < f64::EPSILON);
         assert!((diff.catalog_completion_p95_delta_ms - 7.0).abs() < f64::EPSILON);
         assert_eq!(diff.reader_bytes_read_delta, -500);
@@ -712,6 +754,7 @@ mod tests {
     fn parity_report_flags_divergent_surface_and_accepts_identical_digests() {
         let oracle = ModeParityDigests {
             mode: WriterMode::QuiescentControl,
+            label: "quiescent_control".to_owned(),
             settled_catalog_range_sha256: "aa".to_owned(),
             boundary_crossing_range_sha256: "bb".to_owned(),
             uncovered_tail_range_sha256: "cc".to_owned(),
@@ -719,12 +762,14 @@ mod tests {
         };
         let matching = ModeParityDigests {
             mode: WriterMode::IngestActive,
+            label: "ingest_active".to_owned(),
             ..oracle.clone()
         };
         assert!(ByteParityReport::evaluate(vec![oracle.clone(), matching]).all_matched);
 
         let divergent = ModeParityDigests {
             mode: WriterMode::IngestProjectorAndPublisher,
+            label: "ingest_projector_and_publisher".to_owned(),
             uncovered_tail_range_sha256: "ff".to_owned(),
             ..oracle.clone()
         };

@@ -21,7 +21,8 @@ mod ping;
 mod published_range;
 mod sealed_history;
 pub use published_range::{
-    PublicationConcurrency, PublishedShieldedHistory, ShieldedCatalogPublisher,
+    EncodedTailTelemetry, PublicationConcurrency, PublishedShieldedHistory,
+    ShieldedCatalogPublisher,
 };
 mod request_limits;
 mod stale_tip;

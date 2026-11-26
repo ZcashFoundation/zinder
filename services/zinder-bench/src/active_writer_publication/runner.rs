@@ -62,8 +62,8 @@ use super::{
     chain_fixture::{AdvancingChainSource, ChainSpecConfig, GeneratedChain, TemplateStores},
     mempool::{BenchmarkMempoolSurface, as_mempool_surface, create_tip_watcher},
     readers::{
-        FleetSignals, ReaderFleetOutput, ReaderFleetSpec, collect_final_tip_parity,
-        spawn_reader_fleet,
+        FleetSignals, ParityProbeRequest, ReaderFleetOutput, ReaderFleetSpec,
+        collect_final_tip_parity, spawn_reader_fleet,
     },
     report::{
         ACTIVE_WRITER_PUBLICATION_CONTRACT, ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION,
@@ -86,9 +86,19 @@ const LIVE_COMMIT_HISTOGRAM: &str = "zinder_ingest_canonical_live_commit_seconds
 const LIVE_PREPARE_HISTOGRAM: &str = "zinder_ingest_canonical_live_prepare_seconds";
 const DEFAULT_MAX_TRANSITION_BYTES: u64 = MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES;
 const READER_GENERATION_SLOTS: usize = 3;
+const MAX_CATALOG_REFRESH_RETRIES: u32 = 500;
 
-/// Runs all four matched writer/publication modes against one shared advancing
-/// Regtest workload and returns the structured comparison and parity report.
+#[derive(Clone, Copy)]
+struct ModeRunSpec {
+    mode: WriterMode,
+    label: &'static str,
+    publish_catalog: bool,
+}
+
+/// Runs all matched writer/publication arms across one advancing Regtest chain.
+///
+/// Exercises both unpublished and published quiescent baselines alongside active
+/// writer, projector, and publisher combinations, returning structured timing and parity.
 pub async fn run_active_writer_publication(
     config: &ActiveWriterPublicationConfig,
 ) -> Result<ActiveWriterPublicationReport, BenchError> {
@@ -102,29 +112,103 @@ pub async fn run_active_writer_publication(
     })?;
     let template_stores = TemplateStores::build(&chain).await?;
 
+    let (published_quiescent_control, published_parity) = run_single_mode(
+        ModeRunSpec {
+            mode: WriterMode::QuiescentControl,
+            label: "published_quiescent_control",
+            publish_catalog: true,
+        },
+        config,
+        &chain,
+        &template_stores,
+    )
+    .await?;
+
     let mut mode_reports = Vec::with_capacity(4);
-    let mut parity_digests = Vec::with_capacity(4);
-    for mode in [
-        WriterMode::QuiescentControl,
-        WriterMode::IngestActive,
-        WriterMode::IngestAndProjector,
-        WriterMode::IngestProjectorAndPublisher,
+    let mut parity_digests = Vec::with_capacity(5);
+    parity_digests.push(published_parity);
+
+    for run_spec in [
+        ModeRunSpec {
+            mode: WriterMode::QuiescentControl,
+            label: "quiescent_control",
+            publish_catalog: false,
+        },
+        ModeRunSpec {
+            mode: WriterMode::IngestActive,
+            label: "ingest_active",
+            publish_catalog: false,
+        },
+        ModeRunSpec {
+            mode: WriterMode::IngestAndProjector,
+            label: "ingest_and_projector",
+            publish_catalog: false,
+        },
+        ModeRunSpec {
+            mode: WriterMode::IngestProjectorAndPublisher,
+            label: "ingest_projector_and_publisher",
+            publish_catalog: true,
+        },
     ] {
-        let (mode_report, parity) = run_single_mode(mode, config, &chain, &template_stores).await?;
+        let (mode_report, parity) =
+            run_single_mode(run_spec, config, &chain, &template_stores).await?;
         mode_reports.push(mode_report);
         parity_digests.push(parity);
     }
 
-    let baseline = mode_reports
+    let unpublished_baseline = mode_reports
         .first()
         .ok_or_else(|| BenchError::tip_replay("quiescent_control report missing"))?;
-    let differentials_vs_quiescent = mode_reports
-        .iter()
-        .skip(1)
-        .map(|candidate| ModeDifferential::between(baseline, candidate))
-        .collect();
+    let differentials_vs_quiescent = build_matched_differentials(
+        unpublished_baseline,
+        &published_quiescent_control,
+        &mode_reports[1..],
+    );
     let byte_parity = ByteParityReport::evaluate(parity_digests);
+    let workload = build_workload_geometry(config, &chain);
 
+    Ok(ActiveWriterPublicationReport {
+        contract_identity: ACTIVE_WRITER_PUBLICATION_CONTRACT.to_owned(),
+        report_format_version: ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION,
+        workload,
+        published_quiescent_control,
+        modes: mode_reports,
+        differentials_vs_quiescent,
+        byte_parity,
+    })
+}
+
+fn build_matched_differentials(
+    unpublished_baseline: &ModeReport,
+    published_baseline: &ModeReport,
+    active_modes: &[ModeReport],
+) -> Vec<ModeDifferential> {
+    active_modes
+        .iter()
+        .map(|candidate| {
+            if candidate.mode == WriterMode::IngestProjectorAndPublisher {
+                ModeDifferential::between(
+                    published_baseline,
+                    "published_quiescent_control",
+                    true,
+                    candidate,
+                )
+            } else {
+                ModeDifferential::between(
+                    unpublished_baseline,
+                    "quiescent_control",
+                    false,
+                    candidate,
+                )
+            }
+        })
+        .collect()
+}
+
+fn build_workload_geometry(
+    config: &ActiveWriterPublicationConfig,
+    chain: &GeneratedChain,
+) -> WorkloadGeometryReport {
     let crossed_boundary = ((chain
         .base_tip_height
         .value()
@@ -132,32 +216,29 @@ pub async fn run_active_writer_publication(
         / config.segment_blocks)
         .saturating_add(1)
         .saturating_mul(config.segment_blocks.get());
-
-    Ok(ActiveWriterPublicationReport {
-        contract_identity: ACTIVE_WRITER_PUBLICATION_CONTRACT.to_owned(),
-        report_format_version: ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION,
-        workload: WorkloadGeometryReport {
-            network: zinder_core::wire::encode_zinder_native_chain_name(chain.network).to_owned(),
-            base_blocks: config.base_blocks,
-            live_blocks: config.live_blocks,
-            final_tip_height: chain.final_tip_height.value(),
-            reorg_window_blocks: config.reorg_window_blocks,
-            segment_blocks: config.segment_blocks.get(),
-            crossed_segment_boundary_height: crossed_boundary,
-            sparse_block_count: chain.sparse_block_count,
-            dense_block_count: chain.dense_block_count,
-            mempool_churn_sizes: config.mempool_churn_sizes.clone(),
-        },
-        modes: mode_reports,
-        differentials_vs_quiescent,
-        byte_parity,
-    })
+    WorkloadGeometryReport {
+        network: zinder_core::wire::encode_zinder_native_chain_name(chain.network).to_owned(),
+        base_blocks: config.base_blocks,
+        live_blocks: config.live_blocks,
+        final_tip_height: chain.final_tip_height.value(),
+        reorg_window_blocks: config.reorg_window_blocks,
+        segment_blocks: config.segment_blocks.get(),
+        crossed_segment_boundary_height: crossed_boundary,
+        sparse_block_count: chain.sparse_block_count,
+        dense_block_count: chain.dense_block_count,
+        mempool_churn_sizes: config.mempool_churn_sizes.clone(),
+    }
 }
 
 fn validate_config(config: &ActiveWriterPublicationConfig) -> Result<(), BenchError> {
     if config.base_blocks <= config.reorg_window_blocks {
         return Err(BenchError::invalid_argument(
             "base_blocks must exceed reorg_window_blocks",
+        ));
+    }
+    if config.reorg_window_blocks == 0 {
+        return Err(BenchError::invalid_argument(
+            "reorg_window_blocks must be positive",
         ));
     }
     if config.live_blocks == 0 {
@@ -167,6 +248,18 @@ fn validate_config(config: &ActiveWriterPublicationConfig) -> Result<(), BenchEr
         return Err(BenchError::invalid_argument(
             "mempool_churn_sizes must name at least one batch size",
         ));
+    }
+    let base_settled = config
+        .base_blocks
+        .saturating_sub(config.reorg_window_blocks);
+    let width = config.segment_blocks.get();
+    let next_boundary = ((base_settled / width).saturating_add(1)).saturating_mul(width);
+    let final_tip = config.base_blocks.saturating_add(config.live_blocks);
+    let final_settled = final_tip.saturating_sub(config.reorg_window_blocks);
+    if final_settled < next_boundary {
+        return Err(BenchError::invalid_argument(format!(
+            "final settled height ({final_settled}) must reach next segment boundary ({next_boundary})"
+        )));
     }
     Ok(())
 }
@@ -269,7 +362,7 @@ struct ModeRuntimeBootstrap {
 }
 
 async fn bootstrap_mode_runtime(
-    mode: WriterMode,
+    run_spec: ModeRunSpec,
     config: &ActiveWriterPublicationConfig,
     chain: &GeneratedChain,
     template: &TemplateStores,
@@ -277,27 +370,31 @@ async fn bootstrap_mode_runtime(
     let paths = ModePaths::prepare(template)?;
     let boundary_height = next_segment_boundary(config, chain);
 
-    if mode == WriterMode::QuiescentControl {
-        pre_advance_quiescent_stores(&paths, config, chain).await?;
+    if run_spec.mode == WriterMode::QuiescentControl {
+        pre_advance_quiescent_stores(&paths, config, chain, run_spec.publish_catalog).await?;
     }
 
-    let bootstrap_publisher = ShieldedCatalogPublisher::open(
-        &paths.catalog_dir,
-        &paths.publisher_priv_key,
-        BlockHeight::new(1),
-        config.segment_blocks,
-    )
-    .map_err(|source| BenchError::io(&paths.catalog_dir, source))?;
-    let publisher_opt = if mode == WriterMode::IngestProjectorAndPublisher {
-        Some(bootstrap_publisher)
-    } else {
-        drop(bootstrap_publisher);
+    let publisher_opt = if run_spec.mode == WriterMode::QuiescentControl && run_spec.publish_catalog
+    {
         None
+    } else {
+        let bootstrap_publisher = ShieldedCatalogPublisher::open(
+            &paths.catalog_dir,
+            &paths.publisher_priv_key,
+            BlockHeight::new(1),
+            config.segment_blocks,
+        )
+        .map_err(|source| BenchError::io(&paths.catalog_dir, source))?;
+        if run_spec.mode == WriterMode::IngestProjectorAndPublisher {
+            Some(bootstrap_publisher)
+        } else {
+            drop(bootstrap_publisher);
+            None
+        }
     };
 
     let reader_pool = ReaderSecondaryPool::open(&paths, chain)?;
-    let initial_reader = reader_pool.capture_slot().capture();
-    let initial_epoch = initial_reader.chain_epoch();
+    let initial_epoch = reader_pool.slot.capture().chain_epoch();
     let initial_tip = initial_epoch.visible_tip_height.value();
 
     let history = Arc::new(
@@ -322,9 +419,9 @@ async fn bootstrap_mode_runtime(
     .await?;
     let channel = connect_channel(server_addr).await?;
 
-    let signals = FleetSignals::new(initial_tip);
+    let signals = FleetSignals::new(initial_tip, initial_epoch.id.value());
     let fleet_spec = ReaderFleetSpec {
-        mode,
+        mode: run_spec.mode,
         base_tip_height: config.base_blocks,
         final_tip_height: chain.final_tip_height.value(),
         reorg_window_blocks: config.reorg_window_blocks,
@@ -351,27 +448,36 @@ async fn bootstrap_mode_runtime(
     })
 }
 
-async fn run_single_mode(
-    mode: WriterMode,
+async fn shutdown_mode_runtime(
+    server_shutdown: oneshot::Sender<()>,
+    server_task: JoinHandle<()>,
+    reader_pool: Arc<ReaderSecondaryPool>,
+) {
+    let _ = server_shutdown.send(());
+    let _ = server_task.await;
+    drop(reader_pool);
+}
+
+async fn run_mode_workload(
+    run_spec: ModeRunSpec,
     config: &ActiveWriterPublicationConfig,
     chain: &GeneratedChain,
-    template: &TemplateStores,
-) -> Result<(ModeReport, ModeParityDigests), BenchError> {
-    let boot = bootstrap_mode_runtime(mode, config, chain, template).await?;
-    let workload_started = Instant::now();
+    boot: &mut ModeRuntimeBootstrap,
+) -> Result<(ActiveOutcome, ReaderFleetOutput), BenchError> {
     let fleet_handle = spawn_reader_fleet(
         boot.channel.clone(),
-        boot.fleet_spec,
+        boot.fleet_spec.clone(),
         Arc::clone(&boot.signals),
         Arc::clone(&boot.mempool),
+        Arc::clone(&boot.history),
     );
-
-    let active_outcome = if mode == WriterMode::QuiescentControl {
-        drop(boot.publisher_opt);
+    let publisher = boot.publisher_opt.take();
+    let active_outcome = if run_spec.mode == WriterMode::QuiescentControl {
+        drop(publisher);
         ActiveOutcome::default()
     } else {
-        drive_active_pipelines(
-            mode,
+        match drive_active_pipelines(
+            run_spec.mode,
             config,
             chain,
             &boot.paths,
@@ -381,34 +487,63 @@ async fn run_single_mode(
                 mempool: &boot.mempool,
                 tip_watcher_tx: &boot.tip_watcher_tx,
                 signals: &boot.signals,
-                publisher: boot.publisher_opt,
+                publisher,
             },
         )
-        .await?
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                boot.signals.writer_done.store(true, Ordering::Release);
+                fleet_handle.abort();
+                let _ = fleet_handle.await;
+                return Err(err);
+            }
+        }
     };
 
     boot.signals.writer_done.store(true, Ordering::Release);
     let fleet_output = fleet_handle
         .await
         .map_err(|err| BenchError::canonical_read(err.to_string()))??;
+    Ok((active_outcome, fleet_output))
+}
+
+async fn run_single_mode(
+    run_spec: ModeRunSpec,
+    config: &ActiveWriterPublicationConfig,
+    chain: &GeneratedChain,
+    template: &TemplateStores,
+) -> Result<(ModeReport, ModeParityDigests), BenchError> {
+    let mut boot = bootstrap_mode_runtime(run_spec, config, chain, template).await?;
+    let workload_started = Instant::now();
+    let workload_res = run_mode_workload(run_spec, config, chain, &mut boot).await;
+    let (active_outcome, fleet_output) = match workload_res {
+        Ok(outputs) => outputs,
+        Err(err) => {
+            shutdown_mode_runtime(boot.server_shutdown, boot.server_task, boot.reader_pool).await;
+            return Err(err);
+        }
+    };
     let workload_duration_ms = workload_started.elapsed().as_secs_f64() * 1_000.0;
 
-    let parity = collect_final_tip_parity(
+    let parity_res = collect_final_tip_parity(
         boot.channel,
-        mode,
-        config.base_blocks,
-        chain.final_tip_height.value(),
-        boot.boundary_height,
+        &ParityProbeRequest {
+            mode: run_spec.mode,
+            label: run_spec.label,
+            base_tip_height: config.base_blocks,
+            final_tip_height: chain.final_tip_height.value(),
+            segment_boundary_height: boot.boundary_height,
+        },
     )
-    .await?;
-
+    .await;
     let (reader_io_modes, reader_secondary_delta) = boot.reader_pool.collect_metrics();
-    let _ = boot.server_shutdown.send(());
-    let _ = boot.server_task.await;
-    drop(boot.reader_pool);
+    shutdown_mode_runtime(boot.server_shutdown, boot.server_task, boot.reader_pool).await;
+    let parity = parity_res?;
 
     let report = assemble_mode_report(ModeReportAssembly {
-        mode,
+        mode: run_spec.mode,
         workload_duration_ms,
         reader_io_modes,
         reader_delta: reader_secondary_delta,
@@ -478,6 +613,88 @@ fn open_active_canonical_store(
     Ok((canonical_store, canonical_io_mode, Arc::new(activations)))
 }
 
+async fn cancel_and_drain_active(
+    handles: ActiveHandles,
+    writer_finished: &AtomicBool,
+    commit_wake: &Notify,
+) {
+    handles.cancel.cancel();
+    writer_finished.store(true, Ordering::Release);
+    commit_wake.notify_waiters();
+    let _ = handles.reader_task.await;
+    if let Some(handle) = handles.projector_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = handles.publisher_handle {
+        let _ = handle.await;
+    }
+}
+
+async fn spawn_active_background_tasks(
+    mode: WriterMode,
+    chain: &GeneratedChain,
+    paths: &ModePaths,
+    canonical_io_mode: String,
+    shared: PipelineShared<'_>,
+) -> Result<(ActiveHandles, Arc<Notify>, Arc<AtomicBool>), BenchError> {
+    let cancel = CancellationToken::new();
+    let commit_wake = Arc::new(Notify::new());
+    let writer_finished = Arc::new(AtomicBool::new(false));
+    let reader_task = spawn_reader_catchup_loop(ReaderCatchupInputs {
+        pool: Arc::clone(shared.reader_pool),
+        commit_wake: Arc::clone(&commit_wake),
+        writer_finished: Arc::clone(&writer_finished),
+        cancel: cancel.clone(),
+        signals: Arc::clone(shared.signals),
+        mempool: Arc::clone(shared.mempool),
+        tip_watcher_tx: shared.tip_watcher_tx.clone(),
+        final_tip_height: chain.final_tip_height,
+    });
+    let mut handles = ActiveHandles {
+        canonical_io_mode,
+        reader_task,
+        projector_handle: None,
+        publisher_handle: None,
+        cancel: cancel.clone(),
+    };
+
+    let init_res: Result<(), BenchError> = (|| {
+        if matches!(
+            mode,
+            WriterMode::IngestAndProjector | WriterMode::IngestProjectorAndPublisher
+        ) {
+            handles.projector_handle = Some(spawn_projector_loop(
+                paths,
+                chain,
+                Arc::clone(&commit_wake),
+                Arc::clone(&writer_finished),
+                cancel.clone(),
+            )?);
+        }
+        if let Some(publisher) = shared.publisher {
+            handles.publisher_handle = Some(spawn_publisher_loop(
+                paths,
+                chain,
+                publisher,
+                PublisherLoopSync {
+                    reader_slot: shared.reader_pool.capture_slot(),
+                    history: Arc::clone(shared.history),
+                    commit_wake: Arc::clone(&commit_wake),
+                    writer_finished: Arc::clone(&writer_finished),
+                    cancel,
+                },
+            )?);
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = init_res {
+        cancel_and_drain_active(handles, &writer_finished, &commit_wake).await;
+        return Err(err);
+    }
+    Ok((handles, commit_wake, writer_finished))
+}
+
 async fn drive_active_pipelines(
     mode: WriterMode,
     config: &ActiveWriterPublicationConfig,
@@ -488,53 +705,11 @@ async fn drive_active_pipelines(
     let source = AdvancingChainSource::new(chain, chain.base_tip_height);
     let (canonical_store, canonical_io_mode, activations) =
         open_active_canonical_store(paths, chain)?;
+    let signals = Arc::clone(shared.signals);
+    let (handles, commit_wake, writer_finished) =
+        spawn_active_background_tasks(mode, chain, paths, canonical_io_mode, shared).await?;
 
-    let cancel = CancellationToken::new();
-    let commit_wake = Arc::new(Notify::new());
-    let writer_finished = Arc::new(AtomicBool::new(false));
-    let reader_task = spawn_reader_catchup_loop(ReaderCatchupInputs {
-        pool: Arc::clone(shared.reader_pool),
-        commit_wake: Arc::clone(&commit_wake),
-        writer_finished: Arc::clone(&writer_finished),
-        signals: Arc::clone(shared.signals),
-        mempool: Arc::clone(shared.mempool),
-        tip_watcher_tx: shared.tip_watcher_tx.clone(),
-        final_tip_height: chain.final_tip_height,
-    });
-
-    let projector_handle = matches!(
-        mode,
-        WriterMode::IngestAndProjector | WriterMode::IngestProjectorAndPublisher
-    )
-    .then(|| {
-        spawn_projector_loop(
-            paths,
-            chain,
-            Arc::clone(&commit_wake),
-            Arc::clone(&writer_finished),
-        )
-    })
-    .transpose()?;
-
-    let publisher_handle = shared
-        .publisher
-        .map(|publisher| {
-            spawn_publisher_loop(
-                paths,
-                chain,
-                publisher,
-                PublisherLoopSync {
-                    reader_slot: shared.reader_pool.capture_slot(),
-                    history: Arc::clone(shared.history),
-                    commit_wake: Arc::clone(&commit_wake),
-                    writer_finished: Arc::clone(&writer_finished),
-                    cancel: cancel.clone(),
-                },
-            )
-        })
-        .transpose()?;
-
-    let writer_output = run_writer_thread(
+    let writer_outcome = run_writer_thread(
         canonical_store,
         source.clone(),
         activations,
@@ -542,22 +717,24 @@ async fn drive_active_pipelines(
             start_height: chain.base_tip_height.value().saturating_add(1),
             end_height: chain.final_tip_height.value(),
             commit_interval: config.commit_interval,
-            signals: Arc::clone(shared.signals),
+            signals,
             commit_wake: Arc::clone(&commit_wake),
         },
     )
-    .await?;
+    .await;
 
-    writer_finished.store(true, Ordering::Release);
-    commit_wake.notify_waiters();
-
-    let handles = ActiveHandles {
-        canonical_io_mode,
-        reader_task,
-        projector_handle,
-        publisher_handle,
-        cancel,
+    let writer_output = match writer_outcome {
+        Ok(output) => {
+            writer_finished.store(true, Ordering::Release);
+            commit_wake.notify_waiters();
+            output
+        }
+        Err(err) => {
+            cancel_and_drain_active(handles, &writer_finished, &commit_wake).await;
+            return Err(err);
+        }
     };
+
     finalize_active_outcome(handles, writer_output, source.rpc_counts()).await
 }
 
@@ -566,29 +743,33 @@ async fn finalize_active_outcome(
     writer_output: WriterThreadOutput,
     node_rpcs: super::report::NodeRpcCounts,
 ) -> Result<ActiveOutcome, BenchError> {
-    handles
-        .reader_task
-        .await
-        .map_err(|err| BenchError::tip_replay(err.to_string()))??;
-
-    let projector_out = match handles.projector_handle {
-        Some(handle) => Some(
-            handle
-                .await
-                .map_err(|err| BenchError::tip_replay(err.to_string()))??,
-        ),
+    let reader_outcome = handles.reader_task.await;
+    if reader_outcome.as_ref().is_err() || reader_outcome.as_ref().is_ok_and(Result::is_err) {
+        handles.cancel.cancel();
+    }
+    let projector_outcome = match handles.projector_handle {
+        Some(handle) => Some(handle.await),
         None => None,
     };
-
-    let publisher_out = match handles.publisher_handle {
-        Some(handle) => Some(
-            handle
-                .await
-                .map_err(|err| BenchError::tip_replay(err.to_string()))??,
-        ),
+    if projector_outcome
+        .as_ref()
+        .is_some_and(|res| res.is_err() || res.as_ref().is_err())
+    {
+        handles.cancel.cancel();
+    }
+    let publisher_outcome = match handles.publisher_handle {
+        Some(handle) => Some(handle.await),
         None => None,
     };
     handles.cancel.cancel();
+
+    reader_outcome.map_err(|err| BenchError::tip_replay(err.to_string()))??;
+    let projector_out = projector_outcome
+        .map(|res| res.map_err(|err| BenchError::tip_replay(err.to_string()))?)
+        .transpose()?;
+    let publisher_out = publisher_outcome
+        .map(|res| res.map_err(|err| BenchError::tip_replay(err.to_string()))?)
+        .transpose()?;
 
     Ok(ActiveOutcome {
         canonical_io_mode: Some(handles.canonical_io_mode),
@@ -702,6 +883,7 @@ fn spawn_projector_loop(
     chain: &GeneratedChain,
     commit_wake: Arc<Notify>,
     writer_finished: Arc<AtomicBool>,
+    cancel: CancellationToken,
 ) -> Result<JoinHandle<Result<ProjectorOutput, BenchError>>, BenchError> {
     let reorg_policy = CanonicalReorgPolicy::new(chain.reorg_window_blocks)?;
     let mut secondary = RocksDbCanonicalSecondary::open_ready(
@@ -726,6 +908,9 @@ fn spawn_projector_loop(
         let mut transitions = 0_u32;
 
         loop {
+            if cancel.is_cancelled() {
+                break;
+            }
             let drained = drain_projector_events(
                 &mut secondary,
                 &mut wallet,
@@ -738,10 +923,21 @@ fn spawn_projector_loop(
             if writer_finished.load(Ordering::Acquire) && wallet_height >= final_height {
                 break;
             }
+            if cancel.is_cancelled() {
+                break;
+            }
             if drained == 0 {
                 std::thread::sleep(Duration::from_millis(2));
             }
             let _ = &commit_wake;
+        }
+
+        if cancel.is_cancelled() {
+            drop(wallet);
+            drop(secondary);
+            return Err(BenchError::tip_replay(
+                "projector cancelled after upstream pipeline abort",
+            ));
         }
 
         let delta = capture_wallet_tickers(&wallet).delta_since(&before);
@@ -818,65 +1014,83 @@ struct PublisherOutput {
     delta: StoreTickerDelta,
 }
 
+struct PublisherStepInput {
+    secondary: RocksDbCanonicalSecondary,
+    publisher: ShieldedCatalogPublisher,
+    catalog_label: String,
+}
+
 struct PublisherStepOutcome {
     secondary: RocksDbCanonicalSecondary,
     publisher: ShieldedCatalogPublisher,
+    settled_tip: BlockHeight,
     elapsed: Option<Duration>,
     sealed: usize,
-    refreshed: bool,
 }
 
-async fn step_publisher_once(
-    secondary: RocksDbCanonicalSecondary,
-    mut publisher: ShieldedCatalogPublisher,
-    sync: &PublisherLoopSync,
+async fn run_publisher_blocking_step(
+    input: PublisherStepInput,
 ) -> Result<PublisherStepOutcome, BenchError> {
-    let canonical_reader = RocksDbCanonicalReader::new(secondary)
-        .map_err(|err| BenchError::canonical_read(err.to_string()))?;
-    let concurrency = PublicationConcurrency {
-        workers: NonZeroUsize::MIN,
-        commit_batch: NonZeroUsize::MIN,
-    };
-    let started = Instant::now();
-    let (published_now, returned_reader, returned_publisher) =
-        tokio::task::spawn_blocking(move || {
-            let sealed_outcome = publisher.publish_available(
-                &canonical_reader,
-                concurrency,
-                &CancellationToken::new(),
-            );
-            (sealed_outcome, canonical_reader, publisher)
-        })
-        .await
-        .map_err(|err| BenchError::tip_replay(err.to_string()))?;
-
-    let recovered_sec = returned_reader
-        .into_secondary()
-        .map_err(|_| BenchError::tip_replay("publisher secondary held unexpectedly"))?;
-    let sealed = published_now.map_err(|err| BenchError::io(paths_catalog_label(sync), err))?;
-    if sealed == 0 {
-        return Ok(PublisherStepOutcome {
+    tokio::task::spawn_blocking(move || {
+        let PublisherStepInput {
+            mut secondary,
+            mut publisher,
+            catalog_label,
+        } = input;
+        secondary.try_catch_up()?;
+        let settled_tip = secondary.chain_epoch()?.settled_tip_height;
+        let canonical_reader = RocksDbCanonicalReader::new(secondary)
+            .map_err(|err| BenchError::canonical_read(err.to_string()))?;
+        let concurrency = PublicationConcurrency {
+            workers: NonZeroUsize::MIN,
+            commit_batch: NonZeroUsize::MIN,
+        };
+        let started = Instant::now();
+        let sealed_outcome =
+            publisher.publish_available(&canonical_reader, concurrency, &CancellationToken::new());
+        let recovered_sec = canonical_reader
+            .into_secondary()
+            .map_err(|_| BenchError::tip_replay("publisher secondary held unexpectedly"))?;
+        let sealed = sealed_outcome.map_err(|err| BenchError::io(&catalog_label, err))?;
+        let elapsed = (sealed > 0).then(|| started.elapsed());
+        Ok(PublisherStepOutcome {
             secondary: recovered_sec,
-            publisher: returned_publisher,
-            elapsed: None,
-            sealed: 0,
-            refreshed: false,
-        });
-    }
+            publisher,
+            settled_tip,
+            elapsed,
+            sealed,
+        })
+    })
+    .await
+    .map_err(|err| BenchError::tip_replay(err.to_string()))?
+}
 
-    let elapsed = started.elapsed();
-    let refreshed = sync
+async fn refresh_pending_catalog(
+    sync: &PublisherLoopSync,
+    precondition_retries: &mut u32,
+    refreshes: &mut u64,
+) -> Result<bool, BenchError> {
+    match sync
         .history
         .refresh_captured(|| CapturedCanonical(sync.reader_slot.capture()))
         .await
-        .map_err(|status| BenchError::canonical_read(status.to_string()))?;
-    Ok(PublisherStepOutcome {
-        secondary: recovered_sec,
-        publisher: returned_publisher,
-        elapsed: Some(elapsed),
-        sealed,
-        refreshed,
-    })
+    {
+        Ok(swapped) => {
+            *precondition_retries = 0;
+            if swapped {
+                *refreshes = refreshes.saturating_add(1);
+            }
+            Ok(false)
+        }
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            *precondition_retries = precondition_retries.saturating_add(1);
+            if *precondition_retries >= MAX_CATALOG_REFRESH_RETRIES {
+                return Err(BenchError::canonical_read(status.to_string()));
+            }
+            Ok(true)
+        }
+        Err(status) => Err(BenchError::canonical_read(status.to_string())),
+    }
 }
 
 async fn run_publisher_task(
@@ -891,34 +1105,52 @@ async fn run_publisher_task(
     let mut publish_durations = Vec::new();
     let mut total_published = 0_usize;
     let mut refreshes = 0_u64;
+    let mut pending_refresh = false;
+    let mut precondition_retries = 0_u32;
 
     loop {
-        active_sec.try_catch_up()?;
-        let settled_tip = active_sec.chain_epoch()?.settled_tip_height;
-        let step = step_publisher_once(active_sec, publisher, &sync).await?;
+        if sync.cancel.is_cancelled() {
+            break;
+        }
+        let step = run_publisher_blocking_step(PublisherStepInput {
+            secondary: active_sec,
+            publisher,
+            catalog_label: paths_catalog_label(&sync),
+        })
+        .await?;
         active_sec = step.secondary;
         publisher = step.publisher;
 
         if let Some(elapsed) = step.elapsed {
             publish_durations.push(elapsed);
             total_published = total_published.saturating_add(step.sealed);
-            if step.refreshed {
-                refreshes = refreshes.saturating_add(1);
-            }
+            pending_refresh = true;
+        }
+        if pending_refresh {
+            pending_refresh =
+                refresh_pending_catalog(&sync, &mut precondition_retries, &mut refreshes).await?;
         }
 
-        if sync.writer_finished.load(Ordering::Acquire) && settled_tip >= final_settled_height {
+        if !pending_refresh
+            && sync.writer_finished.load(Ordering::Acquire)
+            && step.settled_tip >= final_settled_height
+        {
             break;
         }
         tokio::select! {
             () = sync.commit_wake.notified() => {}
-            () = tokio::time::sleep(Duration::from_millis(3)) => {}
+            () = tokio::time::sleep(Duration::from_millis(2)) => {}
             () = sync.cancel.cancelled() => break,
         }
     }
 
-    let delta = capture_secondary_tickers(&active_sec).delta_since(&before);
-    drop(active_sec);
+    let delta = tokio::task::spawn_blocking(move || {
+        let delta = capture_secondary_tickers(&active_sec).delta_since(&before);
+        drop(active_sec);
+        delta
+    })
+    .await
+    .map_err(|err| BenchError::tip_replay(err.to_string()))?;
     let total_ms = publish_durations
         .iter()
         .map(|dur| dur.as_secs_f64() * 1_000.0)
@@ -1018,7 +1250,14 @@ impl ReaderSecondaryPool {
         self.slot.clone()
     }
 
-    fn try_catch_up_and_publish(&self) -> Result<(u32, ChainEpoch), BenchError> {
+    async fn try_catch_up_and_publish(self: &Arc<Self>) -> Result<(u32, ChainEpoch), BenchError> {
+        let pool = Arc::clone(self);
+        tokio::task::spawn_blocking(move || pool.try_catch_up_and_publish_blocking())
+            .await
+            .map_err(|err| BenchError::tip_replay(err.to_string()))?
+    }
+
+    fn try_catch_up_and_publish_blocking(&self) -> Result<(u32, ChainEpoch), BenchError> {
         self.reclaim_retired();
         let current_epoch = self.slot.capture().chain_epoch();
         let spare = self.spares.lock().pop();
@@ -1045,11 +1284,10 @@ impl ReaderSecondaryPool {
         let mut remaining = Vec::with_capacity(retired.len());
         for reader in retired.drain(..) {
             match Arc::try_unwrap(reader) {
-                Ok(sole) => {
-                    if let Ok(sec) = sole.into_secondary() {
-                        self.spares.lock().push(sec);
-                    }
-                }
+                Ok(sole) => match sole.into_secondary() {
+                    Ok(sec) => self.spares.lock().push(sec),
+                    Err(still_busy) => remaining.push(Arc::new(still_busy)),
+                },
                 Err(shared) => remaining.push(shared),
             }
         }
@@ -1058,11 +1296,10 @@ impl ReaderSecondaryPool {
 
     fn return_or_retire(&self, old_reader: Arc<RocksDbCanonicalReader>) {
         match Arc::try_unwrap(old_reader) {
-            Ok(sole) => {
-                if let Ok(sec) = sole.into_secondary() {
-                    self.spares.lock().push(sec);
-                }
-            }
+            Ok(sole) => match sole.into_secondary() {
+                Ok(sec) => self.spares.lock().push(sec),
+                Err(still_busy) => self.retired.lock().push(Arc::new(still_busy)),
+            },
             Err(shared) => self.retired.lock().push(shared),
         }
     }
@@ -1080,6 +1317,7 @@ struct ReaderCatchupInputs {
     pool: Arc<ReaderSecondaryPool>,
     commit_wake: Arc<Notify>,
     writer_finished: Arc<AtomicBool>,
+    cancel: CancellationToken,
     signals: Arc<FleetSignals>,
     mempool: Arc<BenchmarkMempoolSurface>,
     tip_watcher_tx: watch::Sender<u64>,
@@ -1089,16 +1327,27 @@ struct ReaderCatchupInputs {
 fn spawn_reader_catchup_loop(inputs: ReaderCatchupInputs) -> JoinHandle<Result<(), BenchError>> {
     tokio::spawn(async move {
         let mut last_published_tip = 0_u32;
+        let mut last_epoch_id = 0_u64;
         loop {
-            let (tip, epoch) = inputs.pool.try_catch_up_and_publish()?;
-            if tip > last_published_tip {
-                last_published_tip = tip;
+            if inputs.cancel.is_cancelled() {
+                break;
+            }
+            let (tip, epoch) = inputs.pool.try_catch_up_and_publish().await?;
+            let epoch_id = epoch.id.value();
+            if tip > last_published_tip || epoch_id > last_epoch_id {
+                last_published_tip = last_published_tip.max(tip);
+                last_epoch_id = last_epoch_id.max(epoch_id);
                 inputs
                     .signals
                     .highest_served_tip
                     .fetch_max(tip, Ordering::AcqRel);
+                inputs
+                    .signals
+                    .current_epoch_id
+                    .store(epoch_id, Ordering::Release);
+                inputs.signals.tip_published_wake.notify_waiters();
                 inputs.mempool.advance_epoch(epoch);
-                inputs.tip_watcher_tx.send_replace(epoch.id.value());
+                inputs.tip_watcher_tx.send_replace(epoch_id);
             }
             if inputs.writer_finished.load(Ordering::Acquire)
                 && tip >= inputs.final_tip_height.value()
@@ -1108,6 +1357,7 @@ fn spawn_reader_catchup_loop(inputs: ReaderCatchupInputs) -> JoinHandle<Result<(
             tokio::select! {
                 () = inputs.commit_wake.notified() => {}
                 () = tokio::time::sleep(Duration::from_millis(2)) => {}
+                () = inputs.cancel.cancelled() => break,
             }
         }
         Ok(())
@@ -1123,6 +1373,7 @@ async fn pre_advance_quiescent_stores(
     paths: &ModePaths,
     config: &ActiveWriterPublicationConfig,
     chain: &GeneratedChain,
+    publish_catalog: bool,
 ) -> Result<(), BenchError> {
     let reorg_policy = CanonicalReorgPolicy::new(chain.reorg_window_blocks)?;
     let source = AdvancingChainSource::new(chain, chain.final_tip_height);
@@ -1176,6 +1427,19 @@ async fn pre_advance_quiescent_stores(
     )?;
     drop(wallet);
 
+    if publish_catalog {
+        publish_quiescent_catalog(paths, config, secondary)?;
+    } else {
+        drop(secondary);
+    }
+    Ok(())
+}
+
+fn publish_quiescent_catalog(
+    paths: &ModePaths,
+    config: &ActiveWriterPublicationConfig,
+    secondary: RocksDbCanonicalSecondary,
+) -> Result<(), BenchError> {
     let canonical_reader = RocksDbCanonicalReader::new(secondary)
         .map_err(|err| BenchError::canonical_read(err.to_string()))?;
     let mut publisher = ShieldedCatalogPublisher::open(
@@ -1451,5 +1715,36 @@ impl metrics::Recorder for FollowStepRecorder {
             kind,
             samples: Arc::clone(&self.samples),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::{ActiveWriterPublicationConfig, validate_config};
+
+    #[test]
+    fn validate_config_rejects_short_live_window_before_segment_seal() {
+        let config = ActiveWriterPublicationConfig {
+            base_blocks: 4_092,
+            live_blocks: 6,
+            reorg_window_blocks: 4,
+            segment_blocks: NonZeroU32::new(4_096).unwrap_or(NonZeroU32::MIN),
+            ..ActiveWriterPublicationConfig::default()
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_zero_reorg_window() {
+        let config = ActiveWriterPublicationConfig {
+            base_blocks: 60,
+            live_blocks: 12,
+            reorg_window_blocks: 0,
+            segment_blocks: NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+            ..ActiveWriterPublicationConfig::default()
+        };
+        assert!(validate_config(&config).is_err());
     }
 }

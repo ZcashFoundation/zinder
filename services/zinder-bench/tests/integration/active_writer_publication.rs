@@ -8,7 +8,8 @@ use std::{num::NonZeroU32, time::Duration};
 use eyre::Result;
 use zinder_bench::active_writer_publication::{
     ACTIVE_WRITER_PUBLICATION_CONTRACT, ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION,
-    ActiveWriterPublicationConfig, ModeReport, WriterMode, run_active_writer_publication,
+    ActiveWriterPublicationConfig, ModeDifferential, ModeReport, WriterMode,
+    run_active_writer_publication,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -38,22 +39,41 @@ async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary
     assert!(report.workload.dense_block_count > 0);
     assert_eq!(report.modes.len(), 4);
     assert_eq!(report.differentials_vs_quiescent.len(), 3);
+    assert_eq!(
+        report.published_quiescent_control.mode,
+        WriterMode::QuiescentControl
+    );
     assert!(
         report.byte_parity.all_matched,
         "byte parity mismatches: {:?}",
         report.byte_parity.mismatches
     );
 
+    assert_differential_baselines(&report.differentials_vs_quiescent);
+    assert_mode_report_invariants(&report.published_quiescent_control, &config)?;
     for mode_report in &report.modes {
         assert_mode_report_invariants(mode_report, &config)?;
     }
     Ok(())
 }
 
-fn assert_mode_report_invariants(
-    mode_report: &ModeReport,
-    config: &ActiveWriterPublicationConfig,
-) -> Result<()> {
+fn assert_differential_baselines(differentials: &[ModeDifferential]) {
+    for diff in differentials {
+        match diff.mode {
+            WriterMode::IngestActive | WriterMode::IngestAndProjector => {
+                assert_eq!(diff.baseline_label, "quiescent_control");
+                assert!(!diff.baseline_catalog_published);
+            }
+            WriterMode::IngestProjectorAndPublisher => {
+                assert_eq!(diff.baseline_label, "published_quiescent_control");
+                assert!(diff.baseline_catalog_published);
+            }
+            WriterMode::QuiescentControl => {}
+        }
+    }
+}
+
+fn assert_common_reader_invariants(mode_report: &ModeReport) {
     assert_eq!(
         mode_report.errors.unexpected_grpc_errors, 0,
         "unexpected grpc errors in {:?}: {:?}",
@@ -77,8 +97,18 @@ fn assert_mode_report_invariants(
             .samples
             > 0
     );
+    assert!(mode_report.tail_refill.encoded_tail_cache_fills > 0);
+    assert!(mode_report.tail_refill.encoded_tail_cache_hits > 0);
     assert!(mode_report.slow_boundary_range.completion_ms.samples > 0);
     assert!(mode_report.tree_state_ms.samples > 0);
+}
+
+fn assert_mode_report_invariants(
+    mode_report: &ModeReport,
+    config: &ActiveWriterPublicationConfig,
+) -> Result<()> {
+    assert_common_reader_invariants(mode_report);
+    let expected_live = usize::try_from(config.live_blocks)?;
 
     match mode_report.mode {
         WriterMode::QuiescentControl => {
@@ -88,20 +118,15 @@ fn assert_mode_report_invariants(
         }
         WriterMode::IngestActive => {
             assert_eq!(mode_report.ingest.blocks_committed, config.live_blocks);
-            assert_eq!(
-                mode_report.ingest.live_prepare_ms.samples,
-                usize::try_from(config.live_blocks)?
-            );
-            assert_eq!(
-                mode_report.ingest.live_commit_ms.samples,
-                usize::try_from(config.live_blocks)?
-            );
-            assert!(mode_report.commit_to_served_tip_ms.samples > 0);
+            assert_eq!(mode_report.ingest.live_prepare_ms.samples, expected_live);
+            assert_eq!(mode_report.ingest.live_commit_ms.samples, expected_live);
+            assert_eq!(mode_report.commit_to_served_tip_ms.samples, expected_live);
             assert!(mode_report.writer_fsyncs.canonical_wal_synced > 0);
             assert!(mode_report.node_rpcs.total > 0);
         }
         WriterMode::IngestAndProjector => {
             assert_eq!(mode_report.ingest.blocks_committed, config.live_blocks);
+            assert_eq!(mode_report.commit_to_served_tip_ms.samples, expected_live);
             assert!(mode_report.projector.transitions_applied >= config.live_blocks);
             assert!(mode_report.writer_fsyncs.canonical_wal_synced > 0);
             assert!(mode_report.writer_fsyncs.wallet_wal_synced > 0);
@@ -110,8 +135,10 @@ fn assert_mode_report_invariants(
         }
         WriterMode::IngestProjectorAndPublisher => {
             assert_eq!(mode_report.ingest.blocks_committed, config.live_blocks);
+            assert_eq!(mode_report.commit_to_served_tip_ms.samples, expected_live);
             assert!(mode_report.projector.transitions_applied >= config.live_blocks);
             assert!(mode_report.publisher.segments_published >= 1);
+            assert!(mode_report.publisher.catalog_refreshes >= 1);
             assert!(mode_report.publisher.total_ms > 0.0);
             assert!(mode_report.io_modes.publisher_secondary.is_some());
             assert!(mode_report.writer_fsyncs.canonical_wal_synced > 0);
@@ -139,6 +166,20 @@ async fn handles_slow_readers_and_mempool_churn_without_parity_loss() -> Result<
 
     let report = run_active_writer_publication(&config).await?;
     assert!(report.byte_parity.all_matched);
+    assert_eq!(
+        report
+            .published_quiescent_control
+            .errors
+            .unexpected_grpc_errors,
+        0
+    );
+    assert!(
+        report
+            .published_quiescent_control
+            .tail_refill
+            .encoded_tail_cache_fills
+            > 0
+    );
 
     for mode_report in &report.modes {
         assert_eq!(mode_report.errors.unexpected_grpc_errors, 0);

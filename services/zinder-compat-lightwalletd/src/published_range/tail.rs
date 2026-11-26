@@ -1,4 +1,11 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use arc_swap::ArcSwapOption;
 use tokio_util::sync::CancellationToken;
@@ -75,6 +82,63 @@ pub(crate) struct ShieldedTailBuffer(Arc<ShieldedTailBufferInner>);
 struct ShieldedTailBufferInner {
     current: ArcSwapOption<EncodedTail>,
     refresh_lock: tokio::sync::Mutex<()>,
+    counters: Arc<EncodedTailCounters>,
+}
+
+#[derive(Default)]
+pub(super) struct EncodedTailCounters {
+    cache_hits: AtomicU64,
+    cache_fills: AtomicU64,
+    cache_rebuilds: AtomicU64,
+    byte_capped_fills: AtomicU64,
+    byte_cap_evictions: AtomicU64,
+    peak_cached_bytes: AtomicU64,
+}
+
+impl EncodedTailCounters {
+    fn record_fill(
+        &self,
+        is_rebuild: bool,
+        retained_bytes: usize,
+        byte_capped: bool,
+        evicted_rows: u64,
+    ) {
+        self.cache_fills.fetch_add(1, Ordering::Relaxed);
+        if is_rebuild {
+            self.cache_rebuilds.fetch_add(1, Ordering::Relaxed);
+        }
+        let retained = u64::try_from(retained_bytes).unwrap_or(u64::MAX);
+        self.peak_cached_bytes
+            .fetch_max(retained, Ordering::Relaxed);
+        if byte_capped {
+            self.byte_capped_fills.fetch_add(1, Ordering::Relaxed);
+        }
+        if evicted_rows > 0 {
+            self.byte_cap_evictions
+                .fetch_add(evicted_rows, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Read-only cache and byte-cap telemetry observed on an in-memory live `EncodedTail`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EncodedTailTelemetry {
+    /// Requests satisfied directly from cached tail rows without re-encoding.
+    pub cache_hits: u64,
+    /// Tail builds or backward prepends read from canonical storage.
+    pub cache_fills: u64,
+    /// Full cold tail builds from an empty or newly-admitted generation (excludes downward prepends).
+    pub cache_rebuilds: u64,
+    /// Tail builds or prepends whose retained span reached the `64 MiB` cap.
+    pub byte_capped_fills: u64,
+    /// Cumulative rows evicted by the `64 MiB` cap during tail builds or prepends.
+    pub byte_cap_evictions: u64,
+    /// High-water mark of retained encoded-tail bytes across all builds.
+    pub peak_cached_bytes: u64,
+    /// Retained payload bytes in the currently active tail (`0` when unpopulated).
+    pub current_cached_bytes: u64,
+    /// Chain epoch ID backing the currently cached tail, if any.
+    pub current_epoch_id: Option<u64>,
 }
 
 pub(super) struct EncodedTail {
@@ -86,6 +150,7 @@ pub(super) struct EncodedTail {
     rows: VecDeque<TailRow>,
     bytes: usize,
     byte_capped: bool,
+    evicted_rows: u64,
     held: HeldBytes,
 }
 
@@ -220,8 +285,44 @@ fn payload_bytes<'a>(rows: impl IntoIterator<Item = &'a TailRow>) -> usize {
 }
 
 impl ShieldedTailBuffer {
+    pub(super) fn empty_with_counters(counters: Arc<EncodedTailCounters>) -> Self {
+        Self(Arc::new(ShieldedTailBufferInner {
+            current: ArcSwapOption::empty(),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            counters,
+        }))
+    }
+
+    pub(super) fn with_counters(&self, counters: Arc<EncodedTailCounters>) -> Self {
+        Self(Arc::new(ShieldedTailBufferInner {
+            current: ArcSwapOption::from(self.load_full()),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            counters,
+        }))
+    }
+
     pub(super) fn load_full(&self) -> Option<Arc<EncodedTail>> {
         self.0.current.load_full()
+    }
+
+    pub(super) fn telemetry(&self) -> EncodedTailTelemetry {
+        let current = self.load_full();
+        EncodedTailTelemetry {
+            cache_hits: self.0.counters.cache_hits.load(Ordering::Relaxed),
+            cache_fills: self.0.counters.cache_fills.load(Ordering::Relaxed),
+            cache_rebuilds: self.0.counters.cache_rebuilds.load(Ordering::Relaxed),
+            byte_capped_fills: self.0.counters.byte_capped_fills.load(Ordering::Relaxed),
+            byte_cap_evictions: self.0.counters.byte_cap_evictions.load(Ordering::Relaxed),
+            peak_cached_bytes: self.0.counters.peak_cached_bytes.load(Ordering::Relaxed),
+            current_cached_bytes: current
+                .as_ref()
+                .map_or(0, |tail| u64::try_from(tail.bytes).unwrap_or(u64::MAX)),
+            current_epoch_id: current.as_ref().map(|tail| tail.epoch.id.value()),
+        }
+    }
+
+    pub(super) fn clear(&self) {
+        self.0.current.store(None);
     }
 
     pub(super) fn after_published(&self, end: BlockHeight) -> Self {
@@ -229,6 +330,7 @@ impl ShieldedTailBuffer {
         Self(Arc::new(ShieldedTailBufferInner {
             current: ArcSwapOption::from(trimmed),
             refresh_lock: tokio::sync::Mutex::new(()),
+            counters: Arc::clone(&self.0.counters),
         }))
     }
 
@@ -283,6 +385,50 @@ impl ShieldedTailBuffer {
         .await
     }
 
+    async fn acquire_refresh_guard(
+        &self,
+        cancel: &CancellationToken,
+        max_wait: Duration,
+    ) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>, Status> {
+        match self.0.refresh_lock.try_lock() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(_) if max_wait.is_zero() => Ok(None),
+            Err(_) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(cancelled()),
+                acquired = tokio::time::timeout(max_wait, self.0.refresh_lock.lock()) => Ok(acquired.ok()),
+            },
+        }
+    }
+
+    async fn install_refreshed_tail<Source: TailSource>(
+        &self,
+        source: &Source,
+        previous: Option<Arc<EncodedTail>>,
+        (next_tail, is_rebuild): (Option<Arc<EncodedTail>>, bool),
+        visible_tip_height: BlockHeight,
+    ) -> Option<Arc<EncodedTail>> {
+        let next_tail = next_tail?;
+        self.0.counters.record_fill(
+            is_rebuild,
+            next_tail.bytes,
+            next_tail.byte_capped,
+            next_tail.evicted_rows,
+        );
+        // Rows that stop below the tip, or were built for a view that stopped
+        // being current during the build, serve this request only.
+        if next_tail
+            .bounds()
+            .is_some_and(|bounds| bounds.end == visible_tip_height)
+            && source.is_current().await
+        {
+            self.0
+                .current
+                .compare_and_swap(&previous, Some(next_tail.clone()));
+        }
+        Some(next_tail)
+    }
+
     async fn refresh<Source: TailSource>(
         &self,
         source: &Source,
@@ -306,6 +452,7 @@ impl ShieldedTailBuffer {
             .as_ref()
             .filter(|tail| tail.satisfies(source, requested_floor))
         {
+            self.0.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(existing.clone()));
         }
         if !fills(existing.as_deref(), source, requested) {
@@ -318,23 +465,15 @@ impl ShieldedTailBuffer {
             return Ok(None);
         }
         check_cancel(source)?;
-        let _guard = match self.0.refresh_lock.try_lock() {
-            Ok(guard) => guard,
-            Err(_) if max_wait.is_zero() => return Ok(None),
-            Err(_) => tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(cancelled()),
-                acquired = tokio::time::timeout(max_wait, self.0.refresh_lock.lock()) => match acquired {
-                    Ok(guard) => guard,
-                    Err(_) => return Ok(None),
-                },
-            },
+        let Some(_guard) = self.acquire_refresh_guard(cancel, max_wait).await? else {
+            return Ok(None);
         };
         check_cancel(source)?;
         let previous = self.load_full();
         if let Some(existing) = &previous
             && existing.satisfies(source, requested_floor)
         {
+            self.0.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(existing.clone()));
         }
         // The view may have changed while this miss waited for the lock.
@@ -347,34 +486,31 @@ impl ShieldedTailBuffer {
         }
         // Another generation's rows are never reused: two admitted stores can
         // share block hashes while holding different compact bytes.
-        let updated = match &previous {
-            Some(existing) if existing.serves(source) => {
-                prepend_missing(source, existing, requested_floor, max_tail_bytes, catalog).await?
-            }
-            _ => build(
+        let (updated, is_rebuild) = match &previous {
+            Some(existing) if existing.serves(source) => (
+                prepend_missing(source, existing, requested_floor, max_tail_bytes, catalog).await?,
+                false,
+            ),
+            _ => (
+                build(
+                    source,
+                    BlockHeightRange::inclusive(requested_floor, epoch.visible_tip_height),
+                    max_tail_bytes,
+                    catalog,
+                )
+                .await?
+                .map(Arc::new),
+                true,
+            ),
+        };
+        Ok(self
+            .install_refreshed_tail(
                 source,
-                BlockHeightRange::inclusive(requested_floor, epoch.visible_tip_height),
-                max_tail_bytes,
-                catalog,
+                previous,
+                (updated, is_rebuild),
+                epoch.visible_tip_height,
             )
-            .await?
-            .map(Arc::new),
-        };
-        let Some(next_tail) = updated else {
-            return Ok(None);
-        };
-        // Rows that stop below the tip, or were built for a view that stopped
-        // being current during the build, serve this request only.
-        if next_tail
-            .bounds()
-            .is_some_and(|bounds| bounds.end == epoch.visible_tip_height)
-            && source.is_current().await
-        {
-            self.0
-                .current
-                .compare_and_swap(&previous, Some(next_tail.clone()));
-        }
-        Ok(Some(next_tail))
+            .await)
     }
 }
 
@@ -404,7 +540,7 @@ impl EncodedTail {
             return self;
         }
         let rows: VecDeque<_> = self.rows.range(covered..).cloned().collect();
-        Arc::new(self.with_rows(rows, false, self.held))
+        Arc::new(self.with_rows(rows, false, self.held, 0))
     }
 
     pub(super) fn bounds(&self) -> Option<BlockHeightRange> {
@@ -428,13 +564,20 @@ impl EncodedTail {
                     .is_some_and(|bounds| bounds.start <= requested_floor))
     }
 
-    fn with_rows(&self, rows: VecDeque<TailRow>, byte_capped: bool, held: HeldBytes) -> Self {
+    fn with_rows(
+        &self,
+        rows: VecDeque<TailRow>,
+        byte_capped: bool,
+        held: HeldBytes,
+        evicted_rows: u64,
+    ) -> Self {
         Self {
             epoch: self.epoch,
             fence: self.fence,
             source: self.source.clone(),
             bytes: payload_bytes(&rows),
             byte_capped,
+            evicted_rows,
             rows,
             held,
         }
@@ -586,6 +729,7 @@ impl EncodedTail {
             if let Some(evicted) = self.rows.pop_front() {
                 self.bytes -= evicted.payload_len();
                 self.byte_capped = true;
+                self.evicted_rows = self.evicted_rows.saturating_add(1);
             }
         }
         if self.bytes > max_tail_bytes {
@@ -609,6 +753,7 @@ async fn build<Source: TailSource>(
         source: source.source().clone(),
         bytes: 0,
         byte_capped: false,
+        evicted_rows: 0,
         rows: VecDeque::new(),
         held: HeldBytes::default(),
     };
@@ -681,6 +826,7 @@ struct PrependWindow {
     /// The last row read, which must link to the rows above the batch.
     top: Option<(BlockId, BlockHash)>,
     dropped: bool,
+    dropped_rows: u64,
 }
 
 impl PrependWindow {
@@ -694,6 +840,7 @@ impl PrependWindow {
             };
             self.bytes -= evicted.payload_len();
             self.dropped = true;
+            self.dropped_rows = self.dropped_rows.saturating_add(1);
         }
     }
 }
@@ -712,6 +859,7 @@ async fn read_prepend_batches<Source: TailSource>(
     let mut expected_parent = existing.rows.front().map(|row| row.parent);
     let mut byte_capped =
         existing.byte_capped || (remaining_bytes == 0 && cursor >= target_floor.value());
+    let mut evicted_rows = 0_u64;
     while cursor >= target_floor.value() && remaining_bytes > 0 {
         check_cancel(source)?;
         let batch_start = cursor
@@ -725,6 +873,7 @@ async fn read_prepend_batches<Source: TailSource>(
             budget: remaining_bytes,
             top: None,
             dropped: false,
+            dropped_rows: 0,
         };
         let retained = existing.bytes + kept_bytes;
         let mut keep = |chunk: Vec<TailRow>| {
@@ -748,6 +897,7 @@ async fn read_prepend_batches<Source: TailSource>(
             return Err(Status::data_loss("discontinuous canonical tail"));
         }
         byte_capped |= window.dropped;
+        evicted_rows = evicted_rows.saturating_add(window.dropped_rows);
         let Some(front) = window.rows.front() else {
             break;
         };
@@ -768,7 +918,12 @@ async fn read_prepend_batches<Source: TailSource>(
         rows.extend(batch);
     }
     rows.extend(existing.rows.iter().cloned());
-    Ok(Some(Arc::new(existing.with_rows(rows, byte_capped, held))))
+    Ok(Some(Arc::new(existing.with_rows(
+        rows,
+        byte_capped,
+        held,
+        evicted_rows,
+    ))))
 }
 
 enum SpanEnd {
@@ -2115,6 +2270,53 @@ mod tests {
         faulty.blocks[60] = mock_block(60, 7, 60);
         let (frames, ending) = tail_fault_outcome(faulty).await?;
         assert_eq!((frames.len(), ending), (60, None));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telemetry_tracks_hits_fills_and_byte_cap_evictions() -> eyre::Result<()> {
+        let buffer = ShieldedTailBuffer::default();
+        let source = build_source(10, 1);
+
+        let initial = buffer.telemetry();
+        assert_eq!(initial, super::EncodedTailTelemetry::default());
+
+        let first = fill(&buffer, &source, span(8, 10), TAIL_BYTES).await?;
+        let after_first = buffer.telemetry();
+        assert_eq!(after_first.cache_fills, 1);
+        assert_eq!(after_first.cache_rebuilds, 1);
+        assert_eq!(after_first.cache_hits, 0);
+        assert_eq!(after_first.byte_capped_fills, 0);
+        assert_eq!(after_first.byte_cap_evictions, 0);
+        assert_eq!(
+            after_first.current_cached_bytes,
+            u64::try_from(first.bytes)?
+        );
+        assert_eq!(after_first.current_epoch_id, Some(first.epoch.id.value()));
+
+        let _repeat = fill(&buffer, &source, span(8, 10), TAIL_BYTES).await?;
+        let after_hit = buffer.telemetry();
+        assert_eq!(after_hit.cache_hits, 1);
+        assert_eq!(after_hit.cache_fills, 1);
+        assert_eq!(after_hit.cache_rebuilds, 1);
+
+        let _prepend = fill(&buffer, &source, span(6, 10), TAIL_BYTES).await?;
+        let after_prepend = buffer.telemetry();
+        assert_eq!(after_prepend.cache_fills, 2);
+        assert_eq!(after_prepend.cache_rebuilds, 1);
+
+        buffer.clear();
+        let after_clear = buffer.telemetry();
+        assert_eq!(after_clear.current_cached_bytes, 0);
+        assert_eq!(after_clear.current_epoch_id, None);
+        assert_eq!(after_clear.cache_fills, after_prepend.cache_fills);
+
+        let row_bytes = first.rows[0].payload_len();
+        let _capped = fill(&buffer, &source, span(1, 10), row_bytes * 2).await?;
+        let after_capped = buffer.telemetry();
+        assert!(after_capped.byte_capped_fills >= 1);
+        assert!(after_capped.byte_cap_evictions >= 1);
+        assert!(after_capped.peak_cached_bytes >= u64::try_from(first.bytes)?);
         Ok(())
     }
 }
