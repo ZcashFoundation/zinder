@@ -1,4 +1,5 @@
 mod bootstrap;
+mod canonical_explorer;
 mod cli;
 mod env_var_contract;
 mod mempool_pagination;

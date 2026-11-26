@@ -12,20 +12,26 @@ use tonic::{Request, Response, Status};
 use zinder_core::wire::{
     decode_height_key_descending, decode_in_block_position, decode_rpc_block_hash_hex,
     decode_rpc_transaction_id_hex, encode_internal_transaction_id, encode_rpc_block_hash_hex,
+    encode_rpc_transaction_id_hex,
 };
-use zinder_core::{BlockHeight, PrivacyShape, TransactionId};
+use zinder_core::{BlockHash, BlockHeight, ChainEpochId, PrivacyShape, TransactionId};
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_HISTORY_V2;
 use zinder_proto::v1::explorer::{
     ShieldedProtocol, TransactionFeesRecord, TransactionHistoryCountScope,
     TransactionHistoryCoverage, TransactionHistoryDirection, TransactionHistoryEntry,
     TransactionHistoryFilter, TransactionHistoryReadFence, TransactionHistoryRequest,
-    TransactionHistoryResponse, transaction_history_request,
+    TransactionHistoryResponse, TransactionIntrinsicValueBalances as WireIntrinsicValueBalances,
+    transaction_history_request,
 };
 use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::decode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
-use zinder_store::chain_epoch_from_message;
+use zinder_store::{CanonicalStoreError, chain_epoch_from_message};
 
+use super::canonical_read::{
+    CanonicalReplayVisitError, SharedCanonicalSecondary, encode_intrinsic_value_balances,
+    internal_canonical_error,
+};
 use super::clamp_max_entries;
 use super::error::ExplorerError;
 use super::freshness::{
@@ -178,6 +184,7 @@ const CURSOR_LEN: usize =
 
 /// Dependencies for one typed transaction-history public read.
 pub(crate) struct TransactionHistoryContext<'store> {
+    pub(crate) canonical_store: Option<&'store SharedCanonicalSecondary>,
     pub(crate) materialized_view_reader: Arc<dyn TransactionHistoryMaterializedViewReadApi>,
     pub(crate) materialized_view_store: Option<&'store MaterializedViewStore>,
     pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
@@ -224,7 +231,15 @@ pub(crate) async fn transaction_history(
         snapshot_read.materialized_view_state,
     )
     .await?;
-    let page = snapshot_read.page;
+    let mut page = snapshot_read.page;
+    if let Some(canonical_store) = context.canonical_store {
+        enrich_intrinsic_value_balances(
+            canonical_store,
+            snapshot_read.materialized_view_state.chain_epoch_id,
+            &mut page.entries,
+        )
+        .await?;
+    }
     let freshness = attach_upstream_observation(
         context.upstream_observation_cache,
         build_explorer_freshness(
@@ -1086,6 +1101,110 @@ fn join_projected_paid_fees(
         }
     }
     Ok(())
+}
+
+async fn enrich_intrinsic_value_balances(
+    canonical_store: &SharedCanonicalSecondary,
+    epoch_id: ChainEpochId,
+    entries: &mut [TransactionHistoryEntry],
+) -> Result<(), Status> {
+    let mut heights: Vec<BlockHeight> = entries
+        .iter()
+        .filter(|entry| entry.intrinsic_value_balances.is_none())
+        .map(|entry| BlockHeight::new(entry.block_height))
+        .collect();
+    if heights.is_empty() {
+        return Ok(());
+    }
+    heights.sort_unstable();
+    heights.dedup();
+
+    let store = Arc::clone(canonical_store);
+    let balances_by_key = tokio::task::spawn_blocking(move || {
+        read_intrinsic_value_balances_at_heights(&store, epoch_id, &heights)
+    })
+    .await
+    .map_err(|error| ExplorerError::internal(format!("canonical read task failed: {error}")))??;
+
+    for entry in entries.iter_mut() {
+        if entry.intrinsic_value_balances.is_some() {
+            continue;
+        }
+        if let Some((block_hash, balances)) =
+            balances_by_key.get(&(entry.block_height, entry.transaction_id.clone()))
+            && entry.block_hash == encode_rpc_block_hash_hex(*block_hash)
+        {
+            entry.intrinsic_value_balances = Some(*balances);
+        }
+    }
+    Ok(())
+}
+
+type IntrinsicBalanceMap = HashMap<(u32, String), (BlockHash, WireIntrinsicValueBalances)>;
+
+fn read_intrinsic_value_balances_at_heights(
+    store: &SharedCanonicalSecondary,
+    epoch_id: ChainEpochId,
+    heights: &[BlockHeight],
+) -> Result<IntrinsicBalanceMap, Status> {
+    if store
+        .read()
+        .chain_epoch()
+        .map_err(internal_canonical_error)?
+        .id
+        < epoch_id
+    {
+        store
+            .write()
+            .try_catch_up()
+            .map_err(internal_canonical_error)?;
+    }
+    let guard = store.read();
+    let current_epoch = guard.chain_epoch().map_err(internal_canonical_error)?;
+    if current_epoch.id < epoch_id {
+        return Ok(HashMap::new());
+    }
+    if current_epoch.id != epoch_id {
+        let pinned = match guard.chain_epoch_at(epoch_id) {
+            Ok(epoch) => epoch,
+            Err(CanonicalStoreError::CanonicalEpochNotRetained { .. }) => return Ok(HashMap::new()),
+            Err(error) => return Err(internal_canonical_error(error)),
+        };
+        if pinned.visible_tip_height > BlockHeight::new(0)
+            && guard
+                .block_header_at(pinned.visible_tip_height)
+                .map_err(internal_canonical_error)?
+                .is_none_or(|header| header.block_hash != pinned.visible_tip_hash)
+        {
+            return Ok(HashMap::new());
+        }
+    }
+
+    let mut balances_by_key = HashMap::new();
+    guard
+        .visit_block_replay_facts_at_heights(heights, |idx, maybe_facts| {
+            let Some(facts) = maybe_facts else {
+                return Ok(());
+            };
+            let height = heights[idx].value();
+            let block_hash = facts.block_header.block_hash;
+            for tx in &facts.transactions {
+                balances_by_key.insert(
+                    (
+                        height,
+                        encode_rpc_transaction_id_hex(tx.public_facts.transaction_id),
+                    ),
+                    (
+                        block_hash,
+                        encode_intrinsic_value_balances(tx.intrinsic_value_balances),
+                    ),
+                );
+            }
+            Ok::<(), CanonicalReplayVisitError>(())
+        })
+        .map_err(Status::from)?;
+    drop(guard);
+    Ok(balances_by_key)
 }
 
 #[cfg(test)]

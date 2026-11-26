@@ -10,6 +10,7 @@ use std::{
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::{Parser, Subcommand};
+use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
@@ -24,17 +25,19 @@ use zinder_runtime::{
     section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_store::{
+    CanonicalStoreError, CanonicalStoreRequirements, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore,
+};
 
 mod config;
 
 use config::{ExplorerConfig, ExplorerConfigError, ExplorerConfigOverrides};
 
+type SharedCanonicalSecondary = Arc<RwLock<RocksDbCanonicalSecondary>>;
+
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
-
-/// Cadence the background task uses to advance the secondary's view to the
-/// primary's latest durable state.
-const MATERIALIZED_VIEW_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Default cadence for the upstream-observation probe.
 ///
@@ -158,6 +161,38 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
     serve_explorer(explorer_config, runtime, Readiness::default()).await
 }
 
+fn open_explorer_stores(
+    explorer_config: &ExplorerConfig,
+) -> Result<
+    (
+        Option<SharedCanonicalSecondary>,
+        Option<MaterializedViewStore>,
+    ),
+    ExplorerConfigError,
+> {
+    let canonical_secondary = open_canonical_secondary(explorer_config)?;
+    let materialized_view_store = open_materialized_view_store(explorer_config)?;
+    Ok((canonical_secondary, materialized_view_store))
+}
+
+fn build_materialized_view_catchup_task(
+    explorer_config: &ExplorerConfig,
+    materialized_view_store: Option<MaterializedViewStore>,
+    canonical_secondary: Option<SharedCanonicalSecondary>,
+    composed_readiness: &ComposedReadiness,
+    stopping: CancellationToken,
+) -> Option<JoinHandle<()>> {
+    match (materialized_view_store, canonical_secondary) {
+        (None, None) => None,
+        (mv_store, canonical_store) => Some(spawn_materialized_view_catchup_task(
+            move || catch_up_secondaries(mv_store.as_ref(), canonical_store.as_ref()),
+            composed_readiness.clone(),
+            explorer_config.storage.secondary_catchup_interval,
+            stopping,
+        )),
+    }
+}
+
 async fn serve_explorer(
     explorer_config: ExplorerConfig,
     runtime: SupervisedRuntime,
@@ -165,22 +200,28 @@ async fn serve_explorer(
 ) -> Result<(), ExplorerConfigError> {
     let start_api_phase = StartupPhase::StartApi.start();
 
-    let materialized_view_store = match open_materialized_view_store(&explorer_config) {
-        Ok(materialized_view_store) => materialized_view_store,
-        Err(error) => {
-            start_api_phase.fail(&error);
-            return Err(error);
-        }
-    };
+    let (canonical_secondary, materialized_view_store) =
+        match open_explorer_stores(&explorer_config) {
+            Ok(stores) => stores,
+            Err(error) => {
+                start_api_phase.fail(&error);
+                return Err(error);
+            }
+        };
     report_materialized_view_identities(&readiness, materialized_view_store.as_ref());
-    let required_inputs: &[ReadinessInput] = if materialized_view_store.is_some() {
-        &[ReadinessInput::MaterializedViewCatchup]
-    } else {
-        &[]
-    };
+    let required_inputs: &[ReadinessInput] =
+        if materialized_view_store.is_some() || canonical_secondary.is_some() {
+            &[ReadinessInput::MaterializedViewCatchup]
+        } else {
+            &[]
+        };
     let composed_readiness = ComposedReadiness::new(readiness.clone(), required_inputs);
 
-    let grpc_adapter = build_grpc_adapter(&explorer_config, materialized_view_store.clone());
+    let grpc_adapter = build_grpc_adapter(
+        &explorer_config,
+        canonical_secondary.clone(),
+        materialized_view_store.clone(),
+    );
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
     let router = runtime.public_grpc_router(
         grpc_adapter.clone().into_server(),
@@ -200,14 +241,13 @@ async fn serve_explorer(
     describe_request_metrics();
     let upstream_observation =
         spawn_upstream_observation_probe(&explorer_config, &grpc_adapter, runtime.stopping())?;
-    let materialized_view_catchup = materialized_view_store.map(|store| {
-        spawn_materialized_view_catchup_task(
-            move || store.try_catch_up(),
-            composed_readiness.clone(),
-            MATERIALIZED_VIEW_CATCHUP_INTERVAL,
-            runtime.stopping(),
-        )
-    });
+    let materialized_view_catchup = build_materialized_view_catchup_task(
+        &explorer_config,
+        materialized_view_store,
+        canonical_secondary,
+        &composed_readiness,
+        runtime.stopping(),
+    );
     let tasks = supervised_tasks(ops_handle, upstream_observation, materialized_view_catchup);
 
     start_api_phase.complete();
@@ -316,6 +356,104 @@ fn build_zebra_json_rpc_source(
         },
     )?;
     Ok(source.with_health_config(node.health.clone()))
+}
+
+fn open_canonical_secondary(
+    explorer_config: &ExplorerConfig,
+) -> Result<Option<SharedCanonicalSecondary>, ExplorerConfigError> {
+    let primary_path = &explorer_config.storage.path;
+    let current_exists = primary_path
+        .join("CURRENT")
+        .try_exists()
+        .map_err(|source| {
+            canonical_secondary_error(
+                "probe canonical primary",
+                CanonicalStoreError::PathUnavailable {
+                    path: primary_path.clone(),
+                    source,
+                },
+            )
+        })?;
+    if !current_exists {
+        tracing::info!(
+            target: "zinder::explorer",
+            event = "canonical_secondary_unavailable",
+            "canonical primary store is absent; canonical-backed explorer capabilities disabled"
+        );
+        return Ok(None);
+    }
+
+    let open_storage_phase = StartupPhase::OpenStorage.start();
+    let summary = match RocksDbCanonicalStore::read_ready_summary(primary_path) {
+        Ok(Some(summary)) => summary,
+        Ok(None) => {
+            tracing::info!(
+                target: "zinder::explorer",
+                event = "canonical_secondary_unavailable",
+                "canonical primary store is not READY; canonical-backed explorer capabilities disabled"
+            );
+            open_storage_phase.complete();
+            return Ok(None);
+        }
+        Err(source) => {
+            let wrapped = canonical_secondary_error("read canonical store ready summary", source);
+            open_storage_phase.fail(&wrapped);
+            return Err(wrapped);
+        }
+    };
+
+    let secondary_path = explorer_config.storage.secondary_path.join("canonical");
+    match RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        primary_path,
+        &secondary_path,
+        explorer_config.network,
+        CanonicalStoreRequirements::default(),
+        summary.reorg_policy(),
+        explorer_config.storage.canonical_rocksdb_budget,
+    ) {
+        Ok(secondary) => {
+            tracing::info!(
+                target: "zinder::explorer",
+                event = "canonical_secondary_opened",
+                storage_path = %primary_path.display(),
+                secondary_path = %secondary_path.display(),
+                visible_tip_height = summary.visible_tip().height.value(),
+                "canonical secondary store opened"
+            );
+            open_storage_phase.complete();
+            Ok(Some(Arc::new(RwLock::new(secondary))))
+        }
+        Err(source) => {
+            let wrapped = canonical_secondary_error("open canonical secondary", source);
+            open_storage_phase.fail(&wrapped);
+            Err(wrapped)
+        }
+    }
+}
+
+fn canonical_secondary_error(
+    operation: &'static str,
+    source: CanonicalStoreError,
+) -> ExplorerConfigError {
+    ExplorerConfigError::Store(MaterializedViewStoreError::CanonicalSecondary { operation, source })
+}
+
+fn catch_up_secondaries(
+    materialized_view_store: Option<&MaterializedViewStore>,
+    canonical_secondary: Option<&SharedCanonicalSecondary>,
+) -> Result<(), MaterializedViewStoreError> {
+    if let Some(store) = materialized_view_store {
+        store.try_catch_up()?;
+    }
+    if let Some(store) = canonical_secondary {
+        store.write().try_catch_up().map_err(|source| {
+            MaterializedViewStoreError::CanonicalSecondary {
+                operation: "catch up canonical secondary",
+                source,
+            }
+        })?;
+    }
+    Ok(())
 }
 
 fn open_materialized_view_store(
@@ -429,6 +567,10 @@ const fn materialized_view_catchup_failure_cause(
             | MaterializedViewStoreError::ConsumerSchemaMismatch { .. }
             | MaterializedViewStoreError::ConsumerNotDeclared { .. }
             | MaterializedViewStoreError::ColumnFamilyIdentityMismatch { .. }
+            | MaterializedViewStoreError::CanonicalSecondary {
+                source: CanonicalStoreError::AdmissionRefused { .. },
+                ..
+            }
     ) {
         ReadinessCause::SchemaMismatch
     } else {
@@ -438,6 +580,7 @@ const fn materialized_view_catchup_failure_cause(
 
 fn build_grpc_adapter(
     explorer_config: &ExplorerConfig,
+    canonical_secondary: Option<SharedCanonicalSecondary>,
     materialized_view_store: Option<MaterializedViewStore>,
 ) -> ExplorerQueryGrpcAdapter {
     let server_info = ExplorerServerInfoSettings {
@@ -446,6 +589,9 @@ fn build_grpc_adapter(
     let has_materialized_view_store = materialized_view_store.is_some();
     let mut grpc_adapter = ExplorerQueryGrpcAdapter::new(server_info)
         .with_prevout_resolution_online(has_materialized_view_store);
+    if let Some(canonical_secondary) = canonical_secondary {
+        grpc_adapter = grpc_adapter.with_canonical_store(canonical_secondary);
+    }
     if let Some(materialized_view_store) = materialized_view_store {
         grpc_adapter = grpc_adapter.with_materialized_view_store(materialized_view_store);
     }

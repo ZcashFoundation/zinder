@@ -2071,3 +2071,87 @@ fn warm_secondary_reopen_caches_permanent_reorg_archive_admission_reads()
     drop(cold_secondary);
     Ok(())
 }
+
+#[test]
+fn canonical_secondary_reads_and_catches_up_displaced_archive_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let requirements =
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions);
+    let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW)?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &store_path,
+        temporary.path().join("secondary"),
+        Network::ZcashTestnet,
+        requirements,
+        reorg_policy,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(secondary.displaced_block_count()?, 0);
+    assert_eq!(secondary.displaced_block_archive_coverage()?, None);
+    let empty_root_search = secondary.search_displaced_final_note_commitment_roots(
+        zinder_core::FinalNoteCommitmentRoot::from_bytes([0; 32]),
+        16,
+    )?;
+    assert_eq!(empty_root_search.matches, []);
+    assert_eq!(empty_root_search.coverage, None);
+
+    let replacement_fence = store.event_fence();
+    let displaced_block_hash = BlockHash::from_bytes([4; 32]);
+    let (store, _) = store.commit_live_replacement(
+        crate::CanonicalLiveReplacement::new(
+            replacement_fence,
+            vec![crate::CanonicalReplacementBlock::new(
+                replacement_block(BlockHeight::new(4), [0x44; 32], [3; 32], 144)?,
+                Vec::new(),
+            )],
+            UnixTimestampMillis::new(1_750_000_000_010),
+        ),
+        &activations,
+    )?;
+    let catchup = secondary.try_catch_up()?;
+    assert!(catchup.advanced());
+    assert_eq!(secondary.displaced_block_count()?, 1);
+    let coverage = secondary
+        .displaced_block_archive_coverage()?
+        .ok_or("expected displaced archive coverage on secondary")?;
+    assert_eq!(
+        coverage.activation_event_sequence,
+        catchup.after().chain_event_sequence()
+    );
+    let page = secondary
+        .displaced_block_page(None, std::num::NonZeroU32::new(10).ok_or("nonzero limit")?)?;
+    assert!(!page.has_more);
+    assert_eq!(page.blocks.len(), 1);
+    assert_eq!(page.blocks[0].block_hash, displaced_block_hash);
+    assert_eq!(
+        secondary.displaced_block_by_hash(displaced_block_hash)?,
+        Some(page.blocks[0].clone())
+    );
+    assert_eq!(
+        secondary.displaced_blocks_for_event(
+            coverage.activation_event_sequence,
+            std::num::NonZeroU32::new(10).ok_or("nonzero limit")?,
+        )?,
+        page.blocks
+    );
+    let root_search = secondary.search_displaced_final_note_commitment_roots(
+        zinder_core::FinalNoteCommitmentRoot::from_bytes([0; 32]),
+        16,
+    )?;
+    let root_coverage = root_search
+        .coverage
+        .ok_or("expected displaced root coverage on secondary")?;
+    assert_eq!(root_coverage.captured_block_count, 1);
+    assert_eq!(root_coverage.root_artifact_unavailable_count, 1);
+    drop(store);
+    Ok(())
+}

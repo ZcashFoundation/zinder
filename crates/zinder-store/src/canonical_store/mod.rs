@@ -86,7 +86,7 @@ pub use builder::RocksDbCanonicalBuilder;
 pub use construction_manifest::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CanonicalConstructionManifestBinding,
 };
-pub use displaced_archive::{DisplacedBlockCursor, DisplacedBlockPage};
+pub use displaced_archive::{DisplacedBlockCursor, DisplacedBlockPage, DisplacedFinalRootSearch};
 pub use event_lifecycle::{
     CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind,
     CanonicalEventRetentionReport, CanonicalRetainedEvent, ProjectionBuildAnchor,

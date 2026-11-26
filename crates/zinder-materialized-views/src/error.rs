@@ -265,6 +265,15 @@ pub enum MaterializedViewStoreError {
         #[source]
         source: rust_rocksdb::Error,
     },
+    /// Canonical secondary storage operation failed.
+    #[error("canonical secondary store failed during {operation}: {source}")]
+    CanonicalSecondary {
+        /// Logical operation that failed.
+        operation: &'static str,
+        /// Underlying canonical store error.
+        #[source]
+        source: zinder_store::CanonicalStoreError,
+    },
 }
 
 /// Column-family identifier surfaced in `MaterializedViewStoreError` variants.

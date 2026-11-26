@@ -8,16 +8,17 @@
 //! for everything else.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 use zinder_core::{
-    BlockHeight, ChainEpoch, ConsensusBranchId, LockTime as CoreLockTime,
+    BlockHeight, BlockId, ChainEpoch, ChainEpochId, ConsensusBranchId, LockTime as CoreLockTime,
     NetworkUpgradeActivations, TransactionId, TransactionPublicFacts as CoreFacts,
     TransactionVersion as CoreTransactionVersion, TransparentOutPoint, TransparentOutputFact,
     explorer_reasons::TRANSPARENT_OUTPUT_SPEND_STATUS_NOT_INDEXED,
     wire::{
-        decode_rpc_transaction_id_hex, encode_branch_id_hex, encode_rpc_auth_digest_hex,
-        encode_rpc_transaction_id_hex, encode_rpc_wtxid_hex,
+        decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex, encode_branch_id_hex,
+        encode_rpc_auth_digest_hex, encode_rpc_transaction_id_hex, encode_rpc_wtxid_hex,
     },
 };
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V4;
@@ -31,6 +32,7 @@ use zinder_proto::v1::{
     explorer::{
         LockTime as WireLockTime, LockTimeUnlocked, TransactionComponentCounts,
         TransactionDetailRequest, TransactionDetailResponse, TransactionFeesRecord,
+        TransactionIntrinsicValueBalances as WireIntrinsicValueBalances,
         TransactionPublicFacts as WireFacts, TransactionVersion as WireVersion,
         TransactionVersionKind, TransparentOutput as WireTransparentOutput, UnavailableField,
         UnavailableReason, lock_time as wire_lock_time,
@@ -42,8 +44,11 @@ use zinder_proto::v1::{
 };
 use zinder_runtime::AuthenticatedChannel;
 use zinder_source::TransactionPublicFactSet;
-use zinder_store::{chain_epoch_from_message, transparent_spend_message};
+use zinder_store::{CanonicalStoreError, chain_epoch_from_message, transparent_spend_message};
 
+use super::canonical_read::{
+    SharedCanonicalSecondary, encode_intrinsic_value_balances, internal_canonical_error,
+};
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
@@ -56,6 +61,7 @@ use super::transparent_input::encode_unresolved_transparent_inputs;
 /// workspace's clippy `too-many-arguments` threshold and so adding a new
 /// shared dependency does not ripple through every call site.
 pub(crate) struct TransactionDetailContext<'context> {
+    pub(crate) canonical_store: Option<&'context SharedCanonicalSecondary>,
     pub(crate) materialized_view_store: Option<&'context MaterializedViewStore>,
     pub(crate) network_upgrade_activations: &'context NetworkUpgradeActivations,
     pub(crate) upstream_observation_cache: &'context UpstreamObservationCache,
@@ -68,6 +74,7 @@ pub(crate) async fn query_transaction_detail(
     request: Request<TransactionDetailRequest>,
 ) -> Result<Response<TransactionDetailResponse>, Status> {
     let TransactionDetailContext {
+        canonical_store,
         materialized_view_store,
         network_upgrade_activations,
         upstream_observation_cache,
@@ -87,12 +94,15 @@ pub(crate) async fn query_transaction_detail(
         .chain_view
         .and_then(|chain_view| chain_view.chain_epoch)
         .ok_or_else(|| ExplorerError::internal("WalletQuery.Transaction missing chain_epoch"))?;
+    let expected_epoch = chain_epoch_from_message(chain_epoch.clone())
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let location = status_response
         .location
         .and_then(|location| location.location)
         .ok_or_else(|| {
             ExplorerError::internal("WalletQuery.Transaction response missing location")
         })?;
+    let mined_block_id = mined_location_block_id(&location)?;
 
     let mut response = transaction_detail_response(
         materialized_view_store,
@@ -101,10 +111,103 @@ pub(crate) async fn query_transaction_detail(
         chain_epoch,
         location,
     )?;
+    if let (Some(canonical_store), Some(block_id)) = (canonical_store, mined_block_id) {
+        response.intrinsic_value_balances = resolve_mined_intrinsic_value_balances(
+            canonical_store,
+            expected_epoch.id,
+            transaction_id,
+            block_id,
+        )
+        .await?;
+    }
     let freshness = response.freshness.take().unwrap_or_default();
     response.freshness =
         Some(attach_upstream_observation(upstream_observation_cache, freshness).await);
     Ok(Response::new(response))
+}
+
+fn mined_location_block_id(location: &wire_location::Location) -> Result<Option<BlockId>, Status> {
+    let wire_location::Location::Mined(mined) = location else {
+        return Ok(None);
+    };
+    let Some(block_loc) = mined.location.as_ref() else {
+        return Ok(None);
+    };
+    let block_hash = decode_rpc_block_hash_hex(&block_loc.block_hash)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    Ok(Some(BlockId::new(
+        BlockHeight::new(block_loc.block_height),
+        block_hash,
+    )))
+}
+
+async fn resolve_mined_intrinsic_value_balances(
+    canonical_store: &SharedCanonicalSecondary,
+    epoch_id: ChainEpochId,
+    transaction_id: TransactionId,
+    block_id: BlockId,
+) -> Result<Option<WireIntrinsicValueBalances>, Status> {
+    let store = Arc::clone(canonical_store);
+    tokio::task::spawn_blocking(move || {
+        read_mined_intrinsic_value_balances(&store, epoch_id, transaction_id, block_id)
+    })
+    .await
+    .map_err(|error| ExplorerError::internal(format!("canonical read task failed: {error}")))?
+}
+
+fn read_mined_intrinsic_value_balances(
+    store: &SharedCanonicalSecondary,
+    epoch_id: ChainEpochId,
+    transaction_id: TransactionId,
+    block_id: BlockId,
+) -> Result<Option<WireIntrinsicValueBalances>, Status> {
+    if store
+        .read()
+        .chain_epoch()
+        .map_err(internal_canonical_error)?
+        .id
+        < epoch_id
+    {
+        store
+            .write()
+            .try_catch_up()
+            .map_err(internal_canonical_error)?;
+    }
+    let guard = store.read();
+    let current_epoch = guard.chain_epoch().map_err(internal_canonical_error)?;
+    if current_epoch.id < epoch_id {
+        return Ok(None);
+    }
+    if current_epoch.id != epoch_id {
+        let pinned = match guard.chain_epoch_at(epoch_id) {
+            Ok(epoch) => epoch,
+            Err(CanonicalStoreError::CanonicalEpochNotRetained { .. }) => return Ok(None),
+            Err(error) => return Err(internal_canonical_error(error)),
+        };
+        if pinned.visible_tip_height > BlockHeight::new(0)
+            && guard
+                .block_header_at(pinned.visible_tip_height)
+                .map_err(internal_canonical_error)?
+                .is_none_or(|header| header.block_hash != pinned.visible_tip_hash)
+        {
+            return Ok(None);
+        }
+    }
+    let Some(facts) = guard
+        .block_replay_facts_at(block_id.height)
+        .map_err(internal_canonical_error)?
+    else {
+        return Ok(None);
+    };
+    drop(guard);
+    if facts.block_header.block_hash != block_id.hash {
+        return Ok(None);
+    }
+    Ok(facts
+        .transactions
+        .iter()
+        .find(|tx| tx.public_facts.transaction_id == transaction_id)
+        .map(|tx| encode_intrinsic_value_balances(tx.intrinsic_value_balances)))
 }
 
 /// Builds the detail response for one wallet-plane transaction, before the
