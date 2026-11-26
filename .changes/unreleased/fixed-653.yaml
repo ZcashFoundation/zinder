@@ -1,6 +1,0 @@
-kind: fixed
-body: Released upstream `zinder-ingest` mempool event subscriptions immediately when a lightwalletd `GetMempoolStream` call closes on a chain tip change or client disconnect, even when outbound stream delivery is backpressured or the mempool is idle.
-time: 2026-11-26T12:53:30Z
-custom:
-    Bump: patch
-    PR: "653"

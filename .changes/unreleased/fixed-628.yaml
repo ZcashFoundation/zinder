@@ -1,6 +1,0 @@
-kind: fixed
-body: Eliminated uncached per-epoch disk reads during canonical secondary open and catch-up by scanning and caching retained `chain_epoch` and `chain_event` rows with 10-bits-per-key Bloom filters, preventing multi-second secondary refresh stalls and `SERVED_TIP_MISMATCH` errors under `O_DIRECT`.
-time: 2026-11-26T09:24:30Z
-custom:
-    Bump: patch
-    PR: "628"

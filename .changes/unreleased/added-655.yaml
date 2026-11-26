@@ -1,6 +1,0 @@
-kind: added
-body: Exported live `EncodedTail` cache telemetry (`zinder_compat_encoded_tail_lookups_total`, `zinder_compat_encoded_tail_fills_total`, `zinder_compat_encoded_tail_byte_capped_fills_total`, `zinder_compat_encoded_tail_byte_cap_evictions_total`, and `zinder_compat_encoded_tail_bytes`), documented in `docs/reference/metrics.md`.
-time: 2026-11-26T18:25:00Z
-custom:
-    Bump: minor
-    PR: "655"
