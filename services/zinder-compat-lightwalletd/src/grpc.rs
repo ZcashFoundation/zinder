@@ -992,6 +992,33 @@ where
             .await
             .map(Response::new)
     }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.query_api, "get_encoded_block_range", &request)
+            .await?;
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
+        self.block_methods
+            .published_block_range_frames(
+                &self.query_api,
+                &request,
+                range,
+                CompactBlockShape::for_range,
+            )
+            .await
+            .map(Response::new)
+    }
 }
 
 #[tonic::async_trait]
@@ -1017,6 +1044,37 @@ where
         );
         self.block_methods
             .published_block_range(
+                &self.query_api,
+                &request,
+                range,
+                CompactBlockShape::for_nullifier_range,
+            )
+            .await
+            .map(Response::new)
+    }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_nullifier_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(
+                &self.query_api,
+                "get_encoded_block_range_nullifiers",
+                &request,
+            )
+            .await?;
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
+        self.block_methods
+            .published_block_range_frames(
                 &self.query_api,
                 &request,
                 range,

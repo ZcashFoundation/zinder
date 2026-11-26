@@ -12,8 +12,9 @@ use tonic::codegen::tokio_stream::Stream;
 
 use super::{
     BATCH_BYTES, BlockRange, BoundedChunkRetention, Bytes, COPIED_PIECE_BYTES, CompactBlock,
-    EnabledCompressionEncodings, EncodedBlock, EncodedBlockBody, EncodedBlockCodec,
-    EncodedBlockRange, EncodedBlockRangeStream, FIRST_BATCH_BYTES, Grpc, InvalidEncodedBlock,
+    EnabledCompressionEncodings, EncodedBlock, EncodedBlockBatcher, EncodedBlockBody,
+    EncodedBlockCodec, EncodedBlockFrame, EncodedBlockFrameStream, EncodedBlockRange,
+    EncodedBlockRangeStream, EncodedFrameBody, FIRST_BATCH_BYTES, Grpc, InvalidEncodedBlock,
     Request, Response, Status, http, server_streaming,
 };
 
@@ -574,5 +575,181 @@ fn only_the_uncompressed_range_body_carries_the_retention_marker() -> eyre::Resu
     };
     assert!(marked(&served(&OneBlock(true))?));
     assert!(!marked(&served(&OneBlock(false))?));
+    Ok(())
+}
+
+struct ScriptedFrames(VecDeque<Result<EncodedBlockFrame, Status>>);
+
+impl Stream for ScriptedFrames {
+    type Item = Result<EncodedBlockFrame, Status>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.get_mut().0.pop_front())
+    }
+}
+
+fn drain_frames(
+    frames: Vec<EncodedBlockFrame>,
+    max_message_size: Option<usize>,
+) -> eyre::Result<Sent> {
+    let stream: EncodedBlockFrameStream =
+        Box::pin(ScriptedFrames(frames.into_iter().map(Ok).collect()));
+    drain(EncodedFrameBody::new(stream, max_message_size))
+}
+
+#[test]
+fn prebatched_frames_match_tonic_bytes_and_preserve_zero_copy_large_blocks() -> eyre::Result<()> {
+    let at_batch = BATCH_BYTES - EncodedBlock::PREFIX_LEN;
+    let sizes = [
+        0,
+        1,
+        400,
+        3_900,
+        4_200,
+        at_batch - 1,
+        at_batch,
+        97_000,
+        CAP + 1,
+        12,
+    ];
+    let mut batcher = EncodedBlockBatcher::new(true);
+    let mut script = Vec::new();
+    let mut zero_copy_ptr = None;
+    for (tag, len) in sizes.into_iter().enumerate() {
+        let raw = payload(len, u8::try_from(tag)?);
+        let block = framed(&raw)?;
+        if len == 97_000 {
+            zero_copy_ptr = Some(block.as_length_prefixed().as_ptr());
+            batcher.push_block(block.clone());
+        } else {
+            batcher.push_payload(&raw)?;
+        }
+        script.push(Some(Ok(block)));
+    }
+    let sent_frames = drain_frames(batcher.finish(), None)?;
+    let (_, tonic_sent) = both(&script, None)?;
+    assert_eq!(sent_frames.bytes(), tonic_sent.bytes());
+    assert_eq!(sent_frames.trailers, tonic_sent.trailers);
+    assert!(sent_frames.frames[0].len() >= FIRST_BATCH_BYTES);
+    assert!(
+        sent_frames
+            .frames
+            .iter()
+            .any(|frame| Some(frame.as_ptr()) == zero_copy_ptr),
+        "97 KiB sliceable block must pass through without copying"
+    );
+    Ok(())
+}
+
+#[test]
+fn prebatched_frames_enforce_message_size_limits_across_open_and_closed_batches() -> eyre::Result<()>
+{
+    let mut open = EncodedBlockBatcher::new(false);
+    open.push_payload(&payload(300, 1))?;
+    open.push_payload(&payload(45_000, 2))?;
+    let dropped = drain_frames(open.finish(), Some(40_000))?;
+    assert_eq!(dropped.frames, Vec::<Bytes>::new());
+    assert_eq!(
+        grpc_status(&dropped).map(|status| status.code()),
+        Some(tonic::Code::OutOfRange)
+    );
+
+    let mut after_first = EncodedBlockBatcher::new(true);
+    for tag in 0..30_u8 {
+        after_first.push_payload(&payload(400, tag))?;
+    }
+    after_first.push_payload(&payload(1_001, 30))?;
+    let kept_first = drain_frames(after_first.finish(), Some(1_000))?;
+    assert_eq!(kept_first.frames.len(), 1);
+    assert_eq!(
+        kept_first.frames[0].len(),
+        21 * (400 + EncodedBlock::PREFIX_LEN)
+    );
+    assert_eq!(
+        grpc_status(&kept_first).map(|status| status.code()),
+        Some(tonic::Code::OutOfRange)
+    );
+    Ok(())
+}
+
+struct BatchedOneBlock {
+    use_frames: bool,
+    succeed: bool,
+}
+
+#[tonic::async_trait]
+impl EncodedBlockRange for BatchedOneBlock {
+    fn supports_encoded_frames(&self) -> bool {
+        self.use_frames
+    }
+
+    async fn get_encoded_block_range(
+        &self,
+        _request: Request<BlockRange>,
+    ) -> Result<Response<EncodedBlockRangeStream>, Status> {
+        let block = EncodedBlock::encode(&CompactBlock {
+            height: 9,
+            ..CompactBlock::default()
+        })
+        .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::once(
+            Ok(block),
+        ))))
+    }
+
+    async fn get_encoded_block_range_frames(
+        &self,
+        _request: Request<BlockRange>,
+    ) -> Result<Response<EncodedBlockFrameStream>, Status> {
+        if !self.succeed {
+            return Err(Status::out_of_range("above tip"));
+        }
+        let mut batcher = EncodedBlockBatcher::new(true);
+        let raw = CompactBlock {
+            height: 7,
+            ..CompactBlock::default()
+        }
+        .encode_to_vec();
+        batcher
+            .push_payload(&raw)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(Box::pin(ScriptedFrames(
+            batcher.finish().into_iter().map(Ok).collect(),
+        ))))
+    }
+}
+
+#[test]
+fn prebatched_server_streaming_routes_when_enabled_and_marks_only_ok_streams() -> eyre::Result<()> {
+    let via_frames = served(&BatchedOneBlock {
+        use_frames: true,
+        succeed: true,
+    })?;
+    assert!(
+        via_frames
+            .extensions()
+            .get::<BoundedChunkRetention>()
+            .is_some()
+    );
+    let sent_frames = drain(via_frames.into_body())?;
+    assert_eq!(CompactBlock::decode(&sent_frames.bytes()[5..])?.height, 7);
+
+    let via_blocks = served(&BatchedOneBlock {
+        use_frames: false,
+        succeed: true,
+    })?;
+    let sent_blocks = drain(via_blocks.into_body())?;
+    assert_eq!(CompactBlock::decode(&sent_blocks.bytes()[5..])?.height, 9);
+
+    let refused = served(&BatchedOneBlock {
+        use_frames: true,
+        succeed: false,
+    })?;
+    assert!(
+        refused
+            .extensions()
+            .get::<BoundedChunkRetention>()
+            .is_none()
+    );
     Ok(())
 }

@@ -9,7 +9,7 @@ mod tail;
 pub(crate) use catalog::PublishedShieldedCatalog;
 pub use catalog::{PublicationConcurrency, ShieldedCatalogPublisher};
 pub use history::PublishedShieldedHistory;
-pub(crate) use read::PublishedRangeRead;
+pub(crate) use read::{PublishedBatchedRangeRead, PublishedRangeRead};
 pub(crate) use tail::ShieldedTailBuffer;
 
 use std::{collections::VecDeque, io, path::Path};

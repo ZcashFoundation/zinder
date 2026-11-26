@@ -25,6 +25,16 @@ use crate::compat::lightwalletd::{BlockRange, CompactBlock};
 /// framed for gRPC.
 pub type EncodedBlockRangeStream = BoxStream<EncodedBlock>;
 
+/// A stream of pre-batched lightwalletd `CompactBlock` wire pieces for an
+/// uncompressed `GetBlockRange` or `GetBlockRangeNullifiers` response.
+pub type EncodedBlockFrameStream = BoxStream<EncodedBlockFrame>;
+
+/// Streamed payload returned by [`TakeMessages`] or [`TakeNullifierMessages`].
+enum TakenRangeStream {
+    Blocks(EncodedBlockRangeStream),
+    Frames(EncodedBlockFrameStream),
+}
+
 /// Serves lightwalletd `GetBlockRange` from previously encoded protobuf messages.
 ///
 /// Return `Some(self)` from [`CompactTxStreamer::encoded_block_range`] to
@@ -38,6 +48,22 @@ pub trait EncodedBlockRange: Send + Sync {
         &self,
         request: Request<BlockRange>,
     ) -> Result<Response<EncodedBlockRangeStream>, Status>;
+
+    /// Returns whether [`Self::get_encoded_block_range_frames`] serves
+    /// pre-batched frames on the uncompressed path.
+    fn supports_encoded_frames(&self) -> bool {
+        false
+    }
+
+    /// Opens a stream of pre-batched wire frames for uncompressed responses.
+    async fn get_encoded_block_range_frames(
+        &self,
+        _request: Request<BlockRange>,
+    ) -> Result<Response<EncodedBlockFrameStream>, Status> {
+        Err(Status::unimplemented(
+            "batched encoded block range is not implemented",
+        ))
+    }
 }
 
 impl<'a> ServerStreamingService<BlockRange> for &'a (dyn EncodedBlockRange + '_) {
@@ -67,6 +93,23 @@ pub trait EncodedBlockRangeNullifiers: Send + Sync {
         &self,
         request: Request<BlockRange>,
     ) -> Result<Response<EncodedBlockRangeStream>, Status>;
+
+    /// Returns whether [`Self::get_encoded_block_range_nullifier_frames`]
+    /// serves pre-batched frames on the uncompressed path.
+    fn supports_encoded_frames(&self) -> bool {
+        false
+    }
+
+    /// Opens a stream of pre-batched nullifier wire frames for uncompressed
+    /// responses.
+    async fn get_encoded_block_range_nullifier_frames(
+        &self,
+        _request: Request<BlockRange>,
+    ) -> Result<Response<EncodedBlockFrameStream>, Status> {
+        Err(Status::unimplemented(
+            "batched encoded nullifier block range is not implemented",
+        ))
+    }
 }
 
 impl<'a> ServerStreamingService<BlockRange> for &'a (dyn EncodedBlockRangeNullifiers + '_) {
@@ -135,6 +178,10 @@ pub struct InvalidEncodedBlock;
 impl EncodedBlock {
     /// Bytes before the payload: the compressed flag and the payload length.
     pub const PREFIX_LEN: usize = 5;
+
+    /// Framed message length at or above which an uncompressed response sends
+    /// the message as its own buffer rather than coalescing it into a batch.
+    pub const LARGE_MESSAGE_MIN_BYTES: usize = BATCH_BYTES;
 
     /// Encodes `block` with its gRPC length prefix.
     ///
@@ -297,17 +344,17 @@ where
     if !send_compression.is_empty() {
         return grpc.server_streaming(service, request).await;
     }
-    let mut messages = None;
+    let mut taken = None;
     let response = grpc
         .server_streaming(
             TakeMessages {
                 service,
-                messages: Some(&mut messages),
+                taken: Some(&mut taken),
             },
             request,
         )
         .await;
-    finish_encoded_body(response, messages, max_message_size)
+    finish_encoded_body(response, taken, max_message_size)
 }
 
 /// Handles one `GetBlockRangeNullifiers` call for the generated server, as
@@ -326,56 +373,60 @@ where
     if !send_compression.is_empty() {
         return grpc.server_streaming(service, request).await;
     }
-    let mut messages = None;
+    let mut taken = None;
     let response = grpc
         .server_streaming(
             TakeNullifierMessages {
                 service,
-                messages: Some(&mut messages),
+                taken: Some(&mut taken),
             },
             request,
         )
         .await;
-    finish_encoded_body(response, messages, max_message_size)
+    finish_encoded_body(response, taken, max_message_size)
 }
 
 /// Marks a response that keeps bounded allocations behind its data chunks and
 /// hands its messages to [`EncodedBlockBody`].
 fn finish_encoded_body(
     response: http::Response<Body>,
-    messages: Option<EncodedBlockRangeStream>,
+    taken: Option<TakenRangeStream>,
     max_message_size: Option<usize>,
 ) -> http::Response<Body> {
-    match messages {
-        Some(messages) => {
-            let (mut parts, _) = response.into_parts();
-            parts.extensions.insert(BoundedChunkRetention(()));
-            let body = EncodedBlockBody::new(messages, max_message_size);
-            http::Response::from_parts(parts, Body::new(body))
+    let (mut parts, _) = match taken {
+        Some(_) => response.into_parts(),
+        None => return response,
+    };
+    parts.extensions.insert(BoundedChunkRetention(()));
+    let body = match taken {
+        Some(TakenRangeStream::Blocks(messages)) => {
+            Body::new(EncodedBlockBody::new(messages, max_message_size))
         }
-        None => response,
-    }
+        Some(TakenRangeStream::Frames(frames)) => {
+            Body::new(EncodedFrameBody::new(frames, max_message_size))
+        }
+        None => return http::Response::from_parts(parts, Body::empty()),
+    };
+    http::Response::from_parts(parts, body)
 }
 
-/// Moves `response`'s messages into `taken` for [`EncodedBlockBody`] and
-/// returns the response with an empty stream for tonic to frame, or returns it
-/// unchanged when no slot is waiting.
-fn hand_off_messages(
-    taken: Option<&mut Option<EncodedBlockRangeStream>>,
-    response: Response<EncodedBlockRangeStream>,
+/// Moves `response`'s stream into `taken` and returns an empty stream for tonic.
+fn hand_off_stream<S>(
+    slot: Option<&mut Option<TakenRangeStream>>,
+    response: Response<S>,
+    wrap: fn(S) -> TakenRangeStream,
 ) -> Response<EncodedBlockRangeStream> {
-    let Some(taken) = taken else {
-        return response;
-    };
-    let (metadata, messages, extensions) = response.into_parts();
-    *taken = Some(messages);
+    let (metadata, stream, extensions) = response.into_parts();
+    if let Some(slot) = slot {
+        *slot = Some(wrap(stream));
+    }
     Response::from_parts(metadata, Box::pin(tokio_stream::empty()), extensions)
 }
 
 /// Opens the range for tonic and keeps its messages for [`EncodedBlockBody`].
 struct TakeMessages<'a> {
     service: &'a dyn EncodedBlockRange,
-    messages: Option<&'a mut Option<EncodedBlockRangeStream>>,
+    taken: Option<&'a mut Option<TakenRangeStream>>,
 }
 
 impl<'a> ServerStreamingService<BlockRange> for TakeMessages<'a> {
@@ -386,10 +437,15 @@ impl<'a> ServerStreamingService<BlockRange> for TakeMessages<'a> {
 
     fn call(&mut self, request: Request<BlockRange>) -> Self::Future {
         let service = self.service;
-        let taken = self.messages.take();
+        let taken = self.taken.take();
         Box::pin(async move {
-            let response = service.get_encoded_block_range(request).await?;
-            Ok(hand_off_messages(taken, response))
+            if service.supports_encoded_frames() {
+                let response = service.get_encoded_block_range_frames(request).await?;
+                Ok(hand_off_stream(taken, response, TakenRangeStream::Frames))
+            } else {
+                let response = service.get_encoded_block_range(request).await?;
+                Ok(hand_off_stream(taken, response, TakenRangeStream::Blocks))
+            }
         })
     }
 }
@@ -397,7 +453,7 @@ impl<'a> ServerStreamingService<BlockRange> for TakeMessages<'a> {
 /// Opens the nullifier range for tonic, as [`TakeMessages`] opens the range.
 struct TakeNullifierMessages<'a> {
     service: &'a dyn EncodedBlockRangeNullifiers,
-    messages: Option<&'a mut Option<EncodedBlockRangeStream>>,
+    taken: Option<&'a mut Option<TakenRangeStream>>,
 }
 
 impl<'a> ServerStreamingService<BlockRange> for TakeNullifierMessages<'a> {
@@ -408,10 +464,17 @@ impl<'a> ServerStreamingService<BlockRange> for TakeNullifierMessages<'a> {
 
     fn call(&mut self, request: Request<BlockRange>) -> Self::Future {
         let service = self.service;
-        let taken = self.messages.take();
+        let taken = self.taken.take();
         Box::pin(async move {
-            let response = service.get_encoded_block_range_nullifiers(request).await?;
-            Ok(hand_off_messages(taken, response))
+            if service.supports_encoded_frames() {
+                let response = service
+                    .get_encoded_block_range_nullifier_frames(request)
+                    .await?;
+                Ok(hand_off_stream(taken, response, TakenRangeStream::Frames))
+            } else {
+                let response = service.get_encoded_block_range_nullifiers(request).await?;
+                Ok(hand_off_stream(taken, response, TakenRangeStream::Blocks))
+            }
         })
     }
 }
@@ -623,6 +686,328 @@ impl http_body::Body for EncodedBlockBody {
         }
         let status = this.status.take().unwrap_or_else(|| Status::ok(""));
         Poll::Ready(Some(this.trailers(&status)))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.is_end_stream
+    }
+}
+
+/// One pre-batched piece of an uncompressed `GetBlockRange` response: either a
+/// coalesced batch of short gRPC messages within [`BoundedChunkRetention`] or
+/// one large message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedBlockFrame {
+    kind: FrameKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FrameKind {
+    Batch {
+        bytes: Bytes,
+        max_payload_len: usize,
+        open_batch: bool,
+    },
+    Large(EncodedBlock),
+}
+
+/// Groups `CompactBlock` payloads or [`EncodedBlock`] messages into
+/// [`EncodedBlockFrame`] pieces before handing a chunk to the HTTP/2 response
+/// task.
+///
+/// The first frame of a stream's first chunk flushes at `8 KiB` and later
+/// frames flush at `32 KiB`, while messages of at least
+/// [`EncodedBlock::LARGE_MESSAGE_MIN_BYTES`] (`32 KiB`) leave as their own
+/// buffer. Every emitted buffer satisfies [`BoundedChunkRetention`].
+#[derive(Debug)]
+pub struct EncodedBlockBatcher {
+    frames: Vec<EncodedBlockFrame>,
+    staged: Vec<u8>,
+    max_payload_len: usize,
+    sent_data: bool,
+    sent_of_batch: usize,
+}
+
+impl EncodedBlockBatcher {
+    /// Starts batching one chunk of a range stream.
+    ///
+    /// Pass `is_first_chunk = true` for the stream's opening chunk so its
+    /// initial frame flushes at `8 KiB`.
+    #[must_use]
+    pub const fn new(is_first_chunk: bool) -> Self {
+        Self {
+            frames: Vec::new(),
+            staged: Vec::new(),
+            max_payload_len: 0,
+            sent_data: !is_first_chunk,
+            sent_of_batch: 0,
+        }
+    }
+
+    /// Appends one raw `CompactBlock` protobuf payload (without the 5-byte
+    /// gRPC prefix) in wire order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidEncodedBlock`] when `payload` exceeds the 4 GiB gRPC
+    /// length field.
+    pub fn push_payload(&mut self, payload: &[u8]) -> Result<(), InvalidEncodedBlock> {
+        let prefix = message_prefix(payload.len())?;
+        let framed_len = EncodedBlock::PREFIX_LEN + payload.len();
+        if framed_len >= BATCH_BYTES {
+            self.flush_staged(true);
+            let mut buf = Vec::with_capacity(framed_len);
+            buf.extend_from_slice(&prefix);
+            buf.extend_from_slice(payload);
+            let allocation_len = buf.capacity();
+            let block = EncodedBlock {
+                message: Bytes::from(buf),
+                allocation_len: Some(allocation_len),
+            };
+            self.sent_data = true;
+            self.sent_of_batch = 0;
+            self.frames.push(EncodedBlockFrame {
+                kind: FrameKind::Large(block),
+            });
+            return Ok(());
+        }
+        self.reserve_staged(framed_len);
+        self.staged.extend_from_slice(&prefix);
+        self.staged.extend_from_slice(payload);
+        self.max_payload_len = self.max_payload_len.max(payload.len());
+        self.flush_if_due();
+        Ok(())
+    }
+
+    /// Appends one already length-prefixed [`EncodedBlock`] in wire order,
+    /// keeping large messages zero-copy when their allocation fits
+    /// [`BoundedChunkRetention`].
+    pub fn push_block(&mut self, block: EncodedBlock) {
+        if block.message.len() >= BATCH_BYTES {
+            self.flush_staged(true);
+            self.sent_data = true;
+            self.sent_of_batch = 0;
+            self.frames.push(EncodedBlockFrame {
+                kind: FrameKind::Large(block),
+            });
+            return;
+        }
+        let payload_len = block.payload_len();
+        self.reserve_staged(block.message.len());
+        self.staged.extend_from_slice(&block.message);
+        self.max_payload_len = self.max_payload_len.max(payload_len);
+        self.flush_if_due();
+    }
+
+    /// Finishes the chunk and returns its coalesced frames.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<EncodedBlockFrame> {
+        self.flush_staged(false);
+        self.frames
+    }
+
+    fn reserve_staged(&mut self, incoming_len: usize) {
+        if self.staged.capacity() == 0 {
+            let target = if self.sent_data {
+                BATCH_BYTES + 4 * 1024
+            } else {
+                FIRST_BATCH_BYTES + 1024
+            };
+            self.staged.reserve_exact(target.max(incoming_len));
+        }
+    }
+
+    fn flush_if_due(&mut self) {
+        let len = self.staged.len();
+        if !self.sent_data && (FIRST_BATCH_BYTES..BATCH_BYTES).contains(&len) {
+            self.flush_staged(false);
+            self.sent_of_batch = len;
+            return;
+        }
+        if len + self.sent_of_batch >= BATCH_BYTES {
+            self.flush_staged(false);
+        }
+    }
+
+    fn flush_staged(&mut self, open_batch: bool) {
+        if self.staged.is_empty() {
+            return;
+        }
+        self.sent_data = true;
+        self.sent_of_batch = 0;
+        let max_payload_len = mem::replace(&mut self.max_payload_len, 0);
+        let bytes = if self.staged.capacity() <= BoundedChunkRetention::MAX_ALLOCATION_BYTES
+            && self.staged.capacity() <= self.staged.len().saturating_mul(2)
+        {
+            Bytes::from(mem::take(&mut self.staged))
+        } else {
+            let copied = Bytes::copy_from_slice(&self.staged);
+            self.staged.clear();
+            copied
+        };
+        self.frames.push(EncodedBlockFrame {
+            kind: FrameKind::Batch {
+                bytes,
+                max_payload_len,
+                open_batch,
+            },
+        });
+    }
+}
+
+fn oversized_message_status(found: usize, limit: usize) -> Status {
+    Status::out_of_range(format!(
+        "Error, encoded message length too large: found {found} bytes, the limit is: {limit} bytes"
+    ))
+}
+
+fn first_oversized_payload(mut batch: &[u8], limit: usize) -> usize {
+    while let Some((prefix, rest)) = batch.split_at_checked(EncodedBlock::PREFIX_LEN) {
+        let len_bytes: [u8; 4] = prefix[1..].try_into().unwrap_or([0; 4]);
+        let payload_len = usize::try_from(u32::from_be_bytes(len_bytes)).unwrap_or(usize::MAX);
+        if payload_len > limit {
+            return payload_len;
+        }
+        let Some((_, after)) = rest.split_at_checked(payload_len) else {
+            break;
+        };
+        batch = after;
+    }
+    limit.saturating_add(1)
+}
+
+/// Uncompressed gRPC response body over pre-batched [`EncodedBlockFrame`] items.
+struct EncodedFrameBody {
+    frames: EncodedBlockFrameStream,
+    max_message_size: Option<usize>,
+    peeked: Option<Result<EncodedBlockFrame, Status>>,
+    large: Bytes,
+    copy_large: bool,
+    status: Option<Status>,
+    is_end_stream: bool,
+}
+
+impl EncodedFrameBody {
+    fn new(frames: EncodedBlockFrameStream, max_message_size: Option<usize>) -> Self {
+        Self {
+            frames,
+            max_message_size,
+            peeked: None,
+            large: Bytes::new(),
+            copy_large: false,
+            status: None,
+            is_end_stream: false,
+        }
+    }
+
+    fn poll_next_item(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<EncodedBlockFrame, Status>>> {
+        if let Some(buffered) = self.peeked.take() {
+            return Poll::Ready(Some(buffered));
+        }
+        self.frames.as_mut().poll_next(cx)
+    }
+
+    fn take_large(&mut self) -> Frame<Bytes> {
+        if !self.copy_large {
+            return Frame::data(mem::take(&mut self.large));
+        }
+        let piece_len = self.large.len().min(COPIED_PIECE_BYTES);
+        let piece = Bytes::copy_from_slice(&self.large[..piece_len]);
+        if piece_len == self.large.len() {
+            self.large = Bytes::new();
+        } else {
+            self.large.advance(piece_len);
+        }
+        Frame::data(piece)
+    }
+
+    fn trailers(&mut self, status: &Status) -> Result<Frame<Bytes>, Status> {
+        self.is_end_stream = true;
+        let mut trailers = http::HeaderMap::new();
+        status.add_header(&mut trailers)?;
+        Ok(Frame::trailers(trailers))
+    }
+
+    fn accept_batch(
+        &mut self,
+        cx: &mut Context<'_>,
+        bytes: Bytes,
+        max_payload_len: usize,
+        open_batch: bool,
+    ) -> Option<Frame<Bytes>> {
+        if let Some(limit) = self.max_message_size {
+            if max_payload_len > limit {
+                let found = first_oversized_payload(&bytes, limit);
+                self.status = Some(oversized_message_status(found, limit));
+                return None;
+            }
+            if open_batch && let Poll::Ready(Some(next_item)) = self.poll_next_item(cx) {
+                if let Ok(EncodedBlockFrame {
+                    kind: FrameKind::Large(ref block),
+                }) = next_item
+                    && block.payload_len() > limit
+                {
+                    self.status = Some(oversized_message_status(block.payload_len(), limit));
+                    return None;
+                }
+                self.peeked = Some(next_item);
+            }
+        }
+        Some(Frame::data(bytes))
+    }
+}
+
+impl http_body::Body for EncodedFrameBody {
+    type Data = Bytes;
+    type Error = Status;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
+        let this = self.get_mut();
+        if this.is_end_stream {
+            return Poll::Ready(None);
+        }
+        if !this.large.is_empty() {
+            return Poll::Ready(Some(Ok(this.take_large())));
+        }
+        if let Some(status) = this.status.take() {
+            return Poll::Ready(Some(this.trailers(&status)));
+        }
+        match this.poll_next_item(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(Some(this.trailers(&Status::ok("")))),
+            Poll::Ready(Some(Err(status))) => Poll::Ready(Some(this.trailers(&status))),
+            Poll::Ready(Some(Ok(EncodedBlockFrame { kind }))) => match kind {
+                FrameKind::Batch {
+                    bytes,
+                    max_payload_len,
+                    open_batch,
+                } => {
+                    if let Some(frame) = this.accept_batch(cx, bytes, max_payload_len, open_batch) {
+                        Poll::Ready(Some(Ok(frame)))
+                    } else {
+                        let status = this.status.take().unwrap_or_else(|| Status::ok(""));
+                        Poll::Ready(Some(this.trailers(&status)))
+                    }
+                }
+                FrameKind::Large(block) => {
+                    if let Some(limit) = this.max_message_size
+                        && block.payload_len() > limit
+                    {
+                        let status = oversized_message_status(block.payload_len(), limit);
+                        return Poll::Ready(Some(this.trailers(&status)));
+                    }
+                    this.copy_large = !block.may_be_sliced();
+                    this.large = block.message;
+                    Poll::Ready(Some(Ok(this.take_large())))
+                }
+            },
+        }
     }
 
     fn is_end_stream(&self) -> bool {

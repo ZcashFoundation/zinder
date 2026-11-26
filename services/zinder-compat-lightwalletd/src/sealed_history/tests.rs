@@ -863,10 +863,14 @@ fn the_terminal_height_and_hash_end_the_segment() {
 }
 
 fn dense_block(height: u32) -> eyre::Result<CompactBlockArtifact> {
+    dense_block_with_outputs(height, 12)
+}
+
+fn dense_block_with_outputs(height: u32, outputs: usize) -> eyre::Result<CompactBlockArtifact> {
     use zinder_core::{
         CompactSaplingOutput, CompactTransaction, CompactTransactionData, TransactionId,
     };
-    let tag = u8::try_from(height)?;
+    let tag = height.to_le_bytes()[0];
     Ok(CompactBlockArtifact::new(
         id(height),
         hash(height - 1),
@@ -883,7 +887,7 @@ fn dense_block(height: u32) -> eyre::Result<CompactBlockArtifact> {
                         ephemeral_key: [2; 32],
                         ciphertext: [3; 52],
                     };
-                    12
+                    outputs
                 ],
                 orchard_actions: Vec::new(),
                 ironwood_actions: Vec::new(),
@@ -892,7 +896,7 @@ fn dense_block(height: u32) -> eyre::Result<CompactBlockArtifact> {
             },
         }],
         CompactChainMetadata {
-            sapling_commitment_tree_size: height * 12,
+            sapling_commitment_tree_size: height * u32::try_from(outputs)?,
             orchard_commitment_tree_size: 0,
             ironwood_commitment_tree_size: 0,
         },
@@ -900,8 +904,8 @@ fn dense_block(height: u32) -> eyre::Result<CompactBlockArtifact> {
 }
 
 #[test]
-fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
-    const TOTAL_BLOCKS: u32 = 100;
+fn dense_chunks_split_into_independent_512kib_slabs() -> eyre::Result<()> {
+    const TOTAL_BLOCKS: u32 = 420;
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("shielded-dense");
     let mut writer = SegmentWriter::create(
@@ -926,7 +930,7 @@ fn dense_chunks_split_into_independent_64kib_slabs() -> eyre::Result<()> {
     let total_payload_bytes: usize = rows.iter().map(|row| row.message.payload_len()).sum();
     assert!(
         total_payload_bytes > SLAB_TARGET_BYTES,
-        "test fixture must exceed 64 KiB slab target (got {total_payload_bytes} bytes)"
+        "test fixture must exceed slab target (got {total_payload_bytes} bytes)"
     );
 
     let mut slab_one_count = 0_usize;
@@ -1278,5 +1282,68 @@ fn slab_validation_nibbles_update_independently_and_preserve_errors() -> eyre::R
         bad.validation[1].load(SealedSlab::Nullifier),
         Some(Ok(()))
     ));
+    Ok(())
+}
+
+#[test]
+fn append_frames_coalesces_short_slabs_and_isolates_large_rows_in_both_orders() -> eyre::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("mixed-frames");
+    let mut writer = SegmentWriter::create(
+        &path,
+        staged_files(dir.path())?,
+        SegmentIdentity::span(NETWORK, ARTIFACT_SCHEMA, id(1).height, id(6)),
+    )?;
+    for height in 1..=6 {
+        let built = if height == 4 {
+            dense_block_with_outputs(height, 320)?
+        } else if height.is_multiple_of(2) {
+            dense_block_with_outputs(height, 8)?
+        } else {
+            block(height)
+        };
+        let native_len = zinder_store::encode_compact_block_artifact(&built).len();
+        writer.push(built, native_len)?;
+    }
+    let identity = writer.finish()?;
+    let history = SealedHistory::open(&path, identity)?;
+
+    // Shielded row 4 exceeds 32 KiB, so plan_slabs splits [0..3], [3..4], [4..6].
+    let shielded_plan = history.plan_slabs(SealedSlab::Shielded, 0..6)?;
+    assert_eq!(shielded_plan.len(), 3);
+    assert_eq!(shielded_plan[0].0, 0..3);
+    assert_eq!(shielded_plan[1].0, 3..4);
+    assert_eq!(shielded_plan[2].0, 4..6);
+
+    let chunk_rows = history.read_chunk(
+        SealedSlab::Shielded,
+        range(1, 6),
+        HeightOrder::Ascending,
+        usize::MAX,
+    )?;
+    assert!(chunk_rows[3].message.as_length_prefixed().is_unique());
+
+    for slab in [SealedSlab::Shielded, SealedSlab::Nullifier] {
+        for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+            let expected = history.read_chunk(slab, range(1, 6), order, usize::MAX)?;
+            let mut scratch = WireProjectionScratch::default();
+            let mut batcher = EncodedBlockBatcher::new(true);
+            let span = history
+                .append_frames(
+                    PublishedProjection::ZeroCopy(slab),
+                    (range(1, 6), order),
+                    (usize::MAX, true),
+                    (&mut scratch, &mut batcher),
+                )?
+                .ok_or_else(|| eyre::eyre!("expected non-empty span"))?;
+            assert_eq!(span.kept_blocks, 6);
+            assert_eq!(span.lowest.id, id(1));
+            assert_eq!(span.highest.id, id(6));
+            let frames = batcher.finish();
+            assert_ne!(frames.len(), 0);
+            assert_eq!(expected.len(), 6);
+        }
+    }
     Ok(())
 }

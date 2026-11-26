@@ -1,4 +1,5 @@
 mod admission;
+mod high_concurrency;
 mod tail_identity;
 
 use super::{

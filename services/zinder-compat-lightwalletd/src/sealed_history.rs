@@ -35,11 +35,13 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, CompactBlockArtifact, Network,
     wire::{decode_internal_block_hash, encode_internal_block_hash},
 };
-use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
+use zinder_proto::compat::lightwalletd::{
+    self, BoundedChunkRetention, EncodedBlock, EncodedBlockBatcher,
+};
 use zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE;
-use zinder_store::HeightOrder;
+use zinder_store::{HeightOrder, ShieldedProjectionSelection};
 
-use crate::compact_block_messages::CompactBlockShape;
+use crate::compact_block_messages::{CompactBlockShape, PublishedProjection};
 
 // The magic binds the unified dual-slab segment format. All integers are big-endian.
 const MAGIC: &[u8; 8] = b"ZSHRNG01";
@@ -58,7 +60,7 @@ mod index;
 pub(crate) mod verity;
 // Bound the encoded bytes allocated for one authenticated row.
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
-const SLAB_TARGET_BYTES: usize = 64 * 1024;
+const SLAB_TARGET_BYTES: usize = BoundedChunkRetention::MAX_ALLOCATION_BYTES;
 // Bit 0 marks the nullifier slab present, which every segment must carry.
 const SEGMENT_FLAGS_HAS_NULLIFIER_SLAB: u16 = 0x0001;
 
@@ -640,6 +642,102 @@ pub(crate) struct SealedBlock {
     pub(crate) message: EncodedBlock,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlockLink {
+    pub(crate) id: BlockId,
+    pub(crate) parent: BlockHash,
+}
+
+impl crate::block_range::RangeBlock for BlockLink {
+    fn height(&self) -> BlockHeight {
+        self.id.height
+    }
+
+    fn block_hash(&self) -> BlockHash {
+        self.id.hash
+    }
+
+    fn previous_block_hash(&self) -> BlockHash {
+        self.parent
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct WireProjectionScratch {
+    frame: Vec<u8>,
+    tx: Vec<u8>,
+}
+
+impl WireProjectionScratch {
+    pub(crate) fn push_projected_payload(
+        &mut self,
+        raw_payload: &[u8],
+        selection: ShieldedProjectionSelection,
+        batcher: &mut EncodedBlockBatcher,
+    ) -> io::Result<()> {
+        if zinder_store::is_passthrough_shielded_block_wire(raw_payload, selection)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        {
+            return batcher
+                .push_payload(raw_payload)
+                .map_err(|_| invalid("shielded segment frame is not a gRPC message"));
+        }
+        zinder_store::project_shielded_block_wire_with_scratch(
+            raw_payload,
+            selection,
+            &mut self.frame,
+            &mut self.tx,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let frame_len = self.frame.len();
+        if frame_len >= EncodedBlock::LARGE_MESSAGE_MIN_BYTES {
+            let standalone = Bytes::copy_from_slice(&self.frame);
+            let block = EncodedBlock::from_length_prefixed_in(standalone, frame_len)
+                .map_err(|_| invalid("projected shielded frame is not a gRPC message"))?;
+            batcher.push_block(block);
+            return Ok(());
+        }
+        batcher
+            .push_payload(&self.frame[EncodedBlock::PREFIX_LEN..])
+            .map_err(|_| invalid("projected shielded frame is not a gRPC message"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChunkSpan {
+    pub(crate) lowest: BlockLink,
+    pub(crate) highest: BlockLink,
+    pub(crate) kept_blocks: usize,
+    pub(crate) kept_native_bytes: usize,
+}
+
+impl ChunkSpan {
+    pub(crate) const fn endpoints(&self) -> [BlockLink; 2] {
+        [self.lowest, self.highest]
+    }
+
+    pub(crate) fn merge(self, other: Self) -> Self {
+        let lowest = if self.lowest.id.height <= other.lowest.id.height {
+            self.lowest
+        } else {
+            other.lowest
+        };
+        let highest = if self.highest.id.height >= other.highest.id.height {
+            self.highest
+        } else {
+            other.highest
+        };
+        Self {
+            lowest,
+            highest,
+            kept_blocks: self.kept_blocks + other.kept_blocks,
+            kept_native_bytes: self
+                .kept_native_bytes
+                .saturating_add(other.kept_native_bytes),
+        }
+    }
+}
+
 pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     let file = {
@@ -754,6 +852,62 @@ impl SealedHistory {
             .map_err(|_| invalid("shielded segment row exceeds address space"))
     }
 
+    fn link_at(&self, index: usize) -> io::Result<BlockLink> {
+        Ok(BlockLink {
+            id: self.block_id(index)?,
+            parent: self.parent_at(index),
+        })
+    }
+
+    fn select_bounded(
+        &self,
+        range: BlockHeightRange,
+        order: HeightOrder,
+        max_bytes: usize,
+        allow_oversized: bool,
+    ) -> io::Result<Option<(std::ops::Range<usize>, usize)>> {
+        if range.start < self.identity.start
+            || range.end > self.identity.end.height
+            || range.start > range.end
+            || range.end.value() - range.start.value() >= DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()
+        {
+            return Err(invalid(
+                "shielded chunk is outside admitted coverage or height limit",
+            ));
+        }
+        let index = |height: BlockHeight| {
+            usize::try_from(height.value() - self.identity.start.value())
+                .map_err(|_| invalid("shielded segment height exceeds address space"))
+        };
+        let first = index(range.start)?;
+        let last = index(range.end)?;
+        let mut remaining = max_bytes;
+        let mut kept_native_bytes = 0_usize;
+        let mut count = 0;
+        let mut iter = self.native_bytes[first..=last].iter();
+        while let Some(&native) = match order {
+            HeightOrder::Ascending => iter.next(),
+            HeightOrder::Descending => iter.next_back(),
+        } {
+            let row_bytes = usize::try_from(native)
+                .map_err(|_| invalid("shielded segment row exceeds address space"))?;
+            if (count != 0 || !allow_oversized) && row_bytes > remaining {
+                break;
+            }
+            count += 1;
+            kept_native_bytes = kept_native_bytes.saturating_add(row_bytes);
+            remaining = remaining.saturating_sub(row_bytes);
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        let selected = match order {
+            HeightOrder::Ascending => first..first + count,
+            HeightOrder::Descending => last + 1 - count..last + 1,
+        };
+        Ok(Some((selected, kept_native_bytes)))
+    }
+
     #[cfg(test)]
     pub(crate) fn read_chunk(
         &self,
@@ -777,44 +931,41 @@ impl SealedHistory {
         max_bytes: usize,
         allow_oversized: bool,
     ) -> io::Result<Vec<SealedBlock>> {
-        if range.start < self.identity.start
-            || range.end > self.identity.end.height
-            || range.start > range.end
-            || range.end.value() - range.start.value() >= DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()
-        {
-            return Err(invalid(
-                "shielded chunk is outside admitted coverage or height limit",
-            ));
-        }
-        let index = |height: BlockHeight| {
-            usize::try_from(height.value() - self.identity.start.value())
-                .map_err(|_| invalid("shielded segment height exceeds address space"))
-        };
-        let first = index(range.start)?;
-        let last = index(range.end)?;
-        let mut remaining = max_bytes;
-        let mut count = 0;
-        let mut iter = self.native_bytes[first..=last].iter();
-        while let Some(&native) = match order {
-            HeightOrder::Ascending => iter.next(),
-            HeightOrder::Descending => iter.next_back(),
-        } {
-            let row_bytes = usize::try_from(native)
-                .map_err(|_| invalid("shielded segment row exceeds address space"))?;
-            if (count != 0 || !allow_oversized) && row_bytes > remaining {
-                break;
-            }
-            count += 1;
-            remaining = remaining.saturating_sub(row_bytes);
-        }
-        let selected = match order {
-            HeightOrder::Ascending => first..first + count,
-            HeightOrder::Descending => last + 1 - count..last + 1,
-        };
-        if selected.is_empty() {
+        let Some((selected, _)) = self.select_bounded(range, order, max_bytes, allow_oversized)?
+        else {
             return Ok(Vec::new());
-        }
+        };
         self.read_payloads(slab, selected)
+    }
+
+    pub(crate) fn append_frames(
+        &self,
+        projection: PublishedProjection,
+        (range, order): (BlockHeightRange, HeightOrder),
+        (max_bytes, allow_oversized): (usize, bool),
+        (scratch, batcher): (&mut WireProjectionScratch, &mut EncodedBlockBatcher),
+    ) -> io::Result<Option<ChunkSpan>> {
+        let slab = projection.slab();
+        let Some((selected, kept_native_bytes)) =
+            self.select_bounded(range, order, max_bytes, allow_oversized)?
+        else {
+            return Ok(None);
+        };
+        let span = ChunkSpan {
+            lowest: self.link_at(selected.start)?,
+            highest: self.link_at(selected.end - 1)?,
+            kept_blocks: selected.len(),
+            kept_native_bytes,
+        };
+        let mut plan = self.plan_slabs(slab, selected)?;
+        if order == HeightOrder::Descending {
+            plan.reverse();
+        }
+        for (rows, offset, len) in plan {
+            let slab_bytes = read_slab_at(&self.file, len, offset)?;
+            self.append_slab_frames(projection, (order, rows), slab_bytes, (scratch, batcher))?;
+        }
+        Ok(Some(span))
     }
 
     fn slab_rel(&self, slab: SealedSlab) -> &[u32] {
@@ -838,47 +989,168 @@ impl SealedHistory {
         }
     }
 
+    fn plan_slabs(
+        &self,
+        slab: SealedSlab,
+        selected: std::ops::Range<usize>,
+    ) -> io::Result<Vec<(std::ops::Range<usize>, u64, usize)>> {
+        let rel = self.slab_rel(slab);
+        let slab_len = self.slab_len(slab);
+        let base = self.slab_base(slab);
+        let first = selected.start;
+        let last = selected.end - 1;
+        let end_rel = rel_end(rel, slab_len, last)?;
+        let total_len = usize::try_from(u64::from(end_rel) - u64::from(rel[first]))
+            .map_err(|_| invalid("shielded chunk exceeds address space"))?;
+        if selected.len() == 1 {
+            return Ok(vec![(selected, base + u64::from(rel[first]), total_len)]);
+        }
+        let mut plan = Vec::new();
+        let mut start = first;
+        let mut bytes = 0_usize;
+        for index in selected.clone() {
+            let row_frame_len = frame_len(rel, slab_len, index)?;
+            let wire_len = row_frame_len - LENGTHS_LEN + EncodedBlock::PREFIX_LEN;
+            if wire_len >= EncodedBlock::LARGE_MESSAGE_MIN_BYTES {
+                if bytes != 0 {
+                    plan.push((start..index, base + u64::from(rel[start]), bytes));
+                    bytes = 0;
+                }
+                plan.push((
+                    index..index + 1,
+                    base + u64::from(rel[index]),
+                    row_frame_len,
+                ));
+                start = index + 1;
+                continue;
+            }
+            if bytes != 0 && bytes + row_frame_len > SLAB_TARGET_BYTES {
+                plan.push((start..index, base + u64::from(rel[start]), bytes));
+                start = index;
+                bytes = 0;
+            }
+            bytes += row_frame_len;
+        }
+        if bytes != 0 {
+            plan.push((start..selected.end, base + u64::from(rel[start]), bytes));
+        }
+        Ok(plan)
+    }
+
     fn read_payloads(
         &self,
         slab: SealedSlab,
         selected: std::ops::Range<usize>,
     ) -> io::Result<Vec<SealedBlock>> {
-        let rel = self.slab_rel(slab);
-        let slab_len = self.slab_len(slab);
-        let first = selected.start;
-        let last = selected.end - 1;
-        let first_frame = self.slab_base(slab) + u64::from(rel[first]);
-        let end_rel = rel_end(rel, slab_len, last)?;
-        let len = usize::try_from(u64::from(end_rel) - u64::from(rel[first]))
-            .map_err(|_| invalid("shielded chunk exceeds address space"))?;
-        let mut plan = Vec::new();
-        if selected.len() == 1 || len <= SLAB_TARGET_BYTES {
-            plan.push((selected.clone(), len));
-        } else {
-            let mut start = first;
-            let mut bytes = 0;
-            for index in selected.clone() {
-                let frame_len = frame_len(rel, slab_len, index)?;
-                if bytes != 0 && bytes + frame_len > SLAB_TARGET_BYTES {
-                    plan.push((start..index, bytes));
-                    start = index;
-                    bytes = 0;
-                }
-                bytes += frame_len;
-            }
-            plan.push((start..selected.end, bytes));
-        }
-        let mut offset = first_frame;
+        let plan = self.plan_slabs(slab, selected.clone())?;
         let mut slabs = Vec::with_capacity(plan.len());
-        for (rows, len) in plan {
+        for (rows, offset, len) in plan {
             slabs.push((rows, read_slab_at(&self.file, len, offset)?));
-            offset += len as u64;
         }
         let mut out = Vec::with_capacity(selected.len());
         for (rows, slab_bytes) in slabs {
             self.append_slab(slab, &mut out, rows, slab_bytes)?;
         }
         Ok(out)
+    }
+
+    fn verify_slab_rows(
+        &self,
+        slab: SealedSlab,
+        rows: std::ops::Range<usize>,
+        slab_bytes: &[u8],
+    ) -> io::Result<()> {
+        let rel = self.slab_rel(slab);
+        let slab_len = self.slab_len(slab);
+        let first_rel = rel[rows.start];
+        let lazy_meta = self.load_unvalidated_meta(slab, rows.clone())?;
+        for index in rows {
+            let frame_start = usize::try_from(u64::from(rel[index]) - u64::from(first_rel))
+                .map_err(|_| invalid("shielded chunk exceeds address space"))?;
+            self.verified_row_start(slab, index, slab_bytes, frame_start)?;
+            let payload_start = frame_start + LENGTHS_LEN;
+            let payload_len = frame_len(rel, slab_len, index)? - LENGTHS_LEN;
+            let lazy_digest = if self.kernel_verified && self.validation[index].load(slab).is_none()
+            {
+                digest_from_meta(lazy_meta.as_ref(), slab, index)?
+            } else {
+                None
+            };
+            self.verify_payload(
+                slab,
+                index,
+                &slab_bytes[payload_start..payload_start + payload_len],
+                lazy_digest.as_ref(),
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        }
+        Ok(())
+    }
+
+    fn append_slab_frames(
+        &self,
+        projection: PublishedProjection,
+        (order, rows): (HeightOrder, std::ops::Range<usize>),
+        mut slab_bytes: Vec<u8>,
+        (scratch, batcher): (&mut WireProjectionScratch, &mut EncodedBlockBatcher),
+    ) -> io::Result<()> {
+        let slab = projection.slab();
+        self.verify_slab_rows(slab, rows.clone(), &slab_bytes)?;
+        if rows.len() == 1
+            && slab_bytes.len() - LENGTHS_LEN + EncodedBlock::PREFIX_LEN
+                >= EncodedBlock::LARGE_MESSAGE_MIN_BYTES
+        {
+            let passthrough = match projection.selection() {
+                None => true,
+                Some(selection) => zinder_store::is_passthrough_shielded_block_wire(
+                    &slab_bytes[LENGTHS_LEN..],
+                    selection,
+                )
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            };
+            if passthrough {
+                slab_bytes[LENGTHS_LEN - EncodedBlock::PREFIX_LEN] = 0;
+                let slab_allocation = slab_bytes.capacity();
+                let packed = Bytes::from(slab_bytes);
+                let message = EncodedBlock::from_length_prefixed_in(
+                    packed.slice(LENGTHS_LEN - EncodedBlock::PREFIX_LEN..),
+                    slab_allocation,
+                )
+                .map_err(|_| invalid("shielded segment frame is not a gRPC message"))?;
+                batcher.push_block(message);
+                return Ok(());
+            }
+        }
+        let rel = self.slab_rel(slab);
+        let slab_len = self.slab_len(slab);
+        let first_rel = rel[rows.start];
+        let mut push_row = |index: usize| -> io::Result<()> {
+            let frame_start = usize::try_from(u64::from(rel[index]) - u64::from(first_rel))
+                .map_err(|_| invalid("shielded chunk exceeds address space"))?;
+            let payload_start = frame_start + LENGTHS_LEN;
+            let payload_len = frame_len(rel, slab_len, index)? - LENGTHS_LEN;
+            let raw_payload = &slab_bytes[payload_start..payload_start + payload_len];
+            if let Some(selection) = projection.selection() {
+                scratch.push_projected_payload(raw_payload, selection, batcher)
+            } else {
+                batcher
+                    .push_payload(raw_payload)
+                    .map_err(|_| invalid("shielded segment frame is not a gRPC message"))
+            }
+        };
+        match order {
+            HeightOrder::Ascending => {
+                for index in rows {
+                    push_row(index)?;
+                }
+            }
+            HeightOrder::Descending => {
+                for index in rows.rev() {
+                    push_row(index)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn append_slab(
@@ -888,24 +1160,24 @@ impl SealedHistory {
         rows: std::ops::Range<usize>,
         mut slab_bytes: Vec<u8>,
     ) -> io::Result<()> {
+        self.verify_slab_rows(slab, rows.clone(), &slab_bytes)?;
         let rel = self.slab_rel(slab);
         let slab_len = self.slab_len(slab);
         let first_rel = rel[rows.start];
-        let mut starts = Vec::with_capacity(rows.len());
         for index in rows.clone() {
             let frame_start = usize::try_from(u64::from(rel[index]) - u64::from(first_rel))
                 .map_err(|_| invalid("shielded chunk exceeds address space"))?;
-            self.verified_row_start(slab, index, &slab_bytes, frame_start)?;
             // The checked length field becomes the gRPC message prefix, so the
             // generated server's response body returns the row as a slice of
             // the slab instead of copying it into an encode buffer.
             slab_bytes[frame_start + LENGTHS_LEN - EncodedBlock::PREFIX_LEN] = 0;
-            starts.push(frame_start + LENGTHS_LEN);
         }
         let slab_allocation = slab_bytes.capacity();
         let packed = Bytes::from(slab_bytes);
-        let lazy_meta = self.load_unvalidated_meta(slab, rows.clone())?;
-        for (index, payload_start) in rows.zip(starts) {
+        for index in rows {
+            let frame_start = usize::try_from(u64::from(rel[index]) - u64::from(first_rel))
+                .map_err(|_| invalid("shielded chunk exceeds address space"))?;
+            let payload_start = frame_start + LENGTHS_LEN;
             let payload_len = frame_len(rel, slab_len, index)? - LENGTHS_LEN;
             // Every row of the slab keeps the whole slab alive.
             let message = EncodedBlock::from_length_prefixed_in(
@@ -913,14 +1185,6 @@ impl SealedHistory {
                 slab_allocation,
             )
             .map_err(|_| invalid("shielded segment frame is not a gRPC message"))?;
-            let lazy_digest = if self.kernel_verified && self.validation[index].load(slab).is_none()
-            {
-                digest_from_meta(lazy_meta.as_ref(), slab, index)?
-            } else {
-                None
-            };
-            self.verify_payload(slab, index, &message.payload(), lazy_digest.as_ref())
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             out.push(SealedBlock {
                 id: self.block_id(index)?,
                 parent: self.parent_at(index),
@@ -972,7 +1236,7 @@ impl SealedHistory {
         &self,
         slab: SealedSlab,
         index: usize,
-        payload: &Bytes,
+        payload: &[u8],
         lazy_digest: Option<&[u8; 32]>,
     ) -> Result<(), PayloadError> {
         // Portable files can change between reads. Only authenticated bytes share a verdict.
@@ -1001,8 +1265,8 @@ impl SealedHistory {
                 return Err(PayloadError::Identity);
             };
             let parent = self.parent_at(index);
-            let block = lightwalletd::CompactBlock::decode(payload.clone())
-                .map_err(|_| PayloadError::Protobuf)?;
+            let block =
+                lightwalletd::CompactBlock::decode(payload).map_err(|_| PayloadError::Protobuf)?;
             if block.height != u64::from(id.height.value())
                 || block.hash != encode_internal_block_hash(id.hash)
                 || block.prev_hash != encode_internal_block_hash(parent)

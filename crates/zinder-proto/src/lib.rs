@@ -154,7 +154,8 @@ pub mod compat {
         )]
 
         pub use crate::encoded_block_range::{
-            BoundedChunkRetention, EncodedBlock, EncodedBlockRange, EncodedBlockRangeNullifiers,
+            BoundedChunkRetention, EncodedBlock, EncodedBlockBatcher, EncodedBlockFrame,
+            EncodedBlockFrameStream, EncodedBlockRange, EncodedBlockRangeNullifiers,
             EncodedBlockRangeStream, InvalidEncodedBlock,
         };
 
