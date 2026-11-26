@@ -17,7 +17,7 @@ secondary_path = "/var/lib/zinder/query/canonical-secondary"
 # instead: the container limit describes the topology, not any one process.
 [storage.canonical.rocksdb]
 block_cache_bytes = 268435456
-max_open_files = 256
+max_open_files = 1024
 
 [wallet]
 path = "/var/lib/zinder/wallet"
