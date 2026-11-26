@@ -245,3 +245,25 @@ async fn a_reader_whose_window_updates_come_after_the_timeout_is_reset() -> Resu
     assert!(received.len() < sent.len(), "every byte arrived");
     Ok(())
 }
+
+/// A small single-frame unary response probed whole (<= 4 KiB) still resets
+/// and frees its data when the client withholds flow-control window.
+#[tokio::test]
+async fn a_small_unary_response_probed_whole_is_reset_when_window_is_withheld() -> Result<()> {
+    const TINY_WINDOW: u32 = 512;
+    const SMALL_UNARY_PAYLOAD: usize = 2 * 1024;
+    let mut server = serve(Bounds::default())?;
+    let channel = tonic_client(server.address, TINY_WINDOW).await?;
+    let mut stream = open_stream(&channel).await?;
+    let mut script = server.next_script().await?;
+    script.send_message(SMALL_UNARY_PAYLOAD).await?;
+    script.finish().await?;
+
+    wait_until("the stalled small unary response's data is freed", || {
+        server.all_freed(1)
+    })
+    .await?;
+    let (_, status) = read_to_end(&mut stream).await?;
+    assert_eq!(status, Code::Cancelled);
+    Ok(())
+}
