@@ -64,7 +64,7 @@ pub async fn run_active_writer_publication(
     config: &ActiveWriterPublicationConfig,
 ) -> Result<ActiveWriterPublicationReport, BenchError> {
     validate_config(config)?;
-    crate::recorder::install_tracing_subscriber();
+    crate::recorder::install_tracing_subscriber()?;
     let chain = build_generated_chain(config)?;
     let template_stores = TemplateStores::build(&chain, config).await?;
     let segment_boundary = next_segment_boundary(config, &chain);
@@ -273,6 +273,7 @@ async fn bootstrap_mode_runtime(
     chain: &GeneratedChain,
     template: &TemplateStores,
 ) -> Result<ModeRuntimeBootstrap, BenchError> {
+    crate::recorder::install_tracing_subscriber()?;
     let paths = ModePaths::prepare(template, config.scratch_dir.as_deref(), run_spec.label)?;
     let boundary_height = next_segment_boundary(config, chain);
 

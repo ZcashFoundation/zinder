@@ -30,7 +30,8 @@ type ProbeEventMap = Mutex<HashMap<(u16, u64), Vec<EncodedTailLookupRecord>>>;
 
 static RECORDER_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
-static TRACING_INIT: OnceLock<()> = OnceLock::new();
+static TRACING_INSTALLED: OnceLock<()> = OnceLock::new();
+static TRACING_INSTALL_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_PROBE_ID: AtomicU64 = AtomicU64::new(1);
 static PROBE_EVENTS: OnceLock<ProbeEventMap> = OnceLock::new();
 
@@ -65,9 +66,15 @@ pub fn install_recorder() -> Result<PrometheusHandle, BenchError> {
 /// Installs the process-wide `tracing` subscriber combining stderr logging with
 /// request-scoped `EncodedTail` lookup capture.
 ///
-/// Safe to invoke repeatedly across tests and CLI commands.
-pub fn install_tracing_subscriber() {
-    TRACING_INIT.get_or_init(|| {
+/// Safe to invoke repeatedly once installed by this helper.
+///
+/// # Errors
+///
+/// Returns [`BenchError::Recorder`] if another global `tracing` subscriber was
+/// already installed, which would leave request-scoped `EncodedTail` probe
+/// capture inactive.
+pub fn install_tracing_subscriber() -> Result<(), BenchError> {
+    install_tracing_subscriber_with(&TRACING_INSTALLED, &TRACING_INSTALL_LOCK, || {
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let fmt_layer = tracing_subscriber::fmt::layer()
@@ -77,11 +84,36 @@ pub fn install_tracing_subscriber() {
             let target = meta.target();
             target == ENCODED_TAIL_TARGET || target == BENCH_SERVER_SPAN_TARGET
         }));
-        let _ = tracing_subscriber::registry()
+        tracing_subscriber::registry()
             .with(fmt_layer)
             .with(capture_layer)
-            .try_init();
-    });
+            .try_init()
+    })
+}
+
+fn install_tracing_subscriber_with<F, E>(
+    installed: &OnceLock<()>,
+    install_lock: &Mutex<()>,
+    init: F,
+) -> Result<(), BenchError>
+where
+    F: FnOnce() -> Result<(), E>,
+    E: fmt::Display,
+{
+    if installed.get().is_some() {
+        return Ok(());
+    }
+    let install_guard = install_lock.lock();
+    if installed.get().is_some() {
+        drop(install_guard);
+        return Ok(());
+    }
+    init().map_err(|source| BenchError::Recorder {
+        reason: format!("failed to install tracing capture subscriber: {source}"),
+    })?;
+    let _ = installed.set(());
+    drop(install_guard);
+    Ok(())
 }
 
 /// One server-side `encoded_tail_lookup` resolution correlated to a request probe.
@@ -132,7 +164,6 @@ impl Drop for ProbeCaptureGuard {
 
 /// Begins capturing `encoded_tail_lookup` events tagged for `server_port`.
 pub(crate) fn begin_probe_capture(server_port: u16) -> ProbeCaptureGuard {
-    install_tracing_subscriber();
     let probe_id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
     probe_events()
         .lock()
@@ -291,14 +322,24 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BENCH_SERVER_SPAN_TARGET, ENCODED_TAIL_TARGET, begin_probe_capture,
-        install_tracing_subscriber,
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
     };
 
+    use parking_lot::Mutex;
+
+    use super::{
+        BENCH_SERVER_SPAN_TARGET, ENCODED_TAIL_TARGET, begin_probe_capture,
+        install_tracing_subscriber, install_tracing_subscriber_with,
+    };
+    use crate::error::BenchError;
+
     #[test]
-    fn scoped_capture_records_events_across_nested_spans() {
-        install_tracing_subscriber();
+    fn scoped_capture_records_events_across_nested_spans() -> Result<(), Box<dyn std::error::Error>>
+    {
+        install_tracing_subscriber()?;
+        install_tracing_subscriber()?;
         let guard = begin_probe_capture(42_420);
         let probe_id = guard.probe_id();
         let req_span = tracing::debug_span!(
@@ -332,5 +373,38 @@ mod tests {
         assert_eq!(events[0].outcome, "rebuild");
         assert_eq!(events[0].chain_epoch, 7);
         assert_eq!(events[0].tail_generation, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn install_tracing_subscriber_propagates_error_and_does_not_mark_initialized()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let installed = OnceLock::new();
+        let install_lock = Mutex::new(());
+        let calls = AtomicUsize::new(0);
+
+        let Err(err) = install_tracing_subscriber_with(&installed, &install_lock, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err::<(), &str>("global subscriber already set")
+        }) else {
+            return Err("failing subscriber install must propagate error".into());
+        };
+        assert!(matches!(err, BenchError::Recorder { .. }));
+        assert!(installed.get().is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        install_tracing_subscriber_with(&installed, &install_lock, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<(), &str>(())
+        })?;
+        assert!(installed.get().is_some());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        install_tracing_subscriber_with(&installed, &install_lock, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err::<(), &str>("should not invoke init once installed")
+        })?;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        Ok(())
     }
 }

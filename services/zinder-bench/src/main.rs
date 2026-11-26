@@ -310,7 +310,15 @@ struct CaptureTipReplayCheckpointsArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    zinder_bench::recorder::install_tracing_subscriber();
+    if let Err(error) = zinder_bench::recorder::install_tracing_subscriber() {
+        tracing::error!(
+            target: "zinder::bench",
+            event = "tracing_init_failed",
+            error = %error,
+            "failed to initialize benchmark tracing subscriber"
+        );
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
     if !zinder_runtime::host_cpu_meets_compiled_baseline() {
         return ExitCode::FAILURE;
