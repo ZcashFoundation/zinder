@@ -1,6 +1,6 @@
 kind: fixed
-body: Bounded mempool snapshot pages to 3.5 MiB of encoded protobuf alongside `max_entries` so `WalletQuery.MempoolSnapshot`, `GetMempoolTx`, and `GetMempoolStream` page cleanly through mempools larger than the 4 MiB default gRPC decode limit, and surfaced oversized single-entry refusals with typed `UNSUPPORTED_WALLET_ENCODING` `ErrorInfo`.
-time: 2026-11-26T13:44:45Z
+body: Bounded mempool snapshot pages to 3.5 MiB of encoded protobuf alongside `max_entries` so `WalletQuery.MempoolSnapshot`, `ExplorerQuery` mempool and overview handlers, `GetMempoolTx`, and `GetMempoolStream` page cleanly through mempools larger than the 4 MiB default gRPC decode limit, while keeping `zinder-query` ingest-control health probes ready and surfacing oversized single-entry refusals with typed `UNSUPPORTED_WALLET_ENCODING` `ErrorInfo`.
+time: 2026-11-26T14:01:30Z
 custom:
     Bump: patch
     PR: "654"

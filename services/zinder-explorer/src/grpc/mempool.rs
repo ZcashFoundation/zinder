@@ -12,11 +12,13 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonic::{Request, Response, Status};
+use tonic_types::StatusExt as _;
 use zinder_core::wire::{decode_rpc_transaction_id_hex, encode_rpc_transaction_id_hex};
 use zinder_core::{
     NetworkUpgradeActivations, TransactionPublicFacts as CoreFacts,
     TransactionVersion as CoreTransactionVersion,
 };
+use zinder_proto::ZINDER_ERROR_DOMAIN;
 use zinder_proto::capabilities::{EXPLORER_MEMPOOL_ACTIVITY_V1, EXPLORER_MEMPOOL_SUMMARY_V1};
 use zinder_proto::v1::explorer::{
     MempoolActivityEntry, MempoolActivityRequest, MempoolActivityResponse, MempoolSnapshotRequest,
@@ -42,10 +44,12 @@ use zinder_materialized_views::MaterializedViewStore;
 /// Hard cap on the mempool entries the summary aggregates in one call.
 ///
 /// Mempool sizes on mainnet sit in the low thousands; bounding the read
-/// keeps parse cost predictable and the gRPC frame within tonic's
-/// per-message limit even when every entry hydrates the raw transaction
-/// bytes.
-const MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST: u32 = 4_096;
+/// keeps parse cost predictable across continuation pages.
+pub(crate) const MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST: u32 = 4_096;
+
+/// Maximum full-walk attempts when the chain tip or snapshot cursor moves
+/// mid-pagination across `WalletQuery.MempoolSnapshot` pages.
+const MAX_MEMPOOL_SNAPSHOT_WALK_ATTEMPTS: usize = 3;
 
 /// Hard cap on the rows one `MempoolActivity` page returns.
 ///
@@ -131,15 +135,28 @@ impl MempoolSummaryBuilder {
     }
 }
 
-struct ParsedMempoolEntry<'entry> {
-    entry: &'entry MempoolEntry,
-    facts: CoreFacts,
+struct ProjectedActivityRow {
+    sort_key: (u64, u32),
+    activity: MempoolActivityEntry,
 }
 
 struct MempoolSnapshotPage {
     summary: MempoolSnapshotSummary,
     entries: Vec<MempoolActivityEntry>,
     next_cursor: Vec<u8>,
+}
+
+/// Completed multi-page `WalletQuery.MempoolSnapshot` drain anchored to one
+/// coherent chain epoch.
+pub(crate) struct DrainedMempoolWalk<T> {
+    pub(crate) chain_epoch: wallet::ChainEpoch,
+    pub(crate) snapshot_age_millis: u64,
+    pub(crate) output: T,
+}
+
+enum SnapshotWalkAttempt<T> {
+    Completed(DrainedMempoolWalk<T>),
+    Restart,
 }
 
 /// Executes one `ExplorerQuery.MempoolSummary` request.
@@ -151,30 +168,26 @@ pub(crate) async fn query_mempool_summary(
     request: Request<MempoolSummaryRequest>,
 ) -> Result<Response<MempoolSummaryResponse>, Status> {
     let _inner = request.into_inner();
-    let snapshot = fetch_mempool_snapshot(wallet_client).await?;
-    let now_unix_millis = current_unix_millis();
     let activations = NetworkUpgradeActivations::empty(network);
-    let mut summary = MempoolSummaryBuilder::default();
-    for entry in &snapshot.entries {
-        let facts = parse_facts(entry, &activations)?;
-        summary.observe(entry, &facts);
-    }
-    let summary = summary.finish(now_unix_millis);
-
-    let chain_epoch = snapshot
-        .chain_view
-        .clone()
-        .and_then(|chain_view| chain_view.chain_epoch)
-        .ok_or_else(|| {
-            ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
-        })?;
+    let drained = drain_wallet_mempool_snapshot(
+        wallet_client,
+        MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST,
+        MempoolSummaryBuilder::default,
+        |summary, entry| {
+            let facts = parse_facts(entry, &activations)?;
+            summary.observe(entry, &facts);
+            Ok(())
+        },
+    )
+    .await?;
+    let summary = drained.output.finish(current_unix_millis());
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
             materialized_view_store,
             EXPLORER_MEMPOOL_SUMMARY_V1,
-            Some(chain_epoch),
-            snapshot.snapshot_age_millis,
+            Some(drained.chain_epoch),
+            drained.snapshot_age_millis,
         )?,
     )
     .await;
@@ -205,29 +218,24 @@ pub(crate) async fn query_mempool_snapshot(
         MAX_MEMPOOL_ACTIVITY_ENTRIES_PER_REQUEST,
     );
     let cursor = decode_activity_cursor(&request.from_cursor)?;
-    let snapshot = fetch_mempool_snapshot(wallet_client).await?;
-    let now_unix_millis = current_unix_millis();
     let activations = NetworkUpgradeActivations::empty(network);
-    let page = build_mempool_snapshot_page(
-        &snapshot,
-        &activations,
-        max_entries,
-        cursor,
-        now_unix_millis,
-    )?;
-    let chain_epoch = snapshot
-        .chain_view
-        .and_then(|chain_view| chain_view.chain_epoch)
-        .ok_or_else(|| {
-            ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
-        })?;
+    let drained = drain_wallet_mempool_snapshot(
+        wallet_client,
+        MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST,
+        || (MempoolSummaryBuilder::default(), Vec::new()),
+        |(summary, rows), entry| observe_snapshot_entry(summary, rows, entry, &activations, cursor),
+    )
+    .await?;
+    let (summary_builder, rows) = drained.output;
+    let page =
+        finish_mempool_snapshot_page(summary_builder, rows, max_entries, current_unix_millis());
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
             materialized_view_store,
             zinder_proto::capabilities::EXPLORER_MEMPOOL_SNAPSHOT_V1,
-            Some(chain_epoch),
-            snapshot.snapshot_age_millis,
+            Some(drained.chain_epoch),
+            drained.snapshot_age_millis,
         )?,
     )
     .await;
@@ -240,6 +248,43 @@ pub(crate) async fn query_mempool_snapshot(
     }))
 }
 
+fn observe_snapshot_entry(
+    summary: &mut MempoolSummaryBuilder,
+    rows: &mut Vec<ProjectedActivityRow>,
+    entry: &MempoolEntry,
+    activations: &NetworkUpgradeActivations,
+    cursor: Option<(u64, u32)>,
+) -> Result<(), Status> {
+    let facts = parse_facts(entry, activations)?;
+    summary.observe(entry, &facts);
+    let sort_key = (
+        entry.first_seen_unix_millis,
+        transaction_id_tail(&entry.transaction_id),
+    );
+    if cursor.is_none_or(|cursor_key| sort_key < cursor_key) {
+        rows.push(ProjectedActivityRow {
+            sort_key,
+            activity: build_mempool_activity_entry(entry, &facts),
+        });
+    }
+    Ok(())
+}
+
+fn finish_mempool_snapshot_page(
+    summary: MempoolSummaryBuilder,
+    rows: Vec<ProjectedActivityRow>,
+    max_entries: u32,
+    now_unix_millis: u64,
+) -> MempoolSnapshotPage {
+    let (entries, next_cursor) = select_activity_rows(rows, max_entries);
+    MempoolSnapshotPage {
+        summary: summary.finish(now_unix_millis),
+        entries,
+        next_cursor,
+    }
+}
+
+#[cfg(test)]
 fn build_mempool_snapshot_page(
     snapshot: &wallet::MempoolSnapshotResponse,
     activations: &NetworkUpgradeActivations,
@@ -248,50 +293,33 @@ fn build_mempool_snapshot_page(
     now_unix_millis: u64,
 ) -> Result<MempoolSnapshotPage, Status> {
     let mut summary = MempoolSummaryBuilder::default();
-    let mut parsed_entries = Vec::with_capacity(snapshot.entries.len());
-
+    let mut rows = Vec::with_capacity(snapshot.entries.len());
     for entry in &snapshot.entries {
-        let facts = parse_facts(entry, activations)?;
-        summary.observe(entry, &facts);
-        parsed_entries.push(ParsedMempoolEntry { entry, facts });
+        observe_snapshot_entry(&mut summary, &mut rows, entry, activations, cursor)?;
     }
+    Ok(finish_mempool_snapshot_page(
+        summary,
+        rows,
+        max_entries,
+        now_unix_millis,
+    ))
+}
 
-    parsed_entries.sort_by(|left, right| {
-        right
-            .entry
-            .first_seen_unix_millis
-            .cmp(&left.entry.first_seen_unix_millis)
-            .then_with(|| {
-                transaction_id_tail(&right.entry.transaction_id)
-                    .cmp(&transaction_id_tail(&left.entry.transaction_id))
-            })
-    });
-
-    let mut entries = Vec::with_capacity(max_entries as usize);
+fn select_activity_rows(
+    mut rows: Vec<ProjectedActivityRow>,
+    max_entries: u32,
+) -> (Vec<MempoolActivityEntry>, Vec<u8>) {
+    rows.sort_by_key(|row| std::cmp::Reverse(row.sort_key));
+    let cap = usize::try_from(max_entries).unwrap_or(usize::MAX);
+    let mut entries = Vec::with_capacity(cap.min(rows.len()));
     let mut last_emitted: Option<(u64, u32)> = None;
-    for parsed in parsed_entries {
-        let position = (
-            parsed.entry.first_seen_unix_millis,
-            transaction_id_tail(&parsed.entry.transaction_id),
-        );
-        if let Some((cursor_millis, cursor_tail)) = cursor
-            && (position.0, position.1) >= (cursor_millis, cursor_tail)
-        {
-            continue;
-        }
-        entries.push(build_mempool_activity_entry(parsed.entry, &parsed.facts));
-        last_emitted = Some(position);
-        if u32::try_from(entries.len()).unwrap_or(u32::MAX) >= max_entries {
-            break;
-        }
+    for row in rows.into_iter().take(cap) {
+        last_emitted = Some(row.sort_key);
+        entries.push(row.activity);
     }
-
-    Ok(MempoolSnapshotPage {
-        summary: summary.finish(now_unix_millis),
-        entries,
-        next_cursor: last_emitted
-            .map_or_default(|(millis, tail)| encode_activity_cursor(millis, tail)),
-    })
+    let next_cursor =
+        last_emitted.map_or_default(|(millis, tail)| encode_activity_cursor(millis, tail));
+    (entries, next_cursor)
 }
 
 /// Executes one `ExplorerQuery.MempoolActivity` request.
@@ -309,58 +337,36 @@ pub(crate) async fn query_mempool_activity(
         MAX_MEMPOOL_ACTIVITY_ENTRIES_PER_REQUEST,
     );
     let cursor = decode_activity_cursor(&inner.from_cursor)?;
-
-    let snapshot = fetch_mempool_snapshot(wallet_client).await?;
     let activations = NetworkUpgradeActivations::empty(network);
-
-    let mut sorted: Vec<&MempoolEntry> = snapshot.entries.iter().collect();
-    sorted.sort_by(|left, right| {
-        right
-            .first_seen_unix_millis
-            .cmp(&left.first_seen_unix_millis)
-            .then_with(|| {
-                transaction_id_tail(&right.transaction_id)
-                    .cmp(&transaction_id_tail(&left.transaction_id))
-            })
-    });
-
-    let mut entries = Vec::with_capacity(max_entries as usize);
-    let mut last_emitted: Option<(u64, u32)> = None;
-    for entry in sorted {
-        let position = (
-            entry.first_seen_unix_millis,
-            transaction_id_tail(&entry.transaction_id),
-        );
-        if let Some((cursor_millis, cursor_tail)) = cursor
-            && (position.0, position.1) >= (cursor_millis, cursor_tail)
-        {
-            continue;
-        }
-        entries.push(build_mempool_activity_entry(
-            entry,
-            &parse_facts(entry, &activations)?,
-        ));
-        last_emitted = Some(position);
-        if u32::try_from(entries.len()).unwrap_or(u32::MAX) >= max_entries {
-            break;
-        }
-    }
-
-    let next_cursor =
-        last_emitted.map_or_default(|(millis, tail)| encode_activity_cursor(millis, tail));
-    let chain_epoch = snapshot
-        .chain_view
-        .and_then(|chain_view| chain_view.chain_epoch)
-        .ok_or_else(|| {
-            ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
-        })?;
+    let drained = drain_wallet_mempool_snapshot(
+        wallet_client,
+        MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST,
+        Vec::new,
+        |rows, entry| {
+            let sort_key = (
+                entry.first_seen_unix_millis,
+                transaction_id_tail(&entry.transaction_id),
+            );
+            if cursor.is_some_and(|cursor_key| sort_key >= cursor_key) {
+                return Ok(());
+            }
+            let facts = parse_facts(entry, &activations)?;
+            rows.push(ProjectedActivityRow {
+                sort_key,
+                activity: build_mempool_activity_entry(entry, &facts),
+            });
+            Ok(())
+        },
+    )
+    .await?;
+    let (entries, next_cursor) = select_activity_rows(drained.output, max_entries);
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
             materialized_view_store,
             EXPLORER_MEMPOOL_ACTIVITY_V1,
-            Some(chain_epoch),
-            snapshot.snapshot_age_millis,
+            Some(drained.chain_epoch),
+            drained.snapshot_age_millis,
         )?,
     )
     .await;
@@ -372,16 +378,123 @@ pub(crate) async fn query_mempool_activity(
     }))
 }
 
-async fn fetch_mempool_snapshot(
+/// Drains `WalletQuery.MempoolSnapshot` continuation pages up to `max_total_entries`.
+///
+/// Drops each raw page after projecting its entries and restarts cleanly if the
+/// chain epoch or snapshot cursor advances mid-walk.
+pub(crate) async fn drain_wallet_mempool_snapshot<T, Init, Observe>(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
-) -> Result<wallet::MempoolSnapshotResponse, Status> {
-    Ok(wallet_client
-        .mempool_snapshot(Request::new(WalletMempoolSnapshotRequest {
-            max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST,
-            from_cursor: Vec::new(),
-        }))
-        .await?
-        .into_inner())
+    max_total_entries: u32,
+    mut init: Init,
+    mut observe: Observe,
+) -> Result<DrainedMempoolWalk<T>, Status>
+where
+    Init: FnMut() -> T,
+    Observe: FnMut(&mut T, &MempoolEntry) -> Result<(), Status>,
+{
+    for _ in 0..MAX_MEMPOOL_SNAPSHOT_WALK_ATTEMPTS {
+        match drain_single_snapshot_attempt(wallet_client, max_total_entries, init(), &mut observe)
+            .await?
+        {
+            SnapshotWalkAttempt::Completed(walk) => return Ok(walk),
+            SnapshotWalkAttempt::Restart => {}
+        }
+    }
+    Err(ExplorerError::upstream_unreachable(
+        "mempool snapshot changed across repeated pagination attempts",
+    )
+    .into())
+}
+
+async fn drain_single_snapshot_attempt<T, Observe>(
+    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    max_total_entries: u32,
+    mut output: T,
+    observe: &mut Observe,
+) -> Result<SnapshotWalkAttempt<T>, Status>
+where
+    Observe: FnMut(&mut T, &MempoolEntry) -> Result<(), Status>,
+{
+    let mut from_cursor = Vec::new();
+    let mut observed_entries: u32 = 0;
+    let mut anchor: Option<(wallet::ChainEpoch, u64)> = None;
+
+    loop {
+        let remaining = max_total_entries.saturating_sub(observed_entries);
+        let is_continuation_page = !from_cursor.is_empty();
+        let response = match wallet_client
+            .mempool_snapshot(Request::new(WalletMempoolSnapshotRequest {
+                max_entries: remaining,
+                from_cursor,
+            }))
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if is_snapshot_walk_reset_status(&status, is_continuation_page) => {
+                return Ok(SnapshotWalkAttempt::Restart);
+            }
+            Err(status) => return Err(status),
+        };
+        let page_epoch = response
+            .chain_view
+            .and_then(|chain_view| chain_view.chain_epoch)
+            .ok_or_else(|| {
+                ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
+            })?;
+        if let Some((ref first_epoch, _)) = anchor {
+            if !same_snapshot_epoch(first_epoch, &page_epoch) {
+                return Ok(SnapshotWalkAttempt::Restart);
+            }
+        } else {
+            anchor = Some((page_epoch, response.snapshot_age_millis));
+        }
+        if response.entries.is_empty() && !response.next_cursor.is_empty() {
+            return Err(ExplorerError::internal(
+                "MempoolSnapshotResponse returned next_cursor with an empty page",
+            )
+            .into());
+        }
+        let page_cap = usize::try_from(remaining).unwrap_or(usize::MAX);
+        for entry in response.entries.iter().take(page_cap) {
+            observe(&mut output, entry)?;
+            observed_entries = observed_entries.saturating_add(1);
+        }
+        drop(response.entries);
+        let next_cursor = response.next_cursor;
+        if next_cursor.is_empty() || observed_entries >= max_total_entries {
+            let (chain_epoch, snapshot_age_millis) = anchor.ok_or_else(|| {
+                ExplorerError::internal("mempool snapshot walk completed without an anchor")
+            })?;
+            return Ok(SnapshotWalkAttempt::Completed(DrainedMempoolWalk {
+                chain_epoch,
+                snapshot_age_millis,
+                output,
+            }));
+        }
+        from_cursor = next_cursor;
+    }
+}
+
+fn same_snapshot_epoch(left: &wallet::ChainEpoch, right: &wallet::ChainEpoch) -> bool {
+    left.chain_epoch_id == right.chain_epoch_id && left.visible_tip == right.visible_tip
+}
+
+fn is_snapshot_walk_reset_status(status: &Status, is_continuation_page: bool) -> bool {
+    let details = status.get_error_details();
+    let Some(error_detail) = details.error_info() else {
+        return false;
+    };
+    if error_detail.domain != ZINDER_ERROR_DOMAIN {
+        return false;
+    }
+    match error_detail.reason.as_str() {
+        "CHAIN_EPOCH_PIN_UNAVAILABLE" => true,
+        "SNAPSHOT_PAGE_CURSOR_EXPIRED"
+        | "MEMPOOL_EVENT_CURSOR_EXPIRED"
+        | "STREAM_CURSOR_EPOCH_MISMATCH"
+        | "STREAM_CURSOR_EXPIRED" => is_continuation_page,
+        _ => false,
+    }
 }
 
 fn parse_facts(
