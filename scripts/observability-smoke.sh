@@ -65,8 +65,8 @@ COMPAT_CONFIG="${CONFIG_DIR}/zinder-compat-lightwalletd.toml"
 QUERY_CONFIG="${CONFIG_DIR}/zinder-query.toml"
 
 BULK_CATCHUP_SECONDS="null"
-RESTORE_STATUS="blocked"
-RESTORE_ERROR_CLASS="coherent_canonical_wallet_bundle_unimplemented"
+RESTORE_STATUS="not_exercised"
+RESTORE_ERROR_CLASS=""
 REPORT_JSON_PATH=""
 REPORT_MARKDOWN_PATH=""
 RUN_ID=""
@@ -93,11 +93,11 @@ usage() {
 Usage: scripts/observability-smoke.sh [run|calibrate|snapshot|stop]
 
 Commands:
-  run        Start Prometheus/Grafana, bulk catch up from a checkpoint, record
-             that restore is blocked until coherent canonical-plus-wallet
-             bundles exist, start ingest/projector/compat
-             services, generate traffic, print Prometheus evidence, and write
-             a readiness report.
+  run        Start Prometheus/Grafana, bulk catch up from a checkpoint, start
+             ingest/projector/query/compat services, generate traffic, print
+             Prometheus evidence, and write a readiness report. Backup/restore
+             is reported as not_exercised unless exercised separately with
+             zinder-projector backup/verify/restore.
              This is the default command.
   calibrate  Run the same smoke multiple times and write an aggregate baseline
              report. Set ZINDER_OBSERVABILITY_RUNS to control the run count.
@@ -929,8 +929,8 @@ PY
   log "checkpoint bulk catchup completed in ${BULK_CATCHUP_SECONDS}s"
 }
 
-record_restore_unavailability() {
-  log "restore remains blocked: a coherent canonical-plus-wallet bundle restore is not implemented"
+record_restore_smoke_status() {
+  log "backup/restore is not exercised by this smoke run (use zinder-projector backup/verify/restore to exercise coherent bundles)"
 }
 
 lightwalletd_grpc() {
@@ -1656,7 +1656,7 @@ report = {
     },
     "restore": {
         "status": os.environ["REPORT_RESTORE_STATUS"],
-        "error_class": os.environ["REPORT_RESTORE_ERROR_CLASS"],
+        "error_class": os.environ["REPORT_RESTORE_ERROR_CLASS"] or None,
     },
     "endpoints": {
         "prometheus": os.environ["REPORT_PROMETHEUS_URL"],
@@ -1866,7 +1866,7 @@ run_stack() {
   wait_http grafana "http://127.0.0.1:${GRAFANA_PORT}/api/health" 120
 
   run_bulk_catchup_seed
-  record_restore_unavailability
+  record_restore_smoke_status
 
   # Long-running ingest. No --target-height here, so the loop
   # runs indefinitely (transitioning to FollowingTip once the store

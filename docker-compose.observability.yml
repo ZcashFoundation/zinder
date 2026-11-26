@@ -23,9 +23,8 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
       - "--web.enable-lifecycle"
-      - "--web.enable-admin-api"
     ports:
-      - "${ZINDER_PROMETHEUS_PORT:-9095}:9090"
+      - "127.0.0.1:${ZINDER_PROMETHEUS_PORT:-9095}:9090"
     networks:
       - zinder_observability
     healthcheck:
@@ -48,7 +47,7 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${ZINDER_GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_DEFAULT_THEME: light
     ports:
-      - "${ZINDER_GRAFANA_PORT:-3002}:3000"
+      - "127.0.0.1:${ZINDER_GRAFANA_PORT:-3002}:3000"
     networks:
       - zinder_observability
     depends_on:
