@@ -92,7 +92,7 @@ pub(crate) fn load_explorer_config(
         .with_default("storage.path", DEFAULT_CANONICAL_PATH)?
         .with_default(
             "storage.secondary_path",
-            "/var/lib/zinder/explorer-secondary",
+            "/var/lib/zinder/explorer/secondary",
         )?
         .with_default("explorer.listen_addr", DEFAULT_LISTEN_ADDR)?
         .with_ops_section(RuntimeService::Explorer)?

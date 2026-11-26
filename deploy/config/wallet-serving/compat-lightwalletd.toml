@@ -1,7 +1,7 @@
 # lightwalletd-compatible CompactTxStreamer configuration for the Railway
-# wallet-serving container. Like the query surface, it binds beyond loopback:
-# Railway's private network is IPv6-only and lightwalletd clients reach this
-# process from outside. Its operational endpoint stays on loopback.
+# wallet-serving container. Like the query surface, both its gRPC listener and
+# operational endpoint bind beyond loopback: Railway's private network is
+# IPv6-only and clients reach this process from outside.
 
 [node]
 request_timeout_secs = 30

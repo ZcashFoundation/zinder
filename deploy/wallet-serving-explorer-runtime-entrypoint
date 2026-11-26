@@ -216,6 +216,28 @@ ulimit -n "$nofile_limit" \
 mkdir -p "$explorer_secondary_path"
 chown -R zinder:zinder "$(dirname "$explorer_secondary_path")"
 
+# deployment.profile rejects Explorer views inside zinder-ingest, and light-wallet
+# does not run projector+query. Fail here before Explorer preflight or wallet
+# serving starts unless Explorer views were explicitly turned off.
+for variable_name in $(zinder_variable_names); do
+  if [ "$(section_routing_name "$variable_name")" = ZINDER_DEPLOYMENT__PROFILE ]; then
+    deployment_profile="$(printenv "$variable_name")"
+    case "$deployment_profile" in
+      light-wallet)
+        fail "ZINDER_DEPLOYMENT__PROFILE=light-wallet is not supported in this single-volume image, which always starts zinder-projector and zinder-query; use the standalone zinder-ingest and zinder-compat-lightwalletd images instead"
+        ;;
+      wallet | wallet-archive)
+        if ! explorer_views_disabled; then
+          fail "ZINDER_DEPLOYMENT__PROFILE=$deployment_profile cannot be combined with Explorer views; remove ZINDER_DEPLOYMENT__PROFILE or set ZINDER_INGEST__EXPLORER_VIEWS=false"
+        fi
+        ;;
+      *)
+        fail "ZINDER_DEPLOYMENT__PROFILE must be wallet or wallet-archive, got '$deployment_profile'"
+        ;;
+    esac
+  fi
+done
+
 # An invalid Explorer configuration fails the deployment here, before wallet
 # serving spends hours building readiness, instead of on every Explorer start.
 if ! (run_explorer --print-config) >/dev/null; then

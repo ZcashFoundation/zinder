@@ -83,13 +83,14 @@ recurrence_min_answered_episode_seconds=60
 # define. The `env_var_contract` tests of each service hold these lists to the
 # loaders. The `wallet_serving` settings configure this entrypoint and reach
 # no process.
-ingest_config_paths="network ops node node_fallbacks security ingest_control ingest retention storage.path storage.canonical storage.materialized_views storage.raw_blob_policy"
-projector_config_paths="network ops security ingest_control projector projector_control storage.canonical_path storage.canonical_secondary_path storage.canonical storage.raw_blob_policy wallet.path wallet.rocksdb"
-query_config_paths="network ops node node_fallbacks security ingest_control query wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
-compat_config_paths="network ops node node_fallbacks security ingest_control compat wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
+ingest_config_paths="deployment network ops node node_fallbacks security ingest_control ingest retention storage.path storage.canonical storage.materialized_views storage.raw_blob_policy"
+projector_config_paths="deployment network ops security ingest_control projector projector_control storage.canonical_path storage.canonical_secondary_path storage.canonical storage.raw_blob_policy wallet.path wallet.rocksdb"
+query_config_paths="deployment network ops node node_fallbacks security ingest_control query wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
+compat_config_paths="deployment network ops node node_fallbacks security ingest_control compat wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
 entrypoint_config_paths="wallet_serving.canonical_construction_deadline_seconds wallet_serving.wallet_construction_deadline_seconds wallet_serving.lightwalletd"
 
 ingest_ops_addr="127.0.0.1:9105"
+ingest_config_path="/etc/zinder/ingest.toml"
 projector_ops_addr="127.0.0.1:9110"
 query_ops_addr="127.0.0.1:9106"
 compat_ops_addr="127.0.0.1:9107"
@@ -878,6 +879,97 @@ zinder_setting() {
   '
 }
 
+# Succeeds when a `ZINDER_*` variable sets configuration path $1, even to an
+# empty value, matched as zinder_setting matches.
+zinder_setting_is_set() {
+  awk -v wanted_path="$1" '
+    BEGIN {
+      for (name in ENVIRON) {
+        if (name !~ /^ZINDER_[A-Za-z0-9_]+$/) {
+          continue
+        }
+        variable_path = tolower(substr(name, 8))
+        gsub(/__/, ".", variable_path)
+        if (variable_path == wanted_path) {
+          exit 0
+        }
+      }
+      exit 1
+    }
+  '
+}
+
+# Succeeds when the baked ingest configuration explicitly sets
+# explorer_views = false.
+ingest_config_disables_explorer_views() {
+  [ -r "$ingest_config_path" ] || return 1
+  awk '
+    BEGIN { found = 0 }
+    /^[[:space:]]*\[/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\].*$/, "", section)
+      next
+    }
+    section == "ingest" && /^[[:space:]]*explorer_views[[:space:]]*=/ {
+      val = $0
+      sub(/^[^=]*=[[:space:]]*/, "", val)
+      sub(/[[:space:]]*(#.*)?$/, "", val)
+      found = (val == "false")
+      exit
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$ingest_config_path"
+}
+
+# Resolves ZINDER_DEPLOYMENT__PROFILE for the single-volume wallet topology.
+# When ingest.toml sets explorer_views = false and ZINDER_INGEST__EXPLORER_VIEWS
+# does not enable them, an unset profile defaults to wallet. light-wallet and
+# any combination with Explorer views fail closed.
+resolve_deployment_profile() {
+  explorer_views_env="$(zinder_setting ingest.explorer_views)"
+  explorer_views_env_lower="$(printf '%s' "$explorer_views_env" | tr '[:upper:]' '[:lower:]')"
+  if ingest_config_disables_explorer_views; then
+    config_explorer_views=0
+  else
+    config_explorer_views=1
+  fi
+
+  case "$explorer_views_env_lower" in
+    1 | true | on | yes) effective_explorer_views=1 ;;
+    0 | false | off | no) effective_explorer_views=0 ;;
+    '')
+      if zinder_setting_is_set ingest.explorer_views; then
+        fail "ZINDER_INGEST__EXPLORER_VIEWS must not be empty"
+      fi
+      effective_explorer_views="$config_explorer_views"
+      ;;
+    *)
+      effective_explorer_views=1
+      ;;
+  esac
+
+  if zinder_setting_is_set deployment.profile; then
+    deployment_profile="$(zinder_setting deployment.profile)"
+    case "$deployment_profile" in
+      light-wallet)
+        fail "ZINDER_DEPLOYMENT__PROFILE=light-wallet is not supported in this single-volume image, which always starts zinder-projector and zinder-query; use the standalone zinder-ingest and zinder-compat-lightwalletd images instead"
+        ;;
+      wallet | wallet-archive)
+        if [ "$effective_explorer_views" -eq 1 ]; then
+          fail "ZINDER_DEPLOYMENT__PROFILE=$deployment_profile cannot be combined with Explorer views (ingest.explorer_views = true); remove ZINDER_DEPLOYMENT__PROFILE or set ZINDER_INGEST__EXPLORER_VIEWS=false"
+        fi
+        ;;
+      *)
+        fail "ZINDER_DEPLOYMENT__PROFILE must be wallet or wallet-archive, got '$deployment_profile'"
+        ;;
+    esac
+  elif [ "$config_explorer_views" -eq 0 ] && [ "$effective_explorer_views" -eq 0 ]; then
+    ZINDER_DEPLOYMENT__PROFILE=wallet
+    export ZINDER_DEPLOYMENT__PROFILE
+  fi
+}
+
 resolve_reader_listen_addrs() {
   query_grpc_addr="$(zinder_setting query.listen_addr)"
   query_grpc_addr="${query_grpc_addr:-[::]:9102}"
@@ -928,6 +1020,7 @@ require_positive_seconds ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_
 require_positive_seconds ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS \
   "$wallet_construction_deadline_seconds"
 resolve_lightwalletd_setting "$lightwalletd_setting"
+resolve_deployment_profile
 require_distinct_reader_secondaries
 resolve_reader_listen_addrs
 
@@ -975,7 +1068,7 @@ if [ -n "${ZINDER_INGEST__REORG_WINDOW_BLOCKS:-}" ]; then
 fi
 
 log "starting canonical construction (deadline ${canonical_construction_deadline_seconds}s)"
-start_runtime_process /usr/local/bin/zinder-ingest /etc/zinder/ingest.toml \
+start_runtime_process /usr/local/bin/zinder-ingest "$ingest_config_path" \
   "$ingest_config_paths"
 ingest_pid="$!"
 await_readiness zinder-ingest "$ingest_ops_addr" \

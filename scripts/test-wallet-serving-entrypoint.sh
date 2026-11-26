@@ -49,6 +49,9 @@ for function_name in \
   start_runtime_process \
   require_positive_seconds \
   zinder_setting \
+  zinder_setting_is_set \
+  ingest_config_disables_explorer_views \
+  resolve_deployment_profile \
   zinder_fallback_positions \
   require_fallback_indexer_endpoints \
   require_known_entrypoint_settings \
@@ -974,9 +977,121 @@ ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://127.0.0.1:28232 \
   ZINDER_node_fallbacks__1__indexer_grpc_addr=http://127.0.0.1:28155 \
   require_fallback_indexer_endpoints \
   || test_failure "a mixed-case fallback indexer URL was rejected: $fail_message"
-[ "$(ZINDER_Node__Indexer_Grpc_Addr=http://127.0.0.1:18155 zinder_setting node.indexer_grpc_addr)" \
+  [ "$(ZINDER_Node__Indexer_Grpc_Addr=http://127.0.0.1:18155 zinder_setting node.indexer_grpc_addr)" \
   = http://127.0.0.1:18155 ] \
   || test_failure "a mixed-case [node] indexer URL was not found"
+
+# Deployment profile resolution defaults to wallet when ingest.toml has
+# explorer_views = false and ZINDER_INGEST__EXPLORER_VIEWS is not true, allows
+# wallet-archive, rejects light-wallet, and rejects combining a profile with
+# Explorer views.
+test_deployment_profile_resolution() {
+  local wallet_ingest_toml="$scoping_root/ingest-wallet.toml"
+  local explorer_ingest_toml="$scoping_root/ingest-explorer.toml"
+  cp "$repository_root/deploy/config/wallet-serving/ingest.toml" "$wallet_ingest_toml"
+  sed 's/^explorer_views = false$/explorer_views = true/' "$wallet_ingest_toml" >"$explorer_ingest_toml"
+
+  local saved_ingest_config_path="${ingest_config_path:-}"
+  ingest_config_path="$wallet_ingest_toml"
+
+  # Default is wallet when explorer_views = false in ingest.toml.
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "default profile failed: $fail_message"
+  [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "wallet" ] \
+    || test_failure "expected default ZINDER_DEPLOYMENT__PROFILE=wallet, got '${ZINDER_DEPLOYMENT__PROFILE:-}'"
+
+  # wallet and wallet-archive overrides succeed when Explorer views are off.
+  for valid_profile in wallet wallet-archive; do
+    unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+    export ZINDER_DEPLOYMENT__PROFILE="$valid_profile"
+    fail_message=""
+    resolve_deployment_profile \
+      || test_failure "profile $valid_profile failed: $fail_message"
+    [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "$valid_profile" ] \
+      || test_failure "expected ZINDER_DEPLOYMENT__PROFILE=$valid_profile, got '${ZINDER_DEPLOYMENT__PROFILE:-}'"
+  done
+
+  # light-wallet and invalid/empty profiles fail closed.
+  for rejected_profile in light-wallet "" unknown; do
+    unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+    fail_message=""
+    ZINDER_DEPLOYMENT__PROFILE="$rejected_profile" resolve_deployment_profile || true
+    [ -n "$fail_message" ] || test_failure "profile '$rejected_profile' was accepted"
+    if [ "$rejected_profile" = "light-wallet" ]; then
+      case "$fail_message" in
+        *zinder-projector*zinder-query*) ;;
+        *) test_failure "light-wallet rejection lacked operator guidance: '$fail_message'" ;;
+      esac
+    fi
+  done
+
+  # ZINDER_INGEST__EXPLORER_VIEWS=true leaves profile unset by default, and
+  # rejects explicit ZINDER_DEPLOYMENT__PROFILE.
+  for truthy_views in true TRUE 1 on yes; do
+    unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+    export ZINDER_INGEST__EXPLORER_VIEWS="$truthy_views"
+    fail_message=""
+    resolve_deployment_profile \
+      || test_failure "explorer_views=$truthy_views without profile failed: $fail_message"
+    [ -z "${ZINDER_DEPLOYMENT__PROFILE:-}" ] \
+      || test_failure "explorer_views=$truthy_views unexpectedly defaulted ZINDER_DEPLOYMENT__PROFILE to '$ZINDER_DEPLOYMENT__PROFILE'"
+
+    fail_message=""
+    ZINDER_DEPLOYMENT__PROFILE=wallet resolve_deployment_profile || true
+    case "$fail_message" in
+      *"cannot be combined with Explorer views"*) ;;
+      *) test_failure "explorer_views=$truthy_views with wallet profile was accepted: '$fail_message'" ;;
+    esac
+  done
+
+  # ZINDER_INGEST__EXPLORER_VIEWS=false still defaults to wallet on the
+  # wallet-serving ingest.toml.
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  export ZINDER_INGEST__EXPLORER_VIEWS=false
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "explorer_views=false failed: $fail_message"
+  [ "${ZINDER_DEPLOYMENT__PROFILE:-}" = "wallet" ] \
+    || test_failure "explorer_views=false did not default to wallet"
+
+  # Explorer image (ingest.toml has explorer_views = true) leaves profile unset
+  # and rejects explicit profiles unless Explorer views are disabled.
+  ingest_config_path="$explorer_ingest_toml"
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "explorer ingest.toml without profile failed: $fail_message"
+  [ -z "${ZINDER_DEPLOYMENT__PROFILE:-}" ] \
+    || test_failure "explorer ingest.toml unexpectedly defaulted profile to '$ZINDER_DEPLOYMENT__PROFILE'"
+
+  for rejected_profile in wallet wallet-archive light-wallet; do
+    fail_message=""
+    ZINDER_DEPLOYMENT__PROFILE="$rejected_profile" resolve_deployment_profile || true
+    [ -n "$fail_message" ] \
+      || test_failure "explorer ingest.toml accepted ZINDER_DEPLOYMENT__PROFILE=$rejected_profile"
+  done
+
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  export ZINDER_INGEST__EXPLORER_VIEWS=false
+  export ZINDER_DEPLOYMENT__PROFILE=wallet-archive
+  fail_message=""
+  resolve_deployment_profile \
+    || test_failure "explorer ingest.toml with views=false and wallet-archive failed: $fail_message"
+
+  unset ZINDER_DEPLOYMENT__PROFILE
+  fail_message=""
+  ZINDER_DEPLOYMENT__PROFILE=light-wallet resolve_deployment_profile || true
+  case "$fail_message" in
+    *zinder-projector*zinder-query*) ;;
+    *) test_failure "explorer ingest.toml with views=false accepted light-wallet: '$fail_message'" ;;
+  esac
+
+  unset ZINDER_DEPLOYMENT__PROFILE ZINDER_INGEST__EXPLORER_VIEWS
+  ingest_config_path="$saved_ingest_config_path"
+}
+test_deployment_profile_resolution
 
 # Each process starts with the variables its binary accepts. A stub setpriv on
 # PATH records the environment variable names each process receives.
@@ -992,6 +1107,7 @@ chmod +x "$scoping_root/bin/setpriv"
 # The subshell keeps the fixture environment out of the rest of this test.
 (
   export SCOPING_RECEIVED_DIR="$scoping_root/received"
+  export ZINDER_DEPLOYMENT__PROFILE=wallet-archive
   export ZINDER_NETWORK__NAME=zcash-testnet
   export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232
   export ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://127.0.0.1:28232
@@ -1043,6 +1159,8 @@ assert_received_by() {
   done
 }
 
+assert_received_by ZINDER_DEPLOYMENT__PROFILE \
+  zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
 assert_received_by ZINDER_NETWORK__NAME \
   zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
 assert_received_by ZINDER_NODE__JSON_RPC_ADDR zinder-ingest zinder-query zinder-compat-lightwalletd

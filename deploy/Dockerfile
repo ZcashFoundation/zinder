@@ -231,8 +231,8 @@ COPY deploy/config/images/ingest.toml /etc/zinder/config.toml
 
 EXPOSE 9105
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["zinder-ingest", "--config", "/etc/zinder/config.toml", "healthcheck", "--path", "/healthz"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["zinder-ingest", "--config", "/etc/zinder/config.toml", "healthcheck"]
 
 ENTRYPOINT ["zinder-ingest"]
 CMD ["--config", "/etc/zinder/config.toml"]

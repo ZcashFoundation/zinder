@@ -794,6 +794,7 @@ fn packaged_wallet_configs_select_dense_construction_unless_overridden_or_servin
                 .arg(configs.join(file))
                 .env("ZINDER_NETWORK__NAME", "zcash-regtest")
                 .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+                .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "http://127.0.0.1:18155")
                 .env("ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH", &token)
                 .env(
                     "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
