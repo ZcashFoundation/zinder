@@ -8299,7 +8299,9 @@ mod tests {
         let mut primaries =
             AdvancingPrimaries::start_through(BlockHeight::new(SPLIT_TIP_HEIGHT)).await?;
         let canonical_primary_path = primaries.close_canonical_primary()?;
+        compact_away_table_files(&canonical_primary_path)?;
         split_rows_into_table_files(&canonical_primary_path)?;
+        saturate_initial_open_pins(&canonical_primary_path)?;
         let (mut publisher, slot) = primaries
             .bootstrap_publisher_every(
                 zinder_runtime::Readiness::default(),
@@ -8308,13 +8310,7 @@ mod tests {
             .await?;
         let stale_pair = slot.capture_ephemeral();
         let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
-        // Evict the tip `block_header` table reader that secondary admission
-        // opened so `served_tip_snapshot()` must reopen its table file without
-        // warming `stale_pair`'s cached tip block time or observing epoch pins.
-        stale_pair
-            .canonical()
-            .compact_blocks_in_range(split_block_range())
-            .await?;
+        evict_tip_header_from_table_cache(stale_pair.canonical()).await?;
         compact_away_table_files(&canonical_primary_path)?;
 
         let replace_the_marked_pair = async {
@@ -8736,12 +8732,56 @@ mod tests {
         path: &Path,
     ) -> Result<(rust_rocksdb::DB, Vec<String>), Box<dyn std::error::Error>> {
         let families = rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), path)?;
-        let db = rust_rocksdb::DB::open_cf(&rust_rocksdb::Options::default(), path, &families)?;
-        for family in &families {
-            let handle = db.cf_handle(family).ok_or("a listed family must open")?;
-            db.set_options_cf(&handle, &[("disable_auto_compactions", "true")])?;
-        }
+        let descriptors: Vec<_> = families
+            .iter()
+            .map(|family| {
+                let mut options = rust_rocksdb::Options::default();
+                options.set_disable_auto_compactions(true);
+                rust_rocksdb::ColumnFamilyDescriptor::new(family, options)
+            })
+            .collect();
+        let db = rust_rocksdb::DB::open_cf_descriptors(
+            &rust_rocksdb::Options::default(),
+            path,
+            descriptors,
+        )?;
         Ok((db, families))
+    }
+
+    /// Consumes `RocksDB`'s `min(16, table_cache_capacity / 4)` open-time
+    /// `table_reader_handle` pins on `default` (`CF 0`) so `block_header` (`CF 1`)
+    /// receives none when `CheckIterationResult` finishes manifest recovery.
+    fn saturate_initial_open_pins(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let (db, _families) = open_raw_primary(path)?;
+        let default_cf = db
+            .cf_handle(rust_rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+            .ok_or("default family must exist")?;
+        let (control_key, control_row) = db
+            .iterator_cf(&default_cf, rust_rocksdb::IteratorMode::Start)
+            .next()
+            .ok_or("default family must hold store control")??;
+        for _ in 0..16 {
+            db.put_cf(&default_cf, &control_key, &control_row)?;
+            db.flush_cf(&default_cf)?;
+        }
+        Ok(())
+    }
+
+    /// Evicts the tip `block_header` reader from the 4-shard table cache.
+    async fn evict_tip_header_from_table_cache(
+        canonical: &dyn crate::CanonicalReader,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        canonical
+            .compact_blocks_in_range(split_block_range())
+            .await?;
+        for height in 1..SPLIT_TIP_HEIGHT {
+            if let Some(header) = canonical.block_header_at(BlockHeight::new(height)).await? {
+                canonical
+                    .block_hash_lookup(header.into_header().block_id.hash)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Rewrites every row of a closed canonical or wallet primary unchanged,
