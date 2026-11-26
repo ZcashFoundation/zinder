@@ -1,0 +1,6 @@
+kind: fixed
+body: Raised forwarded-read arrival waiter queues (`forwarded_read_waiters_per_slot` default from `16` to `64`, accepted range `1..=256`, and unspent-output response waiting places from `128` to `1,024`) and released streamed unspent-output response permits on yielding the final row so concurrent `light-wallet` `GetAddressUtxosStream` bursts queue and drain instead of returning `UNAVAILABLE`.
+time: 2026-11-26T10:16:30Z
+custom:
+    Bump: patch
+    PR: "631"

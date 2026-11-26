@@ -46,10 +46,14 @@ pub const DEFAULT_FORWARDED_READ_WAIT: Duration = Duration::from_secs(10);
 pub const MAX_FORWARDED_READ_WAIT: Duration = Duration::from_secs(30);
 
 /// Default requests that may wait for each slot of a kind's cap.
-pub const DEFAULT_FORWARDED_READ_WAITERS_PER_SLOT: NonZeroU32 = NonZeroU32::MIN.saturating_add(15);
+///
+/// At 64 waiters per slot, the 8-slot UTXO cap holds up to 512 waiting calls,
+/// enough for 256 concurrent wallets issuing paired UTXO lookups to queue and
+/// drain well inside [`DEFAULT_FORWARDED_READ_WAIT`].
+pub const DEFAULT_FORWARDED_READ_WAITERS_PER_SLOT: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
 
 /// Most requests an operator may let wait for each slot of a kind's cap.
-pub const MAX_FORWARDED_READ_WAITERS_PER_SLOT: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
+pub const MAX_FORWARDED_READ_WAITERS_PER_SLOT: NonZeroU32 = NonZeroU32::MIN.saturating_add(255);
 
 /// Default size of the verified transaction byte cache: 64 MiB.
 pub const DEFAULT_FORWARDED_TRANSACTION_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -62,10 +66,10 @@ pub const MAX_FORWARDED_TRANSACTION_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const FORWARDED_HISTORY_DEADLINE: Duration = Duration::from_mins(1);
 
 /// Default unspent-output response bodies held at once, and requests that
-/// may wait for one.
+/// may wait for one before contacting the node.
 const UTXO_RESPONSE_LIMIT: ResponseLimit = ResponseLimit {
     active: NonZeroU32::MIN.saturating_add(15),
-    waiters: 128,
+    waiters: 1_024,
 };
 
 /// Default address-history streams open at once, and requests that may wait
@@ -161,10 +165,10 @@ impl ForwardedReadConfig {
     /// Returns these settings with at most `active` responses of `kind` held
     /// at once and at most `waiters` requests waiting for one.
     ///
-    /// By default 16 unspent-output response bodies and 32 address-history
-    /// streams are held at once, each with 128 waiting places. Operators do
-    /// not configure these limits; an embedding runtime may size them to its
-    /// memory budget.
+    /// By default 16 unspent-output response bodies (with 1,024 waiting
+    /// places) and 32 address-history streams (with 128 waiting places) are
+    /// held at once. Operators do not configure these limits; an embedding
+    /// runtime may size them to its memory budget.
     #[must_use]
     pub const fn with_response_limit(
         self,
