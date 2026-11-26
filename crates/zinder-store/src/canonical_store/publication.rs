@@ -753,18 +753,18 @@ pub(super) fn validate_ready_publication(
     validate_first_retained_block(db, ready_evidence.first_retained_block)?;
     let replay_tail = authenticate_ready_replay_tail(db, reorg_policy, ready_evidence)?;
     let baseline_tip = build_plan.build_tip();
-    let baseline_epoch = decode_chain_epoch(&read_family_row(
-        db,
-        CHAIN_EPOCH_COLUMN_FAMILY,
-        &BASELINE_EPOCH_ID.value().to_be_bytes(),
-    )?)?;
-    let baseline_event = decode_chain_event(&read_family_row(
-        db,
-        CHAIN_EVENT_COLUMN_FAMILY,
-        &BASELINE_EVENT_SEQUENCE.to_be_bytes(),
-    )?)?;
+    let mut epoch_cursor = CachedSequenceCursor::open_at_start(db, CHAIN_EPOCH_COLUMN_FAMILY)?;
+    let mut event_cursor = CachedSequenceCursor::open_at_start(db, CHAIN_EVENT_COLUMN_FAMILY)?;
+    let baseline_epoch =
+        epoch_cursor.read_current_expected(BASELINE_EPOCH_ID.value(), decode_chain_epoch)?;
+    let baseline_event =
+        event_cursor.read_current_expected(BASELINE_EVENT_SEQUENCE, decode_chain_event)?;
     validate_baseline_publication(build_plan, ready_evidence, baseline_epoch, baseline_event)?;
     if ready_evidence.visible_epoch == BASELINE_EPOCH_ID {
+        epoch_cursor.advance()?;
+        epoch_cursor.ensure_exhausted(BASELINE_EPOCH_ID.value())?;
+        event_cursor.advance()?;
+        event_cursor.ensure_exhausted(BASELINE_EVENT_SEQUENCE)?;
         validate_epoch_record(
             db,
             ready_evidence.first_retained_block.height,
@@ -772,7 +772,18 @@ pub(super) fn validate_ready_publication(
             baseline_epoch,
         )?;
     } else {
-        validate_live_history(db, build_plan, reorg_policy, ready_evidence, baseline_epoch)?;
+        let context = LiveHistoryValidationContext {
+            build_plan,
+            reorg_policy,
+            ready_evidence,
+        };
+        validate_live_history(
+            db,
+            &context,
+            baseline_epoch,
+            &mut epoch_cursor,
+            &mut event_cursor,
+        )?;
     }
     validate_permanent_reorg_archive(
         db,
@@ -997,6 +1008,12 @@ fn lowest_retained_height_since(
     previous: &CanonicalStoreReadyEvidence,
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<Option<BlockHeight>, CanonicalStoreError> {
+    if ready_evidence.visible_event_sequence < previous.visible_event_sequence {
+        return Ok(None);
+    }
+    if ready_evidence.visible_event_sequence == previous.visible_event_sequence {
+        return Ok(Some(previous.visible_tip.height));
+    }
     let tip_advance = ready_evidence
         .visible_tip
         .height
@@ -1005,7 +1022,9 @@ fn lowest_retained_height_since(
     if tip_advance > reorg_window_blocks {
         return Ok(None);
     }
-    let first_sequence = previous.visible_event_sequence.saturating_add(1);
+    let Some(first_sequence) = previous.visible_event_sequence.checked_add(1) else {
+        return Ok(None);
+    };
     let retention_floor = super::event_lifecycle::canonical_event_retention_floor_from_db(
         db,
         ready_evidence.visible_event_sequence,
@@ -1013,29 +1032,55 @@ fn lowest_retained_height_since(
     if first_sequence < retention_floor {
         return Ok(None);
     }
+    if first_sequence == ready_evidence.visible_event_sequence {
+        let encoded_event =
+            match read_family_row(db, CHAIN_EVENT_COLUMN_FAMILY, &first_sequence.to_be_bytes()) {
+                Ok(encoded) => encoded,
+                Err(CanonicalStoreError::PublicationRefused { .. }) => return Ok(None),
+                Err(other_error) => return Err(other_error),
+            };
+        let Ok(event) = decode_chain_event(&encoded_event) else {
+            return Ok(None);
+        };
+        return Ok(unchanged_height_through_event(
+            previous.visible_tip.height,
+            first_sequence,
+            &event,
+        ));
+    }
+    let mut event_cursor =
+        CachedSequenceCursor::open_from_sequence(db, CHAIN_EVENT_COLUMN_FAMILY, first_sequence)?;
     let mut retained_height = previous.visible_tip.height;
     for sequence in first_sequence..=ready_evidence.visible_event_sequence {
-        let Ok(encoded) = read_family_row(db, CHAIN_EVENT_COLUMN_FAMILY, &sequence.to_be_bytes())
+        let event = match event_cursor.read_expected_and_advance(sequence, decode_chain_event) {
+            Ok(decoded) => decoded,
+            Err(CanonicalStoreError::PublicationRefused { .. }) => return Ok(None),
+            Err(other_error) => return Err(other_error),
+        };
+        let Some(next_retained) = unchanged_height_through_event(retained_height, sequence, &event)
         else {
             return Ok(None);
         };
-        let Ok(event) = decode_chain_event(&encoded) else {
-            return Ok(None);
-        };
-        if event.resulting_epoch_id.value() != sequence {
-            return Ok(None);
-        }
-        let first_changed = event
-            .reverted_range
-            .map_or(event.committed_range.start, |reverted| {
-                reverted.start.min(event.committed_range.start)
-            });
-        let Some(unchanged_through) = first_changed.value().checked_sub(1) else {
-            return Ok(None);
-        };
-        retained_height = retained_height.min(BlockHeight::new(unchanged_through));
+        retained_height = next_retained;
     }
     Ok(Some(retained_height))
+}
+
+fn unchanged_height_through_event(
+    retained_height: BlockHeight,
+    expected_sequence: u64,
+    event: &DecodedChainEvent,
+) -> Option<BlockHeight> {
+    if event.resulting_epoch_id.value() != expected_sequence {
+        return None;
+    }
+    let first_changed = event
+        .reverted_range
+        .map_or(event.committed_range.start, |reverted| {
+            reverted.start.min(event.committed_range.start)
+        });
+    let unchanged_through = first_changed.value().checked_sub(1)?;
+    Some(retained_height.min(BlockHeight::new(unchanged_through)))
 }
 
 fn validate_ready_settlement_window(
@@ -1144,14 +1189,23 @@ fn validate_baseline_publication(
     Ok(())
 }
 
+struct LiveHistoryValidationContext<'ctx> {
+    build_plan: &'ctx super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
+    ready_evidence: &'ctx CanonicalStoreReadyEvidence,
+}
+
 fn validate_live_history(
     db: &DB,
-    build_plan: &super::CanonicalStoreBuildPlan,
-    reorg_policy: super::CanonicalReorgPolicy,
-    ready_evidence: &CanonicalStoreReadyEvidence,
+    context: &LiveHistoryValidationContext<'_>,
     baseline_epoch: DecodedChainEpoch,
+    epoch_cursor: &mut CachedSequenceCursor<'_>,
+    event_cursor: &mut CachedSequenceCursor<'_>,
 ) -> Result<(), CanonicalStoreError> {
-    if ready_evidence.visible_event_sequence != ready_evidence.visible_epoch.value() {
+    let ready_evidence = context.ready_evidence;
+    if ready_evidence.visible_epoch.value() < 2
+        || ready_evidence.visible_event_sequence != ready_evidence.visible_epoch.value()
+    {
         return Err(CanonicalStoreError::publication(
             "READY live epoch and chain-event sequence must advance together",
         ));
@@ -1161,36 +1215,26 @@ fn validate_live_history(
         ready_evidence.visible_event_sequence,
     )?;
     let first_event_sequence = retention_floor.max(2);
-    let (mut previous_epoch_id, mut previous_epoch) = if first_event_sequence == 2 {
-        (BASELINE_EPOCH_ID, baseline_epoch)
-    } else {
-        let previous_epoch_id = ChainEpochId::new(first_event_sequence - 1);
-        let previous_epoch = decode_chain_epoch(&read_family_row(
-            db,
-            CHAIN_EPOCH_COLUMN_FAMILY,
-            &previous_epoch_id.value().to_be_bytes(),
-        )?)?;
-        (previous_epoch_id, previous_epoch)
-    };
+    let (mut previous_epoch_id, mut previous_epoch) = seek_live_history_cursors(
+        first_event_sequence,
+        baseline_epoch,
+        epoch_cursor,
+        event_cursor,
+    )?;
+    let mut latest_event = None;
     for epoch_value in first_event_sequence..=ready_evidence.visible_epoch.value() {
         let chain_epoch_id = ChainEpochId::new(epoch_value);
-        let chain_epoch = decode_chain_epoch(&read_family_row(
-            db,
-            CHAIN_EPOCH_COLUMN_FAMILY,
-            &epoch_value.to_be_bytes(),
-        )?)?;
-        let chain_event = decode_chain_event(&read_family_row(
-            db,
-            CHAIN_EVENT_COLUMN_FAMILY,
-            &epoch_value.to_be_bytes(),
-        )?)?;
+        let chain_epoch =
+            epoch_cursor.read_expected_and_advance(epoch_value, decode_chain_epoch)?;
+        let chain_event =
+            event_cursor.read_expected_and_advance(epoch_value, decode_chain_event)?;
         if chain_event.resulting_epoch_id != chain_epoch_id
             || chain_event.previous_epoch_id != previous_epoch_id.value()
             || chain_event.visible_tip != chain_epoch.visible_tip
             || chain_event.visible_block_count == 0
             || !live_transition_is_valid(
-                build_plan,
-                reorg_policy,
+                context.build_plan,
+                context.reorg_policy,
                 previous_epoch,
                 chain_epoch,
                 chain_event,
@@ -1202,33 +1246,61 @@ fn validate_live_history(
         }
         previous_epoch_id = chain_epoch_id;
         previous_epoch = chain_epoch;
+        latest_event = Some(chain_event);
     }
+    epoch_cursor.ensure_exhausted(ready_evidence.visible_epoch.value())?;
+    event_cursor.ensure_exhausted(ready_evidence.visible_event_sequence)?;
     validate_epoch_record(
         db,
         ready_evidence.first_retained_block.height,
         ready_evidence.visible_tip,
         previous_epoch,
     )?;
-    let current_event = decode_chain_event(&read_family_row(
-        db,
-        CHAIN_EVENT_COLUMN_FAMILY,
-        &ready_evidence.visible_event_sequence.to_be_bytes(),
-    )?)?;
-    let epoch_matches_ready = previous_epoch.visible_tip == ready_evidence.visible_tip;
-    let expected_epoch_id = ready_evidence.visible_epoch;
-    let expected_tip = ready_evidence.visible_tip;
-    let expected_block_count = ready_evidence.visible_block_count;
-    let expected_sequence_digest = ready_evidence.visible_sequence_digest;
-    let event_matches_ready = current_event.resulting_epoch_id == expected_epoch_id
-        && current_event.visible_tip == expected_tip
-        && current_event.visible_block_count == expected_block_count
-        && current_event.visible_sequence_digest == expected_sequence_digest;
-    if !(epoch_matches_ready && event_matches_ready) {
+    let current_event = latest_event.ok_or_else(|| {
+        CanonicalStoreError::publication("READY live history must contain at least one transition")
+    })?;
+    if !live_history_matches_ready_fence(previous_epoch, current_event, ready_evidence) {
         return Err(CanonicalStoreError::publication(
             "READY live history does not end at the authenticated visible fence",
         ));
     }
     Ok(())
+}
+
+fn seek_live_history_cursors(
+    first_event_sequence: u64,
+    baseline_epoch: DecodedChainEpoch,
+    epoch_cursor: &mut CachedSequenceCursor<'_>,
+    event_cursor: &mut CachedSequenceCursor<'_>,
+) -> Result<(ChainEpochId, DecodedChainEpoch), CanonicalStoreError> {
+    if first_event_sequence == 2 {
+        epoch_cursor.advance()?;
+        event_cursor.advance()?;
+        return Ok((BASELINE_EPOCH_ID, baseline_epoch));
+    }
+    let previous_epoch_id = ChainEpochId::new(first_event_sequence - 1);
+    epoch_cursor.seek_from_sequence(previous_epoch_id.value())?;
+    let previous_epoch =
+        epoch_cursor.read_expected_and_advance(previous_epoch_id.value(), decode_chain_epoch)?;
+    event_cursor.seek_from_sequence(first_event_sequence)?;
+    Ok((previous_epoch_id, previous_epoch))
+}
+
+fn live_history_matches_ready_fence(
+    final_epoch: DecodedChainEpoch,
+    final_event: DecodedChainEvent,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+) -> bool {
+    let epoch_matches_ready = final_epoch.visible_tip == ready_evidence.visible_tip;
+    let expected_epoch_id = ready_evidence.visible_epoch;
+    let expected_tip = ready_evidence.visible_tip;
+    let expected_block_count = ready_evidence.visible_block_count;
+    let expected_sequence_digest = ready_evidence.visible_sequence_digest;
+    let event_matches_ready = final_event.resulting_epoch_id == expected_epoch_id
+        && final_event.visible_tip == expected_tip
+        && final_event.visible_block_count == expected_block_count
+        && final_event.visible_sequence_digest == expected_sequence_digest;
+    epoch_matches_ready && event_matches_ready
 }
 
 fn live_transition_is_valid(
@@ -1906,6 +1978,174 @@ fn record_cold_family_scan(evidence: &ColdFamilyScanEvidence) {
     );
 }
 
+struct CachedSequenceCursor<'db> {
+    family_name: &'static str,
+    iterator: rust_rocksdb::DBRawIteratorWithThreadMode<'db, DB>,
+    previous_key: Option<u64>,
+}
+
+impl<'db> CachedSequenceCursor<'db> {
+    fn open_at_start(db: &'db DB, family_name: &'static str) -> Result<Self, CanonicalStoreError> {
+        let family = column_family(db, family_name)?;
+        let mut read_options = ReadOptions::default();
+        read_options.fill_cache(true);
+        let mut iterator = db.raw_iterator_cf_opt(&family, read_options);
+        iterator.seek_to_first();
+        let cursor = Self {
+            family_name,
+            iterator,
+            previous_key: None,
+        };
+        cursor.check_status("READY publication history scan")?;
+        Ok(cursor)
+    }
+
+    fn open_from_sequence(
+        db: &'db DB,
+        family_name: &'static str,
+        first_sequence: u64,
+    ) -> Result<Self, CanonicalStoreError> {
+        let family = column_family(db, family_name)?;
+        let mut read_options = ReadOptions::default();
+        read_options.fill_cache(true);
+        let iterator = db.raw_iterator_cf_opt(&family, read_options);
+        let mut cursor = Self {
+            family_name,
+            iterator,
+            previous_key: None,
+        };
+        cursor.seek_from_sequence(first_sequence)?;
+        Ok(cursor)
+    }
+
+    fn seek_from_sequence(&mut self, first_sequence: u64) -> Result<(), CanonicalStoreError> {
+        if first_sequence <= 1 {
+            self.previous_key = None;
+            self.iterator.seek_to_first();
+        } else {
+            let start_key = ascending_u64_key_scan_start(first_sequence);
+            self.previous_key = Some(first_sequence - 1);
+            self.iterator.seek(start_key);
+        }
+        self.check_status("READY publication history seek")
+    }
+
+    fn read_current_expected<Decoded, Decode>(
+        &mut self,
+        expected_sequence: u64,
+        decode: Decode,
+    ) -> Result<Decoded, CanonicalStoreError>
+    where
+        Decode: FnOnce(&[u8]) -> Result<Decoded, CanonicalStoreError>,
+    {
+        if !self.iterator.valid() {
+            self.check_status("READY publication history scan")?;
+            return Err(CanonicalStoreError::publication(format!(
+                "{} row {expected_sequence} is absent",
+                self.family_name
+            )));
+        }
+        let Some((key_bytes, row_bytes)) = self.iterator.item() else {
+            self.check_status("READY publication history scan")?;
+            return Err(CanonicalStoreError::publication(format!(
+                "{} row {expected_sequence} is absent",
+                self.family_name
+            )));
+        };
+        let observed_sequence =
+            decode_u64_key_ascending(self.family_name, key_bytes, self.previous_key)?;
+        if observed_sequence != expected_sequence {
+            return Err(CanonicalStoreError::publication(format!(
+                "{} expected sequence {expected_sequence}, found {observed_sequence}",
+                self.family_name
+            )));
+        }
+        let decoded = decode(row_bytes)?;
+        self.previous_key = Some(observed_sequence);
+        Ok(decoded)
+    }
+
+    fn read_expected_and_advance<Decoded, Decode>(
+        &mut self,
+        expected_sequence: u64,
+        decode: Decode,
+    ) -> Result<Decoded, CanonicalStoreError>
+    where
+        Decode: FnOnce(&[u8]) -> Result<Decoded, CanonicalStoreError>,
+    {
+        let decoded = self.read_current_expected(expected_sequence, decode)?;
+        self.advance()?;
+        Ok(decoded)
+    }
+
+    fn advance(&mut self) -> Result<(), CanonicalStoreError> {
+        self.iterator.next();
+        if !self.iterator.valid() {
+            self.check_status("READY publication history scan")?;
+        }
+        Ok(())
+    }
+
+    fn ensure_exhausted(&self, visible_sequence: u64) -> Result<(), CanonicalStoreError> {
+        if !self.iterator.valid() {
+            return self.check_status("READY publication trailing-row check");
+        }
+        if let Some((key_bytes, _)) = self.iterator.item() {
+            let trailing_sequence =
+                decode_u64_key_ascending(self.family_name, key_bytes, self.previous_key)?;
+            return Err(CanonicalStoreError::publication(format!(
+                "{} contains unexpected row {trailing_sequence} after visible sequence {visible_sequence}",
+                self.family_name
+            )));
+        }
+        self.check_status("READY publication trailing-row check")?;
+        Err(CanonicalStoreError::publication(format!(
+            "{} contains unexpected trailing row after visible sequence {visible_sequence}",
+            self.family_name
+        )))
+    }
+
+    fn check_status(&self, operation: &'static str) -> Result<(), CanonicalStoreError> {
+        self.iterator
+            .status()
+            .map_err(|source| CanonicalStoreError::RocksDbOperation { operation, source })
+    }
+}
+
+/// Returns the seek key immediately preceding `sequence`.
+///
+/// The 9-byte key sorts strictly after `(sequence - 1)`'s 8-byte big-endian
+/// key, skipping 8-byte point tombstones below `sequence` while still landing
+/// on any malformed 9-byte key extending `sequence - 1`.
+fn ascending_u64_key_scan_start(sequence: u64) -> [u8; 9] {
+    let predecessor = sequence.saturating_sub(1).to_be_bytes();
+    let mut start = [0_u8; 9];
+    start[..8].copy_from_slice(&predecessor);
+    start
+}
+
+fn decode_u64_key_ascending(
+    family_name: &'static str,
+    key: &[u8],
+    previous_key: Option<u64>,
+) -> Result<u64, CanonicalStoreError> {
+    let key_bytes: [u8; 8] = key.try_into().map_err(|_| {
+        CanonicalStoreError::publication(format!(
+            "{family_name} key has length {}, expected 8",
+            key.len()
+        ))
+    })?;
+    let sequence = u64::from_be_bytes(key_bytes);
+    if let Some(previous) = previous_key
+        && sequence <= previous
+    {
+        return Err(CanonicalStoreError::publication(format!(
+            "{family_name} key {sequence} is not strictly ascending after {previous}"
+        )));
+    }
+    Ok(sequence)
+}
+
 fn read_family_row(
     db: &DB,
     name: &'static str,
@@ -1913,7 +2153,7 @@ fn read_family_row(
 ) -> Result<Vec<u8>, CanonicalStoreError> {
     let family = column_family(db, name)?;
     let mut read_options = ReadOptions::default();
-    read_options.fill_cache(false);
+    read_options.fill_cache(true);
     db.get_cf_opt(&family, key, &read_options)
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
             operation: "READY publication point read",
@@ -2087,6 +2327,52 @@ mod tests {
             decode_chain_event(&genesis_event)?.committed_range,
             genesis_range
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ascending_u64_key_decoding_rejects_malformed_lengths_and_non_monotonic_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, &1_u64.to_be_bytes(), None)?,
+            1
+        );
+        assert_eq!(
+            decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, &2_u64.to_be_bytes(), Some(1))?,
+            2
+        );
+        assert_eq!(
+            decode_u64_key_ascending(
+                CHAIN_EVENT_COLUMN_FAMILY,
+                &u64::MAX.to_be_bytes(),
+                Some(u64::MAX - 1)
+            )?,
+            u64::MAX
+        );
+        for bad_key in [
+            &[][..],
+            &[0_u8; 4][..],
+            &[0_u8; 7][..],
+            &[0_u8; 9][..],
+            &ascending_u64_key_scan_start(5)[..],
+        ] {
+            assert!(
+                decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, bad_key, None).is_err(),
+                "expected malformed key of len {} to fail",
+                bad_key.len()
+            );
+        }
+        assert!(
+            decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, &2_u64.to_be_bytes(), Some(2))
+                .is_err()
+        );
+        assert!(
+            decode_u64_key_ascending(CHAIN_EPOCH_COLUMN_FAMILY, &1_u64.to_be_bytes(), Some(2))
+                .is_err()
+        );
+        let scan_start = ascending_u64_key_scan_start(5);
+        assert!(scan_start.as_slice() > 4_u64.to_be_bytes().as_slice());
+        assert!(scan_start.as_slice() < 5_u64.to_be_bytes().as_slice());
         Ok(())
     }
 
