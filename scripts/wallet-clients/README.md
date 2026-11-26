@@ -86,9 +86,7 @@ For Zingo, use `--wallet zingo`, omit `--variant`, and supply the CLI binary and
 
 ## Read the receipts
 
-The lifecycle runner owns each wallet step's process group and enforces its
-600-second deadline. On timeout or interruption it stops the adapter, tracer,
-and wallet together before removing scratch state.
+The lifecycle runner owns each wallet step's process group and enforces its 600-second deadline. On timeout or interruption it stops the adapter, tracer, and wallet together before removing scratch state.
 
 Each step uses explicit checks that remain enforced under optimized Python. The adapters additionally refuse optimized startup, so a misconfigured invocation cannot silently discard a check. The `send`, `pending`, `mined`, and `scanned` records fingerprint the same canonical display transaction ID and match the canonical inclusion height to the wallet record. Restore compares independent database identities, public wallet identities, and known preexisting transaction activity. Zingo passes its generated recovery phrase through the restore process environment and excludes the recovery command's output from retained logs. Zkool passes its public Regtest vector as a driver argument.
 
@@ -101,3 +99,5 @@ During Zingo shielded discovery, each transaction returned by `quickshield` must
 Restart process IDs identify completed CLI invocation supervisors, each of which waits for its wallet process tree to exit. Zkool's offline report invocations directly identify native engine processes. Resume requires actual persisted wallet height growth after a new private block is mined. Endpoint connection traces are retained for online invocations; offline wallet reads do not create a new connection trace.
 
 A partial gate remains partial. Preserve failed attempts, source identities, client logs, and the exact missing condition. Do not transfer evidence between engines, scanning variants, application platforms, transports, or server revisions.
+
+For coverage comparisons, `coverage.py` and `scripts/release-wallet-tests.py` use the machine-readable baseline in `coverage-v0.22.0.json` (run `python3 scripts/wallet-clients/coverage.py render` to format a Markdown summary on demand; the earlier v0.22.0 prose snapshot has been retired).

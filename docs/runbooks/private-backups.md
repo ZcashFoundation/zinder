@@ -1,20 +1,19 @@
-# Back up and restore a wallet-serving indexer
+# Backups and Edge Snapshots
 
-Use a private backup to recover the canonical and wallet RocksDB stores from
-one captured block. The archive includes the indexer's cursor authentication
-key. Keep both the staging area and the archive private to the deployment.
-Explorer views rebuild separately.
+Use this runbook for two distinct recovery and bootstrap workflows:
 
-## Capture a backup
+| Mechanism | Scope | When to use | Trust & cursor behavior |
+| --- | --- | --- | --- |
+| **Coherent private backup** (`zinder-projector backup` / `restore`) | Canonical + wallet RocksDB stores together, plus `cursor_auth_key` | Private disaster recovery or replacing an existing wallet-serving host without rebuilding | Keeps the deployment's `cursor_auth_key`; requires matching schemas and private archive/pin storage |
+| **Verified edge snapshot** ([ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md); `zinder-ingest export-edge-snapshot` / `bootstrap-from-snapshot`) | Canonical store at a settled height divisible by 4,096 + optional `sealed-history/` | Initializing a new independent single-host `rocksdb` writer from a publisher checkpoint | Publisher-signed (Ed25519) + validator-attested; generates a fresh `cursor_auth_key` and clears leases/mempool |
 
-Run the projector binary from the same build as the running projector, with
-its configuration and environment. It needs access to the owner's loopback
-control listener, checkpoint token, and checkpoint staging directory. Ingest
-and projector must run under the same filesystem user for a private capture.
-Choose an absolute archive path outside the checkpoint staging directory
-and the live stores. Its parent must exist and be writable. Each new
-recovery point needs a unique name of 1 to 64 lowercase ASCII letters,
-digits, or interior hyphens.
+Explorer views rebuild separately from the canonical store in both workflows. Never copy live RocksDB directories with `cp` or `rsync` — copies taken across non-quiesced files or different timestamps are inconsistent.
+
+## Coherent private backups (`zinder-projector`)
+
+### Capture a backup
+
+Run the `zinder-projector` binary from the same build as the running projector, using its configuration and filesystem user, with access to the loopback control listener, checkpoint token, and checkpoint staging directory. Choose an absent archive path outside the checkpoint staging directory and live stores, using a unique recovery name (1–64 lowercase ASCII letters, digits, or interior hyphens):
 
 ```bash
 set -euo pipefail
@@ -22,14 +21,7 @@ archive=/srv/zinder-backups/wallet-20261120
 receipt=$(zinder-projector --config /etc/zinder/projector.toml backup --archive "$archive")
 ```
 
-Backup waits up to one hour for the projector to return the capture receipt.
-Set `--capture-timeout-seconds` to a positive number of seconds if the owner
-needs longer. If the wait expires, the owner may still finish the checkpoint.
-Retry with the same `--archive` path to recover its receipt. The deadline
-ends when the receipt arrives, before the local copy and validation begin.
-
-For a single-volume wallet container named `zinder-wallet`, mount the archive
-parent writable by the runtime user. Run this alternative in your host shell.
+For the single-volume container (`zinder-wallet`), mount the archive parent writable by UID `10001`:
 
 ```bash
 set -euo pipefail
@@ -38,15 +30,9 @@ receipt=$(docker exec --user 10001:10001 zinder-wallet zinder-projector \
   --config /etc/zinder/projector.toml backup --archive "$archive")
 ```
 
-The Compose projector uses `/etc/zinder/config.toml`. Capture can pin old
-RocksDB files in the checkpoint staging directory while the live stores
-advance. Allow space for the sealed archive, outstanding captures, and
-wallet validation scratch space.
+In Compose, the projector uses `/etc/zinder/config.toml`. Capture waits up to 1 hour by default (`--capture-timeout-seconds` overrides it); if a wait times out, retry with the same `--archive` name to recover the receipt. Reserve disk space for the combined size of both stores plus external-sort validation scratch.
 
-Both examples capture the JSON receipt from standard output. Progress goes to
-standard error. In the same shell, use `jq` to save the digest from the first
-capture. The example assumes an existing, writable pin directory under
-independent operator control.
+Save the returned manifest digest immediately under independent operator control, then copy the archive off-host and verify it before retiring old checkpoints:
 
 ```bash
 pin_dir=/etc/zinder/backup-pins
@@ -54,24 +40,9 @@ pin=$(jq -er '.manifest_sha256' <<< "$receipt")
 (set -o noclobber; printf '%s\n' "$pin" > "$pin_dir/${archive##*/}.sha256")
 ```
 
-Keep an independently retrievable copy of that pin. Transfer the complete
-archive directory to operator-controlled storage outside the indexer's
-failure domain. For immutable retention, configure the target to prevent
-replacement or deletion for the required period. Download a copy and run
-the offline verification below with the saved pin. A retry with the same archive name verifies the original
-completed capture. Compare the returned digest with the saved pin. Use a
-new name to capture a later block. If capture stopped before its manifest
-was published, use a fresh name. Once the off-host copy verifies, retire the
-corresponding checkpoint candidate and local archive according to your
-retention policy.
+### Choose wallet validation limits
 
-## Choose wallet validation limits
-
-`backup`, `verify`, and `restore` accept the same three limits when checking the
-wallet database. Each command uses the defaults below unless you pass an
-override in bytes. For example, add `--max-accounted-reorg-undo-bytes 1073741824`
-to allow 1 GiB of accounted reorg undo data. Supply the override again for
-offline verification and restore on the replacement host.
+`backup`, `verify`, and `restore` re-derive address-ordered rows with two external sorts (scratch lives under the archive dir for `backup`, `TMPDIR` for `verify`, and the destination working dir for `restore`). Override defaults consistently across all three commands (for example, `--max-accounted-reorg-undo-bytes 1073741824`):
 
 | Limit | Default | CLI flag |
 | --- | --- | --- |
@@ -79,36 +50,9 @@ offline verification and restore on the replacement host.
 | Temporary file space per sorter | 192 GiB | `--max-temporary-file-bytes-per-sorter` |
 | Accounted reorg undo data | 512 MiB | `--max-accounted-reorg-undo-bytes` |
 
-The wallet check re-derives the address-ordered rows with two external
-sorts and needs temporary space for them. Each command writes this
-scratch in a different place:
+### Restore on an empty host
 
-- Backup writes it inside the archive's working directory, on the
-  archive's filesystem.
-- Verify writes it under `TMPDIR`.
-- Restore writes it inside the destination's working directory, on the
-  destination filesystem.
-
-The archive is about the combined size of both stores. Reserve that space
-plus the scratch for backup. Restore needs space for both stores plus the
-scratch on the destination filesystem.
-
-## Restore on an empty host
-
-Download the archive to a directory where only the recovery operator can
-change it. Retrieve the pin separately and place it in the example's pin
-directory on the replacement host. Supply the intended network.
-Offline verification checks the exact manifest and payload files, opens both
-databases read-only, and compares the stored chain and wallet state with
-the captured fence. Wallet validation uses temporary space under `TMPDIR`.
-Set `TMPDIR` to an existing, writable directory outside the archive if you
-need to choose the verification volume. After a forced process kill, remove
-abandoned verification scratch once its verifier has exited.
-
-Run restore as the user that will own the replacement stores. Choose an
-absent destination beneath an existing, privately controlled parent on a
-local filesystem that supports atomic directory publication without replacement.
-Reserve space for both databases and validation scratch on that filesystem.
+Download the archive and saved pin to private storage on the replacement host (use `TMPDIR` if `verify` scratch should live outside `/tmp`), and run `restore` as the user that owns the stores into an absent destination directory:
 
 ```bash
 set -euo pipefail
@@ -120,46 +64,53 @@ zinder-projector restore --network "$network" --archive "$archive" --sha256 "$pi
   --into /srv/zinder/replacement
 ```
 
-Restore checks each file against the pinned inventory as it copies, then
-reads the installed files back and verifies both databases before publishing.
-After interruption, repeat the command with the same paths.
-The installer reclaims its own unpublished working directory. If the
-destination was already published, inspect it before making another attempt.
-Keep the hidden recovery work marker beside the destination while retries
-are possible.
+If interrupted before publication, repeat with the same paths. After publication:
 
-Point ingest and the projector's canonical reader at
-`/srv/zinder/replacement/canonical`. Point the projector's wallet writer at
-`/srv/zinder/replacement/wallet`. Configure query and lightwalletd compatibility
-to read both replacement paths, with a fresh secondary directory for each
-reader. Give the replacement its own node configuration, control credentials,
-and projector owner identity. The private copy keeps
-its chain history and cursor authentication identity. Restore releases
-captured projector retention leases so a new owner can acquire its own.
-The live mempool hydrates from the node on startup.
+1. Point `zinder-ingest` and `zinder-projector`'s canonical reader at `/srv/zinder/replacement/canonical`, `zinder-projector` at `/srv/zinder/replacement/wallet`, and `zinder-query` / `zinder-compat-lightwalletd` at both with unique `secondary_path` directories.
+2. Give the replacement its own node config, control tokens, and `projector.build_owner_hex` (restore releases old retention leases; mempool hydrates from the node).
+3. Start the replacement outside traffic, wait for catch-up, and compare block hashes and a wallet range against the node and reference before cutting traffic over.
+4. Keep the old deployment and off-host archive through your rollback window, then dispose of retired copies as private key material.
 
-Start ingest, projector, query, and lightwalletd compatibility with the replacement
-outside traffic. After catch-up, compare the node's block hash with the hash
-served at the same height by the native and lightwalletd listeners. Complete
-a wallet block range through the replacement and check the wallet projection
-against a reference at the same fence. A ready reader can still serve an
-earlier height during catch-up. At cutover, drain the old endpoint and stop
-its writers before exposing the replacement as the sole active deployment.
-Both copies recognize the same cursor identity. A client whose cursor lies
-beyond the restored history must resume from a retained position or obtain
-a fresh head and reconcile its view.
+Verification and restore refuse backups from another wallet schema before copying; rebuild from empty paths on a schema bump ([ADR-0004](../adrs/0004-storage-and-deployment-topologies.md)).
 
-Keep the previous deployment and the verified off-host archive through the
-rollback window. If the replacement fails its checks before cutover, keep
-traffic on the original. To roll back after cutover, drain the replacement
-and stop its writers. Start the previous deployment outside traffic and
-repeat the same block-hash and wallet-range checks before routing clients
-back. When retention expires, dispose of every stored copy as private key
-material, including any downloaded verification copies.
+## Verified edge snapshot bootstrap (`ADR-0024`)
 
-This workflow uses matching current store schemas and a state bundle with a
-writer-admitted upgrade schedule. Verification and restore read the backup's
-manifests first. They refuse a backup written under another wallet schema
-before they read or copy its payload, and the error names both schema
-versions. Rebuild the wallet store and take a new backup instead. A public bootstrap snapshot requires its own
-export format and publisher authentication. [Storage and deployment topologies](../adrs/0004-storage-and-deployment-topologies.md)
+An edge snapshot (`zinder-edge-snapshot.v1`) lets a new regional `zinder-ingest` instance initialize its canonical store from a publisher's checkpoint and follow the remaining chain from its own Zcash validator.
+
+### Export an edge snapshot (publisher)
+
+Prepare a quiesced READY canonical store whose visible and settled tips name the **same block** at a height divisible by `4,096` and that retains each terminal completed subtree root at that boundary. Stop the source `zinder-ingest` writer, then run:
+
+```bash
+zinder-ingest --config /etc/zinder/ingest.toml export-edge-snapshot \
+  --output-dir /srv/zinder-snapshots/mainnet-3592192 \
+  --signing-key /etc/zinder/snapshot-publisher.pk8 \
+  --include-sealed-history /srv/zinder-history/mainnet/key-1/catalog
+```
+
+- `--signing-key` takes a DER-encoded Ed25519 PKCS#8 key and writes `manifest.v1.json`, `manifest.v1.sig`, `canonical-rocksdb/`, and optional `sealed-history/`.
+- Export clears projection build leases and mempool events and replaces the publisher's `cursor_auth_key` in the copy.
+- `--include-sealed-history` is optional; the source history directory must not overlap `--output-dir` or its staging path and must not contain the signing key.
+
+### Bootstrap a new writer (receiver)
+
+Point the receiving `zinder-ingest` config at an absent or empty `storage.path` and your own configured `NodeSource` validator (`--source` accepts a local directory or an `http://` / `https://` base URL without credentials, query, or fragment):
+
+```bash
+zinder-ingest --config /etc/zinder/ingest.toml bootstrap-from-snapshot \
+  --source https://snapshots.example.org/mainnet-3592192 \
+  --public-key "$PUBLISHER_PUBKEY_HEX" \
+  --sealed-history-output /srv/zinder-history/mainnet/key-1/catalog
+```
+
+- `--public-key` takes the publisher's 64-character hex raw Ed25519 public key (repeat `--public-key` during a key rotation).
+- `--spot-check-blocks` sets the positive random block sample count compared against your validator (default `32`, plus the snapshot boundary).
+- `--sealed-history-output` is optional and must point to an absent or empty directory separate from `storage.path`.
+- Before writing or downloading payloads, bootstrap verifies the manifest signature, store config (`network`, `raw_blob_policy`, `reorg_window_blocks`, `checkpoint_height`), and file lengths/SHA-256 digests. After cold admission, it attests genesis, network-upgrade schedule, validator tip (at least `reorg_window_blocks` ahead of the snapshot), commitment roots, terminal subtrees, and spot-checked blocks against your validator, generates a fresh `cursor_auth_key`, and atomically publishes `storage.path`.
+
+> [!IMPORTANT]
+>**Re-enable `fs-verity` when `require_fs_verity = true`.** Snapshot bundles copy opaque `sealed-history/` files without filesystem fs-verity metadata. If `zinder-compat-lightwalletd` sets `compat.shielded_history.require_fs_verity = true`, enable fs-verity on every destination segment file on an `ext4 -O verity` filesystem before starting compatibility:
+>
+>```bash for f in /srv/zinder-history/mainnet/key-1/catalog/*.bin; do fsverity enable --hash-alg sha256 --block-size 4096 "$f" done ```
+
+After bootstrap succeeds, start `zinder-ingest` normally to follow from the snapshot tip, and start `zinder-projector` if running `wallet` or `wallet-archive` so it derives the local wallet store. If an interrupted bootstrap leaves `<storage.path>.bootstrap.staging`, `<storage.path>.bootstrap.download`, or `<sealed_history_output>.bootstrap.staging`, confirm no snapshot process is running, delete those scratch directories, and retry.

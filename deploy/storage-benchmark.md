@@ -1,51 +1,31 @@
 # Storage benchmark environment
 
-`docker-compose.storage-benchmark.yml` compares RocksDB and PostgreSQL as
-stores for Zinder's canonical replay records. Both arms run from one immutable
-`zinder-bench` image and one captured fixture. Each arm writes every
-`CanonicalBlockFacts` replay envelope, reads every row back, recomputes the
-ordered sequence digest, and writes a completion marker only after that check
-passes. This is a maintainer procedure.
+>**Maintainer benchmark.** This harness compares RocksDB and PostgreSQL for canonical replay-record round trips. PostgreSQL is not a production Zinder storage backend. Operators deploying Zinder should follow [Deploying Zinder](../docs/runbooks/deploying.md).
 
-The reports measure this replay-record round trip. Canonical construction,
-compact blocks, tree positions, chain events, reorgs, the wallet store, and
-query serving are outside their scope. PostgreSQL is not a Zinder storage backend,
-and neither deployment depends on this environment.
+`docker-compose.storage-benchmark.yml` compares RocksDB and PostgreSQL from one immutable `zinder-bench` image and one captured fixture. Each arm writes every `CanonicalBlockFacts` replay envelope, reads every row back, recomputes the ordered sequence digest, and writes a completion marker only after that check passes. Canonical construction, compact blocks, tree positions, chain events, reorgs, the wallet store, and query serving are outside its scope.
 
 ## Profiles
 
-Measure throughput with one isolated profile at a time. The `comparison`
-profile starts every service, which then compete for resources, so use it only
-for integration checks.
+Measure throughput with one isolated profile at a time (`comparison` runs all three services together and is for integration checks only):
 
 | Profile | Services | Budget |
 | --- | --- | --- |
 | `rocksdb` | `rocksdb-canonical-replay-storage` | 8 CPUs, 16 GiB |
-| `postgres` | `postgres-canonical-replay-storage`, `postgres-database` | 8 CPUs, 16 GiB in total: client 2 CPUs and 8 GiB, database 6 CPUs and 8 GiB |
+| `postgres` | `postgres-canonical-replay-storage`, `postgres-database` | 8 CPUs, 16 GiB total (client 2 CPUs / 8 GiB; database 6 CPUs / 8 GiB) |
 | `comparison` | All 3 services | Shared host resources |
 
-The PostgreSQL report records the arm total and both component limits. The CLI
-rejects component limits that do not sum to the reported total.
-
-The fixture and reports are host bind mounts, and the fixture is the only
-read-only input. The RocksDB store and PostgreSQL `PGDATA` each use their own
-named volume. PostgreSQL keeps logged tables, `fsync`, full-page writes, and
-synchronous commit on; only operating-system temporary files use `tmpfs`. If
-you change the database memory limit, adjust its memory settings and keep the
-rendered Compose model with the evidence.
+Component limits in PostgreSQL reports must sum to the reported arm total. The fixture (read-only) and reports are host bind mounts; each store uses its own named volume. PostgreSQL keeps logged tables, `fsync`, full-page writes, and synchronous commit enabled (OS temporary files only on `tmpfs`). If you change the database memory limit, update its settings and keep the rendered Compose model with the evidence.
 
 ## Prepare the environment
 
-Run every command from the repository root. Copy the example environment file
-and create a results directory writable by UID 10001:
+Run from the repository root. Copy the example env file and create a results directory writable by UID 10001:
 
 ```bash
 cp deploy/.env.storage-benchmark.example /tmp/zinder-storage-benchmark.env
 mkdir -p benchmark-results
 ```
 
-A formal run needs an immutable image and recorded provenance. From a clean,
-committed worktree, build the image and append its identity to the copied file:
+From a clean, committed worktree, build an immutable image and append its provenance (`@sha256:<64-hex>` registry references are also accepted; mutable tags such as `latest` are rejected):
 
 ```bash
 test -z "$(git status --porcelain)"
@@ -81,14 +61,9 @@ printf 'ZINDER_BENCH_FIXTURE_CACHE_POLICY=%s\n' "$ZINDER_BENCH_FIXTURE_CACHE_POL
   >> /tmp/zinder-storage-benchmark.env
 ```
 
-Regenerate the file whenever the revision or image changes. A shared image may
-use a registry reference pinned with `@sha256:<64-hex>`. The CLI rejects
-mutable tags such as `latest`.
-
 ## Validate the Compose model
 
-Render the model before starting containers. The all-zero image ID and
-`config-validation` labels exist only for this static check:
+Check the rendered Compose config and profiles (`comparison`, `postgres`, `rocksdb`):
 
 ```bash
 ZINDER_BENCH_IMAGE=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
@@ -115,12 +90,9 @@ docker compose \
   config --profiles
 ```
 
-The second command prints `comparison`, `postgres`, and `rocksdb`.
-
 ## Run the RocksDB arm
 
-Start from an empty volume. The candidate refuses an existing store, and the
-report refuses an existing output path:
+Start from an empty volume (both existing stores and existing output paths are refused):
 
 ```bash
 docker compose \
@@ -143,29 +115,16 @@ docker compose \
   --profile rocksdb run --rm --no-deps rocksdb-canonical-replay-storage
 ```
 
-The root-only step changes ownership of the fresh volume before timing starts.
-The arm builds one sorted external SST file, ingests it, validates the replay
-sequence, writes its completion marker, and reopens the store for a second
-validation pass. It writes two files:
+The arm builds one sorted external SST file, ingests it, validates the replay sequence, writes its completion marker, and reopens the store for a second validation pass, writing:
 
-- `rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`,
-  the report;
-- `rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`,
-  the resource evidence: sampled cgroup `memory.current`, the exact
-  `memory.peak`, and sampled disk use under `/var/lib/zinder`.
+- `rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json` (report)
+- `rocksdb-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json` (cgroup `memory.current`, exact `memory.peak`, and sampled disk under `/var/lib/zinder`)
 
-Keep `ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS` fixed for a whole
-campaign. The disk sampler runs a recursive `du`, which adds its own I/O, so
-the interval is a delay between samples rather than an exact cadence. Compare
-observer-on and observer-off smoke runs before you rely on peak disk evidence.
+Keep `ZINDER_BENCH_RESOURCE_SAMPLE_INTERVAL_SECONDS` fixed across a campaign; disk sampling uses recursive `du`, so compare observer-on and observer-off smoke runs before relying on peak disk evidence.
 
 ## Run the PostgreSQL arm
 
-The client receives the database URL through the
-`ZINDER_BENCH_POSTGRES_DATABASE_URL` variable inside its container, so
-credentials stay out of command arguments and the report. The database uses
-SCRAM-SHA-256 authentication without TLS on an isolated benchmark network.
-Point the client only at a database you control.
+The client reads `ZINDER_BENCH_POSTGRES_DATABASE_URL` inside its container using SCRAM-SHA-256 without TLS on the isolated benchmark network (`127.0.0.1:55432` with public local-only credentials `zinder_bench` / `zinder_bench_local_only`; point only at a database you control):
 
 ```bash
 docker compose \
@@ -200,36 +159,17 @@ docker compose \
   --profile postgres stop postgres-database
 ```
 
-The arm creates a fresh schema, streams the fixture through binary `COPY` in
-one transaction, builds its primary-key index, validates the sequence, and
-commits its completion row. Large replay encodings use `lz4` compression. It
-writes three files:
+The arm streams the fixture via binary `COPY` in one transaction (`lz4` for large encodings), builds its primary-key index, validates the sequence, and writes three files (wait for `postgres-database` to stop so both resource files exist):
 
-- `postgres-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`,
-  the report, including the effective database settings;
-- `postgres-canonical-replay-storage-client-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`,
-  written when the client exits;
-- `postgres-canonical-replay-storage-database-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`,
-  written only when `postgres-database` stops.
+- `postgres-canonical-replay-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`
+- `postgres-canonical-replay-storage-client-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
+- `postgres-canonical-replay-storage-database-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.resources.json`
 
-Do not record a campaign row until both resource files exist.
-
-The local host endpoint is
-`postgresql://zinder_bench:zinder_bench_local_only@127.0.0.1:55432/zinder_bench`.
-These credentials are public and valid only for this loopback-bound database.
-The database joins a second bridge network so Docker can publish that loopback
-port. That bridge does not block the database's outbound traffic.
-
-The formal services require a private cgroup v2 namespace, readable
-`memory.current` and `memory.peak`, and a sampleable volume root. If any is
-missing, the container fails with a configuration error before the trial
-starts.
+Formal services require a private cgroup v2 namespace, readable `memory.current` and `memory.peak`, and a sampleable volume root.
 
 ## Run the PostgreSQL driver integration gate
 
-This smaller test creates its own one-block fixture and checks the Rust driver
-path against the same database service. Pull-request CI runs the same nextest
-profile.
+Tests the Rust driver path against a fresh database (matching CI `ci-postgres`):
 
 ```bash
 docker compose \
@@ -251,26 +191,14 @@ docker compose \
   --profile postgres down --volumes --remove-orphans
 ```
 
-The test requires a fresh database. It covers SCRAM authentication, binary
-`COPY`, commit, reconnect, complete read-back, storage measurement, and
-rejection of an existing schema.
-
 ## Run a comparison campaign
 
-One RocksDB and PostgreSQL pair is a smoke test. For evidence:
+For evidence beyond a single smoke pair:
 
-1. Use one otherwise idle host. Keep the fixture, images, resource partition,
-   storage class, revision, and preparation concurrency fixed.
-2. Choose one fixture page-cache policy for the whole campaign and set
-   `ZINDER_BENCH_FIXTURE_CACHE_POLICY`. Use `warm` unless you can reset the
-   host or Docker VM page cache before every arm: before each measured arm,
-   read every fixture file once, untimed. Claim `cold` only when you reset the
-   cache before every arm, and record how. Fresh volumes do not clear the
-   cached fixture pages.
-3. Run at least five fresh-volume pairs. Set a unique `ZINDER_BENCH_TRIAL_ID`,
-   such as `trial-01`, before each pair, and alternate which arm runs first.
-4. After each pair completes and the database has stopped, add a row to a
-   tab-separated ledger beside the reports. Paths are relative to the ledger:
+1. Run on an idle host with fixed fixture, images, resource partition, storage class, revision, and preparation concurrency.
+2. Fix `ZINDER_BENCH_FIXTURE_CACHE_POLICY` (`warm` by reading every fixture file untimed before each arm, or `cold` only if you reset host/VM page caches before every arm and record how).
+3. Run at least five fresh-volume pairs with unique `ZINDER_BENCH_TRIAL_ID` values, alternating which arm runs first.
+4. Record each completed pair in a tab-separated ledger beside the reports:
 
    <!-- markdownlint-disable MD010 -->
 
@@ -281,7 +209,7 @@ One RocksDB and PostgreSQL pair is a smoke test. For evidence:
 
    <!-- markdownlint-enable MD010 -->
 
-5. Validate the campaign and produce the summary:
+5. Validate the campaign (checks >=5 pairs, alternation, provenance, digests, and observer alignment) and write the summary:
 
    ```bash
    scripts/validate-storage-benchmark-campaign.sh \
@@ -289,39 +217,9 @@ One RocksDB and PostgreSQL pair is a smoke test. For evidence:
      > benchmark-results/campaign-summary.json
    ```
 
-The validator orders trials from the reports' own timestamps. It rejects fewer
-than five pairs, overlapping or non-alternating runs, inconsistent cache policy
-or runner identity, duplicate trials or paths, mutable images, a failed digest
-check, mismatched configuration, failed or incomplete resource observers, and
-PostgreSQL samples it cannot align in time. The summary keeps every artifact
-path and SHA-256 with the minimum, median, and maximum of each metric.
-
 ## Compare the reports
 
-A valid pair uses the same fixture digest, revision, image, runner, resource
-budget, storage class, and preparation concurrency. Both reports must show
-`fixture_sequence_digest_match: true` before throughput or size means anything.
-
-Read the results as whole-arm measurements, not as an engine ranking.
-PostgreSQL splits its budget between client and database, while RocksDB runs in
-one process. External SST ingestion and binary `COPY` are different operations,
-and a RocksDB reopen is a stronger check than a PostgreSQL reconnect. Draw
-conclusions from end-to-end wall time, final storage bytes, digest equality,
-and the recorded resource partition together.
-
-Use these campaign metrics:
-
-- `sampled_whole_arm_memory_peak_bytes`: for RocksDB, the largest sampled
-  `memory.current`; for PostgreSQL, the largest sum of client and database
-  samples taken within one sample interval of each other. Never add the two
-  components' `memory.peak` values, because the peaks can occur at different
-  times. `round_trip.benchmark_client_peak_rss` covers only the client process.
-- `sampled_whole_arm_storage_peak_bytes`: sampled disk high-water mark of the
-  RocksDB volume or the PostgreSQL data volume. Read it together with the
-  observed sample gaps and the report's final physical byte count.
-
-Physical byte totals follow each engine's own layout. Read
-`round_trip.storage` before you compare storage efficiency.
+Both reports must show `fixture_sequence_digest_match: true` and matching provenance. Evaluate whole-arm wall time, physical bytes, digest equality, and resource partitions together (`sampled_whole_arm_memory_peak_bytes` aligns client + database samples within one interval rather than summing asynchronous `memory.peak` values; `sampled_whole_arm_storage_peak_bytes` tracks volume high water alongside `round_trip.storage`).
 
 ```bash
 jq '{
@@ -358,9 +256,7 @@ jq '{
 
 ## Check integration with the comparison profile
 
-The `comparison` profile makes every service reachable but does not isolate
-their budgets. Do not publish throughput from it. Start from clean volumes and
-fresh report paths:
+Do not publish throughput from `comparison` (shared budgets):
 
 ```bash
 docker compose \
@@ -389,9 +285,6 @@ docker compose \
 ```
 
 ## Clean up
-
-Remove the containers and candidate volumes after you capture the reports. The
-fixture and results bind mounts stay untouched:
 
 ```bash
 docker compose \
