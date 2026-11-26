@@ -58,8 +58,8 @@ pub use event_stream::{
 };
 pub use format::{
     AddressOutputCursorPayload, ChainEventStreamFamily, MempoolEventCursorPayload,
-    STREAM_CURSOR_TOKEN_V1_LEN, SnapshotPageCursorAnchor, SnapshotPageCursorPayload,
-    StreamCursorError, StreamCursorTokenV1,
+    SNAPSHOT_PAGE_CURSOR_LEN, STREAM_CURSOR_TOKEN_V1_LEN, SnapshotPageCursorAnchor,
+    SnapshotPageCursorPayload, StreamCursorError, StreamCursorTokenV1,
 };
 pub use grpc_status::{
     chain_event_stream_family_from_request, event_stream_start_from_request,

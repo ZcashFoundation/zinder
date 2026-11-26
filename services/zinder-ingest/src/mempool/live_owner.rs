@@ -15,6 +15,7 @@ use std::{
 
 use futures_util::FutureExt as _;
 use parking_lot::{Mutex as ParkingMutex, RwLock};
+use prost::Message as _;
 use tokio::{
     sync::{Mutex, watch},
     time::{Instant as TokioInstant, MissedTickBehavior},
@@ -24,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::{
     BlockId, ChainEpoch, MempoolEntry, MempoolEvictionReason, TransactionId, UnixTimestampMillis,
+    wire::encode_rpc_transaction_id_hex,
 };
 use zinder_proto::{
     status_for_reason,
@@ -35,11 +37,15 @@ use zinder_source::{
 use zinder_store::{
     EventStreamStartPosition, MempoolEvent, MempoolEventPosition, MempoolEventRetentionConfig,
     MempoolEventRetentionStepBudget, MempoolEventRetentionStepOutcome,
-    MempoolEventRetentionStepStop, StreamCursorTokenV1, mempool_event_envelope_message,
+    MempoolEventRetentionStepStop, SNAPSHOT_PAGE_CURSOR_LEN, StreamCursorTokenV1,
+    block_tip_message, chain_view_message, mempool_entry_message, mempool_event_envelope_message,
 };
 
 use crate::source_recovery::default_recovery_backoff;
-use crate::writer::control::{CanonicalControlHandle, ParkedWriterHalt};
+use crate::writer::{
+    control::{CanonicalControlHandle, ParkedWriterHalt},
+    ingest_control::MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES,
+};
 
 use super::{
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolIndexPreflight,
@@ -151,7 +157,7 @@ fn mined_block(event: &MempoolEvent) -> Option<BlockId> {
 #[derive(Clone, Debug)]
 pub(crate) struct LiveMempoolSnapshotPage {
     pub(crate) source_tip: BlockId,
-    pub(crate) entries: Vec<Arc<MempoolEntry>>,
+    pub(crate) entries: Vec<wallet::MempoolEntry>,
     pub(crate) events_resume_cursor: Vec<u8>,
     pub(crate) snapshot_age_millis: u64,
     pub(crate) next_cursor: Vec<u8>,
@@ -450,10 +456,27 @@ impl LiveMempoolOwner {
         let _mutation_guard = self.mutation_gate.lock().await;
         let (source_tip, snapshot_certified_at) = self.coherent_serving_state_for(chain_epoch)?;
         let start = canonical.begin_mempool_snapshot(from_cursor).await?;
-        let snapshot = self
+        let events_resume_cursor = start
+            .events_resume_cursor()
+            .map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec());
+        let snapshot_age_millis = UnixTimestampMillis::now()
+            .value()
+            .saturating_sub(snapshot_certified_at.value());
+        let base_encoded_bytes = snapshot_envelope_encoded_len(
+            chain_epoch,
+            source_tip,
+            &events_resume_cursor,
+            snapshot_age_millis,
+        );
+        let candidates = self
             .index
             .snapshot_page(max_entries, start.after_transaction_id());
-        let next_cursor = match snapshot.next_after_transaction_id {
+        let (entries, next_after_transaction_id) = select_bounded_snapshot_entries(
+            &candidates,
+            base_encoded_bytes,
+            MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES,
+        )?;
+        let next_cursor = match next_after_transaction_id {
             Some(after_transaction_id) => canonical
                 .encode_mempool_snapshot_next_cursor(
                     start.events_resume_anchor(),
@@ -464,18 +487,13 @@ impl LiveMempoolOwner {
                 .to_vec(),
             None => Vec::new(),
         };
-        let snapshot_age_millis = UnixTimestampMillis::now()
-            .value()
-            .saturating_sub(snapshot_certified_at.value());
         metrics::histogram!("zinder_mempool_snapshot_age_seconds")
             .record(Duration::from_millis(snapshot_age_millis));
         self.require_serving()?;
         Ok(LiveMempoolSnapshotPage {
             source_tip,
-            entries: snapshot.entries,
-            events_resume_cursor: start
-                .events_resume_cursor()
-                .map_or_else(Vec::new, |cursor| cursor.as_bytes().to_vec()),
+            entries,
+            events_resume_cursor,
             snapshot_age_millis,
             next_cursor,
         })
@@ -1397,6 +1415,90 @@ fn tip_transition_read_expired() -> Status {
     )
 }
 
+fn snapshot_envelope_encoded_len(
+    chain_epoch: ChainEpoch,
+    source_tip: BlockId,
+    events_resume_cursor: &[u8],
+    snapshot_age_millis: u64,
+) -> usize {
+    wallet::MempoolSnapshotResponse {
+        chain_view: Some(chain_view_message(chain_epoch)),
+        events_resume_cursor: events_resume_cursor.to_vec(),
+        snapshot_age_millis,
+        entries: Vec::new(),
+        next_cursor: vec![0_u8; SNAPSHOT_PAGE_CURSOR_LEN],
+        source_tip: Some(block_tip_message(source_tip.height, source_tip.hash)),
+    }
+    .encoded_len()
+}
+
+fn encoded_repeated_snapshot_entry_len(entry: &wallet::MempoolEntry) -> usize {
+    let payload_len = entry.encoded_len();
+    // `MempoolSnapshotResponse.entries` uses field tag 4 (`(4 << 3) | 2`),
+    // whose wire key is 1 byte, followed by the length-delimiter varint.
+    1_usize
+        .saturating_add(prost::encoding::encoded_len_varint(
+            u64::try_from(payload_len).unwrap_or(u64::MAX),
+        ))
+        .saturating_add(payload_len)
+}
+
+fn select_bounded_snapshot_entries(
+    candidates: &super::MempoolSnapshotPage,
+    base_encoded_bytes: usize,
+    max_response_bytes: usize,
+) -> Result<(Vec<wallet::MempoolEntry>, Option<TransactionId>), Status> {
+    let mut encoded_bytes = base_encoded_bytes;
+    let mut entries = Vec::with_capacity(candidates.entries.len());
+    let mut last_emitted_transaction_id = None;
+    let mut truncated_by_bytes = false;
+
+    for candidate in &candidates.entries {
+        if !entries.is_empty()
+            && encoded_bytes.saturating_add(candidate.raw_transaction_bytes().len())
+                > max_response_bytes
+        {
+            truncated_by_bytes = true;
+            break;
+        }
+        let entry_message = mempool_entry_message(candidate.as_ref());
+        let next_encoded_bytes =
+            encoded_bytes.saturating_add(encoded_repeated_snapshot_entry_len(&entry_message));
+        if next_encoded_bytes > max_response_bytes {
+            if entries.is_empty() {
+                return Err(oversized_mempool_entry_status(
+                    candidate.transaction_id(),
+                    next_encoded_bytes,
+                    max_response_bytes,
+                ));
+            }
+            truncated_by_bytes = true;
+            break;
+        }
+        encoded_bytes = next_encoded_bytes;
+        last_emitted_transaction_id = Some(candidate.transaction_id());
+        entries.push(entry_message);
+    }
+
+    let has_more = truncated_by_bytes || candidates.next_after_transaction_id.is_some();
+    Ok((entries, last_emitted_transaction_id.filter(|_| has_more)))
+}
+
+fn oversized_mempool_entry_status(
+    transaction_id: TransactionId,
+    encoded_bytes: usize,
+    max_response_bytes: usize,
+) -> Status {
+    status_for_reason(
+        ErrorReason::UnsupportedWalletEncoding,
+        format!(
+            "mempool entry {} requires a {encoded_bytes}-byte snapshot response, \
+             exceeding the {max_response_bytes}-byte gRPC response budget",
+            encode_rpc_transaction_id_hex(transaction_id),
+        ),
+    )
+}
+
 fn rejected_snapshot_outcome(status: &Status) -> MempoolOwnerLoopOutcome {
     tracing::warn!(
         target: "zinder::ingest",
@@ -2090,7 +2192,7 @@ mod tests {
 
         assert_eq!(
             snapshot.entries,
-            [] as [std::sync::Arc<zinder_core::MempoolEntry>; 0]
+            [] as [zinder_proto::v1::wallet::MempoolEntry; 0]
         );
         assert!(snapshot.snapshot_age_millis >= 5_000);
         command_task.abort();
@@ -2338,7 +2440,10 @@ mod tests {
         let (_, page) = owner
             .snapshot_page_at_canonical_tip(&canonical, 1, Vec::new())
             .await?;
-        assert_eq!(page.entries, [] as [Arc<MempoolEntry>; 0]);
+        assert_eq!(
+            page.entries,
+            [] as [zinder_proto::v1::wallet::MempoolEntry; 0]
+        );
         cancel.cancel();
         task.await?;
         command_task.abort();
@@ -4171,6 +4276,93 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_byte_accounting_matches_prost_encoded_len_and_exact_boundary()
+    -> Result<(), Box<dyn Error>> {
+        use prost::Message as _;
+        use zinder_core::{
+            ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpochId, ChainTipMetadata,
+            CompactTransactionData, MempoolObservation, Network, RawTransactionBytes,
+        };
+        use zinder_proto::v1::wallet::MempoolSnapshotResponse;
+
+        let chain_epoch = ChainEpoch {
+            id: ChainEpochId::new(7),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(2),
+            visible_tip_hash: BlockHash::from_bytes([2; 32]),
+            settled_tip_height: BlockHeight::new(1),
+            settled_tip_hash: BlockHash::from_bytes([1; 32]),
+            artifact_schema_version: ArtifactSchemaVersion::new(4),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1_750_000_000_000),
+        };
+        let source_tip = visible_tip(chain_epoch);
+        let resume_cursor = vec![0xAB; zinder_store::STREAM_CURSOR_TOKEN_V1_LEN];
+        let age_millis = 42_000;
+        let base_bytes = super::snapshot_envelope_encoded_len(
+            chain_epoch,
+            source_tip,
+            &resume_cursor,
+            age_millis,
+        );
+
+        let first_entry = Arc::new(MempoolEntry::new(
+            TransactionId::from_bytes([0x10; 32]),
+            None,
+            RawTransactionBytes::new(vec![0x11; 4_096]),
+            CompactTransactionData::default(),
+            MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_750_000_000_000),
+                first_seen_chain_epoch: chain_epoch,
+            },
+        )?);
+        let second_entry = Arc::new(MempoolEntry::new(
+            TransactionId::from_bytes([0x20; 32]),
+            None,
+            RawTransactionBytes::new(vec![0x22; 4_096]),
+            CompactTransactionData::default(),
+            MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_750_000_000_001),
+                first_seen_chain_epoch: chain_epoch,
+            },
+        )?);
+        let candidates = super::super::MempoolSnapshotPage {
+            entries: vec![Arc::clone(&first_entry), Arc::clone(&second_entry)],
+            next_after_transaction_id: None,
+            last_applied_event: None,
+        };
+
+        let first_wire = super::mempool_entry_message(&first_entry);
+        let exact_single_entry_budget =
+            base_bytes + super::encoded_repeated_snapshot_entry_len(&first_wire);
+
+        let (selected, next_after) = super::select_bounded_snapshot_entries(
+            &candidates,
+            base_bytes,
+            exact_single_entry_budget,
+        )?;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(next_after, Some(first_entry.transaction_id()));
+        let full_response = MempoolSnapshotResponse {
+            chain_view: Some(super::chain_view_message(chain_epoch)),
+            events_resume_cursor: resume_cursor,
+            snapshot_age_millis: age_millis,
+            entries: selected,
+            next_cursor: vec![0xCD; zinder_store::SNAPSHOT_PAGE_CURSOR_LEN],
+            source_tip: Some(super::block_tip_message(source_tip.height, source_tip.hash)),
+        };
+        assert_eq!(full_response.encoded_len(), exact_single_entry_budget);
+
+        let one_byte_short = super::select_bounded_snapshot_entries(
+            &candidates,
+            base_bytes,
+            exact_single_entry_budget.saturating_sub(1),
+        );
+        assert!(one_byte_short.is_err());
         Ok(())
     }
 }

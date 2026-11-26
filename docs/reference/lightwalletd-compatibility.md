@@ -426,7 +426,7 @@ The protocol has no lossless way to page past the cap. A single block with more 
 
 When suffixes overlap, the shortest matching suffix takes precedence, as in Go lightwalletd v0.6.2. A list containing an empty suffix therefore excludes the only transaction in a singleton snapshot. An empty list excludes nothing. [Go mempool filter](https://github.com/zcash/lightwalletd/blob/v0.6.2/frontend/service.go#L1019-L1058)
 
-A pool list containing only unrecognized numeric values yields an empty stream. A request containing `POOL_TYPE_INVALID` (0) fails with `INVALID_ARGUMENT` before any transaction is sent.
+A pool list containing only unrecognized numeric values yields an empty stream. A request containing `POOL_TYPE_INVALID` (0) fails with `INVALID_ARGUMENT` before any transaction is sent. Snapshot reads page through the live mempool within the 3.5 MiB unary response budget; an admitted entry that cannot fit in a single snapshot page fails the call with `UNAVAILABLE` and `UNSUPPORTED_WALLET_ENCODING`.
 
 ### `GetMempoolStream`
 
@@ -434,6 +434,7 @@ A pool list containing only unrecognized numeric values yields an empty stream. 
 
 - The stream ends with `OK` when the chain tip changes, including a change already observed while the stream was starting. Clients reconnect, as with lightwalletd.
 - If the tip-change signal itself closes, for example during shutdown, the stream ends with `UNAVAILABLE`, so a client does not mistake it for a new block.
+- An admitted mempool entry that exceeds the 3.5 MiB unary snapshot response budget fails the stream with `UNAVAILABLE` and `UNSUPPORTED_WALLET_ENCODING` (after any earlier snapshot pages already sent).
 - One stream sends at most 100,000 distinct transactions between tip changes. The next new one ends it with `UNAVAILABLE`, which clients retry.
 
 ## Request limits

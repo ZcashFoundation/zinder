@@ -8,6 +8,7 @@ mod light_wallet;
 mod lightwalletd_grpc;
 mod lightwalletd_scan_contract;
 mod mempool_compat;
+mod mempool_snapshot_budget;
 mod reflection;
 mod release_image;
 mod repeated_field_limits;

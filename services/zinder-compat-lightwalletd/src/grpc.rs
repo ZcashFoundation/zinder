@@ -2624,6 +2624,10 @@ fn mempool_snapshot_entries(
 fn status_from_mempool_surface_error(error: MempoolSurfaceError) -> Status {
     match error {
         MempoolSurfaceError::Unavailable { reason } => Status::unavailable(reason),
+        MempoolSurfaceError::UnsupportedEncoding { reason } => zinder_proto::status_for_reason(
+            zinder_proto::v1::ops::ErrorReason::UnsupportedWalletEncoding,
+            reason,
+        ),
         MempoolSurfaceError::CursorInvalid => Status::invalid_argument("mempool cursor is invalid"),
         MempoolSurfaceError::CursorExpired => Status::failed_precondition("mempool cursor expired"),
     }

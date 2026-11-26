@@ -99,6 +99,7 @@ pub use writer::follow::{
 pub use writer::ingest_control::{
     CanonicalIngestControlGrpcAdapter,
     MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE as CANONICAL_WRITER_MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE,
+    MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES as CANONICAL_WRITER_MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES,
 };
 pub use writer::{
     CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store,

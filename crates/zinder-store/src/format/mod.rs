@@ -8,8 +8,8 @@ pub(crate) use mempool_event_codec::{
 pub(crate) use store_key::StoreKey;
 pub use stream_cursor::{
     AddressOutputCursorPayload, ChainEventStreamFamily, MempoolEventCursorPayload,
-    STREAM_CURSOR_TOKEN_V1_LEN, SnapshotPageCursorAnchor, SnapshotPageCursorPayload,
-    StreamCursorError, StreamCursorTokenV1,
+    SNAPSHOT_PAGE_CURSOR_LEN, STREAM_CURSOR_TOKEN_V1_LEN, SnapshotPageCursorAnchor,
+    SnapshotPageCursorPayload, StreamCursorError, StreamCursorTokenV1,
 };
 pub(crate) use stream_cursor::{
     CHAIN_EVENT_LOCATOR_MAX, ChainEventCursorAnchor, ChainEventCursorPayload, ChainEventLocator,

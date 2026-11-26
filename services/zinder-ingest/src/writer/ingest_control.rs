@@ -9,6 +9,7 @@
 
 use std::{num::NonZeroU32, pin::Pin, sync::Arc, time::Duration};
 
+use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
@@ -18,6 +19,7 @@ use zinder_core::{
 };
 use zinder_proto::{
     capabilities::{CapabilitySurface, capabilities_for_surface},
+    status_for_reason,
     v1::{
         ingest::{
             MempoolTransactionRequest, ServerInfoRequest, ServerInfoResponse, WriterPhase,
@@ -35,7 +37,7 @@ use zinder_runtime::{
 use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
     CanonicalEventKind, block_tip_message, chain_epoch_message, chain_view_message,
-    event_stream_start_from_message, mempool_entry_message,
+    event_stream_start_from_message,
 };
 
 use crate::{
@@ -48,8 +50,14 @@ type VisibleChainEventsStream = IngestControlStream<wallet::ChainEventEnvelope>;
 type MempoolEventsStream = IngestControlStream<wallet::MempoolEventEnvelope>;
 
 const DEFAULT_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 256;
-/// Hard response bound shared by the private writer control APIs.
+/// Hard response entry-count bound shared by the private writer control APIs.
 pub const MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1_024;
+/// Maximum encoded protobuf size of a `MempoolSnapshotResponse` page.
+///
+/// Leaves 512 KiB of headroom below tonic's 4 MiB default client decode limit
+/// while comfortably fitting a single consensus-maximum (~2 MiB) Zcash
+/// transaction with its compact and transparent overlays.
+pub const MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES: usize = 3_584 * 1_024;
 const CANONICAL_EVENT_PAGE_SIZE: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
 const EVENT_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -239,21 +247,27 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 request.from_cursor,
             ))
             .await?;
-        Ok(Response::new(wallet::MempoolSnapshotResponse {
+        let response = wallet::MempoolSnapshotResponse {
             chain_view: Some(chain_view_message(chain_epoch)),
             events_resume_cursor: page.events_resume_cursor,
             snapshot_age_millis: page.snapshot_age_millis,
-            entries: page
-                .entries
-                .iter()
-                .map(|entry| mempool_entry_message(entry.as_ref()))
-                .collect(),
+            entries: page.entries,
             next_cursor: page.next_cursor,
             source_tip: Some(block_tip_message(
                 page.source_tip.height,
                 page.source_tip.hash,
             )),
-        }))
+        };
+        if response.encoded_len() > MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES {
+            return Err(status_for_reason(
+                ops::ErrorReason::UnsupportedWalletEncoding,
+                format!(
+                    "mempool snapshot response ({} bytes) exceeds the {MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES}-byte response budget",
+                    response.encoded_len(),
+                ),
+            ));
+        }
+        Ok(Response::new(response))
     }
 
     async fn mempool_transaction(
@@ -1875,6 +1889,72 @@ mod tests {
             writer_hit.location.and_then(|location| location.location),
             Some(zinder_proto::v1::wallet::transaction_location::Location::InMempool(_))
         ));
+        fixture.shutdown().await
+    }
+
+    /// Oversized raw entries fail deterministically with `UNSUPPORTED_WALLET_ENCODING`.
+    ///
+    /// Preceding entries that fit within the page budget still stream before
+    /// the oversized page is reached over the default 4 MiB tonic channel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mempool_snapshot_rejects_oversized_raw_entry_with_typed_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use prost::Message as _;
+        use tonic_types::StatusExt as _;
+
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        let oversized = MempoolEntry::new(
+            TransactionId::from_bytes([0xFE; 32]),
+            None,
+            RawTransactionBytes::new(vec![0xAB; 4 * 1_024 * 1_024 + 65_536]),
+            CompactTransactionData::default(),
+            MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_750_000_000_900),
+                first_seen_chain_epoch: chain_epoch,
+            },
+        )?;
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added { entry: oversized },
+                UnixTimestampMillis::new(1_750_000_000_900),
+            )
+            .await?;
+
+        let first_page = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1_024,
+                from_cursor: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first_page.entries.len(), 1);
+        assert!(first_page.encoded_len() <= super::MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES);
+        assert_ne!(first_page.next_cursor, [] as [u8; 0]);
+
+        let second_outcome = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1_024,
+                from_cursor: first_page.next_cursor,
+            }))
+            .await;
+        let Err(status) = second_outcome else {
+            return Err("oversized >4 MiB entry must fail deterministically".into());
+        };
+        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+        let details = status.get_error_details();
+        let error_detail = details
+            .error_info()
+            .ok_or("oversized mempool entry status must carry google.rpc.ErrorInfo")?;
+        assert_eq!(error_detail.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+        assert_eq!(
+            error_detail.reason,
+            zinder_proto::v1::ops::ErrorReason::UnsupportedWalletEncoding.as_str_name()
+        );
         fixture.shutdown().await
     }
 
