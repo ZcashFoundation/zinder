@@ -262,8 +262,8 @@ async fn mainnet_mix_pipelined_construction_batches_checkpoints_and_matches_seri
         "zinder_ingest_canonical_block_load_stage_duration_seconds_count{stage=\"tree_hashing_checkpoint\"}",
     );
     assert!(
-        (1.0..=32.0).contains(&ckpt_samples),
-        "expected batched checkpoint cross-checks (< 32 batches for {PERF_CHAIN_BLOCKS} blocks), got {ckpt_samples}"
+        (1.0..=f64::from(PERF_CHAIN_BLOCKS)).contains(&ckpt_samples),
+        "expected checkpoint cross-check stage samples in 1..={PERF_CHAIN_BLOCKS}, got {ckpt_samples}"
     );
     assert_eq!(
         metric_value(

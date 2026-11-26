@@ -72,7 +72,7 @@ pub struct CommitmentTreeFrontier {
     /// Root computed from `final_state_bytes`, in Zebra RPC display order.
     final_root: FinalNoteCommitmentRoot,
     /// Canonical `z_gettreestate` `finalState` bytes.
-    final_state_bytes: Arc<[u8]>,
+    final_state_bytes: Box<[u8]>,
 }
 
 impl CommitmentTreeFrontier {
@@ -106,8 +106,7 @@ impl CommitmentTreeFrontier {
         final_root: FinalNoteCommitmentRoot,
         final_state_bytes: impl Into<Box<[u8]>>,
     ) -> Result<Self, CommitmentTreeFrontierValidationError> {
-        let frontier =
-            Self::from_canonical_encoding(protocol, Arc::from(final_state_bytes.into()))?;
+        let frontier = Self::from_canonical_encoding(protocol, final_state_bytes.into())?;
         if frontier.final_root != final_root {
             return Err(CommitmentTreeFrontierValidationError::RootMismatch);
         }
@@ -118,7 +117,7 @@ impl CommitmentTreeFrontier {
     #[cfg(feature = "commitment-tree-codec")]
     fn from_canonical_encoding(
         protocol: ShieldedProtocol,
-        final_state_bytes: Arc<[u8]>,
+        final_state_bytes: Box<[u8]>,
     ) -> Result<Self, CommitmentTreeFrontierValidationError> {
         match protocol {
             ShieldedProtocol::Sapling => canonical_frontier::<SaplingNode>(
@@ -160,10 +159,10 @@ impl CommitmentTreeFrontier {
         &self.final_state_bytes
     }
 
-    /// Consumes the frontier and returns its `finalState` bytes.
+    /// Consumes the frontier and returns its `finalState` bytes without copying.
     #[must_use]
     pub fn into_final_state_bytes(self) -> Box<[u8]> {
-        Box::from(&*self.final_state_bytes)
+        self.final_state_bytes
     }
 }
 
@@ -192,7 +191,7 @@ where
         protocol,
         tree_size: 0,
         final_root: FinalNoteCommitmentRoot::from_bytes(root_bytes_in_rpc_order(&root)),
-        final_state_bytes: Arc::from([0_u8, 0, 0]),
+        final_state_bytes: Box::from([0_u8, 0, 0]),
     }
 }
 
@@ -227,7 +226,7 @@ pub enum CommitmentTreeFrontierValidationError {
 #[cfg(feature = "commitment-tree-codec")]
 fn canonical_frontier<Node>(
     protocol: ShieldedProtocol,
-    final_state_bytes: Arc<[u8]>,
+    final_state_bytes: Box<[u8]>,
     root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
 ) -> Result<CommitmentTreeFrontier, CommitmentTreeFrontierValidationError>
 where
@@ -302,9 +301,6 @@ where
 }
 
 #[cfg(test)]
-static TOTAL_ROOT_COMPUTATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
 thread_local! {
     static ROOT_COMPUTATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Bytes the next accumulator snapshot on this thread encodes in place of
@@ -320,10 +316,7 @@ where
     Node: Clone + Hashable,
 {
     #[cfg(test)]
-    {
-        ROOT_COMPUTATIONS.set(ROOT_COMPUTATIONS.get().saturating_add(1));
-        TOTAL_ROOT_COMPUTATIONS.fetch_add(1, Ordering::Relaxed);
-    }
+    ROOT_COMPUTATIONS.set(ROOT_COMPUTATIONS.get().saturating_add(1));
     frontier.root()
 }
 
@@ -2728,7 +2721,7 @@ fn snapshot_pool<Node>(
 where
     Node: Clone + Hashable + HashSer,
 {
-    let final_state_bytes = Arc::from(encode_pool(protocol, pool)?);
+    let final_state_bytes = encode_pool(protocol, pool)?;
     let validation_failed = |source| {
         CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed { protocol, source }
     };
@@ -2769,7 +2762,7 @@ fn validated_cached_pool_frontier<Node>(
         protocol,
         tree_size: pool.tree_size,
         final_root: cached.final_root,
-        final_state_bytes: Arc::clone(&cached.final_state_bytes),
+        final_state_bytes: Box::from(&*cached.final_state_bytes),
     })
 }
 
@@ -2786,7 +2779,7 @@ where
         return cross_checked_pool_from_bytes(
             protocol,
             pool,
-            Arc::from(override_bytes),
+            override_bytes.into_boxed_slice(),
             true,
             root_bytes_in_rpc_order,
         );
@@ -2794,7 +2787,7 @@ where
     if let Some(cached) = pool.cross_checked.get() {
         return validated_cached_pool_frontier(protocol, pool, cached);
     }
-    let final_state_bytes = Arc::from(encode_pool_raw(protocol, pool)?);
+    let final_state_bytes = encode_pool_raw(protocol, pool)?.into_boxed_slice();
     let frontier = cross_checked_pool_from_bytes(
         protocol,
         pool,
@@ -2804,7 +2797,7 @@ where
     )?;
     let cached = pool.cross_checked.get_or_init(|| CrossCheckedPoolState {
         final_root: frontier.final_root,
-        final_state_bytes: Arc::clone(&frontier.final_state_bytes),
+        final_state_bytes: Arc::from(&*frontier.final_state_bytes),
     });
     if cached.final_root != frontier.final_root
         || *cached.final_state_bytes != *frontier.final_state_bytes
@@ -2822,7 +2815,7 @@ where
 fn cross_checked_pool_from_bytes<Node>(
     protocol: ShieldedProtocol,
     pool: &PoolAccumulator<Node>,
-    final_state_bytes: Arc<[u8]>,
+    final_state_bytes: Box<[u8]>,
     verify_reencoding: bool,
     root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
 ) -> Result<CommitmentTreeFrontier, CommitmentTreeAccumulatorError>
@@ -5257,6 +5250,16 @@ mod tests {
         })
     }
 
+    fn reset_pool_root_computations(pool: &rayon::ThreadPool) {
+        let _ = pool.broadcast(|_| ROOT_COMPUTATIONS.set(0));
+    }
+
+    fn pool_root_computations(pool: &rayon::ThreadPool) -> u64 {
+        pool.broadcast(|_| ROOT_COMPUTATIONS.get())
+            .into_iter()
+            .sum()
+    }
+
     #[test]
     fn cross_checked_frontiers_batch_computes_each_distinct_pool_root_once_across_threads()
     -> TestResult {
@@ -5268,7 +5271,8 @@ mod tests {
         } = build_staggered_batch_snapshots(&activations)?;
 
         let ckpt_pool = rayon::ThreadPoolBuilder::new().num_threads(8).build()?;
-        TOTAL_ROOT_COMPUTATIONS.store(0, Ordering::SeqCst);
+        reset_pool_root_computations(&ckpt_pool);
+        let caller_before = root_computations();
         let mut actual_frontiers = Vec::with_capacity(snapshots.len());
         for chunk in snapshots.chunks(32) {
             let refs: Vec<&CommitmentTreeSnapshot> = chunk.iter().collect();
@@ -5277,23 +5281,25 @@ mod tests {
                 .map_err(|(_, error)| error)?;
             actual_frontiers.extend(batch_checked.iter().map(frontiers_hex_summary));
         }
+        let ckpt_computations = pool_root_computations(&ckpt_pool)
+            .saturating_add(root_computations().saturating_sub(caller_before));
         assert_eq!(actual_frontiers, expected_frontiers);
-        assert_eq!(
-            TOTAL_ROOT_COMPUTATIONS.load(Ordering::SeqCst),
-            distinct_pool_states
-        );
+        assert_eq!(ckpt_computations, distinct_pool_states);
 
         // A second thread pool with empty thread-local memos reuses shared
         // OnceLock cross-checked states with zero depth-32 root derivations.
         let cold_pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
-        TOTAL_ROOT_COMPUTATIONS.store(0, Ordering::SeqCst);
+        reset_pool_root_computations(&cold_pool);
+        let caller_before_cold = root_computations();
         let all_refs: Vec<&CommitmentTreeSnapshot> = snapshots.iter().collect();
         let rechecked = cold_pool
             .install(|| CommitmentTreeSnapshot::cross_checked_frontiers_batch(&all_refs))
             .map_err(|(_, error)| error)?;
+        let cold_computations = pool_root_computations(&cold_pool)
+            .saturating_add(root_computations().saturating_sub(caller_before_cold));
         let rechecked_hex: Vec<_> = rechecked.iter().map(frontiers_hex_summary).collect();
         assert_eq!(rechecked_hex, expected_frontiers);
-        assert_eq!(TOTAL_ROOT_COMPUTATIONS.load(Ordering::SeqCst), 0);
+        assert_eq!(cold_computations, 0);
         Ok(())
     }
 

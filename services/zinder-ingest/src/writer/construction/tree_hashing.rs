@@ -244,8 +244,10 @@ impl PipelinedBuildBlocks {
     ) -> Result<(ConstructionProgress, Vec<CanonicalBuildSubtreeRoot>), CanonicalConstructionError>
     {
         self.active_memory_permit = None;
-        self.record_staged_block();
-        if !load_succeeded {
+        if load_succeeded {
+            self.record_staged_block();
+        } else {
+            self.in_flight_store_height = None;
             self.producer_stop.cancel();
             self.queue.close_consumer();
         }
@@ -337,9 +339,15 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use tokio_util::sync::CancellationToken;
+    use zinder_core::{BlockHash, BlockHeight, BlockId};
+    use zinder_runtime::{ComposedReadiness, Readiness, ReadinessCause};
+    use zinder_store::{CanonicalReorgPolicy, CanonicalStoreBuildPlan, RawBlobRetention};
+    use zinder_testkit::sample_regtest_upgrade_activations;
+
     use super::{
-        BoundedBuildBlockQueue, CanonicalConstructionError, PopBuildBlock, ProducerFinishGuard,
-        TreeHashers,
+        BoundedBuildBlockQueue, CanonicalConstructionError, ConstructionProgress,
+        PipelinedBuildBlocks, PopBuildBlock, ProducerFinishGuard, TreeHashers,
     };
 
     #[test]
@@ -403,5 +411,46 @@ mod tests {
         });
         assert!(producer.join().is_err());
         assert!(queue.pop_blocking().is_none());
+    }
+
+    #[test]
+    fn finish_and_join_skips_recording_failed_in_flight_block_height()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            BlockId::new(BlockHeight::new(5), BlockHash::from_bytes([5; 32])),
+            RawBlobRetention::All,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
+        for (succeeded, expected_height, expected_lag) in
+            [(false, Some(0), Some(5)), (true, Some(5), Some(0))]
+        {
+            let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+            let (progress, subtrees) = (PipelinedBuildBlocks {
+                queue: BoundedBuildBlockQueue::new(1),
+                active_memory_permit: None,
+                in_flight_store_height: Some(BlockHeight::new(5)),
+                progress: ConstructionProgress::start(&build_plan, Some(readiness.clone())),
+                cancel: CancellationToken::new(),
+                producer_stop: CancellationToken::new(),
+                producer_handle: Some(thread::spawn(Vec::new)),
+            })
+            .finish_and_join(succeeded)?;
+            drop(progress);
+            let report = readiness.runtime_readiness().report();
+            drop(readiness);
+            assert_eq!(subtrees.len(), 0);
+            assert_eq!(report.current_height, expected_height);
+            assert_eq!(
+                report.cause,
+                ReadinessCause::Syncing {
+                    lag_blocks: expected_lag,
+                    wait_reason: None,
+                }
+            );
+        }
+        Ok(())
     }
 }
