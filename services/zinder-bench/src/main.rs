@@ -168,7 +168,7 @@ struct ActiveWriterPublicationArgs {
     #[arg(long = "slow-reader-frame-delay-millis", default_value_t = 3)]
     slow_reader_frame_delay_millis: u64,
     /// Mempool churn transaction counts (comma-separated or repeated).
-    #[arg(long = "mempool-churn-size", default_values_t = vec![50, 500])]
+    #[arg(long = "mempool-churn-size", value_delimiter = ',', default_values_t = vec![50, 500])]
     mempool_churn_sizes: Vec<u32>,
     /// Minimum request rounds for the `quiescent_control` baseline arm.
     #[arg(long = "quiescent-rounds", default_value_t = 6)]
@@ -1073,6 +1073,35 @@ mod tests {
             parsed.command,
             Command::ActiveWriterPublication(_)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn active_writer_publication_parses_comma_separated_and_repeated_mempool_churn_sizes()
+    -> Result<(), Box<dyn Error>> {
+        for argv in [
+            vec![
+                "zinder-bench",
+                "active-writer-publication",
+                "--mempool-churn-size",
+                "50,500",
+            ],
+            vec![
+                "zinder-bench",
+                "active-writer-publication",
+                "--mempool-churn-size",
+                "50",
+                "--mempool-churn-size",
+                "500",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(argv)?;
+            assert!(matches!(
+                parsed.command,
+                Command::ActiveWriterPublication(ref args)
+                    if args.mempool_churn_sizes == [50, 500]
+            ));
+        }
         Ok(())
     }
 }

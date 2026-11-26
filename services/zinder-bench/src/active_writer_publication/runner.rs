@@ -603,6 +603,7 @@ async fn run_single_mode(
         }
     };
     let workload_duration_ms = workload_started.elapsed().as_secs_f64() * 1_000.0;
+    let (reader_io_modes, reader_secondary_delta) = boot.reader_pool.collect_metrics();
 
     let parity_res = collect_final_tip_parity(
         boot.channel,
@@ -615,7 +616,6 @@ async fn run_single_mode(
         },
     )
     .await;
-    let (reader_io_modes, reader_secondary_delta) = boot.reader_pool.collect_metrics();
     shutdown_mode_runtime(boot.servers, boot.reader_pool).await;
     let parity = parity_res?;
 

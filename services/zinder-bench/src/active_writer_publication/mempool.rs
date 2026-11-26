@@ -161,16 +161,19 @@ impl MempoolSurface for BenchmarkMempoolSurface {
             .as_ref()
             .and_then(|token| <[u8; 8]>::try_from(token.as_bytes()).ok())
             .map_or(0, u64::from_be_bytes);
-        let mut replay = Vec::new();
-        {
+        let (replay, receiver) = {
             let guard = self.state.read();
-            for event in &guard.events {
-                if event.event_sequence > after_sequence {
-                    replay.push(Ok(event.clone()));
-                }
-            }
-        }
-        let receiver = self.events_tx.subscribe();
+            let replay: Vec<Result<MempoolEventEnvelope, MempoolSurfaceError>> = guard
+                .events
+                .iter()
+                .filter(|event| event.event_sequence > after_sequence)
+                .cloned()
+                .map(Ok)
+                .collect();
+            let receiver = self.events_tx.subscribe();
+            drop(guard);
+            (replay, receiver)
+        };
         let live = BroadcastStream::new(receiver).filter_map(|outcome| outcome.ok().map(Ok));
         let combined: Pin<
             Box<
@@ -250,4 +253,78 @@ fn synthetic_mempool_entry(
         },
     )
     .map_err(|err| BenchError::tip_replay(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, sync::Arc, time::Duration};
+
+    use tokio_stream::StreamExt as _;
+    use zinder_compat_lightwalletd::MempoolSurface as _;
+    use zinder_core::{
+        ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
+        Network, UnixTimestampMillis,
+    };
+
+    use super::BenchmarkMempoolSurface;
+
+    fn sample_epoch() -> ChainEpoch {
+        ChainEpoch {
+            id: ChainEpochId::new(1),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(10),
+            visible_tip_hash: BlockHash::from_bytes([1_u8; 32]),
+            settled_tip_height: BlockHeight::new(6),
+            settled_tip_hash: BlockHash::from_bytes([2_u8; 32]),
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(1),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mempool_events_handoff_preserves_every_event_under_concurrent_churn()
+    -> Result<(), Box<dyn Error>> {
+        let surface = BenchmarkMempoolSurface::new(sample_epoch());
+        let batch_size = 8_u32;
+        let rounds = 24_u32;
+        let expected_total =
+            u64::from(batch_size) + u64::from(rounds - 1) * u64::from(batch_size) * 2;
+        let expected_sequences: Vec<u64> = (1..=expected_total).collect();
+
+        let writer_surface = Arc::clone(&surface);
+        let writer = tokio::task::spawn_blocking(move || -> Result<(), super::BenchError> {
+            let sample_tx = [0_u8; 16];
+            for round in 1..=rounds {
+                writer_surface.apply_churn_batch(batch_size, round, &sample_tx)?;
+                std::thread::yield_now();
+            }
+            Ok(())
+        });
+
+        let mut streams = Vec::with_capacity(usize::try_from(rounds)?);
+        for _ in 0..rounds {
+            streams.push(surface.mempool_events(None).await?);
+            tokio::task::yield_now().await;
+        }
+        writer.await??;
+
+        for mut stream in streams {
+            let mut observed = Vec::with_capacity(usize::try_from(expected_total)?);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(entry) = stream.next().await {
+                    let env = entry?;
+                    let seq = env.event_sequence;
+                    observed.push(seq);
+                    if seq >= expected_total {
+                        break;
+                    }
+                }
+                Ok::<(), zinder_compat_lightwalletd::MempoolSurfaceError>(())
+            })
+            .await??;
+            assert_eq!(observed, expected_sequences);
+        }
+        Ok(())
+    }
 }

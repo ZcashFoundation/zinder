@@ -823,6 +823,25 @@ async fn run_mempool_readers(
     Ok(tier_reports)
 }
 
+async fn await_commit_progress_or_done(signals: &FleetSignals, target_commits: u32) {
+    loop {
+        let wake = signals.commit_wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
+        if signals.fleet_cancel.is_cancelled()
+            || signals.commits_completed.load(Ordering::Acquire) >= target_commits
+            || signals.writer_commits_done.load(Ordering::Acquire)
+        {
+            break;
+        }
+        tokio::select! {
+            biased;
+            () = signals.fleet_cancel.cancelled() => break,
+            () = &mut wake => {}
+        }
+    }
+}
+
 async fn run_mempool_tier(
     client: &mut CompactTxStreamerClient<AuthenticatedChannel>,
     (index, batch_size): (usize, u32),
@@ -834,15 +853,8 @@ async fn run_mempool_tier(
     pending_watchers: &mut Vec<(usize, JoinHandle<u64>)>,
 ) -> Result<MempoolTierMetrics, BenchError> {
     let required_commits = u32::try_from(index).unwrap_or(u32::MAX);
-    while spec.mode != WriterMode::QuiescentControl
-        && signals.commits_completed.load(Ordering::Acquire) < required_commits
-        && !signals.writer_commits_done.load(Ordering::Acquire)
-    {
-        tokio::select! {
-            biased;
-            () = signals.fleet_cancel.cancelled() => break,
-            () = signals.commit_wake.notified() => {}
-        }
+    if spec.mode != WriterMode::QuiescentControl && required_commits > 0 {
+        await_commit_progress_or_done(signals, required_commits).await;
     }
 
     let commits_before = signals.commits_completed.load(Ordering::Acquire);
@@ -863,16 +875,8 @@ async fn run_mempool_tier(
         if signals.fleet_cancel.is_cancelled() {
             break;
         }
-        if spec.mode != WriterMode::QuiescentControl
-            && pass + 1 == passes
-            && signals.commits_completed.load(Ordering::Acquire) == commits_before
-            && !signals.writer_commits_done.load(Ordering::Acquire)
-        {
-            tokio::select! {
-                biased;
-                () = signals.fleet_cancel.cancelled() => break,
-                () = signals.commit_wake.notified() => {}
-            }
+        if spec.mode != WriterMode::QuiescentControl && pass + 1 == passes {
+            await_commit_progress_or_done(signals, commits_before.saturating_add(1)).await;
         }
         probe_mempool_tx(client, &mut tracker, signals).await;
     }
@@ -1350,10 +1354,11 @@ mod tests {
     use std::{
         collections::VecDeque,
         error::Error,
+        future::Future as _,
         marker::PhantomData,
         pin::Pin,
         sync::Arc,
-        task::{Context, Poll},
+        task::{Context, Poll, Waker},
         time::Duration,
     };
 
@@ -1379,9 +1384,38 @@ mod tests {
     use zinder_runtime::connect_zinder_grpc_with_timeout;
 
     use super::{
-        CLIENT_MAX_MESSAGE_BYTES, TailPairObservation, TailPairOutcome, TailProbeSnap,
-        classify_tail_pair, hash_block_range, hash_tree_states,
+        CLIENT_MAX_MESSAGE_BYTES, FleetSignals, TailPairObservation, TailPairOutcome,
+        TailProbeSnap, await_commit_progress_or_done, classify_tail_pair, hash_block_range,
+        hash_tree_states,
     };
+
+    #[tokio::test]
+    async fn await_commit_progress_or_done_wakes_across_final_commit_and_completion_interleaving()
+    -> Result<(), Box<dyn Error>> {
+        let signals = FleetSignals::new(100, 1);
+        let noop_waker = Waker::noop();
+
+        {
+            let mut wait_commit = std::pin::pin!(await_commit_progress_or_done(&signals, 1));
+            let mut cx = Context::from_waker(noop_waker);
+            assert!(wait_commit.as_mut().poll(&mut cx).is_pending());
+            signals.record_commit(101);
+            tokio::time::timeout(Duration::from_secs(1), wait_commit).await?;
+        }
+
+        {
+            let mut wait_done = std::pin::pin!(await_commit_progress_or_done(&signals, 5));
+            let mut cx = Context::from_waker(noop_waker);
+            assert!(wait_done.as_mut().poll(&mut cx).is_pending());
+            signals.mark_writer_commits_done();
+            tokio::time::timeout(Duration::from_secs(1), wait_done).await?;
+        }
+
+        let mut already_done = std::pin::pin!(await_commit_progress_or_done(&signals, 9));
+        let mut cx = Context::from_waker(noop_waker);
+        assert!(already_done.as_mut().poll(&mut cx).is_ready());
+        Ok(())
+    }
 
     #[test]
     fn classify_tail_pair_rejects_same_epoch_catalog_extension_mid_pair() {
