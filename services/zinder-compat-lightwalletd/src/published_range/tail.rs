@@ -7,14 +7,14 @@ use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, CanonicalHistoryBounds, ChainEpoch,
     CompactBlockArtifact,
 };
-use zinder_proto::compat::lightwalletd::EncodedBlock;
+use zinder_proto::compat::lightwalletd::{EncodedBlock, EncodedBlockBatcher};
 use zinder_query::{CompactBlockFence, CompactBlockSource};
 use zinder_store::{CanonicalEventFence, HeightOrder};
 
 use crate::{
     block_methods::CompactBlockReads,
     compact_block_messages::CompactBlockShape,
-    sealed_history::{SealedBlock, SealedSlab},
+    sealed_history::{BlockLink, ChunkSpan, SealedBlock, SealedSlab},
 };
 
 const TAIL_BLOCKS: u32 = 5_096;
@@ -44,16 +44,26 @@ impl TailRow {
         self.shielded.payload_len() + self.nullifiers.payload_len()
     }
 
-    fn sealed_block(&self, slab: SealedSlab) -> SealedBlock {
-        let message = match slab {
+    fn message_for(&self, slab: SealedSlab) -> &EncodedBlock {
+        match slab {
             SealedSlab::Shielded => &self.shielded,
             SealedSlab::Nullifier => &self.nullifiers,
-        };
+        }
+    }
+
+    fn link(&self) -> BlockLink {
+        BlockLink {
+            id: self.id,
+            parent: self.parent,
+        }
+    }
+
+    fn sealed_block(&self, slab: SealedSlab) -> SealedBlock {
         SealedBlock {
             id: self.id,
             parent: self.parent,
             native_bytes: self.native_bytes,
-            message: message.clone(),
+            message: self.message_for(slab).clone(),
         }
     }
 }
@@ -465,6 +475,106 @@ impl EncodedTail {
             selected.reverse();
         }
         selected
+    }
+
+    pub(super) fn append_frames(
+        &self,
+        slab: SealedSlab,
+        (span, order): (BlockHeightRange, HeightOrder),
+        (budget, allow_first): (usize, bool),
+        batcher: &mut EncodedBlockBatcher,
+    ) -> Option<ChunkSpan> {
+        let bounds = self.bounds()?;
+        let mut rows = self.rows.range(
+            (span.start.value() - bounds.start.value()) as usize
+                ..=(span.end.value() - bounds.start.value()) as usize,
+        );
+        let mut combined: Option<ChunkSpan> = None;
+        let mut room = budget;
+        while let Some(row) = match order {
+            HeightOrder::Ascending => rows.next(),
+            HeightOrder::Descending => rows.next_back(),
+        } {
+            if row.native_bytes > room && !(allow_first && combined.is_none()) {
+                break;
+            }
+            batcher.push_block(row.message_for(slab).clone());
+            let link = row.link();
+            let row_span = ChunkSpan {
+                lowest: link,
+                highest: link,
+                kept_blocks: 1,
+                kept_native_bytes: row.native_bytes,
+            };
+            combined = Some(combined.map_or(row_span, |prior| prior.merge(row_span)));
+            room = room.saturating_sub(row.native_bytes);
+        }
+        combined
+    }
+
+    pub(super) fn append_projected_frames(
+        &self,
+        projection: crate::compact_block_messages::PublishedProjection,
+        (span, order): (BlockHeightRange, HeightOrder),
+        (budget, allow_first): (usize, bool),
+        (cancel, scratch, batcher): (
+            &CancellationToken,
+            &mut crate::sealed_history::WireProjectionScratch,
+            &mut EncodedBlockBatcher,
+        ),
+    ) -> std::io::Result<Option<ChunkSpan>> {
+        let Some(selection) = projection.selection() else {
+            return Ok(self.append_frames(
+                projection.slab(),
+                (span, order),
+                (budget, allow_first),
+                batcher,
+            ));
+        };
+        let Some(bounds) = self.bounds() else {
+            return Ok(None);
+        };
+        let slab = projection.slab();
+        let mut rows = self.rows.range(
+            (span.start.value() - bounds.start.value()) as usize
+                ..=(span.end.value() - bounds.start.value()) as usize,
+        );
+        let mut combined: Option<ChunkSpan> = None;
+        let mut room = budget;
+        while let Some(row) = match order {
+            HeightOrder::Ascending => rows.next(),
+            HeightOrder::Descending => rows.next_back(),
+        } {
+            if cancel.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "block-range stream cancelled",
+                ));
+            }
+            if row.native_bytes > room && !(allow_first && combined.is_none()) {
+                break;
+            }
+            let stored = row.message_for(slab);
+            let payload = stored.payload();
+            if stored.as_length_prefixed().len() >= EncodedBlock::LARGE_MESSAGE_MIN_BYTES
+                && zinder_store::is_passthrough_shielded_block_wire(&payload, selection)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+            {
+                batcher.push_block(stored.clone());
+            } else {
+                scratch.push_projected_payload(&payload, selection, batcher)?;
+            }
+            let link = row.link();
+            let row_span = ChunkSpan {
+                lowest: link,
+                highest: link,
+                kept_blocks: 1,
+                kept_native_bytes: row.native_bytes,
+            };
+            combined = Some(combined.map_or(row_span, |prior| prior.merge(row_span)));
+            room = room.saturating_sub(row.native_bytes);
+        }
+        Ok(combined)
     }
 
     /// Appends `row`, evicting the lowest rows past `max_tail_bytes`. The

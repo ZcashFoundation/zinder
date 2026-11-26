@@ -13,7 +13,8 @@ use zinder_query::CanonicalReader;
 use zinder_store::HeightOrder;
 
 use super::{PublishedShieldedCatalog, ShieldedTailBuffer};
-use crate::sealed_history::SealedBlock;
+use crate::sealed_history::{ChunkSpan, SealedBlock};
+use zinder_proto::compat::lightwalletd::EncodedBlockBatcher;
 
 /// The admitted shielded history shared by a listener and its catalog refresher.
 pub struct PublishedShieldedHistory {
@@ -375,5 +376,82 @@ impl PublishedShieldedCatalog {
             output.reverse();
         }
         Ok(output)
+    }
+
+    pub(super) fn append_chunk_frames(
+        &self,
+        projection: crate::compact_block_messages::PublishedProjection,
+        (range, order): (BlockHeightRange, HeightOrder),
+        (max_bytes, allow_oversized): (usize, bool),
+        (cancel, scratch, batcher): (
+            &CancellationToken,
+            &mut crate::sealed_history::WireProjectionScratch,
+            &mut EncodedBlockBatcher,
+        ),
+    ) -> io::Result<Option<ChunkSpan>> {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "block-range stream cancelled",
+            ));
+        }
+        let segments = self.segments();
+        let start =
+            segments.partition_point(|part| part.segment.identity().end.height < range.start);
+        let end = segments.partition_point(|part| part.segment.identity().start <= range.end);
+        let selected = segments
+            .get(start..end)
+            .filter(|parts| !parts.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "range outside shielded catalog",
+                )
+            })?;
+        if let [part] = selected {
+            return part.segment.append_frames(
+                projection,
+                (range, order),
+                (max_bytes, allow_oversized),
+                (scratch, batcher),
+            );
+        }
+        let mut combined: Option<ChunkSpan> = None;
+        let mut remaining = max_bytes;
+        let mut parts = selected.iter();
+        while let Some(part) = match order {
+            HeightOrder::Ascending => parts.next(),
+            HeightOrder::Descending => parts.next_back(),
+        } {
+            if cancel.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "block-range stream cancelled",
+                ));
+            }
+            let identity = part.segment.identity();
+            let span = BlockHeightRange::inclusive(
+                range.start.max(identity.start),
+                range.end.min(identity.end.height),
+            );
+            let allow_first = allow_oversized && combined.is_none();
+            let Some(part_span) = part.segment.append_frames(
+                projection,
+                (span, order),
+                (remaining, allow_first),
+                (scratch, batcher),
+            )?
+            else {
+                break;
+            };
+            let whole_span = u64::try_from(part_span.kept_blocks).ok()
+                == Some(u64::from(span.end.value() - span.start.value()) + 1);
+            remaining = remaining.saturating_sub(part_span.kept_native_bytes);
+            combined = Some(combined.map_or(part_span, |prior| prior.merge(part_span)));
+            if !whole_span || remaining == 0 {
+                break;
+            }
+        }
+        Ok(combined)
     }
 }
