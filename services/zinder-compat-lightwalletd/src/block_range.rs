@@ -350,6 +350,7 @@ impl BlockRangeStreamLimit {
         // zero would discard the slots that other limits in the process hold.
         metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
         register_refusal_counter();
+        crate::sealed_history::register_published_history_metrics();
         Self {
             published_reads: Arc::new(Semaphore::new(PUBLISHED_READERS)),
             slots: Arc::new(Semaphore::new(permits)),
@@ -531,11 +532,64 @@ fn record_admission(outcome: AdmissionOutcome, waited: Duration) {
         }
         AdmissionOutcome::Refused(reason) => {
             metrics::counter!(REFUSED_STREAMS_COUNTER, "reason" => reason.label()).increment(1);
+            if reason == RefusalReason::WaitTimeout {
+                maybe_warn_cgroup_memory_pressure();
+            }
             "refused"
         }
         AdmissionOutcome::Cancelled => "cancelled",
     };
     metrics::histogram!(SLOT_WAIT_HISTOGRAM, "outcome" => outcome_label).record(waited);
+}
+
+const CGROUP_PRESSURE_WARN_INTERVAL_SECS: u64 = 30;
+
+fn maybe_warn_cgroup_memory_pressure() {
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    };
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LAST_SAMPLE_SECS: AtomicU64 = AtomicU64::new(0);
+
+    // Reserve the sampling interval atomically before touching cgroup files so
+    // bursts of concurrent timeouts cannot hammer synchronous reads on Tokio
+    // workers.
+    let elapsed_secs = START.get_or_init(Instant::now).elapsed().as_secs().max(1);
+    let previous = LAST_SAMPLE_SECS.load(AtomicOrdering::Relaxed);
+    if previous != 0 && elapsed_secs.saturating_sub(previous) < CGROUP_PRESSURE_WARN_INTERVAL_SECS {
+        return;
+    }
+    if LAST_SAMPLE_SECS
+        .compare_exchange(
+            previous,
+            elapsed_secs,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Relaxed,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    let Some(snapshot) = zinder_runtime::container_memory_snapshot() else {
+        return;
+    };
+    if snapshot.limit_bytes == 0
+        || u128::from(snapshot.current_bytes) * 10 < u128::from(snapshot.limit_bytes) * 8
+    {
+        return;
+    }
+    tracing::warn!(
+        target: "zinder::compat::lightwalletd",
+        event = "block_range_wait_timeout_under_cgroup_memory_pressure",
+        memory_current_bytes = snapshot.current_bytes,
+        memory_limit_bytes = snapshot.limit_bytes,
+        memory_file_cache_bytes = snapshot.file_cache_bytes,
+        "block-range admission timed out while cgroup v2 memory usage is near its limit; \
+         signed-history catalog reads charge OS page cache to MemoryMax/mem_limit outside RocksDB"
+    );
 }
 
 /// A taken slot, counted in `zinder_compat_block_range_streams_open` until it
@@ -1839,6 +1893,24 @@ mod tests {
                 ),
                 Some(0.0),
                 "expected 0 sample for reason={reason} in:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("# HELP zinder_compat_published_history_read_bytes_total "),
+            "missing # HELP for published history read bytes in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE zinder_compat_published_history_read_bytes_total counter"),
+            "missing # TYPE for published history read bytes in:\n{rendered}"
+        );
+        for slab in ["shielded", "nullifier"] {
+            assert_eq!(
+                rendered_sample(
+                    &rendered,
+                    &format!("zinder_compat_published_history_read_bytes_total{{slab=\"{slab}\"}}"),
+                ),
+                Some(0.0),
+                "expected 0 sample for slab={slab} in:\n{rendered}"
             );
         }
     }

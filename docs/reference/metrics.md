@@ -480,6 +480,8 @@ bidirectional calls.
 | `zinder_compat_block_range_stream_refusals_total` | counter | `reason` | Block-range requests refused with `UNAVAILABLE`: `wait_timeout` when no slot returned within 10 seconds, `waiters_full` when three times as many requests already waited as the limit has slots. Both `reason` series are registered and start at zero when the process starts. |
 | `zinder_compat_block_range_slot_wait_duration_seconds` | histogram | `outcome` | Time a block-range request waited before it took a slot (`admitted`), was refused (`refused`), or its client went away (`cancelled`). |
 | `zinder_compat_block_range_stage_duration_seconds` | histogram | `stage` | Time one chunk of a block-range stream spent reading from storage (`read`), converting to lightwalletd messages (`convert`), or, for each chunk after the first, waiting for room for it before its read (`send`). The adapter holds two chunks of a stream, so a chunk waits until the gRPC server has taken every block of the chunk two before it to send. A later read that finds a height outside retained history and gives way to a read of heights an earlier read checked records a `read` sample for each. In compact-blocks mode `read` is the storage read alone; in wallet mode it is the wallet query, including its wait for a blocking thread, and ends when the query returns, so it leaves out the conversion's wait for one. |
+| `zinder_compat_published_history_read_bytes_total` | counter | `slab` | Bytes read from signed-history catalog segment files (`ZSHRNG01`) through OS buffered I/O, labelled by `slab` (`shielded` or `nullifier`). Both `slab` series are registered and start at zero when the process starts. |
+| `zinder_compat_published_history_read_duration_seconds` | histogram | `slab` | Time spent reading framed payloads from signed-history catalog segment files through OS buffered I/O, labelled by `slab` (`shielded` or `nullifier`). |
 | `zinder_compat_tip_wait_total` | counter | `method`, `outcome`, `blocks_ahead` | Height-selected block reads and light-wallet forwarded UTXO and balance reads that observed a tip just past the visible tip, by how the [tip wait](lightwalletd-compatibility.md#waiting-for-a-height-just-past-the-tip) ended. `method` is snake_case, such as `get_block`, `get_block_range`, `get_tree_state`, `get_address_utxos`, `get_address_utxos_stream`, `get_taddress_balance`, or `get_taddress_balance_stream`. `outcome` is `served` (the height arrived), `expired` (the wait ran out), `cancelled` (the client left, shutdown began, or the publisher stopped), `waiters_full` (every waiting place was taken), `left_window` (the tip moved down out of the window), or `refused` (reading the tip failed, and the request failed with that status). `blocks_ahead` is `1` to `4`, or `over_4`. |
 | `zinder_compat_tip_wait_duration_seconds` | histogram | `outcome` | Time a read waited for the tip, by the same outcomes. |
 | `zinder_compat_tip_waiters` | gauge | | Reads waiting for the tip now, against `compat.tip_wait_max_waiters`. |
@@ -531,8 +533,8 @@ within each process.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `zinder_store_block_cache_capacity_bytes` | gauge | `store_role` | Block cache capacity. |
-| `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. |
+| `zinder_store_block_cache_capacity_bytes` | gauge | `store_role` | Block cache capacity. Excludes signed-history catalog (`ZSHRNG01`) reads, which bypass RocksDB and rely on the Linux OS page cache. |
+| `zinder_store_block_cache_usage_bytes` | gauge | `store_role` | Block cache use. It can exceed capacity by pinned index and filter blocks. Excludes signed-history catalog page-cache residency. |
 | `zinder_store_block_cache_pinned_usage_bytes` | gauge | `store_role` | Pinned block cache use. |
 | `zinder_store_block_cache_entries` | gauge | `store_role`, `entry_role` | Serving readers only. Number of cached entries by RocksDB role, such as `DataBlock`, `IndexBlock`, or `FilterBlock`. |
 | `zinder_store_block_cache_entry_bytes` | gauge | `store_role`, `entry_role` | Serving readers only. Approximate cache charge by entry role. RocksDB rounds each role's charge before export. |
@@ -545,6 +547,17 @@ within each process.
 | `zinder_store_rocksdb_io_mode` | gauge | `store_role`, `mode` | 1 for the I/O mode: `direct` or `buffered`. |
 | `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes and per-family live SST size (`rocksdb.live-sst-files-size`). |
 | `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
+
+> **Diagnosing signed-catalog cgroup v2 page-cache thrashing:** Signed-history
+> catalog segment reads (`ZSHRNG01`) use OS buffered I/O outside RocksDB, so
+> `zinder_store_block_cache_*` and `rocksdb.block.cache.miss` stay at zero even
+> when the reader repeatedly re-reads catalog segments from disk. Under Linux
+> cgroup v2, OS page cache for those files is charged to the reader's
+> `MemoryMax` (systemd) or `mem_limit` (Docker). If
+> `zinder_compat_block_range_stream_refusals_total{reason="wait_timeout"}` rises
+> alongside high `zinder_compat_published_history_read_bytes_total` rates and
+> elevated `zinder_compat_published_history_read_duration_seconds`, raise the
+> reader's cgroup memory limit to hold the signed catalog plus its working set.
 
 Ingest samples the canonical primary after bulk loads, while following the
 tip, and after checkpoint densification commits. The projector samples the

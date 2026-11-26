@@ -1,0 +1,6 @@
+kind: added
+body: Exported signed-catalog read telemetry (`zinder_compat_published_history_read_bytes_total` pre-registered at zero and `zinder_compat_published_history_read_duration_seconds`, both labelled by `slab` `shielded` and `nullifier`) plus rate-limited cgroup v2 memory-pressure diagnostics on `wait_timeout` refusals, and documented cgroup v2 page-cache troubleshooting in `docs/reference/metrics.md`.
+time: 2026-11-25T21:14:00Z
+custom:
+    Bump: minor
+    PR: "618"

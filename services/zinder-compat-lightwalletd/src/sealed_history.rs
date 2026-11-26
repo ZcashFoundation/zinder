@@ -64,6 +64,13 @@ const SLAB_TARGET_BYTES: usize = BoundedChunkRetention::MAX_ALLOCATION_BYTES;
 // Bit 0 marks the nullifier slab present, which every segment must carry.
 const SEGMENT_FLAGS_HAS_NULLIFIER_SLAB: u16 = 0x0001;
 
+/// Counter of bytes read from signed-history catalog segments, labelled by `slab`.
+const PUBLISHED_HISTORY_READ_BYTES_COUNTER: &str =
+    "zinder_compat_published_history_read_bytes_total";
+/// Histogram of signed-history catalog file read duration, labelled by `slab`.
+const PUBLISHED_HISTORY_READ_DURATION_HISTOGRAM: &str =
+    "zinder_compat_published_history_read_duration_seconds";
+
 /// Which slab of a segment a range read serves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SealedSlab {
@@ -71,6 +78,47 @@ pub(crate) enum SealedSlab {
     Shielded,
     /// Pre-encoded `CompactBlockShape::DEFAULT_NULLIFIER_RANGE` frames.
     Nullifier,
+}
+
+impl SealedSlab {
+    const ALL: [Self; 2] = [Self::Shielded, Self::Nullifier];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Shielded => "shielded",
+            Self::Nullifier => "nullifier",
+        }
+    }
+}
+
+/// Describes and pre-registers signed-catalog read telemetry at zero for both slabs.
+pub(crate) fn register_published_history_metrics() {
+    metrics::describe_counter!(
+        PUBLISHED_HISTORY_READ_BYTES_COUNTER,
+        metrics::Unit::Bytes,
+        "Bytes read from signed-history catalog segment files through OS buffered I/O, \
+         labelled by `slab` (`shielded` or `nullifier`)."
+    );
+    metrics::describe_histogram!(
+        PUBLISHED_HISTORY_READ_DURATION_HISTOGRAM,
+        metrics::Unit::Seconds,
+        "Time spent reading framed payloads from signed-history catalog segment files, \
+         labelled by `slab` (`shielded` or `nullifier`)."
+    );
+    for slab in SealedSlab::ALL {
+        let slab_label = slab.label();
+        metrics::counter!(PUBLISHED_HISTORY_READ_BYTES_COUNTER, "slab" => slab_label).increment(0);
+        metrics::histogram!(PUBLISHED_HISTORY_READ_DURATION_HISTOGRAM, "slab" => slab_label)
+            .record_many(0.0, 0);
+    }
+}
+
+fn record_published_history_read(slab: SealedSlab, bytes_read: u64, elapsed: std::time::Duration) {
+    let slab_label = slab.label();
+    metrics::counter!(PUBLISHED_HISTORY_READ_BYTES_COUNTER, "slab" => slab_label)
+        .increment(bytes_read);
+    metrics::histogram!(PUBLISHED_HISTORY_READ_DURATION_HISTOGRAM, "slab" => slab_label)
+        .record(elapsed);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -961,10 +1009,16 @@ impl SealedHistory {
         if order == HeightOrder::Descending {
             plan.reverse();
         }
+        let mut total_bytes_read = 0_u64;
+        let mut read_duration = std::time::Duration::ZERO;
         for (rows, offset, len) in plan {
+            let read_started_at = std::time::Instant::now();
             let slab_bytes = read_slab_at(&self.file, len, offset)?;
+            read_duration += read_started_at.elapsed();
+            total_bytes_read = total_bytes_read.saturating_add(len as u64);
             self.append_slab_frames(projection, (order, rows), slab_bytes, (scratch, batcher))?;
         }
+        record_published_history_read(slab, total_bytes_read, read_duration);
         Ok(Some(span))
     }
 
@@ -1044,9 +1098,13 @@ impl SealedHistory {
     ) -> io::Result<Vec<SealedBlock>> {
         let plan = self.plan_slabs(slab, selected.clone())?;
         let mut slabs = Vec::with_capacity(plan.len());
+        let mut total_bytes_read = 0_u64;
+        let read_started_at = std::time::Instant::now();
         for (rows, offset, len) in plan {
             slabs.push((rows, read_slab_at(&self.file, len, offset)?));
+            total_bytes_read = total_bytes_read.saturating_add(len as u64);
         }
+        record_published_history_read(slab, total_bytes_read, read_started_at.elapsed());
         let mut out = Vec::with_capacity(selected.len());
         for (rows, slab_bytes) in slabs {
             self.append_slab(slab, &mut out, rows, slab_bytes)?;
@@ -1425,3 +1483,75 @@ fn invalid(reason: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::{SealedSlab, record_published_history_read, register_published_history_metrics};
+
+    #[test]
+    fn published_history_read_records_bytes_and_duration_for_both_slabs() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        register_published_history_metrics();
+        let before = handle.render();
+        for slab in ["shielded", "nullifier"] {
+            assert!(
+                before.contains(&format!(
+                    "zinder_compat_published_history_read_bytes_total{{slab=\"{slab}\"}} 0"
+                )),
+                "missing zero bytes counter for slab={slab} in:\n{before}"
+            );
+            assert!(
+                before.contains(&format!(
+                    "zinder_compat_published_history_read_duration_seconds_count{{slab=\"{slab}\"}} 0"
+                )),
+                "missing zero duration count for slab={slab} in:\n{before}"
+            );
+            assert!(
+                before.contains(&format!(
+                    "zinder_compat_published_history_read_duration_seconds_sum{{slab=\"{slab}\"}} 0"
+                )),
+                "missing zero duration sum for slab={slab} in:\n{before}"
+            );
+        }
+
+        record_published_history_read(
+            SealedSlab::Shielded,
+            4_096,
+            std::time::Duration::from_millis(2),
+        );
+        record_published_history_read(
+            SealedSlab::Nullifier,
+            1_024,
+            std::time::Duration::from_millis(1),
+        );
+
+        let after = handle.render();
+        assert!(
+            after.contains(
+                "zinder_compat_published_history_read_bytes_total{slab=\"shielded\"} 4096"
+            ),
+            "missing shielded bytes counter in:\n{after}"
+        );
+        assert!(
+            after.contains(
+                "zinder_compat_published_history_read_bytes_total{slab=\"nullifier\"} 1024"
+            ),
+            "missing nullifier bytes counter in:\n{after}"
+        );
+        assert!(
+            after.contains(
+                "zinder_compat_published_history_read_duration_seconds_count{slab=\"shielded\"} 1"
+            ),
+            "missing shielded duration histogram in:\n{after}"
+        );
+        assert!(
+            after.contains(
+                "zinder_compat_published_history_read_duration_seconds_count{slab=\"nullifier\"} 1"
+            ),
+            "missing nullifier duration histogram in:\n{after}"
+        );
+    }
+}
