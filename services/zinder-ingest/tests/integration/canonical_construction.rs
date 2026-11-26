@@ -2583,10 +2583,9 @@ fn assert_compose_legacy_transactions_print_config(
         zinder_testkit::manifest_dir!().join("../../deploy/config/ingest.toml");
     let token_path = temporary_root.join("fixture.token");
     std::fs::write(&token_path, "fixture-token\n")?;
-    let printed = std::process::Command::new(env!("CARGO_BIN_EXE_zinder-ingest"))
+    let printed = crate::common::zinder_ingest_command()
         .args(["--print-config", "--config"])
         .arg(&compose_ingest_config)
-        .env_remove("ZINDER_DEPLOYMENT__PROFILE")
         .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
         .env("ZINDER_NETWORK__NAME", "zcash-regtest")
         .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
