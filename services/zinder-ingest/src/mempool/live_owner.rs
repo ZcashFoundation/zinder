@@ -9,7 +9,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     num::NonZeroU64,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -310,6 +313,8 @@ pub struct LiveMempoolOwner {
     staged_generation: Arc<ParkingMutex<Option<StagedMempoolGeneration>>>,
     /// Point-in-time entry membership pinned for active multi-page snapshot walks.
     pinned_snapshots: Arc<ParkingMutex<PinnedSnapshotWalks>>,
+    /// Set when an append or apply failure leaves durable/index coherence uncertain.
+    durable_replay_required: Arc<AtomicBool>,
 }
 
 impl LiveMempoolOwner {
@@ -337,6 +342,7 @@ impl LiveMempoolOwner {
             status_changes: Arc::new(watch::Sender::new(0)),
             staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
             pinned_snapshots: Arc::new(ParkingMutex::new(PinnedSnapshotWalks::default())),
+            durable_replay_required: Arc::new(AtomicBool::new(false)),
         };
         record_mempool_lifecycle_status(&MempoolOwnerStatus::Hydrating);
         owner
@@ -716,7 +722,7 @@ impl LiveMempoolOwner {
         observed_at: UnixTimestampMillis,
     ) -> Result<MempoolApplyOutcome, Status> {
         let preflight = self.index.preflight_event(&event).map_err(|error| {
-            self.mark_rebuild_required();
+            self.mark_durable_replay_required();
             Status::failed_precondition(format!(
                 "mempool index preflight rejected a source transition: {error}"
             ))
@@ -728,10 +734,11 @@ impl LiveMempoolOwner {
         let envelope = canonical
             .append_mempool_event(event.clone(), observed_at)
             .await
-            .inspect_err(|_status| self.mark_rebuild_required())?;
-        let outcome = apply_to_index(&self.index, event, envelope.position())?;
+            .inspect_err(|_status| self.mark_durable_replay_required())?;
+        let outcome = apply_to_index(&self.index, event, envelope.position())
+            .inspect_err(|_status| self.mark_durable_replay_required())?;
         if outcome != MempoolApplyOutcome::Applied {
-            self.mark_rebuild_required();
+            self.mark_durable_replay_required();
             return Err(Status::unavailable(
                 "durable mempool event could not be applied to the live index",
             ));
@@ -789,7 +796,7 @@ impl LiveMempoolOwner {
         let mut applicable_transitions = Vec::with_capacity(transitions.len());
         for (event, observed_at) in transitions {
             let preflight = self.index.preflight_event(&event).map_err(|error| {
-                self.mark_rebuild_required();
+                self.mark_durable_replay_required();
                 Status::failed_precondition(format!(
                     "mempool index preflight rejected a reconciliation transition: {error}"
                 ))
@@ -807,10 +814,10 @@ impl LiveMempoolOwner {
             .append_mempool_events(applicable_transitions)
             .await
             .inspect_err(|_status| {
-                self.mark_rebuild_required();
+                self.mark_durable_replay_required();
             })?;
         if envelopes.len() != expected_envelope_count {
-            self.mark_rebuild_required();
+            self.mark_durable_replay_required();
             return Err(Status::unavailable(
                 "durable mempool reconciliation returned an incomplete transition batch",
             ));
@@ -819,10 +826,10 @@ impl LiveMempoolOwner {
             let position = envelope.position();
             let outcome =
                 apply_to_index(&self.index, envelope.event, position).inspect_err(|_status| {
-                    self.mark_rebuild_required();
+                    self.mark_durable_replay_required();
                 })?;
             if outcome != MempoolApplyOutcome::Applied {
-                self.mark_rebuild_required();
+                self.mark_durable_replay_required();
                 return Err(Status::unavailable(
                     "durable mempool reconciliation could not be applied to the live index",
                 ));
@@ -911,6 +918,15 @@ impl LiveMempoolOwner {
 
     fn mark_rebuild_required(&self) {
         self.set_status(MempoolOwnerStatus::RebuildRequired);
+    }
+
+    fn mark_durable_replay_required(&self) {
+        self.durable_replay_required.store(true, Ordering::Release);
+        self.mark_rebuild_required();
+    }
+
+    fn requires_durable_replay(&self) -> bool {
+        self.durable_replay_required.load(Ordering::Acquire)
     }
 
     #[allow(
@@ -1130,6 +1146,7 @@ impl LiveMempoolOwner {
         canonical: &CanonicalControlHandle,
     ) -> Result<(), Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
+        self.durable_replay_required.store(true, Ordering::Release);
         self.index.reset();
         self.pinned_snapshots.lock().clear();
         *self.staged_generation.lock() = Some(StagedMempoolGeneration::new());
@@ -1151,7 +1168,7 @@ impl LiveMempoolOwner {
                 after_cursor = Some(envelope.cursor.as_bytes().to_vec());
                 let event = envelope.event.clone();
                 let preflight = self.index.preflight_event(&event).map_err(|error| {
-                    self.mark_rebuild_required();
+                    self.mark_durable_replay_required();
                     Status::failed_precondition(format!(
                         "durable mempool history cannot rebuild the live index: {error}"
                     ))
@@ -1160,15 +1177,17 @@ impl LiveMempoolOwner {
                     MempoolIndexPreflight::Apply => MempoolApplyOutcome::Applied,
                     MempoolIndexPreflight::NoChange => MempoolApplyOutcome::NoChange,
                 };
-                let outcome = apply_to_index(&self.index, event, envelope.position())?;
+                let outcome = apply_to_index(&self.index, event, envelope.position())
+                    .inspect_err(|_status| self.mark_durable_replay_required())?;
                 if outcome != expected_outcome {
-                    self.mark_rebuild_required();
+                    self.mark_durable_replay_required();
                     return Err(Status::failed_precondition(
                         "durable mempool history could not rebuild the live index",
                     ));
                 }
             }
         }
+        self.durable_replay_required.store(false, Ordering::Release);
         record_mempool_size_gauge(&self.index);
         Ok(())
     }
@@ -1262,7 +1281,13 @@ async fn follow_mempool_source(
                 {
                     return;
                 }
-                if !restore_durable_mempool_index(owner, canonical, mempool_ready_signal, cancel)
+                if owner.requires_durable_replay()
+                    && !restore_durable_mempool_index(
+                        owner,
+                        canonical,
+                        mempool_ready_signal,
+                        cancel,
+                    )
                     .await
                 {
                     return;
@@ -4589,17 +4614,108 @@ mod tests {
         source_control.complete_initial_snapshot(serving_tip)?;
         wait_for_serving(&owner, true).await?;
 
+        assert_pinned_walk_survives_invalidation(&owner, &canonical, &source_control, chain_epoch)
+            .await?;
+        assert_eq!(durable_event_count(&canonical).await?, 5);
+
+        cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
+    async fn assert_pinned_walk_survives_invalidation(
+        owner: &LiveMempoolOwner,
+        canonical: &CanonicalControlHandle,
+        source_control: &MockMempoolSourceControl,
+        chain_epoch: ChainEpoch,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut expected_txids = [
+            source_entry(0x11)?.transaction_id,
+            source_entry(0x22)?.transaction_id,
+        ];
+        expected_txids.sort();
+
         let first_page = owner
-            .snapshot_page(&canonical, chain_epoch, 1, Vec::new())
+            .snapshot_page(canonical, chain_epoch, 1, Vec::new())
             .await?;
         assert_eq!(first_page.entries.len(), 1);
+        assert_eq!(
+            first_page
+                .entries
+                .first()
+                .map(|entry| entry.transaction_id.as_str()),
+            Some(super::encode_rpc_transaction_id_hex(expected_txids[0]).as_str())
+        );
         assert_ne!(first_page.next_cursor, [] as [u8; 0]);
+
+        source_control.push_invalidated(expected_txids[1], MempoolEvictionReason::Unknown)?;
+        wait_until(|| owner.index.entry_for(expected_txids[1]).is_none()).await?;
+
         let second_page = owner
-            .snapshot_page(&canonical, chain_epoch, 1, first_page.next_cursor)
+            .snapshot_page(canonical, chain_epoch, 1, first_page.next_cursor)
             .await?;
         assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(
+            second_page
+                .entries
+                .first()
+                .map(|entry| entry.transaction_id.as_str()),
+            Some(super::encode_rpc_transaction_id_hex(expected_txids[1]).as_str()),
+            "second page must read the pinned point-in-time snapshot after a live invalidation"
+        );
         assert_eq!(second_page.next_cursor, [] as [u8; 0]);
-        assert_eq!(durable_event_count(&canonical).await?, 4);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn source_disconnect_reconnects_without_replaying_retained_history()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let replay_page_calls = Arc::new(AtomicU32::new(0));
+        let recorded_replay_calls = Arc::clone(&replay_page_calls);
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if matches!(&command, CanonicalControlCommand::MempoolEventPage { .. }) {
+                    recorded_replay_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                let _ = apply_canonical_control_command(&mut store, command);
+            }
+        });
+
+        let serving_tip = fixture_source_tip();
+        let (source, source_control) = MockMempoolSource::streaming();
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, _ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let owner_task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            ready_signal,
+            cancel.clone(),
+        ));
+
+        wait_for_source_open(&source_control, 1).await?;
+        source_control.push_added(source_entry(0x51)?)?;
+        source_control.complete_initial_snapshot(serving_tip)?;
+        wait_for_serving(&owner, true).await?;
+        let startup_replay_calls = replay_page_calls.load(Ordering::SeqCst);
+        assert!(startup_replay_calls >= 1);
+
+        source_control.close_stream();
+        wait_for_source_open(&source_control, 2).await?;
+        source_control.push_added(source_entry(0x51)?)?;
+        source_control.complete_initial_snapshot(serving_tip)?;
+        wait_for_serving(&owner, true).await?;
+        assert_eq!(
+            replay_page_calls.load(Ordering::SeqCst),
+            startup_replay_calls,
+            "ordinary source disconnects must preserve the coherent index without replaying retained history"
+        );
 
         cancel.cancel();
         owner_task.await?;
