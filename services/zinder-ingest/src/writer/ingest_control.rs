@@ -973,6 +973,155 @@ mod tests {
         fixture.shutdown().await
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_walk_pins_point_in_time_membership_across_same_epoch_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        // `shared_control_fixture` seeds `0xA1`; adding `0xB2` forms `{0xA1, 0xB2}`.
+        let entry_a = fixture_mempool_entry(chain_epoch)?;
+        let entry_b = fixture_mempool_entry_with_id(0xB2, chain_epoch)?;
+        let entry_c = fixture_mempool_entry_with_id(0xC3, chain_epoch)?;
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added {
+                    entry: entry_b.clone(),
+                },
+                UnixTimestampMillis::new(1_750_000_000_150),
+            )
+            .await?;
+
+        let first_page = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first_page.entries.len(), 1);
+        assert_eq!(
+            first_page.entries[0].transaction_id,
+            encode_rpc_transaction_id_hex(entry_a.transaction_id())
+        );
+
+        // Evict `A` and add `C` before page 2 runs at the same `ChainEpoch`.
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Invalidated {
+                    transaction_id: entry_a.transaction_id(),
+                    reason: zinder_core::MempoolEvictionReason::Expired,
+                },
+                UnixTimestampMillis::new(1_750_000_000_200),
+            )
+            .await?;
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added { entry: entry_c },
+                UnixTimestampMillis::new(1_750_000_000_250),
+            )
+            .await?;
+
+        let second_page = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 10,
+                from_cursor: first_page.next_cursor,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(
+            second_page.entries[0].transaction_id,
+            encode_rpc_transaction_id_hex(entry_b.transaction_id())
+        );
+        assert_eq!(second_page.next_cursor, [] as [u8; 0]);
+
+        fixture.shutdown().await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_walk_expires_cursor_once_lru_pin_is_evicted_and_index_advances()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tonic_types::StatusExt as _;
+
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        for tx_byte in [0x10_u8, 0x20_u8] {
+            fixture
+                .mempool
+                .apply_event(
+                    &fixture.canonical,
+                    MempoolEvent::Added {
+                        entry: fixture_mempool_entry_with_id(tx_byte, chain_epoch)?,
+                    },
+                    UnixTimestampMillis::new(1_750_000_000_100),
+                )
+                .await?;
+        }
+
+        let oldest_walk = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+
+        for step in 0_u8..9_u8 {
+            fixture
+                .mempool
+                .apply_event(
+                    &fixture.canonical,
+                    MempoolEvent::Added {
+                        entry: fixture_mempool_entry_with_id(0x40 + step, chain_epoch)?,
+                    },
+                    UnixTimestampMillis::new(1_750_000_000_200 + u64::from(step)),
+                )
+                .await?;
+            let _newer_walk = fixture
+                .ingest_client
+                .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                    max_entries: 1,
+                    from_cursor: Vec::new(),
+                }))
+                .await?;
+        }
+
+        let Err(status) = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: oldest_walk.next_cursor,
+            }))
+            .await
+        else {
+            return Err("evicted snapshot walk cursor must expire after index updates".into());
+        };
+        assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+        assert_eq!(
+            status
+                .get_error_details()
+                .error_info()
+                .map(|detail| (detail.domain.clone(), detail.reason.clone())),
+            Some((
+                zinder_proto::ZINDER_ERROR_DOMAIN.to_owned(),
+                zinder_proto::v1::ops::ErrorReason::SnapshotPageCursorExpired
+                    .as_str_name()
+                    .to_owned(),
+            )),
+        );
+
+        fixture.shutdown().await
+    }
+
     /// Retention is owned by the canonical writer: once a mined envelope is
     /// pruned, its cursor must be rejected at the public replay boundary.
     #[tokio::test(flavor = "multi_thread")]

@@ -263,6 +263,163 @@ async fn explorer_restarts_on_mid_walk_epoch_change_and_rejects_stalled_or_churn
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn explorer_preserves_point_in_time_membership_across_same_epoch_updates() -> Result<()> {
+    let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+    let initial = build_wallet_entries(0, 2, 1_750_000_000_000, &activations)?;
+    let entry_c = build_wallet_entries(2, 1, 1_750_000_050_000, &activations)?;
+    let entry_a = initial[0].clone();
+    let entry_b = initial[1].clone();
+    let entry_c = entry_c[0].clone();
+
+    // 1. Pinned walk at `{A, B}` serves `[A]` then `[B]` (`2` entries, never `{A, B, C}`).
+    let pinned_wallet =
+        ScriptedWalletQuery::two_pages_with_resume_cursors(entry_a.clone(), entry_b.clone());
+    let (mut pinned_client, pinned_guard) =
+        spawn_explorer_over_scripted_wallet(pinned_wallet).await?;
+    let pinned_snap = pinned_client
+        .mempool_snapshot(MempoolSnapshotRequest {
+            max_entries: 10,
+            from_cursor: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        pinned_snap
+            .summary
+            .as_ref()
+            .map(|summary| summary.transaction_count),
+        Some(2)
+    );
+    assert_eq!(
+        pinned_snap
+            .entries
+            .iter()
+            .map(|row| row.transaction_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            entry_b.transaction_id.as_str(),
+            entry_a.transaction_id.as_str()
+        ]
+    );
+    pinned_guard.shutdown().await;
+
+    // 2. If page 2 shifts `events_resume_cursor` after `A` is evicted and `C` added,
+    //    explorer restarts from `from_cursor = []` and reports `{B, C}` (`2` entries, never `3`).
+    let shifted_wallet = ScriptedWalletQuery::resume_cursor_shift_then_updated_set(
+        entry_a,
+        entry_b.clone(),
+        entry_c.clone(),
+    );
+    let (mut shifted_client, shifted_guard) =
+        spawn_explorer_over_scripted_wallet(shifted_wallet).await?;
+    let shifted_snap = shifted_client
+        .mempool_snapshot(MempoolSnapshotRequest {
+            max_entries: 10,
+            from_cursor: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        shifted_snap
+            .summary
+            .as_ref()
+            .map(|summary| summary.transaction_count),
+        Some(2),
+        "explorer must never combine page 1's evicted A with post-restart {{B, C}}"
+    );
+    assert_eq!(
+        shifted_snap
+            .entries
+            .iter()
+            .map(|row| row.transaction_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            entry_c.transaction_id.as_str(),
+            entry_b.transaction_id.as_str()
+        ]
+    );
+    shifted_guard.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explorer_propagates_first_page_epoch_pin_and_unsupported_encoding_without_retrying()
+-> Result<()> {
+    // 1. First-page `CHAIN_EPOCH_PIN_UNAVAILABLE` fails immediately after 1 call as `FAILED_PRECONDITION`.
+    let pin_wallet = ScriptedWalletQuery::fixed_error(zinder_proto::status_for_reason(
+        ErrorReason::ChainEpochPinUnavailable,
+        "mempool view did not converge to visible tip within 5s",
+    ));
+    let pin_calls = pin_wallet.recorded_max_entries.clone();
+    let (mut pin_client, pin_guard) = spawn_explorer_over_scripted_wallet(pin_wallet).await?;
+    let pin_status = pin_client
+        .mempool_summary(MempoolSummaryRequest::default())
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected first-page CHAIN_EPOCH_PIN_UNAVAILABLE failure"))?;
+    assert_eq!(pin_status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        pin_status
+            .get_error_details()
+            .error_info()
+            .map(|detail| (detail.domain.clone(), detail.reason.clone())),
+        Some((
+            ZINDER_ERROR_DOMAIN.to_owned(),
+            ErrorReason::ChainEpochPinUnavailable
+                .as_str_name()
+                .to_owned(),
+        )),
+    );
+    assert_eq!(
+        pin_calls.lock().await.len(),
+        1,
+        "first-page CHAIN_EPOCH_PIN_UNAVAILABLE must not retry"
+    );
+    pin_guard.shutdown().await;
+
+    // 2. `UNSUPPORTED_WALLET_ENCODING` fails immediately after 1 call on both `MempoolSummary` and `OverviewSnapshot`.
+    let encoding_wallet = ScriptedWalletQuery::fixed_error(zinder_proto::status_for_reason(
+        ErrorReason::UnsupportedWalletEncoding,
+        "mempool entry exceeds unary response budget",
+    ));
+    let encoding_calls = encoding_wallet.recorded_max_entries.clone();
+    let (mut enc_client, enc_guard) = spawn_explorer_over_scripted_wallet(encoding_wallet).await?;
+    for status in [
+        enc_client
+            .mempool_summary(MempoolSummaryRequest::default())
+            .await
+            .err()
+            .ok_or_else(|| eyre!("expected MempoolSummary UNSUPPORTED_WALLET_ENCODING"))?,
+        enc_client
+            .overview_snapshot(OverviewSnapshotRequest::default())
+            .await
+            .err()
+            .ok_or_else(|| eyre!("expected OverviewSnapshot UNSUPPORTED_WALLET_ENCODING"))?,
+    ] {
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(
+            status
+                .get_error_details()
+                .error_info()
+                .map(|detail| (detail.domain.clone(), detail.reason.clone())),
+            Some((
+                ZINDER_ERROR_DOMAIN.to_owned(),
+                ErrorReason::UnsupportedWalletEncoding
+                    .as_str_name()
+                    .to_owned(),
+            )),
+        );
+    }
+    assert_eq!(
+        encoding_calls.lock().await.len(),
+        2,
+        "UNSUPPORTED_WALLET_ENCODING must make exactly 1 upstream call per explorer RPC"
+    );
+    enc_guard.shutdown().await;
+    Ok(())
+}
+
 #[derive(Clone)]
 enum WalletSnapshotBehavior {
     ThreePages([Vec<wallet::MempoolEntry>; 3]),
@@ -270,6 +427,12 @@ enum WalletSnapshotBehavior {
         expired_once: Arc<AtomicBool>,
         pages: [Vec<wallet::MempoolEntry>; 2],
     },
+    TwoPinnedPages([Vec<wallet::MempoolEntry>; 2]),
+    ResumeCursorShiftThenUpdatedSet {
+        shifted_once: Arc<AtomicBool>,
+        entries: Arc<[wallet::MempoolEntry; 3]>,
+    },
+    FixedError(Status),
     PerpetualEpochMismatch(Vec<wallet::MempoolEntry>),
     StalledEmptyCursor,
 }
@@ -301,6 +464,37 @@ impl ScriptedWalletQuery {
                 expired_once: Arc::new(AtomicBool::new(false)),
                 pages: [first, second],
             },
+            recorded_max_entries: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn two_pages_with_resume_cursors(
+        first: wallet::MempoolEntry,
+        second: wallet::MempoolEntry,
+    ) -> Self {
+        Self {
+            behavior: WalletSnapshotBehavior::TwoPinnedPages([vec![first], vec![second]]),
+            recorded_max_entries: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn resume_cursor_shift_then_updated_set(
+        entry_a: wallet::MempoolEntry,
+        entry_b: wallet::MempoolEntry,
+        entry_c: wallet::MempoolEntry,
+    ) -> Self {
+        Self {
+            behavior: WalletSnapshotBehavior::ResumeCursorShiftThenUpdatedSet {
+                shifted_once: Arc::new(AtomicBool::new(false)),
+                entries: Arc::new([entry_a, entry_b, entry_c]),
+            },
+            recorded_max_entries: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn fixed_error(status: Status) -> Self {
+        Self {
+            behavior: WalletSnapshotBehavior::FixedError(status),
             recorded_max_entries: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -506,74 +700,146 @@ impl WalletQuery for ScriptedWalletQuery {
             .lock()
             .await
             .push(inner.max_entries);
+        self.serve_scripted_snapshot(&inner.from_cursor)
+            .map(Response::new)
+    }
+}
+
+impl ScriptedWalletQuery {
+    fn serve_scripted_snapshot(
+        &self,
+        from_cursor: &[u8],
+    ) -> Result<WalletMempoolSnapshotResponse, Status> {
         match &self.behavior {
-            WalletSnapshotBehavior::ThreePages(pages) => match inner.from_cursor.as_slice() {
-                [] => Ok(Response::new(snapshot_response(
-                    1,
-                    pages[0].clone(),
-                    vec![1],
-                ))),
-                [1] => Ok(Response::new(snapshot_response(
-                    1,
-                    pages[1].clone(),
-                    vec![2],
-                ))),
-                [2] => Ok(Response::new(snapshot_response(
-                    1,
-                    pages[2].clone(),
-                    Vec::new(),
-                ))),
-                other => Err(Status::invalid_argument(format!(
-                    "unexpected cursor {other:?}"
-                ))),
-            },
+            WalletSnapshotBehavior::ThreePages(pages) => serve_three_pages(pages, from_cursor),
             WalletSnapshotBehavior::ExpireOnceThenTwoPages {
                 expired_once,
                 pages,
-            } => match inner.from_cursor.as_slice() {
-                [] => Ok(Response::new(snapshot_response(
-                    2,
-                    pages[0].clone(),
-                    vec![1],
-                ))),
-                [1] => {
-                    if !expired_once.swap(true, Ordering::SeqCst) {
-                        return Err(zinder_proto::status_for_reason(
-                            ErrorReason::SnapshotPageCursorExpired,
-                            "snapshot page cursor expired",
-                        ));
-                    }
-                    Ok(Response::new(snapshot_response(
-                        2,
-                        pages[1].clone(),
-                        Vec::new(),
-                    )))
-                }
-                other => Err(Status::invalid_argument(format!(
-                    "unexpected cursor {other:?}"
-                ))),
-            },
+            } => serve_expire_once(expired_once, pages, from_cursor),
             WalletSnapshotBehavior::PerpetualEpochMismatch(entries) => {
-                match inner.from_cursor.as_slice() {
-                    [] => Ok(Response::new(snapshot_response(
-                        1,
-                        entries.clone(),
-                        vec![1],
-                    ))),
-                    [1] => Ok(Response::new(snapshot_response(
-                        2,
-                        entries.clone(),
-                        Vec::new(),
-                    ))),
-                    other => Err(Status::invalid_argument(format!(
-                        "unexpected cursor {other:?}"
-                    ))),
-                }
+                serve_epoch_mismatch(entries, from_cursor)
             }
+            WalletSnapshotBehavior::TwoPinnedPages(pages) => serve_pinned_pages(pages, from_cursor),
+            WalletSnapshotBehavior::ResumeCursorShiftThenUpdatedSet {
+                shifted_once,
+                entries,
+            } => serve_resume_cursor_shift(shifted_once, entries, from_cursor),
+            WalletSnapshotBehavior::FixedError(status) => Err(status.clone()),
             WalletSnapshotBehavior::StalledEmptyCursor => {
-                Ok(Response::new(snapshot_response(1, Vec::new(), vec![9])))
+                Ok(snapshot_response(1, Vec::new(), vec![9]))
             }
         }
+    }
+}
+
+fn serve_three_pages(
+    pages: &[Vec<wallet::MempoolEntry>; 3],
+    from_cursor: &[u8],
+) -> Result<WalletMempoolSnapshotResponse, Status> {
+    match from_cursor {
+        [] => Ok(snapshot_response(1, pages[0].clone(), vec![1])),
+        [1] => Ok(snapshot_response(1, pages[1].clone(), vec![2])),
+        [2] => Ok(snapshot_response(1, pages[2].clone(), Vec::new())),
+        other => Err(Status::invalid_argument(format!(
+            "unexpected cursor {other:?}"
+        ))),
+    }
+}
+
+fn serve_expire_once(
+    expired_once: &AtomicBool,
+    pages: &[Vec<wallet::MempoolEntry>; 2],
+    from_cursor: &[u8],
+) -> Result<WalletMempoolSnapshotResponse, Status> {
+    match from_cursor {
+        [] => Ok(snapshot_response(2, pages[0].clone(), vec![1])),
+        [1] => {
+            if !expired_once.swap(true, Ordering::SeqCst) {
+                return Err(zinder_proto::status_for_reason(
+                    ErrorReason::SnapshotPageCursorExpired,
+                    "snapshot page cursor expired",
+                ));
+            }
+            Ok(snapshot_response(2, pages[1].clone(), Vec::new()))
+        }
+        other => Err(Status::invalid_argument(format!(
+            "unexpected cursor {other:?}"
+        ))),
+    }
+}
+
+fn serve_epoch_mismatch(
+    entries: &[wallet::MempoolEntry],
+    from_cursor: &[u8],
+) -> Result<WalletMempoolSnapshotResponse, Status> {
+    match from_cursor {
+        [] => Ok(snapshot_response(1, entries.to_vec(), vec![1])),
+        [1] => Ok(snapshot_response(2, entries.to_vec(), Vec::new())),
+        other => Err(Status::invalid_argument(format!(
+            "unexpected cursor {other:?}"
+        ))),
+    }
+}
+
+fn serve_pinned_pages(
+    pages: &[Vec<wallet::MempoolEntry>; 2],
+    from_cursor: &[u8],
+) -> Result<WalletMempoolSnapshotResponse, Status> {
+    match from_cursor {
+        [] => Ok(snapshot_response_with_resume(
+            1,
+            vec![0xAA],
+            pages[0].clone(),
+            vec![1],
+        )),
+        [1] => Ok(snapshot_response_with_resume(
+            1,
+            vec![0xAA],
+            pages[1].clone(),
+            Vec::new(),
+        )),
+        other => Err(Status::invalid_argument(format!(
+            "unexpected cursor {other:?}"
+        ))),
+    }
+}
+
+fn serve_resume_cursor_shift(
+    shifted_once: &AtomicBool,
+    entries: &[wallet::MempoolEntry; 3],
+    from_cursor: &[u8],
+) -> Result<WalletMempoolSnapshotResponse, Status> {
+    match from_cursor {
+        [] if !shifted_once.load(Ordering::SeqCst) => Ok(snapshot_response_with_resume(
+            1,
+            vec![0x01],
+            vec![entries[0].clone()],
+            vec![1],
+        )),
+        [1] => {
+            shifted_once.store(true, Ordering::SeqCst);
+            Ok(snapshot_response_with_resume(
+                1,
+                vec![0x02],
+                vec![entries[1].clone(), entries[2].clone()],
+                Vec::new(),
+            ))
+        }
+        [] => Ok(snapshot_response_with_resume(
+            1,
+            vec![0x02],
+            vec![entries[1].clone()],
+            vec![2],
+        )),
+        [2] => Ok(snapshot_response_with_resume(
+            1,
+            vec![0x02],
+            vec![entries[2].clone()],
+            Vec::new(),
+        )),
+        other => Err(Status::invalid_argument(format!(
+            "unexpected cursor {other:?}"
+        ))),
     }
 }
 
@@ -702,9 +968,18 @@ fn snapshot_response(
     entries: Vec<wallet::MempoolEntry>,
     next_cursor: Vec<u8>,
 ) -> WalletMempoolSnapshotResponse {
+    snapshot_response_with_resume(epoch_id, Vec::new(), entries, next_cursor)
+}
+
+fn snapshot_response_with_resume(
+    epoch_id: u64,
+    events_resume_cursor: Vec<u8>,
+    entries: Vec<wallet::MempoolEntry>,
+    next_cursor: Vec<u8>,
+) -> WalletMempoolSnapshotResponse {
     WalletMempoolSnapshotResponse {
         chain_view: Some(test_chain_view(epoch_id)),
-        events_resume_cursor: Vec::new(),
+        events_resume_cursor,
         snapshot_age_millis: 25,
         entries,
         next_cursor,

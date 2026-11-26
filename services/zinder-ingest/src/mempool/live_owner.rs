@@ -6,7 +6,7 @@
 //! canonical control channel.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     num::NonZeroU64,
     sync::Arc,
@@ -24,8 +24,8 @@ use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::{
-    BlockId, ChainEpoch, MempoolEntry, MempoolEvictionReason, TransactionId, UnixTimestampMillis,
-    wire::encode_rpc_transaction_id_hex,
+    BlockId, ChainEpoch, ChainEpochId, MempoolEntry, MempoolEvictionReason, TransactionId,
+    UnixTimestampMillis, wire::encode_rpc_transaction_id_hex,
 };
 use zinder_proto::{
     status_for_reason,
@@ -50,13 +50,15 @@ use crate::writer::{
 use super::{
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolIndexPreflight,
     MempoolReadySignal, ObservedNodeEndpoint, build_mempool_entry,
-    ready_gate::MEMPOOL_TIP_TRANSITION_GRACE,
+    index::snapshot_page_from_pinned_entries, ready_gate::MEMPOOL_TIP_TRANSITION_GRACE,
 };
 
 const MEMPOOL_EVENT_PAGE_SIZE: u32 = 64;
 const MEMPOOL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MEMPOOL_CANONICAL_TIP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS: usize = 256;
+const MAX_PINNED_SNAPSHOT_WALKS: usize = 8;
+const PINNED_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 const MEMPOOL_LIFECYCLE_STATUS_LABELS: &[&str] =
     &["hydrating", "serving", "rebuild_required", "halted"];
 /// Longest a live read waits for the owner to certify the canonical tip.
@@ -229,6 +231,68 @@ impl MempoolOwnerStatus {
     }
 }
 
+type PinnedSnapshotKey = (ChainEpochId, Option<MempoolEventPosition>);
+
+struct PinnedSnapshotEntry {
+    key: PinnedSnapshotKey,
+    entries: Arc<[Arc<MempoolEntry>]>,
+    last_accessed: TokioInstant,
+}
+
+#[derive(Default)]
+struct PinnedSnapshotWalks {
+    entries: VecDeque<PinnedSnapshotEntry>,
+}
+
+impl PinnedSnapshotWalks {
+    fn prune_expired(&mut self, now: TokioInstant) {
+        self.entries.retain(|pinned| {
+            now.saturating_duration_since(pinned.last_accessed) < PINNED_SNAPSHOT_TTL
+        });
+    }
+
+    fn get_and_touch(
+        &mut self,
+        key: PinnedSnapshotKey,
+        now: TokioInstant,
+    ) -> Option<Arc<[Arc<MempoolEntry>]>> {
+        self.prune_expired(now);
+        let position = self.entries.iter().position(|pinned| pinned.key == key)?;
+        let mut found = self.entries.remove(position)?;
+        found.last_accessed = now;
+        let entries = Arc::clone(&found.entries);
+        self.entries.push_back(found);
+        Some(entries)
+    }
+
+    fn insert_if_absent(
+        &mut self,
+        key: PinnedSnapshotKey,
+        make_entries: impl FnOnce() -> Arc<[Arc<MempoolEntry>]>,
+        now: TokioInstant,
+    ) {
+        if self.get_and_touch(key, now).is_some() {
+            return;
+        }
+        if self.entries.len() >= MAX_PINNED_SNAPSHOT_WALKS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(PinnedSnapshotEntry {
+            key,
+            entries: make_entries(),
+            last_accessed: now,
+        });
+    }
+
+    fn retain_epoch(&mut self, epoch_id: ChainEpochId) {
+        self.entries.retain(|pinned| pinned.key.0 == epoch_id);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 /// Process-local live index with a serialized durable-log handoff.
 #[derive(Clone)]
 pub struct LiveMempoolOwner {
@@ -244,6 +308,8 @@ pub struct LiveMempoolOwner {
     status_changes: Arc<watch::Sender<u64>>,
     /// A generation hydrating behind the serving one, or the first one.
     staged_generation: Arc<ParkingMutex<Option<StagedMempoolGeneration>>>,
+    /// Point-in-time entry membership pinned for active multi-page snapshot walks.
+    pinned_snapshots: Arc<ParkingMutex<PinnedSnapshotWalks>>,
 }
 
 impl LiveMempoolOwner {
@@ -270,6 +336,7 @@ impl LiveMempoolOwner {
             status: Arc::new(RwLock::new(MempoolOwnerStatus::Hydrating)),
             status_changes: Arc::new(watch::Sender::new(0)),
             staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
+            pinned_snapshots: Arc::new(ParkingMutex::new(PinnedSnapshotWalks::default())),
         };
         record_mempool_lifecycle_status(&MempoolOwnerStatus::Hydrating);
         owner
@@ -468,14 +535,27 @@ impl LiveMempoolOwner {
             &events_resume_cursor,
             snapshot_age_millis,
         );
-        let candidates = self
-            .index
-            .snapshot_page(max_entries, start.after_transaction_id());
+        let candidates = self.resolve_snapshot_candidates(
+            chain_epoch.id,
+            start.events_resume_anchor(),
+            start.after_transaction_id(),
+            max_entries,
+        )?;
         let (entries, next_after_transaction_id) = select_bounded_snapshot_entries(
             &candidates,
             base_encoded_bytes,
             MAX_MEMPOOL_SNAPSHOT_RESPONSE_BYTES,
         )?;
+        if next_after_transaction_id.is_some()
+            && self.index.last_applied_event() == start.events_resume_anchor()
+        {
+            let pin_key = (chain_epoch.id, start.events_resume_anchor());
+            self.pinned_snapshots.lock().insert_if_absent(
+                pin_key,
+                || self.index.pinned_entries().0,
+                TokioInstant::now(),
+            );
+        }
         let next_cursor = match next_after_transaction_id {
             Some(after_transaction_id) => canonical
                 .encode_mempool_snapshot_next_cursor(
@@ -497,6 +577,38 @@ impl LiveMempoolOwner {
             snapshot_age_millis,
             next_cursor,
         })
+    }
+
+    fn resolve_snapshot_candidates(
+        &self,
+        chain_epoch_id: ChainEpochId,
+        events_resume_anchor: Option<MempoolEventPosition>,
+        after_transaction_id: Option<TransactionId>,
+        max_entries: u32,
+    ) -> Result<super::MempoolSnapshotPage, Status> {
+        let pin_key = (chain_epoch_id, events_resume_anchor);
+        let now = TokioInstant::now();
+        let pinned_walk = self.pinned_snapshots.lock().get_and_touch(pin_key, now);
+        if let Some(pinned) = pinned_walk {
+            return Ok(snapshot_page_from_pinned_entries(
+                &pinned,
+                events_resume_anchor,
+                max_entries,
+                after_transaction_id,
+            ));
+        }
+        if let Some(after_transaction_id) = after_transaction_id {
+            if self.index.last_applied_event() != events_resume_anchor {
+                return Err(status_for_reason(
+                    ErrorReason::SnapshotPageCursorExpired,
+                    "mempool snapshot page cursor expired after concurrent mempool updates",
+                ));
+            }
+            return Ok(self
+                .index
+                .snapshot_page(max_entries, Some(after_transaction_id)));
+        }
+        Ok(self.index.snapshot_page(max_entries, None))
     }
 
     /// Resolves a durable mempool stream start while excluding a concurrent index transition.
@@ -787,6 +899,7 @@ impl LiveMempoolOwner {
     pub(crate) async fn halt(&self, halt: ParkedWriterHalt) {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.staged_generation.lock().take();
+        self.pinned_snapshots.lock().clear();
         self.set_status(MempoolOwnerStatus::Halted(halt));
         self.index.reset();
         record_mempool_size_gauge(&self.index);
@@ -893,6 +1006,7 @@ impl LiveMempoolOwner {
             .await
             .inspect_err(|_status| self.mark_rebuild_required())?;
         self.require_active_endpoint(endpoint)?;
+        self.pinned_snapshots.lock().retain_epoch(chain_epoch.id);
         self.set_status(MempoolOwnerStatus::Serving {
             replacement_deadline: None,
             endpoint: endpoint.clone(),
@@ -1013,6 +1127,7 @@ impl LiveMempoolOwner {
     ) -> Result<(), Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.index.reset();
+        self.pinned_snapshots.lock().clear();
         *self.staged_generation.lock() = Some(StagedMempoolGeneration::new());
         self.set_status(MempoolOwnerStatus::Hydrating);
         let mut after_cursor = None;
@@ -1056,6 +1171,7 @@ impl LiveMempoolOwner {
     async fn withdraw_for_rebuild(&self) {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.staged_generation.lock().take();
+        self.pinned_snapshots.lock().clear();
         self.mark_rebuild_required();
     }
 

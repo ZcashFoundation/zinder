@@ -2,11 +2,11 @@
 //!
 //! Each handler composes `WalletQuery.MempoolSnapshot` at request time;
 //! no materialized-view consumer is required. `MempoolSnapshot` derives global summary
-//! facts and its requested page from one wallet response. The summary
-//! aggregates every entry into one explorer-shaped page; the activity feed
-//! projects the same entries into typed rows ordered by newest-first
-//! observation time and paginates with an opaque cursor that encodes
-//! `(first_seen_unix_millis, transaction_id)`.
+//! facts and its requested page from one pinned `WalletQuery.MempoolSnapshot`
+//! walk. The summary aggregates every entry into one explorer-shaped page; the
+//! activity feed projects the same entries into typed rows ordered by
+//! newest-first observation time and paginates with an opaque cursor that
+//! encodes `(first_seen_unix_millis, transaction_id)`.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +26,7 @@ use zinder_proto::v1::explorer::{
     PrivacyShapeCount, TransactionVersion as WireVersion, TransactionVersionCount,
     TransactionVersionKind,
 };
+use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::v1::wallet::{
     self, MempoolEntry, MempoolSnapshotRequest as WalletMempoolSnapshotRequest,
     wallet_query_client::WalletQueryClient,
@@ -406,6 +407,12 @@ where
     .into())
 }
 
+struct SnapshotWalkAnchor {
+    chain_epoch: wallet::ChainEpoch,
+    snapshot_age_millis: u64,
+    events_resume_cursor: Vec<u8>,
+}
+
 async fn drain_single_snapshot_attempt<T, Observe>(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     max_total_entries: u32,
@@ -417,7 +424,7 @@ where
 {
     let mut from_cursor = Vec::new();
     let mut observed_entries: u32 = 0;
-    let mut anchor: Option<(wallet::ChainEpoch, u64)> = None;
+    let mut anchor: Option<SnapshotWalkAnchor> = None;
 
     loop {
         let remaining = max_total_entries.saturating_sub(observed_entries);
@@ -441,12 +448,18 @@ where
             .ok_or_else(|| {
                 ExplorerError::internal("MempoolSnapshotResponse.chain_view.chain_epoch missing")
             })?;
-        if let Some((ref first_epoch, _)) = anchor {
-            if !same_snapshot_epoch(first_epoch, &page_epoch) {
+        if let Some(ref first_anchor) = anchor {
+            if !same_snapshot_epoch(&first_anchor.chain_epoch, &page_epoch)
+                || response.events_resume_cursor != first_anchor.events_resume_cursor
+            {
                 return Ok(SnapshotWalkAttempt::Restart);
             }
         } else {
-            anchor = Some((page_epoch, response.snapshot_age_millis));
+            anchor = Some(SnapshotWalkAnchor {
+                chain_epoch: page_epoch,
+                snapshot_age_millis: response.snapshot_age_millis,
+                events_resume_cursor: response.events_resume_cursor,
+            });
         }
         if response.entries.is_empty() && !response.next_cursor.is_empty() {
             return Err(ExplorerError::internal(
@@ -462,12 +475,12 @@ where
         drop(response.entries);
         let next_cursor = response.next_cursor;
         if next_cursor.is_empty() || observed_entries >= max_total_entries {
-            let (chain_epoch, snapshot_age_millis) = anchor.ok_or_else(|| {
+            let walk_anchor = anchor.ok_or_else(|| {
                 ExplorerError::internal("mempool snapshot walk completed without an anchor")
             })?;
             return Ok(SnapshotWalkAttempt::Completed(DrainedMempoolWalk {
-                chain_epoch,
-                snapshot_age_millis,
+                chain_epoch: walk_anchor.chain_epoch,
+                snapshot_age_millis: walk_anchor.snapshot_age_millis,
                 output,
             }));
         }
@@ -476,10 +489,15 @@ where
 }
 
 fn same_snapshot_epoch(left: &wallet::ChainEpoch, right: &wallet::ChainEpoch) -> bool {
-    left.chain_epoch_id == right.chain_epoch_id && left.visible_tip == right.visible_tip
+    left.network_name == right.network_name
+        && left.chain_epoch_id == right.chain_epoch_id
+        && left.visible_tip == right.visible_tip
 }
 
 fn is_snapshot_walk_reset_status(status: &Status, is_continuation_page: bool) -> bool {
+    if !is_continuation_page {
+        return false;
+    }
     let details = status.get_error_details();
     let Some(error_detail) = details.error_info() else {
         return false;
@@ -487,14 +505,18 @@ fn is_snapshot_walk_reset_status(status: &Status, is_continuation_page: bool) ->
     if error_detail.domain != ZINDER_ERROR_DOMAIN {
         return false;
     }
-    match error_detail.reason.as_str() {
-        "CHAIN_EPOCH_PIN_UNAVAILABLE" => true,
-        "SNAPSHOT_PAGE_CURSOR_EXPIRED"
-        | "MEMPOOL_EVENT_CURSOR_EXPIRED"
-        | "STREAM_CURSOR_EPOCH_MISMATCH"
-        | "STREAM_CURSOR_EXPIRED" => is_continuation_page,
-        _ => false,
+    let Some(reason) = ErrorReason::from_str_name(&error_detail.reason) else {
+        return false;
+    };
+    if status.code() != zinder_proto::reason_policy(reason).code {
+        return false;
     }
+    matches!(
+        reason,
+        ErrorReason::ChainEpochPinUnavailable
+            | ErrorReason::SnapshotPageCursorExpired
+            | ErrorReason::MempoolEventCursorExpired
+    )
 }
 
 fn parse_facts(
