@@ -763,9 +763,11 @@ outside the primary. Omit it to print JSON to stdout. Set `--workload`
 `all`), and `--supported-reorg-depth` to the values persisted in the store.
 The defaults are `wallet`, `transactions`, and 1,000 blocks. Pass
 `--canonical-io-mode direct|buffered` (default `direct`) to compare direct
-and buffered canonical reads, and `--evict-page-cache` on Linux to drop
-cached pages of `--canonical-store` with `posix_fadvise(POSIX_FADV_DONTNEED)`
-before each cold secondary open.
+and buffered canonical reads, and `--evict-page-cache` on Linux to sync each
+file in `--canonical-store` and drop its cached pages with
+`posix_fadvise(POSIX_FADV_DONTNEED)` before each cold secondary open.
+Reproducible cold measurements require a quiescent store because concurrent
+reads or writes can repopulate the OS page cache.
 
 The compact-block report (version 4) retains the 128-, 512-, and 1,024-block
 unbounded calls in `cases`. Each entry in `bounded_cases` measures one

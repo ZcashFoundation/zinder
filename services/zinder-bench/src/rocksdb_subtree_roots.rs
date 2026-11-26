@@ -62,6 +62,7 @@ struct SubtreePage {
 
 #[derive(Serialize)]
 struct SubtreeCase {
+    io_mode: &'static str,
     fresh_secondary_open_seconds: f64,
     cold: SubtreeMeasurement,
     warm: SubtreeMeasurement,
@@ -101,6 +102,7 @@ async fn measure_page(
     max_entries: u32,
 ) -> Result<SubtreePage, BenchError> {
     let (direct, direct_open) = store.open("direct", None)?;
+    let direct_io_mode = direct.io_mode().as_str();
     let ready = direct.ready_evidence();
     let start = start_index.unwrap_or_else(|| {
         direct
@@ -151,11 +153,13 @@ async fn measure_page(
         returned_roots: count.get(),
         output_digest_sha256,
         direct: SubtreeCase {
+            io_mode: direct_io_mode,
             fresh_secondary_open_seconds: direct_open,
             cold: cold.into(),
             warm: warm.into(),
         },
         canonical_reader: SubtreeCase {
+            io_mode: reader.secondary().io_mode().as_str(),
             fresh_secondary_open_seconds: reader_open,
             cold: reader_cold.into(),
             warm: reader_warm.into(),
@@ -224,10 +228,15 @@ mod tests {
             workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: writer.canonical_primary()?.reorg_policy(),
-            budget: RocksDbResourceBudget::for_local_tests(),
-            evict_page_cache: false,
+            budget: zinder_store::RocksDbResourceBudget {
+                preferred_io_mode: zinder_store::RocksDbIoMode::Buffered,
+                ..RocksDbResourceBudget::for_local_tests()
+            },
+            evict_page_cache: true,
         };
         let page = measure_page(&store, ShieldedProtocol::Sapling, None, 4).await?;
+        assert_eq!(page.direct.io_mode, "buffered");
+        assert_eq!(page.canonical_reader.io_mode, "buffered");
         assert_eq!(page.start_index, 1);
         assert_eq!(page.max_entries, 4);
         assert_eq!(page.returned_roots, 1);

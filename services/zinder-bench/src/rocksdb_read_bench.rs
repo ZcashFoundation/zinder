@@ -246,6 +246,8 @@ fn evict_directory_page_cache(directory: &Path) -> Result<(), BenchError> {
         } else if file_type.is_file() {
             let file = fs::File::open(&entry_path)
                 .map_err(|source| BenchError::io(&entry_path, source))?;
+            file.sync_all()
+                .map_err(|source| BenchError::io(&entry_path, source))?;
             rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)
                 .map_err(|source| BenchError::io(&entry_path, source.into()))?;
         }

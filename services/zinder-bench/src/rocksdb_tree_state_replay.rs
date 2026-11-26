@@ -49,6 +49,7 @@ pub(crate) struct RocksDbTreeStateReplayReport {
     report_format_version: u16,
     #[serde(flatten)]
     environment: ReadEnvironment,
+    io_mode: &'static str,
     visible_tip_height: u32,
     heights_file_sha256: Option<String>,
     #[serde(flatten)]
@@ -131,6 +132,7 @@ pub(crate) fn run_rocksdb_tree_state_replay(
         contract_identity: "rocksdb-tree-state-replay",
         report_format_version: 3,
         environment,
+        io_mode: secondary.io_mode().as_str(),
         visible_tip_height: ready.visible_tip.height.value(),
         heights_file_sha256: explicit.map(|(_, digest)| digest),
         measurement,
