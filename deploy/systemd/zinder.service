@@ -8,8 +8,8 @@
 # WorkingDirectory below if your operator-chosen layout differs.
 #
 # /etc/zinder/env is a copy of one deploy/.env.* file. Its
-# ZINDER_DEPLOY_NETWORK names the Compose project that ExecStartPre removes
-# with --remove-orphans, so Compose refuses to run when it is unset.
+# ZINDER_DEPLOY_NETWORK names the Compose project, so Compose refuses to run
+# when it is unset.
 
 [Unit]
 Description=Zinder Zcash indexer (Compose topology)
@@ -23,12 +23,11 @@ Type=simple
 WorkingDirectory=/opt/zinder/deploy
 EnvironmentFile=-/etc/zinder/env
 
-# `docker compose up` blocks while the topology runs, so Type=simple is
-# correct. ExecStop tears down the topology on stop; ExecStartPre prunes
-# any stale containers so a half-restarted state does not strand the
-# named volume on a previous container's lifecycle.
-ExecStartPre=-/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml down --remove-orphans
-ExecStart=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml up
+# `docker compose up --no-build` blocks while the topology runs, so Type=simple
+# is correct. `--no-build` avoids unintended image builds during unit restarts,
+# and ExecStop tears down the topology on explicit stop without wiping an
+# active non-resumable sync before startup.
+ExecStart=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml up --no-build
 ExecStop=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml down
 
 Restart=on-failure

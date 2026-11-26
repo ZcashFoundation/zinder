@@ -16,7 +16,6 @@ path = "/var/run/auth/.cookie"
 
 [storage]
 path = "/var/lib/zinder/canonical"
-raw_blob_policy = "transactions"
 
 [ingest]
 source = "zebra-json-rpc"

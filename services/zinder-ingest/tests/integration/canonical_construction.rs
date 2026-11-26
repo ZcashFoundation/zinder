@@ -2574,3 +2574,119 @@ async fn every_block_multi_batch_construction_matches_serial_across_workers()
     );
     Ok(())
 }
+
+fn assert_compose_legacy_transactions_print_config(
+    temporary_root: &std::path::Path,
+    store_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compose_ingest_config =
+        zinder_testkit::manifest_dir!().join("../../deploy/config/ingest.toml");
+    let token_path = temporary_root.join("fixture.token");
+    std::fs::write(&token_path, "fixture-token\n")?;
+    let printed = crate::common::zinder_ingest_command()
+        .args(["--print-config", "--config"])
+        .arg(&compose_ingest_config)
+        .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+        .env("ZINDER_STORAGE__PATH", store_path)
+        .env("ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH", &token_path)
+        .env(
+            "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
+            &token_path,
+        )
+        .output()?;
+    assert!(printed.status.success(), "{printed:?}");
+    let stdout = String::from_utf8(printed.stdout)?;
+    assert!(
+        stdout.contains("raw_blob_policy = \"transactions\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("coverage = \"wallet-serving\""), "{stdout}");
+    assert!(!stdout.contains("[deployment]"), "{stdout}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_transactions_compose_override_reopens_pre_change_store()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source_block, chain_checkpoint) = held_construction_chain()?;
+    let fixed_tip = chain_checkpoint.block_id;
+    let source = HeldConstructionSource::new(source_block, chain_checkpoint);
+    source.release_chain_segments();
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let legacy_config = held_construction_writer_config(store_path.clone(), regtest_activations());
+    assert_eq!(
+        legacy_config.raw_blob_retention,
+        RawBlobRetention::Transactions
+    );
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let initial_store = admit_canonical_store(
+        &source,
+        regtest_activations(),
+        &legacy_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(
+        initial_store.raw_blob_retention(),
+        RawBlobRetention::Transactions
+    );
+    assert_eq!(initial_store.event_fence().visible_tip(), fixed_tip);
+    let construction_requests = source.chain_segment_requests.load(Ordering::SeqCst);
+    drop(initial_store);
+
+    // Upgrading to the default `wallet` profile (`raw_blob_policy = "none"`)
+    // must fail writer admission against a pre-change `transactions` store.
+    let wallet_profile_config = CanonicalWriterConfig {
+        raw_blob_retention: RawBlobRetention::None,
+        ..legacy_config.clone()
+    };
+    let rejected = admit_canonical_store(
+        &source,
+        regtest_activations(),
+        &wallet_profile_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await
+    .err()
+    .ok_or("default wallet profile must reject reopening a pre-change transactions store")?;
+    assert!(
+        matches!(
+            &rejected,
+            CanonicalWriterError::Store(CanonicalStoreError::AdmissionRefused { reason, .. })
+                if reason.contains("raw blob retention")
+                    && reason.contains("transactions")
+                    && reason.contains("none")
+        ),
+        "{rejected}"
+    );
+
+    // Using the legacy transactions overlay (`ZINDER_DEPLOYMENT__PROFILE`
+    // unset, `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`) resolves cleanly
+    // against `deploy/config/ingest.toml` and reopens the pre-change store.
+    assert_compose_legacy_transactions_print_config(temporary.path(), &store_path)?;
+
+    let reopened = admit_canonical_store(
+        &source,
+        regtest_activations(),
+        &legacy_config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(
+        reopened.raw_blob_retention(),
+        RawBlobRetention::Transactions
+    );
+    assert_eq!(reopened.event_fence().visible_tip(), fixed_tip);
+    assert_eq!(
+        source.chain_segment_requests.load(Ordering::SeqCst),
+        construction_requests
+    );
+    Ok(())
+}

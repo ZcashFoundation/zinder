@@ -70,7 +70,9 @@ bash "$validator" \
 bash "$validator" \
   --prometheus-config "$repository_root/deploy/observability/prometheus.yml"
 
-if grep -Eq 'zinder-[a-z-]+:latest' "$repository_root/deploy/docker-compose.yml"; then
+if grep -Eq 'zinder-[a-z-]+:latest' \
+  "$repository_root/deploy/docker-compose.yml" \
+  "$repository_root/deploy/docker-compose.light-wallet.yml"; then
   fail "the deployment Compose file defaults a Zinder runtime to latest"
 fi
 
@@ -83,7 +85,10 @@ env_file_value() {
 if grep -Eiq 'JSON_RPC_ADDR:?-|INDEXER_GRPC_ADDR:?-[^}]|//(zebra|zakura)\b|z3-|:1?8232\b|:8230\b|:8155\b' \
   "$repository_root/deploy/docker-compose.yml" \
   "$repository_root/deploy/docker-compose.explorer.yml" \
-  "$repository_root"/deploy/config/{ingest,projector,query,compat-lightwalletd,explorer}.toml; then
+  "$repository_root/deploy/docker-compose.transactions.yml" \
+  "$repository_root/deploy/docker-compose.light-wallet.yml" \
+  "$repository_root"/deploy/config/{ingest,projector,query,compat-lightwalletd,explorer}.toml \
+  "$repository_root"/deploy/config/light-wallet/{ingest,compat-lightwalletd}.toml; then
   fail "the deployment Compose topology or its configs default to a node"
 fi
 
@@ -116,6 +121,48 @@ docker compose \
   --profile observability \
   config --format json > "$resolved_compose"
 bash "$validator" --compose-contract "$resolved_compose"
+jq -e '
+  .services as $services
+  | [
+      "zinder-ingest",
+      "zinder-projector",
+      "zinder-query",
+      "zinder-compat-lightwalletd"
+    ]
+  | all($services[.].environment.ZINDER_DEPLOYMENT__PROFILE == "wallet")
+  and $services["zinder-ingest"].environment.ZINDER_INGEST__SOURCE == "zebra-json-rpc"
+  and (($services["zinder-history-publisher"].tmpfs // []) == ["/tmp:rw,noexec,nosuid,size=512m"])
+  and ($services["zinder-history-publisher"].command as $cmd
+    | ($cmd | index("--workers")) as $idx
+    | $idx != null and $cmd[$idx + 1] == "1")
+' "$resolved_compose" >/dev/null \
+  || fail "the default Compose topology does not select the wallet profile, zebra-json-rpc source, and bounded history-publisher defaults"
+
+wallet_archive_compose="$temporary_directory/wallet-archive-compose.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_DEPLOYMENT__PROFILE=wallet-archive \
+ZINDER_INGEST__SOURCE=zebra-indexer-grpc \
+ZINDER_HISTORY_PUBLISHER_WORKERS=4 \
+docker compose \
+  --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config --format json > "$wallet_archive_compose"
+bash "$validator" --compose-contract "$wallet_archive_compose"
+jq -e '
+  .services as $services
+  | [
+      "zinder-ingest",
+      "zinder-projector",
+      "zinder-query",
+      "zinder-compat-lightwalletd"
+    ]
+  | all($services[.].environment.ZINDER_DEPLOYMENT__PROFILE == "wallet-archive")
+  and $services["zinder-ingest"].environment.ZINDER_INGEST__SOURCE == "zebra-indexer-grpc"
+  and ($services["zinder-history-publisher"].command as $cmd
+    | ($cmd | index("--workers")) as $idx
+    | $idx != null and $cmd[$idx + 1] == "4")
+' "$wallet_archive_compose" >/dev/null \
+  || fail "the Compose topology does not forward wallet-archive profile, ZINDER_INGEST__SOURCE, or ZINDER_HISTORY_PUBLISHER_WORKERS overrides"
 
 history_dir="$temporary_directory/history"
 history_compose="$temporary_directory/history-compose.json"
@@ -319,13 +366,15 @@ fi
 
 resolved_explorer_compose="$temporary_directory/resolved-explorer-compose.json"
 ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_DEPLOYMENT__PROFILE=wallet-archive \
 docker compose \
   --env-file "$repository_root/deploy/.env.testnet" \
   -f "$repository_root/deploy/docker-compose.yml" \
   -f "$repository_root/deploy/docker-compose.explorer.yml" \
   config --format json > "$resolved_explorer_compose"
 jq -e '
-  .services["zinder-explorer"].build.target == "zinder-explorer"
+  . as $services_root
+  | .services["zinder-explorer"].build.target == "zinder-explorer"
   and .services["zinder-explorer"].command == ["--config", "/etc/zinder/config.toml"]
   and .services["zinder-explorer"].network_mode == "service:zinder-ingest"
   and .services["zinder-ingest"].ulimits.nofile.soft == 65536
@@ -339,6 +388,14 @@ jq -e '
     "zinder-explorer",
     "healthcheck"
   ]
+  and .services["zinder-ingest"].environment.ZINDER_INGEST__EXPLORER_VIEWS == "true"
+  and ([
+      "zinder-ingest",
+      "zinder-projector",
+      "zinder-query",
+      "zinder-compat-lightwalletd"
+    ] | all(. as $service
+      | (($services_root.services[$service].environment // {}) | has("ZINDER_DEPLOYMENT__PROFILE") | not)))
   and .services["zinder-explorer"].environment.ZINDER_EXPLORER__LISTEN_ADDR == "[::]:9068"
   and .services["zinder-explorer"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9069"
   and (.services["zinder-ingest"].networks.node.aliases | index("zinder-testnet-explorer")) != null
@@ -472,6 +529,169 @@ if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
   -f "$repository_root/deploy/docker-compose.yml" \
   config -q >/dev/null 2>&1; then
   fail "docker-compose.yml resolved without ZINDER_DEPLOY_NETWORK"
+fi
+
+# Light-wallet Compose bundle admission and override checks.
+resolved_light_wallet_default="$temporary_directory/resolved-light-wallet-default.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+docker compose \
+  --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.light-wallet.yml" \
+  config --format json > "$resolved_light_wallet_default"
+bash "$validator" --light-wallet-compose-contract "$resolved_light_wallet_default"
+jq -e '
+  (.services | keys | sort) == [
+    "state-init",
+    "zinder-compat-lightwalletd",
+    "zinder-history-publisher",
+    "zinder-ingest"
+  ]
+  and .services["zinder-ingest"].environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet"
+  and .services["zinder-ingest"].environment.ZINDER_INGEST__SOURCE == "zebra-json-rpc"
+  and .services["zinder-compat-lightwalletd"].environment.ZINDER_DEPLOYMENT__PROFILE == "light-wallet"
+  and .services["zinder-compat-lightwalletd"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS == "false"
+  and (.services["zinder-history-publisher"].tmpfs == ["/tmp:rw,noexec,nosuid,size=512m"])
+  and (.services["zinder-history-publisher"].command as $cmd
+    | ($cmd | index("--workers")) as $idx
+    | $idx != null and $cmd[$idx + 1] == "1")
+' "$resolved_light_wallet_default" >/dev/null \
+  || fail "the default light-wallet Compose bundle does not match the expected projector-free topology"
+
+resolved_light_wallet_observability="$temporary_directory/resolved-light-wallet-observability.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_INGEST__SOURCE=zebra-indexer-grpc \
+ZINDER_HISTORY_PUBLISHER_WORKERS=3 \
+ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true \
+ZINDER_VERSION=v9.8.7 \
+docker compose \
+  --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.light-wallet.yml" \
+  --profile observability \
+  config --format json > "$resolved_light_wallet_observability"
+bash "$validator" --light-wallet-compose-contract "$resolved_light_wallet_observability"
+jq -e '
+  (.services | keys | sort) == [
+    "state-init",
+    "zinder-compat-lightwalletd",
+    "zinder-grafana",
+    "zinder-history-publisher",
+    "zinder-ingest",
+    "zinder-prometheus"
+  ]
+  and .services["zinder-ingest"].image == "ghcr.io/zcashfoundation/zinder-ingest:v9.8.7"
+  and .services["zinder-compat-lightwalletd"].image == "ghcr.io/zcashfoundation/zinder-compat-lightwalletd:v9.8.7"
+  and .services["zinder-history-publisher"].image == "ghcr.io/zcashfoundation/zinder-compat-lightwalletd:v9.8.7"
+  and .services["zinder-ingest"].environment.ZINDER_INGEST__SOURCE == "zebra-indexer-grpc"
+  and .services["zinder-compat-lightwalletd"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS == "true"
+  and (.services["zinder-history-publisher"].command as $cmd
+    | ($cmd | index("--workers")) as $idx
+    | $idx != null and $cmd[$idx + 1] == "3")
+' "$resolved_light_wallet_observability" >/dev/null \
+  || fail "the light-wallet Compose bundle does not honor observability profile, version, source, workers, or proxy trust overrides"
+
+for deployment_env in "${deployment_env_names[@]}"; do
+  resolved_env_light_wallet="$temporary_directory/resolved-$deployment_env-light-wallet.json"
+  ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+  docker compose \
+    --env-file "$repository_root/deploy/.env.$deployment_env" \
+    -f "$repository_root/deploy/docker-compose.light-wallet.yml" \
+    --profile observability \
+    config --format json > "$resolved_env_light_wallet"
+  bash "$validator" --light-wallet-compose-contract "$resolved_env_light_wallet"
+done
+
+if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_node_env" \
+  -f "$repository_root/deploy/docker-compose.light-wallet.yml" \
+  config -q >/dev/null 2>&1; then
+  fail "docker-compose.light-wallet.yml resolved without a node JSON-RPC address"
+fi
+if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_deploy_network_env" \
+  -f "$repository_root/deploy/docker-compose.light-wallet.yml" \
+  config -q >/dev/null 2>&1; then
+  fail "docker-compose.light-wallet.yml resolved without ZINDER_DEPLOY_NETWORK"
+fi
+
+invalid_light_wallet="$temporary_directory/invalid-light-wallet.json"
+jq '.services["zinder-projector"] = {}' \
+  "$resolved_light_wallet_default" > "$invalid_light_wallet"
+expect_rejected \
+  "a light-wallet Compose bundle containing zinder-projector" \
+  --light-wallet-compose-contract "$invalid_light_wallet"
+jq '.services["zinder-query"] = {}' \
+  "$resolved_light_wallet_default" > "$invalid_light_wallet"
+expect_rejected \
+  "a light-wallet Compose bundle containing zinder-query" \
+  --light-wallet-compose-contract "$invalid_light_wallet"
+jq 'del(.services["zinder-history-publisher"].tmpfs)' \
+  "$resolved_light_wallet_default" > "$invalid_light_wallet"
+expect_rejected \
+  "a light-wallet Compose bundle omitting publisher tmpfs" \
+  --light-wallet-compose-contract "$invalid_light_wallet"
+jq '.services["zinder-compat-lightwalletd"].volumes += [
+  (.services["zinder-ingest"].volumes[] | select(.target == "/var/run/zinder-checkpoint/checkpoint.token"))
+]' "$resolved_light_wallet_default" > "$invalid_light_wallet"
+expect_rejected \
+  "a light-wallet Compose bundle exposing checkpoint.token to compat" \
+  --light-wallet-compose-contract "$invalid_light_wallet"
+jq '
+  .services["zinder-prometheus"].volumes |= map(
+    if .target == "/etc/prometheus/prometheus.yml" then
+      .source |= sub("/deploy/observability/light-wallet/prometheus\\.yml$"; "/deploy/observability/prometheus.yml")
+    else . end
+  )
+' "$resolved_light_wallet_observability" > "$invalid_light_wallet"
+expect_rejected \
+  "a light-wallet Compose bundle mounting the four-runtime Prometheus config" \
+  --light-wallet-compose-contract "$invalid_light_wallet"
+jq 'del(.services["zinder-prometheus"].networks.observability.aliases)' \
+  "$resolved_light_wallet_observability" > "$invalid_light_wallet"
+expect_rejected \
+  "a light-wallet Compose bundle omitting the prometheus network alias for Grafana" \
+  --light-wallet-compose-contract "$invalid_light_wallet"
+jq 'del(.services["zinder-prometheus"].networks.observability.aliases)' \
+  "$resolved_compose" > "$invalid_history_compose"
+expect_rejected \
+  "a Compose contract omitting the prometheus network alias for Grafana" \
+  --compose-contract "$invalid_history_compose"
+
+# Legacy transactions-retention overlay clears any inherited profile and pins
+# transactions retention across writer and wallet-serving readers.
+resolved_transactions_compose="$temporary_directory/resolved-transactions-compose.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_DEPLOYMENT__PROFILE=wallet \
+docker compose \
+  --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  -f "$repository_root/deploy/docker-compose.transactions.yml" \
+  config --format json > "$resolved_transactions_compose"
+bash "$validator" --compose-contract "$resolved_transactions_compose"
+jq -e '
+  .services as $services
+  | [
+      "zinder-ingest",
+      "zinder-projector",
+      "zinder-query",
+      "zinder-compat-lightwalletd"
+    ]
+  | all(
+      (($services[.].environment // {}) | has("ZINDER_DEPLOYMENT__PROFILE") | not)
+      and $services[.].environment.ZINDER_STORAGE__RAW_BLOB_POLICY == "transactions"
+    )
+' "$resolved_transactions_compose" >/dev/null \
+  || fail "the transactions Compose overlay does not clear ZINDER_DEPLOYMENT__PROFILE and set raw_blob_policy=transactions across all runtimes"
+
+# systemd unit must keep active syncs intact on restart and avoid unintended builds.
+systemd_unit="$repository_root/deploy/systemd/zinder.service"
+grep -Fqx 'ExecStart=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml up --no-build' \
+  "$systemd_unit" \
+  || fail "deploy/systemd/zinder.service ExecStart must pass --no-build"
+grep -Fqx 'ExecStop=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml down' \
+  "$systemd_unit" \
+  || fail "deploy/systemd/zinder.service must preserve ExecStop down"
+if grep -Ev '^[[:space:]]*#' "$systemd_unit" | grep -Eq 'ExecStartPre|--remove-orphans'; then
+  fail "deploy/systemd/zinder.service must not run destructive ExecStartPre down --remove-orphans"
 fi
 
 missing_state_init_compose="$temporary_directory/missing-state-init-compose.json"

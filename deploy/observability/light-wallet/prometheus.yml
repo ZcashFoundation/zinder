@@ -1,0 +1,39 @@
+# Scrape config for the two-runtime light-wallet Compose observability profile
+# (`deploy/docker-compose.light-wallet.yml`, which omits `zinder-projector` and
+# `zinder-query`). Loads the shared alert rules together with the matching
+# two-target `zinder:expected_target` definitions so missing projector/query
+# targets do not trigger `ZinderTargetDown` or `ZinderTargetMissing`.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+  - /etc/prometheus/light-wallet/rules/*.yml
+
+scrape_configs:
+  - job_name: "zinder-ingest"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["zinder-ingest:9105"]
+        labels:
+          stack: "zinder"
+          service: "zinder-ingest"
+
+  - job_name: "zinder-compat-lightwalletd"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["zinder-ingest:9107"]
+        labels:
+          stack: "zinder"
+          service: "zinder-compat-lightwalletd"
+
+  - job_name: "prometheus"
+    scrape_interval: 60s
+    static_configs:
+      - targets: ["localhost:9090"]
