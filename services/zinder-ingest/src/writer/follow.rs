@@ -1941,6 +1941,64 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn timed_out_mempool_append_does_not_commit_after_replay_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::writer::control::canonical_control_channel;
+
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, commands) = canonical_control_channel();
+        let mut control = ControlInbox::new(Some(commands));
+        let single_event = MempoolEvent::Invalidated {
+            transaction_id: TransactionId::from_bytes([1; 32]),
+            reason: MempoolEvictionReason::Unknown,
+        };
+        let batch_event = MempoolEvent::Invalidated {
+            transaction_id: TransactionId::from_bytes([2; 32]),
+            reason: MempoolEvictionReason::Unknown,
+        };
+
+        let (single_outcome, batch_outcome, ()) = tokio::join!(
+            canonical.append_mempool_event(single_event, UnixTimestampMillis::new(1_000)),
+            canonical.append_mempool_events(vec![(batch_event, UnixTimestampMillis::new(1_001))]),
+            control.serve_reads_until(
+                &store,
+                TipConfirmation::Confirmed,
+                tokio::time::sleep(Duration::from_secs(61)),
+            ),
+        );
+        assert!(single_outcome.is_err());
+        assert!(batch_outcome.is_err());
+
+        let page_size = NonZeroU32::new(4).ok_or("page size must be nonzero")?;
+        let (replay_page, ()) = tokio::join!(
+            canonical.mempool_event_page(None, page_size),
+            control.serve_reads_until(
+                &store,
+                TipConfirmation::Confirmed,
+                tokio::time::sleep(Duration::from_secs(1)),
+            ),
+        );
+        assert_eq!(replay_page?, [] as [zinder_store::MempoolEventEnvelope; 0]);
+
+        control.drain(&mut store, TipConfirmation::Confirmed);
+        let (durable_page, ()) = tokio::join!(
+            canonical.mempool_event_page(None, page_size),
+            control.serve_reads_until(
+                &store,
+                TipConfirmation::Confirmed,
+                tokio::time::sleep(Duration::from_secs(1)),
+            ),
+        );
+        assert_eq!(
+            durable_page?,
+            [] as [zinder_store::MempoolEventEnvelope; 0],
+            "abandoned mempool appends held during node waits must not commit after replay"
+        );
+        Ok(())
+    }
+
     async fn send_mempool_append(
         commands: &mpsc::Sender<CanonicalControlCommand>,
         transaction_tag: u8,

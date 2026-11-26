@@ -857,9 +857,11 @@ pub(crate) enum CanonicalControlRead {
 /// nothing observes a write before its reply: every caller awaits the reply
 /// before it acts, and the live mempool owner publishes an index change only
 /// after its durable append replies. The owner also sends each mempool read
-/// and write under one gate, so a snapshot anchor or stream start never
-/// overtakes the owner's own pending append. A read answered first therefore
-/// sees the state before the pending write, which no caller has seen past.
+/// and write under one gate, and mempool appends whose caller already dropped
+/// its reply receiver are skipped before touching the store, so a snapshot
+/// anchor, stream start, or rebuild replay never overtakes an append that can
+/// still commit later. A read answered first therefore sees the state before
+/// the pending write, which no caller has seen past.
 pub(crate) fn answer_canonical_control_read(
     store: &RocksDbCanonicalStore,
     command: CanonicalControlCommand,
@@ -1034,6 +1036,9 @@ fn append_mempool_event(
     observed_at: UnixTimestampMillis,
     reply: oneshot::Sender<Result<MempoolEventEnvelope, Status>>,
 ) {
+    if reply.is_closed() {
+        return;
+    }
     send_control_response(
         reply,
         store
@@ -1047,6 +1052,9 @@ fn append_mempool_events(
     events: Vec<(MempoolEvent, UnixTimestampMillis)>,
     reply: oneshot::Sender<Result<Vec<MempoolEventEnvelope>, Status>>,
 ) {
+    if reply.is_closed() {
+        return;
+    }
     send_control_response(
         reply,
         store
