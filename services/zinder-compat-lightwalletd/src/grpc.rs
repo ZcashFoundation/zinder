@@ -95,6 +95,9 @@ pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 20_000;
 /// stalled tip from growing it without limit; it is far above what a Zcash
 /// mempool turns over in one block interval.
 const MAX_MEMPOOL_STREAM_TRANSACTIONS: usize = 100_000;
+/// Outbound `RawTransaction` messages one `GetMempoolStream` task buffers ahead
+/// of its gRPC transport before backpressuring its upstream subscription.
+const MEMPOOL_STREAM_CHANNEL_CAPACITY: usize = 16;
 
 /// Response bounds for [`LightwalletdGrpcAdapter`].
 ///
@@ -2246,10 +2249,6 @@ pub(crate) const fn u32_to_usize(count: u32) -> usize {
     count as usize
 }
 
-#[allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "non-exhaustive core networks must fail closed until lightwalletd mapping exists"
-)]
 fn close_mempool_stream_on_tip_change<S>(
     raw_transaction_stream: S,
     watcher: SharedTipChangeWatcher,
@@ -2260,20 +2259,45 @@ where
         + Send
         + 'static,
 {
-    let (output_sender, output_receiver) = tokio::sync::mpsc::channel(16);
+    let (output_sender, output_receiver) =
+        tokio::sync::mpsc::channel(MEMPOOL_STREAM_CHANNEL_CAPACITY);
     tokio::spawn(async move {
-        tokio::pin!(raw_transaction_stream);
+        let mut raw_transaction_stream = Box::pin(raw_transaction_stream);
         let mut tip_change_signal =
             Box::pin(watcher.await_tip_change_after(snapshot_chain_epoch_id));
         loop {
+            let permit = tokio::select! {
+                biased;
+                () = output_sender.closed() => return,
+                tip_change_outcome = &mut tip_change_signal => {
+                    drop(raw_transaction_stream);
+                    if let Err(error) = record_mempool_stream_tip_signal(tip_change_outcome) {
+                        // Ending with OK would tell the client a new block
+                        // arrived when no tip change was observed.
+                        let _ = output_sender
+                            .send(Err(Status::unavailable(error.to_string())))
+                            .await;
+                    }
+                    return;
+                }
+                permit_outcome = output_sender.reserve() => match permit_outcome {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                },
+            };
             tokio::select! {
+                biased;
+                () = output_sender.closed() => return,
+                tip_change_outcome = &mut tip_change_signal => {
+                    drop(raw_transaction_stream);
+                    if let Err(error) = record_mempool_stream_tip_signal(tip_change_outcome) {
+                        permit.send(Err(Status::unavailable(error.to_string())));
+                    }
+                    return;
+                }
                 outcome = tonic::codegen::tokio_stream::StreamExt::next(&mut raw_transaction_stream) => {
                     match outcome {
-                        Some(raw_transaction_outcome) => {
-                            if output_sender.send(raw_transaction_outcome).await.is_err() {
-                                return;
-                            }
-                        }
+                        Some(raw_transaction_outcome) => permit.send(raw_transaction_outcome),
                         None => {
                             // Underlying mempool source ended; let the
                             // gRPC stream end naturally.
@@ -2281,35 +2305,34 @@ where
                         }
                     }
                 }
-                tip_change_outcome = &mut tip_change_signal => {
-                    match tip_change_outcome {
-                        Ok(()) => {
-                            tracing::debug!(
-                                target: "zinder::compat_lightwalletd",
-                                event = "mempool_stream_close_on_tip_change",
-                                "GetMempoolStream closing on observed best-chain tip change"
-                            );
-                        }
-                        Err(error @ TipChangeWatcherError::SignalClosed) => {
-                            tracing::warn!(
-                                target: "zinder::compat_lightwalletd",
-                                event = "mempool_stream_tip_signal_closed",
-                                error = %error,
-                                "tip-change signal source closed; GetMempoolStream will end"
-                            );
-                            // Ending with OK would tell the client a new block
-                            // arrived when no tip change was observed.
-                            let _ = output_sender
-                                .send(Err(Status::unavailable(error.to_string())))
-                                .await;
-                        }
-                    }
-                    return;
-                }
             }
         }
     });
     tokio_stream::wrappers::ReceiverStream::new(output_receiver)
+}
+
+fn record_mempool_stream_tip_signal(
+    tip_change_outcome: Result<(), TipChangeWatcherError>,
+) -> Result<(), TipChangeWatcherError> {
+    match tip_change_outcome {
+        Ok(()) => {
+            tracing::debug!(
+                target: "zinder::compat_lightwalletd",
+                event = "mempool_stream_close_on_tip_change",
+                "GetMempoolStream closing on observed best-chain tip change"
+            );
+            Ok(())
+        }
+        Err(error @ TipChangeWatcherError::SignalClosed) => {
+            tracing::warn!(
+                target: "zinder::compat_lightwalletd",
+                event = "mempool_stream_tip_signal_closed",
+                error = %error,
+                "tip-change signal source closed; GetMempoolStream will end"
+            );
+            Err(error)
+        }
+    }
 }
 
 /// Passes each item whose `key` it has not yielded before, and errors are
@@ -2748,5 +2771,103 @@ mod tests {
             outcome,
             Err(status) if status.code() == tonic::Code::OutOfRange
         ));
+    }
+
+    struct PendingDropStream {
+        remaining_messages: u8,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl PendingDropStream {
+        fn new(remaining_messages: u8) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (dropped, on_drop) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    remaining_messages,
+                    dropped: Some(dropped),
+                },
+                on_drop,
+            )
+        }
+    }
+
+    impl tonic::codegen::tokio_stream::Stream for PendingDropStream {
+        type Item = Result<lightwalletd::RawTransaction, Status>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if self.remaining_messages == 0 {
+                return std::task::Poll::Pending;
+            }
+            let next_byte = self.remaining_messages;
+            self.remaining_messages -= 1;
+            std::task::Poll::Ready(Some(Ok(lightwalletd::RawTransaction {
+                data: vec![next_byte],
+                height: 0,
+            })))
+        }
+    }
+
+    impl Drop for PendingDropStream {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mempool_stream_wrapper_drops_idle_upstream_when_receiver_drops() -> Result<(), Status>
+    {
+        let (_tip_sender, tip_receiver) = tokio::sync::watch::channel(7_u64);
+        let watcher: SharedTipChangeWatcher =
+            Arc::new(crate::mempool::WatchTipChangeWatcher::new(tip_receiver));
+        let (upstream, on_drop) = PendingDropStream::new(0);
+        let response = close_mempool_stream_on_tip_change(upstream, watcher, ChainEpochId::new(7));
+        tokio::task::yield_now().await;
+
+        drop(response);
+
+        tokio::time::timeout(Duration::from_millis(500), on_drop)
+            .await
+            .map_err(|_| Status::deadline_exceeded("idle upstream outlived dropped receiver"))?
+            .map_err(|_| Status::internal("upstream drop sender disappeared"))
+    }
+
+    #[tokio::test]
+    async fn mempool_stream_wrapper_releases_upstream_on_closed_tip_signal_with_full_queue()
+    -> Result<(), Status> {
+        let (tip_sender, tip_receiver) = tokio::sync::watch::channel(7_u64);
+        let watcher: SharedTipChangeWatcher =
+            Arc::new(crate::mempool::WatchTipChangeWatcher::new(tip_receiver));
+        let (upstream, on_drop) = PendingDropStream::new(17);
+        let mut response =
+            close_mempool_stream_on_tip_change(upstream, watcher, ChainEpochId::new(7));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(tip_sender);
+
+        tokio::time::timeout(Duration::from_millis(500), on_drop)
+            .await
+            .map_err(|_| Status::deadline_exceeded("upstream stayed open on closed tip signal"))?
+            .map_err(|_| Status::internal("upstream drop sender disappeared"))?;
+        for _ in 0..16 {
+            let buffered = response
+                .next()
+                .await
+                .ok_or_else(|| Status::internal("missing buffered message"))?;
+            assert!(buffered.is_ok());
+        }
+        let terminal = response
+            .next()
+            .await
+            .ok_or_else(|| Status::internal("missing UNAVAILABLE status"))?;
+        let Err(status) = terminal else {
+            return Err(Status::internal("expected UNAVAILABLE status after queue"));
+        };
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        Ok(())
     }
 }
