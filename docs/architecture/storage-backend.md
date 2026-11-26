@@ -77,7 +77,9 @@ RocksDB applies these codecs per data column family.
 `block_hash_index` and `transaction_location` also carry partitioned hybrid
 Ribbon filters (10 bits per key; Bloom filters before level 1 and Ribbon
 filters at deeper levels) with two-level indexes and top-level index and filter
-blocks pinned in the block cache. Other canonical families use no filters.
+blocks pinned in the block cache. `chain_epoch` and `chain_event` carry
+10-bits-per-key full-table Bloom filters cached in the block cache. Other
+canonical families use no filters.
 
 A control record ties the store to its network, workload (`wallet` or
 `explorer`), raw-blob retention, reorg window, network-upgrade activations,
@@ -154,7 +156,8 @@ The filters let the projector prove quickly that a new output, spend, or
 history row does not exist yet. They use about 10 bits per key, for roughly a
 1% false-positive rate. Flushed and level-0 files use Bloom filters, and deeper
 files use Ribbon filters, which are about 30% smaller. Filters share the
-store's block cache. Materialized-view stores and the other canonical families
+store's block cache. Materialized-view stores and canonical families other than
+`block_hash_index`, `transaction_location`, `chain_epoch`, and `chain_event`
 use no filters.
 
 **Construction.** The projector builds a new wallet store in an inactive path

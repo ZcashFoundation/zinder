@@ -23,7 +23,7 @@ use crate::{
 #[derive(Clone, Copy)]
 pub(crate) struct SlotPin<'slot> {
     slot: &'slot WalletServingPairSlot,
-    chain_epoch_id: Option<ChainEpochId>,
+    mode: Replacement,
 }
 
 impl<'slot> SlotPin<'slot> {
@@ -33,8 +33,21 @@ impl<'slot> SlotPin<'slot> {
     ) -> Self {
         Self {
             slot,
-            chain_epoch_id,
+            mode: Replacement::Pinned(chain_epoch_id),
         }
+    }
+
+    /// Captures ephemerally when unpinned (`None`), or pins to `Some(id)` when
+    /// a multi-step caller bound the read to a specific epoch.
+    pub(crate) const fn ephemeral_unless_pinned(
+        slot: &'slot WalletServingPairSlot,
+        chain_epoch_id: Option<ChainEpochId>,
+    ) -> Self {
+        let mode = match chain_epoch_id {
+            Some(id) => Replacement::Pinned(Some(id)),
+            None => Replacement::Ephemeral,
+        };
+        Self { slot, mode }
     }
 }
 
@@ -81,8 +94,8 @@ where
     Read: FnOnce(Arc<WalletServingReadPair>) -> Reading + Clone,
     Reading: Future<Output = Result<Output, QueryError>>,
 {
-    let pair = pin.slot.capture_at(pin.chain_epoch_id);
-    read_pair(pin.slot, pair, pin.chain_epoch_id, read).await
+    let pair = pin.mode.capture(pin.slot);
+    read_replaceable_pair(pin.slot, pair, pin.mode, read).await
 }
 
 /// How a read selects the pair that replaces one whose reader was

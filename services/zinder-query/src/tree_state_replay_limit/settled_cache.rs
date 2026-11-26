@@ -213,7 +213,7 @@ impl EncodedTreeStateHex {
     }
 }
 
-/// Settled [`ServedTreeState`] paired with lazily computed hexadecimal wire
+/// [`ServedTreeState`] paired with lazily computed hexadecimal wire
 /// fields so repeated warm `GetTreeState` hits avoid cloning raw frontier
 /// buffers and repeating hex encoding.
 #[derive(Debug)]
@@ -223,7 +223,7 @@ pub(crate) struct CachedTreeState {
 }
 
 impl CachedTreeState {
-    fn new(state: ServedTreeState) -> Self {
+    pub(crate) const fn new(state: ServedTreeState) -> Self {
         Self {
             state,
             hex: OnceLock::new(),
@@ -454,21 +454,31 @@ impl SettledStates {
         self.get_touching(height)
     }
 
+    #[cfg(test)]
     pub(super) fn remember(
         &mut self,
         anchor: SettledChainAnchor,
         generation: &ReaderGeneration,
         state: &ServedTreeState,
     ) {
+        let _ = self.remember_owned(anchor, generation, state.clone());
+    }
+
+    pub(super) fn remember_owned(
+        &mut self,
+        anchor: SettledChainAnchor,
+        generation: &ReaderGeneration,
+        state: ServedTreeState,
+    ) -> Result<Arc<CachedTreeState>, ServedTreeState> {
         let height = state.block_id().height;
         if !anchor.covers(height) {
-            return;
+            return Err(state);
         }
         let is_current = generation.is_current();
         match self.anchor {
             None => {
                 if !is_current {
-                    return;
+                    return Err(state);
                 }
                 self.reset_to(anchor, &generation.weak);
             }
@@ -477,15 +487,27 @@ impl SettledStates {
                     self.adopt_generation(&generation.weak);
                 }
             }
-            Some(_) => return,
+            Some(_) => return Err(state),
         }
-        self.put(height, state.clone());
+        self.put_owned(height, state)
     }
 
-    fn put(&mut self, height: BlockHeight, state: ServedTreeState) {
+    fn put_owned(
+        &mut self,
+        height: BlockHeight,
+        state: ServedTreeState,
+    ) -> Result<Arc<CachedTreeState>, ServedTreeState> {
+        if let Some(existing) = self.entries.get(&height)
+            && existing.state.state() == &state
+        {
+            existing
+                .last_used
+                .store(self.allocate_tick(), Ordering::Relaxed);
+            return Ok(Arc::clone(&existing.state));
+        }
         let bytes = tree_state_byte_footprint(&state);
         if self.max_entries == 0 || bytes > self.max_bytes {
-            return;
+            return Err(state);
         }
         if let Some(removed) = self.entries.remove(&height) {
             self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
@@ -507,14 +529,16 @@ impl SettledStates {
         }
         let tick = self.allocate_tick();
         self.total_bytes = self.total_bytes.saturating_add(bytes);
+        let cached = Arc::new(CachedTreeState::new(state));
         self.entries.insert(
             height,
             CachedEntry {
-                state: Arc::new(CachedTreeState::new(state)),
+                state: Arc::clone(&cached),
                 bytes,
                 last_used: AtomicU64::new(tick),
             },
         );
+        Ok(cached)
     }
 
     #[cfg(test)]

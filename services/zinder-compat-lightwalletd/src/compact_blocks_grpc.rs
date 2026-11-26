@@ -427,6 +427,28 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
             .await
             .map(Response::new)
     }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.slot, "get_encoded_block_range", &request)
+            .await?;
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
+        self.block_methods
+            .published_block_range_frames(&self.slot, &request, range, CompactBlockShape::for_range)
+            .await
+            .map(Response::new)
+    }
 }
 
 #[tonic::async_trait]

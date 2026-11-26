@@ -565,7 +565,7 @@ pub(super) fn validate_permanent_reorg_archive(
         .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
         .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
     let mut options = ReadOptions::default();
-    options.fill_cache(false);
+    options.fill_cache(true);
     let mut rows = db.raw_iterator_cf_opt(&family, options);
     rows.seek([EVENT_CONTEXT_KEY_TAG]);
 
@@ -665,7 +665,7 @@ fn validate_latest_event_rows(
         .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
         .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
     let mut options = ReadOptions::default();
-    options.fill_cache(false);
+    options.fill_cache(true);
     let mut rows = db.raw_iterator_cf_opt(&family, options);
     rows.seek_for_prev(encode_order_key(ArchivePosition {
         event_sequence: context.event_sequence,
@@ -758,7 +758,7 @@ fn read_exact_db_row(
         .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
         .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
     let mut options = ReadOptions::default();
-    options.fill_cache(false);
+    options.fill_cache(true);
     db.get_cf_opt(&family, key, &options)
         .map_err(|source| CanonicalStoreError::RocksDbOperation { operation, source })
 }
@@ -768,7 +768,7 @@ fn archive_has_any_row(db: &rust_rocksdb::DB) -> Result<bool, CanonicalStoreErro
         .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
         .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
     let mut options = ReadOptions::default();
-    options.fill_cache(false);
+    options.fill_cache(true);
     let mut rows = db.raw_iterator_cf_opt(&family, options);
     rows.seek_to_first();
     let has_row = rows.valid();

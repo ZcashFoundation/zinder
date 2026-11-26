@@ -35,15 +35,39 @@ fn cgroup_memory_snapshot_in(
     cgroup_root: &Path,
     proc_cgroup: &Path,
 ) -> Option<CgroupMemorySnapshot> {
-    let limit_bytes = cgroup_memory_budget_bytes_in(cgroup_root, proc_cgroup)?;
     let cgroup_dir = cgroup_v2_dir(cgroup_root, proc_cgroup);
-    let current_bytes = read_cgroup_u64(&cgroup_dir, "memory.current")?;
-    let file_cache_bytes = read_cgroup_stat_u64(&cgroup_dir, "memory.stat", "file");
-    Some(CgroupMemorySnapshot {
-        current_bytes,
-        limit_bytes,
-        file_cache_bytes,
-    })
+    let mut most_pressured: Option<CgroupMemorySnapshot> = None;
+    for ancestor in cgroup_dir.ancestors() {
+        if !ancestor.starts_with(cgroup_root) {
+            break;
+        }
+        let high = read_cgroup_u64(ancestor, "memory.high");
+        let max = read_cgroup_u64(ancestor, "memory.max");
+        let Some(limit_bytes) = (match (high, max) {
+            (Some(high_bytes), Some(max_bytes)) => Some(high_bytes.min(max_bytes)),
+            (high_bytes, max_bytes) => high_bytes.or(max_bytes),
+        }) else {
+            continue;
+        };
+        let Some(current_bytes) = read_cgroup_u64(ancestor, "memory.current") else {
+            continue;
+        };
+        let candidate = CgroupMemorySnapshot {
+            current_bytes,
+            limit_bytes,
+            file_cache_bytes: read_cgroup_stat_u64(ancestor, "memory.stat", "file"),
+        };
+        let replaces_best = most_pressured.is_none_or(|best| {
+            let candidate_lhs = u128::from(candidate.current_bytes) * u128::from(best.limit_bytes);
+            let best_rhs = u128::from(best.current_bytes) * u128::from(candidate.limit_bytes);
+            candidate_lhs > best_rhs
+                || (candidate_lhs == best_rhs && candidate.limit_bytes < best.limit_bytes)
+        });
+        if replaces_best {
+            most_pressured = Some(candidate);
+        }
+    }
+    most_pressured
 }
 
 fn read_cgroup_stat_u64(dir: &Path, file_name: &str, key_name: &str) -> Option<u64> {
@@ -649,6 +673,36 @@ mod tests {
         assert_eq!(snapshot.limit_bytes, 4_294_967_296);
         assert_eq!(snapshot.current_bytes, 3_900_000_000);
         assert_eq!(snapshot.file_cache_bytes, Some(3_500_000_000));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_snapshot_selects_most_pressured_ancestor_when_parent_slice_is_tighter()
+    -> Result<(), Box<dyn Error>> {
+        let tempdir = tempdir()?;
+        let cgroup_root = tempdir.path().join("cgroup");
+        let parent = cgroup_root.join("system.slice");
+        let leaf = parent.join("zinder.service");
+        fs::create_dir_all(&leaf)?;
+        // Parent slice holds 7.5 GiB / 8 GiB (93.75% utilized due to siblings).
+        fs::write(parent.join("memory.max"), format!("{}\n", 8 * 1024 * MIB))?;
+        fs::write(parent.join("memory.current"), format!("{}\n", 7_680 * MIB))?;
+        fs::write(
+            parent.join("memory.stat"),
+            format!("file {}\n", 6_144 * MIB),
+        )?;
+        // Leaf has its own 8 GiB limit but only 2 GiB usage (25%).
+        fs::write(leaf.join("memory.max"), format!("{}\n", 8 * 1024 * MIB))?;
+        fs::write(leaf.join("memory.current"), format!("{}\n", 2 * 1024 * MIB))?;
+        fs::write(leaf.join("memory.stat"), format!("file {}\n", 1_536 * MIB))?;
+        let proc_cgroup = tempdir.path().join("proc-cgroup");
+        fs::write(&proc_cgroup, "0::/system.slice/zinder.service\n")?;
+
+        let snapshot = cgroup_memory_snapshot_in(&cgroup_root, &proc_cgroup)
+            .ok_or("expected parent-slice memory snapshot")?;
+        assert_eq!(snapshot.limit_bytes, 8 * 1024 * MIB);
+        assert_eq!(snapshot.current_bytes, 7_680 * MIB);
+        assert_eq!(snapshot.file_cache_bytes, Some(6_144 * MIB));
         Ok(())
     }
 }

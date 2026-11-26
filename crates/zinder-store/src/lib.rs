@@ -101,6 +101,7 @@ pub use settled_shielded_segment::{
     PoolPresenceMask, SEGMENT_FLAG_RESERVED_SHIFTED_EPK, SETTLED_SHIELDED_SEGMENT_MAGIC,
     SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES, SettledShieldedSegmentError,
     SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader, SettledShieldedSegmentWriter,
-    ShieldedProjectionSelection, ShieldedSegmentIdentity, project_shielded_block_wire,
+    ShieldedProjectionSelection, ShieldedSegmentIdentity, is_passthrough_shielded_block_wire,
+    project_shielded_block_wire, project_shielded_block_wire_with_scratch,
 };
 pub use store_error::{ArtifactFamily, StorageKey, StoreError};

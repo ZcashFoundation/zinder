@@ -1,0 +1,6 @@
+kind: changed
+body: Serve non-transparent lightwalletd `GetBlockRange` and `GetBlockRangeNullifiers` `pool_types` subsets (such as `[PoolType::Orchard]`) from published `ZSHRNG01` segments and the in-memory shielded tail instead of falling back to canonical RocksDB reads.
+time: 2026-11-26T09:35:00Z
+custom:
+    Bump: patch
+    PR: "630"

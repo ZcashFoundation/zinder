@@ -868,6 +868,42 @@ where
             .await
             .map_err(|error| status_from_query_error(&error))
     }
+
+    async fn tree_state_hex_for_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<zinder_query::ServedTreeStateHex, Status>
+    where
+        QueryApi: Clone,
+    {
+        self.block_methods
+            .await_tip(&self.query_api, "get_tree_state", height)
+            .await?;
+        let view = self.query_api.capture_ephemeral_view().await?;
+        reject_future_tree_state_height(height, view.visible_tip_height)?;
+        match self.query_api.tree_state_hex_at(height, None).await {
+            Ok(tree_state) => Ok(tree_state),
+            Err(QueryError::BlockNotInBestChain) => {
+                if self
+                    .query_api
+                    .canonical_history_bounds()
+                    .and_then(zinder_core::CanonicalHistoryBounds::preceding_checkpoint)
+                    .is_some_and(|checkpoint| height < checkpoint.height)
+                {
+                    return Err(tree_state_status(&QueryError::BlockNotInBestChain));
+                }
+                let latest_view = self.query_api.capture_ephemeral_view().await?;
+                reject_future_tree_state_height(height, latest_view.visible_tip_height)?;
+                let pinned_view = self.query_api.capture_view().await?;
+                reject_future_tree_state_height(height, pinned_view.visible_tip_height)?;
+                self.query_api
+                    .tree_state_hex_at(height, Some(pinned_view.id))
+                    .await
+                    .map_err(|error| tree_state_status(&error))
+            }
+            Err(error) => Err(tree_state_status(&error)),
+        }
+    }
 }
 
 const EMPTY_BALANCE_ADDRESSES: &str = "addresses list must not be empty";
@@ -956,6 +992,33 @@ where
             .await
             .map(Response::new)
     }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.query_api, "get_encoded_block_range", &request)
+            .await?;
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
+        self.block_methods
+            .published_block_range_frames(
+                &self.query_api,
+                &request,
+                range,
+                CompactBlockShape::for_range,
+            )
+            .await
+            .map(Response::new)
+    }
 }
 
 #[tonic::async_trait]
@@ -981,6 +1044,37 @@ where
         );
         self.block_methods
             .published_block_range(
+                &self.query_api,
+                &request,
+                range,
+                CompactBlockShape::for_nullifier_range,
+            )
+            .await
+            .map(Response::new)
+    }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_nullifier_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(
+                &self.query_api,
+                "get_encoded_block_range_nullifiers",
+                &request,
+            )
+            .await?;
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
+        self.block_methods
+            .published_block_range_frames(
                 &self.query_api,
                 &request,
                 range,
@@ -1224,26 +1318,23 @@ where
         request: Request<lightwalletd::BlockId>,
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
-        if let RequestedBlock::Height(height) = block {
-            self.block_methods
-                .await_tip(&self.query_api, "get_tree_state", height)
-                .await?;
-        }
-        let view = self.query_api.capture_view().await?;
-        reject_genesis_tree_state(block, view.network)?;
-        let height = resolve_block_height(&self.query_api, &view, block)
-            .await
-            .map_err(|error| tree_state_block_lookup_status(&error))?;
-        reject_future_tree_state_height(height, view.visible_tip_height)?;
-        let tree_state = self
-            .query_api
-            .tree_state_at(height, Some(view.id))
-            .await
-            .map_err(|error| tree_state_status(&error))?;
+        let tree_state = match block {
+            RequestedBlock::Height(height) => self.tree_state_hex_for_height(height).await?,
+            RequestedBlock::Hash(_) => {
+                let view = self.query_api.capture_view().await?;
+                reject_genesis_tree_state(block, view.network)?;
+                let height = resolve_block_height(&self.query_api, &view, block)
+                    .await
+                    .map_err(|error| tree_state_block_lookup_status(&error))?;
+                reject_future_tree_state_height(height, view.visible_tip_height)?;
+                self.query_api
+                    .tree_state_hex_at(height, Some(view.id))
+                    .await
+                    .map_err(|error| tree_state_status(&error))?
+            }
+        };
 
-        require_sapling_tree_state(&tree_state)?;
-
-        Ok(Response::new(lightwalletd_tree_state(&tree_state)))
+        lightwalletd_tree_state_from_hex(tree_state).map(Response::new)
     }
 
     async fn get_latest_tree_state(
@@ -1252,13 +1343,11 @@ where
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let tree_state = self
             .query_api
-            .latest_tree_state_checkpoint(None)
+            .latest_tree_state_checkpoint_hex(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
-        require_sapling_tree_state(&tree_state)?;
-
-        Ok(Response::new(lightwalletd_tree_state(&tree_state)))
+        lightwalletd_tree_state_from_hex(tree_state).map(Response::new)
     }
 
     type GetSubtreeRootsStream = GrpcStream<lightwalletd::SubtreeRoot>;

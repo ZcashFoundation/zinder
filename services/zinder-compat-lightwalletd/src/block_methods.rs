@@ -530,6 +530,30 @@ impl BlockMethods {
         stream_range(reads, range, is_descending, slot, source).await
     }
 
+    pub(crate) async fn published_block_range_frames<Reads: CompactBlockReads>(
+        &self,
+        reads: &Reads,
+        request: &lightwalletd::BlockRange,
+        (history, live_tail): (
+            Option<Arc<crate::published_range::PublishedShieldedCatalog>>,
+            crate::published_range::ShieldedTailBuffer,
+        ),
+        select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
+    ) -> Result<lightwalletd::EncodedBlockFrameStream, Status> {
+        let (range, is_descending) = block_range_from_request(request)?;
+        let shape = select(&request.pool_types)?;
+        let slot = self.block_range_streams.open().await?;
+        let shape = resolve_published_shape(reads, shape, range.end).await;
+        let source = crate::published_range::PublishedBatchedRangeRead::new(
+            history,
+            live_tail,
+            shape,
+            is_descending,
+            self.block_range_streams.clone(),
+        );
+        stream_range(reads, range, is_descending, slot, source).await
+    }
+
     /// Captures the current view, reads the times of its tip for the tip call
     /// `method`, and refuses the tip when it is older than the stale-tip
     /// limit and the writer's node does not vouch for it.
@@ -584,12 +608,11 @@ async fn published_read_permit(
     }
 }
 
-/// Resolves a pool selection that omits only Ironwood to the published shape
-/// it matches.
+/// Upgrades a pool selection that omits only Ironwood to its zero-copy
+/// published shape when the current chain schedule proves Ironwood has not
+/// activated at or below `end`.
 ///
-/// A request the stored frames cannot serve then never queues for a
-/// signed-file permit or inherits the reduced published byte budget. The
-/// caller holds its ordinary stream slot first, so a saturated listener
+/// The caller holds its ordinary stream slot first, so a saturated listener
 /// refuses a request before this reads anything.
 ///
 /// Every chunk's highest height is at or below the request's highest height,
@@ -597,16 +620,16 @@ async fn published_read_permit(
 /// reaches the request's highest height: an admitted activation schedule
 /// revision never changes activations at or below the tip it was admitted at,
 /// while a view below the end can still lack an activation the writer admits
-/// before a later chunk's view sees the end. A captured view that falls short
-/// of the end, a schedule the reader cannot read, or a view it cannot take
-/// leaves the selection alone, so the native path serves the request and
-/// reports its own canonical errors.
+/// before a later chunk's view sees the end. When Ironwood is active at or
+/// below `end`, or when the view or schedule cannot prove equivalence, the
+/// explicit selection stays in place so `PublishedRangeRead` wire-projects
+/// authenticated frames instead of slicing default frames directly.
 async fn resolve_published_shape<Reads: CompactBlockReads>(
     reads: &Reads,
     shape: CompactBlockShape,
     end: BlockHeight,
 ) -> CompactBlockShape {
-    if shape.is_published_shape() {
+    if shape.is_zero_copy_published() {
         return shape;
     }
     let Some(equivalent) = shape.published_equivalent() else {
@@ -860,10 +883,29 @@ struct ChunkConversion {
 /// `Ok`, because a chunk that cannot be converted fails whole.
 pub(crate) type ChunkMessages<Message> = Vec<Result<Message, Status>>;
 
+pub(crate) trait RangeChunk: Send + 'static {
+    type Block: RangeBlock;
+
+    fn kept_blocks(&self) -> usize;
+    fn endpoints(&self) -> &[Self::Block];
+}
+
+impl<Block: RangeBlock + Send + 'static> RangeChunk for Vec<Block> {
+    type Block = Block;
+
+    fn kept_blocks(&self) -> usize {
+        self.len()
+    }
+
+    fn endpoints(&self) -> &[Block] {
+        self.as_slice()
+    }
+}
+
 pub(crate) trait RangeSource<Reads: CompactBlockReads>:
     Clone + Send + Sync + 'static
 {
-    type Block: RangeBlock + Send + 'static;
+    type Chunk: RangeChunk;
     type Message: Send + 'static;
 
     /// Returns the published-read limit if the offered chunk or its possible
@@ -876,7 +918,7 @@ pub(crate) trait RangeSource<Reads: CompactBlockReads>:
         None
     }
 
-    fn messages(&self, blocks: Vec<Self::Block>) -> Result<ChunkMessages<Self::Message>, Status>;
+    fn messages(&self, blocks: Self::Chunk) -> Result<ChunkMessages<Self::Message>, Status>;
 
     fn read<Output, Convert>(
         &self,
@@ -886,14 +928,14 @@ pub(crate) trait RangeSource<Reads: CompactBlockReads>:
     ) -> impl Future<Output = ChunkReadOutcome<Output>> + Send
     where
         Output: Send + 'static,
-        Convert: FnOnce(ChainEpoch, Vec<Self::Block>) -> Output + Send + 'static;
+        Convert: FnOnce(ChainEpoch, Self::Chunk) -> Output + Send + 'static;
 }
 
 /// The chunks after the first, and the continuity the next must follow.
 type LaterChunks = Option<(BlockRangeChunks, BlockRangeContinuity)>;
 
 impl<Reads: CompactBlockReads> RangeSource<Reads> for ChunkConversion {
-    type Block = CompactBlockArtifact;
+    type Chunk = Vec<CompactBlockArtifact>;
     type Message = lightwalletd::CompactBlock;
 
     fn read<Output, Convert>(
@@ -904,7 +946,7 @@ impl<Reads: CompactBlockReads> RangeSource<Reads> for ChunkConversion {
     ) -> impl Future<Output = ChunkReadOutcome<Output>> + Send
     where
         Output: Send + 'static,
-        Convert: FnOnce(ChainEpoch, Vec<Self::Block>) -> Output + Send + 'static,
+        Convert: FnOnce(ChainEpoch, Self::Chunk) -> Output + Send + 'static,
     {
         reads.read_compact_block_chunk(read, convert)
     }
@@ -994,12 +1036,12 @@ async fn read_first_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
         conversion.clone(),
         read,
         move |read_at, blocks, timings| {
-            chunks.advance(blocks.len());
+            chunks.advance(blocks.kept_blocks());
             let later_chunks = chunks
                 .has_remaining()
                 .then(|| {
                     BlockRangeContinuity::after_first_chunk(
-                        &blocks,
+                        blocks.endpoints(),
                         read_at.id,
                         matches!(chunks.order(), HeightOrder::Descending),
                     )
@@ -1138,8 +1180,8 @@ async fn read_later_chunk<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
         conversion.clone(),
         read,
         move |read_at, blocks, timings| {
-            let link = sent.link(chunk, read_at.id, &blocks);
-            let kept_blocks = blocks.len();
+            let link = sent.link(chunk, read_at.id, blocks.endpoints());
+            let kept_blocks = blocks.kept_blocks();
             let messages = if link.continues() {
                 timings.time_convert(|| conversion.messages(blocks))?
             } else {
@@ -1167,7 +1209,7 @@ async fn read_chunk<Reads, Source, Output>(
     reads: &Reads,
     source: Source,
     read: ChunkRead<Reads::View>,
-    convert: impl FnOnce(ChainEpoch, Vec<Source::Block>, &mut ChunkTimings) -> Result<Output, Status>
+    convert: impl FnOnce(ChainEpoch, Source::Chunk, &mut ChunkTimings) -> Result<Output, Status>
     + Send
     + 'static,
 ) -> Result<Output, ChunkReadFailure>

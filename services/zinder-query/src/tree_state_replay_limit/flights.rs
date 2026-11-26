@@ -121,16 +121,51 @@ enum AnchorVerifyStep {
     },
 }
 
+#[derive(Debug)]
+pub(crate) enum StoredTreeState {
+    Owned(ServedTreeState),
+    Shared(Arc<CachedTreeState>),
+}
+
+impl StoredTreeState {
+    pub(crate) fn as_served(&self) -> &ServedTreeState {
+        match self {
+            Self::Owned(state) => state,
+            Self::Shared(cached) => cached.state(),
+        }
+    }
+
+    fn into_served(self) -> ServedTreeState {
+        match self {
+            Self::Owned(state) => state,
+            Self::Shared(cached) => cached.state().clone(),
+        }
+    }
+
+    fn into_hex(self, network: Network) -> ServedTreeStateHex {
+        match self {
+            Self::Owned(state) => ServedTreeStateHex::from_served(network, &state),
+            Self::Shared(cached) => cached.to_hex(network),
+        }
+    }
+}
+
+impl PartialEq<ServedTreeState> for StoredTreeState {
+    fn eq(&self, other: &ServedTreeState) -> bool {
+        self.as_served() == other
+    }
+}
+
 pub(crate) enum ReadyState {
     Cached(Arc<CachedTreeState>),
-    Stored(ServedTreeState),
+    Stored(StoredTreeState),
 }
 
 impl ReadyState {
     pub(crate) fn serve(self) -> ServedTreeState {
         let (source, state) = match self {
             Self::Cached(cached) => ("cached", cached.state().clone()),
-            Self::Stored(state) => ("stored", state),
+            Self::Stored(stored) => ("stored", stored.into_served()),
         };
         super::record_tree_state_read(state.block_id().height, source);
         state
@@ -142,10 +177,24 @@ impl ReadyState {
                 super::record_tree_state_read(cached.state().block_id().height, "cached");
                 cached.to_hex(network)
             }
-            Self::Stored(state) => {
-                super::record_tree_state_read(state.block_id().height, "stored");
-                ServedTreeStateHex::from_served(network, &state)
+            Self::Stored(stored) => {
+                super::record_tree_state_read(stored.as_served().block_id().height, "stored");
+                stored.into_hex(network)
             }
+        }
+    }
+}
+
+pub(crate) enum ReplayedState {
+    Cached(Arc<CachedTreeState>),
+    Uncached(ServedTreeState),
+}
+
+impl ReplayedState {
+    pub(crate) fn into_served(self) -> ServedTreeState {
+        match self {
+            Self::Cached(cached) => cached.state().clone(),
+            Self::Uncached(state) => state,
         }
     }
 }
@@ -408,9 +457,17 @@ impl TreeStateReplayLimit {
                 && anchor.covers(key.height)
                 && generation.is_current()
             {
-                self.settled.write().remember(anchor, generation, &state);
+                let remembered = self
+                    .settled
+                    .write()
+                    .remember_owned(anchor, generation, state);
+                let stored_state = match remembered {
+                    Ok(cached) => StoredTreeState::Shared(cached),
+                    Err(unretained) => StoredTreeState::Owned(unretained),
+                };
+                return Ok(Some(ReadyState::Stored(stored_state)));
             }
-            return Ok(Some(ReadyState::Stored(state)));
+            return Ok(Some(ReadyState::Stored(StoredTreeState::Owned(state))));
         }
         if let Some(refusal) = lookup_refusal {
             return Err(refusal);
@@ -739,6 +796,22 @@ impl Subscription {
             + Send
             + 'static,
     {
+        self.replay_shared(take_permit, read)
+            .await
+            .map(|replayed| replayed.map(ReplayedState::into_served))
+    }
+
+    pub(crate) async fn replay_shared<Read, Reading>(
+        &self,
+        take_permit: TakeReplayPermit,
+        read: Read,
+    ) -> Result<Option<ReplayedState>, QueryError>
+    where
+        Read: FnOnce(Arc<AtomicBool>) -> Reading,
+        Reading: Future<Output = Result<Option<TreeStateReplayOutcome>, StorageReadError>>
+            + Send
+            + 'static,
+    {
         let flight = &self.flight;
         let (mut pending, joined) = {
             let mut state = flight.state.lock();
@@ -785,13 +858,17 @@ impl Subscription {
         };
         super::record_tree_state_read(flight.key.height, source);
         if state.block_id().height == flight.key.height {
-            flight.settled.write().remember(
+            let remembered = flight.settled.write().remember_owned(
                 flight.key.settled_anchor(),
                 &flight.generation,
-                &state,
+                state,
             );
+            return Ok(Some(match remembered {
+                Ok(cached) => ReplayedState::Cached(cached),
+                Err(unretained) => ReplayedState::Uncached(unretained),
+            }));
         }
-        Ok(Some(state))
+        Ok(Some(ReplayedState::Uncached(state)))
     }
 }
 

@@ -551,22 +551,17 @@ fn maybe_warn_cgroup_memory_pressure() {
     };
 
     static START: OnceLock<Instant> = OnceLock::new();
-    static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+    static LAST_SAMPLE_SECS: AtomicU64 = AtomicU64::new(0);
 
-    let Some(snapshot) = zinder_runtime::container_memory_snapshot() else {
-        return;
-    };
-    if snapshot.limit_bytes == 0
-        || u128::from(snapshot.current_bytes) * 10 < u128::from(snapshot.limit_bytes) * 8
-    {
-        return;
-    }
+    // Reserve the sampling interval atomically before touching cgroup files so
+    // bursts of concurrent timeouts cannot hammer synchronous reads on Tokio
+    // workers.
     let elapsed_secs = START.get_or_init(Instant::now).elapsed().as_secs().max(1);
-    let previous = LAST_WARN_SECS.load(AtomicOrdering::Relaxed);
+    let previous = LAST_SAMPLE_SECS.load(AtomicOrdering::Relaxed);
     if previous != 0 && elapsed_secs.saturating_sub(previous) < CGROUP_PRESSURE_WARN_INTERVAL_SECS {
         return;
     }
-    if LAST_WARN_SECS
+    if LAST_SAMPLE_SECS
         .compare_exchange(
             previous,
             elapsed_secs,
@@ -574,6 +569,15 @@ fn maybe_warn_cgroup_memory_pressure() {
             AtomicOrdering::Relaxed,
         )
         .is_err()
+    {
+        return;
+    }
+
+    let Some(snapshot) = zinder_runtime::container_memory_snapshot() else {
+        return;
+    };
+    if snapshot.limit_bytes == 0
+        || u128::from(snapshot.current_bytes) * 10 < u128::from(snapshot.limit_bytes) * 8
     {
         return;
     }
@@ -663,7 +667,7 @@ impl BlockRangeStreamSlot {
     where
         Message: StreamItemEndsStream + Send + 'static,
     {
-        self.hold_for_stream(Box::pin(tokio_stream::iter(messages)))
+        self.hold_for_stream(Box::pin(ChunkIter::new(messages)))
     }
 
     /// Returns a response that sends `first_messages` and then each chunk
@@ -696,7 +700,7 @@ impl BlockRangeStreamSlot {
             _stream_slot: self.clone(),
         }));
         self.hold_for_stream(Box::pin(ChunkedMessages {
-            current: Some(tokio_stream::iter(first_messages)),
+            current: Some(ChunkIter::new(first_messages)),
             next_chunks,
             cancel,
         }))
@@ -773,13 +777,60 @@ impl<Message> ChunkRoom<'_, Message> {
     }
 }
 
+/// Items yielded from one chunk before returning `Poll::Pending` once to let
+/// sibling tasks run.
+///
+/// `tokio_stream::iter` yields every 32 items (~2.5 KiB of empty blocks), which
+/// breaks 32 KiB gRPC batches into tiny HTTP/2 DATA frames and forces a task
+/// reschedule every 32 blocks. 768 items covers two full 32 KiB frames of
+/// minimum-size blocks (current + `ReleaseGate` lookahead) while still yielding
+/// inside a 1,000-block typed chunk.
+const CHUNK_YIELD_EVERY: usize = 768;
+
+struct ChunkIter<Message> {
+    messages: std::vec::IntoIter<Message>,
+    polled_since_yield: usize,
+}
+
+impl<Message> ChunkIter<Message> {
+    fn new(messages: Vec<Message>) -> Self {
+        Self {
+            messages: messages.into_iter(),
+            polled_since_yield: 0,
+        }
+    }
+}
+
+impl<Message> Unpin for ChunkIter<Message> {}
+
+impl<Message> Stream for ChunkIter<Message> {
+    type Item = Message;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Message>> {
+        if self.messages.len() == 0 {
+            return Poll::Ready(None);
+        }
+        if self.polled_since_yield >= CHUNK_YIELD_EVERY {
+            self.polled_since_yield = 0;
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.polled_since_yield += 1;
+        Poll::Ready(self.messages.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.messages.size_hint()
+    }
+}
+
 /// The messages of a stream with later chunks, sent from one chunk at a
 /// time.
 struct ChunkedMessages<Message> {
     /// The messages of the chunk being sent that the client has not taken,
     /// which yield to the runtime as a one-chunk response does, or `None`
     /// once they have all been taken.
-    current: Option<tokio_stream::Iter<std::vec::IntoIter<Message>>>,
+    current: Option<ChunkIter<Message>>,
     /// The chunks the stream's reader hands on, at most one ahead.
     next_chunks: mpsc::Receiver<Vec<Message>>,
     /// Cooperative cancellation token signaled when this stream drops.
@@ -810,7 +861,7 @@ impl<Message> Stream for ChunkedMessages<Message> {
             let Some(next_chunk) = std::task::ready!(self.next_chunks.poll_recv(context)) else {
                 return Poll::Ready(None);
             };
-            self.current = Some(tokio_stream::iter(next_chunk));
+            self.current = Some(ChunkIter::new(next_chunk));
         }
     }
 
@@ -2089,7 +2140,7 @@ mod tests {
         let first_messages = (0..FIRST_CHUNK_MESSAGES).collect::<Vec<_>>();
         let (next_chunk, next_chunks) = mpsc::channel(1);
         let mut chunked_messages = ChunkedMessages {
-            current: Some(tokio_stream::iter(first_messages.clone())),
+            current: Some(super::ChunkIter::new(first_messages.clone())),
             next_chunks,
             cancel: super::CancellationToken::new(),
         };

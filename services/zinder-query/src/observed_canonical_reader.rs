@@ -6,7 +6,7 @@ use std::{
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -30,6 +30,7 @@ use crate::{CanonicalReader, IndexedTransaction, RocksDbCanonicalReader, Storage
 pub(crate) struct ObservedCanonicalReader {
     inner: RocksDbCanonicalReader,
     reads: AtomicUsize,
+    fail_latest_checkpoint: AtomicBool,
     replays: Arc<ReplayGate>,
 }
 
@@ -67,6 +68,7 @@ impl ObservedCanonicalReader {
         Self {
             inner,
             reads: AtomicUsize::new(0),
+            fail_latest_checkpoint: AtomicBool::new(false),
             replays: Arc::new(replays),
         }
     }
@@ -84,10 +86,17 @@ impl ObservedCanonicalReader {
             Self {
                 inner,
                 reads: AtomicUsize::new(0),
+                fail_latest_checkpoint: AtomicBool::new(false),
                 replays: Arc::clone(&replays),
             },
             replays,
         )
+    }
+
+    /// Forces the next `tree_state_checkpoint_at_or_before` call to fail with
+    /// [`StorageReadError::ReaderInvalidated`].
+    pub(crate) fn fail_next_latest_checkpoint(&self) {
+        self.fail_latest_checkpoint.store(true, Ordering::Release);
     }
 
     /// Returns how many storage reads were made through this reader.
@@ -226,6 +235,12 @@ impl CanonicalReader for ObservedCanonicalReader {
         &self,
         height: BlockHeight,
     ) -> Result<Option<ServedTreeState>, StorageReadError> {
+        if self.fail_latest_checkpoint.swap(false, Ordering::AcqRel) {
+            self.reads.fetch_add(1, Ordering::AcqRel);
+            return Err(StorageReadError::ReaderInvalidated {
+                source: Box::new(std::io::Error::other("simulated missing table file")),
+            });
+        }
         self.count()
             .tree_state_checkpoint_at_or_before(height)
             .await

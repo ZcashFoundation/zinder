@@ -57,9 +57,27 @@ const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BL
 // cold validator runs after sorting has released its memory.
 const WALLET_OUTPOINT_SORT_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER: u64 = 1024 * 1024 * 1024;
-const WALLET_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 64 * 1024 * 1024 * 1024;
+const WALLET_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 192 * 1024 * 1024 * 1024;
 const WALLET_SST_TARGET_LOGICAL_BYTES: u64 = 128 * 1024 * 1024;
 const WALLET_ACCOUNTED_REORG_UNDO_BYTES: u64 = 512 * 1024 * 1024;
+
+fn lifecycle_canonical_resource_budget() -> RocksDbResourceBudget {
+    RocksDbResourceBudget::canonical_writer_defaults()
+}
+
+fn lifecycle_wallet_build_options(supported_reorg_depth: u32) -> RocksDbWalletBuildOptions {
+    RocksDbWalletBuildOptions {
+        resource_budget: RocksDbResourceBudget::wallet_projection_writer_defaults(),
+        max_outpoint_sort_memory_bytes: WALLET_OUTPOINT_SORT_MEMORY_BYTES,
+        max_secondary_sort_memory_bytes_per_sorter: WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,
+        max_temporary_file_bytes_per_sorter: WALLET_TEMPORARY_FILE_BYTES_PER_SORTER,
+        sst_target_logical_bytes: WALLET_SST_TARGET_LOGICAL_BYTES,
+        max_accounted_reorg_undo_bytes: WALLET_ACCOUNTED_REORG_UNDO_BYTES,
+        supported_reorg_depth,
+        accumulator_hashing_workers:
+            RocksDbWalletBuildOptions::automatic_accumulator_hashing_workers(),
+    }
+}
 
 /// CLI contract for a clean complete-history `RocksDB` storage lifecycle.
 #[derive(Args)]
@@ -168,8 +186,9 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let run_started_at_unix_millis = UnixTimestampMillis::now().value();
     let total_started = Instant::now();
     let validated = args.validate()?;
-    let canonical_resource_budget = RocksDbResourceBudget::canonical_writer_defaults();
-    let wallet_resource_budget = RocksDbResourceBudget::materialized_view_writer_defaults();
+    let canonical_resource_budget = lifecycle_canonical_resource_budget();
+    let wallet_build_options = lifecycle_wallet_build_options(validated.supported_reorg_depth);
+    let wallet_resource_budget = wallet_build_options.resource_budget;
 
     let source_discovery_started = Instant::now();
     let node_auth = args
@@ -318,18 +337,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let wallet_outcome = build_wallet_from_canonical(
         &canonical_store,
         &validated.wallet_store,
-        RocksDbWalletBuildOptions {
-            resource_budget: wallet_resource_budget,
-            max_outpoint_sort_memory_bytes: WALLET_OUTPOINT_SORT_MEMORY_BYTES,
-            max_secondary_sort_memory_bytes_per_sorter:
-                WALLET_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER,
-            max_temporary_file_bytes_per_sorter: WALLET_TEMPORARY_FILE_BYTES_PER_SORTER,
-            sst_target_logical_bytes: WALLET_SST_TARGET_LOGICAL_BYTES,
-            max_accounted_reorg_undo_bytes: WALLET_ACCOUNTED_REORG_UNDO_BYTES,
-            supported_reorg_depth: validated.supported_reorg_depth,
-            accumulator_hashing_workers:
-                RocksDbWalletBuildOptions::automatic_accumulator_hashing_workers(),
-        },
+        wallet_build_options,
     )?;
     let wallet_build = wallet_outcome.report.phase_durations.total;
     let expected_wallet_source = wallet_outcome.report.canonical_source_identity();
@@ -1005,5 +1013,38 @@ mod tests {
 
         assert!(cli.args.validate().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn lifecycle_defaults_match_production_writer_and_sorter_budgets() {
+        const TEN_GIB: u64 = 10 * 1024 * 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        assert_eq!(
+            super::lifecycle_canonical_resource_budget(),
+            zinder_store::RocksDbResourceBudget::canonical_writer_defaults()
+        );
+
+        let wallet = super::lifecycle_wallet_build_options(super::DEFAULT_SUPPORTED_REORG_DEPTH);
+        assert_eq!(
+            wallet.resource_budget,
+            zinder_store::RocksDbResourceBudget::wallet_projection_writer_defaults()
+        );
+        assert_eq!(wallet.resource_budget.max_wal_bytes, 32 * MIB);
+        assert_eq!(
+            wallet.max_outpoint_sort_memory_bytes,
+            zinder_runtime::wallet_build_outpoint_sort_memory_bytes_for(Some(TEN_GIB))
+        );
+        assert_eq!(
+            wallet.max_secondary_sort_memory_bytes_per_sorter,
+            zinder_runtime::wallet_build_secondary_sort_memory_bytes_per_sorter_for(Some(TEN_GIB))
+        );
+        assert_eq!(
+            wallet.max_accounted_reorg_undo_bytes,
+            zinder_runtime::wallet_build_reorg_undo_memory_bytes_for(Some(TEN_GIB))
+        );
+        assert_eq!(wallet.max_temporary_file_bytes_per_sorter, 192 * GIB);
+        assert_eq!(wallet.sst_target_logical_bytes, 128 * MIB);
     }
 }

@@ -229,7 +229,7 @@ jq -e \
       + .cold_validation_seconds
       + .ready_publication_seconds
     )
-    and (.cold_validation_seconds as $cold_validation
+      and (.cold_validation_seconds as $cold_validation
       | [
           .cold_validation_primary_output_scan_seconds,
           .cold_validation_address_index_and_balance_readback_seconds,
@@ -237,6 +237,29 @@ jq -e \
           .cold_validation_reorg_undo_readback_seconds
         ]
       | all(. <= $cold_validation));
+  def wallet_build_stages($total_seconds):
+    type == "array"
+    and all(.[]; exact_keys(["seconds", "stage"]) and (.seconds | duration))
+    and ([.[].stage] == [
+      "store_initialization",
+      "canonical_scan",
+      "outpoint_run_spill",
+      "outpoint_sort",
+      "outpoint_drain",
+      "primary_sst_write",
+      "address_index_run_spill",
+      "address_transaction_run_spill",
+      "secondary_address_derivation",
+      "reorg_undo_write",
+      "logical_evidence",
+      "row_load",
+      "flush_and_close",
+      "cold_reopen",
+      "cold_validation_family_readback",
+      "cold_validation_reorg_undo_readback",
+      "ready_publication"
+    ])
+    and (([.[].seconds] | add) <= $total_seconds);
   def report_phase_durations:
     exact_keys([
       "canonical_cold_reopen_seconds",
@@ -292,14 +315,12 @@ jq -e \
       | exact_keys([
           "canonical_engine",
           "canonical_model",
-          "diagnostic_projection_engine",
           "id",
           "topology"
         ])
       and .id == "rocksdb-storage-lifecycle"
       and .canonical_engine == "rocksdb"
       and .canonical_model == "canonical-replay-storage"
-      and .diagnostic_projection_engine == null
       and .topology == "rocksdb")
     and (.provenance
       | exact_keys([
@@ -442,8 +463,29 @@ jq -e \
         134217728;
         536870912
       )
-      and (.canonical_rocksdb | resource_budget)
-      and (.wallet_rocksdb | resource_budget))
+      and (.canonical_rocksdb
+        | resource_budget
+        and .block_cache_bytes == 536870912
+        and .max_wal_bytes == 268435456
+        and .max_open_files == 512
+        and .write_buffer_bytes == 16777216
+        and .max_write_buffer_count == 2
+        and .max_background_jobs == 2
+        and .memtable_budget_bytes == 268435456)
+      and (.wallet_rocksdb
+        | resource_budget
+        and .block_cache_bytes == 268435456
+        and .max_wal_bytes == 33554432
+        and .max_open_files == 512
+        and .write_buffer_bytes == 16777216
+        and .max_write_buffer_count == 4
+        and .max_background_jobs == 2
+        and .memtable_budget_bytes == 536870912)
+      and .wallet_max_outpoint_sort_memory_bytes == 4294967296
+      and .wallet_max_secondary_sort_memory_bytes_per_sorter == 1073741824
+      and .wallet_max_temporary_file_bytes_per_sorter == 206158430208
+      and .wallet_sst_target_logical_bytes == 134217728
+      and .wallet_max_accounted_reorg_undo_bytes == 536870912)
     and (.acceptance
       | exact_keys(["canonical_storage_ready", "wallet_storage_ready"])
       and (.canonical_storage_ready | acceptance("canonical-storage-ready"))
@@ -515,6 +557,7 @@ jq -e \
       and .cold_reopen_evidence_match == true))
     and (.wallet_storage_ready
       | exact_keys([
+          "build_stages",
           "canonical_fence_match",
           "cold_reopen_evidence_match",
           "construction",
@@ -616,6 +659,7 @@ jq -e \
         and (.sst_file_count | positive_integer))
       and (.phase_durations | wallet_phase_durations)
       and .phase_durations.total_seconds == $report.phase_durations.wallet_build_seconds
+      and (.build_stages | wallet_build_stages($report.wallet_storage_ready.phase_durations.total_seconds))
       and (.physical_store_bytes | positive_integer)
       and .cold_reopen_evidence_match == true
       and .canonical_fence_match == true)

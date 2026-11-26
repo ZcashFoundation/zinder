@@ -152,15 +152,11 @@ async fn a_short_small_row_range_keeps_its_data_frames() -> Result<()> {
 
     let total = |sizes: &[usize]| sizes.iter().sum::<usize>();
     assert_eq!(total(&gated), total(&ungated), "the body's length changed");
-    // Every frame stays as it was, except that the last one gives up the
-    // probe byte the gate sends before the end.
-    let (last, kept) = ungated
-        .split_last()
-        .ok_or_else(|| eyre!("the ungated range sent no data"))?;
-    let mut expected = kept.to_vec();
-    expected.extend([last - 1, 1]);
+    // Every frame stays as it was: the last frame (3,264 bytes) fits within
+    // the whole-frame probe threshold, so the gate probes it intact without
+    // splitting off its trailing byte.
     assert_eq!(
-        gated, expected,
+        gated, ungated,
         "frames with the gate {gated:?}, without it {ungated:?}"
     );
     Ok(())

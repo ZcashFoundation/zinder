@@ -33,9 +33,9 @@ fn the_default_budget_reserves_a_floor_per_kind_and_shares_the_rest() {
     assert_eq!(
         split,
         [
-            ("transaction", 12, 24, 384),
-            ("utxo", 4, 8, 128),
-            ("history", 4, 16, 256),
+            ("transaction", 12, 24, 1_536),
+            ("utxo", 4, 8, 512),
+            ("history", 4, 16, 1_024),
         ]
     );
     assert_eq!(elastic, 12);
@@ -77,7 +77,7 @@ fn settings_outside_their_ranges_are_refused() {
         Err(ForwardedReadConfigError::Wait)
     );
     assert_eq!(
-        ForwardedReadConfig::resolve(None, None, Some(65), None),
+        ForwardedReadConfig::resolve(None, None, Some(257), None),
         Err(ForwardedReadConfigError::WaitersPerSlot)
     );
     assert_eq!(

@@ -1093,6 +1093,33 @@ impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<NodeBackedLight
             .await
             .map(Response::new)
     }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(&self.query_api.slot, "get_encoded_block_range", &request)
+            .await?;
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
+        self.block_methods
+            .published_block_range_frames(
+                &self.query_api.slot,
+                &request,
+                range,
+                CompactBlockShape::for_range,
+            )
+            .await
+            .map(Response::new)
+    }
 }
 
 #[tonic::async_trait]
@@ -1115,6 +1142,37 @@ impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<NodeB
         );
         self.block_methods
             .published_block_range(
+                &self.query_api.slot,
+                &request,
+                range,
+                CompactBlockShape::for_nullifier_range,
+            )
+            .await
+            .map(Response::new)
+    }
+
+    fn supports_encoded_frames(&self) -> bool {
+        true
+    }
+
+    async fn get_encoded_block_range_nullifier_frames(
+        &self,
+        request: Request<lightwalletd::BlockRange>,
+    ) -> Result<Response<lightwalletd::EncodedBlockFrameStream>, Status> {
+        let request = request.into_inner();
+        self.block_methods
+            .await_range_tip(
+                &self.query_api.slot,
+                "get_encoded_block_range_nullifiers",
+                &request,
+            )
+            .await?;
+        let range = self.published_history.as_ref().map_or_else(
+            || (None, self.live_tail.clone()),
+            |history| history.encoded_range(),
+        );
+        self.block_methods
+            .published_block_range_frames(
                 &self.query_api.slot,
                 &request,
                 range,
@@ -1431,12 +1489,17 @@ impl compact_tx_streamer_server::CompactTxStreamer
         let outputs: Self::GetAddressUtxosStreamStream = match outputs {
             None => Box::pin(stream::empty()),
             Some((rows, permit)) => Box::pin(try_unfold(
-                (rows.into_iter(), permit),
-                |(mut rows, permit)| async move {
+                (rows.into_iter(), Some(permit)),
+                |(mut rows, mut permit)| async move {
                     let Some(row) = rows.next() else {
                         return Ok(None);
                     };
-                    Ok(Some((utxo_reply(row)?, (rows, permit))))
+                    let reply = utxo_reply(row)?;
+                    if rows.as_slice().is_empty() {
+                        rows = Vec::new().into_iter();
+                        permit = None;
+                    }
+                    Ok(Some((reply, (rows, permit))))
                 },
             )),
         };

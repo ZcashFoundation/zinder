@@ -1202,7 +1202,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Forwarded reads that may wait for each node-call slot of their kind's cap; a read \
                       that finds every waiting place taken is refused at once with \
-                      `FORWARDED_READ_LIMIT_REACHED`. Must be in 1..=64; defaults to 16.",
+                      `FORWARDED_READ_LIMIT_REACHED`. Must be in 1..=256; defaults to 64.",
     },
     EnvVarDoc {
         name: "ZINDER_QUERY__FORWARDED_TRANSACTION_CACHE_BYTES",
@@ -1374,7 +1374,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Forwarded reads that may wait for each node-call slot of their kind's cap. A read \
                       that finds every waiting place taken fails at once with `UNAVAILABLE`. \
                       Applies to wallet and light-wallet serving. Compact-blocks serving rejects \
-                      it. Accepts 1 to 64 and defaults to 16.",
+                      it. Accepts 1 to 256 and defaults to 64.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__FORWARDED_TRANSACTION_CACHE_BYTES",
