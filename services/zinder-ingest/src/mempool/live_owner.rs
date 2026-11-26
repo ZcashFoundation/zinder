@@ -57,7 +57,7 @@ const MEMPOOL_EVENT_PAGE_SIZE: u32 = 64;
 const MEMPOOL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MEMPOOL_CANONICAL_TIP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS: usize = 256;
-const MAX_PINNED_SNAPSHOT_WALKS: usize = 8;
+pub(crate) const MAX_PINNED_SNAPSHOT_WALKS: usize = 32;
 const PINNED_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 const MEMPOOL_LIFECYCLE_STATUS_LABELS: &[&str] =
     &["hydrating", "serving", "rebuild_required", "halted"];
@@ -727,7 +727,8 @@ impl LiveMempoolOwner {
 
         let envelope = canonical
             .append_mempool_event(event.clone(), observed_at)
-            .await?;
+            .await
+            .inspect_err(|_status| self.mark_rebuild_required())?;
         let outcome = apply_to_index(&self.index, event, envelope.position())?;
         if outcome != MempoolApplyOutcome::Applied {
             self.mark_rebuild_required();
@@ -1152,11 +1153,12 @@ impl LiveMempoolOwner {
                         "durable mempool history cannot rebuild the live index: {error}"
                     ))
                 })?;
-                if preflight == MempoolIndexPreflight::NoChange {
-                    continue;
-                }
+                let expected_outcome = match preflight {
+                    MempoolIndexPreflight::Apply => MempoolApplyOutcome::Applied,
+                    MempoolIndexPreflight::NoChange => MempoolApplyOutcome::NoChange,
+                };
                 let outcome = apply_to_index(&self.index, event, envelope.position())?;
-                if outcome != MempoolApplyOutcome::Applied {
+                if outcome != expected_outcome {
                     self.mark_rebuild_required();
                     return Err(Status::failed_precondition(
                         "durable mempool history could not rebuild the live index",
@@ -4479,6 +4481,48 @@ mod tests {
             exact_single_entry_budget.saturating_sub(1),
         );
         assert!(one_byte_short.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serving_append_failure_withdraws_owner_into_rebuild_required()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let owner = LiveMempoolOwner::default();
+        assert_eq!(
+            owner
+                .try_complete_hydration(
+                    &canonical,
+                    fixture_source_tip(),
+                    &mempool_ready_channel().0.observe_node_endpoint(),
+                )
+                .await?,
+            SnapshotCertification::Certified
+        );
+        assert!(owner.is_serving());
+
+        command_task.abort();
+        let _ = command_task.await;
+
+        let (event, observed_at) = added_transition(0x77, 16, chain_epoch)?;
+        let apply_outcome = owner.apply_event(&canonical, event, observed_at).await;
+        assert_eq!(
+            apply_outcome.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        assert!(matches!(
+            *owner.status.read(),
+            MempoolOwnerStatus::RebuildRequired
+        ));
+        assert!(!owner.is_serving());
         Ok(())
     }
 }

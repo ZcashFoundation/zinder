@@ -1075,13 +1075,14 @@ mod tests {
             .await?
             .into_inner();
 
-        for step in 0_u8..9_u8 {
+        let eviction_steps = u8::try_from(crate::mempool::MAX_PINNED_SNAPSHOT_WALKS)?;
+        for step in 0_u8..=eviction_steps {
             fixture
                 .mempool
                 .apply_event(
                     &fixture.canonical,
                     MempoolEvent::Added {
-                        entry: fixture_mempool_entry_with_id(0x40 + step, chain_epoch)?,
+                        entry: fixture_mempool_entry_with_id(0x60 + step, chain_epoch)?,
                     },
                     UnixTimestampMillis::new(1_750_000_000_200 + u64::from(step)),
                 )
@@ -2105,6 +2106,269 @@ mod tests {
             zinder_proto::v1::ops::ErrorReason::UnsupportedWalletEncoding.as_str_name()
         );
         fixture.shutdown().await
+    }
+
+    /// Restored owners advance their applied anchor across pruned additions.
+    ///
+    /// When retention prunes an `Added` event before a retained `Mined` event,
+    /// reconciling unchanged active entries must still pin multi-page walks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restored_owner_after_pruned_add_serves_multi_page_snapshots_without_cursor_expiry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, commands) = canonical_control_channel();
+        let parked = Arc::new(parking_lot::Mutex::new(None));
+        let command_task = spawn_fixture_owner_loop(store, commands, parked);
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let source_tip = BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+
+        let (entry_b, entry_c) = seed_pruned_mempool_history(&canonical, source_tip).await?;
+        let mut expected_ids = [entry_b.transaction_id, entry_c.transaction_id];
+        expected_ids.sort();
+
+        let (second_source, second_feed) = zinder_testkit::MockMempoolSource::streaming();
+        let restored_owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = crate::mempool_ready_channel();
+        let owner_cancel = CancellationToken::new();
+        let owner_task = tokio::spawn(crate::run_live_mempool_owner(
+            Arc::new(second_source),
+            canonical.clone(),
+            restored_owner.clone(),
+            ready_signal,
+            owner_cancel.clone(),
+        ));
+        wait_for_condition(|| second_feed.open_count() >= 1).await?;
+        second_feed.push_added(entry_b)?;
+        second_feed.push_added(entry_c)?;
+        second_feed.complete_initial_snapshot(source_tip)?;
+        wait_for_condition(|| ready_gate.admits_canonical_tip(source_tip)).await?;
+
+        let (mut client, server_cancel, server_task) =
+            serve_ingest_control_for_owner(canonical.clone(), restored_owner).await?;
+        let first_page = client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(first_page.entries.len(), 1);
+        assert_eq!(
+            first_page.entries[0].transaction_id,
+            encode_rpc_transaction_id_hex(expected_ids[0])
+        );
+        assert_ne!(first_page.next_cursor, [] as [u8; 0]);
+
+        let late_entry = synthetic_mempool_source_entry(4, 1_750_000_000_500)?;
+        let late_tx_id = late_entry.transaction_id;
+        second_feed.push_added(late_entry)?;
+        wait_for_live_mempool_entry(&mut client, late_tx_id).await?;
+
+        let second_page = client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 10,
+                from_cursor: first_page.next_cursor,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(
+            second_page.entries[0].transaction_id,
+            encode_rpc_transaction_id_hex(expected_ids[1])
+        );
+        assert_eq!(second_page.next_cursor, [] as [u8; 0]);
+
+        drop(client);
+        server_cancel.cancel();
+        server_task.await??;
+        owner_cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _ = command_task.await;
+        Ok(())
+    }
+
+    async fn seed_pruned_mempool_history(
+        canonical: &crate::CanonicalControlHandle,
+        source_tip: BlockId,
+    ) -> Result<
+        (
+            zinder_source::MempoolSourceEntry,
+            zinder_source::MempoolSourceEntry,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let (first_source, first_feed) = zinder_testkit::MockMempoolSource::streaming();
+        let first_owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = crate::mempool_ready_channel();
+        let first_cancel = CancellationToken::new();
+        let first_task = tokio::spawn(crate::run_live_mempool_owner(
+            Arc::new(first_source),
+            canonical.clone(),
+            first_owner.clone(),
+            ready_signal,
+            first_cancel.clone(),
+        ));
+        wait_for_condition(|| first_feed.open_count() >= 1).await?;
+        first_feed.complete_initial_snapshot(source_tip)?;
+        wait_for_condition(|| ready_gate.admits_canonical_tip(source_tip)).await?;
+
+        let entry_a = synthetic_mempool_source_entry(1, 1_750_000_000_100)?;
+        let entry_b = synthetic_mempool_source_entry(2, 1_750_000_000_200)?;
+        let entry_c = synthetic_mempool_source_entry(3, 1_750_000_000_300)?;
+        let mined_tx_id = entry_a.transaction_id;
+        first_feed.push_added(entry_a)?;
+        first_feed.push_added(entry_b.clone())?;
+        first_feed.push_added(entry_c.clone())?;
+        first_feed.push_mined(mined_tx_id, source_tip.height, source_tip.hash)?;
+        wait_for_durable_sequence(canonical, 4).await?;
+
+        let retention = MempoolEventRetentionConfig::new(Some(Duration::from_millis(1)), None);
+        let budget = zinder_store::MempoolEventRetentionStepBudget::new(
+            NonZeroU32::new(8).ok_or("retention event budget must be nonzero")?,
+            std::num::NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+        );
+        let prune_now =
+            UnixTimestampMillis::new(UnixTimestampMillis::now().value().saturating_add(10_000));
+        let prune_outcome = first_owner
+            .prune_events(canonical, prune_now, retention, budget)
+            .await?;
+        assert_eq!(prune_outcome.report.oldest_retained_sequence, Some(2));
+        assert_eq!(prune_outcome.report.pruned_added_count, 1);
+
+        first_cancel.cancel();
+        first_task.await?;
+        Ok((entry_b, entry_c))
+    }
+
+    async fn serve_ingest_control_for_owner(
+        canonical: crate::CanonicalControlHandle,
+        owner: LiveMempoolOwner,
+    ) -> Result<
+        (
+            IngestControlClient<tonic::transport::Channel>,
+            CancellationToken,
+            tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let bearer_token = BearerToken::from_str("fixture-control-token")?;
+        let node_source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        readiness.publish_admission(ReadinessState::ready(Some(1)));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_addr = listener.local_addr()?;
+        let server_cancel = CancellationToken::new();
+        let shutdown_token = server_cancel.clone();
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            canonical,
+            owner,
+            node_source,
+            readiness,
+        )
+        .with_bearer_token(Some(bearer_token));
+        let server_task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(adapter.into_server())
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    shutdown_token.cancelled_owned(),
+                )
+                .await
+        });
+        let client = IngestControlClient::connect(format!("http://{listen_addr}")).await?;
+        Ok((client, server_cancel, server_task))
+    }
+
+    fn synthetic_mempool_source_entry(
+        transaction_nonce: u32,
+        observed_at_millis: u64,
+    ) -> Result<zinder_source::MempoolSourceEntry, Box<dyn std::error::Error>> {
+        use zebra_chain::{
+            serialization::ZcashDeserializeInto as _, transaction::Transaction as ZebraTransaction,
+        };
+
+        let mut raw_bytes = Vec::with_capacity(27);
+        raw_bytes.extend_from_slice(&0x8000_0004_u32.to_le_bytes());
+        raw_bytes.extend_from_slice(&0x892F_2085_u32.to_le_bytes());
+        raw_bytes.extend_from_slice(&[0, 0]);
+        raw_bytes.extend_from_slice(&transaction_nonce.to_le_bytes());
+        raw_bytes.extend_from_slice(&0_u32.to_le_bytes());
+        raw_bytes.extend_from_slice(&0_i64.to_le_bytes());
+        raw_bytes.extend_from_slice(&[0, 0, 0]);
+        let parsed: ZebraTransaction = raw_bytes.as_slice().zcash_deserialize_into()?;
+        Ok(zinder_source::MempoolSourceEntry {
+            transaction_id: TransactionId::from_bytes(parsed.hash().0),
+            auth_digest: parsed
+                .auth_digest()
+                .map(|digest| zinder_core::AuthDigest::from_bytes(digest.0)),
+            raw_transaction_bytes: RawTransactionBytes::new(raw_bytes),
+            observed_at_unix_millis: UnixTimestampMillis::new(observed_at_millis),
+        })
+    }
+
+    async fn wait_for_durable_sequence(
+        canonical: &crate::CanonicalControlHandle,
+        expected_sequence: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let page_size = NonZeroU32::new(16).ok_or("mempool page size must be nonzero")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let page = canonical.mempool_event_page(None, page_size).await?;
+            if page
+                .last()
+                .is_some_and(|envelope| envelope.event_sequence >= expected_sequence)
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("timed out waiting for durable mempool event sequence".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_live_mempool_entry(
+        client: &mut IngestControlClient<tonic::transport::Channel>,
+        expected_tx_id: TransactionId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tx_hex = encode_rpc_transaction_id_hex(expected_tx_id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if client
+                .mempool_transaction(authenticated(MempoolTransactionRequest {
+                    transaction_id: tx_hex.clone(),
+                }))
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("timed out waiting for late entry in live mempool index".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_condition(
+        mut predicate: impl FnMut() -> bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !predicate() {
+            if std::time::Instant::now() > deadline {
+                return Err("timed out waiting for mempool owner state".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 
     struct SharedControlFixture {

@@ -162,7 +162,7 @@ The writer, `zinder-ingest`, owns the live mempool view. `zinder-query` forwards
 `MempoolSnapshot(max_entries, from_cursor)` returns one page of the current mempool:
 
 - A page holds at most `max_entries` entries (clamped to 1,024; zero means 256) and at most 3.5 MiB (`3,670,016` bytes) of encoded protobuf response, staying within a default 4 MiB gRPC message limit.
-- `next_cursor` is set when more entries remain, whether bounded by `max_entries` or by the response byte budget. Pass it as `from_cursor` for the next page; a multi-page walk serves from the point-in-time mempool membership anchored when the walk began (retaining up to 8 concurrent multi-page walks for 30 seconds at the active chain epoch).
+- `next_cursor` is set when more entries remain, whether bounded by `max_entries` or by the response byte budget. Pass it as `from_cursor` for the next page; a multi-page walk serves from the point-in-time mempool membership anchored when the walk began (retaining up to 32 concurrent multi-page walks for 30 seconds at the active chain epoch).
 - A single mempool entry whose one-entry response exceeds the 3.5 MiB budget fails with `UNAVAILABLE` and `UNSUPPORTED_WALLET_ENCODING`.
 - `source_tip` equals `chain_view.chain_epoch.visible_tip` by height and hash. When the chain tip moves, the writer waits up to five seconds for the mempool to catch up. A view still not coherent then fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. A view with no certified generation yet, or one being rebuilt, fails with `UNAVAILABLE`. The server never returns a stale or falsely empty page.
 - `snapshot_age_millis` is the time since the current mempool view was certified.

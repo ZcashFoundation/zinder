@@ -113,7 +113,7 @@ with a `type` and `subject`.
 | --- | --- |
 | `CHAIN_EVENT_CURSOR_EXPIRED` | The cursor is older than retained chain events. Client policy: `RestartFromEarliestRetained`. |
 | `MEMPOOL_EVENT_CURSOR_EXPIRED` | The event cursor is older than retained mempool events. The client reports `RefreshMempoolSnapshot`. |
-| `SNAPSHOT_PAGE_CURSOR_EXPIRED` | The snapshot page cursor is ahead of the writer’s applied events. The client reports `RefreshMempoolSnapshot`. |
+| `SNAPSHOT_PAGE_CURSOR_EXPIRED` | The snapshot page cursor is ahead of the writer’s applied events, or its pinned multi-page snapshot was evicted before concurrent mempool updates. The client reports `RefreshMempoolSnapshot`. |
 | `CHAIN_EPOCH_PIN_UNAVAILABLE` | The pinned epoch is no longer retained. A `TransparentAddressUnspentOutputs` or `FullBlocksInRange` stream can also end with it after sending items, when its serving pair is released or replaced. Discard the partial result and read again at a newer epoch. Client policy: `RefreshChainEpoch`. |
 | `SCHEMA_MISMATCH` | The store's schema does not match the running binary. |
 | `SCHEMA_TOO_NEW` | A newer Zinder wrote the store. Rolling back is unsafe. |
