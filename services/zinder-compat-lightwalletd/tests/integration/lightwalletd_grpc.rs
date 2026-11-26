@@ -4206,6 +4206,36 @@ async fn checkpointed_tree_state_rejects_genesis_but_preserves_height_lookups() 
 }
 
 #[tokio::test]
+async fn checkpointed_tree_state_pruned_height_skips_pinned_reorg_retry() -> eyre::Result<()> {
+    let mut fixture = checkpointed_tree_state_store()?;
+    let (canonical, wallet) = fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(RocksDbCanonicalReader::new(canonical)?),
+        Arc::new(RocksDbWalletReader::new(wallet)),
+    )?);
+    let published = tip_wait::published_query::PublishedQuery::new(
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair)),
+    );
+    let adapter = LightwalletdGrpcAdapter::new(published.clone());
+
+    let pruned = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 1,
+            hash: Vec::new(),
+        }))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("served a pruned height"))?;
+    assert_eq!(pruned.code(), Code::NotFound);
+    assert_eq!(
+        published.pinned_tree_state_hex_calls(),
+        0,
+        "pruned height below preceding_checkpoint must not enter the pinned reorg retry path"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn tree_state_matches_go_at_the_sapling_activation_boundary() -> eyre::Result<()> {
     let mut upgrades = sample_regtest_upgrade_activations().activations().to_vec();
     for upgrade in &mut upgrades {

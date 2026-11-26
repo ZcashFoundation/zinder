@@ -884,6 +884,14 @@ where
         match self.query_api.tree_state_hex_at(height, None).await {
             Ok(tree_state) => Ok(tree_state),
             Err(QueryError::BlockNotInBestChain) => {
+                if self
+                    .query_api
+                    .canonical_history_bounds()
+                    .and_then(zinder_core::CanonicalHistoryBounds::preceding_checkpoint)
+                    .is_some_and(|checkpoint| height < checkpoint.height)
+                {
+                    return Err(tree_state_status(&QueryError::BlockNotInBestChain));
+                }
                 let latest_view = self.query_api.capture_ephemeral_view().await?;
                 reject_future_tree_state_height(height, latest_view.visible_tip_height)?;
                 let pinned_view = self.query_api.capture_view().await?;

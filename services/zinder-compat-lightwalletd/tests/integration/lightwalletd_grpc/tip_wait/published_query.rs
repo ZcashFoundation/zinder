@@ -46,6 +46,7 @@ pub(in crate::integration::lightwalletd_grpc) struct PublishedQuery {
     current: Arc<Mutex<WalletServingQuery<()>>>,
     publications: Arc<watch::Sender<()>>,
     unpinned_tree_state_steps: Arc<Mutex<Option<UnpinnedTreeStateSteps>>>,
+    pinned_tree_state_hex_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PublishedQuery {
@@ -55,7 +56,13 @@ impl PublishedQuery {
             first,
             publications: Arc::new(watch::Sender::new(())),
             unpinned_tree_state_steps: Arc::new(Mutex::new(None)),
+            pinned_tree_state_hex_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    pub(in crate::integration::lightwalletd_grpc) fn pinned_tree_state_hex_calls(&self) -> usize {
+        self.pinned_tree_state_hex_calls
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Runs `before` immediately before the next unpinned `tree_state_hex_at`
@@ -98,6 +105,10 @@ impl WalletQueryApi for PublishedQuery {
 
     fn current_chain_epoch(&self) -> Option<ChainEpoch> {
         self.now().current_chain_epoch()
+    }
+
+    fn canonical_history_bounds(&self) -> Option<zinder_core::CanonicalHistoryBounds> {
+        self.now().canonical_history_bounds()
     }
 
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
@@ -320,6 +331,8 @@ impl WalletQueryApi for PublishedQuery {
                 steps.after
             })
         } else {
+            self.pinned_tree_state_hex_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             None
         };
         let outcome = self.now().tree_state_hex_at(height, at_epoch_id).await;

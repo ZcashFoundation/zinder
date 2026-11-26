@@ -562,6 +562,12 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// configured, and [`SourceError::SourceProtocolMismatch`] when the node
     /// answers with a zero fee or a reply of another shape.
     async fn standard_fee(&self) -> Result<StandardFee, QueryError>;
+
+    /// Returns the retained canonical history bounds of the current serving
+    /// view without observing or pinning it, when available synchronously.
+    fn canonical_history_bounds(&self) -> Option<zinder_core::CanonicalHistoryBounds> {
+        None
+    }
 }
 
 /// Default maximum compact-block count returned by one range call.

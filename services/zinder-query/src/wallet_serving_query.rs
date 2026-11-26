@@ -949,6 +949,13 @@ where
         )
     }
 
+    fn canonical_history_bounds(&self) -> Option<zinder_core::CanonicalHistoryBounds> {
+        Some(
+            self.serving_pair_slot
+                .with_ephemeral(|pair| pair.canonical().history_bounds()),
+        )
+    }
+
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
         &self.native_endpoint_capabilities
     }
