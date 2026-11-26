@@ -3,4 +3,4 @@ body: Enabled `--features pasta_curves/asm` by default (`ZINDER_PASTA_ASM=1`) ac
 time: 2026-11-26T17:42:00Z
 custom:
     Bump: minor
-    PR: "624"
+    PR: "659"
