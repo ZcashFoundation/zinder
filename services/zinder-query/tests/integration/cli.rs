@@ -311,8 +311,8 @@ fn forwarded_read_settings_default_and_are_bounded() -> eyre::Result<()> {
         (
             "FORWARDED_READ_WAITERS_PER_SLOT",
             "forwarded_read_waiters_per_slot",
-            "16",
             "64",
+            "256",
             "0",
         ),
         (

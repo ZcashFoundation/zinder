@@ -1431,12 +1431,17 @@ impl compact_tx_streamer_server::CompactTxStreamer
         let outputs: Self::GetAddressUtxosStreamStream = match outputs {
             None => Box::pin(stream::empty()),
             Some((rows, permit)) => Box::pin(try_unfold(
-                (rows.into_iter(), permit),
-                |(mut rows, permit)| async move {
+                (rows.into_iter(), Some(permit)),
+                |(mut rows, mut permit)| async move {
                     let Some(row) = rows.next() else {
                         return Ok(None);
                     };
-                    Ok(Some((utxo_reply(row)?, (rows, permit))))
+                    let reply = utxo_reply(row)?;
+                    if rows.as_slice().is_empty() {
+                        rows = Vec::new().into_iter();
+                        permit = None;
+                    }
+                    Ok(Some((reply, (rows, permit))))
                 },
             )),
         };

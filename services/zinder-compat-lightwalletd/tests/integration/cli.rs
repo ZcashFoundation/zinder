@@ -665,9 +665,9 @@ const FORWARDED_READ_SETTINGS: [(&str, &str, &str, &str, &str); 4] = [
     (
         "FORWARDED_READ_WAITERS_PER_SLOT",
         "forwarded_read_waiters_per_slot",
-        "16",
+        "64",
         "1",
-        "65",
+        "257",
     ),
     (
         "FORWARDED_TRANSACTION_CACHE_BYTES",
