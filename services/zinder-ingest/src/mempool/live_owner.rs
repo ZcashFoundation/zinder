@@ -57,7 +57,7 @@ const MEMPOOL_EVENT_PAGE_SIZE: u32 = 64;
 const MEMPOOL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MEMPOOL_CANONICAL_TIP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS: usize = 256;
-pub(crate) const MAX_PINNED_SNAPSHOT_WALKS: usize = 32;
+pub(crate) const MAX_PINNED_SNAPSHOT_WALKS: usize = 64;
 const PINNED_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 const MEMPOOL_LIFECYCLE_STATUS_LABELS: &[&str] =
     &["hydrating", "serving", "rebuild_required", "halted"];
@@ -805,7 +805,10 @@ impl LiveMempoolOwner {
         let expected_envelope_count = applicable_transitions.len();
         let envelopes = canonical
             .append_mempool_events(applicable_transitions)
-            .await?;
+            .await
+            .inspect_err(|_status| {
+                self.mark_rebuild_required();
+            })?;
         if envelopes.len() != expected_envelope_count {
             self.mark_rebuild_required();
             return Err(Status::unavailable(
@@ -1256,6 +1259,11 @@ async fn follow_mempool_source(
                     reconnect_backoff,
                 )
                 .await
+                {
+                    return;
+                }
+                if !restore_durable_mempool_index(owner, canonical, mempool_ready_signal, cancel)
+                    .await
                 {
                     return;
                 }
@@ -4523,6 +4531,80 @@ mod tests {
             MempoolOwnerStatus::RebuildRequired
         ));
         assert!(!owner.is_serving());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebuild_replays_durable_commit_when_append_reply_is_dropped()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let drop_single_append_reply = Arc::new(AtomicBool::new(false));
+        let drop_flag = Arc::clone(&drop_single_append_reply);
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if drop_flag.load(Ordering::SeqCst)
+                    && let CanonicalControlCommand::AppendMempoolEvent {
+                        event,
+                        observed_at,
+                        reply,
+                    } = command
+                {
+                    drop_flag.store(false, Ordering::SeqCst);
+                    let _ = store.append_mempool_event(*event, observed_at);
+                    drop(reply);
+                } else {
+                    let _ = apply_canonical_control_command(&mut store, command);
+                }
+            }
+        });
+
+        let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let serving_tip = fixture_source_tip();
+        let (source, source_control) = MockMempoolSource::streaming();
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, _ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let owner_task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            ready_signal,
+            cancel.clone(),
+        ));
+
+        wait_for_source_open(&source_control, 1).await?;
+        source_control.push_added(source_entry(0x11)?)?;
+        source_control.push_added(source_entry(0x22)?)?;
+        source_control.complete_initial_snapshot(serving_tip)?;
+        wait_for_serving(&owner, true).await?;
+
+        drop_single_append_reply.store(true, Ordering::SeqCst);
+        source_control.push_added(source_entry(0x33)?)?;
+        wait_for_source_open(&source_control, 2).await?;
+
+        source_control.push_added(source_entry(0x11)?)?;
+        source_control.push_added(source_entry(0x22)?)?;
+        source_control.complete_initial_snapshot(serving_tip)?;
+        wait_for_serving(&owner, true).await?;
+
+        let first_page = owner
+            .snapshot_page(&canonical, chain_epoch, 1, Vec::new())
+            .await?;
+        assert_eq!(first_page.entries.len(), 1);
+        assert_ne!(first_page.next_cursor, [] as [u8; 0]);
+        let second_page = owner
+            .snapshot_page(&canonical, chain_epoch, 1, first_page.next_cursor)
+            .await?;
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(second_page.next_cursor, [] as [u8; 0]);
+        assert_eq!(durable_event_count(&canonical).await?, 4);
+
+        cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _ = command_task.await;
         Ok(())
     }
 }
