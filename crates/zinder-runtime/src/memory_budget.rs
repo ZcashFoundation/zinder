@@ -23,15 +23,14 @@ pub struct CgroupMemorySnapshot {
     pub file_cache_bytes: Option<u64>,
 }
 
-/// Returns the current Linux cgroup v2 memory usage, limit, and file-cache
-/// charge for the most-pressured ancestor cgroup (highest `current / limit`
-/// ratio, breaking ties by tighter limit) when both a finite limit and
-/// `memory.current` are readable.
+/// Returns a cgroup v2 memory snapshot for the most-pressured ancestor cgroup.
 ///
-/// All three fields in the returned snapshot come from that same cgroup so
-/// callers can compare usage against its matching limit. For the tightest
-/// effective memory budget across all ancestors, use
-/// [`container_memory_budget_bytes`].
+/// Walks the process's ancestor chain and selects the cgroup with the highest
+/// `current / limit` ratio (breaking ties by tighter limit) where both a finite
+/// limit and `memory.current` are readable. All three fields in the returned
+/// snapshot come from that same cgroup so callers can compare usage against its
+/// matching limit. For the tightest effective memory budget across all
+/// ancestors, use [`container_memory_budget_bytes`].
 ///
 /// Returns `None` outside cgroup v2 or when no finite ancestor limit exists.
 #[must_use]
