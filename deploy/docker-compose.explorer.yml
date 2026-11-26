@@ -49,7 +49,7 @@ services:
       dockerfile: deploy/Dockerfile
       target: zinder-explorer
       args:
-        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-0}
+        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
     restart: on-failure
     network_mode: "service:zinder-ingest"
     # Same dependency rule as zinder-query: the shared network namespace needs

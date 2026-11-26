@@ -15,7 +15,7 @@ Every first-party crate and service shares one product version, the root
 | --- | --- |
 | Runtime images | The five images in `deploy/release-images.json`, for amd64 and arm64 |
 | Single-volume host images | The three images in `deploy/release-single-volume-images.json`, for amd64 and arm64 |
-| Binary archives | One archive per platform (x86-64-v3 and AArch64 GNU/Linux) with the five runtime executables, plus an SPDX 2.3 SBOM for each |
+| Binary archives | One archive per platform (x86-64-v3 with BMI2+ADX Pasta assembly, and AArch64 GNU/Linux) with the five runtime executables, plus an SPDX 2.3 SBOM for each |
 | Rust SDK | `zinder-core`, `zinder-proto`, and `zinder-client` on crates.io |
 | API artifacts | `zinder.v1.descriptor.bin` and a `zinder-api-docs` archive with the native `.proto` sources and OpenAPI documents |
 | GitHub Release | All of the above files, `SHA256SUMS`, and its signature `SHA256SUMS.sigstore.json` |

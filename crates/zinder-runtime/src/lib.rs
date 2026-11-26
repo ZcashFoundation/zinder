@@ -393,28 +393,29 @@ fn missing_required_cpu_features() -> Vec<&'static str> {
 /// The Pasta field-arithmetic backend compiled into this build, from
 /// `pasta_curves`: `"portable"`, `"x86-64"`, `"aarch64"`, or `"armv7em"`.
 ///
-/// `pasta_curves` selects the backend at compile time from its opt-in `asm`
-/// feature and the target. Operators build an accelerated binary by enabling
-/// `pasta_curves/asm` (see the deploying runbook); this function names the
-/// backend that build actually compiled so a silent fall back to portable
-/// arithmetic is visible in the startup log instead of being hidden.
+/// `pasta_curves` selects the backend at compile time from its `asm` feature
+/// and the target. Release images, binary archives, and Compose builds enable
+/// `pasta_curves/asm` by default (`ZINDER_PASTA_ASM=1`; set `0` for portable);
+/// logging this backend at startup makes any accidental portable fallback
+/// immediately visible.
 #[must_use]
 pub const fn pasta_backend() -> &'static str {
     pasta_curves::BACKEND
 }
 
 /// Verifies the host CPU provides every instruction-set feature the compiled
-/// Pasta backend requires, logging the selected backend and returning `false`
-/// when the host falls short.
+/// Pasta backend requires.
 ///
-/// The `pasta_curves` x86-64 assembly backend uses BMI2 and ADX instructions
-/// and does not detect them at run time. ADX is outside the x86-64-v3
-/// release baseline, so a build that opted into `asm` must refuse to start on
-/// a host that lacks ADX rather than die with `SIGILL` inside commitment
-/// hashing. The portable backend, and the `AArch64` and `ARMv7E-M` backends,
-/// require nothing beyond their target. This is a separate check from
-/// [`host_cpu_meets_compiled_baseline`], which covers the x86-64-v3 baseline
-/// every release binary requires.
+/// Logs the selected backend and returns `false` when the host falls short.
+/// The `pasta_curves` x86-64 assembly backend (enabled by default in release
+/// images and binary archives via `ZINDER_PASTA_ASM=1`) uses BMI2 and ADX
+/// instructions without runtime dispatch. Because ADX lies above the base
+/// `x86-64-v3` profile, the runtime fails closed before storage opens rather
+/// than crashing with `SIGILL` on pre-Broadwell/Haswell CPUs (rebuild with
+/// `ZINDER_PASTA_ASM=0` for such hosts). The portable backend and the `AArch64`
+/// and `ARMv7E-M` backends require nothing beyond their target. This is a
+/// separate check from [`host_cpu_meets_compiled_baseline`], which covers the
+/// base `x86-64-v3` features every release binary requires.
 #[must_use]
 pub fn host_cpu_meets_pasta_backend_baseline() -> bool {
     tracing::info!(
