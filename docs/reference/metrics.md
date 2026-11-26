@@ -538,6 +538,15 @@ within each process.
 | `zinder_store_block_cache_pinned_usage_bytes` | gauge | `store_role` | Pinned block cache use. |
 | `zinder_store_block_cache_entries` | gauge | `store_role`, `entry_role` | Serving readers only. Number of cached entries by RocksDB role, such as `DataBlock`, `IndexBlock`, or `FilterBlock`. |
 | `zinder_store_block_cache_entry_bytes` | gauge | `store_role`, `entry_role` | Serving readers only. Approximate cache charge by entry role. RocksDB rounds each role's charge before export. |
+| `zinder_store_memtable_budget_bytes` | gauge | `store_role` | Memtable budget. Readers sum it over open pair slots. |
+| `zinder_store_memtable_budget_usage_bytes` | gauge | `store_role` | Memtable use. Readers sum it over open pair slots. |
+| `zinder_store_table_reader_memory_bytes` | gauge | `store_role` | Readers only: table-reader memory outside the block cache, sampled at most every 15 seconds. |
+| `zinder_store_wal_bytes` | gauge | `store_role` | Live WAL size. |
+| `zinder_store_wal_bytes_limit` | gauge | `store_role` | Configured WAL limit. Only primary opens apply it. |
+| `zinder_store_max_background_jobs` | gauge | `store_role` | Configured background job limit on a primary. |
+| `zinder_store_rocksdb_io_mode` | gauge | `store_role`, `mode` | 1 for the I/O mode: `direct` or `buffered`. |
+| `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes and per-family live SST size (`rocksdb.live-sst-files-size`). |
+| `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
 
 > **Diagnosing signed-catalog cgroup v2 page-cache thrashing:** Signed-history
 > catalog segment reads (`ZSHRNG01`) use OS buffered I/O outside RocksDB, so
@@ -549,15 +558,6 @@ within each process.
 > alongside high `zinder_compat_published_history_read_bytes_total` rates and
 > elevated `zinder_compat_published_history_read_duration_seconds`, raise the
 > reader's cgroup memory limit to hold the signed catalog plus its working set.
-| `zinder_store_memtable_budget_bytes` | gauge | `store_role` | Memtable budget. Readers sum it over open pair slots. |
-| `zinder_store_memtable_budget_usage_bytes` | gauge | `store_role` | Memtable use. Readers sum it over open pair slots. |
-| `zinder_store_table_reader_memory_bytes` | gauge | `store_role` | Readers only: table-reader memory outside the block cache, sampled at most every 15 seconds. |
-| `zinder_store_wal_bytes` | gauge | `store_role` | Live WAL size. |
-| `zinder_store_wal_bytes_limit` | gauge | `store_role` | Configured WAL limit. Only primary opens apply it. |
-| `zinder_store_max_background_jobs` | gauge | `store_role` | Configured background job limit on a primary. |
-| `zinder_store_rocksdb_io_mode` | gauge | `store_role`, `mode` | 1 for the I/O mode: `direct` or `buffered`. |
-| `zinder_store_rocksdb_property` | gauge | `store_role`, `cf`, `property` | RocksDB properties, such as pending compaction bytes and per-family live SST size (`rocksdb.live-sst-files-size`). |
-| `zinder_store_rocksdb_ticker` | gauge | `store_role`, `ticker` | RocksDB statistics tickers, when statistics are on. |
 
 Ingest samples the canonical primary after bulk loads, while following the
 tip, and after checkpoint densification commits. The projector samples the
