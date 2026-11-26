@@ -1,22 +1,18 @@
 # Configuration
 
-This page lists the settings each Zinder runtime reads, how they combine, and
-the fixed limits that public listeners enforce. It is for operators who deploy
-Zinder and for client developers who need to know why a request was refused.
+This page lists the settings each Zinder runtime reads, how they combine, and the fixed limits that public listeners enforce. It is for operators who deploy Zinder and for client developers who need to know why a request was refused.
 
 ## Settings for a first deployment
 
-Most settings have working defaults. A wallet-serving deployment of
-`zinder-ingest`, `zinder-projector`, `zinder-query`, and
-`zinder-compat-lightwalletd` needs the settings below.
+Most settings have working defaults. A wallet-serving deployment of `zinder-ingest`, `zinder-projector`, `zinder-query`, and `zinder-compat-lightwalletd` needs the settings below.
 
 | Setting | Runtimes | Value |
 | --- | --- | --- |
+| `deployment.profile` | ingest, projector, query, compat | `wallet` (recommended production default: complete history without raw blobs; requires a verified primary `[node]`), `wallet-archive` (retains all raw blobs locally), or `light-wallet` (ingest and compat only). Prefer this over setting `ingest.run_overrides.coverage = "wallet-serving"` manually. |
 | `network.name` | all | `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest` |
-| `node.json_rpc_addr` | ingest; query and compat to broadcast | JSON-RPC URL of an archive Zebra or Zakura node |
+| `node.json_rpc_addr` | ingest; query and compat to broadcast and serve lean-mode transaction bytes | JSON-RPC URL of an archive Zebra or Zakura node |
 | `node.auth.method` | wherever `[node]` is set | `cookie`, with a cookie file in `node.auth.path`; or `basic`, with `node.auth.username` and `node.auth.password` |
-| `ingest.source` | ingest | `zebra-json-rpc`, the only supported value |
-| `ingest.run_overrides.coverage` | ingest | `wallet-serving`, so ingest keeps the history and transaction bytes that wallets need |
+| `ingest.source` | ingest | `"zebra-json-rpc"` (default) or `"zebra-indexer-grpc"` (binary block fetch; requires `node.indexer_grpc_addr`) |
 | `storage.path` | ingest, query, compat, explorer | Canonical store directory |
 | `storage.canonical_path` | projector | The same canonical store directory |
 | `wallet.path` | projector, query, compat | Wallet store directory |
@@ -26,20 +22,11 @@ Most settings have working defaults. A wallet-serving deployment of
 | `ingest_control.bearer_token_path` | ingest, projector, query, compat | File holding a shared secret. Ingest requires it when `ingest_control.listen_addr` is not a loopback address. |
 | `security.allow_public_bind` | any runtime bound to `0.0.0.0`, `::`, or a public address | `true`, and only behind a proxy that terminates TLS |
 
-The `*.toml` files directly in `deploy/config/` are complete examples for the
-Compose topology, and [Deploying Zinder](../runbooks/deploying.md) walks
-through them. Run any binary with `--print-config` to see the merged result
-before you start it.
+The `*.toml` files directly in `deploy/config/` are complete examples for the Compose topology, and [Deploying Zinder](../runbooks/deploying.md) walks through them. Run any binary with `--print-config` to see the merged result before you start it.
 
-Every listener binds to loopback by default. The
-[security boundary](../architecture/service-operations.md#security-boundary)
-explains which addresses `security.allow_public_bind` admits and why a public
-listener needs your own proxy.
+Every listener binds to loopback by default. The [security boundary](../architecture/service-operations.md#security-boundary) explains which addresses `security.allow_public_bind` admits and why a public listener needs your own proxy.
 
-The runtime images change those defaults. Each image installs a file from
-`deploy/config/images/` at `/etc/zinder/config.toml` and starts with
-`--config /etc/zinder/config.toml`. The file sets
-`security.allow_public_bind = true` and these listeners:
+The runtime images change those defaults. Each image installs a file from `deploy/config/images/` at `/etc/zinder/config.toml` and starts with `--config /etc/zinder/config.toml`. The file sets `security.allow_public_bind = true` and these listeners:
 
 | Image | Listeners |
 | --- | --- |
@@ -49,22 +36,11 @@ The runtime images change those defaults. Each image installs a file from
 | `zinder-compat-lightwalletd` | `compat.listen_addr = "[::]:9067"`, `ops.listen_addr = "[::]:9107"` |
 | `zinder-explorer` | `explorer.listen_addr = "[::]:9068"`, `ops.listen_addr = "[::]:9069"` |
 
-Other listeners, such as `ingest_control.listen_addr`, keep their loopback
-defaults. The image files leave network, node, and storage settings to each
-binary. Supply required values and any overrides with `ZINDER_*` variables
-or a mounted file. A file you mount at
-`/etc/zinder/config.toml` replaces the image file whole. A listener it does
-not set then binds loopback, and without `allow_public_bind = true` a
-listener on `[::]` or a public address is refused. Arguments after the image
-name replace `--config /etc/zinder/config.toml`, so repeat it when you pass
-your own.
+Other listeners, such as `ingest_control.listen_addr`, keep their loopback defaults. The image files leave network, node, and storage settings to each binary. Supply required values and any overrides with `ZINDER_*` variables or a mounted file. A file you mount at `/etc/zinder/config.toml` replaces the image file whole. A listener it does not set then binds loopback, and without `allow_public_bind = true` a listener on `[::]` or a public address is refused. Arguments after the image name replace `--config /etc/zinder/config.toml`, so repeat it when you pass your own.
 
 ## Deployment profiles
 
-Set `deployment.profile` on each participating standalone runtime. Matching
-explicit settings are accepted. Conflicting settings fail configuration
-resolution. `--print-config` shows the profile and omits the settings it
-supplies.
+Set `deployment.profile` on each participating standalone runtime. Matching explicit settings are accepted; conflicting settings fail configuration resolution. `--print-config` prints the profile and omits the settings it supplies.
 
 | Profile | Canonical workload | Raw blobs | Serving |
 | --- | --- | --- | --- |
@@ -72,56 +48,13 @@ supplies.
 | `wallet` | Wallet | None | Ingest, projector, native query, and wallet compatibility |
 | `wallet-archive` | Wallet | All | Ingest, projector, native query, and wallet compatibility |
 
-All profiles build complete canonical history. For `wallet`, give the native
-query and compatibility processes a primary `[node]` that can supply mined
-transaction bytes. Readers check the stored data requirements when opening
-the canonical store. A writer changing retention must build a new store.
-
-`light-wallet` and `wallet` depend on the node for every mined transaction
-body a wallet asks for, through `GetTransaction` and address history. Each
-process admits these reads through a bounded node-call budget, a wait queue,
-and a verified byte cache, configured with the `forwarded_read_*` and
-`forwarded_transaction_cache_bytes` settings of `[query]` or `[compat]`; see
-[Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads).
-Retain transaction bodies locally instead when the node is remote, pruning,
-or shared with other heavy work, or when a public deployment serves many
-wallets at once. Use `wallet-archive`, or build the store with
-`storage.raw_blob_policy = "transactions"` and set `compat.serving =
-"light-wallet"` or `"wallet"` explicitly. Transaction bodies take about 251
-GiB on Mainnet.
+All profiles build complete canonical history, and changing retention requires a new store. `light-wallet` and `wallet` forward mined transaction body reads (plus address history in `light-wallet`) to `[node]` through a bounded call budget, wait queue, and verified byte cache (`forwarded_read_*` and `forwarded_transaction_cache_bytes` under `[query]` or `[compat]`; see [Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads)). When your node is remote, pruning, or shared, or under heavy public traffic, retain all raw block and transaction blobs locally with `wallet-archive` (`raw_blob_policy = "all"`), or omit `deployment.profile` and build with `storage.raw_blob_policy = "transactions"` (about 251.1 GiB on Mainnet for transaction bodies alone) alongside explicit `ingest.run_overrides.coverage` and `compat.serving` settings.
 
 ## Light-wallet profile
 
-Set `deployment.profile = "light-wallet"` in both the ingest and
-lightwalletd compatibility TOML files, or set `ZINDER_DEPLOYMENT__PROFILE=light-wallet`
-for both processes. Run `zinder-ingest` and `zinder-compat-lightwalletd` with
-the same network, canonical primary path, and canonical reorg window. Give
-compatibility its own secondary path, the ingest-control endpoint, and one
-archive node with transparent address indexes.
+Set `deployment.profile = "light-wallet"` (or `ZINDER_DEPLOYMENT__PROFILE=light-wallet`) on standalone `zinder-ingest` and `zinder-compat-lightwalletd` (the bundled wallet-serving image starts a projector and native query and does not use this profile). Give both the same network, canonical primary path, and reorg window, plus a unique secondary path, `ingest_control.addr`, and one archive node with transparent address indexes.
 
-The profile selects complete wallet history, no raw blob retention, and no
-Explorer views for ingest. Compatibility uses canonical data and ingest
-control for local wallet reads and forwards selected reads to the node.
-Use the standalone runtimes for this profile. The bundled wallet-serving
-image starts a wallet projector and native query. Omit
-`ingest.run_overrides.coverage`, `ingest.explorer_views`, `storage.raw_blob_policy`, and
-`compat.serving` when selecting this profile. Matching values are accepted,
-and conflicting values fail at startup. Compatibility requires complete
-block history and a complete subtree-root prefix, and can read a store with
-additional retained blobs. The ingest writer must match the store's original
-retention policy. For ingest and the compatibility listener, `--print-config`
-writes the resolved profile and omits the settings it supplies.
-
-The explicit `compat.serving = "light-wallet"` setting applies the same history
-and subtree requirements.
-Without the profile, both use the reader's configured
-`storage.raw_blob_policy`, which defaults to `transactions`.
-Set it to `none` explicitly to admit a store without transaction bodies. See
-[Lightwalletd compatibility](lightwalletd-compatibility.md#runtime-serving-selection)
-for method behavior. Light-wallet serving bounds its forwarded transaction,
-address history, and unspent-output reads as
-[Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads)
-describes, with the settings in the table below.
+Compatibility requires complete block history and a complete subtree-root prefix, and also admits a store with retained blobs. Without the profile, setting `compat.serving = "light-wallet"` applies the same requirements against `storage.raw_blob_policy` (which defaults to `transactions`; set it to `none` explicitly to admit a lean store). See [Lightwalletd compatibility](lightwalletd-compatibility.md#runtime-serving-selection) and [Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads).
 
 ## How configuration is loaded
 
@@ -132,73 +65,43 @@ Every binary merges four layers. Each layer overrides the one before it:
 3. `ZINDER_*` environment variables.
 4. Command-line flags.
 
-An environment variable name is `ZINDER_` followed by the TOML path in
-uppercase, with `__` between levels. A single `_` stays inside a key. For
-example, `ingest.follow.poll_interval_ms` becomes
-`ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS`.
+An environment variable name is `ZINDER_` followed by the TOML path in uppercase, with `__` between levels. A single `_` stays inside a key. For example, `ingest.follow.poll_interval_ms` becomes `ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS`.
 
 The loader enforces these rules:
 
-- An unknown key fails startup, whether it comes from the file or the
-  environment. For a rejected variable, the error names it and suggests a
-  correction.
+- An unknown key fails startup, whether it comes from the file or the environment. For a rejected variable, the error names it and suggests a correction.
 - Cross-field rules are checked before storage opens or a listener binds.
-- `--print-config` prints the merged configuration as TOML without opening
-  storage or binding. Passwords and inline cookies are redacted.
+- `--print-config` prints the merged configuration as TOML without opening storage or binding. Passwords and inline cookies are redacted.
 - `ZINDER_TEST_*` variables never reach the loader. They are test-only knobs.
-- `RUST_LOG` sets the log filter and has no TOML field. Unset or blank means
-  `info`. A value that does not parse fails startup.
-- The single-volume image entrypoints read `ZINDER_WALLET_SERVING__*` and the
-  `ZINDER_NODE__INDEXER_TLS__*_PEM` forms themselves. The binaries refuse the
-  `*_PEM` variables. See
-  [single-volume deployment](../runbooks/deploying-single-volume.md).
+- `RUST_LOG` sets the log filter and has no TOML field. Unset or blank means `info`. A value that does not parse fails startup.
+- The single-volume image entrypoints read `ZINDER_WALLET_SERVING__*` and the `ZINDER_NODE__INDEXER_TLS__*_PEM` forms themselves. The binaries refuse the `*_PEM` variables. See [single-volume deployment](../runbooks/deploying-single-volume.md).
 
-[ADR-0021](../adrs/0021-shared-configuration-sections.md) records why sections
-such as `[node]`, `[ops]`, and `[security]` are shared by every runtime.
+[ADR-0021](../adrs/0021-shared-configuration-sections.md) records why sections such as `[node]`, `[ops]`, and `[security]` are shared by every runtime.
 
 ## Sections by runtime
 
 | Runtime | Sections |
 | --- | --- |
 | `zinder-ingest` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `ingest`, `retention`, `ingest_control`, `ops`, `security` |
-| `zinder-projector` | `network`, `storage`, `wallet`, `projector`, `ingest_control`, `projector_control`, `ops`, `security` |
-| `zinder-query` | `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `query`, `ingest_control`, `ops`, `security` |
+| `zinder-projector` | `deployment`, `network`, `storage`, `wallet`, `projector`, `ingest_control`, `projector_control`, `ops`, `security` |
+| `zinder-query` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `query`, `ingest_control`, `ops`, `security` |
 | `zinder-compat-lightwalletd` | `deployment`, `network`, `node`, `node_fallbacks.N`, `storage`, `wallet`, `compat`, `ingest_control`, `ops`, `security` |
 | `zinder-explorer` | `network`, `node`, `node_fallbacks.N`, `storage`, `explorer`, `ops`, `security` |
 | `zinder-compat-cipherscan` | `network`, `cipherscan`, `ops`, `security` |
 
-`[ingest]` has the subsections `construction`, `follow`, `mempool`,
-`phase_classification`, `run_overrides`, `tree_state_densification`, and
-`tree_state_verification`. `[projector]` has `build` and `follow`.
+`[ingest]` has the subsections `construction`, `follow`, `mempool`, `phase_classification`, `run_overrides`, `tree_state_densification`, and `tree_state_verification`. `[projector]` has `build` and `follow`.
 
 ### The node sections
 
 Each runtime uses `[node]` differently:
 
-- Ingest requires it. Both `"zebra-json-rpc"` and `"zebra-indexer-grpc"`
-  values of `ingest.source` require `node.json_rpc_addr` (control plane);
-  selecting `"zebra-indexer-grpc"` also requires `indexer_grpc_addr` on `[node]`
-  and every `[node_fallbacks.N]`.
-- Query and wallet-mode compatibility use it only to broadcast transactions
-  and, in compatibility, to read the recommended fee, for which a pruned node
-  works. They start without contacting the node. Without `[node]` they serve
-  stored data and do not advertise broadcast, and compatibility answers
-  `GetStandardFee` with `UNIMPLEMENTED`. Any node setting requires
-  `node.json_rpc_addr`.
-- Light-wallet serving requires one `[node]` and rejects fallbacks. For
-  the methods it forwards, see
-  [Lightwalletd serving modes](lightwalletd-compatibility.md#runtime-serving-selection).
+- Ingest requires it. Both `"zebra-json-rpc"` and `"zebra-indexer-grpc"` values of `ingest.source` require `node.json_rpc_addr` (control plane); selecting `"zebra-indexer-grpc"` also requires `indexer_grpc_addr` on `[node]` and every `[node_fallbacks.N]`.
+- Query and wallet-mode compatibility use it only to broadcast transactions and, in compatibility, to read the recommended fee, for which a pruned node works. They start without contacting the node. Without `[node]` they serve stored data and do not advertise broadcast, and compatibility answers `GetStandardFee` with `UNIMPLEMENTED`. Any node setting requires `node.json_rpc_addr`.
+- Light-wallet serving requires one `[node]` and rejects fallbacks. For the methods it forwards, see [Lightwalletd serving modes](lightwalletd-compatibility.md#runtime-serving-selection).
 - Explorer uses it only to report the node's tip in its freshness envelope.
-- The projector, and compatibility with `compat.serving = "compact-blocks"`,
-  reject it.
+- The projector, and compatibility with `compat.serving = "compact-blocks"`, reject it.
 
-`[node_fallbacks.N]` adds fallback endpoints. `[node]` is position 0, and the
-fallbacks count from 1 without a gap. Each fallback table takes the fields of
-`[node]`, and its environment names start with `ZINDER_NODE_FALLBACKS__<N>__`.
-A fallback does not inherit `broadcast_timeout_secs` or
-`max_concurrent_requests` from `[node]`, so set them on each endpoint. Positions are table keys, not a TOML array, so a file and the
-environment merge field by field. A TOML array of tables
-(`[[node_fallbacks]]`) is refused:
+`[node_fallbacks.N]` adds fallback endpoints. `[node]` is position 0, and the fallbacks count from 1 without a gap. Each fallback table takes the fields of `[node]`, and its environment names start with `ZINDER_NODE_FALLBACKS__<N>__`. A fallback does not inherit `broadcast_timeout_secs` or `max_concurrent_requests` from `[node]`, so set them on each endpoint. Positions are table keys, not a TOML array, so a file and the environment merge field by field. A TOML array of tables (`[[node_fallbacks]]`) is refused:
 
 ```toml
 [node]
@@ -213,17 +116,9 @@ method = "cookie"
 path = "/var/run/auth-fallback/.cookie"
 ```
 
-[Node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover)
-describes how each runtime uses the list.
+[Node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover) describes how each runtime uses the list.
 
-`max_concurrent_requests` caps the JSON-RPC calls one process has in flight to
-one node endpoint. It defaults to 64 and accepts 1 to 1024. Zebra accepts 100
-JSON-RPC connections by default and refuses more with HTTP 429, which Zinder
-reports as `NODE_RATE_LIMITED`. A call beyond the cap waits for a free slot for
-at most its own timeout, then fails with `NODE_UNAVAILABLE` without reaching
-the node. Readiness probes use a slot of their own, so a busy node does not
-fail readiness. When ingest and readers share one node, keep the sum of their
-caps below the node's connection limit:
+`max_concurrent_requests` caps the JSON-RPC calls one process has in flight to one node endpoint. It defaults to 64 and accepts 1 to 1024. Zebra accepts 100 JSON-RPC connections by default and refuses more with HTTP 429, which Zinder reports as `NODE_RATE_LIMITED`. A call beyond the cap waits for a free slot for at most its own timeout, then fails with `NODE_UNAVAILABLE` without reaching the node. Readiness probes use a slot of their own, so a busy node does not fail readiness. When ingest and readers share one node, keep the sum of their caps below the node's connection limit:
 
 ```toml
 [node]
@@ -233,12 +128,7 @@ max_concurrent_requests = 32
 
 ## Environment variables
 
-Every `ZINDER_*` variable a binary accepts is listed below, with its TOML
-field. The table is generated by
-`zinder_runtime::render_environment_variable_table()`. A test checks that the
-table matches, and each binary's `env_var_contract` test checks that it
-accepts exactly the variables whose "Used by" column names it. The tests do
-not check descriptions or defaults.
+Every `ZINDER_*` variable a binary accepts is listed below, with its TOML field. The table is generated by `zinder_runtime::render_environment_variable_table()`. A test checks that the table matches, and each binary's `env_var_contract` test checks that it accepts exactly the variables whose "Used by" column names it. The tests do not check descriptions or defaults.
 
 <!-- env-var-table:public-interfaces:start -->
 | Variable | Used by | Requirement | TOML field | Description |
@@ -422,15 +312,11 @@ not check descriptions or defaults.
 
 ## Listener and request limits
 
-These limits are compiled in. No setting changes them unless the entry names
-one. A refusal from the transport carries no `ErrorInfo` reason; a refusal
-from a handler carries one of the reasons in
-[Error vocabulary](error-vocabulary.md).
+These limits are compiled in. No setting changes them unless the entry names one. A refusal from the transport carries no `ErrorInfo` reason; a refusal from a handler carries one of the reasons in [Error vocabulary](error-vocabulary.md).
 
 ### Public gRPC listeners
 
-`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` share one
-transport policy.
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` share one transport policy.
 
 | Limit | Value | Client sees |
 | --- | --- | --- |
@@ -446,143 +332,33 @@ transport policy.
 | Streams the server resets because of the client's protocol errors, per HTTP/2 connection | 1,024 | Connection closed with `ENHANCE_YOUR_CALM` |
 | Open `grpc.health.v1.Health/Watch` streams, per process (`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer`) | 1,024 | `RESOURCE_EXHAUSTED` |
 
-A unary or server-streaming call holds its receive slot only until its request
-has arrived. Long response streams such as `ChainEvents`,
-`CompactBlocksInRange`, and `GetBlockRange` therefore hold no slot. When a
-pool is full, a request from a client that holds fewer slots takes the
-oldest slot of the client that holds the most. The request that loses its
-slot fails with `UNAVAILABLE`. A request from a client that holds no slot is
-therefore always admitted, and a client is refused only while it holds at
-least as many slots as every other client. Retry these refusals with backoff.
+A unary or server-streaming call holds its receive slot only until its request has arrived. Long response streams such as `ChainEvents`, `CompactBlocksInRange`, and `GetBlockRange` therefore hold no slot. When a pool is full, a request from a client that holds fewer slots takes the oldest slot of the client that holds the most. The request that loses its slot fails with `UNAVAILABLE`. A request from a client that holds no slot is therefore always admitted, and a client is refused only while it holds at least as many slots as every other client. Retry these refusals with backoff.
 
-A client is the connection a request arrives on. A proxy reaches Zinder over
-a few pooled connections, so behind one every client looks like the same few.
-Set `query.trust_proxy_client_address`, `compat.trust_proxy_client_address`,
-or `explorer.trust_proxy_client_address` to `true` when the listener is
-reachable only through a proxy that sets the `x-zinder-client-address`
-request header to the client connection's IP address and port, or to a bare
-IP address. Zinder then counts each request against that connection, or
-against that whole address when the header names only a bare IP, as a load
-balancer's `{client_ip_address}` does. A request that carries the header
-more than once, as a comma-separated list, or as anything that is neither one
-`ip:port` address nor one bare IP address, or that carries none, counts
-against the proxy's own connection instead, and
-`zinder_grpc_proxy_client_address_fallbacks_total` counts it. A loopback
-`grpc.health.v1.Health/Check` with no header uses its own connection for the
-receive limit and leaves the fallback counter unchanged.
-With the setting off, the default, Zinder ignores the header.
-[Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit)
-lists the proxy settings this depends on.
+A client is the connection a request arrives on. A proxy reaches Zinder over a few pooled connections, so behind one every client looks like the same few. Set `query.trust_proxy_client_address`, `compat.trust_proxy_client_address`, or `explorer.trust_proxy_client_address` to `true` when the listener is reachable only through a proxy that sets the `x-zinder-client-address` request header to the client connection's IP address and port, or to a bare IP address. Zinder then counts each request against that connection, or against that whole address when the header names only a bare IP, as a load balancer's `{client_ip_address}` does. A request that carries the header more than once, as a comma-separated list, or as anything that is neither one `ip:port` address nor one bare IP address, or that carries none, counts against the proxy's own connection instead, and `zinder_grpc_proxy_client_address_fallbacks_total` counts it. A loopback `grpc.health.v1.Health/Check` with no header uses its own connection for the receive limit and leaves the fallback counter unchanged. With the setting off, the default, Zinder ignores the header. [Exposing over TLS](../runbooks/exposing-over-tls.md#keep-wallets-apart-in-the-receive-limit) lists the proxy settings this depends on.
 
-These limits count all clients together. A client that opens many connections
-counts as many clients when Zinder keys it by connection, as it does for a
-direct connection or an `ip:port` proxy header. When a proxy names only a bare
-IP address, every connection from that address counts as one client. Limit
-connections per client in the proxy.
+These limits count all clients together. A client that opens many connections counts as many clients when Zinder keys it by connection, as it does for a direct connection or an `ip:port` proxy header. When a proxy names only a bare IP address, every connection from that address counts as one client. Limit connections per client in the proxy.
 
-A response ends once one piece of it has waited 60 seconds to go out. A piece
-waits either for the client's flow-control window to cover everything queued
-ahead of it plus one byte, or, once it has that window, for HTTP/2 to write
-out the data queued ahead of it. The listener then resets the response's
-HTTP/2 stream with `RST_STREAM` and `CANCEL`. The reset drops the call, so it
-starts no further work. HTTP/2 discards the data it holds for the response,
-and frees the stream's place among its connection's 200 streams, the next
-time it writes to the connection; a connection that cannot write is closed
-by the write rule below. A read already in flight finishes first, and a
-`GetBlockRange` stream returns its range-stream slot once that read is done.
-The connection and its other streams stay open. A response that is waiting
-for the server to produce its next message is reset only if data it already
-sent is still waiting to go out.
+A response ends once one piece of it has waited 60 seconds to go out. A piece waits either for the client's flow-control window to cover everything queued ahead of it plus one byte, or, once it has that window, for HTTP/2 to write out the data queued ahead of it. The listener then resets the response's HTTP/2 stream with `RST_STREAM` and `CANCEL`. The reset drops the call, so it starts no further work. HTTP/2 discards the data it holds for the response, and frees the stream's place among its connection's 200 streams, the next time it writes to the connection; a connection that cannot write is closed by the write rule below. A read already in flight finishes first, and a `GetBlockRange` stream returns its range-stream slot once that read is done. The connection and its other streams stay open. A response that is waiting for the server to produce its next message is reset only if data it already sent is still waiting to go out.
 
-A client that reads slowly is reset when a piece waits 60 seconds for window.
-The shortfall comes from the piece queued just ahead of the waiting one,
-so window updates that arrive often but grant too little in total can still
-end the stream. In the worst case, when the connection's window is not the
-limit and the client's settings do not change, the waiting piece needs a
-whole piece of new window: 64 KiB for gRPC and binary gRPC-Web, or 87,384
-bytes for gRPC-Web text. Shorter pieces need less. How fast a client must
-then read depends on how it grants window. Rust's h2, which tonic and hyper
-use, sends a window update once the capacity it has released reaches half of
-its remaining window, roughly a third of the configured window for a steady
-reader. Under those assumptions, a worst-case reader with a 1 MiB window must
-read about 341 KiB within 60 seconds, about 5.7 KiB/s, and one with a 64 KiB
-window must read about 64 KiB, about 1.1 KiB/s.
+A client that reads slowly is reset when a piece waits 60 seconds for window. The shortfall comes from the piece queued just ahead of the waiting one, so window updates that arrive often but grant too little in total can still end the stream. In the worst case, when the connection's window is not the limit and the client's settings do not change, the waiting piece needs a whole piece of new window: 64 KiB for gRPC and binary gRPC-Web, or 87,384 bytes for gRPC-Web text. Shorter pieces need less. How fast a client must then read depends on how it grants window. Rust's h2, which tonic and hyper use, sends a window update once the capacity it has released reaches half of its remaining window, roughly a third of the configured window for a steady reader. Under those assumptions, a worst-case reader with a 1 MiB window must read about 341 KiB within 60 seconds, about 5.7 KiB/s, and one with a 64 KiB window must read about 64 KiB, about 1.1 KiB/s.
 
-A piece that has window still waits while the connection cannot write out
-the data ahead of it. Before the server ends a response or waits for its
-producer, it waits for HTTP/2 to encode everything queued ahead of the last
-byte. If that takes 60 seconds, because the client's socket takes data slowly
-or other busy streams on the connection share it, the stream is reset with
-`CANCEL` and counted in `zinder_grpc_response_send_stalls_total`, even while
-the connection writes enough to meet the 16 KiB rule below. As an
-illustration, assume a stream has its 1 MiB send buffer and one 64 KiB
-piece queued ahead of that byte, about 1,088 KiB (about 1,109 KiB for
-gRPC-Web text), and that HTTP/2 shares the socket evenly among busy streams.
-Then a socket that takes less than about 18.1 KiB/s over 60 seconds resets a
-stream that is alone on its connection, and with n busy streams the socket
-must take about n times that.
+A piece that has window still waits while the connection cannot write out the data ahead of it. Before the server ends a response or waits for its producer, it waits for HTTP/2 to encode everything queued ahead of the last byte. If that takes 60 seconds, because the client's socket takes data slowly or other busy streams on the connection share it, the stream is reset with `CANCEL` and counted in `zinder_grpc_response_send_stalls_total`, even while the connection writes enough to meet the 16 KiB rule below. As an illustration, assume a stream has its 1 MiB send buffer and one 64 KiB piece queued ahead of that byte, about 1,088 KiB (about 1,109 KiB for gRPC-Web text), and that HTTP/2 shares the socket evenly among busy streams. Then a socket that takes less than about 18.1 KiB/s over 60 seconds resets a stream that is alone on its connection, and with n busy streams the socket must take about n times that.
 
-A client that reads again receives the data that reached it before the
-reset, then the reset. grpc-go, grpc-java, and tonic built with its `server`
-feature report the reset as `CANCELLED`. gRPC Swift on SwiftNIO reports
-`UNAVAILABLE`, and other clients, or a proxy in front of Zinder, may report it
-differently.
+A client that reads again receives the data that reached it before the reset, then the reset. grpc-go, grpc-java, and tonic built with its `server` feature report the reset as `CANCELLED`. gRPC Swift on SwiftNIO reports `UNAVAILABLE`, and other clients, or a proxy in front of Zinder, may report it differently.
 
-While a response is open, the transport holds less than about 1,216 KiB of
-its payload, or 1,280 KiB and 8 bytes for a gRPC-Web text response: the
-1 MiB HTTP/2 send buffer, the piece queued past it, the piece waiting for
-window, and the next piece. These are estimates of transport payload. The
-listener also keeps the response chunk it is splitting into pieces until it
-hands out that chunk's last piece; for `GetBlockRange` that chunk is one
-encoded block, or a batch of smaller ones. A gRPC-Web response's trailers
-add a frame of their own. One connection holds at most 200 responses, about
-237.5 MiB of transport payload, or 250 MiB in gRPC-Web text mode. A
-`GetBlockRange` response on the lightwalletd listener hands HTTP/2 slices of
-its stored blocks instead of copies, so a stalled range stream can keep up to
-about 3,456 KiB of block allocations alive, and one connection about
-675 MiB ([lightwalletd compatibility](lightwalletd-compatibility.md)).
-That data is held only until the stream's reset.
+While a response is open, the transport holds less than about 1,216 KiB of its payload, or 1,280 KiB and 8 bytes for a gRPC-Web text response: the 1 MiB HTTP/2 send buffer, the piece queued past it, the piece waiting for window, and the next piece. These are estimates of transport payload. The listener also keeps the response chunk it is splitting into pieces until it hands out that chunk's last piece; for `GetBlockRange` that chunk is one encoded block, or a batch of smaller ones. A gRPC-Web response's trailers add a frame of their own. One connection holds at most 200 responses, about 237.5 MiB of transport payload, or 250 MiB in gRPC-Web text mode. A `GetBlockRange` response on the lightwalletd listener hands HTTP/2 slices of its stored blocks instead of copies, so a stalled range stream can keep up to about 3,456 KiB of block allocations alive, and one connection about 675 MiB ([lightwalletd compatibility](lightwalletd-compatibility.md)). That data is held only until the stream's reset.
 
-The server ends a response, or waits for its producer, only once HTTP/2 has
-encoded every byte sent so far. It sends the last byte as a frame of its own,
-which HTTP/2 encodes only after everything queued ahead of it on the stream.
-A response that has ended therefore waits for nothing but the client's
-socket. A client that lowers its stream window with an HTTP/2 `SETTINGS`
-frame before that point leaves the rest waiting for window again, and the
-stream is reset if that still keeps the rest from being encoded when its
-piece has waited 60 seconds. Zinder sets no process-wide bound on the data responses hold,
-because a client can open many connections. Limit connections per client at
-your proxy.
+The server ends a response, or waits for its producer, only once HTTP/2 has encoded every byte sent so far. It sends the last byte as a frame of its own, which HTTP/2 encodes only after everything queued ahead of it on the stream. A response that has ended therefore waits for nothing but the client's socket. A client that lowers its stream window with an HTTP/2 `SETTINGS` frame before that point leaves the rest waiting for window again, and the stream is reset if that still keeps the rest from being encoded when its piece has waited 60 seconds. Zinder sets no process-wide bound on the data responses hold, because a client can open many connections. Limit connections per client at your proxy.
 
-Once a write to a connection blocks, the connection must write 16 KiB, or
-finish writing everything it had buffered, within 60 seconds or it is
-closed. This closes a connection whose client has stopped
-reading every stream on it, which not even a reset can reach. A client that
-reads its socket a few bytes at a time stays within the memory bounds above
-but has no deadline: its connection stays open while it reads 16 KiB a
-minute, and HTTP/2 frees a reset stream's data only when it next writes to
-that connection. An HTTP/1.1 connection, which gRPC-Web uses when
-`compat.browser_origins` is set, carries one response at a time, so a
-stalled response closes its connection.
-[ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md)
-records this policy.
+Once a write to a connection blocks, the connection must write 16 KiB, or finish writing everything it had buffered, within 60 seconds or it is closed. This closes a connection whose client has stopped reading every stream on it, which not even a reset can reach. A client that reads its socket a few bytes at a time stays within the memory bounds above but has no deadline: its connection stays open while it reads 16 KiB a minute, and HTTP/2 frees a reset stream's data only when it next writes to that connection. An HTTP/1.1 connection, which gRPC-Web uses when `compat.browser_origins` is set, carries one response at a time, so a stalled response closes its connection. [ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md) records this policy.
 
 ### Request list bounds
 
-The server counts the elements of every repeated request field before it
-decodes the request. Without that bound, one 2 MiB request could decode into
-tens of MiB of empty elements. The count covers every frame of the request and
-the lists inside nested messages, and allocates nothing.
+The server counts the elements of every repeated request field before it decodes the request. Without that bound, one 2 MiB request could decode into tens of MiB of empty elements. The count covers every frame of the request and the lists inside nested messages, and allocates nothing.
 
-A request over a bound fails with `INVALID_ARGUMENT` and the message
-`<Method> request field <field> carries <count> elements; at most <bound> are
-accepted`. `INVALID_ARGUMENT` fits because the same request can never
-succeed.
+A request over a bound fails with `INVALID_ARGUMENT` and the message `<Method> request field <field> carries <count> elements; at most <bound> are accepted`. `INVALID_ARGUMENT` fits because the same request can never succeed.
 
-A field that its handler also caps gets a bound of twice the cap. A request
-just over the cap therefore still reaches the handler and gets its typed
-reason. An enum list that no handler caps gets 1,000
-(`zinder_runtime::MAX_UNCAPPED_ENUM_LIST_ELEMENTS`).
+A field that its handler also caps gets a bound of twice the cap. A request just over the cap therefore still reaches the handler and gets its typed reason. An enum list that no handler caps gets 1,000 (`zinder_runtime::MAX_UNCAPPED_ENUM_LIST_ELEMENTS`).
 
 | Service | Method | Field | Bound | Handler cap |
 | --- | --- | --- | --- | --- |
@@ -595,12 +371,7 @@ reason. An enum list that no handler caps gets 1,000
 | `ExplorerQuery` | `ValuePoolFlowAmountThresholdSummary` | `minimum_amounts_zat` | 64 | 32 |
 | `ExplorerQuery` | `TransactionHistory` | `filter.privacy_shapes`, `filter.contains_any_protocol` | 1,000 each | none |
 
-[Lightwalletd compatibility](lightwalletd-compatibility.md) lists the
-`CompactTxStreamer` bounds. Each adapter keeps its table in
-`WALLET_QUERY_FIELD_LIMITS`, `EXPLORER_QUERY_FIELD_LIMITS`, or
-`COMPACT_TX_STREAMER_FIELD_LIMITS`. A test compares each table with the
-service descriptor, so a new repeated request field fails the tests until it
-has a bound.
+[Lightwalletd compatibility](lightwalletd-compatibility.md) lists the `CompactTxStreamer` bounds. Each adapter keeps its table in `WALLET_QUERY_FIELD_LIMITS`, `EXPLORER_QUERY_FIELD_LIMITS`, or `COMPACT_TX_STREAMER_FIELD_LIMITS`. A test compares each table with the service descriptor, so a new repeated request field fails the tests until it has a bound.
 
 ### Per-request caps
 
@@ -618,24 +389,13 @@ has a bound.
 | Node calls that forwarded wallet reads run at once, per process | 32 by default (`query.forwarded_read_max_concurrent`, `compat.forwarded_read_max_concurrent`, 1 to 256), split into a reserved floor and cap per kind; a read waits up to 10 s by default (`forwarded_read_wait_ms`) with 64 waiting per slot of its kind's cap by default (`forwarded_read_waiters_per_slot`, 1 to 256) | `FORWARDED_READ_LIMIT_REACHED` natively; `UNAVAILABLE` with no reason in lightwalletd |
 | Forwarded unspent-output responses and address-history streams open at once, per process | 16 (with 1,024 waiting places) and 32 (with 128 waiting places), with the same wait | `UNAVAILABLE` |
 
-The broadcast budget covers native `BroadcastTransaction` and lightwalletd
-`SendTransaction`. A broadcast holds its transaction's bytes until the node
-answers or the broadcast times out. One that does not fit is refused at once,
-without reaching any node. The budget always fits one maximum-size
-transaction.
+The broadcast budget covers native `BroadcastTransaction` and lightwalletd `SendTransaction`. A broadcast holds its transaction's bytes until the node answers or the broadcast times out. One that does not fit is refused at once, without reaching any node. The budget always fits one maximum-size transaction.
 
-`zinder-compat-lightwalletd` adds `compat.max_concurrent_block_range_streams`,
-`compat.tree_state_replay_wait_ms`, `compat.tree_state_replay_waiters_per_slot`,
-`compat.stale_tip_limit_ms`, `compat.tip_wait_ms`,
-`compat.tip_wait_max_blocks`, `compat.tip_wait_max_waiters`, and
-`compat.ping_very_insecure`, which
-[Lightwalletd compatibility](lightwalletd-compatibility.md) describes with the
-methods they govern.
+`zinder-compat-lightwalletd` adds `compat.max_concurrent_block_range_streams`, `compat.tree_state_replay_wait_ms`, `compat.tree_state_replay_waiters_per_slot`, `compat.stale_tip_limit_ms`, `compat.tip_wait_ms`, `compat.tip_wait_max_blocks`, `compat.tip_wait_max_waiters`, and `compat.ping_very_insecure`, which [Lightwalletd compatibility](lightwalletd-compatibility.md) describes with the methods they govern.
 
 ### HTTP listeners
 
-The operational endpoint of every runtime (`/healthz`, `/readyz`, `/metrics`)
-and the Cipherscan adapter use one hardened HTTP/1 listener.
+The operational endpoint of every runtime (`/healthz`, `/readyz`, `/metrics`) and the Cipherscan adapter use one hardened HTTP/1 listener.
 
 | Limit | Cipherscan adapter | Operational endpoint |
 | --- | --- | --- |
@@ -645,21 +405,11 @@ and the Cipherscan adapter use one hardened HTTP/1 listener.
 | Open connections | 2,048 | 64 |
 | Request body size | 2 MiB | 4 KiB |
 
-The operational endpoint must stay private. `ops.listen_addr` sets its
-address, and an empty value disables it.
+The operational endpoint must stay private. `ops.listen_addr` sets its address, and an empty value disables it.
 
 ### Dials between Zinder runtimes
 
-A runtime that calls another Zinder runtime, such as a reader dialing
-`ingest_control.addr` or the Cipherscan adapter dialing
-`cipherscan.explorer_query_endpoint`, gives each dial 5 seconds. The dial must
-finish the name lookup, the TCP connect, and the TLS handshake and receive the
-peer's whole initial HTTP/2 `SETTINGS` frame within that time. A peer that
-opens with any other frame fails the dial at once. The dial sends no request,
-so a TLS-terminating proxy in front of the peer needs no route or credential
-for it. A reconnect that the open channel makes on its own gets the same 5
-seconds, from the name lookup until the peer's `SETTINGS` frame is complete, so
-a call that waits on it fails within that time when the peer stalls.
+A runtime that calls another Zinder runtime, such as a reader dialing `ingest_control.addr` or the Cipherscan adapter dialing `cipherscan.explorer_query_endpoint`, gives each dial 5 seconds. The dial must finish the name lookup, the TCP connect, and the TLS handshake and receive the peer's whole initial HTTP/2 `SETTINGS` frame within that time. A peer that opens with any other frame fails the dial at once. The dial sends no request, so a TLS-terminating proxy in front of the peer needs no route or credential for it. A reconnect that the open channel makes on its own gets the same 5 seconds, from the name lookup until the peer's `SETTINGS` frame is complete, so a call that waits on it fails within that time when the peer stalls.
 
 | Caller | When a dial runs out of time |
 | --- | --- |
@@ -667,6 +417,4 @@ a call that waits on it fails within that time when the peer stalls.
 | `zinder-query` and `zinder-compat-lightwalletd` dialing `ingest_control.addr` at startup | Startup fails with the connect timeout. |
 | Mempool reads in `zinder-compat-lightwalletd` and wallet reads in `zinder-explorer` | The request fails as unavailable, and the next request dials again. Requests that arrive during a dial wait for that dial. |
 
-The bound is not configurable.
-[ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md)
-records this policy.
+The bound is not configurable. [ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md) records this policy.

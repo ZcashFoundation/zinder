@@ -1,225 +1,122 @@
 # Deploying the single-volume container
 
-This runbook deploys Zinder on a platform that attaches one persistent volume
-to one container, such as Railway. The `zinder-wallet-serving` image runs
-`zinder-ingest`, `zinder-projector`, `zinder-query`, and
-`zinder-compat-lightwalletd` as supervised processes in one container. It
-serves native `WalletQuery` on port 9102 and lightwalletd `CompactTxStreamer`
-on port 9067. Read [Deploying Zinder](deploying.md) first for host
-requirements.
+Use this runbook when your platform attaches one persistent volume to one container, such as Railway. The `zinder-wallet-serving` image supervises `zinder-ingest`, `zinder-projector`, `zinder-query` (port `9102`), and `zinder-compat-lightwalletd` (port `9067`) together in one container. Read [Deploying Zinder](deploying.md) first for host sizing and profile tradeoffs.
 
-## When to use it
-
-Use this image when your platform attaches one volume to one container. The
-readers open the stores on the writers' filesystem, so the four processes
-share a container. When your host shares a volume between containers,
-[Deploying on a VM](deploying-on-a-vm.md) runs each process in its own
-container.
+> [!NOTE]
+> **Key tradeoffs vs. the VM Compose topology:**
+> - **Shared cgroup memory:** All four processes share one container memory ceiling (minimum 8 GB; count `ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES` 3x across projector, query, and compatibility).
+> - **All-in-one restarts:** Every redeploy or kernel OOM kill restarts all processes together (and restarts an unfinished first sync from scratch).
+> - **No signed history catalog:** `zinder-wallet-serving` and `zinder-wallet-serving-explorer` do **not** bundle `publish-shielded-history` or a signed `ZSHRNG01` catalog today; `GetBlockRange` serves from canonical storage and the live-tail buffer.
+> - **Mainnet deadline & blob defaults:** Default construction deadlines (`10800`s / `7200`s) are sized for Testnet and will kill a slow Mainnet build unless raised. The shipped image config (`deploy/config/wallet-serving/ingest.toml`) sets `raw_blob_policy = "transactions"` (+251 GiB on Mainnet) and `coverage = "wallet-serving"`, and the entrypoint currently strips `ZINDER_DEPLOYMENT__*`, so this image retains transaction blobs unless custom TOML configs are mounted (`ZINDER_STORAGE__RAW_BLOB_POLICY=none` without a profile fails startup).
 
 ## Get the image
 
-Each release publishes the image for Linux amd64 and arm64. The package is
-public, so pulling needs no credentials. Pin the release tag or its digest:
+Public multi-arch (`amd64`, `arm64`) release images are published without credentials required. Pin an exact tag or digest:
 
 ```text
 ghcr.io/zcashfoundation/zinder-wallet-serving:vX.Y.Z
 ```
 
-To run an unreleased commit, build the `zinder-wallet-serving` target and push
-it to a registry your platform can read:
+To build an unreleased commit:
 
 ```bash
 docker build -f deploy/Dockerfile --target zinder-wallet-serving \
   -t <registry>/zinder-wallet-serving:<commit> .
 ```
 
-Unlike the per-service images, this image is built on a digest-pinned Debian
-slim base with `sh` and `curl`, so you can open a shell in it. It starts as
-root, hands the volume to the `zinder` user (UID and GID 10001) on every
-start, and runs each process as that user.
+This image uses a digest-pinned Debian slim base with `sh` and `curl`, hands `/var/lib/zinder` to UID/GID `10001` at startup, and drops privileges to `10001`.
 
 ## Configure the container
 
-Attach one persistent volume at `/var/lib/zinder`, sized as
-[What you need](deploying.md#what-you-need) describes. Give the container at
-least 8 GB of memory. All four processes share one memory limit. In a
-smaller container, the kernel kills a process during the first build. The
-whole container then restarts, and the build starts over and fails again.
+Attach one persistent volume at `/var/lib/zinder`, sized per [Size your host](deploying.md#what-you-need), with at least 8 GB of RAM. Lightwalletd compatibility starts after both builds finish; record peak memory under your client range-stream load and lower `ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` or raise memory if headroom is tight (or set `ZINDER_WALLET_SERVING__LIGHTWALLETD=false`).
 
-Lightwalletd compatibility starts after both builds, so it does not raise the
-build peak that sets this minimum. Its memory while serving has not been
-measured in this image. Size its block-range streams as
-[lightwalletd compatibility](../reference/lightwalletd-compatibility.md#getblockrange-and-getblockrangenullifiers)
-describes. Before you rely on 8 GB, record the container's peak memory under
-the block ranges your wallets request. Lower
-`ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS` or add memory if the peak
-leaves too little headroom. To run without compatibility, set
-`ZINDER_WALLET_SERVING__LIGHTWALLETD=false`.
-
-Set these variables:
+### Required variables
 
 | Variable | Value |
 | --- | --- |
 | `ZINDER_NETWORK__NAME` | `zcash-mainnet` or `zcash-testnet` |
-| `ZINDER_NODE__JSON_RPC_ADDR` | The node's JSON-RPC URL, such as `http://zebra.railway.internal:18232` |
+| `ZINDER_NODE__JSON_RPC_ADDR` | Node JSON-RPC URL, e.g. `http://zebra.railway.internal:18232` |
 | `ZINDER_NODE__AUTH__METHOD` | `cookie` |
-| `ZINDER_NODE__AUTH__COOKIE` | The node's cookie, as the inline `user:password` string |
-| `ZINDER_NODE__INDEXER_GRPC_ADDR` | The node's indexer gRPC URL, such as `http://zebra.railway.internal:8155`. An `https://` URL uses TLS; see [Indexer TLS](#indexer-tls). |
-| `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | A stable 32-character hexadecimal value |
+| `ZINDER_NODE__AUTH__COOKIE` | Inline `user:password` cookie string |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | Node indexer gRPC URL (e.g. `http://zebra.railway.internal:8155`, or `https://...` for TLS). **Required** — the container exits at startup without it. |
+| `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | Stable 32-character hexadecimal projector identity |
 
-The container requires `ZINDER_NODE__INDEXER_GRPC_ADDR` and stops at startup
-without it. Without the indexer stream, ingest would reread the whole node
-mempool after every block, and withdraw readiness whenever that takes longer
-than 30 seconds.
-
-These variables are optional:
+### Optional variables
 
 | Variable | Effect |
 | --- | --- |
-| `ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS` | How long the chain-store build may take before the container stops. Default `10800`, 3 hours. |
-| `ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS` | How long the wallet-store build may take before the container stops. Default `7200`, 2 hours. |
-| `ZINDER_WALLET_SERVING__LIGHTWALLETD` | `false` leaves lightwalletd compatibility stopped and port 9067 closed. Default `true`. Letter case does not matter, and any other value stops the container at startup. Changing it takes a redeploy; the stores need no rebuild. |
-| `INGEST_CONTROL_BEARER_TOKEN`, `CHECKPOINT_BEARER_TOKEN` | The internal control tokens. The container generates them at startup when unset. |
-| `RUST_LOG` | Log filter. Default `info`. A value that does not parse stops the container. |
+| `ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS` | Chain-store build deadline in seconds. Default `10800` (3 h). Set at least `86400` (24 h) for Mainnet. |
+| `ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS` | Wallet-store build deadline in seconds. Default `7200` (2 h). Set at least `43200` (12 h) for Mainnet. |
+| `ZINDER_WALLET_SERVING__LIGHTWALLETD` | `false` disables compatibility and closes port `9067`. Default `true`. |
+| `INGEST_CONTROL_BEARER_TOKEN`, `CHECKPOINT_BEARER_TOKEN` | Internal control tokens (auto-generated at startup when unset). |
+| `RUST_LOG` | Log filter (default `info`; unparseable values stop the container). |
 
-The default deadlines fit a sparse Testnet build; the every-block default has
-not been timed on Testnet. For Mainnet, set at least `86400` (24 hours) and
-`43200` (12 hours) before the first deployment, and more on slower disks or a
-slower node, because the defaults end a Mainnet build from an empty volume.
-On fewer than 8 logical CPUs, also consider the faster settings in
-[First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
+On hosts with fewer than 8 logical CPUs, also check [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
 
-Any other variable from the
-[configuration reference](../reference/configuration.md#environment-variables)
-works if it applies to ingest, projector, query, or lightwalletd
-compatibility. `ZINDER_COMPAT__*` variables reach compatibility alone.
-Compatibility serves in `wallet` mode here, so
-`ZINDER_COMPAT__SERVING=compact-blocks` stops the container when
-compatibility starts. The
-entrypoint passes each process only the variables its binary accepts. At
-startup it logs the names of `ZINDER_*` variables that no process reads, so
-check that line after you add one. A misspelled `ZINDER_WALLET_SERVING__*`
-name stops the container.
-
-Do not override storage paths, listen addresses, control endpoints, or token
-paths. They are fixed in `deploy/config/wallet-serving/`, and a path variable
-such as `ZINDER_STORAGE__PATH` would reach more than one process. Unless
-compatibility is turned off, `ZINDER_STORAGE__SECONDARY_PATH` or
-`ZINDER_WALLET__SECONDARY_PATH` stops the container at startup, because it
-would give both readers the same secondary directory.
-`ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES` sizes the wallet cache of the
-projector, query, and compatibility, so count it three times against the
-memory limit.
+Other `ZINDER_*` variables from [Configuration](../reference/configuration.md#environment-variables) are routed to matching processes (check the startup log line listing unread `ZINDER_*` names; misspelled `ZINDER_WALLET_SERVING__*` names stop startup). Compatibility runs in `wallet` mode here, so `ZINDER_COMPAT__SERVING=compact-blocks` stops the container. Do not override storage paths, listen addresses, control endpoints, or token paths; unless compatibility is disabled, setting `ZINDER_STORAGE__SECONDARY_PATH` or `ZINDER_WALLET__SECONDARY_PATH` stops startup because both readers would share a secondary path.
 
 ### Indexer TLS
 
-Zakura requires mutual TLS on an indexer listener that is not on loopback.
-Set `ZINDER_NODE__INDEXER_GRPC_ADDR` to the `https://` URL. If your platform
-can mount files, mount the PEM files and set their paths. If it delivers
-secrets only as variables, as Railway does, set the PEM text with its line
-breaks intact:
+For mTLS (such as Zakura off loopback), set `ZINDER_NODE__INDEXER_GRPC_ADDR` to `https://...` and either mount PEM files or pass multi-line PEM env vars (such as on Railway):
 
 | Item | Path variable | Text variable |
 | --- | --- | --- |
-| CA that verifies the node. Omit to use system roots. | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM` |
+| CA verifying node (omit for system roots) | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM` |
 | Client certificate chain | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM` |
 | Client private key | `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` | `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM` |
 
-Set `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` when the node certificate names a
-different host than the URL.
-
-The entrypoint writes each PEM value to a file only the `zinder` user can
-read. The deploy log names the location: `/dev/shm` is in memory, and `/run`
-may be on disk. The container stops when a value lacks a `-----BEGIN` line,
-has no line breaks, or is set as both text and path. To rotate the material,
-change the variables and redeploy.
+Set `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` if the node certificate names another host. The entrypoint writes PEM text to `0400` files owned by `zinder` (logged at startup; `/dev/shm` stays in memory, `/run` may hit disk) and rejects missing headers, single-line values, or setting both path and text. Rotate by updating variables and redeploying.
 
 ### Fallback node endpoints
 
-Ingest can switch to a second node, and both readers broadcast through it; see
-[node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover).
-Name each fallback with the `[node]` variables under a position, counting from
-1:
+Configure fallbacks starting at position `1` ([node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover)):
 
 | Variable | Value |
 | --- | --- |
 | `ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR` | `http://zakura.railway.internal:18232` |
 | `ZINDER_NODE_FALLBACKS__1__AUTH__METHOD` | `cookie` |
-| `ZINDER_NODE_FALLBACKS__1__AUTH__COOKIE` | That node's cookie |
-| `ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR` | That node's indexer gRPC URL. Required. |
-| `ZINDER_NODE_FALLBACKS__1__BROADCAST_TIMEOUT_SECS` | `7` |
+| `ZINDER_NODE_FALLBACKS__1__AUTH__COOKIE` | Fallback node cookie |
+| `ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR` | Fallback indexer gRPC URL (required) |
+| `ZINDER_NODE_FALLBACKS__1__BROADCAST_TIMEOUT_SECS` | `7` (not inherited from `[node]`) |
 
-Set the broadcast timeout on every fallback, because
-[a fallback does not inherit it](../reference/configuration.md#the-node-sections).
-Indexer TLS takes the same variables under the
-position, such as `ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM`.
+Indexer TLS variables follow the same prefix (for example, `ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM`).
 
 ## Ports
 
 | Port | Serves | Reachable from |
 | --- | --- | --- |
-| 9067 | lightwalletd `CompactTxStreamer` gRPC, plaintext | The platform's private network |
-| 9102 | Native `WalletQuery` gRPC, plaintext | The platform's private network |
-| 9106 | Query ops: `/healthz`, `/readyz`, `/metrics` | The private network and the platform health check |
-| 9107 | Compatibility ops: `/healthz`, `/readyz`, `/metrics` | The private network |
-| 9100, 9101 | Ingest and projector control | Container loopback only |
-| 9105, 9110 | Ingest and projector ops | Container loopback only |
+| `9067` | lightwalletd `CompactTxStreamer` gRPC (plaintext) | Platform private network |
+| `9102` | Native `WalletQuery` gRPC (plaintext) | Platform private network |
+| `9106` | Query ops (`/healthz`, `/readyz`, `/metrics`) | Private network + platform health check |
+| `9107` | Compatibility ops (`/healthz`, `/readyz`, `/metrics`) | Private network |
+| `9100`, `9101` | Ingest and projector control | Container loopback only |
+| `9105`, `9110` | Ingest and projector ops | Container loopback only |
 
-Do not attach a public domain to 9067 or 9102. Put TLS, authentication, rate
-limits, and quotas in a proxy in front of them, as
-[Before you expose it](deploying.md#before-you-expose-it) describes.
+Never attach a public domain directly to `9067` or `9102`; put TLS, limits, and auth in a proxy ([Before you expose it](deploying.md#before-you-expose-it)).
 
 ## Deploy on Railway
 
-1. Create the service from a Docker image source, and name the image by its
-   exact tag. Railway pulls it. To upgrade, change the tag.
-2. Attach a volume at `/var/lib/zinder`, and set the variables above.
-3. Set `PORT=9106`, the query ops port that Railway health-checks, and
-   `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30`. The entrypoint gives the
-   processes 20 seconds to flush their stores on shutdown, which a shorter
-   drain window cuts off.
-4. Set the restart policy to Always.
-5. On a first deployment to an empty volume, leave the health-check path
-   unset. Port 9106 does not listen until both builds finish, which can take
-   longer than Railway's maximum health-check timeout of 3600 seconds.
-6. When the deploy log shows `wallet serving is ready`, set the health-check
-   path to `/healthz` and the timeout to `3600`, then deploy again. A changed
-   setting applies to a new deployment, not to Redeploy of an existing one.
+1. Create a service from `ghcr.io/zcashfoundation/zinder-wallet-serving:vX.Y.Z` (Railway builds only the last Dockerfile stage, so deploy from the published image).
+2. Attach a volume at `/var/lib/zinder` and set the configuration variables above.
+3. Set `PORT=9106` and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30` (the entrypoint waits up to 20 seconds for graceful store flush on shutdown).
+4. Set restart policy to **Always**.
+5. On a first deploy to an empty volume, leave the health-check path unset (port `9106` stays closed until both builds finish, which can exceed Railway's 3600s max timeout).
+6. Once the log prints `wallet serving is ready`, set health-check path to `/healthz`, timeout to `3600`, and deploy again.
 
-Deploy from the published image. Railway builds only the last stage of a
-Dockerfile, so it cannot build this image from the repository. Clients reach
-the service at `<service>.railway.internal:9067` and
-`<service>.railway.internal:9102` over Railway's IPv6 private network.
-
-The Railway health check confirms that query listens, and it does not read
-compatibility. Also monitor `/readyz` on 9106 and 9107, and
-`zinder_readiness_served_epoch_age_seconds`, which is the only signal of a
-[node outage](../reference/readiness.md#during-a-node-outage). A compatibility
-process that exits, or is not ready within the serving deadline, stops the
-container.
-
-For private scrape placement, lifecycle evidence, and coverage checks, follow
-[Measure a wallet-serving deployment](serving-census.md).
+Clients reach `<service>.railway.internal:9067` and `:9102` over Railway private IPv6. Because Railway's health check probes `9106` only, also monitor `/readyz` on `9106` and `9107` plus `zinder_readiness_served_epoch_age_seconds` ([Readiness](../reference/readiness.md#during-a-node-outage)). See [Measure a wallet-serving deployment](serving-census.md) for private Prometheus scraping.
 
 ## What a fresh sync looks like
 
-A fresh volume builds the chain store, then the wallet store, and serves
-wallets once both finish. Expect several hours without a serving port.
-The deploy log names each phase:
+Expect hours with serving ports closed on an empty volume. Key log lines:
 
 | Log line | Phase |
 | --- | --- |
-| `starting canonical construction` | Ingest is building the chain store. The line names the deadline. |
-| `starting wallet construction` | The projector is building the wallet store. |
-| `starting wallet serving with zinder-query and zinder-compat-lightwalletd` | Both readers are opening the stores. They share one fixed 30-minute deadline. With compatibility turned off, the line names `zinder-query` alone. |
-| `wallet serving is ready` | Native `WalletQuery` answers, and so does lightwalletd unless it is turned off. |
+| `starting canonical construction` | `zinder-ingest` building the chain store (prints deadline). |
+| `starting wallet construction` | `zinder-projector` building the wallet store. |
+| `starting wallet serving with zinder-query and zinder-compat-lightwalletd` | Readers opening stores (shared fixed 30-minute deadline; `zinder-query` only if compat disabled). |
+| `wallet serving is ready` | Serving listeners open. |
 
-While a phase waits, the log repeats that process's `/readyz` body every five
-minutes. A restart during a build discards it and starts over. Once both
-stores are built, a restart resumes from them. [Initial sync](initial-sync.md)
-describes each phase.
-
-From a shell in the container, such as `railway ssh`, check each process:
+While waiting, the active process's `/readyz` body is logged every 5 minutes. Inside `railway ssh`, inspect processes directly:
 
 ```bash
 curl --fail-with-body -sS http://127.0.0.1:9105/readyz   # ingest
@@ -228,142 +125,44 @@ curl --fail-with-body -sS http://127.0.0.1:9106/readyz   # query
 curl --fail-with-body -sS http://127.0.0.1:9107/readyz   # lightwalletd compatibility
 ```
 
+See [Initial sync](initial-sync.md) for construction mechanics.
+
 ## Private backups
 
-[Back up and restore a wallet-serving indexer](private-backups.md) covers
-coherent capture, off-host storage, and replacement on a fresh volume.
+See [Backups and Edge Snapshots](private-backups.md) for coherent capture, verification, and replacement on a fresh volume.
 
 ## Failure handling
 
-The entrypoint watches every process and its `/readyz`. When an enabled
-wallet reader answers HTTP 200, the entrypoint also calls `grpc.health.v1.Health/Check`
-on that reader's serving socket. A non-serving reply counts as an answered
-unready poll. A connection failure or a missed reply counts as an unreachable
-listener. When a budget expires, the entrypoint exits non-zero, and the
-platform's restart policy starts a clean set.
+The entrypoint polls `/readyz` on each process and `grpc.health.v1.Health/Check` on enabled readers. When a failure budget expires, the entrypoint exits non-zero so the platform restarts a clean set.
 
-| Symptom | Cause | What the container does | Action |
+| Symptom | Cause | Container behavior | Action |
 | --- | --- | --- | --- |
-| A build phase outlives its deadline | The build is slower than the deadline | Logs the last `/readyz` body and exits | Raise the deadline variable. A restarted build starts over. |
-| A process exits | Crash or configuration error | Exits | Read the process's error in the log. |
-| `/readyz` reports `schema_mismatch` or `node_capability_missing` | Incompatible store, or a pruned or incapable node | Exits at once | Use empty paths for a new schema, or an archive node. |
-| A process stays unready for an hour | Lag or a fault that did not clear | Exits | Read the logged `/readyz` body. |
-| A process flaps between ready and unready | Repeated short faults | Exits after six unready episodes, or 900 seconds unready in total, without 10 ready minutes in a row | Read the logged episodes. |
-| Ingest cannot reach its node | Node outage | Keeps serving stored data. Logs the outage once when it starts and once when it ends. Exits after 24 hours of active outage time. | Restore the node. After a restart, the container serves nothing until a node answers, because ingest needs one to start. |
-| Ingest reports `upstream_not_ready`, for example while the node resyncs | The node answers but is not synchronized | Keeps serving stored data with no time limit | Wait for the node. |
-| Query and compatibility refuse wallets with `REORG_WINDOW_EXCEEDED` | The node replaced more blocks than the reorg window, `ZINDER_INGEST__REORG_WINDOW_BLOCKS`, default 1000. Ingest parks. | Stays up and keeps the typed refusal | Look for a replaced or misbehaving node, then rebuild. Do not redeploy otherwise: ingest parks again on the same reorg. |
-| Ingest, query, and compatibility report `canonical_store_damaged` | Ingest found a stored row of the canonical store that fails verification and logged it as `tree_state_verification_mismatch`. | Stays up, and query and compatibility refuse wallets with `SERVICE_NOT_READY` | Rebuild the canonical store. Do not redeploy otherwise: ingest reports the recorded damage again and confirms it on the next start. |
-| Query and compatibility report `canonical_store_damaged` without a height | Ingest cannot read its verification record and logged `tree_state_verification_record_unreadable`. | Stays up, refuses wallets, and verifies every settled row at once | Wait for the cycle to pass, which clears the cause, or rebuild the canonical store. |
-| Projector reports `wallet_transition_limit_exceeded` | See [below](#wallet-transition-exceeds-its-logical-byte-limit) | Stays up | Raise the limit and redeploy. |
-| Query logs `wallet_serving_pair_table_file_missing` | Compaction deleted a file under an open read view. Query replaced the view and retried. | Stays up | None for an occasional warning. If it follows most blocks, check for `wallet_serving_pair_publisher_refresh_failed` and for bulk compactions. |
+| Build outlives deadline | Build slower than deadline | Logs last `/readyz` and exits | Raise deadline variable (build restarts from scratch). |
+| Process exits | Crash or invalid config | Exits | Inspect process error in log. |
+| `/readyz` reports `schema_mismatch` or `node_capability_missing` | Incompatible store or pruned/incapable node | Exits immediately | Use empty paths for a new schema, or an archive node. |
+| Process stays unready 1 hour | Lag or persistent fault | Exits | Read logged `/readyz` body. |
+| Process flaps ready/unready | Repeated short faults | Exits after 6 unready episodes or 900s total unready without 10 consecutive ready minutes | Inspect logged episodes. |
+| Ingest cannot reach node | Node outage | Keeps serving stored data; exits after 24 h active outage | Restore node (a restart cannot serve until a node answers). |
+| Ingest reports `upstream_not_ready` | Node syncing | Keeps serving stored data indefinitely | Wait for node. |
+| Readers refuse with `REORG_WINDOW_EXCEEDED` | Reorg deeper than `ZINDER_INGEST__REORG_WINDOW_BLOCKS` (default 1000) | Stays up serving typed refusal | Verify node chain, then rebuild on empty paths. |
+| Ingest/readers report `canonical_store_damaged` | Checkpoint row failed verification (`tree_state_verification_mismatch`) | Stays up; readers refuse with `SERVICE_NOT_READY` | Rebuild canonical store (or wait if `tree_state_verification_record_unreadable` clears after one cycle). |
+| Projector reports `wallet_transition_limit_exceeded` | Oversized atomic wallet transition | Stays up, parked | See [below](#wallet-transition-exceeds-its-logical-byte-limit). |
+| Query logs `wallet_serving_pair_table_file_missing` | Compaction removed a file under an open read view | Retries and replaces view | Ignore occasional warnings; check bulk compactions if frequent. |
 
-If ingest reports `syncing`, check the `ingest_control` entry in query's
-`/readyz`. A relayed `upstream_not_ready` means the node is answering and
-syncing. For a relayed `node_unavailable`, read `cause.syncing.wait_reason`
-on ingest. With `mempool_hydration_at_tip`, check the writer's connection
-to the node's mempool feed.
-With `canonical_progress`, inspect ingest's progress even if the reported
-heights match. Lag and block preparation use the one-hour tolerance and the
-recurrence budgets. The 24-hour clock pauses until ingest is back at the tip
-if the same mempool outage continues.
+When ingest reports `syncing`, check `ingest_control` in query's `/readyz`: `upstream_not_ready` means the node is syncing; `node_unavailable` with `wait_reason = mempool_hydration_at_tip` means the mempool feed is down (counts toward the 24-hour clock, pausing during `canonical_progress`).
 
-The image `HEALTHCHECK` runs `zinder-wallet-serving-healthcheck`. It passes
-when query and compatibility each return 200 from `/readyz` or serve the
-`reorg_window_exceeded` or `canonical_store_damaged` refusal. Both readers
-serve the same data, so either
-one failing fails the check. With compatibility turned off, the check reads
-query alone. It also passes while the projector is parked on its transition
-limit. A host that restarts unhealthy containers therefore does not restart
-into the same park. Its start period is 6 hours, which covers only the default
-deadlines. Lengthen it for a Mainnet build.
-
-On `SIGTERM`, the entrypoint signals compatibility, query, the projector, and
-ingest in that order, and they stop in parallel. Query and compatibility
-end gRPC calls still open after 10 seconds with `UNAVAILABLE`, and allow 2
-more seconds to deliver that status, so a slow block-range client cannot hold
-the shutdown open. The entrypoint waits 20 seconds, then exits non-zero and
-names any process still holding a store open.
+The image `HEALTHCHECK` (`zinder-wallet-serving-healthcheck`) passes when enabled readers return `200` on `/readyz`, serve `reorg_window_exceeded` / `canonical_store_damaged` refusals, or while the projector is parked on its transition limit (start period is 6 hours; lengthen for Mainnet builds). On `SIGTERM`, the entrypoint stops compat, query, projector, and ingest, ending open gRPC calls after 10s (+2s status grace) and waiting 20s before exiting non-zero.
 
 ### Wallet transition exceeds its logical-byte limit
 
-The projector applies wallet changes as atomic transitions, and refuses a
-transition that touches more wallet data than
-`projector.follow.max_transition_logical_bytes` allows. A deep reorg that
-rolls back and replays many blocks of a busy address can exceed it. The
-projector logs `wallet_projection_following_parked` once, with an error that
-begins:
+When a deep reorg or busy-address transition exceeds `projector.follow.max_transition_logical_bytes` (default `536870912`), the projector logs `wallet_projection_following_parked`, leaves the wallet unchanged, and reports `wallet_transition_limit_exceeded` (`required_bytes`, `configured_bytes`) on `/readyz`. Query and compat keep serving briefly, then return `SERVICE_NOT_READY` (and on restart the entrypoint skips starting readers).
 
-```text
-wallet following stopped planning a transition that already needs <n> logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows (<limit>)
-```
-
-The wallet is unchanged, and `<n>` is a lower bound. The projector stays up,
-parked, and its `/readyz` reports `wallet_transition_limit_exceeded` with
-`required_bytes` and `configured_bytes`. It keeps its place in the chain, so
-it resumes without a rebuild once the limit allows the transition. A running
-query or compatibility process keeps answering from its last view for a few
-blocks, then refuses wallets with `SERVICE_NOT_READY`. After a restart, the
-entrypoint starts neither reader behind the parked projector and logs
-`wallet readers not started`.
-
-To recover, set `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES` well
-above `<n>`, at most `1073741824`, and redeploy. The default is `536870912`.
-While it applies one transition, the projector's memory grows by up to about
-1.5 times the bytes the transition counts. Add at least 1.5 times the bytes
-you add to the limit to the container's memory. On Testnet, one 1,000-block reorg needed 796 MB, which the default
-refuses.
-
-If the limit is still too small, the projector parks again and the readers
-never start. If `<n>` already exceeds `1073741824`, no setting admits the
-transition. Rebuild the wallet in a second service with its own volume, move
-traffic to it once its `/readyz` returns 200, and retire this one.
+Recover by setting `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES` well above `required_bytes` (at most `1073741824`) and redeploying, adding `1.5x` the added byte delta to container RAM. If `required_bytes` exceeds `1073741824`, rebuild the wallet in a fresh service/volume and cut over.
 
 ## Serve the Explorer from the same volume
 
-The `zinder-wallet-serving-explorer` image adds `zinder-explorer`, which
-serves `ExplorerQuery` for explorer front ends. Ingest in this image also
-builds the Explorer views. Configure it exactly like `zinder-wallet-serving`,
-with the same volume, variables, and Railway settings:
-
-```text
-ghcr.io/zcashfoundation/zinder-wallet-serving-explorer:vX.Y.Z
-```
-
-| Port | Serves | Reachable from |
-| --- | --- | --- |
-| 9068 | `ExplorerQuery` gRPC, plaintext | The private network |
-| 9069 | Explorer ops | The private network |
-
-The Explorer reads `ZINDER_NETWORK__*`, `ZINDER_NODE__*`, and
-`ZINDER_EXPLORER__*` variables. It reads from `[node]` and not from the
-fallbacks. Give the container more than the 8 GB minimum and watch the
-volume, because memory and disk for the Explorer and its views are not
-measured.
-
-The container stops at startup if the Explorer configuration is invalid. The
-Explorer starts once wallet serving passes its health check and ingest admits
-the view store, or 10 minutes after that check passes. An Explorer failure
-does not stop wallet serving: the entrypoint restarts the Explorer after 15
-seconds, doubling the delay up to 5 minutes. The image `HEALTHCHECK` and the
-Railway health check cover wallet serving, so monitor the Explorer's `/readyz`
-on port 9069.
-
-Ingest pauses the views when the volume runs low on space, as
-[What it needs](../architecture/explorer-plane.md#what-it-needs) describes. Set
-`ZINDER_INGEST__EXPLORER_VIEWS=false` to stop the views from growing while you
-grow the volume, and the Explorer serves them as they last stood.
-
-To rebuild the views after a release that changes them, follow
-[Add the Explorer](deploying-on-a-vm.md#add-the-explorer). From a shell in the
-container, move the store with
-`mv /var/lib/zinder/canonical/materialized-views /var/lib/zinder/materialized-views.previous`,
-then restart the deployment.
+`ghcr.io/zcashfoundation/zinder-wallet-serving-explorer:vX.Y.Z` adds `zinder-explorer` (`ExplorerQuery` on port `9068`, ops on `9069`) with `ingest.explorer_views = true`. Use the same configuration plus `ZINDER_EXPLORER__*` variables (`[node]` only, no fallbacks) and add RAM/disk beyond the 8 GB minimum. Explorer starts after wallet serving is healthy (with independent restart backoff if it fails). Set `ZINDER_INGEST__EXPLORER_VIEWS=false` to pause view growth while resizing a volume. To rebuild views after a schema change, move `/var/lib/zinder/canonical/materialized-views` to `/var/lib/zinder/materialized-views.previous` and restart ([Add the Explorer](deploying-on-a-vm.md#add-the-explorer)).
 
 ## Chain-store-only diagnostic image
 
-Releases also publish `zinder-canonical-runtime`, which runs `zinder-ingest`
-alone. It builds and follows the chain store but serves no clients. Use it to
-check chain construction on a platform, not to serve wallets. The image takes
-every ingest setting, including the storage path under `/var/lib/zinder`,
-from `ZINDER_*` variables. Its ops port is
-9105, so set `PORT=9105` on Railway. Indexer TLS PEM variables work as above.
+`zinder-canonical-runtime` runs `zinder-ingest` alone for platform build checks (serves no clients; ops port `9105`, set `PORT=9105` on Railway). Accepts all `ZINDER_*` ingest and `*_PEM` TLS variables.

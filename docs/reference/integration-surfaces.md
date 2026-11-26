@@ -44,9 +44,9 @@ The Zcash Foundation runs these public endpoints, which any client can use:
 | lightwalletd `CompactTxStreamer` | `https://lwd.zfnd.org:443` | `https://testnet.lwd.zfnd.org:443` |
 | Native `WalletQuery`, including `zinder-client` | `https://zinder.zfnd.org:443` | `https://testnet.zinder.zfnd.org:443` |
 
-Each address is a gRPC endpoint over TLS, not a website. Give it to a gRPC client, such as a wallet, `grpcurl`, or `zinder-client`. A browser that opens it gets an empty 404 response.
+Each address is a gRPC endpoint over TLS, not a website. Give it to a gRPC client, such as a wallet, `grpcurl`, or `zinder-client`; browser requests return an empty 404 response.
 
-On the Foundation's Mainnet endpoints, wallets behind one public IPv4 address share bandwidth. The lightwalletd gateway also limits how quickly it accepts new calls. If it rejects a read during a burst, it returns the gRPC status `UNAVAILABLE` (14). Honor the delay in `grpc-retry-pushback-ms` when the response includes it. Otherwise, retry the read with exponential backoff.
+On the Foundation's Mainnet endpoints, wallets behind one public IPv4 address share bandwidth, and `GetBlockRangeNullifiers` has burst/rate limits. NGINX admission refusals return trailers-only gRPC `UNAVAILABLE` (14) without a numeric retry delay on current configs. Retry **read** RPCs with exponential backoff (honoring `grpc-retry-pushback-ms` if a response includes it), and **do not automatically retry transaction submission (`SendTransaction` or `BroadcastTransaction`)** without first checking transaction status or idempotency.
 
 ## What every client must handle
 
@@ -57,7 +57,7 @@ On the Foundation's Mainnet endpoints, wallets behind one public IPv4 address sh
 **Capability discovery.** On connect, call `ServerInfo` and check three things:
 
 1. `network` is exactly `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`, matching what you expect.
-2. `contract_revision` is at least the revision your client was built for. `zinder-client` requires 8.
+2. `contract_revision` is at least the revision your client was built for. `zinder-client` requires 8 (v0.26.0 native servers advertise 15).
 3. Every capability string your client depends on is present. Strings match exactly. [Capabilities](capabilities.md) lists them.
 
 On `zinder-query`, a method whose capability is absent fails with `FAILED_PRECONDITION` and `ENDPOINT_CAPABILITY_UNAVAILABLE`. On `zinder-explorer`, a method whose backing store or `WalletQuery` endpoint is not configured fails with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`. The `node` field describes the node that broadcasts transactions and can change while the server runs, so read it from a fresh `ServerInfo` instead of caching it.
@@ -130,7 +130,7 @@ This quickstart builds a small program that connects to a native endpoint, confi
    ```bash
    cargo new zinder-quickstart
    cd zinder-quickstart
-   cargo add 'zinder-client@=0.23.0'
+   cargo add 'zinder-client@=0.26.0'
    cargo add tokio --features macros,rt-multi-thread
    ```
 
@@ -193,7 +193,7 @@ This quickstart builds a small program that connects to a native endpoint, confi
    The program prints the server identity and three values from one snapshot. This output is from a Mainnet endpoint:
 
    ```text
-   zinder-query 0.23.0 on ZcashMainnet, contract revision 14
+   zinder-query 0.26.0 on ZcashMainnet, contract revision 15
    chain epoch 1499
    visible tip height 3604138
    settled tip height 3603138
@@ -219,9 +219,10 @@ The URL scheme selects the transport. An `http://` endpoint uses plaintext HTTP/
 
 ### Beyond the quickstart
 
-- `ChainIndex` holds stored reads. `snapshot()` captures one chain epoch and pins every later read through the snapshot to it. `OwnedChainSnapshot` does the same over an `Arc` for a view that must be cloneable and `'static`.
+- `ChainIndex` holds stored reads. `snapshot()` issues a `VisibleTipBlock` RPC to capture one chain epoch and pins every later read through the snapshot to it (`OwnedChainSnapshot` wraps an `Arc` for a cloneable, `'static` view).
+- `CompactBlocksInRange` caps each stream at 1,000 blocks on v0.26.0 (`BLOCK_RANGE_TOO_LARGE` when wider). Pinned epochs stay readable for about 60 seconds after replacement, so long range walks must split into bounded chunks and refresh the snapshot from the start when `ChainEpochPinUnavailable` / `RetryPolicy::RefreshChainEpoch` occurs.
 - `EndpointBackedIndex` holds calls that need a live endpoint: `server_info`, broadcast, chain events, and mempool reads. Bound a generic handle as `T: ChainIndex + EndpointBackedIndex` when you need both.
-- Every `IndexerError` has a `retry_policy()`: `RefreshChainEpoch`, `RestartFromEarliestRetained`, `RetryWithBackoff`, `OperatorActionRequired`, or `ClientError`. Act on the policy rather than on the error text.
+- Every `IndexerError` has a `retry_policy()`: `RefreshChainEpoch`, `RestartFromEarliestRetained`, `RefreshMempoolSnapshot`, `RetryWithBackoff`, `OperatorActionRequired`, or `ClientError`. Act on the policy rather than on the error text.
 - The client checks the server's streams. A stream that breaks its contract, such as a repeated event cursor or a missing range header, fails with `IndexerError::MalformedResponse`. Reconnect from the last accepted cursor.
 
 To follow the chain, open a `ChainEvents` stream, store the cursor from each event, and resume from it after a disconnect. [Chain events](../architecture/chain-events.md#resume-with-a-cursor) describes the contract. The crate's examples in `crates/zinder-client/examples/`, `observe_transparent_address.rs` and `observe_mempool_to_confirmed.rs`, show the snapshot, subscribe, and reconnect pattern end to end. Run one from a Zinder checkout against a running query endpoint. It takes the endpoint, the network as `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`, and a transparent address to watch. This command uses the Compose Regtest port. Set `ADDRESS` to your own address first:

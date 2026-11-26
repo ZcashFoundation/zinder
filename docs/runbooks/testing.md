@@ -1592,12 +1592,7 @@ and paired throughput campaigns remain separate evidence, using
 
 ## Compare wallet correctness across releases
 
-The [wallet coverage matrix](../../scripts/wallet-clients/coverage-v0.22.0.md)
-records each wallet build, interface, fixture, action, observed RPCs, and wallet
-assertions. A successful restore can prove persisted history even when its
-receipt identifies only the endpoint. Field handling requires a wallet
-observation or an inspection of the pinned consumer. Keep native WalletQuery and
-lightwalletd observations under their respective interfaces.
+The [wallet coverage baseline](../../scripts/wallet-clients/coverage-v0.22.0.json) records each wallet build, interface, fixture, action, observed RPCs, and wallet assertions. A successful restore can prove persisted history even when its receipt identifies only the endpoint. Field handling requires a wallet observation or an inspection of the pinned consumer. Keep native WalletQuery and lightwalletd observations under their respective interfaces.
 
 Build the pinned Zingo CLI and Zkool example and generate the Python protobuf
 modules using the [client build instructions](../../scripts/wallet-clients/README.md#prerequisites).

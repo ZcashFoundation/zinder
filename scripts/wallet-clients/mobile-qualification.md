@@ -1,6 +1,6 @@
 # Qualify a signed wallet on Android or iOS
 
-Run one row per wallet build, platform, and network. The row identifies the signed product a user can install. The Zingo CLI, Zkool library, Vizor Rust engine, and Cake GraphQL engine have their own rows in the [release coverage matrix](coverage-v0.22.0.md).
+Run one row per wallet build, platform, and network. The row identifies the signed product a user can install. The Zingo CLI, Zkool library, Vizor Rust engine, and Cake GraphQL engine have their own rows in the [release coverage baseline](coverage-v0.22.0.json).
 
 ## Identify the build and chain
 

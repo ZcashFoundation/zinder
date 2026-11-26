@@ -1,182 +1,106 @@
 # Deploying Zinder
 
-This page takes an operator from an empty host to a running, verified Zinder
-deployment that serves wallets from your own node. It covers what you deploy,
-what the host needs, which deployment to choose, and a Docker Compose
-quickstart.
+This page takes an operator from an empty host to a running, verified Zinder deployment that serves wallets from your own Zcash node. It covers choosing a profile, choosing how to run it, host sizing, the canonical port matrix, and a Testnet Docker Compose quickstart.
 
-A deployment runs on one host and builds its stores from your node. Pin an
-exact release tag, and read each release's notes before you upgrade.
+Each deployment runs on one host (`rocksdb` topology) and builds its stores from your node. Pin an exact release tag, and read each release's notes before upgrading.
 
-## What you deploy
+<a id="choose-a-profile"></a>
 
-Zinder reads the chain from your Zcash node, stores it once, and serves it to
-wallets and applications. The single-host Compose deployment also runs a
-publisher that signs settled shielded ranges for the lightwalletd endpoint.
-`zinder-ingest` is the only process that writes the chain store, and `zinder-projector` is the only one that writes the
-wallet store. Native query and lightwalletd compatibility read both stores.
-The optional Explorer reads the chain store and the Explorer views that ingest
-writes, and it gets wallet data through native query. The
-[architecture overview](../architecture/overview.md) explains how they fit
-together.
+## Step 1: Choose a profile
 
-| Process | Serves | Port | Ops port |
+Select the profile that matches what your clients read. All profiles build complete canonical history from genesis unless configured with a checkpoint override.
+
+| Profile | Processes run | Mainnet disk | First sync (8 writer cores) | Transaction bodies & transparent reads |
+| --- | --- | --- | --- | --- |
+| **`wallet`** *(recommended production default)* | `zinder-ingest`, `zinder-projector`, `zinder-history-publisher`, `zinder-query`, `zinder-compat-lightwalletd` | ~123 GB | ~76 min | Local transparent index (`wallet` store); verified mined transaction bodies forwarded from your primary `[node]` and cached. |
+| **`light-wallet`** | `zinder-ingest`, `zinder-compat-lightwalletd` (plus optional `zinder-history-publisher`) | ~72 GB | ~49–60 min | No projector or `zinder-query`. Forwards transparent address reads and omitted transaction bodies to one archive node with transparent address indexes. |
+| **`wallet-archive`** | Same as `wallet` + all raw block & tx blobs | >392 GB (`wallet` + raw blocks + ~270 GB / ~251.1 GiB raw tx blobs) | ~76+ min | Sets `raw_blob_policy = "all"` for self-hosted raw transaction bodies and `FullBlocksInRange`. Omit `deployment.profile` and set `raw_blob_policy = "transactions"` (+~270 GB / ~251.1 GiB, ~392 GB total) if you only want raw transaction bodies. |
+
+To add the optional **Explorer** (`zinder-explorer` + `ingest.explorer_views = true` via `deploy/docker-compose.explorer.yml`), omit `deployment.profile` and configure `storage`, `ingest`, `wallet`, and `compat` explicitly (`zinder-ingest` rejects `ingest.explorer_views = true` when any `deployment.profile` is set).
+
+> [!WARNING]
+> **Check `raw_blob_policy` in shipped configs before your first sync.** The shipped `deploy/config/*.toml` files (`ingest.toml`, `projector.toml`, `query.toml`, `compat-lightwalletd.toml`, and `deploy/config/wallet-serving/ingest.toml`; `history-publisher.toml` also sets it for older binaries, though `publish-shielded-history` ignores it) still set `raw_blob_policy = "transactions"`, which adds **+251.1 GiB** on Mainnet. Because `ingest.toml` also sets `coverage = "wallet-serving"` (which rejects `raw_blob_policy = "none"` without a profile) and `deployment.profile` rejects conflicting explicit `raw_blob_policy` / `coverage` / `serving` keys, passing `ZINDER_DEPLOYMENT__PROFILE=wallet` or `ZINDER_STORAGE__RAW_BLOB_POLICY=none` over the unmodified shipped Compose TOMLs fails startup. To run the `wallet` profile without raw blobs in Compose or standalone binaries, set `deployment.profile = "wallet"` in your TOML files and remove `storage.raw_blob_policy`, `ingest.run_overrides.coverage`, and `compat.serving` before initial sync (note: `zinder-wallet-serving` currently strips `ZINDER_DEPLOYMENT__*` and retains `transactions` blobs unless custom configs are mounted). Changing raw-blob retention on an existing store requires a rebuild.
+
+See [Deployment profiles](../reference/configuration.md#deployment-profiles) for setting conflicts and [ADR-0023](../adrs/0023-deployment-profiles.md) for the design contract.
+
+<a id="choose-a-deployment"></a>
+
+## Step 2: Choose how to run it
+
+| Option | Pick it when | Guide |
+| --- | --- | --- |
+| **Docker Compose + systemd on a Linux VM** *(recommended production)* | You run a long-lived multi-process service on a VM you manage, or alongside a Z3/Zakura container stack. | [Testnet quickstart](#quickstart-with-docker-compose) below; [Deploying on a VM](deploying-on-a-vm.md) for systemd and production hardening |
+| **Single-volume container (`zinder-wallet-serving`)** | Your PaaS attaches one persistent volume to one container (such as Railway). | [Deploying the single-volume container](deploying-single-volume.md) |
+| **Standalone binaries** | You manage systemd units and OS packages directly without Docker. | [Run the release binaries without Docker](deploying-on-a-vm.md#run-the-release-binaries-without-docker) |
+| **Public Foundation endpoints** | You want to evaluate or integrate a client without operating an indexer. | [Integration surfaces](../reference/integration-surfaces.md#endpoints) |
+
+<a id="what-you-need"></a>
+
+## Step 3: Size your host
+
+You need an archive Zebra or Zakura node on the same network. Ingest reads every historical block and refuses a pruned node at startup. The certified node versions are **Zebra 7.1.0** and **Zakura 1.8.6**. For a Mainnet first sync, use a Zakura node that was not built with fast sync, because fast sync omits per-height commitment trees below its last checkpoint. Give the node its own disk on top of the Zinder storage below.
+
+### Private or standard Mainnet VM
+
+- **CPU:** 8+ vCPUs (`x86-64-v3` or `AArch64`). Wallet accumulators select AVX-512F/VL at run time when available and AVX2 otherwise; both produce identical store bytes. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
+- **RAM:** 32 GiB RAM. Keep the shipped `4g` `ZINDER_COMPAT_MEMORY_LIMIT` as an OOM guardrail. The shipped Mainnet Compose env files set container ceilings of `14g` (ingest), `10g` (projector), `4g` (query), `4g` (history-publisher), `4g` (compat), and `4g` (optional explorer). Give single-volume containers at least 8 GB.
+- **Disk:** Fast local SSD/NVMe formatted **`ext4 -O verity`** (so `zinder-history-publisher` can protect settled segments with Linux fs-verity). Reserve **260+ GB free** for `wallet` (~123 GB steady-state total, which already includes the ~20.9 GB / ~19.5 GiB signed `ZSHRNG01` catalog across 877 segments at Mainnet height 3,593,347 and growing, plus ~130 GB temporary sort spill headroom during initial wallet construction), or **550+ GB free** when retaining raw transaction blobs (+251.1 GiB; `wallet-archive` with `raw_blob_policy = "all"` needs additional space for raw blocks).
+
+### Public high-concurrency Mainnet endpoint
+
+- **CPU:** 8–16+ vCPUs. On Broadwell+/Zen+ `x86-64` (BMI2 + ADX) or `AArch64`, build images with `--build-arg ZINDER_PASTA_ASM=1` (or `ZINDER_PASTA_ASM=1` with Compose, or `--features pasta_curves/asm` with Cargo) for the faster Pasta field-arithmetic backend (~2–7% lower CPU and elapsed time on measured 2,000-block windows; the binary checks ADX at startup).
+- **RAM:** **64+ GiB RAM** and raise `ZINDER_COMPAT_MEMORY_LIMIT=32g` (or higher). Under cgroup v2, the `ZSHRNG01` signed-history catalog page cache (~20–21 GiB on Mainnet and growing) counts against the cgroup that first reads each page (`zinder-compat-lightwalletd` or `zinder-history-publisher`). Keeping compat's ceiling above the catalog plus working set avoids 5–7x page-cache thrashing and `wait_timeout` refusals under concurrent range syncs. Leave `ZINDER_QUERY_MEMORY_LIMIT` and `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` at `4g` (`zinder-query` uses `O_DIRECT` RocksDB and does not mount the catalog); validate cache residency with publisher activity included.
+- **Node feed:** Set `ZINDER_NODE__INDEXER_GRPC_ADDR` and set `source = "zebra-indexer-grpc"` in `deploy/config/ingest.toml` (`deploy/docker-compose.yml` does not forward `ZINDER_INGEST__SOURCE` from the environment; for standalone binaries, pass `ZINDER_INGEST__SOURCE=zebra-indexer-grpc`) to stream mempool events and fetch blocks as binary protobufs instead of polling the full mempool over JSON-RPC on every block.
+- **Edge proxy:** Put a TLS proxy with per-client connection, request, and stream limits in front of the listeners ([Exposing over TLS](exposing-over-tls.md)).
+
+### Testnet and Regtest baselines
+
+| Network | Compose memory ceilings (ingest / projector / query / publisher / compat) | First sync notes |
+| --- | --- | --- |
+| **Testnet** | `8g` / `6g` / `2g` / `2g` / `2g` | Fits the default construction deadlines (3 h canonical, 2 h wallet). |
+| **Regtest** | `2g` / `2g` / `1g` / `1g` / `1g` | Minutes from genesis. |
+
+<a id="what-you-deploy"></a>
+
+## Processes and canonical ports
+
+`zinder-ingest` is the only writer of the canonical store (and Explorer views when enabled), and `zinder-projector` is the only writer of the wallet store. `zinder-query`, `zinder-compat-lightwalletd`, and optional `zinder-explorer` open read-only RocksDB secondaries on the same filesystem. See the [architecture overview](../architecture/overview.md) for data flow.
+
+| Process | Role / serves | Serving port | Ops port |
 | --- | --- | --- | --- |
-| `zinder-ingest` | Nothing to clients. Reads the node and writes the chain store. | none | 9105 |
-| `zinder-projector` | Nothing to clients. Builds the wallet store. | none | 9110 |
-| `zinder-history-publisher` | Writes signed shielded ranges for lightwalletd. | none | none |
+| `zinder-ingest` | Reads the node, writes the canonical store and optional Explorer views. | none | 9105 |
+| `zinder-projector` | Builds and updates the wallet store. | none | 9110 |
+| `zinder-history-publisher` | Writes Ed25519-signed settled shielded ranges (`ZSHRNG01`) for lightwalletd. | none | none |
 | `zinder-query` | Native `WalletQuery` gRPC | 9102 | 9106 |
-| `zinder-compat-lightwalletd` | lightwalletd `CompactTxStreamer` gRPC | 9067 | 9107 |
-| `zinder-explorer` (optional) | `ExplorerQuery` gRPC | 9068 | 9069 |
+| `zinder-compat-lightwalletd` | lightwalletd `CompactTxStreamer` gRPC (and optional gRPC-Web) | 9067 | 9107 |
+| `zinder-explorer` *(optional)* | `ExplorerQuery` gRPC | 9068 | 9069 |
 
-Each ops port serves `/healthz`, `/readyz`, and `/metrics`. The two wallet
-gRPC ports also serve `grpc.health.v1.Health`, which a gRPC load balancer or a
-Kubernetes `grpc` probe can call directly; see
-[gRPC health](../reference/readiness.md#grpc-health) for the probe. These are
-the Mainnet ports. The Compose files add 10000 on Testnet and 20000 on Regtest, so
-the Testnet native query port is 19102. Compose publishes every port on host
-loopback only.
+Each ops port serves `/healthz`, `/readyz`, and `/metrics`. The serving gRPC ports also serve `grpc.health.v1.Health` ([gRPC health](../reference/readiness.md#grpc-health)).
 
-Compose also runs these private ports:
+These are the **Mainnet** ports. The shipped Compose env files add `+10000` on Testnet (for example, `19102` for `zinder-query`) and `+20000` on Regtest, and bind every published port to host loopback (`127.0.0.1`) only.
 
-| Port | Use | Published on the host |
+Compose also exposes these internal/observability ports:
+
+| Port | Use | Host publication |
 | --- | --- | --- |
-| 9100 | Ingest control API, used by the projector and the readers | No. Loopback inside the shared container network, same number on every network. |
-| 9101 | Projector control API | No. Loopback inside the shared container network, same number on every network. |
-| 9095 | Prometheus | Yes, on loopback. Testnet 19095, Regtest 29095. |
-| 3002 | Grafana, under the `observability` profile | Yes, on loopback. Testnet 13002, Regtest 23002. |
+| 9100 | Ingest control API (projector and readers) | Loopback inside the shared container network only (same on all networks). |
+| 9101 | Projector control API | Loopback inside the shared container network only (same on all networks). |
+| 9095 | Prometheus | Loopback (`19095` Testnet, `29095` Regtest). |
+| 3002 | Grafana (`--profile observability`) | Loopback (`13002` Testnet, `23002` Regtest). |
 
-## What you need
+<a id="quickstart-with-docker-compose"></a>
 
-You need an archive Zebra or Zakura node on the same network. Ingest reads
-every historical block, so it refuses a pruned node at startup. The certified
-node versions are Zebra 7.1.0 and Zakura 1.8.6. For a Mainnet first sync, use
-a Zakura node that was not built by fast sync, because fast sync does not
-store the per-height commitment trees below its last checkpoint. Give the node
-its own disk on top of the figures below.
+## Testnet Docker Compose quickstart
 
-| Network | Disk | Memory | First sync |
-| --- | --- | --- | --- |
-| Mainnet | About 465 GB in use, including Explorer views. Wallet construction also needs about 130 GB free for temporary files when it starts. | Compose container limits: ingest 14 GiB, projector 10 GiB, query 4 GiB, compatibility 4 GiB | Between about 6 and 16 hours. See the note below. |
-| Testnet | Not measured | Compose container limits: ingest 8 GiB, projector 6 GiB, query 2 GiB, compatibility 2 GiB | Not measured. A sparse build fits the default construction deadlines of 3 hours for the chain store and 2 hours for the wallet store. The every-block wallet-serving default has not been timed on Testnet. |
-| Regtest | Not measured | Compose container limits: 2, 2, 1, and 1 GiB | Not measured |
+This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](https://github.com/ZcashFoundation/z3) using Docker Engine, the Compose v2 plugin, `git`, `openssl`, `curl`, and `grpcurl`. For Zakura, use `deploy/.env.zakura-testnet` and follow [Attach a Zakura node](deploying-on-a-vm.md#attach-a-zakura-node) for step 1.
 
-The memory figures are the limits the shipped Compose env files set. They are
-ceilings. Actual usage varies. The publisher has its own container with an
-independent memory ceiling (`ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT`: `4 GiB` on
-Mainnet, `2 GiB` on Testnet, `1 GiB` on Regtest), decoupled from
-`ZINDER_COMPAT_MEMORY_LIMIT`. Give the single-volume container at
-least 8 GB. The release binaries need an x86-64-v3 or AArch64 CPU. On x86-64
-CPUs that report AVX-512F and AVX-512VL, the wallet accumulators hash with
-AVX-512 code selected at run time; other x86-64-v3 CPUs use AVX2. Both produce
-the same bytes, so stores and backups move freely between hosts.
-
-Reserve additional disk for signed history. In a single-host trial at Mainnet
-height 3,593,347, the 877 settled segments occupied 17.28 GiB on ext4 with
-fs-verity. Fresh sequential publication (`--workers 1`) took 8 min 40 s and
-140 CPU-seconds, reaching the publisher's 4 GiB cgroup limit, including file
-cache, with no OOM kills. By default `publish-shielded-history` builds segments
-across `min(available CPUs, 4)` `--workers` (up to `16`), bounding concurrent
-in-flight segment buffers and sharing the RocksDB secondary block cache while
-batching manifest commits during initial bulk catchup; both modes produce
-byte-identical segments and manifests. On memory-constrained or shared-disk
-hosts, verify parallel runs against your target cgroup limit or pass
-`--workers 1`.
-
-After a host page-cache reset, the wallet reader admitted all 877 segments and
-reached READY in 9.75 s, compared with 5.72 s for the canonical reader. At
-readiness it had read 1.30 GiB, used 0.66 CPU-seconds, and reached 537 MiB
-peak RSS and 1,218 open descriptors. These figures describe startup on a
-12,000-IOPS disk. Catalog growth and concurrent wallet traffic affect sizing.
-
-Under cgroup v2, `ZSHRNG01` catalog page cache (~20–21 GiB on Mainnet
-and growing) is charged to the cgroup that first populates each page, which
-can be the publisher or `zinder-compat-lightwalletd`. Raising
-`ZINDER_COMPAT_MEMORY_LIMIT` does not transfer publisher-owned charges;
-publisher memory pressure can still reclaim those pages. `zinder-query`
-does not mount the catalog.
-
-Keep `4 GiB` as an OOM guardrail on 16–32 GiB self-hosted VMs. On 64+ GiB
-public Mainnet endpoints serving high-concurrency range syncs, raise
-`ZINDER_COMPAT_MEMORY_LIMIT` (for example `32g` or higher) above the catalog
-size plus working set to reduce cache thrashing and related `wait_timeout`
-refusals. Validate cache residency with publisher activity included; a larger
-reader ceiling alone does not guarantee it.
-
-### Optional Pasta assembly backend
-
-The shipped images compile the portable Pasta field-arithmetic backend, which
-runs on every supported `x86-64-v3` (down to Haswell) and AArch64 CPU. Because
-`pasta_curves` selects its backend at compile time and its x86-64 assembly
-requires BMI2 and ADX, the portable default keeps ADX instructions out of
-release binaries. To build images with the faster assembly backend instead, pass
-`--build-arg ZINDER_PASTA_ASM=1` to the Docker build (including `zinder-bench`),
-set `ZINDER_PASTA_ASM=1` when building from source with Docker Compose, or pass
-`--features pasta_curves/asm` to a Cargo source build. The `x86-64-v3` release
-already requires BMI2 and OS support for XMM and YMM state. The assembly build
-additionally verifies ADX at startup and refuses to run on unsupported CPUs
-before opening storage. Each binary logs the backend it compiled (`portable`,
-`x86-64`, or `aarch64`) at startup.
-
-A paired comparison on two retained 2,000-block fixtures measured the x86-64
-backend at about 7% lower process CPU and 6% lower elapsed time on an
-Ironwood-heavy window, and about 2% lower on a Sapling-heavy window. Dense
-Pasta history, the AArch64 backend, and a full first sync have not been
-measured.
-
-The Mainnet disk figures come from separate observations, so do not add them
-up to get a peak:
-
-- About 465 GB is the volume in use on one deployment on v0.16.3, after both
-  stores were built.
-- About 310 GB is the staging size of one measured canonical build. Ingest
-  builds the chain store in a staging directory on the same volume and renames
-  it into place when it publishes.
-- About 130 GB is the free space that the projector's temporary sort files
-  need on the same volume when wallet construction starts.
-
-Peak disk use during a first sync has not been measured.
-
-Plan for up to about 16 hours for a Mainnet first sync. One measured build
-took about four hours for the chain store and more than two hours for the
-wallet store. Builds on earlier releases took about 16 hours in total. With 6
-hashing workers on 8 physical cores, the wallet-serving chain store, with a
-checkpoint at every height, reached READY in 1 h 51 min. Smaller hosts take longer; see
-[First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
-No full first sync, including the wallet store, has been timed on the current
-release.
-
-## Choose a deployment
-
-| Deployment | Pick it when | Runbook |
-| --- | --- | --- |
-| Docker Compose beside a node | You want to try Zinder, or run it on a host that already runs your node in Docker. | [Quickstart](#quickstart-with-docker-compose) below |
-| Docker Compose under systemd on a VM | You run a long-lived service on a VM you manage. This is the complete topology. | [Deploying on a VM](deploying-on-a-vm.md) |
-| Single-volume container | Your platform attaches one volume to one container, such as Railway. It runs ingest, the projector, and both wallet readers in one container and serves native `WalletQuery` and lightwalletd. | [Deploying the single-volume container](deploying-single-volume.md) |
-
-## Quickstart with Docker Compose
-
-This path runs Zinder on Testnet beside a Zebra node from the
-[Z3 stack](https://github.com/ZcashFoundation/z3). For a Zakura node, use
-`deploy/.env.zakura-testnet` and follow
-[Attach a Zakura node](deploying-on-a-vm.md#attach-a-zakura-node) instead of
-step 1.
-
-The steps use Docker Engine with the Compose v2 plugin, `git`, `openssl`,
-`curl`, and `grpcurl`. Step 4 runs the published release images. To build the
-images from source instead, see [Build from source](#build-from-source).
-
-1. Start a Zebra Testnet node with Z3, from your Z3 checkout, and wait until it
-   has synchronized:
+1. Start a Zebra Testnet node with Z3 and wait until it is synced (this creates the `z3-testnet` Docker network and `z3-testnet-cookie` volume):
 
    ```bash
    Z3_NETWORK=testnet docker compose up -d
    ```
 
-   Z3 creates the `z3-testnet` Docker network and the `z3-testnet-cookie`
-   volume. `deploy/.env.testnet` names both.
-
-2. Check out a Zinder release:
+2. Check out a Zinder release tag:
 
    ```bash
    git clone https://github.com/ZcashFoundation/zinder.git
@@ -184,9 +108,7 @@ images from source instead, see [Build from source](#build-from-source).
    git checkout vX.Y.Z
    ```
 
-3. Create the two control tokens and the publisher key on the host. The
-   Testnet env file uses the paths below. Keep the key and its catalog on
-   durable storage.
+3. Create the two control tokens and the shielded-history publisher key generation on the host:
 
    ```bash
    sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
@@ -198,7 +120,7 @@ images from source instead, see [Build from source](#build-from-source).
    sudo scripts/prepare-shielded-history.sh /srv/zinder-history/testnet/key-1
    ```
 
-4. Pull the release images for the tag you checked out, and start Zinder:
+4. Pull the signed release images for your tag and start Zinder (keep `--no-build` so Compose does not compile local images under the release tag; add `--profile observability` to also start Grafana on `13002`):
 
    ```bash
    export ZINDER_VERSION=vX.Y.Z
@@ -208,24 +130,9 @@ images from source instead, see [Build from source](#build-from-source).
      -f deploy/docker-compose.yml up -d --no-build
    ```
 
-   `ZINDER_VERSION` selects the signed release image of every runtime, such
-   as `ghcr.io/zcashfoundation/zinder-ingest:vX.Y.Z`. Use the tag you checked out, because each Compose file
-   matches the images of its own release. `pull` fails on a tag that was never
-   published. Keep `--no-build`: without it, Compose would build missing
-   images from source and label the result as the release.
+   Compose starts `zinder-ingest`, then `zinder-projector` and `zinder-history-publisher` once ingest is healthy, and then `zinder-query` and `zinder-compat-lightwalletd` once the projector is healthy.
 
-   Compose starts ingest first. It starts the projector only once ingest is
-   healthy. The publisher also starts at that point. The two wallet readers
-   start once the projector is healthy. A new generation serves canonical
-   ranges after the reader verifies the publisher's empty checkpoint. The
-   listener automatically adopts signed ranges as they become available.
-   See [Publish signed wallet history](deploying-on-a-vm.md#publish-signed-wallet-history)
-   for backup, key rotation, and recovery.
-   [Initial sync](initial-sync.md) describes each phase.
-
-5. Check readiness. Each command prints a JSON body that starts with
-   `{"status":"ready"` once that process serves traffic. Until then, `/readyz`
-   answers 503 with the reason, and `curl -f` exits non-zero:
+5. Check `/readyz` on each runtime (each prints `{"status":"ready",...}` once serving, or HTTP 503 while syncing):
 
    ```bash
    curl -fsS http://127.0.0.1:19105/readyz   # ingest
@@ -234,7 +141,7 @@ images from source instead, see [Build from source](#build-from-source).
    curl -fsS http://127.0.0.1:19107/readyz   # lightwalletd compatibility
    ```
 
-6. Make one native call and one lightwalletd call:
+6. Verify one native RPC and one lightwalletd RPC:
 
    ```bash
    grpcurl -plaintext -d '{}' 127.0.0.1:19102 \
@@ -243,62 +150,27 @@ images from source instead, see [Build from source](#build-from-source).
      cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
    ```
 
-   `ServerInfo` reports the network `zcash-testnet` and the service
-   `zinder-query`. `GetLightdInfo` reports `chainName` `test` and a
-   `blockHeight` close to your node's tip.
+   `ServerInfo` reports `network: "zcash-testnet"` and `zinder-query`; `GetLightdInfo` reports `chainName: "test"` and a `blockHeight` near your node's tip.
 
-The same Compose file also starts Prometheus on host port 19095. Add
-`--profile observability` to the commands in step 4 to start Grafana on 13002.
+<a id="build-from-source"></a>
 
 ### Build from source
 
-To run a checkout that has no published images, leave `ZINDER_VERSION` unset
-and run this command instead of step 4:
+To run an unreleased checkout instead of published images, leave `ZINDER_VERSION` unset (optionally export `ZINDER_PASTA_ASM=1` on supported CPUs) and run:
 
 ```bash
 docker compose --env-file deploy/.env.testnet \
   -f deploy/docker-compose.yml up -d --build
 ```
 
-Compose builds every image from the checkout and tags it `:local`.
+<a id="before-you-expose-it"></a>
 
 ## Before you expose it
 
-Wallet listeners serve plaintext gRPC, and TLS termination and client
-authentication belong in your proxy. Expose them only through that proxy, as
-[Exposing over TLS](exposing-over-tls.md) sets up. Compose
-publishes ports on host loopback, but any container on the node's Docker
-network can still reach the wallet and ops listeners. The
-[security boundary](../architecture/service-operations.md#security-boundary)
-lists what must stay private.
-
-## Optional pieces
-
-- **Binary indexer block source.** When your node exposes Zebra's indexer
-  gRPC listener (`node.indexer_grpc_addr`), setting
-  `ingest.source = "zebra-indexer-grpc"` (or `ZINDER_INGEST__SOURCE=zebra-indexer-grpc`)
-  switches historical block fetches from hex JSON-RPC batches to binary unary
-  `GetBlock` RPCs. Keep `node.json_rpc_addr` configured as well (and
-  `indexer_grpc_addr` set on every `[node_fallbacks.N]` entry), because tip,
-  tree-state, subtree-root, and health control-plane reads continue using JSON-RPC.
-- **Fallback nodes.** Ingest can switch to a second node when the first stops
-  answering, and broadcasts move to the next node. See
-  [Fail over to a second node](deploying-on-a-vm.md#fail-over-to-a-second-node)
-  and [node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover).
-- **Explorer.** `zinder-explorer` serves block, transaction, address, and
-  mempool views for explorer front ends. See
-  [Add the Explorer](deploying-on-a-vm.md#add-the-explorer) and the
-  [Explorer plane](../architecture/explorer-plane.md).
-- **Full blocks.** Wallets that scan whole blocks need
-  `storage.raw_blob_policy = "all"` on ingest and every reader before the
-  first sync. The shipped configuration stores transactions only, and
-  changing an existing store requires a rebuild. See the
-  [wallet data plane](../architecture/wallet-data-plane.md).
+Zinder listeners serve plaintext gRPC. Put TLS termination, authentication, and per-client rate/connection limits in front of them using [Exposing over TLS](exposing-over-tls.md). Keep operational, control, and observability ports private as listed in the [security boundary](../architecture/service-operations.md#security-boundary).
 
 ## What happens next
 
-The first sync builds the chain store and then the wallet store, and Zinder
-serves wallets once both finish. Do not restart a process during that build,
-because a restart starts it over.
-[Initial sync](initial-sync.md) describes each phase and what to watch.
-[Readiness](../reference/readiness.md) explains every `/readyz` state.
+- Do not restart `zinder-ingest` or `zinder-projector` while they are constructing their stores; a restart discards the unfinished build and starts over.
+- Follow construction progress and phases in [Initial sync](initial-sync.md) and `/readyz` causes in [Readiness](../reference/readiness.md).
+- For production VM setup with systemd, failover nodes, indexer mTLS, signed-history key rotation, or Explorer, continue to [Deploying on a VM](deploying-on-a-vm.md).
