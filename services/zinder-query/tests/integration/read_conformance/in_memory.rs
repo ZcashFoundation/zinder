@@ -568,6 +568,27 @@ impl CanonicalReader for InMemoryCanonicalReader {
         }))
     }
 
+    async fn mined_transactions(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<Vec<Option<IndexedTransaction>>, StorageReadError> {
+        Ok(transaction_ids
+            .iter()
+            .map(|transaction_id| {
+                let transaction = self.snapshot.transactions.get(transaction_id)?;
+                Some(IndexedTransaction {
+                    location: transaction.location,
+                    block_header: self
+                        .snapshot
+                        .blocks
+                        .get(&transaction.location.block_height.value())
+                        .map(|block| block.header.clone()),
+                    transaction_blob: self.retained_blob(transaction),
+                })
+            })
+            .collect())
+    }
+
     async fn transaction_blob_by_id(
         &self,
         transaction_id: TransactionId,

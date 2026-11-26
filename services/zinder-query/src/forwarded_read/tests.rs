@@ -926,3 +926,189 @@ async fn a_zero_byte_cache_keeps_nothing() -> Result<()> {
     assert_eq!(node.calls().len(), 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn point_transaction_lookup_bypasses_queued_history_flight_and_shares_verified_cache()
+-> Result<()> {
+    let mut node = TransactionNode::start(true, mined_reply)?;
+    let source = node.source()?;
+    let limit = ForwardedReadLimit::new(ForwardedReadConfig::resolve(
+        Some(4),
+        Some(80),
+        Some(4),
+        None,
+    )?);
+    let held_a = limit
+        .node_call_slot(ForwardedReadKind::History, limit.deadline())
+        .await?;
+    let held_b = limit
+        .node_call_slot(ForwardedReadKind::History, limit.deadline())
+        .await?;
+    let target = mined(0x21, &[0x55]);
+
+    let queued_history = tokio::spawn({
+        let (limit, source) = (limit.clone(), source.clone());
+        async move {
+            limit
+                .mined_transaction_bytes(
+                    &source,
+                    target,
+                    ForwardedReadKind::History,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while limit.node_call_counts(ForwardedReadKind::History) != (2, 1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let point_bytes = limit
+        .mined_transaction_bytes(
+            &source,
+            target,
+            ForwardedReadKind::Transaction,
+            Instant::now() + Duration::from_millis(40),
+        )
+        .await?;
+    assert_eq!(point_bytes.as_ref(), [0x55]);
+    let history_bytes = tokio::time::timeout(Duration::from_secs(2), queued_history).await???;
+    assert_eq!(history_bytes.as_ref(), [0x55]);
+    assert_eq!(node.calls().len(), 1);
+    assert_eq!(limit.node_call_counts(ForwardedReadKind::History), (2, 0));
+    drop((held_a, held_b));
+
+    assert_uncached_point_lookup_bypasses_queued_history(&source).await
+}
+
+async fn assert_uncached_point_lookup_bypasses_queued_history(
+    source: &ZebraJsonRpcSource,
+) -> Result<()> {
+    let uncached = ForwardedReadLimit::new(ForwardedReadConfig::resolve(
+        Some(4),
+        Some(60),
+        Some(4),
+        Some(0),
+    )?);
+    let held_a = uncached
+        .node_call_slot(ForwardedReadKind::History, uncached.deadline())
+        .await?;
+    let held_b = uncached
+        .node_call_slot(ForwardedReadKind::History, uncached.deadline())
+        .await?;
+    let target = mined(0x22, &[0x55]);
+    let queued_history = tokio::spawn({
+        let (limit, source) = (uncached.clone(), source.clone());
+        async move {
+            limit
+                .mined_transaction_bytes(
+                    &source,
+                    target,
+                    ForwardedReadKind::History,
+                    limit.deadline(),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while uncached.node_call_counts(ForwardedReadKind::History) != (2, 1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let point_bytes = uncached
+        .mined_transaction_bytes(
+            source,
+            target,
+            ForwardedReadKind::Transaction,
+            uncached.deadline(),
+        )
+        .await?;
+    assert_eq!(point_bytes.as_ref(), [0x55]);
+    let history_refused = queued_history.await?;
+    assert!(matches!(
+        history_refused,
+        Err(ForwardedTransactionError::Refused(refused)) if refused.kind() == "history"
+    ));
+    drop((held_a, held_b));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unrelated_cache_insertions_preserve_arrival_order_for_waiting_lookup() -> Result<()> {
+    let mut node = TransactionNode::start(true, mined_reply)?;
+    let source = node.source()?;
+    let limit = ForwardedReadLimit::new(ForwardedReadConfig::resolve(
+        Some(4),
+        Some(5_000),
+        Some(4),
+        None,
+    )?);
+    let held_a = limit
+        .node_call_slot(ForwardedReadKind::History, limit.deadline())
+        .await?;
+    let held_b = limit
+        .node_call_slot(ForwardedReadKind::History, limit.deadline())
+        .await?;
+    let older = tokio::spawn({
+        let (limit, source) = (limit.clone(), source.clone());
+        async move {
+            limit
+                .mined_transaction_bytes(
+                    &source,
+                    mined(0x31, &[0x55]),
+                    ForwardedReadKind::History,
+                    limit.deadline(),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while limit.node_call_counts(ForwardedReadKind::History) != (2, 1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let younger = tokio::spawn({
+        let limit = limit.clone();
+        async move {
+            limit
+                .node_call_slot(ForwardedReadKind::History, limit.deadline())
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while limit.node_call_counts(ForwardedReadKind::History) != (2, 2) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    for unrelated in [0x32, 0x33] {
+        let bytes = limit
+            .mined_transaction_bytes(
+                &source,
+                mined(unrelated, &[0x55]),
+                ForwardedReadKind::Transaction,
+                limit.deadline(),
+            )
+            .await?;
+        assert_eq!(bytes.as_ref(), [0x55]);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    drop(held_a);
+    let older_bytes = tokio::time::timeout(Duration::from_secs(2), older).await???;
+    assert_eq!(older_bytes.as_ref(), [0x55]);
+    let younger_slot = tokio::time::timeout(Duration::from_secs(2), younger).await???;
+    drop((younger_slot, held_b));
+    assert_eq!(node.calls().len(), 3);
+    assert_eq!(limit.node_call_counts(ForwardedReadKind::History), (0, 0));
+    Ok(())
+}

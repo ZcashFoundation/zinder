@@ -1,0 +1,6 @@
+kind: changed
+body: Batched canonical transaction-location, retained-blob, and block-header multi-get lookups and pipelined up to 8 concurrent `ForwardedReadKind::History` cold raw-transaction fetches per stream in wallet-mode `GetTaddressTxids` and `GetTaddressTransactions`, preserving canonical `(block_height, tx_index)` wire order, SHA-256 digest verification, `GetTransaction` slot reservations, and immediate cancellation on client disconnect or serving-pair revocation.
+time: 2026-11-26T10:42:10Z
+custom:
+    Bump: patch
+    PR: "632"

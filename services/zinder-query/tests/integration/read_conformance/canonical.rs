@@ -249,6 +249,13 @@ pub(crate) async fn mined_transactions_are_found_or_proven_absent<H: ReaderHarne
         .await?
         .ok_or_else(|| eyre!("an unretained transaction must still be found"))?;
     assert_eq!(transaction.transaction_blob, None);
+    let batched = reader
+        .mined_transactions(&[never_mined(), mined, mined])
+        .await?;
+    assert_eq!(
+        batched,
+        vec![None, Some(transaction.clone()), Some(transaction)]
+    );
     Ok(())
 }
 

@@ -70,6 +70,13 @@ fn keys_read(store: &RocksDbCanonicalStore) -> u64 {
         .get_ticker_count(Ticker::NumberKeysRead)
 }
 
+fn multiget_keys_read(store: &RocksDbCanonicalStore) -> u64 {
+    store
+        .bounded_open
+        .statistics
+        .get_ticker_count(Ticker::NumberMultigetKeysRead)
+}
+
 /// Writes `location` over its transaction's location row, as store damage would.
 fn overwrite_location_row(
     store: &RocksDbCanonicalStore,
@@ -343,5 +350,51 @@ fn a_by_id_read_reads_the_location_row_once() -> TestResult {
     let before = keys_read(&store);
     store.transaction_location_and_blob_or_proven_absence(never_mined())?;
     assert_eq!(keys_read(&store) - before, 1);
+    Ok(())
+}
+
+#[test]
+fn batched_locations_blobs_and_headers_preserve_request_order_and_skip_unretained_blobs()
+-> TestResult {
+    let temporary = TempDir::new()?;
+    let retained_store = store_at(
+        &temporary.path().join("retained"),
+        RawBlobRetention::Transactions,
+    )?;
+    let requested = [mined_at(4), never_mined(), mined_at(2), mined_at(4)];
+    let retained_before = multiget_keys_read(&retained_store);
+    let batched = retained_store.transaction_locations_and_blobs(&requested)?;
+    assert_eq!(multiget_keys_read(&retained_store) - retained_before, 7);
+    let individual = requested
+        .iter()
+        .map(|id| retained_store.transaction_location_and_blob(*id))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(batched, individual);
+
+    let heights = [
+        BlockHeight::new(4),
+        BlockHeight::new(99),
+        BlockHeight::new(2),
+        BlockHeight::new(4),
+    ];
+    let batched_headers = retained_store.block_headers_at(&heights)?;
+    let individual_headers = heights
+        .iter()
+        .map(|height| retained_store.block_header_at(*height))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(batched_headers, individual_headers);
+
+    let lean_store = store_at(&temporary.path().join("lean"), RawBlobRetention::None)?;
+    let point_before = keys_read(&lean_store);
+    let multiget_before = multiget_keys_read(&lean_store);
+    let lean_batch = lean_store.transaction_locations_and_blobs(&[mined_at(3), mined_at(2)])?;
+    assert_eq!(keys_read(&lean_store) - point_before, 0);
+    assert_eq!(multiget_keys_read(&lean_store) - multiget_before, 2);
+    assert_eq!(lean_batch.len(), 2);
+    assert!(
+        lean_batch
+            .iter()
+            .all(|entry| matches!(entry, Some((_, None))))
+    );
     Ok(())
 }

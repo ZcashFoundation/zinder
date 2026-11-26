@@ -32,10 +32,11 @@ use zinder_core::{
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    ArtifactKey, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError, SubtreeRoots,
-    TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
+    ArtifactKey, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, PendingTransaction, QueryError,
+    SubtreeRoots, TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransactionsInOrder,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
+    address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
 use zinder_source::{NodeCapability, SourceError};
@@ -1249,10 +1250,7 @@ where
         request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
         let history = self.transparent_history(&request.into_inner()).await?;
-        Ok(Response::new(spawn_response_stream(
-            history,
-            TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY,
-        )))
+        Ok(Response::new(history.into_stream()))
     }
 
     type GetTaddressTransactionsStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -1262,10 +1260,7 @@ where
         request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTransactionsStream>, Status> {
         let history = self.transparent_history(&request.into_inner()).await?;
-        Ok(Response::new(spawn_response_stream(
-            history,
-            TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY,
-        )))
+        Ok(Response::new(history.into_stream()))
     }
 
     async fn get_taddress_balance(
@@ -1477,19 +1472,66 @@ fn spawn_response_stream<Source: ResponseSource>(
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(queued_messages))
 }
 
-/// One transparent address's mined transactions at one chain epoch, read a
-/// page of history entries at a time and one transaction at a time.
+/// One transparent address's mined transactions at one chain epoch.
+///
+/// Pages of history entries are read one at a time, with up to
+/// [`TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY`] transaction reads in flight
+/// or buffered ahead of the client.
 struct TransparentHistory<QueryApi> {
     query_api: QueryApi,
     request: TransparentAddressTxIdsInRangeRequest,
     at_epoch_id: ChainEpochId,
-    page: std::vec::IntoIter<TransparentAddressTxIndexArtifact>,
+    transactions: TransactionsInOrder,
     has_later_pages: bool,
+}
+
+type HistoryPermit = tokio::sync::mpsc::OwnedPermit<Result<lightwalletd::RawTransaction, Status>>;
+
+struct HistoryPipeline {
+    in_flight: futures_util::stream::FuturesOrdered<PendingHistoryRow>,
+    refill: Option<zinder_query::CanonicalRefill>,
+    permits: Vec<HistoryPermit>,
+}
+
+struct PendingHistoryRow {
+    permit: Option<HistoryPermit>,
+    pending: PendingTransaction,
+}
+
+impl PendingHistoryRow {
+    const fn new(permit: HistoryPermit, pending: PendingTransaction) -> Self {
+        Self {
+            permit: Some(permit),
+            pending,
+        }
+    }
+}
+
+impl Future for PendingHistoryRow {
+    type Output = (HistoryPermit, Result<lightwalletd::RawTransaction, Status>);
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let std::task::Poll::Ready(outcome) = Pin::new(&mut self.pending).poll(cx) else {
+            return std::task::Poll::Pending;
+        };
+        let message = outcome
+            .map_err(|error| forwarded_read_status(&error))
+            .and_then(|response| {
+                raw_transaction_from_mined(mined_transaction_from_status(response.status)?)
+            });
+        let Some(permit) = self.permit.take() else {
+            return std::task::Poll::Pending;
+        };
+        std::task::Poll::Ready((permit, message))
+    }
 }
 
 impl<QueryApi> TransparentHistory<QueryApi>
 where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
     async fn start(
         query_api: QueryApi,
@@ -1500,7 +1542,7 @@ where
             query_api,
             request,
             at_epoch_id,
-            page: Vec::new().into_iter(),
+            transactions: TransactionsInOrder::empty(),
             has_later_pages: true,
         };
         history.read_page().await?;
@@ -1513,45 +1555,176 @@ where
             .transparent_address_tx_ids_in_range(self.request.clone(), Some(self.at_epoch_id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        self.page = response.artifacts.into_iter();
         self.has_later_pages = response.next_cursor.is_some();
         self.request.from_cursor = response.next_cursor;
+        if response.artifacts.is_empty() {
+            self.transactions = TransactionsInOrder::empty();
+            return Ok(());
+        }
+        let transaction_ids: Vec<TransactionId> = response
+            .artifacts
+            .into_iter()
+            .map(|artifact: TransparentAddressTxIndexArtifact| artifact.transaction_id)
+            .collect();
+        self.transactions = self
+            .query_api
+            .transactions_in_order(transaction_ids, Some(self.at_epoch_id))
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
         Ok(())
     }
 
-    async fn read_transaction(
-        &self,
-        transaction_id: TransactionId,
-    ) -> Result<lightwalletd::RawTransaction, Status> {
-        let response = self
-            .query_api
-            .transaction(transaction_id, Some(self.at_epoch_id))
-            .await
-            .map_err(|error| forwarded_read_status(&error))?;
-        raw_transaction_from_mined(mined_transaction_from_status(response.status)?)
+    fn into_stream(mut self) -> GrpcStream<lightwalletd::RawTransaction> {
+        if !self.transactions.has_remaining() && !self.has_later_pages {
+            return Box::pin(stream::empty());
+        }
+        let (messages, queued_messages) =
+            tokio::sync::mpsc::channel(TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            self.stream_into(messages).await;
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(queued_messages))
     }
-}
 
-impl<QueryApi> ResponseSource for TransparentHistory<QueryApi>
-where
-    QueryApi: WalletQueryApi + Send + Sync + 'static,
-{
-    type Message = lightwalletd::RawTransaction;
-
-    async fn next(&mut self) -> Option<Result<Self::Message, Status>> {
+    async fn stream_into(
+        &mut self,
+        messages: tokio::sync::mpsc::Sender<Result<lightwalletd::RawTransaction, Status>>,
+    ) {
+        let mut pipeline = HistoryPipeline {
+            in_flight: futures_util::stream::FuturesOrdered::new(),
+            refill: None,
+            permits: Vec::with_capacity(TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY),
+        };
         loop {
-            if let Some(artifact) = self.page.next() {
-                return Some(self.read_transaction(artifact.transaction_id).await);
+            let window_cap = self.max_window();
+            self.fill_window(&messages, window_cap, &mut pipeline);
+            if pipeline.in_flight.is_empty()
+                && pipeline.refill.is_none()
+                && !self.transactions.has_remaining()
+            {
+                if !self.has_later_pages {
+                    return;
+                }
+                if !self.advance_page(&messages, &mut pipeline.permits).await {
+                    return;
+                }
+                continue;
             }
-            if !self.has_later_pages {
-                return None;
-            }
-            if let Err(status) = self.read_page().await {
-                self.has_later_pages = false;
-                return Some(Err(status));
+            let need_permit = pipeline.in_flight.len() + pipeline.permits.len() < window_cap
+                && pipeline.permits.is_empty()
+                && (self.transactions.can_take_ready()
+                    || (pipeline.refill.is_none() && self.transactions.needs_refill()));
+            tokio::select! {
+                biased;
+                () = messages.closed() => return,
+                completed = pipeline.in_flight.next(), if !pipeline.in_flight.is_empty() => {
+                    if let Some((permit, message)) = completed {
+                        let is_terminal = message.is_err();
+                        permit.send(message);
+                        if is_terminal {
+                            return;
+                        }
+                    }
+                }
+                completed_refill = poll_optional_refill(&mut pipeline.refill), if pipeline.refill.is_some() => {
+                    self.transactions.apply_refill(completed_refill);
+                }
+                reserved = messages.clone().reserve_owned(), if need_permit => {
+                    let Ok(permit) = reserved else {
+                        return;
+                    };
+                    pipeline.permits.push(permit);
+                }
             }
         }
     }
+
+    fn max_window(&self) -> usize {
+        if !self.transactions.has_remaining() {
+            return 0;
+        }
+        self.transactions
+            .max_in_flight()
+            .clamp(1, TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY)
+    }
+
+    fn fill_window(
+        &mut self,
+        messages: &tokio::sync::mpsc::Sender<Result<lightwalletd::RawTransaction, Status>>,
+        window_cap: usize,
+        pipeline: &mut HistoryPipeline,
+    ) {
+        while pipeline.in_flight.len() < window_cap && self.transactions.has_remaining() {
+            while pipeline.in_flight.len() + pipeline.permits.len() < window_cap {
+                let Ok(permit) = messages.clone().try_reserve_owned() else {
+                    break;
+                };
+                pipeline.permits.push(permit);
+            }
+            if pipeline.permits.is_empty() {
+                break;
+            }
+            let ready = self.transactions.take_ready(pipeline.permits.len());
+            if !ready.is_empty() {
+                let started = ready.len();
+                for (permit, pending) in pipeline.permits.drain(..started).zip(ready) {
+                    pipeline
+                        .in_flight
+                        .push_back(PendingHistoryRow::new(permit, pending));
+                }
+                continue;
+            }
+            if pipeline.refill.is_none() && self.transactions.needs_refill() {
+                pipeline.refill = self.transactions.start_refill(pipeline.permits.len());
+            }
+            break;
+        }
+        if !self.transactions.has_remaining() {
+            pipeline.permits.truncate(usize::from(self.has_later_pages));
+        }
+    }
+
+    async fn advance_page(
+        &mut self,
+        messages: &tokio::sync::mpsc::Sender<Result<lightwalletd::RawTransaction, Status>>,
+        permits: &mut Vec<HistoryPermit>,
+    ) -> bool {
+        let permit = if let Some(permit) = permits.pop() {
+            permit
+        } else {
+            let Ok(permit) = messages.clone().reserve_owned().await else {
+                return false;
+            };
+            permit
+        };
+        let page_outcome = tokio::select! {
+            biased;
+            () = messages.closed() => return false,
+            outcome = self.read_page() => outcome,
+        };
+        match page_outcome {
+            Ok(()) => {
+                permits.push(permit);
+                true
+            }
+            Err(status) => {
+                self.has_later_pages = false;
+                permit.send(Err(status));
+                false
+            }
+        }
+    }
+}
+
+async fn poll_optional_refill(
+    refill: &mut Option<zinder_query::CanonicalRefill>,
+) -> zinder_query::CompletedCanonicalRefill {
+    let Some(active) = refill.as_mut() else {
+        return std::future::pending().await;
+    };
+    let completed = active.await;
+    *refill = None;
+    completed
 }
 
 trait SubtreeRootReads: Send + Sync + 'static {

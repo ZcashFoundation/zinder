@@ -41,6 +41,7 @@ mod native_wallet_endpoint_capabilities;
 mod node_broadcast;
 #[cfg(test)]
 mod observed_canonical_reader;
+mod ordered_transactions;
 pub use light_wallet::{LightWalletNodeQuery, VerifiedNodeTarget};
 mod rocksdb_serving_readers;
 mod serving_read;
@@ -84,6 +85,9 @@ pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
 pub use node_broadcast::OrderedBroadcaster;
+pub use ordered_transactions::{
+    CanonicalRefill, CompletedCanonicalRefill, PendingTransaction, TransactionsInOrder,
+};
 pub use rocksdb_serving_readers::MinedTransactionDigest;
 pub use rocksdb_serving_readers::{RocksDbCanonicalReader, RocksDbWalletReader};
 pub use serving_readers::{
@@ -343,6 +347,38 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError>;
+
+    /// Opens an ordered reader for `transaction_ids` at `at_epoch_id`.
+    ///
+    /// Canonical locations, block headers, and retained bodies are read in
+    /// bounded multi-get batches, and uncached cold bodies are fetched as
+    /// independent [`PendingTransaction`] futures charged to
+    /// [`ForwardedReadKind::History`].
+    ///
+    /// The default implementation resolves the current visible epoch once when
+    /// `at_epoch_id` is `None` and starts [`Self::transaction`] futures pinned
+    /// to that single epoch on demand as the caller polls
+    /// [`TransactionsInOrder`], never materializing more transaction bodies than
+    /// the caller's batch capacity. An implementation that wraps another should
+    /// forward this method to keep batched canonical reads active.
+    async fn transactions_in_order(
+        &self,
+        transaction_ids: Vec<TransactionId>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransactionsInOrder, QueryError>
+    where
+        Self: Sized + Clone,
+    {
+        let resolved_epoch_id = match at_epoch_id {
+            Some(epoch_id) => epoch_id,
+            None => self.visible_tip_block(None).await?.chain_epoch.id,
+        };
+        Ok(TransactionsInOrder::from_lazy_query(
+            self.clone(),
+            transaction_ids,
+            resolved_epoch_id,
+        ))
+    }
 
     /// Verifies the node that supplies this query's transaction bytes against
     /// the served tip of `at_epoch_id`, or of the current epoch when `None`.

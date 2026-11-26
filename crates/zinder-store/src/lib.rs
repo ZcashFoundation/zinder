@@ -38,7 +38,7 @@ pub use canonical_store::{
     CanonicalStoreWorkload, CanonicalStoredData, CanonicalStoredSet,
     CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
     DEFAULT_REORG_WINDOW_BLOCKS, DensifiedTreeStateStride, DisplacedBlockCursor,
-    DisplacedBlockPage, HeightOrder, InadmissibleActivationSchedule,
+    DisplacedBlockPage, HeightOrder, InadmissibleActivationSchedule, LocatedTransactionBlob,
     MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, MAX_TREE_STATE_STRIDE_SCAN_READS,
     ObservedCanonicalReplaySequence, PreparedCanonicalBaselinePublication, ProjectionBuildAnchor,
     ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,

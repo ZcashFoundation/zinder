@@ -851,7 +851,7 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
 
     /// Returns the epoch `pair` serves when it answers `requested`, the
     /// epoch a pinned read names.
-    fn chain_epoch(
+    pub(crate) fn chain_epoch(
         pair: &WalletServingReadPair,
         requested: Option<ChainEpochId>,
     ) -> Result<ChainEpoch, QueryError> {
@@ -1382,6 +1382,36 @@ where
                 })
             },
         )
+        .await
+    }
+
+    async fn transactions_in_order(
+        &self,
+        transaction_ids: Vec<TransactionId>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<crate::TransactionsInOrder, QueryError>
+    where
+        Self: Sized + Clone,
+    {
+        serving_read::record("transactions_in_order", None, async {
+            let pair = self.serving_pair_slot.capture_at(at_epoch_id);
+            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            if pair.are_reads_revoked() {
+                return Err(pair.revoked_read_error());
+            }
+            let retains_transaction_blobs = pair
+                .canonical()
+                .raw_blob_retention()
+                .retains_transaction_blobs();
+            drop(pair);
+            Ok(crate::TransactionsInOrder::from_serving(
+                self.serving_pair_slot.clone(),
+                chain_epoch,
+                retains_transaction_blobs,
+                self.cold_transactions.clone(),
+                transaction_ids,
+            ))
+        })
         .await
     }
 

@@ -13,4 +13,5 @@ mod release_image;
 mod repeated_field_limits;
 mod runtime_allocator;
 mod standard_fee_node_replies;
+pub(crate) mod transparent_wallet_history_pipeline;
 mod transparent_wallet_serving;
