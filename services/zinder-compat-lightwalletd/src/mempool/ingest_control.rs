@@ -31,12 +31,14 @@
 //! restart from driving a tight reconnect loop.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, watch};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::watch;
+use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request};
 use zinder_core::{
@@ -264,41 +266,9 @@ impl MempoolSurface for IngestControlMempoolSurface {
             })
             .await?;
 
-        let (output_sender, output_receiver) = mpsc::channel(16);
-        let mut response_stream = response.into_inner();
-        tokio::spawn(async move {
-            loop {
-                match tokio_stream::StreamExt::next(&mut response_stream).await {
-                    Some(Ok(message)) => {
-                        match mempool_event_envelope_from_message(message).map_err(|error| {
-                            MempoolSurfaceError::Unavailable {
-                                reason: error.to_string(),
-                            }
-                        }) {
-                            Ok(envelope) => {
-                                if output_sender.send(Ok(envelope)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(error) => {
-                                let _ = output_sender.send(Err(error)).await;
-                                return;
-                            }
-                        }
-                    }
-                    Some(Err(status)) => {
-                        let _ = output_sender
-                            .send(Err(MempoolSurfaceError::Unavailable {
-                                reason: format!("ingest-control mempool_events errored: {status}"),
-                            }))
-                            .await;
-                        return;
-                    }
-                    None => return,
-                }
-            }
-        });
-        Ok(Box::pin(ReceiverStream::new(output_receiver)))
+        Ok(Box::pin(IngestControlMempoolEventStream {
+            response_stream: Some(response.into_inner()),
+        }))
     }
 
     async fn mempool_transaction(
@@ -339,6 +309,46 @@ impl MempoolSurface for IngestControlMempoolSurface {
             });
         }
         Ok(MempoolTransactionLookup::Pending(Box::new(entry)))
+    }
+}
+
+struct IngestControlMempoolEventStream {
+    response_stream: Option<tonic::codec::Streaming<wallet::MempoolEventEnvelope>>,
+}
+
+impl Stream for IngestControlMempoolEventStream {
+    type Item = Result<zinder_store::MempoolEventEnvelope, MempoolSurfaceError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Some(response_stream) = self.response_stream.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match Pin::new(response_stream).poll_next(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                self.response_stream = None;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(message))) => {
+                match mempool_event_envelope_from_message(message).map_err(|error| {
+                    MempoolSurfaceError::Unavailable {
+                        reason: error.to_string(),
+                    }
+                }) {
+                    Ok(envelope) => Poll::Ready(Some(Ok(envelope))),
+                    Err(error) => {
+                        self.response_stream = None;
+                        Poll::Ready(Some(Err(error)))
+                    }
+                }
+            }
+            Poll::Ready(Some(Err(status))) => {
+                self.response_stream = None;
+                Poll::Ready(Some(Err(MempoolSurfaceError::Unavailable {
+                    reason: format!("ingest-control mempool_events errored: {status}"),
+                })))
+            }
+        }
     }
 }
 
@@ -622,6 +632,147 @@ mod tests {
             "lookups waited {elapsed:?}, longer than one dial"
         );
         drop(listener);
+        Ok(())
+    }
+
+    struct IdleMempoolEventsServer {
+        closed_sender: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    struct DropSignalStream {
+        closed_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tokio_stream::Stream for DropSignalStream {
+        type Item = Result<wallet::MempoolEventEnvelope, tonic::Status>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for DropSignalStream {
+        fn drop(&mut self) {
+            if let Some(sender) = self.closed_sender.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl zinder_proto::v1::ingest::ingest_control_server::IngestControl for IdleMempoolEventsServer {
+        type VisibleChainEventsStream = std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<wallet::ChainEventEnvelope, tonic::Status>>
+                    + Send,
+            >,
+        >;
+        type MempoolEventsStream = std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<wallet::MempoolEventEnvelope, tonic::Status>>
+                    + Send,
+            >,
+        >;
+
+        async fn server_info(
+            &self,
+            _request: Request<zinder_proto::v1::ingest::ServerInfoRequest>,
+        ) -> Result<tonic::Response<zinder_proto::v1::ingest::ServerInfoResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn writer_status(
+            &self,
+            _request: Request<zinder_proto::v1::ingest::WriterStatusRequest>,
+        ) -> Result<tonic::Response<zinder_proto::v1::ingest::WriterStatusResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn visible_chain_events(
+            &self,
+            _request: Request<wallet::EventStreamStart>,
+        ) -> Result<tonic::Response<Self::VisibleChainEventsStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn mempool_snapshot(
+            &self,
+            _request: Request<wallet::MempoolSnapshotRequest>,
+        ) -> Result<tonic::Response<wallet::MempoolSnapshotResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn mempool_transaction(
+            &self,
+            _request: Request<MempoolTransactionRequest>,
+        ) -> Result<tonic::Response<wallet::TransactionStatusResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+
+        async fn mempool_events(
+            &self,
+            _request: Request<wallet::MempoolEventsRequest>,
+        ) -> Result<tonic::Response<Self::MempoolEventsStream>, tonic::Status> {
+            let closed_sender = self.closed_sender.lock().take();
+            Ok(tonic::Response::new(Box::pin(DropSignalStream {
+                closed_sender,
+            })))
+        }
+
+        async fn chain_value_pools_at_tip(
+            &self,
+            _request: Request<wallet::ChainValuePoolsAtTipRequest>,
+        ) -> Result<tonic::Response<wallet::ChainValuePoolsAtTipResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in unit test"))
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_mempool_events_stream_releases_idle_ingest_control_subscription()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        let service = IdleMempoolEventsServer {
+            closed_sender: parking_lot::Mutex::new(Some(closed_sender)),
+        };
+        let server_cancel = CancellationToken::new();
+        let shutdown_signal = server_cancel.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    zinder_proto::v1::ingest::ingest_control_server::IngestControlServer::new(
+                        service,
+                    ),
+                )
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    shutdown_signal.cancelled_owned(),
+                )
+                .await
+        });
+
+        let surface = IngestControlMempoolSurface::new(endpoint);
+        let mut events = surface.mempool_events(None).await?;
+        let pending_poll = tokio::time::timeout(
+            Duration::from_millis(50),
+            tokio_stream::StreamExt::next(&mut events),
+        )
+        .await;
+        assert!(pending_poll.is_err(), "idle stream must stay pending");
+
+        drop(events);
+
+        let release_outcome =
+            tokio::time::timeout(Duration::from_millis(500), closed_receiver).await;
+        server_cancel.cancel();
+        let _ = server.await;
+        release_outcome??;
         Ok(())
     }
 }

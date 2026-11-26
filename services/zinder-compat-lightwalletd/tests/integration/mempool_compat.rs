@@ -4,12 +4,16 @@
 )]
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::eyre;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::{Stream, StreamExt as _, wrappers::UnboundedReceiverStream};
 use tonic::{Code, Request};
 use zinder_compat_lightwalletd::{
@@ -858,6 +862,8 @@ struct ScriptedMempoolSurface {
     retained_events: Arc<Mutex<Vec<MempoolEventEnvelope>>>,
     pending_event_sender: SharedEventSenderSlot,
     event_sequence: Arc<Mutex<u64>>,
+    polled_events: Arc<AtomicUsize>,
+    polled_notify: Arc<Notify>,
 }
 
 impl ScriptedMempoolSurface {
@@ -869,6 +875,8 @@ impl ScriptedMempoolSurface {
             retained_events: Arc::new(Mutex::new(Vec::new())),
             pending_event_sender: Arc::new(Mutex::new(None)),
             event_sequence: Arc::new(Mutex::new(0u64)),
+            polled_events: Arc::new(AtomicUsize::new(0)),
+            polled_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -887,6 +895,8 @@ impl ScriptedMempoolSurface {
             retained_events: Arc::clone(&self.retained_events),
             sender_slot: Arc::clone(&self.pending_event_sender),
             event_sequence: Arc::clone(&self.event_sequence),
+            polled_events: Arc::clone(&self.polled_events),
+            polled_notify: Arc::clone(&self.polled_notify),
         }
     }
 }
@@ -895,6 +905,8 @@ struct ScriptedMempoolEventControl {
     retained_events: Arc<Mutex<Vec<MempoolEventEnvelope>>>,
     sender_slot: SharedEventSenderSlot,
     event_sequence: Arc<Mutex<u64>>,
+    polled_events: Arc<AtomicUsize>,
+    polled_notify: Arc<Notify>,
 }
 
 impl ScriptedMempoolEventControl {
@@ -917,6 +929,48 @@ impl ScriptedMempoolEventControl {
             .send(Ok(envelope))
             .map_err(|_| eyre!("scripted mempool surface receiver dropped"))?;
         Ok(())
+    }
+
+    fn has_open_subscription(&self) -> bool {
+        self.sender_slot
+            .lock()
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed())
+    }
+
+    async fn wait_for_polled_events(
+        &self,
+        expected_count: usize,
+        timeout_duration: Duration,
+    ) -> eyre::Result<()> {
+        tokio::time::timeout(timeout_duration, async {
+            loop {
+                let notified = self.polled_notify.notified();
+                if self.polled_events.load(Ordering::SeqCst) >= expected_count {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            eyre!(
+                "timed out waiting for {expected_count} polled mempool events (observed {})",
+                self.polled_events.load(Ordering::SeqCst)
+            )
+        })
+    }
+
+    async fn wait_for_subscription_release(&self, timeout_duration: Duration) -> eyre::Result<()> {
+        let active_sender = self
+            .sender_slot
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| eyre!("scripted mempool surface has no open event stream"))?;
+        tokio::time::timeout(timeout_duration, active_sender.closed())
+            .await
+            .map_err(|_| eyre!("upstream mempool subscription stayed open past timeout"))
     }
 
     fn next_envelope(&self, event: MempoolEvent) -> eyre::Result<MempoolEventEnvelope> {
@@ -1090,6 +1144,134 @@ async fn lightwalletd_get_mempool_stream_sends_each_transaction_once() -> eyre::
     Ok(())
 }
 
+async fn assert_tip_change_releases_full_queue(extra_upstream_events: u8) -> eyre::Result<()> {
+    const QUEUE_CAPACITY: u8 = 16;
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let surface = ScriptedMempoolSurface::with_entries(Vec::new());
+    let event_control = surface.event_control();
+    let tip_change_watcher = ScriptedTipChangeWatcher::new();
+    let tip_change_signal = tip_change_watcher.signal();
+    let adapter = LightwalletdGrpcAdapter::new(wallet_query)
+        .with_mempool_surface(Arc::new(surface))
+        .with_tip_change_watcher(Arc::new(tip_change_watcher));
+
+    let mut response_stream = adapter
+        .get_mempool_stream(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    let total_pushed = QUEUE_CAPACITY.saturating_add(extra_upstream_events);
+    for tx_byte in 1..=total_pushed {
+        event_control.push_event(MempoolEvent::Added {
+            entry: synthetic_entry(tx_byte, synthetic_chain_epoch())?,
+        })?;
+    }
+    event_control
+        .wait_for_polled_events(usize::from(QUEUE_CAPACITY), Duration::from_secs(2))
+        .await?;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        event_control.has_open_subscription(),
+        "upstream subscription must remain open before tip change"
+    );
+
+    // Downstream receiver remains paused with all 16 queue slots full.
+    tip_change_signal.observe_tip_change();
+    event_control
+        .wait_for_subscription_release(Duration::from_millis(500))
+        .await?;
+
+    // Frames already buffered before the tip change drain cleanly, while no
+    // 17th or post-tip-change transaction is produced.
+    for expected_byte in 1..=QUEUE_CAPACITY {
+        let buffered = tokio::time::timeout(Duration::from_secs(2), response_stream.next())
+            .await?
+            .ok_or_else(|| eyre!("expected buffered transaction {expected_byte}"))??;
+        assert_eq!(buffered.data, vec![expected_byte; 16]);
+    }
+    let after_buffered =
+        tokio::time::timeout(Duration::from_secs(2), response_stream.next()).await?;
+    assert!(
+        after_buffered.is_none(),
+        "expected stream end after buffered frames, got: {after_buffered:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_stream_releases_subscription_on_tip_change_when_send_backpressured()
+-> eyre::Result<()> {
+    assert_tip_change_releases_full_queue(1).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_stream_releases_subscription_on_tip_change_with_full_idle_queue()
+-> eyre::Result<()> {
+    assert_tip_change_releases_full_queue(0).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_stream_releases_subscription_on_idle_receiver_drop()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let surface = ScriptedMempoolSurface::with_entries(Vec::new());
+    let event_control = surface.event_control();
+    let tip_change_watcher = ScriptedTipChangeWatcher::new();
+    let adapter = LightwalletdGrpcAdapter::new(wallet_query)
+        .with_mempool_surface(Arc::new(surface))
+        .with_tip_change_watcher(Arc::new(tip_change_watcher));
+
+    let response_stream = adapter
+        .get_mempool_stream(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    assert!(event_control.has_open_subscription());
+
+    drop(response_stream);
+
+    event_control
+        .wait_for_subscription_release(Duration::from_millis(500))
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_stream_releases_subscription_on_idle_grpc_client_disconnect()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let surface = ScriptedMempoolSurface::with_entries(Vec::new());
+    let event_control = surface.event_control();
+    let tip_change_watcher = ScriptedTipChangeWatcher::new();
+    let adapter = LightwalletdGrpcAdapter::new(wallet_query)
+        .with_mempool_surface(Arc::new(surface))
+        .with_tip_change_watcher(Arc::new(tip_change_watcher));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(
+        zinder_runtime::public_grpc_server(zinder_runtime::ClientAddressSource::Connection)
+            .add_service(adapter.into_server())
+            .serve_with_incoming(listener),
+    );
+
+    let mut client =
+        lightwalletd::compact_tx_streamer_client::CompactTxStreamerClient::connect(endpoint)
+            .await?;
+    let response_stream = client
+        .get_mempool_stream(lightwalletd::Empty {})
+        .await?
+        .into_inner();
+    assert!(event_control.has_open_subscription());
+
+    drop(response_stream);
+
+    let release = event_control
+        .wait_for_subscription_release(Duration::from_millis(500))
+        .await;
+    server.abort();
+    release
+}
+
 /// A tip-change watcher whose signal source is already gone.
 struct ClosedTipChangeWatcher {
     receiver: tokio::sync::watch::Receiver<u64>,
@@ -1235,13 +1417,21 @@ impl MempoolSurface for ScriptedMempoolSurface {
             }
         }
         *self.pending_event_sender.lock() = Some(event_sender);
+        let polled_events = Arc::clone(&self.polled_events);
+        let polled_notify = Arc::clone(&self.polled_notify);
+        let counted_stream =
+            UnboundedReceiverStream::new(event_receiver).map(move |envelope_outcome| {
+                polled_events.fetch_add(1, Ordering::SeqCst);
+                polled_notify.notify_waiters();
+                envelope_outcome
+            });
         let stream: Pin<
             Box<
                 dyn Stream<Item = Result<MempoolEventEnvelope, MempoolSurfaceError>>
                     + Send
                     + 'static,
             >,
-        > = Box::pin(UnboundedReceiverStream::new(event_receiver));
+        > = Box::pin(counted_stream);
         Ok(stream)
     }
 
