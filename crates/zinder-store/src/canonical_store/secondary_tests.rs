@@ -1,22 +1,38 @@
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, path::Path};
 
 use rust_rocksdb::{DEFAULT_COLUMN_FAMILY_NAME, statistics::Ticker};
 use tempfile::TempDir;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockId, Network, UnixTimestampMillis,
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, Network, NetworkUpgradeActivations,
+    UnixTimestampMillis,
 };
 
 use super::{
-    CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreError,
+    CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
+    CanonicalSequenceCheckpoint, CanonicalStoreError, CanonicalStoreReadyEvidence,
     CanonicalStoreWorkload, ProjectionBuildLease, ProjectionBuildLeaseId,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, ServedTreeState, TreeStateLookup,
     TreeStateReplayOutcome,
-    block_load::encode_block_position,
-    live_replacement_tests::{open_store, published_store, replacement_block},
-    rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, validate_open_store_control},
+    block_load::{
+        encode_block_hash_location, encode_block_header, encode_block_position,
+        encode_tree_state_checkpoint,
+    },
+    block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
+    control::encode_ready_store_control_with_revisions,
+    live_replacement_tests::{
+        canonical_block, open_store, open_store_with_retention, published_store,
+        published_store_with_retention, replacement_block,
+    },
+    publication::{encode_live_append_event, encode_live_chain_epoch},
+    rocksdb::{
+        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
+        CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY, STORE_CONTROL_KEY,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY, validate_open_store_control,
+    },
 };
 use crate::{
-    HeightOrder, RawBlobRetention, RocksDbOpenResources, RocksDbResourceBudget, SharedBlockCache,
+    HeightOrder, RawBlobRetention, RocksDbOpenResources, RocksDbResourceBudget,
+    RocksDbStatisticsLevel, SharedBlockCache, SharedSecondaryResources,
 };
 
 const REORG_WINDOW: u32 = 2;
@@ -1379,4 +1395,685 @@ fn append_block_five(
         activations,
     )?;
     Ok(store)
+}
+
+const MULTI_THOUSAND_BATCHES: u32 = 6;
+const EPOCHS_PER_L0_BATCH: u32 = 400;
+const BASELINE_TIP_HEIGHT: u32 = 12;
+
+fn multi_epoch_block_hash(height: u32) -> Result<[u8; 32], std::num::TryFromIntError> {
+    if height <= BASELINE_TIP_HEIGHT {
+        return Ok([u8::try_from(height)?; 32]);
+    }
+    let mut hash = [0x77; 32];
+    hash[..4].copy_from_slice(&height.to_be_bytes());
+    Ok(hash)
+}
+
+fn build_empty_live_block(
+    height: BlockHeight,
+    frontiers: &zinder_core::CommitmentTreeFrontiers,
+    include_checkpoint: bool,
+) -> Result<crate::CanonicalBuildBlock, Box<dyn std::error::Error>> {
+    let block_hash = multi_epoch_block_hash(height.value())?;
+    let parent_hash = multi_epoch_block_hash(height.value() - 1)?;
+    let mut block = canonical_block(height, block_hash, parent_hash, 1);
+    block.facts.transactions.clear();
+    block.facts.serialized_bytes_digest =
+        zinder_core::SerializedBytesDigest::from_serialized_bytes(&[]);
+    block.replay_envelope = zinder_core::encode_canonical_block_replay(
+        &block.facts,
+        zinder_core::CanonicalBlockReplayFormatVersion::V1,
+        zinder_core::CanonicalBlockFactsDigestVersion::V1,
+    );
+    block.transaction_blobs.clear();
+    block.block_blob = None;
+    if include_checkpoint {
+        block.tree_state_checkpoint = Some(zinder_core::CommitmentTreeCheckpoint::new(
+            BlockId::new(height, BlockHash::from_bytes(block_hash)),
+            height.value(),
+            frontiers.clone(),
+        ));
+    }
+    Ok(block)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "seeds 2,400 valid canonical transitions across 6 L0 SSTs in memory-bounded WriteBatches without 2,400 individual fsyncs"
+)]
+fn seed_multi_thousand_epoch_store(
+    store_path: &std::path::Path,
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let store = published_store_with_retention(
+        store_path,
+        REORG_WINDOW,
+        BlockHeight::new(BASELINE_TIP_HEIGHT),
+        BlockHeight::new(BASELINE_TIP_HEIGHT - REORG_WINDOW),
+        RawBlobRetention::None,
+    )?;
+    let tip_frontiers = store.append_anchor()?.tip_checkpoint().frontiers.clone();
+    let mut checkpoints = std::collections::VecDeque::from(store.replay_tail.checkpoints());
+    let mut current_ready = store.ready_evidence();
+    let revisions = store.control_revisions();
+    let workload = store.workload();
+    let build_plan = store.build_plan().clone();
+    let cursor_auth_key = store.cursor_auth_key;
+    let db = &store.bounded_open.db;
+    for family_name in [CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY] {
+        let handle = db.cf_handle(family_name).ok_or("family must exist")?;
+        db.set_options_cf(&handle, &[("disable_auto_compactions", "true")])?;
+    }
+
+    let mut next_height = BASELINE_TIP_HEIGHT + 1;
+    for _ in 0..MULTI_THOUSAND_BATCHES {
+        let mut batch = rust_rocksdb::WriteBatch::default();
+        let batch_end_height = next_height + EPOCHS_PER_L0_BATCH - 1;
+        for height_num in next_height..=batch_end_height {
+            let height = BlockHeight::new(height_num);
+            let include_checkpoint = height_num == batch_end_height
+                || height_num.is_multiple_of(super::TREE_STATE_CHECKPOINT_STRIDE);
+            let block = build_empty_live_block(height, &tip_frontiers, include_checkpoint)?;
+            let height_key = encode_block_position(height);
+            batch.put_cf(
+                &db.cf_handle(BLOCK_HEADER_COLUMN_FAMILY)
+                    .ok_or("block_header absent")?,
+                height_key,
+                encode_block_header(&block.facts.block_header),
+            );
+            batch.put_cf(
+                &db.cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
+                    .ok_or("block_replay absent")?,
+                height_key,
+                block.replay_envelope.as_bytes(),
+            );
+            batch.put_cf(
+                &db.cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
+                    .ok_or("compact_block absent")?,
+                height_key,
+                crate::encode_compact_block_artifact(&block.compact_block),
+            );
+            let hash_record =
+                encode_block_hash_location(block.facts.block_header.block_hash, height);
+            batch.put_cf(
+                &db.cf_handle(BLOCK_HASH_INDEX_COLUMN_FAMILY)
+                    .ok_or("block_hash_index absent")?,
+                &hash_record[..32],
+                &hash_record[32..],
+            );
+            if let Some(checkpoint) = &block.tree_state_checkpoint {
+                batch.put_cf(
+                    &db.cf_handle(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
+                        .ok_or("tree_state_checkpoint absent")?,
+                    height_key,
+                    encode_tree_state_checkpoint(
+                        checkpoint.block_time_seconds,
+                        &checkpoint.frontiers,
+                    ),
+                );
+            }
+            let tip_checkpoint = *checkpoints.back().ok_or("checkpoint queue empty")?;
+            let mut digest_builder =
+                zinder_core::CanonicalBlockFactsSequenceDigestBuilder::resume_from_prefix(
+                    tip_checkpoint.sequence_digest(),
+                );
+            digest_builder.try_append(
+                block
+                    .facts
+                    .digest(zinder_core::CanonicalBlockFactsDigestVersion::V1),
+            )?;
+            let visible_tip = BlockId::new(height, block.facts.block_header.block_hash);
+            let replay_len = u64::try_from(block.replay_envelope.as_bytes().len())?;
+            let next_tip_checkpoint = CanonicalSequenceCheckpoint::from_admitted_parts(
+                visible_tip,
+                tip_checkpoint.retained_block_count() + 1,
+                digest_builder.finish(),
+                tip_checkpoint.logical_replay_bytes() + replay_len,
+            );
+            checkpoints.push_back(next_tip_checkpoint);
+            let settled_checkpoint = checkpoints.pop_front().ok_or("settled checkpoint absent")?;
+            let settled_checkpoint =
+                if settled_checkpoint.through().height.value() < height_num - REORG_WINDOW {
+                    checkpoints
+                        .pop_front()
+                        .ok_or("advanced settled checkpoint absent")?
+                } else {
+                    settled_checkpoint
+                };
+            checkpoints.push_front(settled_checkpoint);
+
+            let previous_epoch_id = current_ready.visible_epoch;
+            let next_epoch_id = zinder_core::ChainEpochId::new(previous_epoch_id.value() + 1);
+            let next_sequence = current_ready.visible_event_sequence + 1;
+            current_ready = CanonicalStoreReadyEvidence {
+                visible_tip,
+                visible_epoch: next_epoch_id,
+                visible_event_sequence: next_sequence,
+                visible_block_count: next_tip_checkpoint.retained_block_count(),
+                visible_sequence_digest: next_tip_checkpoint.sequence_digest().as_bytes(),
+                visible_logical_replay_bytes: next_tip_checkpoint.logical_replay_bytes(),
+                sequence_checkpoint: settled_checkpoint,
+                ..current_ready
+            };
+            let fence = CanonicalEventFence::from_persisted_event(
+                next_epoch_id,
+                next_sequence,
+                visible_tip,
+                current_ready.visible_block_count,
+                current_ready.visible_sequence_digest,
+            );
+            batch.put_cf(
+                &db.cf_handle(CHAIN_EPOCH_COLUMN_FAMILY)
+                    .ok_or("chain_epoch absent")?,
+                next_epoch_id.value().to_be_bytes(),
+                encode_live_chain_epoch(
+                    visible_tip,
+                    settled_checkpoint.through(),
+                    block.tip_metadata,
+                    UnixTimestampMillis::new(1_750_000_000_000 + next_sequence),
+                ),
+            );
+            batch.put_cf(
+                &db.cf_handle(CHAIN_EVENT_COLUMN_FAMILY)
+                    .ok_or("chain_event absent")?,
+                next_sequence.to_be_bytes(),
+                encode_live_append_event(previous_epoch_id, fence),
+            );
+        }
+        batch.put(
+            STORE_CONTROL_KEY,
+            encode_ready_store_control_with_revisions(
+                workload,
+                &build_plan,
+                cursor_auth_key,
+                &current_ready,
+                revisions,
+            )?,
+        );
+        db.write(&batch)?;
+        for family_name in [
+            CHAIN_EPOCH_COLUMN_FAMILY,
+            CHAIN_EVENT_COLUMN_FAMILY,
+            BLOCK_HEADER_COLUMN_FAMILY,
+            BLOCK_REPLAY_COLUMN_FAMILY,
+            COMPACT_BLOCK_COLUMN_FAMILY,
+            TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        ] {
+            let handle = db.cf_handle(family_name).ok_or("family must exist")?;
+            db.flush_cf(&handle)?;
+        }
+        next_height = batch_end_height + 1;
+    }
+    db.flush()?;
+    drop(store);
+
+    let reopened = open_store_with_retention(
+        store_path,
+        activations,
+        REORG_WINDOW,
+        RawBlobRetention::None,
+    )?;
+    for family_name in [CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY] {
+        let handle = reopened
+            .bounded_open
+            .db
+            .cf_handle(family_name)
+            .ok_or("family must exist")?;
+        reopened
+            .bounded_open
+            .db
+            .set_options_cf(&handle, &[("disable_auto_compactions", "true")])?;
+        let rows = reopened
+            .bounded_open
+            .db
+            .iterator_cf(&handle, rust_rocksdb::IteratorMode::Start)
+            .collect::<Result<Vec<_>, _>>()?;
+        for chunk in rows.chunks(EPOCHS_PER_L0_BATCH as usize) {
+            let mut batch = rust_rocksdb::WriteBatch::default();
+            for (key, encoded) in chunk {
+                batch.put_cf(&handle, key, encoded);
+            }
+            reopened.bounded_open.db.write(&batch)?;
+            reopened.bounded_open.db.flush_cf(&handle)?;
+        }
+    }
+    Ok(reopened)
+}
+
+#[test]
+fn warm_secondary_reopen_caches_live_epoch_and_event_history_across_l0_ssts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut store = seed_multi_thousand_epoch_store(&store_path, &activations)?;
+    assert_eq!(store.ready_evidence().visible_epoch.value(), 2_401);
+    assert_epoch_and_event_l0_file_counts(&store)?;
+
+    let mut budget = RocksDbResourceBudget::for_local_tests();
+    budget.block_cache_bytes = 32 * 1024 * 1024;
+    budget.statistics_level = RocksDbStatisticsLevel::Tickers;
+    budget.preferred_io_mode = crate::RocksDbIoMode::Direct;
+    let shared_resources = SharedSecondaryResources::new(budget);
+    let requirements =
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None);
+    let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW)?;
+
+    let cold_started = std::time::Instant::now();
+    let cold_secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &store_path,
+        temporary.path().join("secondary-cold"),
+        Network::ZcashTestnet,
+        requirements,
+        reorg_policy,
+        &shared_resources,
+    )?;
+    let cold_elapsed = cold_started.elapsed();
+    assert!(
+        cold_elapsed < std::time::Duration::from_millis(500),
+        "cold secondary open over 2,401 epochs took {cold_elapsed:?}"
+    );
+    let mut ticker_snapshot = SecondaryCacheCounters::sample(&cold_secondary);
+    for step in 0_u32..3 {
+        store = append_live_step_for_multi_epoch_test(store, &activations, step)?;
+        verify_warm_secondary_step(
+            &store,
+            &store_path,
+            &temporary.path().join(format!("secondary-warm-{step}")),
+            &shared_resources,
+            &mut ticker_snapshot,
+        )?;
+    }
+    drop(cold_secondary);
+    Ok(())
+}
+
+struct SecondaryCacheCounters {
+    misses: u64,
+    hits: u64,
+    bytes_read: u64,
+}
+
+impl SecondaryCacheCounters {
+    fn sample(secondary: &RocksDbCanonicalSecondary) -> Self {
+        Self {
+            misses: secondary.rocksdb_ticker_count(Ticker::BlockCacheDataMiss),
+            hits: secondary.rocksdb_ticker_count(Ticker::BlockCacheDataHit),
+            bytes_read: secondary.rocksdb_ticker_count(Ticker::BytesRead),
+        }
+    }
+}
+
+fn assert_epoch_and_event_l0_file_counts(
+    store: &RocksDbCanonicalStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let live_files = store.bounded_open.db.live_files()?;
+    let l0_epoch_files = live_files
+        .iter()
+        .filter(|file| file.column_family_name == CHAIN_EPOCH_COLUMN_FAMILY && file.level == 0)
+        .count();
+    let l0_event_files = live_files
+        .iter()
+        .filter(|file| file.column_family_name == CHAIN_EVENT_COLUMN_FAMILY && file.level == 0)
+        .count();
+    assert!(
+        l0_epoch_files >= MULTI_THOUSAND_BATCHES as usize
+            && l0_event_files >= MULTI_THOUSAND_BATCHES as usize,
+        "expected >= {MULTI_THOUSAND_BATCHES} L0 SSTs, got epoch={l0_epoch_files}, event={l0_event_files}"
+    );
+    Ok(())
+}
+
+fn append_live_step_for_multi_epoch_test(
+    store: RocksDbCanonicalStore,
+    activations: &NetworkUpgradeActivations,
+    step: u32,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let tip_frontiers = store.append_anchor()?.tip_checkpoint().frontiers.clone();
+    let next_height = BlockHeight::new(BASELINE_TIP_HEIGHT + 2_400 + 1 + step);
+    let settled_height = BlockHeight::new(next_height.value() - REORG_WINDOW);
+    let settled_hash = BlockHash::from_bytes(multi_epoch_block_hash(settled_height.value())?);
+    let block = build_empty_live_block(next_height, &tip_frontiers, true)?;
+    let expected_fence = store.event_fence();
+    let (next_store, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            expected_fence,
+            block,
+            Vec::new(),
+            BlockId::new(settled_height, settled_hash),
+            UnixTimestampMillis::new(1_750_000_010_000 + u64::from(step)),
+        ),
+        activations,
+    )?;
+    if step == 1 {
+        for family_name in [CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY] {
+            let handle = next_store
+                .bounded_open
+                .db
+                .cf_handle(family_name)
+                .ok_or("family must exist")?;
+            next_store.bounded_open.db.flush_cf(&handle)?;
+        }
+    }
+    Ok(next_store)
+}
+
+fn verify_warm_secondary_step(
+    store: &RocksDbCanonicalStore,
+    store_path: &Path,
+    secondary_path: &Path,
+    shared_resources: &SharedSecondaryResources,
+    previous: &mut SecondaryCacheCounters,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let warm_started = std::time::Instant::now();
+    let warm_secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        store_path,
+        secondary_path,
+        Network::ZcashTestnet,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+        CanonicalReorgPolicy::new(REORG_WINDOW)?,
+        shared_resources,
+    )?;
+    let warm_elapsed = warm_started.elapsed();
+    let after = SecondaryCacheCounters::sample(&warm_secondary);
+    let delta_misses = after.misses - previous.misses;
+    let delta_hits = after.hits - previous.hits;
+    let delta_bytes_read = after.bytes_read - previous.bytes_read;
+
+    assert_eq!(warm_secondary.event_fence(), store.event_fence());
+    assert!(
+        warm_elapsed < std::time::Duration::from_millis(500),
+        "warm secondary open took {warm_elapsed:?}"
+    );
+    assert!(
+        delta_misses <= 4,
+        "warm secondary open incurred {delta_misses} block-cache data misses \
+         (delta_hits={delta_hits}, delta_bytes_read={delta_bytes_read}, io_mode={:?})",
+        warm_secondary.io_mode()
+    );
+    assert!(
+        delta_hits > 0,
+        "warm secondary open must serve retained epoch/event blocks from the shared cache"
+    );
+    *previous = after;
+    Ok(())
+}
+
+#[test]
+fn secondary_open_rejects_malformed_length_keys_in_epoch_and_event_families()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    for family_name in [CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY] {
+        for bad_key in [
+            &[0_u8; 4][..],
+            &3_u32.to_be_bytes()[..],
+            &[0_u8, 0, 0, 0, 0, 0, 0, 1, 0][..],
+            &[0_u8, 0, 0, 0, 0, 0, 0, 2, 0][..],
+            &[0_u8, 0, 0, 0, 0, 0, 0, 9, 0][..],
+        ] {
+            assert_injected_family_mutation_refused(&activations, family_name, bad_key, false)?;
+        }
+        assert_injected_family_mutation_refused(
+            &activations,
+            family_name,
+            &[0_u8, 0, 0, 0, 0, 0, 0, 2, 0],
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_injected_family_mutation_refused(
+    activations: &NetworkUpgradeActivations,
+    family_name: &'static str,
+    injected_key: &[u8],
+    advance_retention_floor: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let store = seed_three_epoch_live_store(&store_path, activations)?;
+    let handle = store
+        .bounded_open
+        .db
+        .cf_handle(family_name)
+        .ok_or("canonical family must exist")?;
+    let sample_row = store
+        .bounded_open
+        .db
+        .get_cf(&handle, 1_u64.to_be_bytes())?
+        .ok_or("baseline row must exist")?;
+    if advance_retention_floor {
+        store.bounded_open.db.put(
+            super::event_lifecycle::RETENTION_FLOOR_KEY,
+            3_u64.to_be_bytes(),
+        )?;
+        if family_name == CHAIN_EVENT_COLUMN_FAMILY {
+            store
+                .bounded_open
+                .db
+                .delete_cf(&handle, 2_u64.to_be_bytes())?;
+        }
+    }
+    store
+        .bounded_open
+        .db
+        .put_cf(&handle, injected_key, sample_row)?;
+    drop(handle);
+    store.bounded_open.db.flush()?;
+    drop(store);
+
+    let failure = open_adopting_secondary(&store_path, temporary.path().join("secondary"))?
+        .err()
+        .ok_or("malformed key in epoch/event family must refuse secondary open")?;
+    assert!(
+        matches!(
+            &failure,
+            CanonicalStoreError::PublicationRefused { reason } if reason.contains("key has length")
+        ),
+        "unexpected error for {family_name} key {injected_key:?}: {failure:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn secondary_open_rejects_trailing_rows_after_visible_epoch_and_missing_live_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    for family_name in [CHAIN_EPOCH_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY] {
+        assert_trailing_row_refused(&activations, family_name, false)?;
+        assert_trailing_row_refused(&activations, family_name, true)?;
+        assert_missing_live_row_refused(&activations, family_name, 2, false)?;
+    }
+    assert_missing_live_row_refused(&activations, CHAIN_EPOCH_COLUMN_FAMILY, 2, true)?;
+    Ok(())
+}
+
+fn assert_trailing_row_refused(
+    activations: &NetworkUpgradeActivations,
+    family_name: &'static str,
+    live_history: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let store = if live_history {
+        seed_three_epoch_live_store(&store_path, activations)?
+    } else {
+        published_store(
+            &store_path,
+            REORG_WINDOW,
+            BlockHeight::new(4),
+            BlockHeight::new(2),
+        )?
+    };
+    let trailing_sequence = store.ready_evidence().visible_epoch.value() + 1;
+    let handle = store
+        .bounded_open
+        .db
+        .cf_handle(family_name)
+        .ok_or("canonical family must exist")?;
+    let sample_row = store
+        .bounded_open
+        .db
+        .get_cf(&handle, 1_u64.to_be_bytes())?
+        .ok_or("baseline row must exist")?;
+    store
+        .bounded_open
+        .db
+        .put_cf(&handle, trailing_sequence.to_be_bytes(), sample_row)?;
+    drop(handle);
+    store.bounded_open.db.flush()?;
+    drop(store);
+
+    let failure = open_adopting_secondary(&store_path, temporary.path().join("secondary"))?
+        .err()
+        .ok_or("trailing row after visible epoch must refuse secondary open")?;
+    assert!(
+        matches!(
+            &failure,
+            CanonicalStoreError::PublicationRefused { reason } if reason.contains("unexpected row")
+        ),
+        "unexpected trailing-row error for {family_name} (live={live_history}): {failure:?}"
+    );
+    Ok(())
+}
+
+fn assert_missing_live_row_refused(
+    activations: &NetworkUpgradeActivations,
+    family_name: &'static str,
+    deleted_sequence: u64,
+    advance_retention_floor: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let store = seed_three_epoch_live_store(&store_path, activations)?;
+    if advance_retention_floor {
+        store.bounded_open.db.put(
+            super::event_lifecycle::RETENTION_FLOOR_KEY,
+            3_u64.to_be_bytes(),
+        )?;
+    }
+    let handle = store
+        .bounded_open
+        .db
+        .cf_handle(family_name)
+        .ok_or("canonical family must exist")?;
+    store
+        .bounded_open
+        .db
+        .delete_cf(&handle, deleted_sequence.to_be_bytes())?;
+    drop(handle);
+    store.bounded_open.db.flush()?;
+    drop(store);
+
+    let failure = open_adopting_secondary(&store_path, temporary.path().join("secondary"))?
+        .err()
+        .ok_or("missing live row must refuse secondary open")?;
+    assert!(
+        matches!(&failure, CanonicalStoreError::PublicationRefused { .. }),
+        "unexpected missing-row error for {family_name}: {failure:?}"
+    );
+    Ok(())
+}
+
+fn seed_three_epoch_live_store(
+    store_path: &Path,
+    activations: &NetworkUpgradeActivations,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let store = append_block_five(
+        published_store(
+            store_path,
+            REORG_WINDOW,
+            BlockHeight::new(4),
+            BlockHeight::new(2),
+        )?,
+        activations,
+    )?;
+    let expected_fence = store.event_fence();
+    let (store, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            expected_fence,
+            replacement_block(BlockHeight::new(6), [6; 32], [5; 32], 106)?,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32])),
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        activations,
+    )?;
+    Ok(store)
+}
+
+#[test]
+fn warm_secondary_reopen_caches_permanent_reorg_archive_admission_reads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let replacement_fence = store.event_fence();
+    let (store, _) = store.commit_live_replacement(
+        crate::CanonicalLiveReplacement::new(
+            replacement_fence,
+            vec![crate::CanonicalReplacementBlock::new(
+                replacement_block(BlockHeight::new(4), [0x44; 32], [3; 32], 144)?,
+                Vec::new(),
+            )],
+            UnixTimestampMillis::new(1_750_000_000_010),
+        ),
+        &activations,
+    )?;
+    store.bounded_open.db.flush()?;
+
+    let mut budget = RocksDbResourceBudget::for_local_tests();
+    budget.block_cache_bytes = 32 * 1024 * 1024;
+    budget.statistics_level = RocksDbStatisticsLevel::Tickers;
+    budget.preferred_io_mode = crate::RocksDbIoMode::Direct;
+    let shared_resources = SharedSecondaryResources::new(budget);
+    let requirements =
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions);
+    let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW)?;
+
+    let cold_secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &store_path,
+        temporary.path().join("secondary-cold"),
+        Network::ZcashTestnet,
+        requirements.clone(),
+        reorg_policy,
+        &shared_resources,
+    )?;
+    let misses_before = cold_secondary.rocksdb_ticker_count(Ticker::BlockCacheDataMiss);
+
+    let append_fence = store.event_fence();
+    let (store, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            append_fence,
+            replacement_block(BlockHeight::new(5), [0x55; 32], [0x44; 32], 155)?,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32])),
+            UnixTimestampMillis::new(1_750_000_000_011),
+        ),
+        &activations,
+    )?;
+    let warm_secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &store_path,
+        temporary.path().join("secondary-warm"),
+        Network::ZcashTestnet,
+        requirements,
+        reorg_policy,
+        &shared_resources,
+    )?;
+    let delta_misses =
+        warm_secondary.rocksdb_ticker_count(Ticker::BlockCacheDataMiss) - misses_before;
+    assert_eq!(warm_secondary.event_fence(), store.event_fence());
+    assert_eq!(
+        delta_misses, 0,
+        "warm secondary reopen with flushed displaced archive SSTs should hit the shared cache"
+    );
+    drop(cold_secondary);
+    Ok(())
 }
