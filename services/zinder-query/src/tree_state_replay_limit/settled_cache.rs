@@ -213,7 +213,7 @@ impl EncodedTreeStateHex {
     }
 }
 
-/// Settled [`ServedTreeState`] paired with lazily computed hexadecimal wire
+/// [`ServedTreeState`] paired with lazily computed hexadecimal wire
 /// fields so repeated warm `GetTreeState` hits avoid cloning raw frontier
 /// buffers and repeating hex encoding.
 #[derive(Debug)]

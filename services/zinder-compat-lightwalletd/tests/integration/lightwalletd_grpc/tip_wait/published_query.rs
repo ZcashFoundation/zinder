@@ -32,12 +32,20 @@ use zinder_store::{
     StreamCursorTokenV1,
 };
 
+type UnpinnedTreeStateStep = Box<dyn FnOnce() + Send>;
+
+struct UnpinnedTreeStateSteps {
+    before: UnpinnedTreeStateStep,
+    after: UnpinnedTreeStateStep,
+}
+
 #[derive(Clone)]
 pub(in crate::integration::lightwalletd_grpc) struct PublishedQuery {
     /// The first query, whose structural capabilities every later one shares.
     first: WalletServingQuery<()>,
     current: Arc<Mutex<WalletServingQuery<()>>>,
     publications: Arc<watch::Sender<()>>,
+    unpinned_tree_state_steps: Arc<Mutex<Option<UnpinnedTreeStateSteps>>>,
 }
 
 impl PublishedQuery {
@@ -46,7 +54,21 @@ impl PublishedQuery {
             current: Arc::new(Mutex::new(first.clone())),
             first,
             publications: Arc::new(watch::Sender::new(())),
+            unpinned_tree_state_steps: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Runs `before` immediately before the next unpinned `tree_state_hex_at`
+    /// call and `after` immediately after it completes.
+    pub(in crate::integration::lightwalletd_grpc) fn on_next_unpinned_tree_state_hex(
+        &self,
+        before: impl FnOnce() + Send + 'static,
+        after: impl FnOnce() + Send + 'static,
+    ) {
+        *self.unpinned_tree_state_steps.lock() = Some(UnpinnedTreeStateSteps {
+            before: Box::new(before),
+            after: Box::new(after),
+        });
     }
 
     /// Serves `next` from now on and wakes every subscriber.
@@ -292,7 +314,19 @@ impl WalletQueryApi for PublishedQuery {
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<ServedTreeStateHex, QueryError> {
-        self.now().tree_state_hex_at(height, at_epoch_id).await
+        let after = if at_epoch_id.is_none() {
+            self.unpinned_tree_state_steps.lock().take().map(|steps| {
+                (steps.before)();
+                steps.after
+            })
+        } else {
+            None
+        };
+        let outcome = self.now().tree_state_hex_at(height, at_epoch_id).await;
+        if let Some(after) = after {
+            after();
+        }
+        outcome
     }
 
     async fn latest_tree_state_checkpoint(

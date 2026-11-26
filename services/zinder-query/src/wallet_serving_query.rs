@@ -1654,7 +1654,7 @@ where
     ) -> Result<ServedTreeStateHex, QueryError> {
         serving_read::record("tree_state_at", None, async {
             if at_epoch_id.is_none()
-                && let Some(hex) = self.serving_pair_slot.with_ephemeral(|pair| {
+                && let Some((network, ready)) = self.serving_pair_slot.with_ephemeral(|pair| {
                     if pair.has_missing_table_file() {
                         return None;
                     }
@@ -1667,10 +1667,10 @@ where
                                 pair,
                             )
                         })
-                        .map(|ready| ready.serve_hex(epoch.network))
+                        .map(|ready| (epoch.network, ready))
                 })
             {
-                return Ok(hex);
+                return Ok(ready.serve_hex(network));
             }
             let (epoch, served) = self
                 .read_tree_state_at(
@@ -1710,14 +1710,14 @@ where
     ) -> Result<ServedTreeStateHex, QueryError> {
         serving_read::record("latest_tree_state_checkpoint", None, async {
             if at_epoch_id.is_none()
-                && let Some(hex) = self.serving_pair_slot.with_ephemeral(|pair| {
+                && let Some((network, cached)) = self.serving_pair_slot.with_ephemeral(|pair| {
                     (!pair.has_missing_table_file())
-                        .then(|| pair.cached_latest_tree_state_checkpoint())
+                        .then(|| pair.cached_latest_tree_state_checkpoint().cloned())
                         .flatten()
-                        .map(|cached| cached.to_hex(pair.chain_epoch().network))
+                        .map(|cached| (pair.chain_epoch().network, cached))
                 })
             {
-                return Ok(hex);
+                return Ok(cached.to_hex(network));
             }
             serving_read::read_at(self.ephemeral_pin(at_epoch_id), move |pair| async move {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;

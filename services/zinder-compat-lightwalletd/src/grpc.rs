@@ -868,6 +868,34 @@ where
             .await
             .map_err(|error| status_from_query_error(&error))
     }
+
+    async fn tree_state_hex_for_height(
+        &self,
+        height: BlockHeight,
+    ) -> Result<zinder_query::ServedTreeStateHex, Status>
+    where
+        QueryApi: Clone,
+    {
+        self.block_methods
+            .await_tip(&self.query_api, "get_tree_state", height)
+            .await?;
+        let view = self.query_api.capture_ephemeral_view().await?;
+        reject_future_tree_state_height(height, view.visible_tip_height)?;
+        match self.query_api.tree_state_hex_at(height, None).await {
+            Ok(tree_state) => Ok(tree_state),
+            Err(QueryError::BlockNotInBestChain) => {
+                let latest_view = self.query_api.capture_ephemeral_view().await?;
+                reject_future_tree_state_height(height, latest_view.visible_tip_height)?;
+                let pinned_view = self.query_api.capture_view().await?;
+                reject_future_tree_state_height(height, pinned_view.visible_tip_height)?;
+                self.query_api
+                    .tree_state_hex_at(height, Some(pinned_view.id))
+                    .await
+                    .map_err(|error| tree_state_status(&error))
+            }
+            Err(error) => Err(tree_state_status(&error)),
+        }
+    }
 }
 
 const EMPTY_BALANCE_ADDRESSES: &str = "addresses list must not be empty";
@@ -1225,22 +1253,7 @@ where
     ) -> Result<Response<lightwalletd::TreeState>, Status> {
         let block = requested_block(&request.into_inner(), decode_rpc_block_hash_bytes)?;
         let tree_state = match block {
-            RequestedBlock::Height(height) => {
-                self.block_methods
-                    .await_tip(&self.query_api, "get_tree_state", height)
-                    .await?;
-                let view = self.query_api.capture_ephemeral_view().await?;
-                reject_future_tree_state_height(height, view.visible_tip_height)?;
-                match self.query_api.tree_state_hex_at(height, None).await {
-                    Ok(tree_state) => tree_state,
-                    Err(QueryError::BlockNotInBestChain) => {
-                        let latest_view = self.query_api.capture_ephemeral_view().await?;
-                        reject_future_tree_state_height(height, latest_view.visible_tip_height)?;
-                        return Err(tree_state_status(&QueryError::BlockNotInBestChain));
-                    }
-                    Err(error) => return Err(tree_state_status(&error)),
-                }
-            }
+            RequestedBlock::Height(height) => self.tree_state_hex_for_height(height).await?,
             RequestedBlock::Hash(_) => {
                 let view = self.query_api.capture_view().await?;
                 reject_genesis_tree_state(block, view.network)?;

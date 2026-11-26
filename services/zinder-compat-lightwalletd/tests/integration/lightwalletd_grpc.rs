@@ -6064,6 +6064,74 @@ async fn wallet_cached_hex_tree_states_follow_live_appends_and_reorgs() -> eyre:
     Ok(())
 }
 
+#[tokio::test]
+async fn wallet_tree_state_height_handles_mid_flight_reorg_dip_and_recovery() -> eyre::Result<()> {
+    use prost::Message as _;
+
+    let activations = three_pool_regtest_activations()?;
+    let base = ChainFixture::new(Network::ZcashRegtest).extend_blocks(126);
+    let chain = with_note_commitments(&base, &activations)?;
+    let reorg_fork = with_note_commitments(
+        &base.fork_at(BlockHeight::new(110))?.extend_blocks(17),
+        &activations,
+    )?;
+    let (_s1, initial_pair) = pair_at(&chain, &activations, 125, 105)?;
+    let (_s2, dipped_pair) = pair_at(&reorg_fork, &activations, 124, 105)?;
+    let (_s3, recovered_pair) = pair_at(&reorg_fork, &activations, 126, 105)?;
+    let initial_query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(initial_pair));
+    let dipped_query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(dipped_pair));
+    let recovered_query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(recovered_pair));
+    let published = tip_wait::published_query::PublishedQuery::new(initial_query.clone());
+    let adapter = LightwalletdGrpcAdapter::new(published.clone());
+
+    // Case 1: Tip dips from 125 -> 124 after the initial ephemeral check and stays at 124.
+    let dip_pub = published.clone();
+    let dip_target = dipped_query.clone();
+    published.on_next_unpinned_tree_state_hex(move || dip_pub.publish(dip_target), || {});
+    let dipped_err = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 125,
+            hash: Vec::new(),
+        }))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("height 125 above mid-flight dipped tip 124 succeeded"))?;
+    assert_eq!(dipped_err.code(), Code::InvalidArgument);
+    assert_eq!(
+        dipped_err.message(),
+        "tree state height 125 is newer than latest block 124"
+    );
+
+    // Case 2: Tip dips 125 -> 124 during the unpinned read, then recovers to 126 before fallback.
+    published.publish(initial_query);
+    let before_pub = published.clone();
+    let after_pub = published.clone();
+    let recovered_target = recovered_query.clone();
+    published.on_next_unpinned_tree_state_hex(
+        move || before_pub.publish(dipped_query),
+        move || after_pub.publish(recovered_target),
+    );
+    let recovered_125 = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: 125,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(
+        recovered_125.encode_to_vec(),
+        reference_encoded_tree_state(
+            &recovered_query
+                .tree_state_at(BlockHeight::new(125), None)
+                .await?
+        )
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sixteen_concurrent_wallet_tree_state_tasks_serve_warm_hex_without_contention()
 -> eyre::Result<()> {
