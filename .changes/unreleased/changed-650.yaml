@@ -1,0 +1,6 @@
+kind: changed
+body: Defaulted the single-host Compose deployment (`deploy/docker-compose.yml`) to `ZINDER_DEPLOYMENT__PROFILE=wallet` (`raw_blob_policy = "none"`, with `wallet-archive` override and automatic profile clearing in `deploy/docker-compose.explorer.yml`), forwarded `ZINDER_INGEST__SOURCE` to `zinder-ingest`, bounded `zinder-history-publisher` with a 512 MiB `/tmp` tmpfs mount and `--workers "${ZINDER_HISTORY_PUBLISHER_WORKERS:-1}"`, added a turn-key projector-free `deploy/docker-compose.light-wallet.yml` bundle, and updated `deploy/systemd/zinder.service` to pass `--no-build` without a destructive `ExecStartPre` teardown.
+time: 2026-11-26T12:31:30Z
+custom:
+    Bump: patch
+    PR: "650"
