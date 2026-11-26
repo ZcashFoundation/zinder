@@ -422,8 +422,9 @@ fn describe_limit_metrics() {
     metrics::describe_counter!(
         RELEASE_PROBES_METRIC,
         metrics::Unit::Count,
-        "One-byte chunks a public gRPC listener sent before ending or pausing an HTTP/2 \
-         response, to confirm the client's flow-control window covers the data before them."
+        "Departure-probe chunks a public gRPC listener sent before ending or pausing an HTTP/2 \
+         response (either a chunk of at most 4 KiB sent whole or a larger chunk's held-back \
+         final byte), to confirm the client's flow-control window covers the data."
     );
 }
 

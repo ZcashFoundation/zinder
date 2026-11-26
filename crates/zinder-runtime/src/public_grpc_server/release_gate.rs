@@ -9,17 +9,24 @@
 //! state from arising.
 //!
 //! Before the gate ends a response, and whenever the response pauses because
-//! its producer has nothing ready, it hands hyper the data's last byte on its
-//! own, as a probe. hyper hands a chunk it holds to h2 only once the stream
-//! has send capacity left after the data already queued. h2 sends a stream's
-//! DATA in order, and it copies a frame this small into its write buffer and
-//! drops it as it does. Only once the probe is dropped does the gate release
-//! the end or poll the producer again: everything queued before the probe has
-//! then been charged to the window and encoded, which no later `SETTINGS`
-//! change can undo. Until then the transport still holds the probe, so the
-//! stall timer keeps running. Until it releases the end, the gate reports
-//! that it has not ended, because hyper sends `END_STREAM` with the last data
-//! frame of a body that has.
+//! its producer has nothing ready, it probes the stream's flow-control window.
+//! A chunk of at most [`WHOLE_FRAME_PROBE_MAX_BYTES`] goes out whole wrapped in
+//! [`ProbeChunk`]; a larger chunk holds back its last byte to send on its own
+//! in [`ProbeByte`]. hyper hands a chunk it holds to h2 only once the stream
+//! has send capacity left after the data already queued, and h2 sends a
+//! stream's DATA in order. When the stream's window covers only part of a
+//! [`ProbeChunk`], h2 advances the `Bytes` cursor over the sent prefix and
+//! re-queues the unwritten remainder on the stream without dropping the owner.
+//! h2 drops [`ProbeByte`] as it copies the byte into its write buffer, and
+//! drops [`ProbeChunk`] once the whole chunk has been charged to the window and
+//! encoded (immediately in `buffer` below h2's chain threshold, or in
+//! `reclaim_written_frame` as soon as the single DATA frame flushes). Only once
+//! the probe is dropped does the gate release the end or poll the producer
+//! again: everything up through the probe has then been charged to the window
+//! and encoded, which no later `SETTINGS` change can undo. Until then the
+//! transport still holds the probe, so the stall timer keeps running. Until it
+//! releases the end, the gate reports that it has not ended, because hyper
+//! sends `END_STREAM` with the last data frame of a body that has.
 //!
 //! A producer that yields to the scheduler, as `tokio_stream::iter` does every
 //! 32 items, is ready again as soon as its task runs. The gate therefore waits
@@ -29,9 +36,11 @@
 //! never merged with later data.
 //!
 //! The probe depends on hyper waiting for capacity before it sends a chunk it
-//! holds (`proto::h2::PipeToSendStream` in hyper 1.12), and on h2 dropping a
-//! small DATA frame as it encodes it (`codec::FramedWrite::buffer` in h2
-//! 0.4.20). The listener's tests fail if an upgrade changes either.
+//! holds (`proto::h2::PipeToSendStream` in hyper 1.12), and on h2 keeping a
+//! DATA frame's `Bytes` owner alive until every byte of that frame has been
+//! charged to flow control and encoded (`proto::streams::Prioritize` and
+//! `codec::FramedWrite` in h2 0.4.20). The listener's tests fail if an upgrade
+//! changes either.
 //!
 //! The gate records each piece the transport takes and each time the
 //! transport asks for the next. The task that carries the response resets
@@ -181,13 +190,14 @@ impl Departure {
 /// Maximum frame size sent whole as a single departure probe instead of
 /// splitting off its final byte.
 ///
-/// Small unary responses (such as `GetTreeState`, `GetLatestBlock`, and
-/// `GetLightdInfo`) sit well below HTTP/2's 16 KiB `max_frame_size`, so h2
-/// encodes and copies the entire frame into its write buffer in one turn and
-/// drops the `Bytes` owner immediately once flow-control window covers it.
-/// Probing the frame whole avoids splitting it into two DATA frames and saves
-/// an extra `poll_frame` turn and `h2::send_data` call while keeping every
-/// send-stall reset and shutdown-replacement guarantee intact.
+/// Small unary responses (such as `GetTreeState`, `GetLatestTreeState`,
+/// `GetLatestBlock`, and `GetLightdInfo`) and small trailing stream chunks sit
+/// well below HTTP/2's 16 KiB `max_frame_size`. h2 advances the `Bytes` cursor
+/// without dropping [`ProbeChunk`] if the peer's window covers only part of the
+/// chunk, and drops [`ProbeChunk`] once the entire frame is charged to flow
+/// control and flushed. Probing the frame whole avoids a second HTTP/2 DATA
+/// frame, an extra `h2::SendStream::send_data` call, and an extra `poll_frame`
+/// turn while preserving send-stall resets and shutdown status replacement.
 const WHOLE_FRAME_PROBE_MAX_BYTES: usize = 4 * 1024;
 
 /// A small data chunk handed out whole as its own departure probe.

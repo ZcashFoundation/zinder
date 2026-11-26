@@ -274,6 +274,12 @@ async fn shutdown_replaces_a_status_before_grpc_web_encodes_it() -> Result<()> {
     shutdown_while_sending("application/grpc-web-text+proto", true, PAYLOAD).await
 }
 
+#[tokio::test]
+async fn shutdown_replaces_a_small_unary_status_before_grpc_web_encodes_it() -> Result<()> {
+    shutdown_while_sending("application/grpc-web+proto", false, 1_653).await?;
+    shutdown_while_sending("application/grpc-web-text+proto", true, 1_653).await
+}
+
 #[expect(
     clippy::future_not_send,
     reason = "the recorder guard stays on the current-thread test runtime"
@@ -719,5 +725,160 @@ async fn a_reader_granting_less_than_a_piece_of_window_within_the_timeout_is_res
         .ok_or_else(|| eyre!("the response ended normally"))?;
     assert_eq!(error.reason(), Some(h2::Reason::CANCEL), "{error}");
     assert!(received < sent, "every byte arrived");
+    Ok(())
+}
+
+/// Reads the `initial_window` prefix of a response while asserting its probe
+/// has neither released `END_STREAM` nor freed the server's tracked storage.
+async fn read_partial_window_prefix(
+    server: &TestServer,
+    body: &mut h2::RecvStream,
+    expected_prefix: &[u8],
+) -> Result<Vec<u8>> {
+    let mut received = Vec::with_capacity(expected_prefix.len());
+    while received.len() < expected_prefix.len() {
+        let chunk = within_wait_limit(body.data())
+            .await?
+            .ok_or_else(|| eyre!("the response ended before filling its initial window"))??;
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received.as_slice(), expected_prefix);
+    assert!(
+        !body.is_end_stream(),
+        "END_STREAM arrived with partial window"
+    );
+    assert!(
+        !server.all_freed(1),
+        "partial Buf::advance dropped ProbeChunk before the remainder was sent"
+    );
+    Ok(received)
+}
+
+/// A partial initial window below h2's 256-byte chain threshold advances into
+/// `ProbeChunk` without dropping it; withholding the rest resets the stream and
+/// frees both the buffer and the stream slot.
+#[tokio::test]
+async fn a_partial_window_on_a_small_unary_response_holds_back_the_end_and_resets_when_stalled()
+-> Result<()> {
+    const PARTIAL_WINDOW: u32 = 100;
+    const TREE_STATE_PAYLOAD: usize = 1_500;
+    let mut server = serve(Bounds::default())?;
+    let client = H2Client::connect(server.address, PARTIAL_WINDOW).await?;
+    let mut body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    let expected = message_frame(TREE_STATE_PAYLOAD, 0);
+    script.send_message(TREE_STATE_PAYLOAD).await?;
+    script.finish().await?;
+
+    let prefix_len = usize::try_from(PARTIAL_WINDOW)?;
+    let _ = read_partial_window_prefix(&server, &mut body, &expected[..prefix_len]).await?;
+
+    let ended_with = match within_wait_limit(body.data()).await? {
+        Some(Ok(_)) => bail!("unexpected bytes arrived without window credit"),
+        Some(Err(error)) => error.reason(),
+        None => None,
+    };
+    assert_eq!(ended_with, Some(h2::Reason::CANCEL));
+    wait_until("the stalled whole-probed chunk is freed", || {
+        server.all_freed(1)
+    })
+    .await?;
+
+    let streams = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)?;
+    let opened = within_wait_limit(futures_util::future::try_join_all(
+        (0..streams).map(|_| client.open_stream()),
+    ))
+    .await??;
+    for _ in 0..streams {
+        server.next_script().await?;
+    }
+    assert_eq!(opened.len(), streams);
+    Ok(())
+}
+
+/// After a partial window consumes the first 100 bytes of `ProbeChunk`,
+/// granting the remaining window delivers the exact suffix and `OK` trailers.
+#[tokio::test]
+async fn a_partial_window_on_a_small_unary_response_completes_once_remaining_window_arrives()
+-> Result<()> {
+    const PARTIAL_WINDOW: u32 = 100;
+    const TREE_STATE_PAYLOAD: usize = 1_500;
+    let mut server = serve(Bounds {
+        send_stall: WINDOW_CHANGE_STALL,
+        ..Bounds::default()
+    })?;
+    let client = H2Client::connect(server.address, PARTIAL_WINDOW).await?;
+    let mut body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    let expected = message_frame(TREE_STATE_PAYLOAD, 0);
+    script.send_message(TREE_STATE_PAYLOAD).await?;
+    script.finish().await?;
+
+    let prefix_len = usize::try_from(PARTIAL_WINDOW)?;
+    let mut received =
+        read_partial_window_prefix(&server, &mut body, &expected[..prefix_len]).await?;
+    body.flow_control().release_capacity(prefix_len)?;
+    assert!(client.set_stream_window(64 * 1024).await?);
+
+    while let Some(chunk) = within_wait_limit(body.data()).await? {
+        let chunk = chunk?;
+        body.flow_control().release_capacity(chunk.len())?;
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, expected);
+    let trailers = within_wait_limit(body.trailers()).await??;
+    let status = trailers
+        .as_ref()
+        .and_then(|trailers| trailers.get("grpc-status"));
+    assert_eq!(
+        status.map(http::HeaderValue::as_bytes),
+        Some(b"0".as_slice())
+    );
+    wait_until("the completed whole-probed chunk is freed", || {
+        server.all_freed(1)
+    })
+    .await?;
+    Ok(())
+}
+
+/// A multi-frame stream whose trailing `<= 4 KiB` chunk stalls mid-frame behind
+/// a partial window still resets and frees every chunk.
+#[tokio::test]
+async fn a_stream_with_a_small_trailing_chunk_resets_when_partial_window_stalls_its_tail()
+-> Result<()> {
+    const FIRST_PAYLOAD: usize = 32 * 1024;
+    const TRAILING_PAYLOAD: usize = 1_500;
+    const TAIL_PREFIX: usize = 100;
+    let first = message_frame(FIRST_PAYLOAD, 0);
+    let tail = message_frame(TRAILING_PAYLOAD, 1);
+    let window = u32::try_from(first.len() + TAIL_PREFIX)?;
+    let mut server = serve(Bounds::default())?;
+    let client = H2Client::connect(server.address, window).await?;
+    let mut body = client.open_stream().await?;
+    let mut script = server.next_script().await?;
+    script.send_message(FIRST_PAYLOAD).await?;
+    script.send_message(TRAILING_PAYLOAD).await?;
+    script.finish().await?;
+
+    let mut expected_prefix = first;
+    expected_prefix.extend_from_slice(&tail[..TAIL_PREFIX]);
+    let mut received = Vec::with_capacity(expected_prefix.len());
+    while received.len() < expected_prefix.len() {
+        let chunk = within_wait_limit(body.data())
+            .await?
+            .ok_or_else(|| eyre!("the stream ended before using its window"))??;
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, expected_prefix);
+    assert!(!body.is_end_stream());
+    assert!(!server.all_freed(2), "trailing ProbeChunk freed early");
+
+    let ended_with = match within_wait_limit(body.data()).await? {
+        Some(Ok(_)) => bail!("unexpected bytes arrived without window credit"),
+        Some(Err(error)) => error.reason(),
+        None => None,
+    };
+    assert_eq!(ended_with, Some(h2::Reason::CANCEL));
+    wait_until("both stream chunks are freed", || server.all_freed(2)).await?;
     Ok(())
 }

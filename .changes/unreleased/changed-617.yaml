@@ -1,5 +1,5 @@
 kind: changed
-body: Reduced per-request CPU on small unary gRPC responses (`<= 4 KiB`, such as `GetTreeState`, `GetLatestBlock`, and `GetLightdInfo`) by probing the frame whole inside the HTTP/2 release gate instead of splitting off its trailing byte into a second DATA frame, preserving all send-stall reset and shutdown termination guarantees.
+body: Reduced per-request CPU on small unary gRPC responses (`<= 4 KiB`, such as `GetTreeState`, `GetLatestTreeState`, `GetLatestBlock`, and `GetLightdInfo`) by probing the frame whole inside the HTTP/2 release gate instead of splitting off its trailing byte into a second DATA frame, preserving all send-stall reset and shutdown termination guarantees.
 time: 2026-11-25T21:09:30Z
 custom:
     Bump: patch
