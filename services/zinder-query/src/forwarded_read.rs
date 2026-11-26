@@ -735,6 +735,8 @@ impl ForwardedReadLimit {
         kind: ForwardedReadKind,
         deadline: Instant,
     ) -> Result<Result<PoolSlot, Arc<[u8]>>, ForwardedReadRefused> {
+        let slot_future = self.node_call_slot(kind, deadline);
+        tokio::pin!(slot_future);
         loop {
             let notified = self.inner.transactions.cache_populated().notified();
             tokio::pin!(notified);
@@ -743,7 +745,7 @@ impl ForwardedReadLimit {
                 return Ok(Err(bytes));
             }
             tokio::select! {
-                slot = self.node_call_slot(kind, deadline) => {
+                slot = &mut slot_future => {
                     let slot = slot?;
                     if let Some(bytes) = self.inner.transactions.cached_without_metric(mined) {
                         return Ok(Err(bytes));
