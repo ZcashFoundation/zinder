@@ -1,0 +1,6 @@
+kind: changed
+body: Cached the visible-tip commitment-tree checkpoint per wallet-serving generation and served pre-encoded hexadecimal tree states without epoch-pin retention on wallet-mode `GetLatestTreeState` and `GetTreeState` height lookups, eliminating per-call RocksDB reads and hexadecimal re-encoding on warm requests while preserving reorg and history-floor guarantees.
+time: 2026-11-26T09:32:45Z
+custom:
+    Bump: patch
+    PR: 629

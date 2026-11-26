@@ -483,11 +483,43 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError>;
 
+    /// Reads the tree state at exactly `height`, pre-encoded in lowercase
+    /// hexadecimal for lightwalletd `GetTreeState` serving.
+    ///
+    /// Validation and errors match [`Self::tree_state_at`]. Because the
+    /// returned value exposes no chain epoch, an unpinned (`None`) read need
+    /// not retain its serving generation for future epoch pins. The default
+    /// encodes [`Self::tree_state_at`].
+    async fn tree_state_hex_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        let tree_state = self.tree_state_at(height, at_epoch_id).await?;
+        Ok(ServedTreeStateHex::from_tree_state(&tree_state))
+    }
+
     /// Reads the latest tree-state checkpoint at the visible chain epoch tip.
     async fn latest_tree_state_checkpoint(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError>;
+
+    /// Reads the latest tree-state checkpoint at the visible chain epoch tip,
+    /// pre-encoded in lowercase hexadecimal for lightwalletd
+    /// `GetLatestTreeState` serving.
+    ///
+    /// Validation and errors match [`Self::latest_tree_state_checkpoint`].
+    /// Because the returned value exposes no chain epoch, an unpinned (`None`)
+    /// read need not retain its serving generation for future epoch pins. The
+    /// default encodes [`Self::latest_tree_state_checkpoint`].
+    async fn latest_tree_state_checkpoint_hex(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        let tree_state = self.latest_tree_state_checkpoint(at_epoch_id).await?;
+        Ok(ServedTreeStateHex::from_tree_state(&tree_state))
+    }
 
     /// Reads subtree-root artifacts for a bounded subtree range.
     ///
@@ -530,6 +562,12 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// configured, and [`SourceError::SourceProtocolMismatch`] when the node
     /// answers with a zero fee or a reply of another shape.
     async fn standard_fee(&self) -> Result<StandardFee, QueryError>;
+
+    /// Returns the retained canonical history bounds of the current serving
+    /// view without observing or pinning it, when available synchronously.
+    fn canonical_history_bounds(&self) -> Option<zinder_core::CanonicalHistoryBounds> {
+        None
+    }
 }
 
 /// Default maximum compact-block count returned by one range call.

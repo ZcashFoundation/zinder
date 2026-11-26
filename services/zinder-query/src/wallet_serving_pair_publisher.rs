@@ -313,6 +313,16 @@ impl WalletServingPairSlot {
         Arc::clone(&self.published.load().current)
     }
 
+    /// Runs a synchronous, non-pinning read against the currently published
+    /// pair without cloning or dropping its `Arc` reference count.
+    pub(crate) fn with_ephemeral<Output>(
+        &self,
+        read: impl FnOnce(&Arc<WalletServingReadPair>) -> Output,
+    ) -> Output {
+        let published = self.published.load();
+        read(&published.current)
+    }
+
     /// Subscribes to the slot's publications.
     ///
     /// The receiver reports a change for every pair published after this
@@ -327,7 +337,10 @@ impl WalletServingPairSlot {
     /// Reports whether `candidate` still names the currently published pair.
     #[must_use]
     pub(crate) fn is_current_weak(&self, candidate: &Weak<WalletServingReadPair>) -> bool {
-        Weak::ptr_eq(candidate, &Arc::downgrade(&self.published.load().current))
+        std::ptr::eq(
+            candidate.as_ptr(),
+            Arc::as_ptr(&self.published.load().current),
+        )
     }
 
     /// Captures the pair that answers a read pinned to `chain_epoch_id`.

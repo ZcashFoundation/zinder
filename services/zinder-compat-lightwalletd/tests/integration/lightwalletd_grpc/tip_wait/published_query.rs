@@ -21,35 +21,65 @@ use zinder_query::{
     BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockFence,
     CompactBlockRange, CompactBlockStream, FullBlock, FullBlockStream,
     NativeWalletEndpointCapabilities, QueryError, RawTransaction, ServedTipSnapshot,
-    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
-    UpstreamNodeCapabilities, VisibleTipBlock, WalletQueryApi, WalletServingQuery,
+    ServedTreeStateHex, SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
+    TransparentOutpointSpendStatuses, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
+    WalletQueryApi, WalletServingQuery,
 };
 use zinder_store::{
     ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
     StreamCursorTokenV1,
 };
 
+type UnpinnedTreeStateStep = Box<dyn FnOnce() + Send>;
+
+struct UnpinnedTreeStateSteps {
+    before: UnpinnedTreeStateStep,
+    after: UnpinnedTreeStateStep,
+}
+
 #[derive(Clone)]
-pub(super) struct PublishedQuery {
+pub(in crate::integration::lightwalletd_grpc) struct PublishedQuery {
     /// The first query, whose structural capabilities every later one shares.
     first: WalletServingQuery<()>,
     current: Arc<Mutex<WalletServingQuery<()>>>,
     publications: Arc<watch::Sender<()>>,
+    unpinned_tree_state_steps: Arc<Mutex<Option<UnpinnedTreeStateSteps>>>,
+    pinned_tree_state_hex_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PublishedQuery {
-    pub(super) fn new(first: WalletServingQuery<()>) -> Self {
+    pub(in crate::integration::lightwalletd_grpc) fn new(first: WalletServingQuery<()>) -> Self {
         Self {
             current: Arc::new(Mutex::new(first.clone())),
             first,
             publications: Arc::new(watch::Sender::new(())),
+            unpinned_tree_state_steps: Arc::new(Mutex::new(None)),
+            pinned_tree_state_hex_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
+    pub(in crate::integration::lightwalletd_grpc) fn pinned_tree_state_hex_calls(&self) -> usize {
+        self.pinned_tree_state_hex_calls
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Runs `before` immediately before the next unpinned `tree_state_hex_at`
+    /// call and `after` immediately after it completes.
+    pub(in crate::integration::lightwalletd_grpc) fn on_next_unpinned_tree_state_hex(
+        &self,
+        before: impl FnOnce() + Send + 'static,
+        after: impl FnOnce() + Send + 'static,
+    ) {
+        *self.unpinned_tree_state_steps.lock() = Some(UnpinnedTreeStateSteps {
+            before: Box::new(before),
+            after: Box::new(after),
+        });
+    }
+
     /// Serves `next` from now on and wakes every subscriber.
-    pub(super) fn publish(&self, next: WalletServingQuery<()>) {
+    pub(in crate::integration::lightwalletd_grpc) fn publish(&self, next: WalletServingQuery<()>) {
         *self.current.lock() = next;
         self.publications.send_replace(());
     }
@@ -67,6 +97,18 @@ impl WalletQueryApi for PublishedQuery {
 
     fn subscribe_publications(&self) -> Option<watch::Receiver<()>> {
         Some(self.publications.subscribe())
+    }
+
+    fn current_visible_tip_height(&self) -> Option<BlockHeight> {
+        self.now().current_visible_tip_height()
+    }
+
+    fn current_chain_epoch(&self) -> Option<ChainEpoch> {
+        self.now().current_chain_epoch()
+    }
+
+    fn canonical_history_bounds(&self) -> Option<zinder_core::CanonicalHistoryBounds> {
+        self.now().canonical_history_bounds()
     }
 
     fn native_endpoint_capabilities(&self) -> &NativeWalletEndpointCapabilities {
@@ -278,11 +320,42 @@ impl WalletQueryApi for PublishedQuery {
         self.now().tree_state_at(height, at_epoch_id).await
     }
 
+    async fn tree_state_hex_at(
+        &self,
+        height: BlockHeight,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        let after = if at_epoch_id.is_none() {
+            self.unpinned_tree_state_steps.lock().take().map(|steps| {
+                (steps.before)();
+                steps.after
+            })
+        } else {
+            self.pinned_tree_state_hex_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            None
+        };
+        let outcome = self.now().tree_state_hex_at(height, at_epoch_id).await;
+        if let Some(after) = after {
+            after();
+        }
+        outcome
+    }
+
     async fn latest_tree_state_checkpoint(
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         self.now().latest_tree_state_checkpoint(at_epoch_id).await
+    }
+
+    async fn latest_tree_state_checkpoint_hex(
+        &self,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<ServedTreeStateHex, QueryError> {
+        self.now()
+            .latest_tree_state_checkpoint_hex(at_epoch_id)
+            .await
     }
 
     async fn subtree_roots(
