@@ -1,0 +1,6 @@
+kind: fixed
+body: Hardened the local observability Compose stack to bind Prometheus and Grafana to `127.0.0.1` by default without `--web.enable-admin-api`, fixed RocksDB property unit and `store_role` rendering plus `zinder-query` availability in the overview Grafana dashboard, added dashboard panels and Prometheus alert rules for v0.26.0 exported signals, and updated `scripts/observability-smoke.sh` to report unexercised backup/restore as `not_exercised` instead of `blocked`.
+time: 2026-11-26T11:45:30Z
+custom:
+    Bump: patch
+    PR: "647"

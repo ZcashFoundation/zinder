@@ -26,10 +26,9 @@ Compose deployment. Metric names and alerts are described in
 7. Writes a readiness report and an evidence directory, and leaves
    everything running so you can inspect the dashboards.
 
-The readiness report records restore as `blocked`, because Zinder recovers
-by rebuilding from the node, as
-[Service operations](../docs/architecture/service-operations.md#recovery)
-describes.
+The readiness report records restore as `not_exercised`, because this smoke
+validates live ingest, projection, serving, and scrape wiring rather than
+running `zinder-projector backup`/`verify`/`restore`.
 
 To test the shipped Prometheus configs, rules, and Scrape Targets panel with
 isolated samples and no node, run `python3 scripts/test-observability-rules.py`.
