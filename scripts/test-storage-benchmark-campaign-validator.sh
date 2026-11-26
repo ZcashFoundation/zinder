@@ -923,14 +923,24 @@ write_lifecycle_evidence() {
     --argjson checkpoint_count "$checkpoint_count" \
     --arg publication_mode "$publication_mode" \
     --argjson cold_validation_seconds "$cold_validation_seconds" '
-    def budget: {
-      block_cache_bytes: 67108864,
-      max_wal_bytes: 33554432,
-      max_open_files: 128,
-      write_buffer_bytes: 8388608,
+    def canonical_budget: {
+      block_cache_bytes: 536870912,
+      max_wal_bytes: 268435456,
+      max_open_files: 512,
+      write_buffer_bytes: 16777216,
       max_write_buffer_count: 2,
       max_background_jobs: 2,
-      memtable_budget_bytes: 16777216,
+      memtable_budget_bytes: 268435456,
+      statistics_level: "tickers"
+    };
+    def wallet_budget: {
+      block_cache_bytes: 268435456,
+      max_wal_bytes: 33554432,
+      max_open_files: 512,
+      write_buffer_bytes: 16777216,
+      max_write_buffer_count: 4,
+      max_background_jobs: 2,
+      memtable_budget_bytes: 536870912,
       statistics_level: "tickers"
     };
     def empty_sort($mem): {
@@ -940,7 +950,7 @@ write_lifecycle_evidence() {
       peak_accounted_sort_memory_bytes: 0,
       max_accounted_sort_memory_bytes: $mem,
       peak_temporary_file_bytes: 0,
-      max_temporary_file_bytes: 68719476736,
+      max_temporary_file_bytes: 206158430208,
       final_run_file_bytes: 0
     };
     {
@@ -970,7 +980,6 @@ write_lifecycle_evidence() {
         id: "rocksdb-storage-lifecycle",
         canonical_engine: "rocksdb",
         canonical_model: "canonical-replay-storage",
-        diagnostic_projection_engine: null,
         topology: "rocksdb"
       },
       source: {
@@ -1001,12 +1010,12 @@ write_lifecycle_evidence() {
           source_fetch_max_in_flight_bytes: 167772160,
           block_prepare_concurrency: 10,
           block_prepare_memory_watermark_bytes: 167772160,
-          canonical_rocksdb: budget,
-          wallet_rocksdb: budget,
+          canonical_rocksdb: canonical_budget,
+          wallet_rocksdb: wallet_budget,
           supported_reorg_depth: 100,
           wallet_max_outpoint_sort_memory_bytes: 4294967296,
           wallet_max_secondary_sort_memory_bytes_per_sorter: 1073741824,
-          wallet_max_temporary_file_bytes_per_sorter: 68719476736,
+          wallet_max_temporary_file_bytes_per_sorter: 206158430208,
           wallet_sst_target_logical_bytes: 134217728,
           wallet_max_accounted_reorg_undo_bytes: 536870912,
           tree_state_checkpoint_coverage: $coverage,
@@ -1125,6 +1134,25 @@ write_lifecycle_evidence() {
           ready_publication_seconds: 0.1,
           total_seconds: 2.0
         },
+        build_stages: [
+          {stage: "store_initialization", seconds: 0.1},
+          {stage: "canonical_scan", seconds: 0.2},
+          {stage: "outpoint_run_spill", seconds: 0.05},
+          {stage: "outpoint_sort", seconds: 0.1},
+          {stage: "outpoint_drain", seconds: 0.05},
+          {stage: "primary_sst_write", seconds: 0.05},
+          {stage: "address_index_run_spill", seconds: 0.02},
+          {stage: "address_transaction_run_spill", seconds: 0.03},
+          {stage: "secondary_address_derivation", seconds: 0.08},
+          {stage: "reorg_undo_write", seconds: 0.02},
+          {stage: "logical_evidence", seconds: 0.1},
+          {stage: "row_load", seconds: 0.1},
+          {stage: "flush_and_close", seconds: 0.05},
+          {stage: "cold_reopen", seconds: 0.05},
+          {stage: "cold_validation_family_readback", seconds: 0.15},
+          {stage: "cold_validation_reorg_undo_readback", seconds: 0.05},
+          {stage: "ready_publication", seconds: 0.1}
+        ],
         physical_store_bytes: 4096,
         cold_reopen_evidence_match: true,
         canonical_fence_match: true
@@ -1285,6 +1313,14 @@ expect_lifecycle_rejected() {
 expect_lifecycle_rejected wrong-store-schema '.contracts.wallet_store_schema_version = 2'
 expect_lifecycle_rejected wrong-commitment-scheme '.wallet_storage_ready.utxo_summary.commitment_scheme = "lthash16"'
 expect_lifecycle_rejected wrong-projection-schema '.contracts.wallet_projection_schema_version = 2'
+expect_lifecycle_rejected legacy-diagnostic-projection-engine '.storage_candidate.diagnostic_projection_engine = null'
+expect_lifecycle_rejected missing-build-stages 'del(.wallet_storage_ready.build_stages)'
+expect_lifecycle_rejected reordered-build-stages '.wallet_storage_ready.build_stages |= (.[0:1] + [.[2], .[1]] + .[3:])'
+expect_lifecycle_rejected unknown-build-stage '.wallet_storage_ready.build_stages[0].stage = "unexpected_stage"'
+expect_lifecycle_rejected excess-build-stages-total '.wallet_storage_ready.build_stages[0].seconds = 5.0'
+expect_lifecycle_rejected legacy-wallet-wal-budget '.resource_limits.wallet_rocksdb.max_wal_bytes = 268435456'
+expect_lifecycle_rejected legacy-canonical-cache-budget '.resource_limits.canonical_rocksdb.block_cache_bytes = 67108864'
+expect_lifecycle_rejected legacy-sorter-temp-budget '.resource_limits.wallet_max_temporary_file_bytes_per_sorter = 68719476736 | .wallet_storage_ready.construction.outpoint_sort.max_temporary_file_bytes = 68719476736 | .wallet_storage_ready.construction.address_index_sort.max_temporary_file_bytes = 68719476736 | .wallet_storage_ready.construction.address_transaction_sort.max_temporary_file_bytes = 68719476736'
 for obsolete_version in 4 5 6; do
   expect_lifecycle_rejected "obsolete-version-$obsolete_version" ".report_format_version = $obsolete_version"
 done
