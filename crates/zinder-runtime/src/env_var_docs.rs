@@ -1860,10 +1860,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       no CPU for a node or projector on the same host; in one measured Mainnet \
                       build, 8 workers sharing 8 cores with a node pinned to 2 of them reached \
                       READY in 1 h 40 min 30 s. An explicit value may exceed 8. A higher value \
-                      hashes each block's pools and large commitment batches in parallel, and \
-                      derives the checkpoints of up to twice that many blocks, at most 64, \
-                      while the loader writes earlier blocks. The stored trees, checkpoints, and \
-                      subtree roots do not change. Must be greater than zero.",
+                      hashes up to 64 blocks' commitment batches and distinct pool checkpoints in \
+                      parallel while staging up to 64 completed blocks into RocksDB. The stored \
+                      trees, checkpoints, and subtree roots do not change. Must be greater than \
+                      zero.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS",

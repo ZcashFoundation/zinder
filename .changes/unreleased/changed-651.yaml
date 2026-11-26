@@ -1,0 +1,6 @@
+kind: changed
+body: Cache unchanged shielded commitment-tree checkpoints across worker threads and pipeline 64-block commitment-tree batches ahead of canonical RocksDB SST staging during fresh store construction when `ingest.construction.tree_hashing_workers` exceeds one.
+time: 2026-11-26T12:40:00Z
+custom:
+    Bump: patch
+    PR: "651"

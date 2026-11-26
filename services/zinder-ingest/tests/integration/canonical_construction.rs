@@ -2352,13 +2352,41 @@ async fn indexer_and_json_rpc_sources_construct_identical_canonical_stores()
     Ok(())
 }
 
+fn non_coinbase_zebra_transactions(
+    source_block: &SourceBlock,
+) -> Result<Vec<Arc<zebra_chain::transaction::Transaction>>, Box<dyn std::error::Error>> {
+    let parsed: ZebraBlock = source_block
+        .raw_block_bytes
+        .as_slice()
+        .zcash_deserialize_into()?;
+    Ok(parsed
+        .transactions
+        .into_iter()
+        .filter(|tx| !tx.is_coinbase())
+        .collect())
+}
+
 fn batched_multi_pool_source(
     activations: &NetworkUpgradeActivations,
 ) -> Result<MultiBlockConstructionSource, Box<dyn std::error::Error>> {
     let sapling = fixture_sapling_source_block()?;
     let orchard = fixture_orchard_source_block()?;
-    MultiBlockConstructionSource::build_with_transactions(72, activations, |height| {
-        if height == 15 || height == 65 {
+    let ironwood_a = non_coinbase_zebra_transactions(&fixture_ironwood_source_block()?)?;
+    let ironwood_b = non_coinbase_zebra_transactions(&fixture_zakura_ironwood_source_block()?)?;
+    MultiBlockConstructionSource::build_with_transactions(141, activations, |height| {
+        if height == 70 {
+            let mut transactions = shielded_transactions_with_lock_time(&sapling, Some(height))?;
+            transactions.extend(shielded_transactions_with_lock_time(
+                &orchard,
+                Some(5_000 + height),
+            )?);
+            transactions.extend(ironwood_a.iter().cloned());
+            return Ok(transactions);
+        }
+        if height == 132 {
+            return Ok(ironwood_b.clone());
+        }
+        if height == 15 || height == 95 {
             let mut transactions = shielded_transactions_with_lock_time(&sapling, Some(height))?;
             for offset in 0_u32..10 {
                 transactions.extend(shielded_transactions_with_lock_time(
@@ -2368,10 +2396,10 @@ fn batched_multi_pool_source(
             }
             return Ok(transactions);
         }
-        match height % 5 {
+        match height % 7 {
             1 => shielded_transactions_with_lock_time(&sapling, Some(height)),
-            2 => shielded_transactions_with_lock_time(&orchard, Some(height)),
-            3 => {
+            3 => shielded_transactions_with_lock_time(&orchard, Some(height)),
+            5 => {
                 let mut transactions =
                     shielded_transactions_with_lock_time(&sapling, Some(2_000 + height))?;
                 transactions.extend(shielded_transactions_with_lock_time(
@@ -2385,6 +2413,84 @@ fn batched_multi_pool_source(
     })
 }
 
+fn checkpoint_frontiers_hex(
+    checkpoint: &CommitmentTreeCheckpoint,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let encode_pool =
+        |pool: Option<&CommitmentTreeFrontier>| pool.map(|f| hex::encode(f.final_state_bytes()));
+    (
+        encode_pool(checkpoint.frontiers.sapling()),
+        encode_pool(checkpoint.frontiers.orchard()),
+        encode_pool(checkpoint.frontiers.ironwood()),
+    )
+}
+
+fn staggered_all_pool_activations()
+-> Result<Arc<NetworkUpgradeActivations>, Box<dyn std::error::Error>> {
+    use zinder_core::{ConsensusBranchId, NetworkUpgradeActivation};
+    let activations = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        vec![
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x5ba8_1b19),
+                activation_height: BlockHeight::new(1),
+                name: "Overwinter".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x76b8_09bb),
+                activation_height: BlockHeight::new(1),
+                name: "Sapling".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x2bb4_0e60),
+                activation_height: BlockHeight::new(1),
+                name: "Blossom".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xf5b9_230b),
+                activation_height: BlockHeight::new(1),
+                name: "Heartwood".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xe9ff_75a6),
+                activation_height: BlockHeight::new(1),
+                name: "Canopy".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xc2d6_d0b4),
+                activation_height: BlockHeight::new(2),
+                name: "NU5".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0xc8e7_1055),
+                activation_height: BlockHeight::new(2),
+                name: "NU6".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x4dec_4df0),
+                activation_height: BlockHeight::new(3),
+                name: "NU6.1".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x5437_f330),
+                activation_height: BlockHeight::new(3),
+                name: "NU6.2".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x37a5_165b),
+                activation_height: BlockHeight::new(60),
+                name: "NU6.3".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x7719_0ad9),
+                activation_height: BlockHeight::new(130),
+                name: "NU7".to_owned(),
+            },
+        ],
+    )?;
+    Ok(Arc::new(activations))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_block_multi_batch_construction_matches_serial_across_workers()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -2394,7 +2500,7 @@ async fn every_block_multi_batch_construction_matches_serial_across_workers()
         network_name: "zcash-regtest",
         advertised_capabilities: Arc::from([]),
     })?;
-    let activations = regtest_activations();
+    let activations = staggered_all_pool_activations()?;
     let source = batched_multi_pool_source(&activations)?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let temporary = TempDir::new()?;
@@ -2402,6 +2508,7 @@ async fn every_block_multi_batch_construction_matches_serial_across_workers()
     let mut serial_checkpoints: Option<ColumnFamilyEntries> = None;
     let mut serial_final_roots: Option<ColumnFamilyEntries> = None;
     let mut serial_subtrees: Option<ColumnFamilyEntries> = None;
+    let mut serial_fence = None;
 
     for workers in [1_u32, 2, 4, 8] {
         let wallet_path = temporary.path().join(format!("wallet-batch-{workers}"));
@@ -2419,43 +2526,50 @@ async fn every_block_multi_batch_construction_matches_serial_across_workers()
             &CancellationToken::new(),
         )
         .await?;
-        for height in 0_u32..=71 {
+        for height in 0_u32..=140 {
+            let stored = wallet_store
+                .tree_state_checkpoint_at(BlockHeight::new(height), &activations)?
+                .ok_or("missing stored checkpoint")?;
+            let expected = source.checkpoint_at(height)?;
+            assert_eq!(&stored, expected);
             assert_eq!(
-                wallet_store
-                    .tree_state_checkpoint_at(BlockHeight::new(height), &activations)?
-                    .as_ref(),
-                Some(source.checkpoint_at(height)?)
+                checkpoint_frontiers_hex(&stored),
+                checkpoint_frontiers_hex(expected)
             );
         }
+        let fence = wallet_store.event_fence();
         drop(wallet_store);
         let wallet_checkpoints = read_cf_entries(&wallet_path, "tree_state_checkpoint")?;
-        assert_eq!(wallet_checkpoints.len(), 72);
+        assert_eq!(wallet_checkpoints.len(), 141);
 
         let explorer_path = temporary.path().join(format!("explorer-batch-{workers}"));
-        build_explorer_every_block_store(&source, &activations, &explorer_path, workers, 71)
+        build_explorer_every_block_store(&source, &activations, &explorer_path, workers, 140)
             .await?;
         let explorer_checkpoints = read_cf_entries(&explorer_path, "tree_state_checkpoint")?;
         let explorer_final_roots =
             read_cf_entries(&explorer_path, "block_final_note_commitment_roots")?;
         let explorer_subtrees = read_cf_entries(&explorer_path, "subtree_root")?;
         assert_eq!(explorer_checkpoints, wallet_checkpoints);
-        assert_eq!(explorer_final_roots.len(), 71);
+        assert_eq!(explorer_final_roots.len(), 140);
 
         if let Some(expected_checkpoints) = &serial_checkpoints {
             assert_eq!(&wallet_checkpoints, expected_checkpoints);
             assert_eq!(Some(&explorer_final_roots), serial_final_roots.as_ref());
             assert_eq!(Some(&explorer_subtrees), serial_subtrees.as_ref());
+            assert_eq!(Some(fence), serial_fence);
         } else {
             serial_checkpoints = Some(wallet_checkpoints);
             serial_final_roots = Some(explorer_final_roots);
             serial_subtrees = Some(explorer_subtrees);
+            serial_fence = Some(fence);
         }
     }
 
     let rendered = recorded_metrics.render();
     assert!(
-        rendered
-            .contains("zinder_ingest_canonical_block_load_stage_duration_seconds_count{stage=\"tree_hashing_append\"}"),
+        rendered.contains(
+            "zinder_ingest_canonical_block_load_stage_duration_seconds_count{stage=\"tree_hashing_append\"}"
+        ),
         "expected tree_hashing_append stage histogram sample in rendered metrics"
     );
     Ok(())

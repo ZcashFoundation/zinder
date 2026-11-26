@@ -1,248 +1,321 @@
-//! Commitment-tree hashing threads for the ordered canonical loader.
+//! Commitment-tree worker pool and bounded SST-stage handoff queue for the
+//! ordered canonical loader.
 //!
-//! The loader still appends every block to the trees and positions it in
-//! height order. With more than one worker, each append hashes on the workers,
-//! and the block's checkpoint and final roots are derived on them from a
-//! snapshot of the trees while the loader appends and writes the blocks around
-//! it. A block is handed to the store only after its own tree work finishes,
-//! so blocks reach the store in height order with the trees and checkpoints a
-//! serial loader produces.
+//! With more than one `tree_hashing_workers` thread, a dedicated tree-staging
+//! thread drains bounded batches of prepared blocks, appends their commitments
+//! across all worker threads, positions them in height order, and cross-checks
+//! distinct pool frontiers in parallel across the batch. Completed
+//! [`CanonicalBuildBlock`] values — still holding their preparation memory
+//! permits — stream through a bounded queue to the `RocksDB` SST stager thread,
+//! so batch `N`'s SST encoding, hashing, and disk writes overlap with batch
+//! `N + 1`'s commitment-tree hashing while preserving height order and bounded
+//! in-flight memory.
 
-use std::{collections::VecDeque, num::NonZeroU32};
-
-use tokio::{
-    runtime::Handle,
-    sync::{OwnedSemaphorePermit, oneshot},
+use std::{
+    collections::VecDeque,
+    num::NonZeroU32,
+    sync::Arc,
+    thread::{self, JoinHandle},
 };
+
+use parking_lot::{Condvar, Mutex};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
-use zinder_core::{
-    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockId, CommitmentTreeAccumulatorError,
-    CommitmentTreeCheckpoint, CommitmentTreeSnapshot,
-};
+use zinder_core::{BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, CommitmentTreeSnapshot};
+use zinder_store::{CanonicalBuildBlock, CanonicalBuildSubtreeRoot};
 
-use super::CanonicalConstructionError;
-use crate::artifact_builder::PositionedCanonicalBlock;
+use super::{CanonicalConstructionError, progress::ConstructionProgress};
 
-/// Most blocks whose tree work can be outstanding, whatever the worker count.
-const MAX_PENDING_BLOCKS: usize = 64;
-
-/// Worker threads and the blocks whose checkpoints they are still deriving.
+/// Unified Rayon worker pool for parallel commitment-tree appends and
+/// checkpoint cross-checks.
 pub(super) struct TreeHashers {
-    /// Dedicated pool for synchronous block appends, or `None` when `workers == 2`
-    /// keeps both spawned threads for checkpoints and runs appends inline.
-    append_workers: Option<rayon::ThreadPool>,
-    checkpoint_workers: rayon::ThreadPool,
-    /// The runtime the loader's blocking thread waits on, so a wait for a
-    /// worker also ends when construction is cancelled.
-    runtime: Handle,
-    /// Appended blocks in height order. An entry that failed to append ends
-    /// the queue, so the blocks before it still reach the store first.
-    pending: VecDeque<Result<PendingBuildBlock, CanonicalConstructionError>>,
-    max_pending: usize,
-}
-
-/// Splits `threads` (`>= 2`) into `(append_threads, checkpoint_threads)`.
-///
-/// With two threads, appends run inline on the loader thread so all spawned
-/// workers stay dedicated to checkpoints. With three or more threads, appends
-/// and checkpoints each receive their own pool within the configured ceiling.
-fn partition_worker_threads(threads: usize) -> (usize, usize) {
-    if threads <= 2 {
-        return (0, threads);
-    }
-    let append_threads = (threads / 2).max(2);
-    (append_threads, threads - append_threads)
-}
-
-fn build_worker_pool(
-    threads: usize,
-    configured_workers: NonZeroU32,
-    name_prefix: &'static str,
-) -> Result<rayon::ThreadPool, CanonicalConstructionError> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(move |index| format!("{name_prefix}-{index}"))
-        // A panicking job drops its result sender, which the loader
-        // reports as a failed block instead of aborting the process.
-        .panic_handler(|_| {
-            tracing::error!(
-                target: "zinder::ingest",
-                event = "commitment_tree_hashing_worker_panicked",
-                "a commitment-tree hashing worker panicked"
-            );
-        })
-        .build()
-        .map_err(
-            |source| CanonicalConstructionError::TreeHashingWorkersUnavailable {
-                workers: configured_workers.get(),
-                reason: source.to_string(),
-            },
-        )
+    workers: rayon::ThreadPool,
 }
 
 impl TreeHashers {
-    /// Starts `workers` hashing threads, or returns `None` for one worker,
-    /// which hashes on the loader thread.
-    pub(super) fn start(
-        workers: NonZeroU32,
-        runtime: Handle,
-    ) -> Result<Option<Self>, CanonicalConstructionError> {
+    /// Starts `workers` commitment-tree hashing threads, or returns `None` for
+    /// one worker, which hashes on the loader thread.
+    pub(super) fn start(workers: NonZeroU32) -> Result<Option<Self>, CanonicalConstructionError> {
         let threads = usize::try_from(workers.get()).unwrap_or(usize::MAX);
-        if threads == 1 {
+        if threads <= 1 {
             return Ok(None);
         }
-        let (append_threads, checkpoint_threads) = partition_worker_threads(threads);
-        let append_workers = (append_threads > 0)
-            .then(|| build_worker_pool(append_threads, workers, "zinder-tree-append"))
-            .transpose()?;
-        let checkpoint_workers =
-            build_worker_pool(checkpoint_threads, workers, "zinder-tree-ckpt")?;
-        Ok(Some(Self {
-            append_workers,
-            checkpoint_workers,
-            runtime,
-            pending: VecDeque::new(),
-            max_pending: threads.saturating_mul(2).min(MAX_PENDING_BLOCKS),
-        }))
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("zinder-tree-hash-{index}"))
+            .panic_handler(|_| {
+                tracing::error!(
+                    target: "zinder::ingest",
+                    event = "commitment_tree_hashing_worker_panicked",
+                    "a commitment-tree hashing worker panicked"
+                );
+            })
+            .build()
+            .map_err(
+                |source| CanonicalConstructionError::TreeHashingWorkersUnavailable {
+                    workers: workers.get(),
+                    reason: source.to_string(),
+                },
+            )?;
+        Ok(Some(Self { workers: pool }))
     }
 
-    /// Whether a dedicated append pool is available for parallel block appends.
-    pub(super) const fn has_append_workers(&self) -> bool {
-        self.append_workers.is_some()
-    }
-
-    /// Runs `hash` on the dedicated append workers, or inline on the caller
-    /// when `workers == 2` leaves all spawned workers for checkpoints.
+    /// Runs `hash` across the commitment-tree worker pool.
     pub(super) fn install<T: Send>(&self, hash: impl FnOnce() -> T + Send) -> T {
-        match &self.append_workers {
-            Some(workers) => workers.install(hash),
-            None => hash(),
-        }
-    }
-
-    pub(super) fn has_pending_error(&self) -> bool {
-        self.pending.back().is_some_and(Result::is_err)
-    }
-
-    /// Whether pending tree work has drained to the low-water mark so the next
-    /// refill takes a multi-block batch rather than single-slot trickle appends.
-    pub(super) fn wants_batch_refill(&self) -> bool {
-        !self.has_pending_error() && self.pending.len() <= self.max_pending / 2
-    }
-
-    /// Whether the loader should take another block before handing one to
-    /// the store.
-    pub(super) fn wants_more(&self) -> bool {
-        self.pending.len() < self.max_pending && !self.has_pending_error()
-    }
-
-    /// Remaining pending-block slots available before reaching `max_pending`.
-    pub(super) fn remaining_pending(&self) -> usize {
-        if self.has_pending_error() {
-            return 0;
-        }
-        self.max_pending.saturating_sub(self.pending.len())
-    }
-
-    pub(super) fn is_idle(&self) -> bool {
-        self.pending.is_empty()
-    }
-
-    pub(super) fn push(&mut self, block: Result<PendingBuildBlock, CanonicalConstructionError>) {
-        self.pending.push_back(block);
-    }
-
-    pub(super) fn pop(&mut self) -> Option<Result<PendingBuildBlock, CanonicalConstructionError>> {
-        self.pending.pop_front()
-    }
-
-    /// Derives the block's checkpoint, when `checkpoint_required`, and its
-    /// final roots, when `final_roots_required`, from `snapshot` on a worker.
-    pub(super) fn spawn_tree_work(
-        &self,
-        snapshot: CommitmentTreeSnapshot,
-        block: BlockId,
-        block_time_seconds: u32,
-        work: TreeWork,
-    ) -> PendingTreeWork {
-        self.spawn_job(move || {
-            let checkpoint = work.checkpoint_required.then(|| {
-                snapshot.cross_checked_frontiers().map(|frontiers| {
-                    CommitmentTreeCheckpoint::new(block, block_time_seconds, frontiers)
-                })
-            });
-            let final_roots = work
-                .final_roots_required
-                .then(|| final_roots(&snapshot, block.hash))
-                .flatten();
-            TreeWorkOutput {
-                checkpoint,
-                final_roots,
-            }
-        })
-    }
-
-    fn spawn_job(&self, job: impl FnOnce() -> TreeWorkOutput + Send + 'static) -> PendingTreeWork {
-        let (sender, receiver) = oneshot::channel();
-        self.checkpoint_workers.spawn(move || {
-            // The loader drops the receiver only when construction stops.
-            let _loader_stopped = sender.send(job());
-        });
-        PendingTreeWork {
-            receiver,
-            runtime: self.runtime.clone(),
-        }
+        self.workers.install(hash)
     }
 }
 
-/// Which of a block's checkpoint and final roots the store needs.
-#[derive(Clone, Copy)]
-pub(super) struct TreeWork {
-    pub(super) checkpoint_required: bool,
-    pub(super) final_roots_required: bool,
-}
-
-/// A block appended to the trees, waiting for its tree work.
-pub(super) struct PendingBuildBlock {
-    pub(super) height: BlockHeight,
-    pub(super) positioned: PositionedCanonicalBlock,
+/// One finished canonical build block paired with its preparation memory permit.
+pub(super) struct GuardedBuildBlock {
+    pub(super) block: CanonicalBuildBlock,
     pub(super) memory_permit: OwnedSemaphorePermit,
-    pub(super) work: TreeWork,
-    pub(super) tree_work: Option<PendingTreeWork>,
 }
 
-pub(super) struct PendingTreeWork {
-    receiver: oneshot::Receiver<TreeWorkOutput>,
-    runtime: Handle,
+pub(super) type QueuedBuildBlock = Result<Box<GuardedBuildBlock>, CanonicalConstructionError>;
+
+pub(super) enum PopBuildBlock {
+    Ready(QueuedBuildBlock),
+    Empty,
+    Closed,
 }
 
-/// A block's checkpoint and final roots, derived on a worker.
-#[derive(Default)]
-pub(super) struct TreeWorkOutput {
-    pub(super) checkpoint: Option<Result<CommitmentTreeCheckpoint, CommitmentTreeAccumulatorError>>,
-    pub(super) final_roots: Option<BlockFinalNoteCommitmentRoots>,
+struct BuildQueueState {
+    entries: VecDeque<QueuedBuildBlock>,
+    producer_done: bool,
+    consumer_closed: bool,
 }
 
-impl PendingTreeWork {
-    /// Waits for the worker deriving this block's tree work, or until
-    /// `cancel` fires.
-    ///
-    /// Call it only from a blocking thread, never from async code.
-    pub(super) fn wait(
-        self,
-        cancel: &CancellationToken,
-    ) -> Result<TreeWorkOutput, CanonicalConstructionError> {
-        let Self { receiver, runtime } = self;
-        runtime.block_on(async {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => Err(CanonicalConstructionError::Cancelled),
-                output = receiver => output.map_err(|_| CanonicalConstructionError::LoaderTaskFailed {
-                    reason: "a commitment-tree hashing worker stopped before finishing a block"
-                        .to_owned(),
-                }),
-            }
+/// Bounded handoff queue between the tree-hashing stage and the SST stager.
+pub(super) struct BoundedBuildBlockQueue {
+    capacity: usize,
+    state: Mutex<BuildQueueState>,
+    not_empty: Condvar,
+    not_full: Condvar,
+}
+
+impl BoundedBuildBlockQueue {
+    pub(super) fn new(capacity: usize) -> Arc<Self> {
+        let bounded_capacity = capacity.max(1);
+        Arc::new(Self {
+            capacity: bounded_capacity,
+            state: Mutex::new(BuildQueueState {
+                entries: VecDeque::with_capacity(bounded_capacity),
+                producer_done: false,
+                consumer_closed: false,
+            }),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
         })
+    }
+
+    /// Enqueues one ordered block or error, returning `false` when the consumer
+    /// has already closed the queue.
+    pub(super) fn push(&self, entry: QueuedBuildBlock) -> bool {
+        let mut guard = self.state.lock();
+        while !guard.consumer_closed && guard.entries.len() >= self.capacity {
+            self.not_full.wait(&mut guard);
+        }
+        if guard.consumer_closed {
+            return false;
+        }
+        guard.entries.push_back(entry);
+        drop(guard);
+        self.not_empty.notify_one();
+        true
+    }
+
+    pub(super) fn finish_producer(&self) {
+        let mut guard = self.state.lock();
+        guard.producer_done = true;
+        drop(guard);
+        self.not_empty.notify_all();
+    }
+
+    pub(super) fn close_consumer(&self) {
+        let mut guard = self.state.lock();
+        guard.consumer_closed = true;
+        guard.entries.clear();
+        drop(guard);
+        self.not_full.notify_all();
+        self.not_empty.notify_all();
+    }
+
+    pub(super) fn try_pop(&self) -> PopBuildBlock {
+        let mut guard = self.state.lock();
+        if let Some(entry) = guard.entries.pop_front() {
+            drop(guard);
+            self.not_full.notify_one();
+            return PopBuildBlock::Ready(entry);
+        }
+        if guard.producer_done || guard.consumer_closed {
+            return PopBuildBlock::Closed;
+        }
+        PopBuildBlock::Empty
+    }
+
+    pub(super) fn pop_blocking(&self) -> Option<QueuedBuildBlock> {
+        let mut guard = self.state.lock();
+        loop {
+            if let Some(entry) = guard.entries.pop_front() {
+                drop(guard);
+                self.not_full.notify_one();
+                return Some(entry);
+            }
+            if guard.producer_done || guard.consumer_closed {
+                return None;
+            }
+            self.not_empty.wait(&mut guard);
+        }
+    }
+}
+
+struct ProducerFinishGuard {
+    queue: Arc<BoundedBuildBlockQueue>,
+}
+
+impl Drop for ProducerFinishGuard {
+    fn drop(&mut self) {
+        self.queue.finish_producer();
+    }
+}
+
+/// Consumer-side iterator that stages finished blocks into `RocksDB` SSTs while
+/// the producer thread hashes the next batch's commitment trees.
+pub(super) struct PipelinedBuildBlocks {
+    queue: Arc<BoundedBuildBlockQueue>,
+    active_memory_permit: Option<OwnedSemaphorePermit>,
+    in_flight_store_height: Option<BlockHeight>,
+    progress: ConstructionProgress,
+    cancel: CancellationToken,
+    producer_stop: CancellationToken,
+    producer_handle: Option<JoinHandle<Vec<CanonicalBuildSubtreeRoot>>>,
+}
+
+impl PipelinedBuildBlocks {
+    pub(super) fn spawn(
+        mut receiver: super::CanonicalBuildBlockReceiver,
+        progress: ConstructionProgress,
+        cancel: CancellationToken,
+        producer_stop: CancellationToken,
+        queue_capacity: usize,
+    ) -> Result<Self, CanonicalConstructionError> {
+        let queue = BoundedBuildBlockQueue::new(queue_capacity);
+        let producer_queue = Arc::clone(&queue);
+        let handle = thread::Builder::new()
+            .name("zinder-tree-stage".to_owned())
+            .spawn(move || {
+                let _finish_guard = ProducerFinishGuard {
+                    queue: Arc::clone(&producer_queue),
+                };
+                while let Some(entry) = receiver.next_guarded() {
+                    let is_err = entry.is_err();
+                    if !producer_queue.push(entry.map(Box::new)) || is_err {
+                        break;
+                    }
+                }
+                std::mem::take(&mut receiver.derived_subtree_roots)
+            })
+            .map_err(|source| CanonicalConstructionError::LoaderTaskFailed {
+                reason: format!("could not start canonical tree-stage thread: {source}"),
+            })?;
+        Ok(Self {
+            queue,
+            active_memory_permit: None,
+            in_flight_store_height: None,
+            progress,
+            cancel,
+            producer_stop,
+            producer_handle: Some(handle),
+        })
+    }
+
+    fn record_staged_block(&mut self) {
+        if let Some(height) = self.in_flight_store_height.take()
+            && !self.cancel.is_cancelled()
+        {
+            self.progress.record_loaded(height);
+        }
+    }
+
+    pub(super) fn finish_and_join(
+        mut self,
+        load_succeeded: bool,
+    ) -> Result<(ConstructionProgress, Vec<CanonicalBuildSubtreeRoot>), CanonicalConstructionError>
+    {
+        self.active_memory_permit = None;
+        if load_succeeded {
+            self.record_staged_block();
+        } else {
+            self.in_flight_store_height = None;
+            self.producer_stop.cancel();
+            self.queue.close_consumer();
+        }
+        let Some(handle) = self.producer_handle.take() else {
+            return Err(CanonicalConstructionError::LoaderTaskFailed {
+                reason: "canonical tree-stage thread handle missing".to_owned(),
+            });
+        };
+        let derived_subtree_roots =
+            handle
+                .join()
+                .map_err(|_| CanonicalConstructionError::LoaderTaskFailed {
+                    reason: "canonical tree-stage thread panicked".to_owned(),
+                })?;
+        // Move progress out before Drop runs (producer_handle is now None).
+        let progress = self.progress.take_finished_handle();
+        Ok((progress, derived_subtree_roots))
+    }
+}
+
+impl Iterator for PipelinedBuildBlocks {
+    type Item = Result<CanonicalBuildBlock, CanonicalConstructionError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.active_memory_permit = None;
+        self.record_staged_block();
+        if self.cancel.is_cancelled() {
+            self.producer_stop.cancel();
+            self.queue.close_consumer();
+            return Some(Err(CanonicalConstructionError::Cancelled));
+        }
+        let popped = match self.queue.try_pop() {
+            PopBuildBlock::Ready(entry) => Some(entry),
+            PopBuildBlock::Closed => None,
+            PopBuildBlock::Empty => {
+                if !self.cancel.is_cancelled() {
+                    self.progress.flush_pending();
+                }
+                self.queue.pop_blocking()
+            }
+        };
+        match popped {
+            Some(Ok(guarded)) => {
+                let GuardedBuildBlock {
+                    block,
+                    memory_permit,
+                } = *guarded;
+                self.active_memory_permit = Some(memory_permit);
+                self.in_flight_store_height = Some(block.facts.block_header.height);
+                Some(Ok(block))
+            }
+            Some(Err(error)) => Some(Err(error)),
+            None => self
+                .cancel
+                .is_cancelled()
+                .then_some(Err(CanonicalConstructionError::Cancelled)),
+        }
+    }
+}
+
+impl Drop for PipelinedBuildBlocks {
+    fn drop(&mut self) {
+        self.active_memory_permit = None;
+        self.producer_stop.cancel();
+        self.queue.close_consumer();
+        if let Some(handle) = self.producer_handle.take() {
+            let _joined = handle.join();
+        }
     }
 }
 
@@ -260,186 +333,124 @@ pub(super) fn final_roots(
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Barrier},
+        num::NonZeroU32,
+        sync::Arc,
+        thread,
         time::{Duration, Instant},
     };
 
     use tokio_util::sync::CancellationToken;
+    use zinder_core::{BlockHash, BlockHeight, BlockId};
+    use zinder_runtime::{ComposedReadiness, Readiness, ReadinessCause};
+    use zinder_store::{CanonicalReorgPolicy, CanonicalStoreBuildPlan, RawBlobRetention};
+    use zinder_testkit::sample_regtest_upgrade_activations;
 
     use super::{
-        CanonicalConstructionError, NonZeroU32, TreeHashers, TreeWorkOutput,
-        partition_worker_threads,
+        BoundedBuildBlockQueue, CanonicalConstructionError, ConstructionProgress,
+        PipelinedBuildBlocks, PopBuildBlock, ProducerFinishGuard, TreeHashers,
     };
-
-    /// Starts `workers` hashing threads whose waits run on `runtime`.
-    fn workers_pool(
-        workers: u32,
-        runtime: &tokio::runtime::Runtime,
-    ) -> Result<TreeHashers, Box<dyn std::error::Error>> {
-        TreeHashers::start(
-            NonZeroU32::new(workers).ok_or("workers must be non-zero")?,
-            runtime.handle().clone(),
-        )?
-        .ok_or_else(|| "multiple workers start a pool".into())
-    }
-
-    /// Starts two workers whose waits run on `runtime`.
-    fn two_workers(
-        runtime: &tokio::runtime::Runtime,
-    ) -> Result<TreeHashers, Box<dyn std::error::Error>> {
-        workers_pool(2, runtime)
-    }
 
     #[test]
     fn one_worker_hashes_on_the_loader_thread() -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = tokio::runtime::Runtime::new()?;
-        assert!(TreeHashers::start(NonZeroU32::MIN, runtime.handle().clone())?.is_none());
+        assert!(TreeHashers::start(NonZeroU32::MIN)?.is_none());
         Ok(())
     }
 
     #[test]
-    fn partition_worker_threads_respects_configured_worker_budget() {
-        assert_eq!(partition_worker_threads(2), (0, 2));
-        for workers in 3_usize..=16 {
-            let (append_threads, checkpoint_threads) = partition_worker_threads(workers);
-            assert_eq!(append_threads + checkpoint_threads, workers);
-            assert!(checkpoint_threads >= 1);
-            assert!(append_threads >= 2);
-        }
-    }
-
-    #[test]
-    fn queued_checkpoint_jobs_do_not_starve_synchronous_append_install()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = tokio::runtime::Runtime::new()?;
-        let cancel = CancellationToken::new();
-        for workers in [2_u32, 4, 8] {
-            let tree_hashers = workers_pool(workers, &runtime)?;
-            let worker_count = usize::try_from(workers).unwrap_or(usize::MAX);
-            let (_, checkpoint_threads) = partition_worker_threads(worker_count);
-            let inside_jobs = Arc::new(Barrier::new(checkpoint_threads + 1));
-            let release_jobs = Arc::new(Barrier::new(checkpoint_threads + 1));
-            let mut held_jobs = Vec::with_capacity(checkpoint_threads * 2);
-            for _ in 0..checkpoint_threads {
-                let inside_jobs = Arc::clone(&inside_jobs);
-                let release_jobs = Arc::clone(&release_jobs);
-                held_jobs.push(tree_hashers.spawn_job(move || {
-                    inside_jobs.wait();
-                    release_jobs.wait();
-                    TreeWorkOutput::default()
-                }));
-            }
-            for _ in 0..checkpoint_threads {
-                held_jobs.push(tree_hashers.spawn_job(TreeWorkOutput::default));
-            }
-            inside_jobs.wait();
-
-            let started_at = Instant::now();
-            let computed = tree_hashers.install(|| rayon::join(|| 20_u32, || 22_u32));
-            let elapsed = started_at.elapsed();
-            drop(tree_hashers);
-            assert_eq!(computed, (20, 22));
-            assert!(
-                elapsed < Duration::from_secs(1),
-                "synchronous install stalled behind held checkpoint jobs for {workers} workers"
-            );
-
-            release_jobs.wait();
-            for job in held_jobs {
-                let _completed = job.wait(&cancel)?;
-            }
+    fn unified_worker_pool_uses_all_configured_threads() -> Result<(), Box<dyn std::error::Error>> {
+        for count in [2_u32, 4, 8] {
+            let workers = NonZeroU32::new(count).ok_or("workers must be non-zero")?;
+            let hashers = TreeHashers::start(workers)?.ok_or("expected worker pool")?;
+            let threads = hashers.install(rayon::current_num_threads);
+            assert_eq!(threads, usize::try_from(count)?);
         }
         Ok(())
     }
 
     #[test]
-    #[allow(clippy::panic, reason = "the test injects a worker panic")]
-    fn a_panicking_worker_fails_its_block_instead_of_the_process()
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "queue stays alive through the final try_pop assertion"
+    )]
+    fn bounded_build_queue_unblocks_blocked_producer_when_consumer_closes()
     -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = tokio::runtime::Runtime::new()?;
-        let tree_hashers = two_workers(&runtime)?;
-        let cancel = CancellationToken::new();
-        assert!(matches!(
-            tree_hashers
-                .spawn_job(|| std::panic::panic_any("injected worker failure"))
-                .wait(&cancel),
-            Err(CanonicalConstructionError::LoaderTaskFailed { .. })
-        ));
-        // The pool keeps running the next block's work.
-        let next = tree_hashers.spawn_job(TreeWorkOutput::default);
-        drop(tree_hashers);
-        assert!(next.wait(&cancel).is_ok());
-        Ok(())
-    }
+        let queue = BoundedBuildBlockQueue::new(1);
+        assert!(queue.push(Err(CanonicalConstructionError::Cancelled)));
 
-    #[test]
-    fn stopping_while_a_worker_hashes_returns_without_waiting_for_it()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = tokio::runtime::Runtime::new()?;
-        let tree_hashers = two_workers(&runtime)?;
-        let inside_job = Arc::new(Barrier::new(2));
-        let release_job = Arc::new(Barrier::new(2));
-        let pending = {
-            let inside_job = Arc::clone(&inside_job);
-            let release_job = Arc::clone(&release_job);
-            tree_hashers.spawn_job(move || {
-                inside_job.wait();
-                release_job.wait();
-                TreeWorkOutput::default()
-            })
-        };
-        inside_job.wait();
-        // Construction stops with this block's work still running: the loader
-        // drops its pending blocks and the pool without joining the worker.
-        let stopped_at = Instant::now();
-        drop(pending);
-        drop(tree_hashers);
-        assert!(stopped_at.elapsed() < Duration::from_secs(1));
-        release_job.wait();
-        Ok(())
-    }
-
-    #[test]
-    fn a_loader_waiting_on_a_held_worker_stops_when_construction_is_cancelled()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = tokio::runtime::Runtime::new()?;
-        let tree_hashers = two_workers(&runtime)?;
-        let inside_job = Arc::new(Barrier::new(2));
-        let release_job = Arc::new(Barrier::new(2));
-        let oldest = {
-            let inside_job = Arc::clone(&inside_job);
-            let release_job = Arc::clone(&release_job);
-            tree_hashers.spawn_job(move || {
-                inside_job.wait();
-                release_job.wait();
-                TreeWorkOutput::default()
-            })
-        };
-        inside_job.wait();
-        let cancel = CancellationToken::new();
-        let (waiting_sender, waiting) = std::sync::mpsc::channel();
-        let loader = std::thread::spawn({
-            let cancel = cancel.clone();
-            move || {
-                let _test_listening = waiting_sender.send(());
-                oldest.wait(&cancel)
-            }
+        let producer_queue = Arc::clone(&queue);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            let _ = entered_tx.send(());
+            producer_queue.push(Err(CanonicalConstructionError::Cancelled))
         });
-        waiting.recv()?;
-        // The loader is in, or about to enter, its wait for the held job.
-        std::thread::sleep(Duration::from_millis(50));
-        let cancelled_at = Instant::now();
-        cancel.cancel();
-        let waited = loader.join().map_err(|_| "loader thread panicked")?;
-        assert!(
-            matches!(waited, Err(CanonicalConstructionError::Cancelled)),
-            "a cancelled wait must report cancellation"
-        );
-        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
-        // The worker still holds the oldest job, and finishing it after the
-        // loader stopped is harmless.
-        release_job.wait();
-        drop(tree_hashers);
+        entered_rx.recv()?;
+        thread::sleep(Duration::from_millis(20));
+
+        let started_at = Instant::now();
+        queue.close_consumer();
+        let accepted = producer.join().map_err(|_| "producer panicked")?;
+        assert!(!accepted);
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        assert!(matches!(queue.try_pop(), PopBuildBlock::Closed));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::panic,
+        reason = "verifies unwind safety of ProducerFinishGuard"
+    )]
+    fn producer_finish_guard_wakes_consumer_on_unwind() {
+        let queue = BoundedBuildBlockQueue::new(2);
+        let producer_queue = Arc::clone(&queue);
+        let producer = thread::spawn(move || {
+            let _guard = ProducerFinishGuard {
+                queue: producer_queue,
+            };
+            std::panic::panic_any("injected producer unwind");
+        });
+        assert!(producer.join().is_err());
+        assert!(queue.pop_blocking().is_none());
+    }
+
+    #[test]
+    fn finish_and_join_skips_recording_failed_in_flight_block_height()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            BlockId::new(BlockHeight::new(5), BlockHash::from_bytes([5; 32])),
+            RawBlobRetention::All,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
+        for (succeeded, expected_height, expected_lag) in
+            [(false, Some(0), Some(5)), (true, Some(5), Some(0))]
+        {
+            let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+            let (progress, subtrees) = (PipelinedBuildBlocks {
+                queue: BoundedBuildBlockQueue::new(1),
+                active_memory_permit: None,
+                in_flight_store_height: Some(BlockHeight::new(5)),
+                progress: ConstructionProgress::start(&build_plan, Some(readiness.clone())),
+                cancel: CancellationToken::new(),
+                producer_stop: CancellationToken::new(),
+                producer_handle: Some(thread::spawn(Vec::new)),
+            })
+            .finish_and_join(succeeded)?;
+            drop(progress);
+            let report = readiness.runtime_readiness().report();
+            drop(readiness);
+            assert_eq!(subtrees.len(), 0);
+            assert_eq!(report.current_height, expected_height);
+            assert_eq!(
+                report.cause,
+                ReadinessCause::Syncing {
+                    lag_blocks: expected_lag,
+                    wait_reason: None,
+                }
+            );
+        }
         Ok(())
     }
 }
