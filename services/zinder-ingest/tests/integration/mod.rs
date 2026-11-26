@@ -7,6 +7,7 @@ mod fixture_block;
 mod materialized_view_replay;
 mod mempool_control_deadline;
 mod mempool_cursor_recovery;
+mod mempool_snapshot_paging;
 mod node_failover;
 mod release_image;
 mod runtime_allocator;

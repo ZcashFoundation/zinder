@@ -1,0 +1,6 @@
+kind: fixed
+body: Bounded mempool snapshot pages to 3.5 MiB of encoded protobuf alongside `max_entries`, pinned multi-page snapshot walks to point-in-time mempool membership, and drained continuation pages across `ExplorerQuery` so `WalletQuery.MempoolSnapshot`, `ExplorerQuery` mempool/overview handlers, `GetMempoolTx`, and `GetMempoolStream` serve coherent snapshots past the 4 MiB default gRPC decode limit while keeping `zinder-query` health probes ready and surfacing oversized single-entry refusals with typed `UNSUPPORTED_WALLET_ENCODING` `ErrorInfo`.
+time: 2026-11-26T14:40:00Z
+custom:
+    Bump: patch
+    PR: "654"

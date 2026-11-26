@@ -161,12 +161,13 @@ The writer, `zinder-ingest`, owns the live mempool view. `zinder-query` forwards
 
 `MempoolSnapshot(max_entries, from_cursor)` returns one page of the current mempool:
 
-- A page holds `max_entries` entries, at most 1,024. Zero means 256.
-- `next_cursor` is set when more entries remain. Pass it as `from_cursor` for the next page.
+- A page holds at most `max_entries` entries (clamped to 1,024; zero means 256) and at most 3.5 MiB (`3,670,016` bytes) of encoded protobuf response, staying within a default 4 MiB gRPC message limit.
+- `next_cursor` is set when more entries remain, whether bounded by `max_entries` or by the response byte budget. Pass it as `from_cursor` for the next page; a multi-page walk serves from the point-in-time mempool membership anchored when the walk began (retaining up to 8 concurrent multi-page walks for 30 seconds at the active chain epoch).
+- A single mempool entry whose one-entry response exceeds the 3.5 MiB budget fails with `UNAVAILABLE` and `UNSUPPORTED_WALLET_ENCODING`.
 - `source_tip` equals `chain_view.chain_epoch.visible_tip` by height and hash. When the chain tip moves, the writer waits up to five seconds for the mempool to catch up. A view still not coherent then fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. A view with no certified generation yet, or one being rebuilt, fails with `UNAVAILABLE`. The server never returns a stale or falsely empty page.
 - `snapshot_age_millis` is the time since the current mempool view was certified.
 - `events_resume_cursor` is the same on every page of one walk. Pass it as `after_cursor` to `MempoolEvents` to follow changes after the walk. Replay from it is at-least-once, so apply events idempotently. It is empty when the writer has applied no event yet; then subscribe with `earliest_retained`.
-- A tampered page cursor fails with `SNAPSHOT_PAGE_CURSOR_INVALID`. A cursor ahead of the writer's applied events fails with `SNAPSHOT_PAGE_CURSOR_EXPIRED`.
+- A tampered page cursor fails with `SNAPSHOT_PAGE_CURSOR_INVALID`. A cursor ahead of the writer's applied events, or one whose pinned multi-page snapshot was evicted before concurrent mempool updates, fails with `SNAPSHOT_PAGE_CURSOR_EXPIRED`.
 
 `MempoolEvents(start)` streams `Added`, `Invalidated`, and `Mined` envelopes with cursors. `start` works as in `ChainEvents`. `Mined` carries the mined height and block hash as the node reported them. A new block keeps the live stream open while the replacement mempool certifies, for up to 30 seconds. If the replacement misses that bound, or its node endpoint becomes inactive, snapshot and transaction reads return `NODE_UNAVAILABLE`. While the writer awaits a certified view, the stream replays retained events and then ends with `UNAVAILABLE` and `NODE_UNAVAILABLE`, so silence never looks like an unchanged mempool. Resubscribe from the last delivered cursor with backoff. Follow `ChainEvents` for tip changes.
 

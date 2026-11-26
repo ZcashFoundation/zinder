@@ -2128,3 +2128,59 @@ async fn served_chain_epochs_report_the_server_info_artifact_schema_version() ->
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn mempool_snapshot_preserves_oversized_entry_error_reason_over_real_grpc() -> eyre::Result<()>
+{
+    let oversized_status = zinder_proto::status_for_reason(
+        ops::ErrorReason::UnsupportedWalletEncoding,
+        "mempool entry exceeds gRPC response budget",
+    );
+    let (grpc_adapter, _store_fixture, cancel, server_task) =
+        native_serving_adapter_with_ingest_control(
+            StaticIngestControl::new().with_mempool_snapshot_status(oversized_status),
+        )
+        .await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let wallet_cancel = CancellationToken::new();
+    let wallet_shutdown = wallet_cancel.clone();
+    let wallet_server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(grpc_adapter.into_server())
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                wallet_shutdown.cancelled_owned(),
+            )
+            .await
+    });
+    let mut client =
+        wallet::wallet_query_client::WalletQueryClient::connect(format!("http://{listen_addr}"))
+            .await?;
+
+    let status = client
+        .mempool_snapshot(Request::new(wallet::MempoolSnapshotRequest {
+            max_entries: 1_024,
+            from_cursor: Vec::new(),
+        }))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expected oversized mempool snapshot refusal"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    let details = status.get_error_details();
+    let error_detail = details
+        .error_info()
+        .ok_or_else(|| eyre!("missing ErrorInfo on forwarded status"))?;
+    assert_eq!(error_detail.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+    assert_eq!(
+        error_detail.reason,
+        ops::ErrorReason::UnsupportedWalletEncoding.as_str_name()
+    );
+
+    drop(client);
+    wallet_cancel.cancel();
+    wallet_server.await??;
+    cancel.cancel();
+    server_task.await??;
+    Ok(())
+}

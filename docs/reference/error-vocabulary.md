@@ -183,7 +183,7 @@ data may be corrupt.
 | `UNSUPPORTED_CHAIN_EVENT` | This binary cannot represent the requested event variant. |
 | `UNSUPPORTED_BLOCK_SELECTOR` | This binary cannot represent the requested selector. |
 | `UNSUPPORTED_TRANSACTION_STATUS` | A transaction status cannot be encoded on the wire. |
-| `UNSUPPORTED_WALLET_ENCODING` | A value has no representation in the wallet protocol. |
+| `UNSUPPORTED_WALLET_ENCODING` | A value has no representation in the wallet protocol, or a single mempool entry exceeds the `MempoolSnapshot` response budget. |
 
 ### `UNIMPLEMENTED`
 

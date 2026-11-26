@@ -37,7 +37,7 @@ use zinder_proto::v1::explorer::{
 };
 use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::v1::wallet::{
-    self, ChainValuePoolsAtTipRequest, MempoolSnapshotRequest, VisibleTipBlockRequest,
+    self, ChainValuePoolsAtTipRequest, VisibleTipBlockRequest,
     wallet_query_client::WalletQueryClient,
 };
 use zinder_proto::wire::{
@@ -50,6 +50,7 @@ use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
+use super::mempool::{MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST, drain_wallet_mempool_snapshot};
 use super::mempool_event_counts::{clamp_window, read_mempool_event_counts};
 use super::transaction_history::decode_history_entry;
 
@@ -73,11 +74,6 @@ const MIN_FEE_SUMMARY_BLOCK_COUNT: u32 = 1;
 const MAX_FEE_SUMMARY_BLOCK_COUNT: u32 = 256;
 /// Server default when `fee_summary_block_count == 0`.
 const DEFAULT_FEE_SUMMARY_BLOCK_COUNT: u32 = 50;
-
-/// Cap on entries the bundle's mempool aggregation hydrates from the
-/// wallet `MempoolSnapshot`. Mirrors the cap in the per-feature mempool
-/// handlers.
-const MAX_MEMPOOL_SNAPSHOT_ENTRIES: u32 = 4_096;
 
 /// Executes one `ExplorerQuery.OverviewSnapshot` request.
 pub(crate) async fn query_overview_snapshot(
@@ -312,51 +308,63 @@ fn read_recent_transactions(
     Ok(entries)
 }
 
+#[derive(Default)]
+struct OverviewMempoolTotals {
+    transaction_count: u32,
+    total_size_bytes: u64,
+    oldest_first_seen: Option<u64>,
+    newest_first_seen: Option<u64>,
+}
+
 async fn aggregate_mempool_summary(
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
 ) -> Result<Option<OverviewMempool>, Status> {
     // Mempool is an optional Overview field. Structural absence is
     // represented through the response freshness envelope; transient
     // transport failures still fail the request.
-    let snapshot = match wallet_client
-        .mempool_snapshot(Request::new(MempoolSnapshotRequest {
-            max_entries: MAX_MEMPOOL_SNAPSHOT_ENTRIES,
-            from_cursor: Vec::new(),
-        }))
-        .await
+    let drained = match drain_wallet_mempool_snapshot(
+        wallet_client,
+        MAX_MEMPOOL_SNAPSHOT_ENTRIES_PER_REQUEST,
+        OverviewMempoolTotals::default,
+        |totals, entry| {
+            totals.transaction_count = totals.transaction_count.saturating_add(1);
+            let entry_size = u64::try_from(entry.raw_transaction_bytes.len()).unwrap_or(u64::MAX);
+            totals.total_size_bytes = totals.total_size_bytes.saturating_add(entry_size);
+            totals.oldest_first_seen = Some(
+                totals
+                    .oldest_first_seen
+                    .map_or(entry.first_seen_unix_millis, |prior| {
+                        prior.min(entry.first_seen_unix_millis)
+                    }),
+            );
+            totals.newest_first_seen = Some(
+                totals
+                    .newest_first_seen
+                    .map_or(entry.first_seen_unix_millis, |prior| {
+                        prior.max(entry.first_seen_unix_millis)
+                    }),
+            );
+            Ok(())
+        },
+    )
+    .await
     {
-        Ok(response) => response.into_inner(),
+        Ok(drained) => drained,
         Err(status) if is_endpoint_capability_unavailable(&status, WALLET_SNAPSHOT_MEMPOOL_V3) => {
             return Ok(None);
         }
         Err(status) => return Err(status),
     };
     let now_millis = current_unix_millis();
-    let mut transaction_count: u32 = 0;
-    let mut total_size_bytes: u64 = 0;
-    let mut oldest_first_seen: Option<u64> = None;
-    let mut newest_first_seen: Option<u64> = None;
-    for entry in &snapshot.entries {
-        transaction_count = transaction_count.saturating_add(1);
-        let entry_size = u64::try_from(entry.raw_transaction_bytes.len()).unwrap_or(u64::MAX);
-        total_size_bytes = total_size_bytes.saturating_add(entry_size);
-        oldest_first_seen = Some(
-            oldest_first_seen.map_or(entry.first_seen_unix_millis, |prior| {
-                prior.min(entry.first_seen_unix_millis)
-            }),
-        );
-        newest_first_seen = Some(
-            newest_first_seen.map_or(entry.first_seen_unix_millis, |prior| {
-                prior.max(entry.first_seen_unix_millis)
-            }),
-        );
-    }
+    let totals = drained.output;
     Ok(Some(OverviewMempool {
-        transaction_count,
-        total_size_bytes,
-        oldest_entry_age_millis: oldest_first_seen
+        transaction_count: totals.transaction_count,
+        total_size_bytes: totals.total_size_bytes,
+        oldest_entry_age_millis: totals
+            .oldest_first_seen
             .map_or(0, |seen| now_millis.saturating_sub(seen)),
-        newest_entry_age_millis: newest_first_seen
+        newest_entry_age_millis: totals
+            .newest_first_seen
             .map_or(0, |seen| now_millis.saturating_sub(seen)),
     }))
 }
