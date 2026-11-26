@@ -584,12 +584,11 @@ async fn published_read_permit(
     }
 }
 
-/// Resolves a pool selection that omits only Ironwood to the published shape
-/// it matches.
+/// Upgrades a pool selection that omits only Ironwood to its zero-copy
+/// published shape when the current chain schedule proves Ironwood has not
+/// activated at or below `end`.
 ///
-/// A request the stored frames cannot serve then never queues for a
-/// signed-file permit or inherits the reduced published byte budget. The
-/// caller holds its ordinary stream slot first, so a saturated listener
+/// The caller holds its ordinary stream slot first, so a saturated listener
 /// refuses a request before this reads anything.
 ///
 /// Every chunk's highest height is at or below the request's highest height,
@@ -597,16 +596,16 @@ async fn published_read_permit(
 /// reaches the request's highest height: an admitted activation schedule
 /// revision never changes activations at or below the tip it was admitted at,
 /// while a view below the end can still lack an activation the writer admits
-/// before a later chunk's view sees the end. A captured view that falls short
-/// of the end, a schedule the reader cannot read, or a view it cannot take
-/// leaves the selection alone, so the native path serves the request and
-/// reports its own canonical errors.
+/// before a later chunk's view sees the end. When Ironwood is active at or
+/// below `end`, or when the view or schedule cannot prove equivalence, the
+/// explicit selection stays in place so `PublishedRangeRead` wire-projects
+/// authenticated frames instead of slicing default frames directly.
 async fn resolve_published_shape<Reads: CompactBlockReads>(
     reads: &Reads,
     shape: CompactBlockShape,
     end: BlockHeight,
 ) -> CompactBlockShape {
-    if shape.is_published_shape() {
+    if shape.is_zero_copy_published() {
         return shape;
     }
     let Some(equivalent) = shape.published_equivalent() else {

@@ -32,7 +32,8 @@ use super::{
         ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN, VALIDATION_INVALID,
         VALIDATION_UNVALIDATED, VALIDATION_VALID, encode_frame_prefix,
     },
-    project_shielded_block_wire,
+    is_passthrough_shielded_block_wire, project_shielded_block_wire,
+    project_shielded_block_wire_with_scratch,
     reader::validate_entries,
     wire_projection::synthesize_empty_nullifier_block,
 };
@@ -1577,6 +1578,66 @@ fn reader_rejects_nonempty_compact_block_header() -> TestOutcome {
     let range_1 = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1));
     assert!(matches!(
         reader.read_default_range(range_1, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn passthrough_wire_check_matches_full_projection_and_rejects_corrupt_tags() -> TestOutcome {
+    let blocks = mixed_fixture_blocks()?;
+    let empty_shielded =
+        reference_encode_block(&blocks[0], ShieldedProjectionSelection::DEFAULT_SHIELDED)?;
+    let empty_nullifier =
+        reference_encode_block(&blocks[0], ShieldedProjectionSelection::DEFAULT_NULLIFIERS)?;
+    let orchard_non_empty =
+        reference_encode_block(&blocks[2], ShieldedProjectionSelection::DEFAULT_NULLIFIERS)?;
+
+    let orchard_range = ShieldedProjectionSelection::new(false, true, false, false);
+    let orchard_nf = ShieldedProjectionSelection::new(false, true, false, true);
+
+    assert!(is_passthrough_shielded_block_wire(
+        &empty_shielded.payload(),
+        orchard_range
+    )?);
+    assert!(!is_passthrough_shielded_block_wire(
+        &empty_shielded.payload(),
+        orchard_nf
+    )?);
+    assert!(is_passthrough_shielded_block_wire(
+        &empty_nullifier.payload(),
+        orchard_nf
+    )?);
+    assert!(!is_passthrough_shielded_block_wire(
+        &orchard_non_empty.payload(),
+        orchard_nf
+    )?);
+
+    let mut out = Vec::new();
+    let mut tx_scratch = Vec::new();
+    project_shielded_block_wire_with_scratch(
+        &empty_nullifier.payload(),
+        orchard_nf,
+        &mut out,
+        &mut tx_scratch,
+    )?;
+    assert_eq!(
+        out.as_slice(),
+        empty_nullifier.as_length_prefixed().as_ref()
+    );
+
+    let mut unknown_tag = empty_nullifier.payload().to_vec();
+    encode_key(99, WireType::Varint, &mut unknown_tag);
+    encode_varint(7, &mut unknown_tag);
+    assert!(!is_passthrough_shielded_block_wire(
+        &unknown_tag,
+        orchard_nf
+    )?);
+
+    assert!(!is_passthrough_shielded_block_wire(&[], orchard_range)?);
+    assert!(!is_passthrough_shielded_block_wire(&[], orchard_nf)?);
+    assert!(matches!(
+        is_passthrough_shielded_block_wire(&[0x10, 0x80], orchard_nf),
         Err(SettledShieldedSegmentError::PayloadIntegrity(_))
     ));
     Ok(())

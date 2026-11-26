@@ -24,7 +24,10 @@ use thiserror::Error;
 use zinder_core::{BlockHeight, BlockId, Network};
 
 pub use reader::{SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader};
-pub use wire_projection::project_shielded_block_wire;
+pub use wire_projection::{
+    is_passthrough_shielded_block_wire, project_shielded_block_wire,
+    project_shielded_block_wire_with_scratch,
+};
 pub use writer::SettledShieldedSegmentWriter;
 
 /// Magic header identifying the `ZSHRNG02` settled shielded segment format.

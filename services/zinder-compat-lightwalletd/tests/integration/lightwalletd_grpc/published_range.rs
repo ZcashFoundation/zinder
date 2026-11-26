@@ -1495,3 +1495,426 @@ async fn a_wallet_range_below_its_cached_frontier_reads_only_the_requested_rows(
     assert_eq!(recorder.recorded_compact_block_ranges().len(), 4);
     Ok(())
 }
+
+const SUBSET_SEALED_END: u32 = 5;
+const SUBSET_IRONWOOD_ACTIVATION: u32 = 4;
+
+fn grpc_subset_commitment(seed: u8) -> [u8; 32] {
+    let mut cmx = [0; 32];
+    cmx[0] = seed;
+    cmx
+}
+
+fn grpc_subset_action(seed: u8) -> zinder_core::CompactShieldedAction {
+    zinder_core::CompactShieldedAction {
+        nullifier: [seed; 32],
+        commitment: grpc_subset_commitment(seed.wrapping_add(1)),
+        ephemeral_key: [seed.wrapping_add(2); 32],
+        ciphertext: [seed.wrapping_add(3); 52],
+    }
+}
+
+fn grpc_subset_sapling_out(seed: u8) -> zinder_core::CompactSaplingOutput {
+    zinder_core::CompactSaplingOutput {
+        commitment: grpc_subset_commitment(seed),
+        ephemeral_key: [seed.wrapping_add(1); 32],
+        ciphertext: [seed.wrapping_add(2); 52],
+    }
+}
+
+fn grpc_settled_subset_txs(height_num: u32) -> Vec<CompactTransaction> {
+    use zinder_core::{CompactTransparentInput, CompactTransparentOutput};
+    match height_num {
+        2 => vec![
+            CompactTransaction {
+                index: 0,
+                transaction_id: TransactionId::from_bytes([0x21; 32]),
+                data: CompactTransactionData {
+                    transparent_inputs: vec![CompactTransparentInput {
+                        previous_transaction_id: TransactionId::from_bytes([0x01; 32]),
+                        previous_output_index: 0,
+                    }],
+                    transparent_outputs: vec![CompactTransparentOutput {
+                        value_zat: 1_000,
+                        script_pub_key: vec![0x51],
+                    }],
+                    ..Default::default()
+                },
+            },
+            CompactTransaction {
+                index: 1,
+                transaction_id: TransactionId::from_bytes([0x22; 32]),
+                data: CompactTransactionData {
+                    fee_zat: Some(1_000),
+                    sapling_outputs: vec![grpc_subset_sapling_out(0x23)],
+                    orchard_actions: vec![grpc_subset_action(0x24)],
+                    ..Default::default()
+                },
+            },
+        ],
+        3 => vec![CompactTransaction {
+            index: 0,
+            transaction_id: TransactionId::from_bytes([0x31; 32]),
+            data: CompactTransactionData {
+                fee_zat: Some(2_000),
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: [0x32; 32],
+                }],
+                sapling_outputs: vec![grpc_subset_sapling_out(0x33)],
+                ..Default::default()
+            },
+        }],
+        4 => vec![CompactTransaction {
+            index: 1,
+            transaction_id: TransactionId::from_bytes([0x41; 32]),
+            data: CompactTransactionData {
+                fee_zat: Some(2_500),
+                orchard_actions: vec![grpc_subset_action(0x42)],
+                ironwood_actions: vec![grpc_subset_action(0x46)],
+                ..Default::default()
+            },
+        }],
+        5 => vec![CompactTransaction {
+            index: 1,
+            transaction_id: TransactionId::from_bytes([0x51; 32]),
+            data: CompactTransactionData {
+                fee_zat: Some(3_000),
+                sapling_outputs: vec![grpc_subset_sapling_out(0x52)],
+                ironwood_actions: vec![grpc_subset_action(0x53)],
+                ..Default::default()
+            },
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn grpc_tail_subset_txs(height_num: u32) -> Vec<CompactTransaction> {
+    match height_num {
+        6 => vec![CompactTransaction {
+            index: 2,
+            transaction_id: TransactionId::from_bytes([0x61; 32]),
+            data: CompactTransactionData {
+                fee_zat: Some(4_000),
+                orchard_actions: vec![grpc_subset_action(0x62), grpc_subset_action(0x66)],
+                ..Default::default()
+            },
+        }],
+        7 => vec![CompactTransaction {
+            index: 0,
+            transaction_id: TransactionId::from_bytes([0x71; 32]),
+            data: CompactTransactionData {
+                fee_zat: Some(5_000),
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: [0x72; 32],
+                }],
+                orchard_actions: vec![grpc_subset_action(0x73)],
+                ironwood_actions: vec![grpc_subset_action(0x77)],
+                ..Default::default()
+            },
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn grpc_subset_txs(height_num: u32) -> Vec<CompactTransaction> {
+    if height_num <= SUBSET_SEALED_END {
+        grpc_settled_subset_txs(height_num)
+    } else {
+        grpc_tail_subset_txs(height_num)
+    }
+}
+
+fn subset_writer(chain: &ChainFixture) -> eyre::Result<CanonicalWriterFixture> {
+    let entries = sample_regtest_upgrade_activations()
+        .activations()
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            if entry.name == "NU6.3" {
+                entry.activation_height = BlockHeight::new(SUBSET_IRONWOOD_ACTIVATION);
+            }
+            entry
+        })
+        .collect();
+    let activations = zinder_core::NetworkUpgradeActivations::new(NETWORK, entries)?;
+    CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(chain).with_settled_tip(BlockHeight::new(SUBSET_SEALED_END)),
+        &activations,
+    )
+}
+
+fn attach_grpc_subset_rows(
+    mut chain: ChainFixture,
+    blk: &zinder_testkit::FixtureBlock,
+    txs: &[CompactTransaction],
+) -> eyre::Result<ChainFixture> {
+    let Some(max_index) = txs.iter().map(|tx| tx.index).max() else {
+        return Ok(chain);
+    };
+    for idx in 0..=max_index {
+        let tx_id = txs.iter().find(|tx| tx.index == idx).map_or_else(
+            || {
+                let mut raw_id = [0xfe; 32];
+                raw_id[0..4].copy_from_slice(&blk.height.value().to_le_bytes());
+                raw_id[4..12].copy_from_slice(&idx.to_le_bytes());
+                TransactionId::from_bytes(raw_id)
+            },
+            |found| found.transaction_id,
+        );
+        chain = chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            tx_id,
+            blk.height,
+            blk.hash,
+            u32::try_from(idx)?,
+            b"grpc-subset-tx".as_slice(),
+        ));
+    }
+    Ok(chain)
+}
+
+fn grpc_subset_blocks(mut chain: ChainFixture) -> eyre::Result<ChainFixture> {
+    let mut sapling_tree_size = 0_u32;
+    let mut orchard_tree_size = 0_u32;
+    let mut ironwood_tree_size = 0_u32;
+    for height_num in 1_u32..=8 {
+        let blk = fixture_block(&chain, BlockHeight::new(height_num))?;
+        let txs = grpc_subset_txs(height_num);
+        for tx in &txs {
+            sapling_tree_size += u32::try_from(tx.data.sapling_outputs.len())?;
+            orchard_tree_size += u32::try_from(tx.data.orchard_actions.len())?;
+            ironwood_tree_size += u32::try_from(tx.data.ironwood_actions.len())?;
+        }
+        chain = attach_grpc_subset_rows(chain, &blk, &txs)?;
+        let parent_hash = if height_num == 1 {
+            NETWORK.genesis_hash()
+        } else {
+            blk.parent_hash
+        };
+        let compact = CompactBlockArtifact::new(
+            BlockId::new(blk.height, blk.hash),
+            parent_hash,
+            blk.block_time_seconds,
+            txs,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: sapling_tree_size,
+                orchard_commitment_tree_size: orchard_tree_size,
+                ironwood_commitment_tree_size: ironwood_tree_size,
+            },
+        )?;
+        chain = chain.with_compact_block_artifact(compact);
+    }
+    Ok(chain)
+}
+
+#[allow(
+    deprecated,
+    reason = "Compatibility covers GetBlockRangeNullifiers across all pool_types subsets."
+)]
+async fn assert_grpc_subset_parity(
+    wallet: &mut Endpoint,
+    blocks_only: &mut Endpoint,
+    stock: &mut Endpoint,
+    pools: &[i32],
+) -> eyre::Result<()> {
+    for (first, last) in [(1_u64, 3_u64), (3, 1), (4, 8), (8, 4), (1, 8), (8, 1)] {
+        let mut req = block_range_request(first, last);
+        req.pool_types = pools.to_vec();
+        let encode_blocks = |blocks: Vec<lightwalletd::CompactBlock>| -> Vec<Vec<u8>> {
+            blocks.iter().map(prost::Message::encode_to_vec).collect()
+        };
+        let expected_range = encode_blocks(stock.blocks(req.clone()).await?);
+        let wallet_range = encode_blocks(wallet.blocks(req.clone()).await?);
+        let compact_range = encode_blocks(blocks_only.blocks(req.clone()).await?);
+        assert_eq!(
+            wallet_range, expected_range,
+            "GetBlockRange {pools:?} {first}..={last}"
+        );
+        assert_eq!(
+            compact_range, expected_range,
+            "CompactBlocks {pools:?} {first}..={last}"
+        );
+
+        let expected_nf = drain_slowly(
+            stock
+                .client
+                .get_block_range_nullifiers(req.clone())
+                .await?
+                .into_inner(),
+        )
+        .await;
+        let actual_nf = drain_slowly(
+            wallet
+                .client
+                .get_block_range_nullifiers(req)
+                .await?
+                .into_inner(),
+        )
+        .await;
+        assert!(expected_nf.ending.is_none() && actual_nf.ending.is_none());
+        assert_eq!(
+            encode_blocks(actual_nf.blocks),
+            encode_blocks(expected_nf.blocks),
+            "Nullifiers {pools:?} {first}..={last}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_pool_subset_ranges_and_nullifiers_match_stock_wire_bytes_with_zero_canonical_reads()
+-> eyre::Result<()> {
+    use zinder_proto::compat::lightwalletd::PoolType;
+
+    let dir = tempfile::tempdir()?;
+    let chain = grpc_subset_blocks(
+        ChainFixture::new(NETWORK)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(8),
+    )?;
+    let store = ReaderFixture::new(subset_writer(&chain)?.into_serving_store_fixture()?)?;
+    let published = store
+        .publish(&dir.path().join("settled"), SUBSET_SEALED_END)
+        .await?;
+    let mut recorder = EpochPinRecorder::new(store.query.clone());
+    recorder.expose_range_fence = true;
+    let mut wallet = Endpoint::start(
+        Server::builder().add_service(
+            LightwalletdGrpcAdapter::new(recorder.clone())
+                .with_published_shielded_history(published.clone())
+                .into_server(),
+        ),
+    )
+    .await?;
+    let mut blocks_only = Endpoint::start(
+        Server::builder().add_service(
+            CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(store.reader.clone()))
+                .with_published_shielded_history(published)
+                .into_server(),
+        ),
+    )
+    .await?;
+    let mut stock = Endpoint::start(
+        Server::builder()
+            .add_service(LightwalletdGrpcAdapter::new(store.query.clone()).into_server()),
+    )
+    .await?;
+
+    let sap = PoolType::Sapling as i32;
+    let orc = PoolType::Orchard as i32;
+    let irw = PoolType::Ironwood as i32;
+    for pools in [
+        Vec::new(),
+        vec![99],
+        vec![sap],
+        vec![orc],
+        vec![irw],
+        vec![sap, orc],
+        vec![sap, irw],
+        vec![orc, irw],
+        vec![sap, orc, irw],
+    ] {
+        assert_grpc_subset_parity(&mut wallet, &mut blocks_only, &mut stock, &pools).await?;
+    }
+    assert_eq!(
+        recorder.offered_compact_block_ranges(),
+        [] as [BlockHeightRange; 0]
+    );
+
+    let mut transparent_orchard = block_range_request(1, 8);
+    transparent_orchard.pool_types = vec![PoolType::Transparent as i32, orc];
+    assert_eq!(
+        wallet.blocks(transparent_orchard.clone()).await?,
+        stock.blocks(transparent_orchard).await?
+    );
+    assert_ne!(
+        recorder.offered_compact_block_ranges(),
+        [] as [BlockHeightRange; 0]
+    );
+    Ok(())
+}
+
+#[allow(
+    deprecated,
+    reason = "Verifies fail-closed Slab 1 integrity for GetBlockRangeNullifiers."
+)]
+#[tokio::test]
+async fn damaged_nullifier_slab_fails_closed_for_orchard_subset_and_default_nullifier_ranges()
+-> eyre::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    use zinder_proto::compat::lightwalletd::PoolType;
+
+    let files = tempfile::tempdir()?;
+    let chain = grpc_subset_blocks(
+        ChainFixture::new(NETWORK)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(8),
+    )?;
+    let fixture = ReaderFixture::new(subset_writer(&chain)?.into_serving_store_fixture()?)?;
+    let source = files.path().join("catalog");
+    fixture.publish(&source, SUBSET_SEALED_END).await?;
+    let directory = files.path().join("portable");
+    copy_portable_catalog(&source, &directory)?;
+    let history = Arc::new(
+        PublishedShieldedHistory::open(
+            &directory.join("current.json"),
+            &files.path().join("verification.pub"),
+            false,
+            fixture.reader.as_ref(),
+        )
+        .await?,
+    );
+    let segment_path = std::fs::read_dir(&directory)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "bin"))
+        .ok_or_else(|| eyre!("missing segment"))?;
+    let header_bytes = std::fs::read(&segment_path)?;
+    let nullifier_slab_offset = u64::from_be_bytes(
+        header_bytes
+            .get(96..104)
+            .and_then(|raw| raw.try_into().ok())
+            .ok_or_else(|| eyre!("short segment header"))?,
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segment_path)?;
+    // Flip the first byte inside Slab 1's first block payload (past the 8-byte frame lengths).
+    file.seek(SeekFrom::Start(nullifier_slab_offset + 8))?;
+    let mutated_byte = header_bytes
+        .get(usize::try_from(nullifier_slab_offset + 8)?)
+        .ok_or_else(|| eyre!("missing Slab 1 payload byte"))?
+        ^ 0xff;
+    file.write_all(&[mutated_byte])?;
+
+    let mut wallet = Endpoint::start(
+        Server::builder().add_service(
+            LightwalletdGrpcAdapter::new(fixture.query)
+                .with_published_shielded_history(history)
+                .into_server(),
+        ),
+    )
+    .await?;
+
+    // Both `[Orchard]` and default `[]` nullifier ranges read Slab 1 and must fail closed with DataLoss.
+    for pools in [Vec::new(), vec![PoolType::Orchard as i32]] {
+        for (first, last) in [(1, 5), (5, 1)] {
+            let mut req = block_range_request(first, last);
+            req.pool_types = pools.clone();
+            match wallet.client.get_block_range_nullifiers(req).await {
+                Err(status) => assert_eq!(status.code(), Code::DataLoss),
+                Ok(response) => {
+                    let drained = drain_slowly(response.into_inner()).await;
+                    assert_eq!(drained.blocks, [] as [lightwalletd::CompactBlock; 0]);
+                    assert_stream_ended_with(drained.ending.as_ref(), Code::DataLoss);
+                }
+            }
+        }
+    }
+
+    // Untouched Slab 0 still serves `[Orchard]` GetBlockRange cleanly.
+    let mut orchard_full = block_range_request(1, 5);
+    orchard_full.pool_types = vec![PoolType::Orchard as i32];
+    assert_eq!(wallet.blocks(orchard_full).await?.len(), 5);
+    Ok(())
+}
