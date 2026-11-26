@@ -11,19 +11,27 @@ use std::{
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 
-/// Point-in-time Linux cgroup v2 memory usage and page-cache snapshot.
+/// Point-in-time Linux cgroup v2 memory usage and page-cache snapshot for the
+/// most-pressured cgroup in the process's ancestor chain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CgroupMemorySnapshot {
-    /// Current memory charged to the cgroup (`memory.current`).
+    /// Current memory charged to the selected cgroup (`memory.current`).
     pub current_bytes: u64,
-    /// Tightest finite ancestor cgroup limit (`memory.high` or `memory.max`).
+    /// Effective finite limit (`min(memory.high, memory.max)`) of the selected cgroup.
     pub limit_bytes: u64,
-    /// File-backed page cache charged to the cgroup (`file` in `memory.stat`).
+    /// File-backed page cache charged to the selected cgroup (`file` in `memory.stat`).
     pub file_cache_bytes: Option<u64>,
 }
 
 /// Returns the current Linux cgroup v2 memory usage, limit, and file-cache
-/// charge when both a finite limit and `memory.current` are readable.
+/// charge for the most-pressured ancestor cgroup (highest `current / limit`
+/// ratio, breaking ties by tighter limit) when both a finite limit and
+/// `memory.current` are readable.
+///
+/// All three fields in the returned snapshot come from that same cgroup so
+/// callers can compare usage against its matching limit. For the tightest
+/// effective memory budget across all ancestors, use
+/// [`container_memory_budget_bytes`].
 ///
 /// Returns `None` outside cgroup v2 or when no finite ancestor limit exists.
 #[must_use]
