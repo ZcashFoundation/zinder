@@ -48,6 +48,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::Stream;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
+use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
 };
@@ -351,6 +352,7 @@ impl BlockRangeStreamLimit {
         metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
         register_refusal_counter();
         crate::sealed_history::register_published_history_metrics();
+        crate::published_range::register_encoded_tail_metrics();
         Self {
             published_reads: Arc::new(Semaphore::new(PUBLISHED_READERS)),
             slots: Arc::new(Semaphore::new(permits)),
@@ -655,9 +657,11 @@ impl BlockRangeStreamSlot {
         Read: Future<Output = Result<Output, Status>> + Send + 'static,
     {
         let stream_slot = self.clone();
-        let (outcome, _stream_slot) = tokio::spawn(async move { (read.await, stream_slot) })
-            .await
-            .map_err(|error| Status::unavailable(format!("block-range read failed: {error}")))?;
+        let (outcome, _stream_slot) = tokio::spawn(
+            async move { (read.await, stream_slot) }.instrument(tracing::Span::current()),
+        )
+        .await
+        .map_err(|error| Status::unavailable(format!("block-range read failed: {error}")))?;
         outcome
     }
 
@@ -694,11 +698,14 @@ impl BlockRangeStreamSlot {
     {
         let (next_chunk, next_chunks) = mpsc::channel(1);
         let cancel = CancellationToken::new();
-        tokio::spawn(reader(BlockRangeSink {
-            next_chunk,
-            cancel: cancel.clone(),
-            _stream_slot: self.clone(),
-        }));
+        tokio::spawn(
+            reader(BlockRangeSink {
+                next_chunk,
+                cancel: cancel.clone(),
+                _stream_slot: self.clone(),
+            })
+            .instrument(tracing::Span::current()),
+        );
         self.hold_for_stream(Box::pin(ChunkedMessages {
             current: Some(ChunkIter::new(first_messages)),
             next_chunks,
@@ -1911,6 +1918,41 @@ mod tests {
                 ),
                 Some(0.0),
                 "expected 0 sample for slab={slab} in:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("# HELP zinder_compat_encoded_tail_lookups_total "),
+            "missing # HELP for encoded tail lookups in:\n{rendered}"
+        );
+        for outcome in ["hit", "rebuild", "prepend", "fallback_native", "bypass"] {
+            assert_eq!(
+                rendered_sample(
+                    &rendered,
+                    &format!("zinder_compat_encoded_tail_lookups_total{{outcome=\"{outcome}\"}}"),
+                ),
+                Some(0.0),
+                "expected 0 sample for outcome={outcome} in:\n{rendered}"
+            );
+        }
+        for kind in ["rebuild", "prepend"] {
+            assert_eq!(
+                rendered_sample(
+                    &rendered,
+                    &format!("zinder_compat_encoded_tail_fills_total{{kind=\"{kind}\"}}"),
+                ),
+                Some(0.0),
+                "expected 0 sample for kind={kind} in:\n{rendered}"
+            );
+        }
+        for series in [
+            "zinder_compat_encoded_tail_byte_capped_fills_total",
+            "zinder_compat_encoded_tail_byte_cap_evictions_total",
+            "zinder_compat_encoded_tail_bytes",
+        ] {
+            assert_eq!(
+                rendered_sample(&rendered, series),
+                Some(0.0),
+                "expected 0 sample for {series} in:\n{rendered}"
             );
         }
     }

@@ -15,7 +15,7 @@ use zinder_store::{HeightOrder, ShieldedProjectionSelection};
 
 use super::{
     PublishedShieldedCatalog,
-    tail::{EncodedTail, Fence, ShieldedTailBuffer, TailReadLimits},
+    tail::{EncodedTail, Fence, ShieldedTailBuffer, TailLookupOutcome, TailReadLimits},
 };
 use crate::{
     block_methods::{
@@ -529,9 +529,17 @@ impl PublishedRangeRead {
         (chunk, max_bytes): (&mut BlockHeightRange, usize),
         catalog_end: Option<(BlockHeight, BlockId)>,
     ) -> AnchorPlan {
+        let order = self.order();
+        let lookup = TailLookupContext {
+            order,
+            requested: *chunk,
+            epoch,
+            catalog_end,
+        };
         let Some(window_floor) =
             ShieldedTailBuffer::window_floor(epoch, fence.1, catalog_end.map(|(end, _)| end))
         else {
+            lookup.emit(TailLookupOutcome::Bypass, None);
             return if catalog_end.is_some() && self.covers_selected_history(*chunk) {
                 AnchorPlan::UseEncoded(None)
             } else {
@@ -539,6 +547,7 @@ impl PublishedRangeRead {
             };
         };
         if chunk.end < window_floor {
+            lookup.emit(TailLookupOutcome::Bypass, None);
             return if catalog_end.is_some() && self.covers_selected_history(*chunk) {
                 AnchorPlan::UseEncoded(None)
             } else {
@@ -547,25 +556,37 @@ impl PublishedRangeRead {
         }
         match self
             .tail
-            .load_or_refresh(
+            .load_or_refresh_with_outcome(
                 (reads, view, cancel),
                 catalog_end,
                 *chunk,
                 TailReadLimits {
-                    ascending_bytes: (self.order() == HeightOrder::Ascending).then_some(max_bytes),
+                    ascending_bytes: (order == HeightOrder::Ascending).then_some(max_bytes),
                     refresh_wait: self.limits.max_wait(),
                 },
             )
             .await
         {
-            Ok(Some(live)) => self.encoded_span(*chunk, self.order(), &live).map_or_else(
-                || AnchorPlan::FallbackNative,
+            Ok((Some(live), outcome)) => self.encoded_span(*chunk, order, &live).map_or_else(
+                || {
+                    lookup.emit(TailLookupOutcome::FallbackNative, None);
+                    AnchorPlan::FallbackNative
+                },
                 |span| {
+                    lookup.emit(outcome, Some(&live));
                     *chunk = span;
                     AnchorPlan::UseEncoded(Some(live))
                 },
             ),
-            Ok(None) => AnchorPlan::FallbackNative,
+            Ok((None, outcome)) => {
+                let recorded = if outcome == TailLookupOutcome::Bypass {
+                    TailLookupOutcome::Bypass
+                } else {
+                    TailLookupOutcome::FallbackNative
+                };
+                lookup.emit(recorded, None);
+                AnchorPlan::FallbackNative
+            }
             // Cancellation and an expired pin end this read as the native path
             // would. A tail that fails to build spans heights beyond this
             // chunk, so the native read reports any fault at the chunk that
@@ -574,10 +595,42 @@ impl PublishedRangeRead {
                 AnchorPlan::Failed(status)
             }
             Err(status) => {
+                lookup.emit(TailLookupOutcome::FallbackNative, None);
                 tracing::warn!(%status, "serving the uncovered tail from canonical storage");
                 AnchorPlan::FallbackNative
             }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TailLookupContext {
+    order: HeightOrder,
+    requested: BlockHeightRange,
+    epoch: ChainEpoch,
+    catalog_end: Option<(BlockHeight, BlockId)>,
+}
+
+impl TailLookupContext {
+    fn emit(self, outcome: TailLookupOutcome, live: Option<&EncodedTail>) {
+        super::tail::record_lookup(outcome);
+        tracing::debug!(
+            target: "zinder::compat_lightwalletd::encoded_tail",
+            event = "encoded_tail_lookup",
+            order = match self.order {
+                HeightOrder::Ascending => "ascending",
+                HeightOrder::Descending => "descending",
+            },
+            range_start = self.requested.start.value(),
+            range_end = self.requested.end.value(),
+            outcome = outcome.label(),
+            chain_epoch = self.epoch.id.value(),
+            visible_tip_height = self.epoch.visible_tip_height.value(),
+            catalog_end_height = self.catalog_end.map_or(0, |(end, _)| end.value()),
+            tail_generation = live.map_or(0, |tail| tail.tail_generation),
+            byte_capped = live.is_some_and(|tail| tail.byte_capped),
+            "resolved live encoded-tail lookup"
+        );
     }
 }
 

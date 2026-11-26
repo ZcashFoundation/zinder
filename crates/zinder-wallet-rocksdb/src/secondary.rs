@@ -301,6 +301,12 @@ impl RocksDbWalletSecondary {
         self.store.io_mode()
     }
 
+    /// Returns this secondary's cumulative ticker, or zero with statistics off.
+    #[must_use]
+    pub fn rocksdb_ticker_count(&self, ticker: rust_rocksdb::statistics::Ticker) -> u64 {
+        self.store.bounded_open.statistics.get_ticker_count(ticker)
+    }
+
     /// Publishes cache composition through one serving generation.
     pub fn record_block_cache_entry_gauges(&self) {
         self.store

@@ -40,6 +40,14 @@ test-group = "rocksdb-tip-replay"
 slow-timeout = { period = "20s", terminate-after = 3 }
 
 [[profile.default.overrides]]
+# Active-writer publication tests build canonical and wallet stores across a
+# 4,096-block segment boundary, clone them into four matched modes, and drive
+# concurrent RocksDB writers, projector, publisher, and gRPC readers.
+filter = "package(=zinder-bench) & test(/^integration::active_writer_publication::/)"
+test-group = "rocksdb-tip-replay"
+slow-timeout = { period = "30s", terminate-after = 3 }
+
+[[profile.default.overrides]]
 # Process-crash tests spawn child processes that abort at a crash point, then
 # reopen the store. Each abort plus RocksDB reopen costs seconds where the host
 # collects core dumps, which exceeds the 20s default kill window under

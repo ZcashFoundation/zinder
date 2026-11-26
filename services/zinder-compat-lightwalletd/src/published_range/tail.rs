@@ -1,4 +1,11 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use arc_swap::ArcSwapOption;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +27,123 @@ use crate::{
 const TAIL_BLOCKS: u32 = 5_096;
 const TAIL_BYTES: usize = 64 * 1024 * 1024;
 const ENCODE_BATCH_BLOCKS: u32 = 1_000;
+static NEXT_TAIL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_tail_generation() -> u64 {
+    NEXT_TAIL_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Counter of live `EncodedTail` cache lookups, labelled by `outcome`.
+const ENCODED_TAIL_LOOKUPS_COUNTER: &str = "zinder_compat_encoded_tail_lookups_total";
+/// Counter of installed `EncodedTail` builds stored in the shared cache, labelled by `kind`.
+const ENCODED_TAIL_FILLS_COUNTER: &str = "zinder_compat_encoded_tail_fills_total";
+/// Counter of installed `EncodedTail` builds that reached the `64 MiB` byte cap.
+const ENCODED_TAIL_BYTE_CAPPED_FILLS_COUNTER: &str =
+    "zinder_compat_encoded_tail_byte_capped_fills_total";
+/// Counter of cached rows evicted by `EncodedTail`'s `64 MiB` byte cap across installed fills.
+const ENCODED_TAIL_BYTE_CAP_EVICTIONS_COUNTER: &str =
+    "zinder_compat_encoded_tail_byte_cap_evictions_total";
+/// Gauge of payload bytes retained in the most recently installed live `EncodedTail`.
+const ENCODED_TAIL_BYTES_GAUGE: &str = "zinder_compat_encoded_tail_bytes";
+
+/// Internal outcome of resolving a live `EncodedTail` lookup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TailLookupOutcome {
+    Hit,
+    Rebuild,
+    Prepend,
+    FallbackNative,
+    Bypass,
+}
+
+impl TailLookupOutcome {
+    const ALL: [Self; 5] = [
+        Self::Hit,
+        Self::Rebuild,
+        Self::Prepend,
+        Self::FallbackNative,
+        Self::Bypass,
+    ];
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Rebuild => "rebuild",
+            Self::Prepend => "prepend",
+            Self::FallbackNative => "fallback_native",
+            Self::Bypass => "bypass",
+        }
+    }
+}
+
+/// Pre-registers live `EncodedTail` Prometheus metrics at zero with metadata.
+pub(crate) fn register_encoded_tail_metrics() {
+    metrics::describe_counter!(
+        ENCODED_TAIL_LOOKUPS_COUNTER,
+        metrics::Unit::Count,
+        "Live uncovered EncodedTail cache lookup resolutions, labelled by `outcome` \
+         (`hit`, `rebuild`, `prepend`, `fallback_native`, or `bypass`)."
+    );
+    metrics::describe_counter!(
+        ENCODED_TAIL_FILLS_COUNTER,
+        metrics::Unit::Count,
+        "Installed EncodedTail builds stored in the shared cache, labelled by `kind` \
+         (`rebuild` or `prepend`). Excludes transient per-request builds."
+    );
+    metrics::describe_counter!(
+        ENCODED_TAIL_BYTE_CAPPED_FILLS_COUNTER,
+        metrics::Unit::Count,
+        "Installed EncodedTail builds or prepends that reached the 64 MiB byte cap."
+    );
+    metrics::describe_counter!(
+        ENCODED_TAIL_BYTE_CAP_EVICTIONS_COUNTER,
+        metrics::Unit::Count,
+        "Cached block rows evicted by EncodedTail's 64 MiB byte cap across installed fills."
+    );
+    metrics::describe_gauge!(
+        ENCODED_TAIL_BYTES_GAUGE,
+        metrics::Unit::Bytes,
+        "Payload bytes retained in the most recently installed live EncodedTail."
+    );
+    for outcome in TailLookupOutcome::ALL {
+        metrics::counter!(ENCODED_TAIL_LOOKUPS_COUNTER, "outcome" => outcome.label()).increment(0);
+    }
+    for kind in ["rebuild", "prepend"] {
+        metrics::counter!(ENCODED_TAIL_FILLS_COUNTER, "kind" => kind).increment(0);
+    }
+    metrics::counter!(ENCODED_TAIL_BYTE_CAPPED_FILLS_COUNTER).increment(0);
+    metrics::counter!(ENCODED_TAIL_BYTE_CAP_EVICTIONS_COUNTER).increment(0);
+    metrics::gauge!(ENCODED_TAIL_BYTES_GAUGE).increment(0.0);
+}
+
+pub(super) fn record_lookup(outcome: TailLookupOutcome) {
+    metrics::counter!(ENCODED_TAIL_LOOKUPS_COUNTER, "outcome" => outcome.label()).increment(1);
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus gauge API requires f64; tail byte size stays far below 2^53"
+)]
+const fn usize_to_f64(bytes: usize) -> f64 {
+    bytes as f64
+}
+
+fn record_installed_fill(
+    is_rebuild: bool,
+    retained_bytes: usize,
+    byte_capped: bool,
+    evicted_rows: u64,
+) {
+    let kind = if is_rebuild { "rebuild" } else { "prepend" };
+    metrics::counter!(ENCODED_TAIL_FILLS_COUNTER, "kind" => kind).increment(1);
+    if byte_capped {
+        metrics::counter!(ENCODED_TAIL_BYTE_CAPPED_FILLS_COUNTER).increment(1);
+    }
+    if evicted_rows > 0 {
+        metrics::counter!(ENCODED_TAIL_BYTE_CAP_EVICTIONS_COUNTER).increment(evicted_rows);
+    }
+    metrics::gauge!(ENCODED_TAIL_BYTES_GAUGE).set(usize_to_f64(retained_bytes));
+}
 
 pub(super) struct TailReadLimits {
     pub(super) ascending_bytes: Option<usize>,
@@ -80,12 +204,14 @@ struct ShieldedTailBufferInner {
 pub(super) struct EncodedTail {
     pub(super) epoch: ChainEpoch,
     pub(super) fence: Fence,
+    pub(super) tail_generation: u64,
     /// The admitted serving generation the rows were read from. Rows are
     /// reused only while requests read that same immutable generation.
     source: CompactBlockSource,
     rows: VecDeque<TailRow>,
     bytes: usize,
-    byte_capped: bool,
+    pub(super) byte_capped: bool,
+    evicted_rows: u64,
     held: HeldBytes,
 }
 
@@ -251,20 +377,33 @@ impl ShieldedTailBuffer {
         (floor <= epoch.visible_tip_height).then_some(floor)
     }
 
+    #[cfg(test)]
     pub(super) async fn load_or_refresh<Reads: CompactBlockReads>(
+        &self,
+        reads_view_cancel: (&Reads, &Reads::View, &CancellationToken),
+        catalog: Option<(BlockHeight, BlockId)>,
+        requested: BlockHeightRange,
+        limits: TailReadLimits,
+    ) -> Result<Option<Arc<EncodedTail>>, Status> {
+        self.load_or_refresh_with_outcome(reads_view_cancel, catalog, requested, limits)
+            .await
+            .map(|(tail, _)| tail)
+    }
+
+    pub(super) async fn load_or_refresh_with_outcome<Reads: CompactBlockReads>(
         &self,
         (reads, view, cancel): (&Reads, &Reads::View, &CancellationToken),
         catalog: Option<(BlockHeight, BlockId)>,
         requested: BlockHeightRange,
         limits: TailReadLimits,
-    ) -> Result<Option<Arc<EncodedTail>>, Status> {
+    ) -> Result<(Option<Arc<EncodedTail>>, TailLookupOutcome), Status> {
         let Some(CompactBlockFence {
             event_fence,
             history_bounds,
             source,
         }) = reads.tail_source(view)
         else {
-            return Ok(None);
+            return Ok((None, TailLookupOutcome::Bypass));
         };
         let source = ReadsTailSource {
             reads,
@@ -274,7 +413,7 @@ impl ShieldedTailBuffer {
             cancel,
             ascending_budget: limits.ascending_bytes,
         };
-        self.refresh(
+        self.refresh_with_outcome(
             &source,
             catalog,
             (requested, TAIL_BYTES),
@@ -283,22 +422,35 @@ impl ShieldedTailBuffer {
         .await
     }
 
+    #[cfg(test)]
     async fn refresh<Source: TailSource>(
+        &self,
+        source: &Source,
+        catalog: Option<(BlockHeight, BlockId)>,
+        bounds: (BlockHeightRange, usize),
+        max_wait: Duration,
+    ) -> Result<Option<Arc<EncodedTail>>, Status> {
+        self.refresh_with_outcome(source, catalog, bounds, max_wait)
+            .await
+            .map(|(tail, _)| tail)
+    }
+
+    async fn refresh_with_outcome<Source: TailSource>(
         &self,
         source: &Source,
         catalog: Option<(BlockHeight, BlockId)>,
         (requested, max_tail_bytes): (BlockHeightRange, usize),
         max_wait: Duration,
-    ) -> Result<Option<Arc<EncodedTail>>, Status> {
+    ) -> Result<(Option<Arc<EncodedTail>>, TailLookupOutcome), Status> {
         let cancel = source.cancel();
         check_cancel(source)?;
         let (epoch, fence) = source.epoch_and_fence();
         let Some(window_floor) = Self::window_floor(epoch, fence.1, catalog.map(|(end, _)| end))
         else {
-            return Ok(None);
+            return Ok((None, TailLookupOutcome::Bypass));
         };
         if requested.end < window_floor {
-            return Ok(None);
+            return Ok((None, TailLookupOutcome::Bypass));
         }
         let requested_floor = requested.start.max(window_floor);
         let existing = self.load_full();
@@ -306,75 +458,134 @@ impl ShieldedTailBuffer {
             .as_ref()
             .filter(|tail| tail.satisfies(source, requested_floor))
         {
-            return Ok(Some(existing.clone()));
+            return Ok((Some(existing.clone()), TailLookupOutcome::Hit));
         }
         if !fills(existing.as_deref(), source, requested) {
-            return Ok(None);
+            return Ok((None, TailLookupOutcome::Bypass));
         }
         drop(existing);
         // A stale view must not spend the refresh lock building rows it may
         // not install.
         if !source.is_current().await {
-            return Ok(None);
+            return Ok((None, TailLookupOutcome::Bypass));
         }
         check_cancel(source)?;
         let _guard = match self.0.refresh_lock.try_lock() {
             Ok(guard) => guard,
-            Err(_) if max_wait.is_zero() => return Ok(None),
+            Err(_) if max_wait.is_zero() => return Ok((None, TailLookupOutcome::Bypass)),
             Err(_) => tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(cancelled()),
                 acquired = tokio::time::timeout(max_wait, self.0.refresh_lock.lock()) => match acquired {
                     Ok(guard) => guard,
-                    Err(_) => return Ok(None),
+                    Err(_) => return Ok((None, TailLookupOutcome::Bypass)),
                 },
             },
         };
+        self.refresh_under_lock(
+            source,
+            catalog,
+            (requested, requested_floor, max_tail_bytes),
+            epoch.visible_tip_height,
+        )
+        .await
+    }
+
+    async fn refresh_under_lock<Source: TailSource>(
+        &self,
+        source: &Source,
+        catalog: Option<(BlockHeight, BlockId)>,
+        (requested, requested_floor, max_tail_bytes): (BlockHeightRange, BlockHeight, usize),
+        visible_tip_height: BlockHeight,
+    ) -> Result<(Option<Arc<EncodedTail>>, TailLookupOutcome), Status> {
         check_cancel(source)?;
         let previous = self.load_full();
         if let Some(existing) = &previous
             && existing.satisfies(source, requested_floor)
         {
-            return Ok(Some(existing.clone()));
+            return Ok((Some(existing.clone()), TailLookupOutcome::Hit));
         }
         // The view may have changed while this miss waited for the lock.
         if !source.is_current().await {
-            return Ok(None);
+            return Ok((None, TailLookupOutcome::Bypass));
         }
         check_cancel(source)?;
         if !fills(previous.as_deref(), source, requested) {
-            return Ok(None);
+            return Ok((None, TailLookupOutcome::Bypass));
         }
         // Another generation's rows are never reused: two admitted stores can
         // share block hashes while holding different compact bytes.
-        let updated = match &previous {
-            Some(existing) if existing.serves(source) => {
-                prepend_missing(source, existing, requested_floor, max_tail_bytes, catalog).await?
-            }
-            _ => build(
-                source,
-                BlockHeightRange::inclusive(requested_floor, epoch.visible_tip_height),
-                max_tail_bytes,
-                catalog,
-            )
-            .await?
-            .map(Arc::new),
+        let (updated, is_rebuild) = match &previous {
+            Some(existing) if existing.serves(source) => (
+                prepend_missing(source, existing, requested_floor, max_tail_bytes, catalog).await?,
+                false,
+            ),
+            _ => (
+                build(
+                    source,
+                    BlockHeightRange::inclusive(requested_floor, visible_tip_height),
+                    max_tail_bytes,
+                    catalog,
+                )
+                .await?
+                .map(Arc::new),
+                true,
+            ),
         };
-        let Some(next_tail) = updated else {
-            return Ok(None);
+        let (tail_opt, was_installed) = self
+            .install_refreshed_tail(source, previous, (updated, is_rebuild), visible_tip_height)
+            .await;
+        let outcome = match (tail_opt.is_some(), was_installed, is_rebuild) {
+            (true, true, true) => TailLookupOutcome::Rebuild,
+            (true, true, false) => TailLookupOutcome::Prepend,
+            _ => TailLookupOutcome::Bypass,
         };
-        // Rows that stop below the tip, or were built for a view that stopped
-        // being current during the build, serve this request only.
-        if next_tail
-            .bounds()
-            .is_some_and(|bounds| bounds.end == epoch.visible_tip_height)
-            && source.is_current().await
-        {
-            self.0
-                .current
-                .compare_and_swap(&previous, Some(next_tail.clone()));
+        Ok((tail_opt, outcome))
+    }
+
+    async fn install_refreshed_tail<Source: TailSource>(
+        &self,
+        source: &Source,
+        previous: Option<Arc<EncodedTail>>,
+        (next_tail, is_rebuild): (Option<Arc<EncodedTail>>, bool),
+        visible_tip_height: BlockHeight,
+    ) -> (Option<Arc<EncodedTail>>, bool) {
+        let Some(next_tail) = next_tail else {
+            return (None, false);
+        };
+        let same_as_previous = previous
+            .as_ref()
+            .is_some_and(|existing| Arc::ptr_eq(existing, &next_tail));
+        if same_as_previous {
+            return (Some(next_tail), false);
         }
-        Ok(Some(next_tail))
+        // Rows that stop below the tip, or were built for a view that stopped
+        // being current during the build, serve this request only and must not
+        // increment shared-cache installation counters.
+        let installed = next_tail
+            .bounds()
+            .is_some_and(|bounds| bounds.end == visible_tip_height)
+            && source.is_current().await
+            && {
+                let swapped_prev = self
+                    .0
+                    .current
+                    .compare_and_swap(&previous, Some(next_tail.clone()));
+                match (swapped_prev.as_ref(), previous.as_ref()) {
+                    (Some(actual), Some(expected)) => Arc::ptr_eq(actual, expected),
+                    (None, None) => true,
+                    _ => false,
+                }
+            };
+        if installed {
+            record_installed_fill(
+                is_rebuild,
+                next_tail.bytes,
+                next_tail.byte_capped,
+                next_tail.evicted_rows,
+            );
+        }
+        (Some(next_tail), installed)
     }
 }
 
@@ -404,7 +615,7 @@ impl EncodedTail {
             return self;
         }
         let rows: VecDeque<_> = self.rows.range(covered..).cloned().collect();
-        Arc::new(self.with_rows(rows, false, self.held))
+        Arc::new(self.with_rows(rows, false, self.held, 0))
     }
 
     pub(super) fn bounds(&self) -> Option<BlockHeightRange> {
@@ -428,13 +639,21 @@ impl EncodedTail {
                     .is_some_and(|bounds| bounds.start <= requested_floor))
     }
 
-    fn with_rows(&self, rows: VecDeque<TailRow>, byte_capped: bool, held: HeldBytes) -> Self {
+    fn with_rows(
+        &self,
+        rows: VecDeque<TailRow>,
+        byte_capped: bool,
+        held: HeldBytes,
+        evicted_rows: u64,
+    ) -> Self {
         Self {
             epoch: self.epoch,
             fence: self.fence,
+            tail_generation: next_tail_generation(),
             source: self.source.clone(),
             bytes: payload_bytes(&rows),
             byte_capped,
+            evicted_rows,
             rows,
             held,
         }
@@ -586,6 +805,7 @@ impl EncodedTail {
             if let Some(evicted) = self.rows.pop_front() {
                 self.bytes -= evicted.payload_len();
                 self.byte_capped = true;
+                self.evicted_rows = self.evicted_rows.saturating_add(1);
             }
         }
         if self.bytes > max_tail_bytes {
@@ -606,9 +826,11 @@ async fn build<Source: TailSource>(
     let mut tail = EncodedTail {
         epoch,
         fence,
+        tail_generation: next_tail_generation(),
         source: source.source().clone(),
         bytes: 0,
         byte_capped: false,
+        evicted_rows: 0,
         rows: VecDeque::new(),
         held: HeldBytes::default(),
     };
@@ -681,6 +903,7 @@ struct PrependWindow {
     /// The last row read, which must link to the rows above the batch.
     top: Option<(BlockId, BlockHash)>,
     dropped: bool,
+    dropped_rows: u64,
 }
 
 impl PrependWindow {
@@ -694,6 +917,7 @@ impl PrependWindow {
             };
             self.bytes -= evicted.payload_len();
             self.dropped = true;
+            self.dropped_rows = self.dropped_rows.saturating_add(1);
         }
     }
 }
@@ -712,6 +936,7 @@ async fn read_prepend_batches<Source: TailSource>(
     let mut expected_parent = existing.rows.front().map(|row| row.parent);
     let mut byte_capped =
         existing.byte_capped || (remaining_bytes == 0 && cursor >= target_floor.value());
+    let mut evicted_rows = 0_u64;
     while cursor >= target_floor.value() && remaining_bytes > 0 {
         check_cancel(source)?;
         let batch_start = cursor
@@ -725,6 +950,7 @@ async fn read_prepend_batches<Source: TailSource>(
             budget: remaining_bytes,
             top: None,
             dropped: false,
+            dropped_rows: 0,
         };
         let retained = existing.bytes + kept_bytes;
         let mut keep = |chunk: Vec<TailRow>| {
@@ -748,6 +974,7 @@ async fn read_prepend_batches<Source: TailSource>(
             return Err(Status::data_loss("discontinuous canonical tail"));
         }
         byte_capped |= window.dropped;
+        evicted_rows = evicted_rows.saturating_add(window.dropped_rows);
         let Some(front) = window.rows.front() else {
             break;
         };
@@ -768,7 +995,12 @@ async fn read_prepend_batches<Source: TailSource>(
         rows.extend(batch);
     }
     rows.extend(existing.rows.iter().cloned());
-    Ok(Some(Arc::new(existing.with_rows(rows, byte_capped, held))))
+    Ok(Some(Arc::new(existing.with_rows(
+        rows,
+        byte_capped,
+        held,
+        evicted_rows,
+    ))))
 }
 
 enum SpanEnd {
@@ -2115,6 +2347,263 @@ mod tests {
         faulty.blocks[60] = mock_block(60, 7, 60);
         let (frames, ending) = tail_fault_outcome(faulty).await?;
         assert_eq!((frames.len(), ending), (60, None));
+        Ok(())
+    }
+
+    fn rendered_metric(rendered: &str, series: &str) -> f64 {
+        rendered
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(series)?
+                    .strip_prefix(' ')?
+                    .parse::<f64>()
+                    .ok()
+            })
+            .unwrap_or(0.0)
+    }
+
+    fn assert_metric_eq(rendered: &str, series: &str, expected: f64) {
+        let actual = rendered_metric(rendered, series);
+        assert!(
+            (actual - expected).abs() < f64::EPSILON,
+            "expected {series} == {expected}, got {actual}\n{rendered}"
+        );
+    }
+
+    async fn run_range_request(
+        methods: &BlockMethods,
+        reads: &FencedReads,
+        buffer: &ShieldedTailBuffer,
+        request: lightwalletd::BlockRange,
+    ) -> eyre::Result<usize> {
+        let mut stream = methods
+            .published_block_range(
+                reads,
+                &request,
+                (None, buffer.clone()),
+                CompactBlockShape::for_range,
+            )
+            .await?;
+        let mut count = 0_usize;
+        while let Some(frame) = stream.next().await {
+            let _ = frame?;
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
+
+    #[tokio::test]
+    async fn encoded_tail_metrics_record_installed_rebuild_prepend_and_hit() -> eyre::Result<()> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let methods = BlockMethods::default();
+        let reads = FencedReads::new(build_source(10, 1));
+        let buffer = ShieldedTailBuffer::default();
+
+        assert_eq!(
+            run_range_request(&methods, &reads, &buffer, range_request(8, 10, Vec::new())).await?,
+            3
+        );
+        assert_eq!(
+            run_range_request(&methods, &reads, &buffer, range_request(9, 10, Vec::new())).await?,
+            2
+        );
+        assert_eq!(
+            run_range_request(&methods, &reads, &buffer, range_request(5, 10, Vec::new())).await?,
+            6
+        );
+
+        let rendered = handle.render();
+        assert!(
+            (rendered_metric(
+                &rendered,
+                "zinder_compat_encoded_tail_fills_total{kind=\"rebuild\"}"
+            ) - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (rendered_metric(
+                &rendered,
+                "zinder_compat_encoded_tail_fills_total{kind=\"prepend\"}"
+            ) - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (rendered_metric(
+                &rendered,
+                "zinder_compat_encoded_tail_lookups_total{outcome=\"rebuild\"}"
+            ) - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (rendered_metric(
+                &rendered,
+                "zinder_compat_encoded_tail_lookups_total{outcome=\"hit\"}"
+            ) - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (rendered_metric(
+                &rendered,
+                "zinder_compat_encoded_tail_lookups_total{outcome=\"prepend\"}"
+            ) - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
+        let retained_bytes = buffer
+            .load_full()
+            .ok_or_eyre("expected installed tail")?
+            .bytes;
+        assert!(
+            (rendered_metric(&rendered, "zinder_compat_encoded_tail_bytes")
+                - usize_to_f64(retained_bytes))
+            .abs()
+                < f64::EPSILON
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn encoded_tail_metrics_ignore_uninstalled_stale_or_partial_builds() -> eyre::Result<()> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        // 1. Partial non-tip-reaching build (ascending chunk stopped below visible tip)
+        let buffer = ShieldedTailBuffer::default();
+        let partial_source = build_source(10, 1);
+        let partial = TailRow {
+            id: BlockId::new(BlockHeight::new(1), mock_hash(1, 1)),
+            parent: mock_hash(0, 1),
+            native_bytes: 64,
+            shielded: CompactBlockShape::DEFAULT_RANGE.encoded(mock_block(1, 1, 1))?,
+            nullifiers: CompactBlockShape::DEFAULT_NULLIFIER_RANGE.encoded(mock_block(1, 1, 1))?,
+        };
+        let mut partial_rows = VecDeque::new();
+        partial_rows.push_back(partial);
+        let partial_tail = Arc::new(EncodedTail {
+            epoch: partial_source.epoch,
+            fence: partial_source.fence,
+            tail_generation: next_tail_generation(),
+            source: partial_source.source.clone(),
+            bytes: payload_bytes(&partial_rows),
+            byte_capped: false,
+            evicted_rows: 0,
+            rows: partial_rows,
+            held: HeldBytes::default(),
+        });
+        let (_, partial_installed) = buffer
+            .install_refreshed_tail(
+                &partial_source,
+                None,
+                (Some(partial_tail), true),
+                BlockHeight::new(10),
+            )
+            .await;
+        assert!(!partial_installed);
+
+        // 2. Stale view overtaken during read
+        let mut overtaken = build_source(7, 1);
+        overtaken.stale_on_read = true;
+        let _ = fill(&buffer, &overtaken, span(3, 7), TAIL_BYTES).await?;
+        assert!(buffer.load_full().is_none());
+
+        let rendered = handle.render();
+        assert!(
+            rendered_metric(
+                &rendered,
+                "zinder_compat_encoded_tail_fills_total{kind=\"rebuild\"}"
+            )
+            .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            rendered_metric(
+                &rendered,
+                "zinder_compat_encoded_tail_fills_total{kind=\"prepend\"}"
+            )
+            .abs()
+                < f64::EPSILON
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn encoded_tail_metrics_record_byte_capped_fills_evictions_and_fallback_native()
+    -> eyre::Result<()> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let source = quarter_chunk_rows(20);
+        let row_bytes = source.largest_payload()?;
+        let buffer = ShieldedTailBuffer::default();
+        let budget = 3 * row_bytes;
+        let capped = fill(&buffer, &source, span(1, 20), budget).await?;
+        assert!(capped.byte_capped);
+        assert!(capped.evicted_rows > 0);
+        let capped_start = capped
+            .bounds()
+            .ok_or_eyre("expected capped tail bounds")?
+            .start
+            .value();
+        assert!(capped_start > 2);
+
+        // Request strictly below `capped_start` (single block/chunk) hits `existing.satisfies` because
+        // `byte_capped == true`, then `encoded_span` returns None -> must record `fallback_native`,
+        // NEVER `hit`.
+        let methods = BlockMethods::default();
+        let reads = FencedReads::new(source);
+        assert_eq!(
+            run_range_request(&methods, &reads, &buffer, range_request(1, 1, Vec::new())).await?,
+            1
+        );
+
+        let rendered = handle.render();
+        assert_metric_eq(
+            &rendered,
+            "zinder_compat_encoded_tail_byte_capped_fills_total",
+            1.0,
+        );
+        assert!(
+            rendered_metric(
+                &rendered,
+                "zinder_compat_encoded_tail_byte_cap_evictions_total"
+            ) >= 1.0
+        );
+        assert_metric_eq(
+            &rendered,
+            "zinder_compat_encoded_tail_lookups_total{outcome=\"fallback_native\"}",
+            1.0,
+        );
+        assert_metric_eq(
+            &rendered,
+            "zinder_compat_encoded_tail_lookups_total{outcome=\"hit\"}",
+            0.0,
+        );
+
+        // A single-chunk request inside the retained capped suffix hits the installed tail once.
+        assert_eq!(
+            run_range_request(&methods, &reads, &buffer, range_request(20, 20, Vec::new())).await?,
+            1
+        );
+        let rendered = handle.render();
+        assert_metric_eq(
+            &rendered,
+            "zinder_compat_encoded_tail_lookups_total{outcome=\"hit\"}",
+            1.0,
+        );
+        assert_metric_eq(
+            &rendered,
+            "zinder_compat_encoded_tail_lookups_total{outcome=\"fallback_native\"}",
+            1.0,
+        );
         Ok(())
     }
 }

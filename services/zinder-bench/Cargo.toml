@@ -21,12 +21,14 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
+ring.workspace = true
 rust-rocksdb.workspace = true
 rustix = { workspace = true, features = ["param", "time"] }
 rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
@@ -56,7 +58,6 @@ workspace = true
 eyre.workspace = true
 http.workspace = true
 rcgen.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tower.workspace = true
 zinder-testkit.workspace = true
