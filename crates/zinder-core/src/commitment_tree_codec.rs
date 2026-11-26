@@ -1247,7 +1247,14 @@ impl CommitmentTreeSnapshot {
                 })
                 .collect();
         }
-        warm_distinct_cross_checked_pools(snapshots)?;
+        if let Err((failed_idx, warm_error)) = warm_distinct_cross_checked_pools(snapshots) {
+            for (idx, snapshot) in snapshots.iter().enumerate().take(failed_idx + 1) {
+                snapshot
+                    .cross_checked_frontiers()
+                    .map_err(|error| (idx, error))?;
+            }
+            return Err((failed_idx, warm_error));
+        }
         snapshots
             .iter()
             .enumerate()
@@ -5343,6 +5350,76 @@ mod tests {
                 .ok_or("expected corrupted cached root error")?;
         assert!(matches!(
             cached_err,
+            (
+                0,
+                CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed {
+                    protocol: ShieldedProtocol::Sapling,
+                    source: CommitmentTreeFrontierValidationError::RootMismatch,
+                }
+            )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cross_checked_frontiers_batch_reports_earlier_cached_error_ahead_of_uncached_error()
+    -> TestResult {
+        let activations = pool_activations(1, 1, 1)?;
+        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+            BlockHeight::new(0),
+            &CommitmentTreeFrontiers::default(),
+            &activations,
+        )?;
+        let sapling_cmus = [commitment(7)];
+        let orchard_cmxs = [commitment(9)];
+        accumulator.append_block_commitments(BlockHeight::new(1), &sapling_cmus, &[], &[])?;
+        let snap_base = accumulator.snapshot();
+        let _warmed = snap_base.cross_checked_frontiers()?;
+
+        let mut snap0_cached_corrupt = snap_base;
+        if let Some(sapling_pool) = snap0_cached_corrupt.sapling.as_mut() {
+            sapling_pool.seed_root = Some(FinalNoteCommitmentRoot::from_bytes([0xcc; 32]));
+        }
+
+        accumulator.append_block_commitments(BlockHeight::new(2), &[], &orchard_cmxs, &[])?;
+        let mut snap1_uncached_corrupt = accumulator.snapshot();
+        if let Some(orchard_pool) = snap1_uncached_corrupt.orchard.as_mut() {
+            orchard_pool.seed_root = Some(FinalNoteCommitmentRoot::from_bytes([0xdd; 32]));
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+        let cross_snap_err = pool
+            .install(|| {
+                CommitmentTreeSnapshot::cross_checked_frontiers_batch(&[
+                    &snap0_cached_corrupt,
+                    &snap1_uncached_corrupt,
+                ])
+            })
+            .err()
+            .ok_or("expected earlier cached snapshot error")?;
+        assert!(matches!(
+            cross_snap_err,
+            (
+                0,
+                CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed {
+                    protocol: ShieldedProtocol::Sapling,
+                    source: CommitmentTreeFrontierValidationError::RootMismatch,
+                }
+            )
+        ));
+
+        let mut same_snap_both_corrupt = snap1_uncached_corrupt;
+        if let Some(sapling_pool) = same_snap_both_corrupt.sapling.as_mut() {
+            sapling_pool.seed_root = Some(FinalNoteCommitmentRoot::from_bytes([0xee; 32]));
+        }
+        let same_snap_err = pool
+            .install(|| {
+                CommitmentTreeSnapshot::cross_checked_frontiers_batch(&[&same_snap_both_corrupt])
+            })
+            .err()
+            .ok_or("expected Sapling cached error ahead of Orchard uncached error")?;
+        assert!(matches!(
+            same_snap_err,
             (
                 0,
                 CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed {
