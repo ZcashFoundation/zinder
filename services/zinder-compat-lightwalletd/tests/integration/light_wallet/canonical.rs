@@ -1582,8 +1582,6 @@ async fn skewed_pending_lookup(
 
 #[tokio::test]
 async fn lean_wallet_history_selects_local_rows_and_verifies_cold_bodies() -> Result<()> {
-    use zinder_core::wire::encode_rpc_transaction_id_hex;
-
     let block = super::served_tip(1)?;
     let first = TransactionId::from_bytes([0x55; 32]);
     let second = TransactionId::from_bytes([0x56; 32]);
@@ -1598,25 +1596,7 @@ async fn lean_wallet_history_selects_local_rows_and_verifies_cold_bodies() -> Re
     )?;
     let schedule = super::one_upgrade_per_height()?;
     let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
-    let node = super::verifiable_node(
-        &schedule,
-        block.hash,
-        [
-            method("getaddresstxids").reply(RpcReply::result(json!([
-                encode_rpc_transaction_id_hex(unrelated)
-            ]))),
-            method("getrawtransaction").reply(mined_reply(first, block, "99")),
-            method("getrawtransaction").reply_with(move |params| {
-                if params[0] == encode_rpc_transaction_id_hex(first) {
-                    mined_reply(first, block, "55")
-                } else if params[0] == encode_rpc_transaction_id_hex(second) {
-                    mined_reply(second, block, "56")
-                } else {
-                    RpcReply::error("transaction is outside the selected address history")
-                }
-            }),
-        ],
-    )?;
+    let node = lean_history_node(&schedule, block, first, second, unrelated)?;
     let query = lean_wallet_query(&mut store, &node)?;
     let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(
         query
@@ -1661,9 +1641,49 @@ async fn lean_wallet_history_selects_local_rows_and_verifies_cold_bodies() -> Re
             "history included an unrelated transaction"
         );
     }
-    assert_eq!(node.requests_for("getrawtransaction")?.len(), 5);
+    let raw_tx_calls = node.requests_for("getrawtransaction")?.len();
+    assert!(
+        (4..=6).contains(&raw_tx_calls),
+        "expected 4..=6 cold reads across the three streams (depending on whether the first stream's pipelined second row finished or cancelled), observed {raw_tx_calls}",
+    );
     assert!(node.requests_for("getaddresstxids")?.is_empty());
     Ok(())
+}
+
+fn lean_history_node(
+    schedule: &zinder_core::NetworkUpgradeActivations,
+    block: zinder_core::BlockId,
+    first: TransactionId,
+    second: TransactionId,
+    unrelated: TransactionId,
+) -> Result<JsonRpcTestServer> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zinder_core::wire::encode_rpc_transaction_id_hex;
+
+    let corrupt_first = AtomicBool::new(true);
+    super::verifiable_node(
+        schedule,
+        block.hash,
+        [
+            method("getaddresstxids").reply(RpcReply::result(json!([
+                encode_rpc_transaction_id_hex(unrelated)
+            ]))),
+            method("getrawtransaction").reply_with(move |params| {
+                if params[0] == encode_rpc_transaction_id_hex(first) {
+                    let hex = if corrupt_first.swap(false, Ordering::SeqCst) {
+                        "99"
+                    } else {
+                        "55"
+                    };
+                    mined_reply(first, block, hex)
+                } else if params[0] == encode_rpc_transaction_id_hex(second) {
+                    mined_reply(second, block, "56")
+                } else {
+                    RpcReply::error("transaction is outside the selected address history")
+                }
+            }),
+        ],
+    )
 }
 
 fn lean_wallet_query(

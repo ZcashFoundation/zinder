@@ -224,6 +224,13 @@ impl CanonicalReader for ObservedCanonicalReader {
         self.count().mined_transaction(transaction_id).await
     }
 
+    async fn mined_transactions(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<Vec<Option<IndexedTransaction>>, StorageReadError> {
+        self.count().mined_transactions(transaction_ids).await
+    }
+
     async fn transaction_blob_by_id(
         &self,
         transaction_id: TransactionId,

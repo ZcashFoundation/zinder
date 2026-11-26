@@ -239,11 +239,11 @@ pub enum ForwardedReadConfigError {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum ForwardedReadKind {
-    /// Mined transaction bytes, for `GetTransaction` and address history rows.
+    /// Mined transaction bytes, for `GetTransaction`.
     Transaction,
     /// Unspent outputs of transparent addresses, including balance lookups.
     Utxo,
-    /// Transaction IDs of transparent address history.
+    /// Address history pages and mined transaction bytes of address history rows.
     History,
 }
 

@@ -183,6 +183,31 @@ pub trait CanonicalReader: Send + Sync + 'static {
         transaction_id: TransactionId,
     ) -> Result<Option<IndexedTransaction>, StorageReadError>;
 
+    /// Reads the mined transactions `transaction_ids` name, one entry per
+    /// requested id in request order, with the header of each block and raw
+    /// bytes when the store retains them.
+    ///
+    /// Unlike [`Self::mined_transaction`], a miss is `None` even when the
+    /// store's retained history starts after a checkpoint; callers check
+    /// [`Self::history_bounds`] when turning `None` into a proven absence so
+    /// earlier hits in the same batch are still served first.
+    async fn mined_transactions(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<Vec<Option<IndexedTransaction>>, StorageReadError> {
+        let mut transactions = Vec::with_capacity(transaction_ids.len());
+        for &transaction_id in transaction_ids {
+            match self.mined_transaction(transaction_id).await {
+                Ok(transaction) => transactions.push(transaction),
+                Err(StorageReadError::CanonicalHistoryUnavailable { .. }) => {
+                    transactions.push(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(transactions)
+    }
+
     /// Reads the raw bytes of the mined transaction `transaction_id` names.
     ///
     /// Fails with [`StorageReadError::ArtifactUnavailable`] for

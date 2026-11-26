@@ -3893,6 +3893,17 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         self.inner.transaction(transaction_id, at_epoch_id).await
     }
 
+    async fn transactions_in_order(
+        &self,
+        transaction_ids: Vec<TransactionId>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<zinder_query::TransactionsInOrder, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .transactions_in_order(transaction_ids, at_epoch_id)
+            .await
+    }
+
     async fn transaction_at_block_index(
         &self,
         height: BlockHeight,

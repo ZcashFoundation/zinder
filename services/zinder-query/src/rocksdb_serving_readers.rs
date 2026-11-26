@@ -346,6 +346,35 @@ impl CanonicalReader for RocksDbCanonicalReader {
         .await
     }
 
+    async fn mined_transactions(
+        &self,
+        transaction_ids: &[TransactionId],
+    ) -> Result<Vec<Option<IndexedTransaction>>, StorageReadError> {
+        if transaction_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = transaction_ids.to_vec();
+        self.read(move |secondary| {
+            let located = secondary.transaction_locations_and_blobs(&ids)?;
+            let heights: Vec<BlockHeight> = located
+                .iter()
+                .filter_map(|entry| entry.as_ref().map(|(location, _)| location.block_height))
+                .collect();
+            let mut headers = secondary.block_headers_at(&heights)?.into_iter();
+            Ok(located
+                .into_iter()
+                .map(|entry| {
+                    entry.map(|(location, transaction_blob)| IndexedTransaction {
+                        location,
+                        block_header: headers.next().flatten(),
+                        transaction_blob,
+                    })
+                })
+                .collect())
+        })
+        .await
+    }
+
     async fn transaction_blob_by_id(
         &self,
         transaction_id: TransactionId,

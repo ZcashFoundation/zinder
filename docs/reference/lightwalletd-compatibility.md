@@ -383,7 +383,7 @@ Both methods resolve `range` the way lightwalletd does on Zebra:
 
 lightwalletd rejects a span wider than 10,000,000 blocks. Zinder clamps the end to the tip and serves it, because wallets such as WebZjs send `end = u64::MAX`.
 
-Wallet serving pins the history to one epoch. It reads 1,000 entries at a time and sends each transaction as it reads it, at most 8 transactions ahead of the client. A stream still reading one minute after a new block replaces its epoch ends with `CHAIN_EPOCH_PIN_UNAVAILABLE`.
+Wallet serving pins the history to one epoch. It reads 1,000 entries at a time and streams transactions in canonical order, overlapping up to 8 transaction reads ahead of the client. A stream still reading one minute after a new block replaces its epoch ends with `CHAIN_EPOCH_PIN_UNAVAILABLE`.
 
 Light-wallet serving bounds forwarded history to the captured tip and releases the reader before the node calls. It checks the node's hash at that tip's height before and after each ID lookup. For each returned transaction, it reads the indexed `transaction_location` record first. The location must fall inside the page's height range and follow the previous row in canonical order. The body then comes from the verified cache or the node, checked against the record's block and digest. Rows need no tip check of their own, because each one is bound to the served view through its local record. The stream checks the tip once more before it ends. These checks validate returned rows. Completeness still depends on the node's address index, and a fork the node leaves and returns to between the two hash checks can go undetected. The stream is best-effort.
 

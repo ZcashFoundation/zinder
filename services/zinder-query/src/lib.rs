@@ -41,6 +41,7 @@ mod native_wallet_endpoint_capabilities;
 mod node_broadcast;
 #[cfg(test)]
 mod observed_canonical_reader;
+mod ordered_transactions;
 pub use light_wallet::{LightWalletNodeQuery, VerifiedNodeTarget};
 mod rocksdb_serving_readers;
 mod serving_read;
@@ -84,6 +85,7 @@ pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
 };
 pub use node_broadcast::OrderedBroadcaster;
+pub use ordered_transactions::{PendingTransaction, TransactionsInOrder};
 pub use rocksdb_serving_readers::MinedTransactionDigest;
 pub use rocksdb_serving_readers::{RocksDbCanonicalReader, RocksDbWalletReader};
 pub use serving_readers::{
@@ -343,6 +345,34 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError>;
+
+    /// Opens an ordered reader for `transaction_ids` at `at_epoch_id`.
+    ///
+    /// Canonical locations, block headers, and retained bodies are read in
+    /// bounded multi-get batches, and uncached cold bodies are fetched as
+    /// independent [`PendingTransaction`] futures charged to
+    /// [`ForwardedReadKind::History`].
+    ///
+    /// The default implementation resolves `transaction_ids` in order with
+    /// [`Self::transaction`], stopping at the first error. An implementation
+    /// that wraps another should forward this method to keep batched reads and
+    /// concurrent cold fetches active.
+    async fn transactions_in_order(
+        &self,
+        transaction_ids: Vec<TransactionId>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransactionsInOrder, QueryError> {
+        let mut outcomes = std::collections::VecDeque::with_capacity(transaction_ids.len());
+        for transaction_id in transaction_ids {
+            let outcome = self.transaction(transaction_id, at_epoch_id).await;
+            let failed = outcome.is_err();
+            outcomes.push_back(outcome);
+            if failed {
+                break;
+            }
+        }
+        Ok(TransactionsInOrder::from_preloaded(outcomes))
+    }
 
     /// Verifies the node that supplies this query's transaction bytes against
     /// the served tip of `at_epoch_id`, or of the current epoch when `None`.

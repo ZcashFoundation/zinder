@@ -55,6 +55,11 @@ impl ColdTransactionSource {
             .await
     }
 
+    /// Returns the cached verified bytes of `mined` without contacting the node.
+    pub(crate) fn cached(&self, mined: &MinedTransactionDigest) -> Option<std::sync::Arc<[u8]>> {
+        self.reads.cached_transaction(mined)
+    }
+
     /// Returns the bytes the served chain mines at `location`, from the cache
     /// or verified against the node's containing block and the committed
     /// digest.
@@ -62,6 +67,17 @@ impl ColdTransactionSource {
         &self,
         reader: &dyn CanonicalReader,
         location: TransactionLocation,
+    ) -> Result<Vec<u8>, QueryError> {
+        self.fetch_with_kind(reader, location, ForwardedReadKind::Transaction)
+            .await
+    }
+
+    /// Returns the verified mined bytes at `location` charged to `kind`.
+    pub(crate) async fn fetch_with_kind(
+        &self,
+        reader: &dyn CanonicalReader,
+        location: TransactionLocation,
+        kind: ForwardedReadKind,
     ) -> Result<Vec<u8>, QueryError> {
         let mined = MinedTransactionDigest::from_location(location)?;
         if let Some(bytes) = self.reads.cached_transaction(&mined) {
@@ -78,7 +94,7 @@ impl ColdTransactionSource {
             .map_err(QueryError::Node)?;
         let bytes = self
             .reads
-            .mined_transaction_bytes(&self.node, mined, ForwardedReadKind::Transaction, deadline)
+            .mined_transaction_bytes(&self.node, mined, kind, deadline)
             .await?;
         Ok(bytes.to_vec())
     }
@@ -302,6 +318,120 @@ mod tests {
         ));
         assert_eq!(calls.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoking_the_pair_releases_ordered_transactions_stalled_at_the_node() -> Result<()> {
+        use crate::{
+            OrderedBroadcaster, WalletQueryApi as _, WalletServingPairSlot, WalletServingQuery,
+        };
+        use futures_util::stream::{FuturesOrdered, StreamExt as _};
+
+        let (_store, pair, schedule, ids) = multi_tx_cold_pair_fixture(12)?;
+        let epoch = pair.canonical_fence().chain_epoch_id();
+        let (entered, mut calls) = mpsc::unbounded_channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let tip = pair.canonical_fence().visible_tip();
+        let node = cold_fetch_node(
+            &schedule,
+            tip,
+            blocked_transaction_stub(tip, String::new(), entered, Arc::clone(&gate)),
+        )?;
+        let source = ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            node.url(),
+            NodeAuth::None,
+            Duration::from_secs(20),
+        )?;
+        let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
+            Arc::clone(&pair),
+        ))
+        .with_node_broadcast(Some(OrderedBroadcaster::new(source, [])))
+        .with_verified_cold_transactions(crate::ForwardedReadLimit::default());
+        let idle_owners = Arc::strong_count(&pair);
+
+        let mut ordered = query.transactions_in_order(ids, Some(epoch)).await?;
+        assert_eq!(Arc::strong_count(&pair), idle_owners);
+        let mut in_flight: FuturesOrdered<_> = ordered.next_batch(4).await.into_iter().collect();
+        let mut window_task = tokio::spawn(async move { in_flight.next().await });
+        for _ in 0..4 {
+            assert!(
+                timeout(Duration::from_secs(5), calls.recv())
+                    .await?
+                    .is_some()
+            );
+        }
+        assert!(Arc::strong_count(&pair) > idle_owners);
+
+        assert!(pair.revoke_reads());
+        let first_aborted = timeout(Duration::from_secs(2), &mut window_task)
+            .await?
+            .map_err(|join_err| eyre!("window task panicked: {join_err}"))?;
+        drop(window_task);
+        let (released, ready) = &*gate;
+        *released.lock() = true;
+        ready.notify_all();
+
+        assert!(matches!(
+            first_aborted,
+            Some(Err(QueryError::ChainEpochPinUnavailable { chain_epoch_id })) if chain_epoch_id == epoch
+        ));
+        assert_eq!(Arc::strong_count(&pair), idle_owners);
+        let after_revoke = ordered
+            .next_batch(4)
+            .await
+            .into_iter()
+            .next()
+            .ok_or_else(|| eyre!("expected revoked sentinel"))?
+            .await;
+        assert!(matches!(
+            after_revoke,
+            Err(QueryError::ChainEpochPinUnavailable { chain_epoch_id }) if chain_epoch_id == epoch
+        ));
+        assert!(!ordered.has_remaining());
+        Ok(())
+    }
+
+    fn multi_tx_cold_pair_fixture(
+        count: u8,
+    ) -> Result<(
+        WalletServingStoreFixture,
+        Arc<crate::WalletServingReadPair>,
+        NetworkUpgradeActivations,
+        Vec<TransactionId>,
+    )> {
+        use crate::{RocksDbCanonicalReader, RocksDbWalletReader, WalletServingReadPair};
+        use zinder_store::RawBlobRetention;
+        use zinder_testkit::FixtureTransactionRows;
+
+        let schedule = verified_node_schedule()?;
+        let mut chain = ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::None)
+            .extend_blocks(1);
+        let block = chain
+            .blocks()
+            .first()
+            .ok_or_else(|| eyre!("missing fixture block"))?
+            .clone();
+        let ids: Vec<TransactionId> = (0..count)
+            .map(|idx| TransactionId::from_bytes([idx.saturating_add(1); 32]))
+            .collect();
+        for (tx_idx, id) in ids.iter().copied().enumerate() {
+            chain = chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+                id,
+                block.height,
+                block.hash,
+                u32::try_from(tx_idx.saturating_add(1))?,
+                vec![0x55],
+            ));
+        }
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(RocksDbCanonicalReader::new(canonical)?),
+            Arc::new(RocksDbWalletReader::new(wallet)),
+        )?);
+        Ok((store, pair, schedule, ids))
     }
 
     fn cold_fetch_fixture() -> Result<(

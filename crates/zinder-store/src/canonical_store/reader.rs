@@ -44,6 +44,9 @@ const BLOCK_BLOB_MULTI_GET_BATCH_SIZE: usize = 1_024;
 const TREE_STATE_ROOTS_MULTI_GET_BATCH_SIZE: usize = 1_024;
 const SUBTREE_ROOT_PAGE_SIZE: usize = zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST as usize;
 
+/// Canonical transaction location paired with its retained raw bytes when stored.
+pub type LocatedTransactionBlob = (TransactionLocation, Option<TransactionBlobArtifact>);
+
 pub(super) trait CanonicalServingRead {
     fn serving_open(&self) -> &BoundedRocksDbOpen;
     fn serving_network(&self) -> Network;
@@ -154,6 +157,18 @@ macro_rules! impl_canonical_typed_reads {
                 height: BlockHeight,
             ) -> Result<Option<BlockHeaderArtifact>, CanonicalStoreError> {
                 read_block_header_at(self, height)
+            }
+
+            /// Reads canonical block headers for `heights` in request order.
+            ///
+            /// Each entry matches [`Self::block_header_at`] for its height.
+            /// Lookups run in height order with duplicates collapsed so
+            /// transactions sharing a block read its header once.
+            pub fn block_headers_at(
+                &self,
+                heights: &[BlockHeight],
+            ) -> Result<Vec<Option<BlockHeaderArtifact>>, CanonicalStoreError> {
+                read_block_headers_at(self, heights)
             }
 
             /// Resolves a block hash through the canonical best-chain index.
@@ -304,6 +319,20 @@ macro_rules! impl_canonical_typed_reads {
                 CanonicalStoreError,
             > {
                 read_transaction_location_and_blob(self, transaction_id)
+            }
+
+            /// Reads the canonical locations and retained raw bytes of several
+            /// transactions in request order, reading each location row once.
+            ///
+            /// Returns one entry per requested id, each matching what
+            /// [`Self::transaction_location_and_blob`] returns for that id.
+            /// Both column families are read in key order, and the blob family
+            /// is skipped when this store does not retain transaction bodies.
+            pub fn transaction_locations_and_blobs(
+                &self,
+                transaction_ids: &[TransactionId],
+            ) -> Result<Vec<Option<LocatedTransactionBlob>>, CanonicalStoreError> {
+                read_transaction_locations_and_blobs(self, transaction_ids)
             }
 
             /// Reads the canonical location of one transaction and its
@@ -591,6 +620,50 @@ pub(super) fn read_block_header_at(
     )?
     .map(|encoded| decode_block_header(height, &encoded))
     .transpose()
+}
+
+fn read_block_headers_at(
+    store: &impl CanonicalServingRead,
+    heights: &[BlockHeight],
+) -> Result<Vec<Option<BlockHeaderArtifact>>, CanonicalStoreError> {
+    if heights.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut unique_heights = heights.to_vec();
+    unique_heights.sort_unstable();
+    unique_heights.dedup();
+    let family = column_family(&store.serving_open().db, BLOCK_HEADER_COLUMN_FAMILY)?;
+    let keys = unique_heights
+        .iter()
+        .copied()
+        .map(encode_block_position)
+        .collect::<Vec<_>>();
+    let rows = store.serving_open().db.batched_multi_get_cf_slice(
+        &family,
+        keys.iter().map(<[u8; 4]>::as_slice),
+        true,
+    );
+    let mut by_height = Vec::with_capacity(unique_heights.len());
+    for (height, row) in unique_heights.into_iter().zip(rows) {
+        let header = row
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "block header batch read",
+                source,
+            })?
+            .map(|encoded| decode_block_header(height, &encoded))
+            .transpose()?;
+        by_height.push((height, header));
+    }
+    Ok(heights
+        .iter()
+        .map(|target| {
+            by_height
+                .binary_search_by_key(target, |(height, _)| *height)
+                .ok()
+                .and_then(|idx| by_height.get(idx))
+                .and_then(|(_, header)| header.clone())
+        })
+        .collect())
 }
 
 fn read_block_hash_lookup(
@@ -983,6 +1056,61 @@ fn read_transaction_location_and_blob(
         location,
         read_located_transaction_blob(store, location)?,
     )))
+}
+
+fn read_transaction_locations_and_blobs(
+    store: &impl CanonicalServingRead,
+    transaction_ids: &[TransactionId],
+) -> Result<Vec<Option<LocatedTransactionBlob>>, CanonicalStoreError> {
+    if transaction_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let locations = read_transaction_locations(store, transaction_ids)?;
+    if !store
+        .serving_build_plan()
+        .raw_blob_retention()
+        .retains_transaction_blobs()
+    {
+        return Ok(locations
+            .into_iter()
+            .map(|location| location.map(|found| (found, None)))
+            .collect());
+    }
+    let mut ordered = locations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, location)| {
+            let found = (*location)?;
+            Some((
+                encode_transaction_position(found.block_height, found.tx_index_in_block),
+                index,
+            ))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_unstable();
+    let family = column_family(&store.serving_open().db, TRANSACTION_BLOB_COLUMN_FAMILY)?;
+    let rows = store.serving_open().db.batched_multi_get_cf_slice(
+        &family,
+        ordered.iter().map(|(key, _)| key.as_slice()),
+        true,
+    );
+    let mut combined: Vec<Option<(TransactionLocation, Option<TransactionBlobArtifact>)>> =
+        locations
+            .into_iter()
+            .map(|location| location.map(|found| (found, None)))
+            .collect();
+    for ((_, index), row) in ordered.iter().zip(rows) {
+        let maybe_bytes = row.map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "transaction blob batch read",
+            source,
+        })?;
+        if let (Some(raw_bytes), Some(Some((location, blob_slot)))) =
+            (maybe_bytes, combined.get_mut(*index))
+        {
+            *blob_slot = Some(TransactionBlobArtifact::new(*location, raw_bytes.to_vec()));
+        }
+    }
+    Ok(combined)
 }
 
 fn read_transaction_blob(
