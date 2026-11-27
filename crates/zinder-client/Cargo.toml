@@ -21,10 +21,17 @@ include = [
 default = ["remote"]
 remote = [
     "dep:arc-swap",
+    "dep:fastrand",
     "dep:futures-util",
+    "dep:hyper-util",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:sha2",
     "dep:tokio",
+    "dep:tokio-stream",
     "dep:tonic",
     "dep:tonic-types",
+    "dep:tower",
     "dep:tracing",
     "dep:zinder-proto",
 ]
@@ -32,18 +39,26 @@ remote = [
 [dependencies]
 arc-swap = { workspace = true, optional = true }
 async-trait.workspace = true
+fastrand = { workspace = true, optional = true }
+futures-core.workspace = true
 futures-util = { workspace = true, optional = true }
+hyper-util = { workspace = true, features = ["client-proxy"], optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"], optional = true }
-tokio-stream.workspace = true
+tokio-stream = { workspace = true, optional = true }
 tonic = { workspace = true, features = ["transport", "tls-ring", "tls-native-roots"], optional = true }
 tonic-types = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 zinder-core = { version = "0.27.0", path = "../zinder-core", default-features = false }
 zinder-proto = { workspace = true, optional = true }
 
 [dev-dependencies]
 eyre.workspace = true
+rcgen.workspace = true
 secrecy.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

@@ -1147,6 +1147,29 @@ where
     Ok(format!("http://{addr}"))
 }
 
+pub(super) fn spawn_transport_wallet_query(
+    listener: TcpListener,
+    tls: Option<tonic::transport::ServerTlsConfig>,
+    interceptor: impl tonic::service::Interceptor + Clone + Send + Sync + 'static,
+) -> eyre::Result<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>> {
+    let service = MalformedEventService::<wallet::ChainEventsRequest, wallet::ChainEventEnvelope> {
+        method_path: "/zinder.v1.wallet.WalletQuery/ChainEvents",
+        revision: WalletRevision::Reported(zinder_proto::CONTRACT_REVISION),
+        events: Arc::new(Vec::new()),
+        request: PhantomData,
+    };
+    let mut server = Server::builder();
+    if let Some(tls) = tls {
+        server = server.tls_config(tls)?;
+    }
+    let service = tonic::service::interceptor::InterceptedService::new(service, interceptor);
+    Ok(tokio::spawn(
+        server
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    ))
+}
+
 async fn spawn_malformed_chain_event_service(
     events: Vec<wallet::ChainEventEnvelope>,
 ) -> eyre::Result<String> {
