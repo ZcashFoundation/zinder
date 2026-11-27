@@ -3747,3 +3747,66 @@ fn portable_post_admission_row_index_page_tamper_fails_closed_and_latches_invali
     ));
     Ok(())
 }
+
+#[test]
+fn rejected_first_record_allows_retry_with_corrected_prev_hash() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("retry-first-record.zstsup01");
+    let start = BlockHeight::new(500);
+    let first_id = BlockId::new(start, det_block_hash(500));
+    let second_id = BlockId::new(BlockHeight::new(501), det_block_hash(501));
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &path,
+        SupplementSegmentIdentity::span(Network::ZcashMainnet, 1, start, second_id),
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+
+    let invalid_first = BlockSupplementRecord {
+        transparent_transactions: vec![
+            CompactTransparentSupplementTx {
+                index: 2,
+                transaction_id: det_txid(2),
+                fee_zat: Some(1_000),
+                transparent_inputs: Vec::new(),
+                transparent_outputs: vec![t_out(50_000, 0x22)],
+            },
+            CompactTransparentSupplementTx {
+                index: 1,
+                transaction_id: det_txid(1),
+                fee_zat: Some(0),
+                transparent_inputs: Vec::new(),
+                transparent_outputs: vec![t_out(100_000, 0x11)],
+            },
+        ],
+        canonical_metadata: None,
+    };
+    let rejected = writer.push_record(first_id, det_block_hash(498), 1_735_000_500, &invalid_first);
+    assert!(rejected.is_err());
+
+    writer.push_record(
+        first_id,
+        det_block_hash(499),
+        1_735_000_500,
+        &empty_supplement_record(),
+    )?;
+    writer.push_record(
+        second_id,
+        det_block_hash(500),
+        1_735_000_501,
+        &empty_supplement_record(),
+    )?;
+    let identity = writer.finish()?;
+
+    let reader = SettledSupplementSegmentReader::open(
+        &path,
+        &identity,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    assert_eq!(reader.first_previous_block_hash()?, det_block_hash(499));
+    assert_eq!(reader.read_block(start)?, empty_supplement_record());
+    assert_eq!(
+        reader.read_block(BlockHeight::new(501))?,
+        empty_supplement_record()
+    );
+    Ok(())
+}

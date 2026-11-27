@@ -99,17 +99,15 @@ impl SettledShieldedSegmentWriter {
         allow_wide_fee_in_supplement: bool,
     ) -> Result<(), SettledShieldedSegmentError> {
         let block_id = BlockId::new(block.height(), block.block_hash());
-        if let Some(prev) = self.prior {
-            if block.previous_block_hash() != prev.hash {
-                return Err(SettledShieldedSegmentError::ChainLinkage(format!(
-                    "block {} parent hash {:?} does not match prior block {:?}",
-                    block.height().value(),
-                    block.previous_block_hash(),
-                    prev.hash
-                )));
-            }
-        } else {
-            self.first_prev_hash = Some(block.previous_block_hash());
+        if let Some(prev) = self.prior
+            && block.previous_block_hash() != prev.hash
+        {
+            return Err(SettledShieldedSegmentError::ChainLinkage(format!(
+                "block {} parent hash {:?} does not match prior block {:?}",
+                block.height().value(),
+                block.previous_block_hash(),
+                prev.hash
+            )));
         }
         check_contiguous_block(&self.identity, block_id, self.prior)?;
         let encoded =
@@ -157,6 +155,9 @@ impl SettledShieldedSegmentWriter {
             )
         })?;
         self.staged = Some(staged);
+        if self.prior.is_none() {
+            self.first_prev_hash = Some(block.previous_block_hash());
+        }
         self.prior = Some(block_id);
         Ok(())
     }

@@ -189,12 +189,6 @@ impl SettledSupplementSegmentWriter {
         }
         let block_hash_wire = encode_internal_block_hash(block_id.hash);
         let prev_hash_wire = encode_internal_block_hash(prev_hash);
-        let first_prev = *self.first_prev_hash_wire.get_or_insert(prev_hash_wire);
-        if self.row_index.is_empty() && first_prev != prev_hash_wire {
-            return Err(SettledSupplementSegmentError::ChainLinkage(
-                "initial prev_hash state mismatch".to_owned(),
-            ));
-        }
 
         let (encoded, row_flags) = encode_block_record(
             BlockEnvelopeIdentity {
@@ -218,6 +212,9 @@ impl SettledSupplementSegmentWriter {
             )
         })?;
         let payload_sha256: [u8; 32] = Sha256::digest(&encoded).into();
+        if self.row_index.is_empty() {
+            self.first_prev_hash_wire = Some(prev_hash_wire);
+        }
         self.pending_chunk.extend_from_slice(&encoded);
         self.pending_chunk_blocks = self.pending_chunk_blocks.saturating_add(1);
         self.row_index.push(DecodedRowIndexEntry {
