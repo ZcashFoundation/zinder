@@ -353,6 +353,46 @@ fn decode_first_grpc_web_message<M: prost::Message + Default>(bytes: &[u8]) -> e
         bytes.len() >= payload_end,
         "grpc-web frame extends past body"
     );
+    let trailer_bytes = &bytes[payload_end..];
+    ensure!(
+        trailer_bytes.len() >= 5,
+        "grpc-web response missing trailers frame"
+    );
+    ensure!(
+        trailer_bytes[0] == 0x80,
+        "expected uncompressed grpc-web trailers frame header 0x80, got {:#x}",
+        trailer_bytes[0]
+    );
+    let trailer_len = usize::try_from(u32::from_be_bytes([
+        trailer_bytes[1],
+        trailer_bytes[2],
+        trailer_bytes[3],
+        trailer_bytes[4],
+    ]))?;
+    let trailer_end = 5 + trailer_len;
+    ensure!(
+        trailer_bytes.len() == trailer_end,
+        "expected single complete final grpc-web trailers frame (len={}, got {})",
+        trailer_end,
+        trailer_bytes.len()
+    );
+    let trailer_text = std::str::from_utf8(&trailer_bytes[5..trailer_end])?;
+    let mut grpc_status = None;
+    for raw_line in trailer_text.split("\r\n") {
+        if raw_line.is_empty() {
+            continue;
+        }
+        let (header_name, header_val) = raw_line
+            .split_once(':')
+            .ok_or_else(|| eyre!("malformed grpc-web trailer line: {raw_line:?}"))?;
+        if header_name.trim().eq_ignore_ascii_case("grpc-status") {
+            grpc_status = Some(header_val.trim().to_owned());
+        }
+    }
+    ensure!(
+        grpc_status.as_deref() == Some("0"),
+        "expected trailing grpc-status: 0, got {grpc_status:?} in {trailer_text:?}"
+    );
     Ok(M::decode(&bytes[5..payload_end])?)
 }
 

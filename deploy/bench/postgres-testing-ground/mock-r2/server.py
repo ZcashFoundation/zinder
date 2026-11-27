@@ -87,7 +87,27 @@ class MockR2Handler(BaseHTTPRequestHandler):
         if length < 0 or length > 16 * 1024 * 1024:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Content-Length out of range"})
             return None
-        return self.rfile.read(length)
+        chunks = bytearray()
+        while len(chunks) < length:
+            part = self.rfile.read(length - len(chunks))
+            if not part:
+                break
+            chunks.extend(part)
+        if len(chunks) != length:
+            self.close_connection = True
+            try:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": "truncated request body",
+                        "expected_bytes": length,
+                        "received_bytes": len(chunks),
+                    },
+                )
+            except OSError:
+                pass
+            return None
+        return bytes(chunks)
 
     def do_GET(self) -> None:
         self._handle_read(head_only=False)

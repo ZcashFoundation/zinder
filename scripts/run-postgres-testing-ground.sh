@@ -308,6 +308,7 @@ import base64
 import hashlib
 import http.client
 import json
+import socket
 import struct
 import subprocess
 import sys
@@ -397,6 +398,46 @@ except urllib.error.HTTPError as err:
 _, _, metrics_after_conflict = http_json("GET", f"{r2_base}/metrics")
 assert metrics_after_conflict["puts"] == metrics_after_first_put["puts"], (metrics_after_first_put, metrics_after_conflict)
 
+# Interrupted PUT must not persist a truncated immutable object and must allow a complete retry.
+truncated_key = "seg-truncated.bin"
+with socket.create_connection(("127.0.0.1", r2_port), timeout=5.0) as sock:
+    sock.sendall(
+        (
+            f"PUT /segments/{truncated_key} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{r2_port}\r\n"
+            "Content-Length: 64\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        + b"0123456789"
+    )
+    sock.shutdown(socket.SHUT_WR)
+    raw_reply = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        raw_reply += chunk
+    if raw_reply:
+        status_line = raw_reply.split(b"\r\n", 1)[0]
+        assert b" 400 " in status_line, status_line
+try:
+    urllib.request.urlopen(urllib.request.Request(f"{r2_base}/segments/{truncated_key}"), timeout=5.0)
+    raise AssertionError("truncated PUT unexpectedly persisted segment object")
+except urllib.error.HTTPError as err:
+    assert err.code == 404, f"expected 404 after truncated PUT, got {err.code}"
+complete_truncated_payload = b"zinder-complete-segment-after-interrupted-upload-00000000000000!"
+assert len(complete_truncated_payload) == 64
+with urllib.request.urlopen(
+    urllib.request.Request(
+        f"{r2_base}/segments/{truncated_key}",
+        data=complete_truncated_payload,
+        method="PUT",
+    ),
+    timeout=5.0,
+) as resp:
+    assert resp.status == 201, f"expected 201 on complete retry, got {resp.status}"
+
 with urllib.request.urlopen(urllib.request.Request(f"{r2_base}/segments/seg-0001.bin"), timeout=5.0) as resp:
     assert resp.status == 200
     assert resp.read() == payload
@@ -483,7 +524,18 @@ for ct, raw in [
         decoded = base64.b64decode(wire) if "grpc-web-text" in ct else wire
         assert decoded[0] == 0
         msg_len = struct.unpack(">I", decoded[1:5])[0]
-        assert msg_len > 0 and len(decoded) >= 5 + msg_len
+        payload_end = 5 + msg_len
+        assert msg_len > 0 and len(decoded) >= payload_end, len(decoded)
+        trailer_bytes = decoded[payload_end:]
+        assert len(trailer_bytes) >= 5 and trailer_bytes[0] == 0x80, f"missing/invalid grpc-web trailers frame: {trailer_bytes!r}"
+        trailer_len = struct.unpack(">I", trailer_bytes[1:5])[0]
+        assert len(trailer_bytes) == 5 + trailer_len, f"incomplete/trailing grpc-web trailers frame: {trailer_bytes!r}"
+        trailer_map = {}
+        for line in trailer_bytes[5:].decode("ascii").split("\r\n"):
+            if line:
+                name, val = line.split(":", 1)
+                trailer_map[name.strip().lower()] = val.strip()
+        assert trailer_map.get("grpc-status") == "0", trailer_map
         grpc_web_replicas.append(resp.headers.get("X-Zinder-Replica"))
 
 assert set(grpc_web_replicas) == {"probe-reader-a", "probe-reader-b"}, grpc_web_replicas
