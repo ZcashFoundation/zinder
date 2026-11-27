@@ -104,7 +104,10 @@ pub use event_lifecycle::{
 };
 pub use live_commit::{CanonicalAppendAnchor, CanonicalEventFence, CanonicalLiveAppend};
 pub use live_replacement::{CanonicalLiveReplacement, CanonicalReplacementBlock};
-pub use mempool_lifecycle::CanonicalMempoolSnapshotStart;
+pub use mempool_lifecycle::{
+    CanonicalMempoolEventStreamStart, CanonicalMempoolSnapshotStart, MempoolEventHeadSubscription,
+    MempoolEventReadCounts,
+};
 pub use publication::{
     CanonicalBaselinePublication, PreparedCanonicalBaselinePublication,
     ValidatedRocksDbCanonicalBuild,

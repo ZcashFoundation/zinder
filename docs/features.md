@@ -1,6 +1,6 @@
 # Features and roadmap
 
-This page is the single overview of what Zinder provides, why teams choose it, how it deploys, and what is supported in `v0.26.0` versus in flight or planned. For consumer integration patterns, see [Use cases](use-cases.md); for a side-by-side matrix against Zebra, Zakura, ztreamer, Zingod, and Go lightwalletd, see [Indexer comparison](reference/indexer-comparison.md).
+This page is the single overview of what Zinder provides, why teams choose it, how it deploys, and what is supported on `main` (building on `v0.26.0` with Canonical Schema `v2`) versus in flight or planned. For consumer integration patterns, see [Use cases](use-cases.md); for a side-by-side matrix against Zebra, Zakura, ztreamer, Zingod, and Go lightwalletd, see [Indexer comparison](reference/indexer-comparison.md).
 
 Zinder serves public chain data only. Keys, note scanning, shielded balances, transaction construction, and signing always stay in the wallet or application.
 
@@ -31,20 +31,20 @@ Choose a deployment preset for what Zinder stores and serves, then choose how to
 
 ### Deployment profiles
 
-Set `--preset` on `zinder serve` / `zinder index` (or `deployment.profile` / `ZINDER_DEPLOYMENT__PROFILE`) to keep storage retention and reader modes aligned ([ADR-0023](adrs/0023-deployment-profiles.md)). Add `--full-blocks` (`storage.full_blocks = true`) on any preset to retain full raw blocks and transactions locally (`raw_blob_policy = "all"`). Mainnet disk and first-sync numbers below are measured on `v0.26.0` against Zebra 7.1.0 on 8 writer cores:
+Set `--preset` on `zinder serve` / `zinder index` (or `deployment.profile` / `ZINDER_DEPLOYMENT__PROFILE`) to keep storage retention and reader modes aligned ([ADR-0023](adrs/0023-deployment-profiles.md)). Add `--full-blocks` (`storage.full_blocks = true`) on any preset to retain full raw blocks and transactions locally (`raw_blob_policy = "all"`). Historical Schema `v1` (`v0.26.0`) Mainnet disk and first-sync numbers against Zebra 7.1.0 on 8 writer cores are shown below for reference; fresh Canonical Schema `v2` Mainnet measurements are tracked in [#364](https://github.com/ZcashFoundation/zinder/issues/364):
 
-| Preset (`deployment.profile`) | Stores & serves | Measured Mainnet (`v0.26.0`) | Best for |
+| Preset (`deployment.profile`) | Stores & serves | Historical Mainnet (`v0.26.0` Schema `v1`) | Best for |
 | --- | --- | --- | --- |
-| `wallet` *(Recommended default)* | Canonical + wallet projection, `WalletQuery` + `CompactTxStreamer`, SHA-256 verified node tx bodies (`raw_blob_policy = "none"`) | ~123 GB disk, ~76 min sync | Production wallets, backends, and public endpoints needing local transparent indexes |
-| `light-wallet` (`lightwalletd`) | Canonical store only (`ingest` + `compat`); node-forwarded transparent reads and tx bodies | ~51 GB disk, ~49–60 min sync | Minimal-footprint `CompactTxStreamer` endpoints focused on shielded wallets |
+| `wallet` *(Recommended default)* | Canonical + wallet projection, `WalletQuery` + `CompactTxStreamer`, SHA-256 verified node tx bodies (`raw_blob_policy = "none"`) | ~123 GB disk (before Schema `v2` deduplication), ~76 min sync | Production wallets, backends, and public endpoints needing local transparent indexes |
+| `light-wallet` (`lightwalletd`) | Canonical store only (`ingest` + `compat`); node-forwarded transparent reads and tx bodies | ~51 GB canonical store (before Schema `v2` deduplication), ~49–60 min sync | Minimal-footprint `CompactTxStreamer` endpoints focused on shielded wallets |
 | `explorer` | Everything in `wallet`, plus `ingest.explorer_views = true`, `zinder-explorer` (`ExplorerQuery`), and `zinder-compat-cipherscan` | Additional view disk & build time | Block explorers, search, fee/pool analytics, and Cipherscan REST compatibility |
-| Any preset + `--full-blocks` | Adds all raw block and transaction blobs (`raw_blob_policy = "all"`) to the selected preset | Adds transaction blobs (~251.1 GiB) plus separate full block blobs | Self-hosted raw transaction bodies or full-block streams (`FullBlocksInRange`); omit `deployment.profile` and set `raw_blob_policy = "transactions"` (+~251.1 GiB) for tx blobs only |
+| Any preset + `--full-blocks` | Adds single-copy full consensus raw block storage (`ZSBLKB01` + `live_tail_raw_block`, `raw_blob_policy = "all"`) to the selected preset | Historical Schema `v1` stored separate tx (~251.1 GiB) and block copies; Schema `v2` stores one deduplicated raw block copy (`ZSBLKB01` / `live_tail_raw_block`) | Self-hosted raw transaction bodies or full-block streams (`FullBlocksInRange`) without upstream node fetches |
 
 ### Packaging options
 
 | Option | Status | Summary | Guide |
 | --- | --- | --- | --- |
-| **Unified OCI image via Docker Compose + systemd (`ghcr.io/zcashfoundation/zinder`)** *(Recommended)* | Supported | Zero-TOML Compose (`zinder-index` + `zinder-serve --readers-only`), optional Prometheus/Grafana profile, signed shielded history, cgroup isolation | [Deploying Zinder](runbooks/deploying.md), [Deploying on a VM](runbooks/deploying-on-a-vm.md) |
+| **Unified OCI image via Docker Compose + systemd (`ghcr.io/zcashfoundation/zinder`)** *(Recommended)* | Supported | Zero-TOML Compose (`zinder-index` + `zinder-serve --readers-only`), optional Prometheus/Grafana profile, canonical `ZSHRNG02` settled-segment streaming, cgroup isolation | [Deploying Zinder](runbooks/deploying.md), [Deploying on a VM](runbooks/deploying-on-a-vm.md) |
 | **Single-volume PaaS (`zinder serve`)** | Supported | Supervised multi-process container (`USER 10001:10001`) with T=0 `/healthz` + `/readyz` on `:9108` for Railway or similar single-volume platforms | [Deploying the single-volume container](runbooks/deploying-single-volume.md) |
 | **Kubernetes (`StatefulSet`)** | Supported *(Single-host RWO)* | Single-replica `StatefulSet` ([deploy/kubernetes/statefulset.yaml](../deploy/kubernetes/statefulset.yaml)) with `ReadWriteOnce` PVC and `fsGroup: 10001` | [Deploying the single-volume container](runbooks/deploying-single-volume.md#kubernetes-statefulset) |
 | **Stateless serverless (Cloud Run, AWS Lambda)** | Not supported *(Planned M3)* | RocksDB secondaries and long-lived streams require persistent stateful instances; horizontal readers wait on M3 PostgreSQL | [Deploying Zinder](runbooks/deploying.md#cloud-and-serverless-boundaries) |
@@ -55,17 +55,13 @@ Set `--preset` on `zinder serve` / `zinder index` (or `deployment.profile` / `ZI
 
 Zinder keeps shipped behavior, active engineering work, and decided future architecture explicitly separate.
 
-### Supported today (`v0.26.0`, alpha)
+### Supported today (Canonical Schema `v2`, alpha)
 
-- **Topology:** Single-host `rocksdb` ([ADR-0004](adrs/0004-storage-and-deployment-topologies.md)), canonical and wallet schema `v1`, native contract revision `15`.
-- **Presets and surfaces:** `wallet`, `light-wallet`, and `explorer` presets (each combinable with `--full-blocks` / `storage.full_blocks`); `CompactTxStreamer` (with gRPC-Web), `WalletQuery` + `zinder-client`, `ExplorerQuery`, and `zinder-compat-cipherscan`.
+- **Topology & layout:** Single-host `rocksdb` ([ADR-0004](adrs/0004-storage-and-deployment-topologies.md)), Canonical Schema `v2` (`CANONICAL_STORE_SCHEMA_VERSION = 2` with deduplicated `ZSHRNG02`/`ZSTSUP01`/`ZSBLKB01` external settled segments and `live_tail_block`/`live_tail_raw_block`), wallet projection schema `v1`, state bundle format `v2`, and native contract revision `15`.
+- **Presets and surfaces:** `wallet`, `light-wallet`, and `explorer` presets (each combinable with `--full-blocks` / `storage.full_blocks`, setting `storage.raw_blob_policy = "all"`; legacy `"transactions"` is removed and refused); `CompactTxStreamer` (with gRPC-Web), `WalletQuery` + `zinder-client`, `ExplorerQuery`, and `zinder-compat-cipherscan`.
 - **Node sources:** Certified Zebra 7.1.0 and Zakura 1.8.6 over JSON-RPC and `zebra-indexer-grpc` binary block fetch.
-- **Verification and recovery:** SHA-256 and optional `fs-verity`-verified canonical `ZSHRNG02` settled segments, SHA-256 verified node-forwarded tx bodies, verified edge-snapshot bootstrap ([ADR-0024](adrs/0024-verified-edge-snapshot-bootstrap.md)), and coherent private backups.
-- **Alpha upgrade model:** Breaking API, config, or schema layout changes happen between alpha tags; schema layout changes require building a fresh store rather than in-place migration.
-
-### Active engineering in flight (not yet in `v0.26.0`)
-
-- **Canonical Schema `v2` deduplicated settled segments:** Eliminating duplicated settled compact-block storage between RocksDB and signed shielded segments, targeting a ~29–30 GB Mainnet `light-wallet` footprint.
+- **Verification and recovery:** SHA-256 and optional `fs-verity`-verified canonical `ZSHRNG02` settled segments streamed directly by `zinder-compat-lightwalletd` (without `history-publisher` or duplicate `ZSHRNG01` catalogs), SHA-256 verified node-forwarded tx bodies, verified edge-snapshot bootstrap ([ADR-0024](adrs/0024-verified-edge-snapshot-bootstrap.md)), and coherent private backups.
+- **Alpha upgrade model:** Breaking API, config, or schema layout changes happen between alpha tags; schema layout changes (including Schema `v1` to Schema `v2`) require building a fresh store rather than in-place migration.
 
 ### Decided and planned (not implemented or certified)
 

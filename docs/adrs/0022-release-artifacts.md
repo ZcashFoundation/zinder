@@ -24,8 +24,7 @@ the release claiming precision it does not have for native libraries.
 2. **An archive holds the single unified `zinder` executable.** It contains
    `bin/zinder` (`serve`, `index`, `run <role>`, `snapshot`, `backup`, `config`,
    and `healthcheck`, covering ingest, projector, query, lightwalletd
-   compatibility, Explorer, Cipherscan adapter, and shielded history
-   publishing), plus build metadata, the license, a README, and checksums.
+   compatibility, Explorer, and Cipherscan adapter), plus build metadata, the license, a README, and checksums.
    `deploy/release-images.json` lists the single OCI image (`zinder`).
    Benchmark (`zinder-bench`) and code-generation binaries are excluded.
 3. **Builds are deterministic and proven by reproduction.** The build pins
@@ -114,4 +113,5 @@ The release procedure and how operators verify a download are in
 
 ## Revision history
 
+- 2026-11-27. Removed the retired shielded history publisher role from decision 2 after Canonical Schema v2 cutover.
 - 2026-11-27. Consolidated the five runtime executables and separate runtime/single-volume images into the single `bin/zinder` archive binary and single distroless `ghcr.io/zcashfoundation/zinder` OCI image (`deploy/release-images.json`).
