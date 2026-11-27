@@ -1,0 +1,6 @@
+kind: added
+body: The reference Caddyfile explicitly configures `protocols h1 h2 h3`. The TLS runbook covers exposing UDP port 443, verifying HTTP/3, and testing HTTP/2 fallback. CI validates the proxy template.
+time: 2026-11-27T22:42:27.123536755Z
+custom:
+    Bump: minor
+    PR: "722"
