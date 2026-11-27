@@ -44,13 +44,17 @@ section_count="$(grep -Ec -- "$section_heading_pattern" "$repository_root/CHANGE
 
 if [[ "$section_count" -ne 0 ]]; then
   normalize_changelog_end
-  bash "$validator" release "v${release_version}" "$repository_root"
+  CHANGIE_BIN="$changie_bin" bash "$validator" release "v${release_version}" "$repository_root"
   echo "changelog v${release_version} is already prepared"
   exit 0
 fi
 if [[ -z "$pending_fragment" ]]; then
-  bash "$validator" release "v${release_version}" "$repository_root"
+  CHANGIE_BIN="$changie_bin" bash "$validator" release "v${release_version}" "$repository_root"
 fi
+
+upgrade_class_line="$(
+  CHANGIE_BIN="$changie_bin" bash "$validator" upgrade-line "$repository_root"
+)"
 
 next_version="$(
   (
@@ -58,6 +62,7 @@ next_version="$(
     prerelease_staging_directory="$(
       mktemp -d "${TMPDIR:-/tmp}/zinder-changie-prereleases.XXXXXX"
     )"
+    # shellcheck disable=SC2329
     restore_prerelease_versions() {
       while IFS= read -r -d '' staged_version; do
         mv "$staged_version" "$repository_root/.changes/"
@@ -118,8 +123,29 @@ fi
       --remove-prereleases \
       --allow-no-changes=false
   fi
+
+  version_file="$repository_root/.changes/v${release_version}.md"
+  tmp_version_file="$(mktemp "$repository_root/.changes/.v${release_version}.XXXXXX")"
+  trap 'rm -f -- "$tmp_version_file"' EXIT
+  awk -v upgrade_line="$upgrade_class_line" '
+    NR == 1 {
+      print
+      print ""
+      print upgrade_line
+      next
+    }
+    NR == 2 && $0 != "" {
+      print ""
+    }
+    {
+      print
+    }
+  ' "$version_file" > "$tmp_version_file"
+  mv "$tmp_version_file" "$version_file"
+  trap - EXIT
+
   "$changie_bin" merge --include-unreleased '## [Unreleased]'
 )
 normalize_changelog_end
-bash "$validator" release "v${release_version}" "$repository_root"
+CHANGIE_BIN="$changie_bin" bash "$validator" release "v${release_version}" "$repository_root"
 echo "prepared changelog v${release_version}"

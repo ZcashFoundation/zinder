@@ -4,3 +4,4 @@ time: 2026-11-27T18:02:10Z
 custom:
   Bump: minor
   PR: "689"
+  Upgrade: canonical-layout
