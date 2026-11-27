@@ -1,12 +1,14 @@
+use std::{io, net::SocketAddr, time::Duration};
+
 use eyre::Result;
 use hyper_util::rt::TokioIo;
-use tokio::{io::AsyncWriteExt as _, net::TcpListener};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::{TcpListener, TcpStream},
+};
 use tonic::transport::Endpoint;
 use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
 use tower::service_fn;
-
-use std::{io, net::SocketAddr, time::Duration};
-use tokio::{io::AsyncReadExt as _, net::TcpStream};
 use zinder_runtime::{ClientAddressSource, GrpcProxyProtocol, public_grpc_server};
 
 #[tokio::test]
@@ -50,15 +52,139 @@ async fn listener_names_the_forwarded_client_and_closes_untrusted_peers() -> Res
         } else {
             let mut stream = TcpStream::connect(address).await?;
             let _ = stream.write_all(preface).await;
-            let mut byte = [0];
-            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await?;
-            assert!(match read {
-                Ok(count) => count == 0,
-                Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
-            });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                expect_connection_closed(&mut stream),
+            )
+            .await??;
         }
         stop.cancel();
         server.await??;
     }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn listener_reuses_preface_slots_and_shuts_down_with_pending_connections() -> Result<()> {
+    // Freeze preface deadlines while loopback I/O is pending. The blocking
+    // task also bounds the test in wall time if an expected socket event stalls.
+    let (finished, wait_for_test) = std::sync::mpsc::channel::<()>();
+    let wall_deadline = tokio::task::spawn_blocking(move || {
+        let _ = wait_for_test.recv_timeout(Duration::from_secs(10));
+    });
+    let outcome = tokio::select! {
+        outcome = verify_preface_slots() => outcome,
+        _ = wall_deadline => Err(eyre::eyre!("preface lifecycle did not finish within 10 seconds")),
+    };
+    drop(finished);
+    outcome
+}
+
+enum PrefaceCompletion {
+    Valid,
+    Invalid,
+    TimedOut,
+}
+
+async fn verify_preface_slots() -> Result<()> {
+    const MAX_PENDING: usize = 128;
+    for completion in [
+        PrefaceCompletion::Valid,
+        PrefaceCompletion::Invalid,
+        PrefaceCompletion::TimedOut,
+    ] {
+        let protocol =
+            GrpcProxyProtocol::resolve(Some("127.0.0.1/32"), ClientAddressSource::Connection)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (_reporter, health) = tonic_health::server::health_reporter();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn(
+            public_grpc_server(ClientAddressSource::Connection)
+                .with_proxy_protocol(protocol)
+                .add_service(health)
+                .serve_with_incoming_shutdown(listener, stop.clone().cancelled_owned()),
+        );
+
+        let mut pending = Vec::with_capacity(MAX_PENDING);
+        for _ in 0..MAX_PENDING {
+            pending.push(connect_with_incomplete_preface(address).await?);
+        }
+        let mut overflow = TcpStream::connect(address).await?;
+        expect_connection_closed(&mut overflow).await?;
+        for stream in &pending {
+            assert_pending(stream);
+        }
+
+        let mut first = pending.remove(0);
+        match completion {
+            PrefaceCompletion::Valid => complete_preface_and_check_health(address, first).await?,
+            PrefaceCompletion::Invalid => {
+                first.write_all(b"INVALID\r\n").await?;
+                expect_connection_closed(&mut first).await?;
+            }
+            PrefaceCompletion::TimedOut => {
+                tokio::time::advance(Duration::from_secs(2)).await;
+                expect_connection_closed(&mut first).await?;
+            }
+        }
+        let replacement = connect_with_incomplete_preface(address).await?;
+        complete_preface_and_check_health(address, replacement).await?;
+
+        if matches!(
+            completion,
+            PrefaceCompletion::Valid | PrefaceCompletion::Invalid
+        ) {
+            assert_pending(&pending[0]);
+        }
+        stop.cancel();
+        server.await??;
+        expect_connection_closed(&mut pending[0]).await?;
+    }
+    Ok(())
+}
+
+async fn connect_with_incomplete_preface(address: SocketAddr) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(address).await?;
+    stream.write_all(b"PROXY ").await?;
+    Ok(stream)
+}
+
+async fn complete_preface_and_check_health(
+    address: SocketAddr,
+    mut stream: TcpStream,
+) -> Result<()> {
+    stream.write_all(b"UNKNOWN\r\n").await?;
+    let mut stream = Some(stream);
+    let channel = Endpoint::from_shared(format!("http://{address}"))?
+        .connect_with_connector(service_fn(move |_| {
+            std::future::ready(
+                stream
+                    .take()
+                    .map(TokioIo::new)
+                    .ok_or_else(|| io::Error::other("test socket already used")),
+            )
+        }))
+        .await?;
+    HealthClient::new(channel)
+        .check(HealthCheckRequest::default())
+        .await?;
+    Ok(())
+}
+
+fn assert_pending(stream: &TcpStream) {
+    assert!(matches!(
+        stream.try_read(&mut [0]),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+}
+
+async fn expect_connection_closed(stream: &mut TcpStream) -> Result<()> {
+    let mut byte = [0];
+    let closed = match stream.read(&mut byte).await {
+        Ok(count) => count == 0,
+        Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
+    };
+    eyre::ensure!(closed, "expected the listener to close the connection");
     Ok(())
 }
