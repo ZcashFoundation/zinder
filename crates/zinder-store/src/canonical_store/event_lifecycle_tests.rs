@@ -726,3 +726,163 @@ fn bounded_retention_skips_lease_pinned_prefix_and_cleans_expired_leases_atomica
     }
     Ok(())
 }
+
+fn setup_explicit_multi_chunk_prune_leases(
+    store: &RocksDbCanonicalStore,
+    t0: UnixTimestampMillis,
+) -> Result<(ProjectionBuildLease, ProjectionBuildLease), Box<dyn std::error::Error>> {
+    let canonical_events =
+        store.canonical_event_history(super::CanonicalEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(10).ok_or("limit must be nonzero")?,
+        ))?;
+    let expired_lease = acquire_test_lease(
+        store,
+        2,
+        canonical_events[1].projection_build_anchor(),
+        UnixTimestampMillis::new(t0.value() + 10),
+        t0,
+    )?;
+    let live_lease = acquire_test_lease(
+        store,
+        9,
+        canonical_events[8].projection_build_anchor(),
+        UnixTimestampMillis::new(t0.value() + 500),
+        t0,
+    )?;
+    Ok((expired_lease, live_lease))
+}
+
+#[derive(Clone, Copy)]
+struct ExplicitPruneReopenExpectation<'a> {
+    store_path: &'a Path,
+    activations: &'a zinder_core::NetworkUpgradeActivations,
+    expected_floor: u64,
+    expired_sequence: u64,
+    expired_cursor: &'a crate::StreamCursorTokenV1,
+    resume_cursor: &'a crate::StreamCursorTokenV1,
+    expected_visible_sequences: &'a [u64],
+}
+
+fn assert_reopened_explicit_prune_state(
+    secondary: &mut RocksDbCanonicalSecondary,
+    expectation: ExplicitPruneReopenExpectation<'_>,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let store = open_store(
+        expectation.store_path,
+        expectation.activations,
+        REORG_WINDOW,
+    )?;
+    assert_eq!(
+        store.canonical_event_retention_floor()?,
+        expectation.expected_floor
+    );
+    secondary.try_catch_up()?;
+    assert_cursor_expired(
+        secondary,
+        expectation.expired_cursor,
+        expectation.expired_sequence,
+        expectation.expected_floor,
+    )?;
+    assert_eq!(
+        event_sequences(&wallet_history(
+            secondary,
+            Some(expectation.resume_cursor),
+            ChainEventStreamFamily::Visible,
+            10,
+        )?),
+        expectation.expected_visible_sequences
+    );
+    for epoch in 1_u64..=10 {
+        let _tips = read_chain_epoch_tips(&store.bounded_open.db, ChainEpochId::new(epoch))?;
+    }
+    Ok(store)
+}
+
+#[test]
+fn explicit_multi_chunk_prune_recovers_after_interruption_reopen_and_resume()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let (store, mut secondary) = store_with_ten_events(temporary.path())?;
+    let events = wallet_history(&secondary, None, ChainEventStreamFamily::Visible, 10)?;
+    let t0 = UnixTimestampMillis::new(BASELINE_CREATED_AT + 1_000);
+    let (expired_lease, live_lease) = setup_explicit_multi_chunk_prune_leases(&store, t0)?;
+
+    let now = UnixTimestampMillis::new(t0.value() + 100);
+    let err = store
+        .prune_canonical_events_before_with_chunk_hook(10, now, 3, |chunk_index| {
+            (chunk_index != 1)
+                .then_some(())
+                .ok_or_else(|| CanonicalStoreError::publication("interrupted chunk 1"))
+        })
+        .err()
+        .ok_or("expected simulated multi-chunk interruption")?;
+    assert!(matches!(
+        err,
+        CanonicalStoreError::PublicationRefused { .. }
+    ));
+
+    drop(store);
+    let store = assert_reopened_explicit_prune_state(
+        &mut secondary,
+        ExplicitPruneReopenExpectation {
+            store_path: &store_path,
+            activations: &activations,
+            expected_floor: 4,
+            expired_sequence: 2,
+            expired_cursor: &events[1].cursor,
+            resume_cursor: &events[2].cursor,
+            expected_visible_sequences: &[4, 5, 6, 7, 8, 9, 10],
+        },
+    )?;
+    assert!(
+        store
+            .active_projection_build_lease(expired_lease.id(), t0)?
+            .is_none()
+    );
+    assert_eq!(
+        store.active_projection_build_lease(live_lease.id(), now)?,
+        Some(live_lease)
+    );
+
+    let mut resumed_chunks = Vec::new();
+    let resumed_report =
+        store.prune_canonical_events_before_with_chunk_hook(10, now, 3, |chunk_index| {
+            resumed_chunks.push(chunk_index);
+            Ok(())
+        })?;
+    assert_eq!(resumed_chunks, vec![0, 1]);
+    assert_eq!(resumed_report.oldest_retained_sequence, 9);
+    assert_eq!(resumed_report.pruned_event_count, 5);
+    assert_eq!(
+        resumed_report.lease_protected_anchor,
+        Some(live_lease.anchor())
+    );
+
+    drop(store);
+    let store = assert_reopened_explicit_prune_state(
+        &mut secondary,
+        ExplicitPruneReopenExpectation {
+            store_path: &store_path,
+            activations: &activations,
+            expected_floor: 9,
+            expired_sequence: 7,
+            expired_cursor: &events[6].cursor,
+            resume_cursor: &events[7].cursor,
+            expected_visible_sequences: &[9, 10],
+        },
+    )?;
+    let final_report =
+        store.prune_canonical_events_before(10, UnixTimestampMillis::new(t0.value() + 600))?;
+    assert_eq!(final_report.oldest_retained_sequence, 10);
+    assert_eq!(final_report.pruned_event_count, 1);
+    assert_eq!(final_report.lease_protected_anchor, None);
+    assert!(
+        store
+            .active_projection_build_lease(live_lease.id(), t0)?
+            .is_none()
+    );
+    Ok(())
+}

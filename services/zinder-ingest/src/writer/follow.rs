@@ -613,14 +613,17 @@ where
     // while this writer was down. Readers learn that it is confirmed only
     // from a source observation, never from the persisted fence itself.
     let mut tip_confirmation = TipConfirmation::Unconfirmed;
-    let mut yielded_to_canonical = false;
+    let mut skip_top_control_drain = false;
 
     loop {
-        if !std::mem::take(&mut yielded_to_canonical) {
-            control.drain(&mut store, tip_confirmation);
-        }
         if follower.cancel.is_cancelled() {
             return Ok(store);
+        }
+        if !std::mem::take(&mut skip_top_control_drain) {
+            control.drain(&mut store, tip_confirmation, follower.cancel);
+            if follower.cancel.is_cancelled() {
+                return Ok(store);
+            }
         }
         if let Some(node_failover) = follower.config.node_failover.as_ref() {
             observe_fence_for_failover(node_failover, &store, &mut observed_fence_tip)?;
@@ -681,7 +684,10 @@ where
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(CanonicalFollowError::Source(source_error)) => {
-                control.drain(&mut store, tip_confirmation);
+                control.drain(&mut store, tip_confirmation, follower.cancel);
+                if follower.cancel.is_cancelled() {
+                    return Ok(store);
+                }
                 let recovery = follower.recover_source_failure(
                     source_error,
                     &mut source_outage,
@@ -725,7 +731,10 @@ where
         if follower.cancel.is_cancelled() {
             return Ok(store);
         }
-        control.drain(&mut store, tip_confirmation);
+        control.drain(&mut store, tip_confirmation, follower.cancel);
+        if follower.cancel.is_cancelled() {
+            return Ok(store);
+        }
 
         match prepared {
             FollowIteration::AtTip { observed_tip } => {
@@ -747,9 +756,8 @@ where
                     )
                     .await
                 {
-                    AtTipWaitOutcome::PollDue => {}
-                    AtTipWaitOutcome::YieldedToCanonical => {
-                        yielded_to_canonical = true;
+                    AtTipWaitOutcome::PollDue | AtTipWaitOutcome::YieldedToCanonical => {
+                        skip_top_control_drain = true;
                     }
                     AtTipWaitOutcome::Cancelled => return Ok(store),
                 }
@@ -843,14 +851,30 @@ impl ControlInbox {
         self.receiver.is_some()
     }
 
-    /// Applies held writes, then the commands already in the channel, until a
-    /// mempool retention step yields to canonical work or none is left.
-    fn drain(&mut self, store: &mut RocksDbCanonicalStore, tip_confirmation: TipConfirmation) {
-        while let Some(command) = self.held_writes.pop_front().or_else(|| {
-            self.receiver
-                .as_mut()
-                .and_then(|receiver| receiver.try_recv().ok())
-        }) {
+    /// Applies up to one bounded batch of held writes and queued channel
+    /// commands, returning early on cancellation or when a mempool retention
+    /// step yields to canonical work.
+    fn drain(
+        &mut self,
+        store: &mut RocksDbCanonicalStore,
+        tip_confirmation: TipConfirmation,
+        cancel: &CancellationToken,
+    ) {
+        let max_commands = self
+            .held_writes
+            .len()
+            .saturating_add(CANONICAL_CONTROL_COMMAND_CAPACITY);
+        for _ in 0..max_commands {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let Some(command) = self.held_writes.pop_front().or_else(|| {
+                self.receiver
+                    .as_mut()
+                    .and_then(|receiver| receiver.try_recv().ok())
+            }) else {
+                return;
+            };
             if apply_following_canonical_control_command(store, command, tip_confirmation)
                 == CanonicalControlScheduling::YieldToCanonical
             {
@@ -1930,6 +1954,8 @@ fn record_fence_metrics(store: &RocksDbCanonicalStore, observed_tip: BlockId) {
 mod tests {
     use std::{num::NonZeroU32, time::Duration};
 
+    use tokio_util::sync::CancellationToken;
+
     use zinder_core::{
         BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint,
         CommitmentTreeFrontiers, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootIndex,
@@ -2028,7 +2054,8 @@ mod tests {
         assert!(prune_outcome.try_recv().is_err());
         assert!(second_append.try_recv().is_err());
 
-        control.drain(&mut store, TipConfirmation::Confirmed);
+        let cancel = CancellationToken::new();
+        control.drain(&mut store, TipConfirmation::Confirmed, &cancel);
         assert_eq!(first_append.try_recv()??.event_sequence, 1);
         prune_outcome.try_recv()??;
         assert!(
@@ -2036,7 +2063,7 @@ mod tests {
             "a held retention step yields before the next held write"
         );
 
-        control.drain(&mut store, TipConfirmation::Confirmed);
+        control.drain(&mut store, TipConfirmation::Confirmed, &cancel);
         assert_eq!(second_append.try_recv()??.event_sequence, 2);
         Ok(())
     }
@@ -2082,7 +2109,8 @@ mod tests {
         );
         assert_eq!(replay_page?, [] as [zinder_store::MempoolEventEnvelope; 0]);
 
-        control.drain(&mut store, TipConfirmation::Confirmed);
+        let cancel = CancellationToken::new();
+        control.drain(&mut store, TipConfirmation::Confirmed, &cancel);
         let (durable_page, ()) = tokio::join!(
             canonical.mempool_event_page(None, page_size),
             control.serve_reads_until(

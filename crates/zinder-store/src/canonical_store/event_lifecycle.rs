@@ -548,10 +548,42 @@ impl RocksDbCanonicalStore {
         self.prune_canonical_events_before_locked(requested_oldest_sequence, now)
     }
 
+    #[cfg(test)]
+    pub(super) fn prune_canonical_events_before_with_chunk_hook(
+        &self,
+        requested_oldest_sequence: u64,
+        now: UnixTimestampMillis,
+        chunk_size: u64,
+        on_before_chunk_write: impl FnMut(u64) -> Result<(), CanonicalStoreError>,
+    ) -> Result<CanonicalEventRetentionReport, CanonicalStoreError> {
+        let _lifecycle_guard = self.lifecycle_lock.lock();
+        self.prune_canonical_events_before_locked_with_hook(
+            requested_oldest_sequence,
+            now,
+            chunk_size,
+            on_before_chunk_write,
+        )
+    }
+
     fn prune_canonical_events_before_locked(
         &self,
         requested_oldest_sequence: u64,
         now: UnixTimestampMillis,
+    ) -> Result<CanonicalEventRetentionReport, CanonicalStoreError> {
+        self.prune_canonical_events_before_locked_with_hook(
+            requested_oldest_sequence,
+            now,
+            u64::from(DEFAULT_CANONICAL_EVENT_RETENTION_MAX_DELETED_EVENTS.get()),
+            |_| Ok(()),
+        )
+    }
+
+    fn prune_canonical_events_before_locked_with_hook(
+        &self,
+        requested_oldest_sequence: u64,
+        now: UnixTimestampMillis,
+        chunk_size: u64,
+        on_before_chunk_write: impl FnMut(u64) -> Result<(), CanonicalStoreError>,
     ) -> Result<CanonicalEventRetentionReport, CanonicalStoreError> {
         let current_event_sequence = self.ready_evidence.visible_event_sequence;
         let oldest_retained_sequence = self.canonical_event_retention_floor()?;
@@ -572,12 +604,14 @@ impl RocksDbCanonicalStore {
         // can still require the exact historical epoch whose branch is being
         // reverted; projecting the current epoch onto that range would lie
         // about its tip and settlement boundary.
-        write_pruned_event_chunks(
-            self,
+        write_pruned_event_chunks_with_hook(PrunedEventChunkWrite {
+            store: self,
             oldest_retained_sequence,
             retained_floor,
             expired_lease_ids,
-        )?;
+            chunk_size,
+            on_before_chunk_write,
+        })?;
         let first_deletable_sequence = oldest_retained_sequence.max(2);
         Ok(CanonicalEventRetentionReport {
             current_event_sequence,
@@ -744,17 +778,29 @@ fn earliest_live_lease_anchor(leases: &[ProjectionBuildLease]) -> Option<Project
         .min_by_key(|anchor| anchor.event_cursor.event_sequence())
 }
 
-fn write_pruned_event_chunks(
-    store: &RocksDbCanonicalStore,
+struct PrunedEventChunkWrite<'a, Hook> {
+    store: &'a RocksDbCanonicalStore,
     oldest_retained_sequence: u64,
     retained_floor: u64,
-    mut expired_lease_ids: Vec<ProjectionBuildLeaseId>,
-) -> Result<(), CanonicalStoreError> {
-    let chunk_size = u64::from(DEFAULT_CANONICAL_EVENT_RETENTION_MAX_DELETED_EVENTS.get());
-    let event_family = column_family(&store.bounded_open.db, CHAIN_EVENT_COLUMN_FAMILY)?;
-    let mut chunk_start = oldest_retained_sequence;
-    while chunk_start < retained_floor {
-        let chunk_end = chunk_start.saturating_add(chunk_size).min(retained_floor);
+    expired_lease_ids: Vec<ProjectionBuildLeaseId>,
+    chunk_size: u64,
+    on_before_chunk_write: Hook,
+}
+
+fn write_pruned_event_chunks_with_hook<Hook>(
+    mut request: PrunedEventChunkWrite<'_, Hook>,
+) -> Result<(), CanonicalStoreError>
+where
+    Hook: FnMut(u64) -> Result<(), CanonicalStoreError>,
+{
+    let chunk_size = request.chunk_size.max(1);
+    let event_family = column_family(&request.store.bounded_open.db, CHAIN_EVENT_COLUMN_FAMILY)?;
+    let mut chunk_start = request.oldest_retained_sequence;
+    let mut chunk_index = 0_u64;
+    while chunk_start < request.retained_floor {
+        let chunk_end = chunk_start
+            .saturating_add(chunk_size)
+            .min(request.retained_floor);
         let mut batch = WriteBatch::default();
         for event_sequence in chunk_start..chunk_end {
             if event_sequence != 1 {
@@ -762,18 +808,20 @@ fn write_pruned_event_chunks(
             }
         }
         batch.put(RETENTION_FLOOR_KEY, chunk_end.to_be_bytes());
-        for lease_id in std::mem::take(&mut expired_lease_ids) {
+        for lease_id in std::mem::take(&mut request.expired_lease_ids) {
             batch.delete(projection_build_lease_key(lease_id));
         }
-        write_lifecycle_batch(store, &batch, "canonical event prune")?;
+        (request.on_before_chunk_write)(chunk_index)?;
+        write_lifecycle_batch(request.store, &batch, "canonical event prune")?;
+        chunk_index = chunk_index.saturating_add(1);
         chunk_start = chunk_end;
     }
-    if !expired_lease_ids.is_empty() {
+    if !request.expired_lease_ids.is_empty() {
         let mut batch = WriteBatch::default();
-        for lease_id in expired_lease_ids {
+        for lease_id in request.expired_lease_ids {
             batch.delete(projection_build_lease_key(lease_id));
         }
-        write_lifecycle_batch(store, &batch, "canonical event prune")?;
+        write_lifecycle_batch(request.store, &batch, "canonical event prune")?;
     }
     Ok(())
 }

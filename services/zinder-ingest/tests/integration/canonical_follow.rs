@@ -4472,3 +4472,81 @@ async fn at_tip_wait_yields_to_canonical_between_successive_maintenance_commands
     let _store = tokio::time::timeout(Duration::from_secs(1), follower_task).await???;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sustained_concurrent_reads_do_not_starve_at_tip_poll_or_shutdown()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (source, activations, store, _dir) = follower_fixture_at_its_node_tip().await?;
+    let (command_sender, control_commands) =
+        mpsc::channel(zinder_ingest::CANONICAL_CONTROL_COMMAND_CAPACITY);
+    let cancel = CancellationToken::new();
+    let follower_source = source.clone();
+    let follower_cancel = cancel.clone();
+    let follower_task = tokio::spawn(async move {
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        let follower = CanonicalFollower::new(
+            &follower_source,
+            Arc::clone(&activations),
+            CanonicalFollowConfig {
+                request_timeout: Duration::from_secs(5),
+                poll_interval: Duration::from_millis(25),
+                lag_threshold_blocks: 0,
+                target_height: None,
+                event_retention_window: None,
+                event_retention_check_interval: Duration::from_secs(60),
+                mempool_ready_gate: None,
+                max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+                node_failover: None,
+            },
+            &readiness,
+            &follower_cancel,
+        );
+        follow_canonical_tip_with_control(store, follower, control_commands).await
+    });
+
+    wait_for_confirmed_at_tip_status(&command_sender).await?;
+    let stop_reads = Arc::new(AtomicBool::new(false));
+    let completed_reads = Arc::new(AtomicUsize::new(0));
+    let reader_sender = command_sender.clone();
+    let reader_stop = Arc::clone(&stop_reads);
+    let reader_completed = Arc::clone(&completed_reads);
+    let reader_task = tokio::spawn(async move {
+        while !reader_stop.load(Ordering::Relaxed) {
+            let (reply, outcome) = oneshot::channel();
+            if reader_sender
+                .send(CanonicalControlCommand::WriterStatus { reply })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if outcome.await.is_err() {
+                break;
+            }
+            reader_completed.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if source.tip_call_count() >= 3 && completed_reads.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "scheduled at-tip polls starved under sustained concurrent reads (tips={}, reads={})",
+            source.tip_call_count(),
+            completed_reads.load(Ordering::Relaxed),
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    cancel.cancel();
+    let _store = tokio::time::timeout(Duration::from_secs(2), follower_task).await???;
+    stop_reads.store(true, Ordering::Relaxed);
+    drop(command_sender);
+    let _ = tokio::time::timeout(Duration::from_secs(2), reader_task).await?;
+    Ok(())
+}
