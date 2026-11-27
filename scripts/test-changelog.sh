@@ -382,6 +382,88 @@ git -C "$fixture_repository" rm -q .changes/unreleased/bad-escape-flow-upgrade.y
 git -C "$fixture_repository" commit -qm "cleanup bad-escape flow Upgrade"
 clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
 
+# Block-scalar Upgrade values with leading/trailing spaces or unstripped newline must fail.
+printf '%s\n' \
+  'kind: fixed' \
+  'body: Reject block-scalar Upgrade values with trailing spaces.' \
+  'time: 2026-07-21T19:14:40Z' \
+  'custom:' \
+  '  Bump: patch' \
+  '  PR: "26"' \
+  '  Upgrade: |-' \
+  '    compatible   ' \
+  > "$fixture_repository/.changes/unreleased/block-trailing-space-upgrade.yaml"
+git -C "$fixture_repository" add .changes/unreleased/block-trailing-space-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with trailing-space block Upgrade"
+block_trailing_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with trailing-space block Upgrade (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with trailing-space block Upgrade (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$block_trailing_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/block-trailing-space-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup trailing-space block Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
+cat > "$fixture_repository/.changes/unreleased/block-leading-space-upgrade.yaml" <<'YAML'
+kind: fixed
+body: Reject block-scalar Upgrade values with leading spaces.
+time: 2026-07-21T19:14:45Z
+custom:
+  Bump: patch
+  PR: "27"
+  Upgrade: |-2
+      compatible
+YAML
+git -C "$fixture_repository" add .changes/unreleased/block-leading-space-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with leading-space block Upgrade"
+block_leading_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with leading-space block Upgrade (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with leading-space block Upgrade (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$block_leading_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/block-leading-space-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup leading-space block Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
+cat > "$fixture_repository/.changes/unreleased/block-clip-newline-upgrade.yaml" <<'YAML'
+kind: fixed
+body: Reject clipped block-scalar Upgrade carrying a trailing newline.
+time: 2026-07-21T19:14:50Z
+custom:
+  Bump: patch
+  PR: "28"
+  Upgrade: |
+    compatible
+YAML
+git -C "$fixture_repository" add .changes/unreleased/block-clip-newline-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with clip block Upgrade"
+block_clip_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with clip block Upgrade (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with clip block Upgrade (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$block_clip_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/block-clip-newline-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup clip block Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
 # projection-layout missing projection name must fail in both fragments and pr modes.
 cat > "$fixture_repository/.changes/unreleased/proj-no-name.yaml" <<'YAML'
 kind: changed

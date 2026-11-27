@@ -374,6 +374,11 @@ def consume_block_scalar(lines, start_idx, rest_stripped, parent_indent):
         return None
     style = block_match.group(1)
     mod = block_match.group(2)
+    chomp = "clip"
+    if "-" in mod:
+        chomp = "-"
+    elif "+" in mod:
+        chomp = "+"
     explicit_indent = None
     for ch in mod:
         if ch.isdigit():
@@ -391,8 +396,10 @@ def consume_block_scalar(lines, start_idx, rest_stripped, parent_indent):
             break
         block_lines.append(bl)
         j += 1
+    trailing_blanks = 0
     while block_lines and block_lines[-1] == "":
         block_lines.pop()
+        trailing_blanks += 1
     if explicit_indent is not None:
         base_indent = parent_indent + explicit_indent if parent_indent > 0 else explicit_indent
     else:
@@ -422,6 +429,14 @@ def consume_block_scalar(lines, start_idx, rest_stripped, parent_indent):
         text = "\n".join(paragraphs)
     else:
         text = "\n".join(cleaned)
+    if chomp == "clip":
+        if text:
+            text += "\n"
+    elif chomp == "+":
+        if text:
+            text += "\n" * (1 + trailing_blanks)
+        else:
+            text += "\n" * trailing_blanks
     return text, j
 
 
@@ -569,7 +584,7 @@ def parse_fragment(path):
                                 if block is not None:
                                     val, next_j = block
                                     if ck == "Upgrade":
-                                        upgrade_entries.append((val.strip(), True))
+                                        upgrade_entries.append((val, True))
                                     j = next_j
                                     continue
                                 if crest_stripped.startswith(("{", "[")):
