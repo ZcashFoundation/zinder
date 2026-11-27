@@ -1,0 +1,6 @@
+kind: added
+body: Define native wallet protocol requests for descending and pool-filtered compact scans, shielded nullifiers, the recommended fee, and transparent address batches.
+time: 2026-11-27T23:23:24.182145547Z
+custom:
+    Bump: minor
+    PR: "734"
