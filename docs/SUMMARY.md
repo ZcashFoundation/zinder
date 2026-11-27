@@ -15,6 +15,7 @@
   - [Deploying on a VM](runbooks/deploying-on-a-vm.md)
   - [Deploying the single-volume container & Kubernetes](runbooks/deploying-single-volume.md)
   - [Exposing over TLS](runbooks/exposing-over-tls.md)
+  - [Serve wallets over Tor](runbooks/tor-onion-service.md)
 - [Initial sync](runbooks/initial-sync.md)
 - [Bulk-catchup resource tuning](runbooks/bulk-catchup-resource-tuning.md)
 - [Upgrading the node](runbooks/upgrading-the-node.md)
