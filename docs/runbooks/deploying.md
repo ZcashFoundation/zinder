@@ -1,38 +1,43 @@
 # Deploying Zinder
 
-This page takes an operator from an empty host to a running, verified Zinder deployment that serves wallets from your own Zcash node. It covers choosing a profile, choosing how to run it, host sizing, the canonical port matrix, and a Testnet Docker Compose quickstart.
+This page takes an operator from an empty host to a running, verified Zinder deployment that serves wallets from your own Zcash node. It covers choosing a preset, choosing a runtime target (VM Compose, single-volume PaaS, or Kubernetes `StatefulSet`), host sizing, the canonical port matrix, and a zero-TOML Testnet Docker Compose quickstart.
 
-Each deployment runs on one host (`rocksdb` topology) and builds its stores from your node. Pin an exact release tag, and read each release's notes before upgrading.
+Each supported deployment runs against persistent storage on one host (`rocksdb` topology, including a single-replica Kubernetes `StatefulSet` on `ReadWriteOnce` storage) and builds its stores from your node. Pin an exact release tag, and read each release's notes before upgrading.
 
 <a id="choose-a-profile"></a>
 
-## Step 1: Choose a profile
+## Step 1: Choose a preset
 
-Select the profile that matches what your clients read. All profiles build complete canonical history from genesis unless configured with a checkpoint override.
+Select the preset (`--preset <light-wallet|wallet|explorer>` on `zinder serve` / `zinder index`, or `ZINDER_PRESET` in Compose / `ZINDER_DEPLOYMENT__PROFILE` in env) that matches what your clients read. All presets build complete canonical history from genesis unless configured with a checkpoint override.
 
-| Profile | Processes run | Mainnet disk | First sync (8 writer cores) | Transaction bodies & transparent reads |
+| Preset (`deployment.profile`) | Roles run | Mainnet disk | First sync (8 writer cores) | Transaction bodies & transparent reads |
 | --- | --- | --- | --- | --- |
-| **`wallet`** *(recommended production default)* | `zinder-ingest`, `zinder-projector`, `zinder-history-publisher`, `zinder-query`, `zinder-compat-lightwalletd` | ~123 GB | ~76 min | Local transparent index (`wallet` store); verified mined transaction bodies forwarded from your primary `[node]` and cached. |
-| **`light-wallet`** | `zinder-ingest`, `zinder-compat-lightwalletd` (plus optional `zinder-history-publisher`) | ~72 GB | ~49–60 min | No projector or `zinder-query` (`deploy/docker-compose.light-wallet.yml` in Compose). Forwards transparent address reads and omitted transaction bodies to one archive node with transparent address indexes. |
-| **`wallet-archive`** | Same as `wallet` + all raw block & tx blobs | >392 GB (`wallet` + raw blocks + ~270 GB / ~251.1 GiB raw tx blobs) | ~76+ min | Sets `raw_blob_policy = "all"` for self-hosted raw transaction bodies and `FullBlocksInRange`. Omit `deployment.profile` and set `raw_blob_policy = "transactions"` (or merge `deploy/docker-compose.transactions.yml` in Compose) (+~270 GB / ~251.1 GiB, ~392 GB total) if you only want raw transaction bodies. |
+| **`wallet`** *(recommended production default)* | `zinder-ingest`, `zinder-projector`, optional `zinder-history-publisher`, `zinder-query`, `zinder-compat-lightwalletd` | ~123 GB | ~76 min | Local transparent index (`wallet` store); verified mined transaction bodies forwarded from your primary `[node]` and cached. |
+| **`light-wallet`** (`lightwalletd`) | `zinder-ingest`, `zinder-compat-lightwalletd` (plus optional `zinder-history-publisher`) | ~72 GB | ~49–60 min | No projector or `zinder-query`. Forwards transparent address reads and omitted transaction bodies to one archive node with transparent address indexes. |
+| **`explorer`** | Everything in `wallet`, plus `ingest.explorer_views = true`, `zinder-explorer`, and `zinder-compat-cipherscan` | Additional view disk & build time | ~76+ min + view backfill | Canonical-only displaced-block RPCs (`DisplacedBlockHistory`, `DisplacedBlockDetail`) read `RocksDbCanonicalSecondary` once canonical ingest is READY; `BlockDetail`, block-production, `BlockTransactions`, `CommitmentRootSearch`, fee/flow/ranking analytics, and Cipherscan routes additionally require `explorer_views` catch-up/backfill coverage and/or `WalletQuery`. |
+| **Add `--full-blocks`** (`storage.full_blocks = true`) | Combinable with any preset above | Adds ~251+ GiB raw block & tx blobs | Same + raw blob I/O | Sets `raw_blob_policy = "all"` to retain full serialized blocks and raw transaction bytes locally (`FullBlocksInRange` + local tx bodies). |
 
-To add the optional **Explorer** (`zinder-explorer` + `ingest.explorer_views = true` via `deploy/docker-compose.explorer.yml`), omit `deployment.profile` and configure `storage`, `ingest`, `wallet`, and `compat` explicitly (`zinder-ingest` rejects `ingest.explorer_views = true` when any `deployment.profile` is set; `deploy/docker-compose.explorer.yml` clears `ZINDER_DEPLOYMENT__PROFILE` automatically).
-
-> [!IMPORTANT]
-> **`deploy/docker-compose.yml` defaults to `wallet`, and `deploy/docker-compose.transactions.yml` preserves upgraded transaction-blob stores.** The shipped Compose TOMLs (`deploy/config/{ingest,projector,query,compat-lightwalletd}.toml`) omit `raw_blob_policy`, and `deploy/docker-compose.yml` sets `ZINDER_DEPLOYMENT__PROFILE=${ZINDER_DEPLOYMENT__PROFILE:-wallet}` (`raw_blob_policy = "none"`, verified mined transaction bodies read from `[node]`). Set `ZINDER_DEPLOYMENT__PROFILE=wallet-archive` to keep all raw blocks and transactions locally, or run `deploy/docker-compose.light-wallet.yml` for the projector-free `light-wallet` topology. When upgrading an existing pre-profile Compose volume created with `raw_blob_policy = "transactions"`, either merge `-f deploy/docker-compose.transactions.yml` to preserve `transactions` retention in place or rebuild on fresh volumes ([Upgrade, restart, and roll back](deploying-on-a-vm.md#upgrade-restart-and-roll-back)); see [Deploying the single-volume container](deploying-single-volume.md) for `zinder-wallet-serving`.
-
-See [Deployment profiles](../reference/configuration.md#deployment-profiles) for setting conflicts and [ADR-0023](../adrs/0023-deployment-profiles.md) for the design contract.
+If you are carrying forward an existing pre-profile store built with `raw_blob_policy = "transactions"` (+~251.1 GiB, no raw block blobs), run standalone `zinder serve` / `zinder index` (or override `deploy/docker-compose.yml`'s `command` and clear `ZINDER_DEPLOYMENT__PROFILE` in a Compose override) with `--preset` / `ZINDER_DEPLOYMENT__PROFILE` **unset** and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`, or rebuild on fresh storage under `--preset wallet`. Default `deploy/docker-compose.yml` always passes `--preset` (`wallet` by default), which refuses `transactions`-only stores. See [Deployment profiles](../reference/configuration.md#deployment-profiles) for setting conflicts and [ADR-0023](../adrs/0023-deployment-profiles.md) for the design contract.
 
 <a id="choose-a-deployment"></a>
 
 ## Step 2: Choose how to run it
 
-| Option | Pick it when | Guide |
-| --- | --- | --- |
-| **Docker Compose + systemd on a Linux VM** *(recommended production)* | You run a long-lived multi-process service on a VM you manage, or alongside a Z3/Zakura container stack. | [Testnet quickstart](#quickstart-with-docker-compose) below; [Deploying on a VM](deploying-on-a-vm.md) for systemd and production hardening |
-| **Single-volume container (`zinder-wallet-serving`)** | Your PaaS attaches one persistent volume to one container (such as Railway). | [Deploying the single-volume container](deploying-single-volume.md) |
-| **Standalone binaries** | You manage systemd units and OS packages directly without Docker. | [Run the release binaries without Docker](deploying-on-a-vm.md#run-the-release-binaries-without-docker) |
-| **Public Foundation endpoints** | You want to evaluate or integrate a client without operating an indexer. | [Integration surfaces](../reference/integration-surfaces.md#endpoints) |
+| Option | Status | Pick it when | Guide |
+| --- | --- | --- | --- |
+| **Docker Compose + systemd on a Linux VM** *(recommended production)* | Supported | You run a long-lived two-container deployment (`zinder-index` writer + `zinder-serve --readers-only`) on a VM you manage, or alongside a Z3/Zakura stack. | [Testnet quickstart](#quickstart-with-docker-compose) below; [Deploying on a VM](deploying-on-a-vm.md) and [deploy/README.md](../../deploy/README.md) |
+| **Single-volume container (`ghcr.io/zcashfoundation/zinder`)** | Supported | Your PaaS attaches one persistent volume to one container (`zinder serve`), such as Railway. | [Deploying the single-volume container](deploying-single-volume.md) |
+| **Kubernetes (`StatefulSet`)** | Supported *(Single-host RWO)* | You run single-replica pods on a cluster with a `ReadWriteOnce` `PersistentVolumeClaim` (`deploy/kubernetes/statefulset.yaml`, `fsGroup: 10001`). | [Kubernetes StatefulSet](deploying-single-volume.md#kubernetes-statefulset) |
+| **Standalone `zinder` binary** | Supported | You supervise `zinder serve`, `zinder index`, or `zinder run <role>` natively via systemd without Docker. | [Run the release binary without Docker](deploying-on-a-vm.md#run-the-release-binaries-without-docker) |
+| **Stateless serverless (Cloud Run, AWS Lambda)** | Not supported *(Planned M3)* | You expect stateless scale-to-zero containers without attached RWO disks. | See [Cloud and serverless boundaries](#cloud-and-serverless-boundaries) below |
+| **Public Foundation endpoints** | Supported | You want to evaluate or integrate a client without operating an indexer. | [Integration surfaces](../reference/integration-surfaces.md#endpoints) |
+
+<a id="cloud-and-serverless-boundaries"></a>
+
+### Cloud and serverless boundaries
+
+- **Kubernetes (`StatefulSet` vs. horizontal `Deployment`):** The shipped [deploy/kubernetes/statefulset.yaml](../../deploy/kubernetes/statefulset.yaml) runs `replicas: 1` against a single `ReadWriteOnce` PVC mounted at `/var/lib/zinder` with `fsGroup: 10001`, so writer primaries and RocksDB secondaries share one local POSIX filesystem inside the pod. Scaling readers across multiple Kubernetes nodes with a shared `Deployment` is **not** supported on `rocksdb` ([ADR-0004](../adrs/0004-storage-and-deployment-topologies.md)).
+- **Stateless serverless (Google Cloud Run, AWS Lambda):** Neither single-volume RocksDB nor long-lived stateful sync streams fit request-scoped or diskless serverless runtimes today. Horizontal stateless readers (`Deployment`, Cloud Run, Lambda) wait on Milestone M3's PostgreSQL storage backend and externalized segment distribution ([ADR-0004](../adrs/0004-storage-and-deployment-topologies.md)).
 
 <a id="what-you-need"></a>
 
@@ -43,41 +48,41 @@ You need an archive Zebra or Zakura node on the same network. Ingest reads every
 ### Private or standard Mainnet VM
 
 - **CPU:** 8+ vCPUs (Broadwell+/Zen+ `x86-64` supporting `x86-64-v3` + `ADX`, or `AArch64`). Published release binaries, images, and Compose builds enable the Pasta assembly backend by default (`ZINDER_PASTA_ASM=1`; pass `ZINDER_PASTA_ASM=0` only when building for pre-Broadwell/Haswell x86-64 hosts without `ADX`, checked at startup). Wallet accumulators select AVX-512F/VL at run time when available and AVX2 otherwise; both produce identical store bytes. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
-- **RAM:** 32 GiB RAM. Keep the shipped `4g` `ZINDER_COMPAT_MEMORY_LIMIT` as an OOM guardrail. The shipped Mainnet Compose env files set container ceilings of `14g` (ingest), `10g` (projector), `4g` (query), `4g` (history-publisher), `4g` (compat), and `4g` (optional explorer). Give single-volume containers at least 8 GB.
-- **Disk:** Fast local SSD/NVMe formatted **`ext4 -O verity`** (so `zinder-history-publisher` can protect settled segments with Linux fs-verity). Reserve **260+ GB free** for `wallet` (~123 GB steady-state total, which already includes the ~20.9 GB / ~19.5 GiB signed `ZSHRNG01` catalog across 877 segments at Mainnet height 3,593,347 and growing, plus ~130 GB temporary sort spill headroom during initial wallet construction), or **550+ GB free** when retaining raw transaction blobs (+251.1 GiB; `wallet-archive` with `raw_blob_policy = "all"` needs additional space for raw blocks).
+- **RAM:** 32 GiB RAM. Give `zinder-index` enough memory for canonical + wallet construction (`14g`–`24g` on Mainnet), keep `4g`+ on `zinder-serve` for private endpoints (raise for high-concurrency range catalogs), and give single-volume containers (`zinder serve`) at least 8–16 GB.
+- **Disk:** Fast local SSD/NVMe formatted **`ext4 -O verity`** (so `history-publisher` can protect settled segments with Linux fs-verity). Reserve **260+ GB free** for `wallet` (~123 GB steady-state total, which already includes the ~20.9 GB / ~19.5 GiB signed `ZSHRNG01` catalog across 877 segments at Mainnet height 3,593,347 and growing, plus ~130 GB temporary sort spill headroom during initial wallet construction), or **550+ GB free** when retaining raw transaction blobs alone (`storage.raw_blob_policy = "transactions"`, ~251.1 GiB transaction payload plus sort spill). Enabling `--full-blocks` (`raw_blob_policy = "all"`) stores complete raw block blobs (another copy of those transaction bytes) separately alongside transaction blobs, so budget additional free NVMe capacity above 550 GB for block blobs as well.
 
 ### Public high-concurrency Mainnet endpoint
 
 - **CPU:** 8–16+ vCPUs (Broadwell+/Zen+ `x86-64` with `BMI2 + ADX`, or `AArch64`). Shipped release images and binary archives enable `pasta_curves/asm` by default (`ZINDER_PASTA_ASM=1`; pass `--features pasta_curves/asm` when compiling directly with Cargo), saving ~6.7–8.2% on Orchard Merkle hashing and canonical construction benchmarks while failing closed at startup if `ADX` is missing.
-- **RAM:** **64+ GiB RAM** and raise `ZINDER_COMPAT_MEMORY_LIMIT=32g` (or higher). Under cgroup v2, the `ZSHRNG01` signed-history catalog page cache (~20–21 GiB on Mainnet and growing) counts against the cgroup that first reads each page (`zinder-compat-lightwalletd` or `zinder-history-publisher`). Keeping compat's ceiling above the catalog plus working set avoids 5–7x page-cache thrashing and `wait_timeout` refusals under concurrent range syncs. Leave `ZINDER_QUERY_MEMORY_LIMIT` and `ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT` at `4g` (`zinder-query` uses `O_DIRECT` RocksDB and does not mount the catalog); validate cache residency with publisher activity included.
-- **Node feed:** Set `ZINDER_NODE__INDEXER_GRPC_ADDR` and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc` (in your Compose env file or exported for standalone binaries) to stream mempool events and fetch blocks as binary protobufs instead of polling the full mempool over JSON-RPC on every block.
+- **RAM:** **64+ GiB RAM** and size `zinder-serve`'s cgroup memory limit above **32 GiB** (`ZINDER_SERVE_MEMORY_LIMIT`). Under cgroup v2, the `ZSHRNG01` signed-history catalog page cache (~20–21 GiB on Mainnet and growing) counts against the container reading those segments; keeping headroom above the catalog plus working set prevents page-cache thrashing and `wait_timeout` refusals under concurrent range syncs.
+- **Node feed:** Set `ZINDER_NODE__INDEXER_GRPC_ADDR` and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc` (in your Compose env file or exported environment) to stream mempool events and fetch blocks as binary protobufs instead of polling the full mempool over JSON-RPC on every block.
 - **Edge proxy:** Put a TLS proxy with per-client connection, request, and stream limits in front of the listeners ([Exposing over TLS](exposing-over-tls.md)).
 
 ### Testnet and Regtest baselines
 
-| Network | Compose memory ceilings (ingest / projector / query / publisher / compat) | First sync notes |
+| Network | Suggested container memory (`zinder-index` / `zinder-serve`) | First sync notes |
 | --- | --- | --- |
-| **Testnet** | `8g` / `6g` / `2g` / `2g` / `2g` | Fits the default construction deadlines (3 h canonical, 2 h wallet). |
-| **Regtest** | `2g` / `2g` / `1g` / `1g` / `1g` | Minutes from genesis. |
+| **Testnet** | `12g` / `4g` | Fits within a few hours on SSD/NVMe. |
+| **Regtest** | `4g` / `2g` | Minutes from genesis. |
 
 <a id="what-you-deploy"></a>
 
 ## Processes and canonical ports
 
-`zinder-ingest` is the only writer of the canonical store (and Explorer views when enabled), and `zinder-projector` is the only writer of the wallet store. `zinder-query`, `zinder-compat-lightwalletd`, and optional `zinder-explorer` open read-only RocksDB secondaries on the same filesystem. See the [architecture overview](../architecture/overview.md) for data flow.
+In `deploy/docker-compose.yml`, `zinder-index` (`zinder index`) writes the canonical and wallet stores while `zinder-serve` (`zinder serve --readers-only`) supervises the reader processes sharing the same volume and network namespace (`network_mode: "service:zinder-index"`). In a single-volume PaaS or `StatefulSet`, `zinder serve` supervises both writers and readers together. See the [architecture overview](../architecture/overview.md) for data flow.
 
-| Process | Role / serves | Serving port | Ops port |
+| Surface / Supervisor | Mode / Role | Mainnet port | Notes |
 | --- | --- | --- | --- |
-| `zinder-ingest` | Reads the node, writes the canonical store and optional Explorer views. | none | 9105 |
-| `zinder-projector` | Builds and updates the wallet store. | none | 9110 |
-| `zinder-history-publisher` | Writes Ed25519-signed settled shielded ranges (`ZSHRNG01`) for lightwalletd. | none | none |
-| `zinder-query` | Native `WalletQuery` gRPC | 9102 | 9106 |
-| `zinder-compat-lightwalletd` | lightwalletd `CompactTxStreamer` gRPC (and optional gRPC-Web) | 9067 | 9107 |
-| `zinder-explorer` *(optional)* | `ExplorerQuery` gRPC | 9068 | 9069 |
+| `zinder serve` ops | Supervisor `/healthz`, `/readyz`, `/metrics` | `9108` | Default ops listener for `zinder serve` |
+| `zinder index` ops | Writer supervisor `/healthz`, `/readyz`, `/metrics` | `9105` | Default ops listener for `zinder index` (and standalone `zinder-ingest`) |
+| `zinder-compat-lightwalletd` | lightwalletd `CompactTxStreamer` gRPC (and optional gRPC-Web) | `9067` | All presets |
+| `zinder-query` | Native `WalletQuery` gRPC | `9102` | `wallet` and `explorer` presets |
+| `zinder-explorer` | `ExplorerQuery` gRPC | `9068` | `explorer` preset |
+| `zinder-compat-cipherscan` | Cipherscan-compatible REST & WebSocket | `9070` | `explorer` preset |
 
-Each ops port serves `/healthz`, `/readyz`, and `/metrics`. The serving gRPC ports also serve `grpc.health.v1.Health` ([gRPC health](../reference/readiness.md#grpc-health)).
+When running individual roles directly via `zinder run <role>`, per-role standalone ops defaults remain `9105` (`ingest`), `9110` (`projector`), `9106` (`query`), `9107` (`compat-lightwalletd`), `9069` (`explorer`), and `9108` (`compat-cipherscan`). The serving gRPC ports also serve `grpc.health.v1.Health` ([gRPC health](../reference/readiness.md#grpc-health)).
 
-These are the **Mainnet** ports. The shipped Compose env files add `+10000` on Testnet (for example, `19102` for `zinder-query`) and `+20000` on Regtest, and bind every published port to host loopback (`127.0.0.1`) only.
+These are the **Mainnet** ports. The shipped Compose env files add `+10000` on Testnet (for example, `19067`, `19068`, `19070`, `19102`, `19105`, and `19108`) and `+20000` on Regtest, and bind all six published ports to host loopback (`127.0.0.1`) only.
 
 Compose also exposes these internal/observability ports:
 
@@ -85,14 +90,14 @@ Compose also exposes these internal/observability ports:
 | --- | --- | --- |
 | 9100 | Ingest control API (projector and readers) | Loopback inside the shared container network only (same on all networks). |
 | 9101 | Projector control API | Loopback inside the shared container network only (same on all networks). |
-| 9095 | Prometheus | Loopback (`19095` Testnet, `29095` Regtest). |
+| 9095 | Prometheus (`--profile observability`) | Loopback (`19095` Testnet, `29095` Regtest). |
 | 3002 | Grafana (`--profile observability`) | Loopback (`13002` Testnet, `23002` Regtest). |
 
 <a id="quickstart-with-docker-compose"></a>
 
 ## Testnet Docker Compose quickstart
 
-This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](https://github.com/ZcashFoundation/z3) using Docker Engine, the Compose v2 plugin, `git`, `openssl`, `curl`, and `grpcurl`. For Zakura, use `deploy/.env.zakura-testnet` and follow [Attach a Zakura node](deploying-on-a-vm.md#attach-a-zakura-node) for step 1.
+This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](https://github.com/ZcashFoundation/z3) with zero TOML configuration files, using Docker Engine, the Compose v2 plugin, `git`, `openssl` (used by `scripts/prepare-shielded-history.sh`), `curl`, and `grpcurl`. For Zakura, use `deploy/.env.zakura-testnet` and follow [Attach a Zakura node](deploying-on-a-vm.md#attach-a-zakura-node) for step 1.
 
 1. Start a Zebra Testnet node with Z3 and wait until it is synced (this creates the `z3-testnet` Docker network and `z3-testnet-cookie` volume):
 
@@ -108,37 +113,33 @@ This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](h
    git checkout vX.Y.Z
    ```
 
-3. Create the two control tokens and the shielded-history publisher key generation on the host:
+3. Provision the required host control tokens (`ingest.token` and `checkpoint.token`) and the required Testnet shielded-history generation (`scripts/prepare-shielded-history.sh`, because `zinder-serve` mounts `publisher.pub` and `catalog/` with `create_host_path: false` and needs `--profile history-publisher` when starting with an empty catalog):
 
    ```bash
    sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
-   openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
-   openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
-   sudo chown root:10001 /etc/zinder/control-secrets/*.token
-   sudo chmod 0440 /etc/zinder/control-secrets/*.token
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin /etc/zinder/control-secrets/ingest.token
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin /etc/zinder/control-secrets/checkpoint.token
    sudo install -d -m 0700 /srv/zinder-history/testnet
-   sudo scripts/prepare-shielded-history.sh /srv/zinder-history/testnet/key-1
+   sudo ./scripts/prepare-shielded-history.sh /srv/zinder-history/testnet/key-1
    ```
 
-4. Pull the signed release images for your tag and start Zinder (keep `--no-build` so Compose does not compile local images under the release tag; add `--profile observability` to also start Grafana on `13002`):
+4. Pull the signed release image for your tag and start Zinder with `--profile history-publisher` (select `--preset` via `ZINDER_PRESET=light-wallet|wallet|explorer`, defaulting to `wallet`; keep `--no-build` so Compose uses the published image; add `--profile observability` to also start Prometheus on `19095` and Grafana on `13002`):
 
    ```bash
    export ZINDER_VERSION=vX.Y.Z
    docker compose --env-file deploy/.env.testnet \
-     -f deploy/docker-compose.yml pull
+     -f deploy/docker-compose.yml --profile history-publisher pull
    docker compose --env-file deploy/.env.testnet \
-     -f deploy/docker-compose.yml up -d --no-build
+     -f deploy/docker-compose.yml --profile history-publisher up -d --no-build
    ```
 
-   Compose starts `zinder-ingest`, then `zinder-projector` and `zinder-history-publisher` once ingest is healthy, and then `zinder-query` and `zinder-compat-lightwalletd` once the projector is healthy.
+   Compose runs `state-init` (setting `/var/lib/zinder` ownership to `10001:10001` while keeping `/var/lib/zinder/canonical` and `/var/lib/zinder/wallet` absent until writers publish them), starts `zinder-index`, starts `zinder-serve --readers-only` sharing its volume and network namespace, and runs `zinder-history-publisher` to seal initial settled segments.
 
-5. Check `/readyz` on each runtime (each prints `{"status":"ready",...}` once serving, or HTTP 503 while syncing):
+5. Check `/healthz` and `/readyz` on `zinder-index` and `zinder-serve` (`{"status":"ready",...}` once serving, or HTTP 503 while syncing):
 
    ```bash
-   curl -fsS http://127.0.0.1:19105/readyz   # ingest
-   curl -fsS http://127.0.0.1:19110/readyz   # projector
-   curl -fsS http://127.0.0.1:19106/readyz   # native query
-   curl -fsS http://127.0.0.1:19107/readyz   # lightwalletd compatibility
+   curl -fsS http://127.0.0.1:19105/readyz   # zinder-index (ingest + projector)
+   curl -fsS http://127.0.0.1:19108/readyz   # zinder-serve (readers)
    ```
 
 6. Verify one native RPC and one lightwalletd RPC:
@@ -167,10 +168,10 @@ docker compose --env-file deploy/.env.testnet \
 
 ## Before you expose it
 
-Zinder listeners serve plaintext gRPC. Put TLS termination, authentication, and per-client rate/connection limits in front of them using [Exposing over TLS](exposing-over-tls.md). Keep operational, control, and observability ports private as listed in the [security boundary](../architecture/service-operations.md#security-boundary).
+Zinder listeners serve plaintext gRPC and REST. Put TLS termination, authentication, and per-client rate/connection limits in front of them using [Exposing over TLS](exposing-over-tls.md). Keep operational, control, and observability ports private as listed in the [security boundary](../architecture/service-operations.md#security-boundary).
 
 ## What happens next
 
-- Do not restart `zinder-ingest` or `zinder-projector` while they are constructing their stores; a restart discards the unfinished build and starts over.
+- Do not restart `zinder-index` (or `zinder-ingest` / `zinder-projector`) while stores are constructing; a restart discards the unfinished build and starts over.
 - Follow construction progress and phases in [Initial sync](initial-sync.md) and `/readyz` causes in [Readiness](../reference/readiness.md).
 - For production VM setup with systemd, failover nodes, indexer mTLS, signed-history key rotation, or Explorer, continue to [Deploying on a VM](deploying-on-a-vm.md).

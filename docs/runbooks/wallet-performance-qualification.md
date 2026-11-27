@@ -4,10 +4,11 @@ Run the private Regtest comparison for a quick PR decision. Use the frozen Testn
 
 ## Compare two binaries locally
 
-Use Linux with Python 3.11 or later and `taskset`. Choose a baseline and a candidate `zinder-compat-lightwalletd` built for the same target with the same Rust version, profile, features, and allocator. Keep each release binary next to its original `BUILD-INFO.json` if available. Build the measurement tools once on the same harness revision for both arms.
+Use Linux with Python 3.11 or later and `taskset`. Choose a baseline and a candidate standalone `zinder-compat-lightwalletd` executable (for example built via `cargo build --release --locked -p zinder-compat-lightwalletd`, since `scripts/compare-wallet-readers.py` currently invokes each argument as a single executable path `[binary, "--config", config]` and does not accept `zinder run compat-lightwalletd`) built for the same target with the same Rust version, profile, features, and allocator. Keep each binary next to its original `BUILD-INFO.json` if available. Build the measurement tools once on the same harness revision for both arms.
 
 ```bash
 cargo build --release --locked -p zinder-bench --bin zinder-bench
+cargo build --release --locked -p zinder-compat-lightwalletd --bin zinder-compat-lightwalletd
 cargo build --release --locked -p zinder-compat-lightwalletd --example wallet-reader-fixture
 scripts/compare-wallet-readers.py \
   --baseline "$BASELINE_READER" --candidate "$CANDIDATE_READER" \

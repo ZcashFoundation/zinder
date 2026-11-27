@@ -121,6 +121,7 @@ above, and brevity.
 
 | Runtime | Role |
 | --- | --- |
+| `zinder` (`services/zinder`) | Unified CLI (`serve`, `index`, `run`, `snapshot`, `backup`, `config`, `healthcheck`) and preset supervisor shipped as the single release binary and OCI image |
 | `zinder-ingest` | Only canonical writer and owner of the live mempool |
 | `zinder-projector` | Only wallet projection writer |
 | `zinder-query` | Native `WalletQuery` gRPC server |
@@ -128,7 +129,7 @@ above, and brevity.
 | `zinder-explorer` | Optional `ExplorerQuery` server |
 | `zinder-compat-cipherscan` | Optional Cipherscan-compatible REST and WebSocket adapter |
 
-[Architecture overview](overview.md) explains how they fit together.
+[Architecture overview](overview.md) explains how they fit together and which roles each `--preset` (`light-wallet`, `wallet`, `explorer`) activates.
 
 Three crates are published: `zinder-core` (domain values), `zinder-proto`
 (generated protocol modules), and `zinder-client` (the typed Rust client).

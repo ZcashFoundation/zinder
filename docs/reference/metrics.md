@@ -55,10 +55,12 @@ expected target has a value of 1 (up), 0 (down), or −1 (missing). A stale seri
 scrape older than 45 seconds counts as missing, including a job removed on
 reload. With evaluations on schedule, the 30-second alert hold expires within
 90 seconds of the final sample in Compose or 80 seconds in the local smoke.
-An explicit stale marker can shorten that interval. Both stacks expect ingest,
-projector, query, and compatibility. The Compose Explorer overlay adds
-Explorer. Keep the independent expected-target rules in step with intentional
-topology or scrape-address changes. Monitor the collector from outside it.
+An explicit stale marker can shorten that interval. Compose expects
+`zinder-index` and `zinder-serve` (aggregating supervised reader metrics under
+`zinder_supervisor_ready` and `zinder_supervisor_role_ready` on `:9108`), while
+individual `zinder run <role>` processes expose per-role targets. Keep the
+independent expected-target rules in step with intentional topology or
+scrape-address changes. Monitor the collector from outside it.
 
 Wallet and light-wallet readers can answer 200 on `/readyz` during a node
 outage. Watch the dependency gauge and the served-chain age. See

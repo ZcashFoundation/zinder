@@ -1,0 +1,6 @@
+kind: added
+body: Document all scripts in scripts/README.md, add Mermaid system and deployment diagrams across README and overview docs, and align runbooks, reference pages, and ADRs with the unified zinder runtime and Kubernetes StatefulSet.
+time: 2026-11-27T03:42:18Z
+custom:
+  Bump: patch
+  PR: "671"

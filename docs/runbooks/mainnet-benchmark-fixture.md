@@ -41,16 +41,31 @@ or wallet schema needs a new fixture, built by that release.
 - Use a workstation with `gcloud`, `jq`, Python 3, Docker, `curl`, and
   `zstd`, and access to the fixture project.
 - Have the fixture's `fixture.json`.
-- Have Zinder release binaries for the release you will serve with. When the
-  fixture pins binaries in `verified_with_release.binaries`, use exactly that
-  set, for example from the archive its `executables` field names; the guest
-  refuses any other. Otherwise the `release-binaries` target of
-  `deploy/Dockerfile` produces them:
+- Have Zinder role binaries for the release you will serve with. When the
+  fixture pins binaries in `verified_with_release.binaries`, use exact
+  executables matching those recorded SHA-256 digests. Because
+  `scripts/mainnet-fixture/build-stage.sh` and the guest runner currently
+  require the five named role executables (`zinder-ingest`, `zinder-projector`,
+  `zinder-query`, `zinder-compat-lightwalletd`, `zinder-explorer`) targeting
+  the Ubuntu 24.04 `linux/amd64` (`x86_64-unknown-linux-gnu`) guest rather than
+  invoking `zinder run <role>`, build `linux/amd64` binaries compatible with
+  Ubuntu 24.04's glibc (on non-amd64 hosts or macOS, compile inside a
+  `linux/amd64` `zinder-build-base` container; on a compatible x86-64 Linux
+  host you can run the inner `cargo build` directly) until the staging harness
+  adopts the unified binary:
 
   ```bash
-  docker buildx build -f deploy/Dockerfile --target release-binaries \
-    --build-arg ZINDER_BUILD_GIT_COMMIT="$(git rev-parse HEAD)" \
-    --platform linux/amd64 --output type=local,dest=.tmp/release-binaries .
+  docker buildx build --platform linux/amd64 -f deploy/Dockerfile \
+    --target zinder-build-base -t zinder-build-base:amd64 --load .
+  docker run --rm --platform linux/amd64 -v "$PWD:/workspace" -w /workspace \
+    zinder-build-base:amd64 cargo build --release --locked \
+    --target x86_64-unknown-linux-gnu \
+    -p zinder-ingest -p zinder-projector -p zinder-query \
+    -p zinder-compat-lightwalletd -p zinder-explorer
+  mkdir -p .tmp/release-binaries/bin
+  install -m 0755 \
+    target/x86_64-unknown-linux-gnu/release/{zinder-ingest,zinder-projector,zinder-query,zinder-compat-lightwalletd,zinder-explorer} \
+    .tmp/release-binaries/bin/
   ```
 
 - Have a private bucket for the stage tarball. Fixture hosts have no
@@ -76,6 +91,7 @@ with a reason that says to rebuild the stage. Rebuild every stage from the
 current checkout, with the same binaries.
 
 ```bash
+mkdir -p .tmp
 scripts/mainnet-fixture/build-stage.sh --binaries .tmp/release-binaries/bin \
   --out .tmp/zfx-stage.tar.zst \
   --upload gs://zfnd-dev-zinder-fixture-backups/zinder/tools/zfx-stage-905dac4e.tar.zst

@@ -21,20 +21,22 @@ the release claiming precision it does not have for native libraries.
    `PCLMULQDQ` for `pasta_curves/asm` and pipelined CRC32C), the other
    `aarch64-unknown-linux-gnu` (`Armv8-A`, which also enables
    `pasta_curves/asm` within the baseline ISA). The x86 file name and `BUILD-INFO.json` preserve the `x86-64-v3` slug and `cpu_baseline` for schema compatibility, while `required_cpu_features` explicitly records `["adx","pclmulqdq"]` on default x86-64 assembly archives (and `[]` on AArch64) so compatibility checkers catch hosts lacking `ADX` or `PCLMULQDQ`.
-2. **An archive holds exactly the runtime catalog.** It contains the five
-   executables listed in `deploy/release-images.json`: ingest, projector,
-   query, lightwalletd compatibility, and the optional Explorer, plus build
-   metadata, the license, a README, and checksums. Benchmark, Cipherscan
-   adapter, and code-generation binaries are excluded.
+2. **An archive holds the single unified `zinder` executable.** It contains
+   `bin/zinder` (`serve`, `index`, `run <role>`, `snapshot`, `backup`, `config`,
+   and `healthcheck`, covering ingest, projector, query, lightwalletd
+   compatibility, Explorer, Cipherscan adapter, and shielded history
+   publishing), plus build metadata, the license, a README, and checksums.
+   `deploy/release-images.json` lists the single OCI image (`zinder`).
+   Benchmark (`zinder-bench`) and code-generation binaries are excluded.
 3. **Builds are deterministic and proven by reproduction.** The build pins
    the toolchain, the source date, file order, ownership, modes, and
    compression, and fixes build settings that would otherwise depend on the
    build machine's CPU. Each platform is built twice in separate jobs without
    caches. Their binary and archive hashes must match before anyone is asked
    to approve the release.
-4. **Images reuse the proven binaries.** Release images copy the binaries
-   from the compared archive instead of compiling again, and each image
-   binary must match its archive binary byte for byte.
+4. **The single image reuses the proven binary.** `ghcr.io/zcashfoundation/zinder`
+   copies `bin/zinder` from the compared archive instead of compiling again,
+   and the image binary matches its archive binary byte for byte.
 5. **The C library stays dynamic with a fixed ceiling.** RocksDB and its
    compression libraries are linked statically. GNU libc and `libstdc++` stay
    dynamic. The release checker rejects symbols newer than `GLIBC_2.34` or
@@ -52,13 +54,13 @@ the release claiming precision it does not have for native libraries.
 8. **Published releases are immutable.** The workflow fails if the published
    GitHub Release is not immutable, and the stable `latest` image tag moves
    only after every artifact passes verification.
-9. **Runtime images hold only their binary.** Each runtime image runs on a
-   digest-pinned distroless base with no shell, package manager, or HTTP
-   client. The binary probes its own operational endpoint for the container
-   healthcheck. Every image runs as UID and GID 10001, the UID of the Zebra
-   and Zakura images, so Zinder reads the node's mode-0600 RPC cookie as the
-   node writes it. The single-volume images keep a Debian base, because their
-   supervising entrypoints are shell scripts.
+9. **The release image holds only `bin/zinder`.** `ghcr.io/zcashfoundation/zinder`
+   runs on a digest-pinned `gcr.io/distroless/cc-debian12:nonroot` base (`USER
+   10001:10001`, `ENTRYPOINT ["/usr/local/bin/zinder"]`, default `CMD ["serve"]`)
+   with no shell, package manager, HTTP client, or wrapper scripts. Its built-in
+   `zinder healthcheck` probes `/healthz` or `/readyz`. Because UID/GID 10001
+   matches the Zebra and Zakura images, Zinder reads the node's mode-0600 RPC
+   cookie directly without root privilege dropping.
 
 The release procedure and how operators verify a download are in
 [Releasing](../runbooks/releasing.md) and
@@ -66,8 +68,7 @@ The release procedure and how operators verify a download are in
 
 ## Consequences
 
-- Operators can run the full topology from native binaries without
-  extracting a container image.
+- Operators run any preset (`light-wallet`, `wallet`, `explorer`) or individual role from the single `bin/zinder` binary without extracting a container image.
 - x86 hosts running published binaries must support `x86-64-v3` plus `ADX`
   (Broadwell+ / Zen 1+ for `pasta_curves/asm`, checked at startup;
   pre-Broadwell/Haswell hosts without `ADX` can rebuild from source with
@@ -106,8 +107,11 @@ The release procedure and how operators verify a download are in
   which workflow and commit produced the bytes.
 - **Guessing native package identities in the SBOM.** An inventory with
   invented versions is worse than one that states its limit.
-- **A Debian runtime base with `curl` for healthchecks.** Every container
-  would carry a shell and a package set that the service never uses.
+- **Separate Debian images with shell entrypoint scripts.** Shipping Debian wrappers beside distroless runtime images duplicated maintenance and added unnecessary packages (`zinder serve` now supervises roles natively in the unified distroless image).
 - **A sidecar that relaxes the node cookie's mode.** It must run beside every
   node, and mode 0644 makes the cookie readable by every UID that mounts the
   volume.
+
+## Revision history
+
+- 2026-11-27. Consolidated the five runtime executables and separate runtime/single-volume images into the single `bin/zinder` archive binary and single distroless `ghcr.io/zcashfoundation/zinder` OCI image (`deploy/release-images.json`).

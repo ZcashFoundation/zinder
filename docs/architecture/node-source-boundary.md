@@ -312,14 +312,7 @@ roots. The client certificate and key, which mutual TLS needs, must be set
 together. `server_name` overrides the name checked against the certificate.
 The section is rejected without an indexer URL or with an `http://` one.
 
-The transport rereads the PEM files whenever it opens a channel, so a stream
-picks up rotated files on its next reconnect. `zinder-ingest` validates the
-files at startup and exits when one is missing or holds no certificate or key.
-Binaries accept key material only as file paths;
-[ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md) covers
-platforms that deliver secrets as environment variables.
-[Deploying on one VM](../runbooks/deploying-on-a-vm.md) shows the Compose
-overlay that mounts the files.
+When using file paths, the transport rereads the PEM files whenever it opens a channel, so a stream picks up rotated files on its next reconnect. You can alternatively supply inline certificates and keys via `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`, `CLIENT_CERT_PEM`, and `CLIENT_KEY_PEM` (mutually exclusive with each `*_PATH`). `zinder-ingest` validates the TLS inputs at startup and exits when a certificate or key is missing or invalid. See [Deploying on a VM](../runbooks/deploying-on-a-vm.md) for configuring `node.indexer_tls` in Docker Compose.
 
 ## Upstream health probe
 

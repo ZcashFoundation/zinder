@@ -21,13 +21,7 @@ epoch-bound read and secondary model.
 | Wallet | `zinder-projector` | `wallet.path` | Transparent address indexes | The canonical store |
 | Materialized views | `zinder-ingest`, when `ingest.explorer_views = true` | `materialized-views` under `storage.path` | Explorer aggregates | The canonical store |
 
-The canonical and wallet paths must be separate directories. Each reader also
-needs its own secondary metadata path. For the canonical store, that is
-`storage.secondary_path` in `zinder-query`, `zinder-compat-lightwalletd`, and
-`zinder-explorer`. The projector uses `storage.canonical_secondary_path` and
-finds the canonical store at `storage.canonical_path`. Wallet-serving readers
-use `wallet.secondary_path` for the wallet store. The
-[configuration reference](../reference/configuration.md) lists every key.
+The canonical and wallet paths must be separate directories. When running through the unified `zinder` CLI (`zinder serve` or `zinder index`), setting `storage.data_dir` (`ZINDER_STORAGE__DATA_DIR`, defaulting to `/var/lib/zinder`) automatically derives isolated subdirectories (`canonical`, `canonical-secondary/<role>`, `wallet`, `wallet-secondary/<role>`, `checkpoints`, and `materialized-views` under `canonical`). When configuring standalone binaries explicitly, each reader needs its own secondary metadata path: `storage.secondary_path` in `zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer`, `storage.canonical_secondary_path` and `storage.canonical_path` in the projector, and `wallet.secondary_path` for wallet-serving readers. The [configuration reference](../reference/configuration.md) lists every key.
 
 New RocksDB SSTs use block-based table format 7, the bundled engine's current
 default. The explicit setting keeps SST output at format 7 if a future engine
@@ -474,4 +468,4 @@ A private recovery archive binds every payload file to that bundle.
 `zinder-bench` includes a PostgreSQL implementation of the canonical replay
 storage benchmark, to compare it with RocksDB on the same captured corpus. It
 is benchmark code; Zinder stores its data in RocksDB. The
-[storage benchmark environment](../../deploy/storage-benchmark.md) runs it.
+[storage benchmark environment](../../deploy/storage-benchmark.md) and `deploy/bench/docker-compose.storage-benchmark.yml` run it.

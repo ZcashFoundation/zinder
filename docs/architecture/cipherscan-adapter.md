@@ -14,7 +14,7 @@ Cipherscan UI
         -> market-price provider    CoinGecko by default
 ```
 
-The adapter is optional. Build it from the workspace as the `zinder-compat-cipherscan` binary; the release images do not include it. It needs a running [Explorer](explorer-plane.md), which in turn needs `[ingest].explorer_views = true`, and a `zinder-query` endpoint. It opens no storage and keeps only bounded in-memory caches, so it restarts without a backfill. The [service README](../../services/zinder-compat-cipherscan/README.md) shows how to run it.
+The adapter is optional. Enable it via `zinder serve --preset explorer` (or `zinder run compat-cipherscan`) from the unified `zinder` binary and `ghcr.io/zcashfoundation/zinder` OCI image, or run the `zinder-compat-cipherscan` binary directly from the workspace. It pairs with [Explorer](explorer-plane.md) and `zinder-query`, opens no storage of its own, and keeps only bounded in-memory caches, so it restarts without a backfill. The [service README](../../services/zinder-compat-cipherscan/README.md) documents standalone flags and environment variables.
 
 ## Boundaries
 
