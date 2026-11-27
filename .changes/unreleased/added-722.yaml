@@ -1,0 +1,6 @@
+kind: added
+body: The reference Caddy proxy now offers HTTP/3 on UDP port 443 alongside HTTP/2 on TCP. Open UDP port 443 to let compatible wallets keep active connections across Wi-Fi and cellular handoffs.
+time: 2026-11-27T22:42:27.123536755Z
+custom:
+    Bump: minor
+    PR: "722"
