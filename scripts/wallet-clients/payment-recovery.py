@@ -133,7 +133,11 @@ def fixture_configuration(directory):
             # The isolated fixture allocates a free IPv4 subnet for each run.
             network_range = ip_network(subnet["subnet"])
             subnet["subnet"] = f"IPv{network_range.version}/{network_range.prefixlen}"
-    del model["services"]["zinder-projector"]["environment"]["ZINDER_PROJECTOR__BUILD_OWNER_HEX"]
+    for service_name in ("zinder-projector", "zinder-index"):
+        if service_name in model["services"]:
+            model["services"][service_name].get("environment", {}).pop(
+                "ZINDER_PROJECTOR__BUILD_OWNER_HEX", None
+            )
     node_mounts = model["services"]["node"]["volumes"]
     node_config = directory / "zebra.toml"
     expected = f"{node_config}:/etc/zebrad/zebrad.toml:ro"

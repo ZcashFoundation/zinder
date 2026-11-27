@@ -271,7 +271,7 @@ if [[ -n "$compose_contract" ]]; then
     and ($services["state-init"].command == [
       "sh",
       "-c",
-      "mkdir -p /var/lib/zinder/canonical /var/lib/zinder/wallet /var/lib/zinder/secondary /var/lib/zinder/checkpoints && chown -R 10001:10001 /var/lib/zinder"
+      "mkdir -p /var/lib/zinder/secondary /var/lib/zinder/checkpoints && chown -R 10001:10001 /var/lib/zinder"
     ])
     and ($state_data | length == 1)
     and ($state_checkpoint | length == 1)
@@ -410,13 +410,16 @@ if [[ -n "$prometheus_config" ]]; then
   index_job="$(prometheus_job_body zinder-index)"
   serve_job="$(prometheus_job_body zinder-serve)"
   if [[ "$index_job_count" -ne 1 || "$serve_job_count" -ne 1 ]] \
+    || ! grep -Fq 'honor_labels: true' <<< "$index_job" \
     || ! grep -Fq 'targets: ["zinder-index:9105"]' <<< "$index_job" \
     || ! grep -Fq 'service: "zinder-index"' <<< "$index_job" \
+    || ! grep -Fq 'honor_labels: true' <<< "$serve_job" \
     || ! grep -Fq 'targets: ["zinder-index:9108"]' <<< "$serve_job" \
     || ! grep -Fq 'service: "zinder-serve"' <<< "$serve_job"; then
     cat >&2 <<'EOF'
-release admission rejected: deploy Prometheus must scrape zinder-index at
-zinder-index:9105 and zinder-serve at zinder-index:9108 with matching service labels.
+release admission rejected: deploy Prometheus must set honor_labels: true and
+scrape zinder-index at zinder-index:9105 and zinder-serve at zinder-index:9108
+with matching service labels.
 EOF
     exit 1
   fi
@@ -978,7 +981,7 @@ EOF
       <<< "$zinder_stage_body" \
     || ! grep -Fqx 'USER 10001:10001' <<< "$zinder_stage_body" \
     || ! grep -Fqx 'WORKDIR /var/lib/zinder' <<< "$zinder_stage_body" \
-    || ! grep -Fqx 'EXPOSE 9067 9068 9069 9102 9108' <<< "$zinder_stage_body" \
+    || ! grep -Fqx 'EXPOSE 9067 9068 9070 9102 9108' <<< "$zinder_stage_body" \
     || ! grep -Fqx '    CMD ["/usr/local/bin/zinder", "healthcheck"]' <<< "$zinder_stage_body" \
     || ! grep -Fqx 'ENTRYPOINT ["/usr/local/bin/zinder"]' <<< "$zinder_stage_body" \
     || ! grep -Fqx 'CMD ["serve"]' <<< "$zinder_stage_body" \
@@ -988,7 +991,7 @@ EOF
     cat >&2 <<'EOF'
 release admission rejected: the unified zinder release stage must build on the
 digest-pinned distroless zinder-service-base as UID/GID 10001 with zero ENV or
-TOML configs, carry only /usr/local/bin/zinder, expose ports 9067/9068/9069/9102/9108,
+TOML configs, carry only /usr/local/bin/zinder, expose ports 9067/9068/9070/9102/9108,
 and use ["/usr/local/bin/zinder", "healthcheck"], while internal CI/benchmark
 stages use UID/GID 10001 on zinder-runtime-base.
 EOF

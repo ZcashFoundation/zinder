@@ -21,8 +21,8 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE_IMAGE = 'docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba'
-SERVICES = {'ingest': 5, 'projector': 10, 'query': 6, 'compat-lightwalletd': 7}
-OFFSETS = [2, 5, 6, 7, 10, 32, 67]
+SERVICES = {'index': 5, 'serve': 8}
+OFFSETS = [2, 5, 8, 32, 67]
 RELAY_DOCKER_TIMEOUT = 10
 RELAY_STOP_GRACE = 5
 
@@ -130,9 +130,9 @@ def start_relay(directory, state, serving=False):
 
     targets = [[state['port_base'] + 32, address('node'), 39232]]
     if serving:
-        host = address('zinder-ingest')
+        host = address('zinder-index')
         targets += [[state['port_base'] + offset, host, port] for offset, port in
-                    [(2, 9102), (5, 9105), (6, 9106), (7, 9107), (10, 9110), (67, 9067)]]
+                    [(2, 9102), (5, 9105), (8, 9108), (67, 9067)]]
     write(directory / 'relay.json', targets)
     with (directory / 'relay.log').open('ab') as log:
         relay = subprocess.Popen([sys.executable, str(ROOT / 'scripts/regtest-fixture-relay.py'),
@@ -193,11 +193,11 @@ def snapshot(directory, state, timeout):
         health[name] = request(url + '/healthz')
         if health[name]['network'] != 'zcash-regtest' or health[name]['git_commit'] != state['zinder_commit']:
             raise RuntimeError(f'{name}: network or revision differs from requested candidate')
-        if name == 'query' and not health[name]['capabilities']:
+        if name == 'serve' and not health[name].get('capabilities'):
             raise RuntimeError(f'{name}: empty capabilities')
     if state['raw_blob_policy'] == 'all':
         required = {'wallet.read.full_block_at_v1', 'wallet.read.full_block_range_v1'}
-        if not required.issubset(health['query']['capabilities']):
+        if not required.issubset(health['serve'].get('capabilities', [])):
             raise RuntimeError('full-block query capabilities missing')
     if rpc(state, 'getpeerinfo', []):
         raise RuntimeError('disposable node has peer connections')
@@ -252,10 +252,11 @@ def provision(args, directory):
         if run('docker', kind, 'ls', '-q', '--filter', f'label=com.docker.compose.project={args.project}'):
             raise ValueError('Compose project resources already exist')
     images = json.loads(args.images.read_text())
-    if set(images) != set(SERVICES):
-        raise ValueError('--images must map ingest/projector/query/compat-lightwalletd to image references')
+    if set(images) != {'zinder'}:
+        raise ValueError('--images must map zinder to an image reference')
     image_references = images.copy()
     images = {name: image_id(ref) for name, ref in images.items()}
+    zinder_image = images['zinder']
     node_image = image_id(NODE_IMAGE)
     directory.mkdir(parents=True, mode=0o700)
     (directory / 'tokens').mkdir()
@@ -269,14 +270,13 @@ def provision(args, directory):
                ZINDER_SOURCE_NETWORK_NAME=args.project + '-node',
                ZINDER_SOURCE_COOKIE_VOLUME_NAME=args.project + '-cookie',
                ZINDER_CONTROL_SECRETS_DIR=str(directory / 'tokens'),
-               ZINDER_PROJECTOR_BUILD_OWNER_HEX=secrets.token_hex(16),
                ZINDER_NODE__JSON_RPC_ADDR='http://node:39232')
     model = json.loads(run('docker', 'compose', '-f', str(ROOT / 'deploy/docker-compose.yml'),
                            'config', '--format', 'json', env=env))
     owner = secrets.token_hex(16)
     model['name'] = args.project
     model['services'] = {k: v for k, v in model['services'].items()
-                         if k in ['state-init'] + ['zinder-' + n for n in SERVICES]}
+                         if k in ('state-init', 'zinder-index', 'zinder-serve')}
     subnets = fixture_subnets(args.subnet_pool)
     model['networks'] = {name: {'internal': True, 'ipam': {'config': [{'subnet': subnet}]}}
                          for name, subnet in zip(('node', 'observability'), subnets)}
@@ -285,32 +285,40 @@ def provision(args, directory):
     binaries = {}
     if args.bin_dir:
         (directory / 'binaries').mkdir()
+        binary = args.bin_dir.resolve() / 'zinder'
+        original = binary
+        binary = directory / 'binaries' / binary.name
+        shutil.copy2(original, binary)
+        binaries['zinder'] = {'source': str(original), 'sha256': digest(binary)}
+        binary_mount = {'type': 'bind', 'source': str(binary),
+                        'target': '/usr/local/bin/zinder', 'read_only': True}
+    else:
+        binary_mount = None
+    model['services']['zinder-index']['environment']['ZINDER_PROJECTOR__BUILD_OWNER_HEX'] = secrets.token_hex(16)
     for name in SERVICES:
         service = model['services']['zinder-' + name]
         service.pop('build', None)
-        service.update(image=images[name], pull_policy='never', restart='no')
-        service['environment'].update(ZINDER_STORAGE__RAW_BLOB_POLICY=args.raw_blob_policy,
-                                      TOKIO_WORKER_THREADS='2', RAYON_NUM_THREADS='2')
-        if name != 'projector':
-            service['environment']['ZINDER_NODE__AUTH__METHOD'] = 'none'
-        if name == 'compat-lightwalletd':
-            # This four-runtime fixture admits released readers predating catalog support.
-            service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY')
-            service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY')
+        service.update(image=zinder_image, pull_policy='never', restart='no')
+        service['environment'].update(TOKIO_WORKER_THREADS='2', RAYON_NUM_THREADS='2',
+                                      ZINDER_NODE__AUTH__METHOD='none')
+        if args.raw_blob_policy == 'all':
+            service['environment']['ZINDER_STORAGE__FULL_BLOCKS'] = 'true'
+        else:
+            service['command'] = ['index'] if name == 'index' else ['serve', '--readers-only']
+            service['environment'].pop('ZINDER_DEPLOYMENT__PROFILE', None)
+            service['environment'].pop('ZINDER_STORAGE__FULL_BLOCKS', None)
+            service['environment']['ZINDER_STORAGE__RAW_BLOB_POLICY'] = 'transactions'
+        if name == 'serve':
+            service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY', None)
+            service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY', None)
             service['volumes'] = [mount for mount in service['volumes']
                                   if mount['target'] not in ('/var/lib/zinder-history',
                                                              '/run/zinder-history/publisher.pub')]
             service['environment']['ZINDER_COMPAT__STALE_TIP_LIMIT_MS'] = '0'
-        if args.bin_dir:
-            binary = args.bin_dir.resolve() / ('zinder-' + name)
-            original = binary
-            binary = directory / 'binaries' / binary.name
-            shutil.copy2(original, binary)
-            binaries[name] = {'source': str(original), 'sha256': digest(binary)}
-            service['volumes'].append({'type': 'bind', 'source': str(binary),
-                                      'target': '/usr/local/bin/zinder-' + name, 'read_only': True})
+        if binary_mount:
+            service['volumes'].append(dict(binary_mount))
         service['healthcheck'].update(interval='1s', start_period='1s', retries=180)
-    model['services']['zinder-ingest'].pop('ports', None)
+    model['services']['zinder-index'].pop('ports', None)
     model['services']['node'] = dict(image=node_image, pull_policy='never', restart='no',
         networks=['node'], environment={'CONFIG_FILE_PATH': '/etc/zebrad/zebrad.toml',
         'ZEBRA_RPC__LISTEN_ADDR': '0.0.0.0:39232', 'ZEBRA_NETWORK__LISTEN_ADDR': '127.0.0.1:18233', 'ZEBRA_RPC__ENABLE_COOKIE_AUTH': 'false',
@@ -327,8 +335,10 @@ def provision(args, directory):
                  raw_blob_policy=args.raw_blob_policy, node_rpc=f'http://127.0.0.1:{args.port_base + 32}',
                  native_wallet_query=f'http://127.0.0.1:{args.port_base + 2}',
                  lightwalletd=f'http://127.0.0.1:{args.port_base + 67}',
-                 query_ops=f'http://127.0.0.1:{args.port_base + 6}',
-                 compat_ops=f'http://127.0.0.1:{args.port_base + 7}')
+                 index_ops=f'http://127.0.0.1:{args.port_base + 5}',
+                 serve_ops=f'http://127.0.0.1:{args.port_base + 8}',
+                 query_ops=f'http://127.0.0.1:{args.port_base + 8}',
+                 compat_ops=f'http://127.0.0.1:{args.port_base + 8}')
     write(directory / 'state.json', state)
     try:
         compose(directory, 'up', '-d', 'node')

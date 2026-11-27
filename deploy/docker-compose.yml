@@ -42,7 +42,7 @@ services:
       [
         "sh",
         "-c",
-        "mkdir -p /var/lib/zinder/canonical /var/lib/zinder/wallet /var/lib/zinder/secondary /var/lib/zinder/checkpoints && chown -R 10001:10001 /var/lib/zinder",
+        "mkdir -p /var/lib/zinder/secondary /var/lib/zinder/checkpoints && chown -R 10001:10001 /var/lib/zinder",
       ]
     volumes:
       - type: volume
@@ -90,6 +90,7 @@ services:
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_NODE__AUTH__PATH: /var/run/auth/.cookie
       ZINDER_STORAGE__DATA_DIR: /var/lib/zinder
+      ZINDER_STORAGE__FULL_BLOCKS: ${ZINDER_STORAGE__FULL_BLOCKS:-false}
       ZINDER_INGEST_CONTROL__LISTEN_ADDR: "127.0.0.1:9100"
       ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH: /var/run/zinder-control/ingest.token
       ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH: /var/run/zinder-checkpoint/checkpoint.token
@@ -146,6 +147,7 @@ services:
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_NODE__AUTH__PATH: /var/run/auth/.cookie
       ZINDER_STORAGE__DATA_DIR: /var/lib/zinder
+      ZINDER_STORAGE__FULL_BLOCKS: ${ZINDER_STORAGE__FULL_BLOCKS:-false}
       ZINDER_INGEST_CONTROL__ADDR: http://127.0.0.1:9100
       ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH: /var/run/zinder-control/ingest.token
       ZINDER_OPS__LISTEN_ADDR: "[::]:9108"

@@ -206,7 +206,7 @@ COPY --from=zinder-binaries-selected /zinder-binaries/zinder /usr/local/bin/zind
 USER 10001:10001
 WORKDIR /var/lib/zinder
 
-EXPOSE 9067 9068 9069 9102 9108
+EXPOSE 9067 9068 9070 9102 9108
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["/usr/local/bin/zinder", "healthcheck"]

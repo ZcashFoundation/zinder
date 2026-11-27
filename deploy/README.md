@@ -16,12 +16,13 @@ Single-container deployments run `zinder serve --preset <preset>` (writer + read
 
 ## Docker Compose
 
-1. Create host control tokens in `${ZINDER_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`) and shielded history directories if serving sealed history.
+1. Create the required host control tokens in `${ZINDER_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`) and initialize the required host shielded-history directory (`publisher.pub`, `publisher.pk8`, and `catalog/`) with `scripts/prepare-shielded-history.sh`. Because `zinder-serve` bind-mounts `publisher.pub` and `catalog` with `create_host_path: false`, compatibility serving also requires enabling `--profile history-publisher` (with `ZINDER_HISTORY_SIGNING_KEY_FILE` / `publisher.pk8`) to publish the first signed checkpoint when the catalog starts empty.
 2. Start the stack with the env file for your network and upstream node:
 
 ```bash
 ZINDER_PRESET=wallet \
-  docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
+  docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml \
+  --profile history-publisher up -d
 ```
 
 Optional profiles:
