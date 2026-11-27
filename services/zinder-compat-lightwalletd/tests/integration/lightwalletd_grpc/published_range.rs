@@ -131,7 +131,7 @@ fn writer(chain: &ChainFixture) -> eyre::Result<CanonicalWriterFixture> {
 
 fn wallet_chain(spend_count: usize) -> eyre::Result<ChainFixture> {
     let chain = ChainFixture::new(NETWORK)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(6);
     let block = fixture_block(&chain, BlockHeight::new(2))?;
     let txid = TransactionId::from_bytes([17; 32]);
@@ -457,7 +457,7 @@ async fn crossing_a_replaced_live_suffix(
     const FORK: u32 = 1_998;
     let dir = tempfile::tempdir()?;
     let mut chain = ChainFixture::new(NETWORK)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(TIP);
     for n in FORK..=TIP {
         let block = fixture_block(&chain, BlockHeight::new(n))?;
@@ -1013,6 +1013,48 @@ async fn damaged_admitted_segment_ends_covered_rpc_with_data_loss_in_both_orders
     Ok(())
 }
 
+fn pad_live_tail_shielded_payload_with_unknown_fields(
+    primary: &std::path::Path,
+    height: BlockHeight,
+    min_len: usize,
+) -> eyre::Result<Vec<u8>> {
+    use sha2::Digest as _;
+    let options = rust_rocksdb::Options::default();
+    let families = rust_rocksdb::DB::list_cf(&options, primary)?;
+    let db = rust_rocksdb::DB::open_cf(&options, primary, &families)?;
+    let family = db
+        .cf_handle("live_tail_block")
+        .ok_or_else(|| eyre!("the canonical primary has no live_tail_block family"))?;
+    let encoded = db
+        .get_cf(&family, height.value().to_be_bytes())?
+        .ok_or_else(|| eyre!("missing live_tail_block row at middle height"))?;
+    let body = encoded
+        .get(..encoded.len().saturating_sub(32))
+        .ok_or_else(|| eyre!("live_tail_block row missing trailer"))?;
+    let len_bytes: [u8; 4] = body
+        .get(85..89)
+        .ok_or_else(|| eyre!("live_tail_block row missing shielded length"))?
+        .try_into()?;
+    let old_len = usize::try_from(u32::from_be_bytes(len_bytes))?;
+    let mut shielded = body
+        .get(89..89 + old_len)
+        .ok_or_else(|| eyre!("live_tail_block shielded payload truncated"))?
+        .to_vec();
+    let suffix = &body[89 + old_len..];
+    // Unknown varint field 127 is skipped by the typed protobuf decoder.
+    while shielded.len() <= min_len {
+        shielded.extend_from_slice(&[0xf8, 0x07, 1]);
+    }
+    let mut updated = Vec::with_capacity(body.len() + shielded.len() + 32);
+    updated.extend_from_slice(&body[..85]);
+    updated.extend_from_slice(&u32::try_from(shielded.len())?.to_be_bytes());
+    updated.extend_from_slice(&shielded);
+    updated.extend_from_slice(suffix);
+    let digest = sha2::Sha256::digest(&updated);
+    updated.extend_from_slice(&digest);
+    Ok(updated)
+}
+
 #[tokio::test]
 async fn catalog_keeps_the_original_native_budget_when_protobuf_has_unknown_fields()
 -> eyre::Result<()> {
@@ -1024,14 +1066,12 @@ async fn catalog_keeps_the_original_native_budget_when_protobuf_has_unknown_fiel
     let primary = writer.canonical_primary_path().to_owned();
     let paths = writer.into_serving_store_fixture()?;
     let middle = BlockHeight::new(2);
-    let mut stored = zinder_store::encode_compact_block_artifact(
-        &fixture_block(&chain, middle)?.compact_block_artifact(),
-    );
-    // Unknown varint field 127 is skipped by the typed protobuf decoder.
-    while stored.len() <= BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES {
-        stored.extend_from_slice(&[0xf8, 0x07, 1]);
-    }
-    super::damage_compact_block_row(&primary, middle, Some(&stored))?;
+    let updated_row = pad_live_tail_shielded_payload_with_unknown_fields(
+        &primary,
+        middle,
+        BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES,
+    )?;
+    super::damage_compact_block_row(&primary, middle, Some(&updated_row))?;
     let fixture = ReaderFixture::new(paths)?;
     let (signer, key) = crate::common::shielded_catalog_keys(files.path())?;
     let directory = files.path().join("history");
@@ -1096,7 +1136,7 @@ async fn catalog_keeps_the_original_native_budget_when_protobuf_has_unknown_fiel
 
 fn dense_history() -> eyre::Result<ChainFixture> {
     let mut chain = ChainFixture::new(NETWORK)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(40);
     for number in 2_u8..=40 {
         let block = fixture_block(&chain, BlockHeight::new(u32::from(number)))?;
@@ -1769,7 +1809,7 @@ async fn grpc_pool_subset_ranges_and_nullifiers_match_stock_wire_bytes_with_zero
     let dir = tempfile::tempdir()?;
     let chain = grpc_subset_blocks(
         ChainFixture::new(NETWORK)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .with_raw_blob_retention(RawBlobRetention::None)
             .extend_blocks(8),
     )?;
     let store = ReaderFixture::new(subset_writer(&chain)?.into_serving_store_fixture()?)?;
@@ -1847,7 +1887,7 @@ async fn damaged_nullifier_slab_fails_closed_for_orchard_subset_and_default_null
     let files = tempfile::tempdir()?;
     let chain = grpc_subset_blocks(
         ChainFixture::new(NETWORK)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .with_raw_blob_retention(RawBlobRetention::None)
             .extend_blocks(8),
     )?;
     let fixture = ReaderFixture::new(subset_writer(&chain)?.into_serving_store_fixture()?)?;

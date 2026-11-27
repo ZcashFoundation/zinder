@@ -40,9 +40,8 @@ use zinder_source::{
     SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
 };
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbIoMode,
-    RocksDbResourceBudget, RocksDbStatisticsLevel,
+    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbIoMode, RocksDbResourceBudget, RocksDbStatisticsLevel,
 };
 use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
 
@@ -331,19 +330,15 @@ impl TemplateStores {
             &chain.activations,
             first_block.block_time_seconds.saturating_sub(1),
             chain.block_id(chain.base_tip_height)?,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(chain.reorg_window_blocks)?,
         )?;
         let mut canonical_budget = RocksDbResourceBudget::for_local_tests();
         canonical_budget.statistics_level = RocksDbStatisticsLevel::Tickers;
         canonical_budget.preferred_io_mode = config.io_mode;
 
-        let builder = RocksDbCanonicalBuilder::create_fresh(
-            &canonical_path,
-            CanonicalStoreWorkload::Wallet,
-            build_plan,
-            canonical_budget,
-        )?;
+        let builder =
+            RocksDbCanonicalBuilder::create_fresh(&canonical_path, build_plan, canonical_budget)?;
         let construction = CanonicalConstructionConfig::for_local_tests(
             Duration::from_secs(10),
             Arc::clone(&chain.activations),
@@ -1185,8 +1180,7 @@ fn derive_chain_commitments(
     );
 
     for (height, source_block) in blocks {
-        let prepared =
-            prepare_canonical_block(source_block, activations, RawBlobPolicy::Transactions)?;
+        let prepared = prepare_canonical_block(source_block, activations, RawBlobPolicy::All)?;
         let positioned = position_canonical_block(prepared, &mut running_sizes)?;
         let commitments = extract_commitments(&positioned.compact_block);
         accumulator
@@ -1322,8 +1316,7 @@ mod tests {
         let mut total_transparent_inputs = 0_u32;
         let mut total_orchard_additions = 0_u32;
         for (height, block) in chain.blocks.iter() {
-            let prepared =
-                prepare_canonical_block(block, &chain.activations, RawBlobPolicy::Transactions)?;
+            let prepared = prepare_canonical_block(block, &chain.activations, RawBlobPolicy::All)?;
             if height.value().is_multiple_of(5) {
                 assert_eq!(prepared.tree_size_additions.orchard, 8);
                 total_orchard_additions = total_orchard_additions.saturating_add(8);

@@ -17,11 +17,11 @@
 
 use std::collections::VecDeque;
 
-use rust_rocksdb::DB;
 use zinder_core::{BlockHeight, BlockId, CanonicalBlockFactsSequenceDigestBuilder};
 
 use super::{
     CanonicalSequenceCheckpoint, CanonicalStoreError, block_replay::read_persisted_replay,
+    settled_segments::store_access::SegmentStoreContext,
 };
 
 /// Sequence checkpoints from the settled tip through the visible tip, each
@@ -37,7 +37,7 @@ impl AuthenticatedReplayTail {
     /// Derives every unsettled checkpoint from the persisted rows above
     /// `settled` through `through`.
     pub(super) fn authenticate(
-        db: &DB,
+        ctx: SegmentStoreContext<'_>,
         settled: CanonicalSequenceCheckpoint,
         through: BlockHeight,
         maximum_replay_blocks: u32,
@@ -47,7 +47,7 @@ impl AuthenticatedReplayTail {
             unsettled: VecDeque::new(),
             rows_since_full_authentication: 0,
         };
-        tail.extend_through(db, through, maximum_replay_blocks)?;
+        tail.extend_through(ctx, through, maximum_replay_blocks)?;
         tail.rows_since_full_authentication = 0;
         Ok(tail)
     }
@@ -83,7 +83,7 @@ impl AuthenticatedReplayTail {
     /// common parent and discards the checkpoints of every replaced height.
     pub(super) fn reauthenticate_above(
         &mut self,
-        db: &DB,
+        ctx: SegmentStoreContext<'_>,
         retained_height: BlockHeight,
         through: BlockHeight,
         maximum_replay_blocks: u32,
@@ -101,7 +101,7 @@ impl AuthenticatedReplayTail {
                 retained_height.value()
             )));
         }
-        self.extend_through(db, through, maximum_replay_blocks)
+        self.extend_through(ctx, through, maximum_replay_blocks)
     }
 
     /// Advances the settled boundary to `settled`, which must equal the
@@ -128,7 +128,7 @@ impl AuthenticatedReplayTail {
     /// most `maximum_replay_blocks` rows.
     fn extend_through(
         &mut self,
-        db: &DB,
+        ctx: SegmentStoreContext<'_>,
         through: BlockHeight,
         maximum_replay_blocks: u32,
     ) -> Result<(), CanonicalStoreError> {
@@ -152,7 +152,7 @@ impl AuthenticatedReplayTail {
             .next()
             .filter(|height| *height <= through)
         {
-            previous = authenticate_next_replay(db, previous, height)?;
+            previous = authenticate_next_replay(ctx, previous, height)?;
             self.unsettled.push_back(previous);
             self.rows_since_full_authentication =
                 self.rows_since_full_authentication.saturating_add(1);
@@ -164,11 +164,11 @@ impl AuthenticatedReplayTail {
 /// Extends `previous` by the persisted replay row at `height`, which must
 /// link to it by parent hash.
 pub(super) fn authenticate_next_replay(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     previous: CanonicalSequenceCheckpoint,
     height: BlockHeight,
 ) -> Result<CanonicalSequenceCheckpoint, CanonicalStoreError> {
-    let persisted = read_persisted_replay(db, height)?;
+    let persisted = read_persisted_replay(ctx, height)?;
     let facts = persisted.replay.facts();
     if facts.block_header.parent_hash != previous.through().hash {
         return Err(CanonicalStoreError::block_replay_sequence(format!(

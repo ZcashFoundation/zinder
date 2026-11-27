@@ -821,7 +821,7 @@ async fn get_block_by_hash_reports_a_missing_compact_block_alike_in_both_modes()
     Ok(())
 }
 
-/// Removes or overwrites a compact-block row in a closed fixture primary.
+/// Removes or overwrites a live-tail block row in a closed fixture primary.
 fn damage_compact_block_row(
     canonical_primary_path: &std::path::Path,
     height: BlockHeight,
@@ -831,8 +831,8 @@ fn damage_compact_block_row(
     let families = rust_rocksdb::DB::list_cf(&options, canonical_primary_path)?;
     let db = rust_rocksdb::DB::open_cf(&options, canonical_primary_path, &families)?;
     let family = db
-        .cf_handle("compact_block")
-        .ok_or_else(|| eyre!("the canonical primary has no compact-block family"))?;
+        .cf_handle("live_tail_block")
+        .ok_or_else(|| eyre!("the canonical primary has no live_tail_block family"))?;
     let key = encode_height_key_ascending(height);
     match replacement {
         Some(bytes) => db.put_cf(&family, key, bytes)?,
@@ -1622,7 +1622,7 @@ async fn get_block_range_ends_when_a_live_replacement_displaces_sent_blocks() ->
     const FORK_HEIGHT: u32 = 995;
     let log_capture = LogCapture::install_for_target("zinder::compat_lightwalletd");
     let mut chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(TIP_HEIGHT);
     for height in FORK_HEIGHT..=TIP_HEIGHT {
         let displaced = fixture_block(&chain, BlockHeight::new(height))?;
@@ -4063,7 +4063,7 @@ async fn get_transaction_by_hash_pins_every_read_to_one_epoch() -> eyre::Result<
     let transaction_id = TransactionId::from_bytes([0x77; 32]);
     let transaction_payload = b"single-epoch-transaction-bytes".to_vec();
     let store_fixture =
-        acceptance_store_fixture_with_transaction_rows(RawBlobRetention::Transactions, |block| {
+        acceptance_store_fixture_with_transaction_rows(RawBlobRetention::All, |block| {
             vec![FixtureTransactionRows::from_raw_transaction(
                 transaction_id,
                 block.height,
@@ -4605,7 +4605,7 @@ async fn get_address_utxos_txid_round_trips_through_get_transaction_by_hash() ->
     let transaction_id = TransactionId::from_bytes([0x77; 32]);
     let transaction_payload = b"round-trip-transaction-bytes".to_vec();
     let store_fixture = acceptance_store_fixture_with_transaction_rows_and_transparent(
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         |block| {
             vec![FixtureTransactionRows::from_raw_transaction(
                 transaction_id,
@@ -6265,7 +6265,7 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
     let transaction_id = TransactionId::from_bytes([0x33; 32]);
     let reorged_height = BlockHeight::new(2);
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(2);
     let reorged_block = fixture_block(&chain, reorged_height)?;
     let chain = chain

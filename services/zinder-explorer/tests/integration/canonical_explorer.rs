@@ -61,9 +61,8 @@ use zinder_runtime::{AuthenticatedChannel, connect_zinder_grpc};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreRequirements, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalStoreBuildPlan, CanonicalStoreRequirements, RawBlobRetention, RocksDbCanonicalBuilder,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_testkit::{
     IngestControlFixture, WalletServingStoreFixture,
@@ -117,6 +116,7 @@ struct ChainFixtureBundle {
     canonical_secondary: Option<RocksDbCanonicalSecondary>,
     mv_secondary: MaterializedViewStore,
     b2_old_hash: BlockHash,
+    b2_old_raw_block_bytes: Vec<u8>,
     b2_new_hash: BlockHash,
     b2_old_roots: BlockFinalNoteCommitmentRoots,
     b2_new_roots: BlockFinalNoteCommitmentRoots,
@@ -543,6 +543,11 @@ fn assemble_block(
     )?;
     let txs = std::mem::take(&mut blueprint.txs);
     let split = split_tx_artifacts(height, block_hash, txs)?;
+    for blob in &split.blobs {
+        blueprint
+            .raw_block_bytes
+            .extend_from_slice(&blob.raw_transaction_bytes);
+    }
     let facts = build_canonical_block_facts(&blueprint, split.facts)?;
     let replay_envelope = encode_canonical_block_replay(
         &facts,
@@ -561,7 +566,6 @@ fn assemble_block(
             block_time_u32,
             committed.frontiers,
         )),
-        block_final_note_commitment_roots: None,
         transaction_blobs: split.blobs,
         block_blob: Some(BlockBlobArtifact::new(
             height,
@@ -738,6 +742,7 @@ struct BaselineOutput {
     tx_b1_cb_id: TransactionId,
     tx_b1_script: Vec<u8>,
     b2_old_roots: BlockFinalNoteCommitmentRoots,
+    b2_old_raw_block_bytes: Vec<u8>,
 }
 
 fn publish_baseline_store(
@@ -747,6 +752,14 @@ fn publish_baseline_store(
 ) -> Result<(RocksDbCanonicalStore, BaselineOutput)> {
     let built = build_baseline_blocks(activations)?;
     let b2_old_roots = built.block2_old.final_roots;
+    let b2_old_raw_block_bytes = built
+        .block2_old
+        .build_block
+        .block_blob
+        .as_ref()
+        .ok_or_else(|| eyre!("missing b2_old block blob"))?
+        .raw_block_bytes
+        .clone();
     let b1_mv = clone_commit_context(&built.block1.commit_context);
     let b2_old_mv = clone_commit_context(&built.block2_old.commit_context);
     let tip_cp = built
@@ -765,7 +778,6 @@ fn publish_baseline_store(
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         canonical_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?
@@ -810,6 +822,7 @@ fn publish_baseline_store(
             tx_b1_cb_id: built.tx_b1_cb_id,
             tx_b1_script: built.tx_b1_script,
             b2_old_roots,
+            b2_old_raw_block_bytes,
         },
     ))
 }
@@ -977,6 +990,7 @@ fn setup_canonical_chain_fixture() -> Result<ChainFixtureBundle> {
         publish_baseline_store(&canonical_path, secondary_dir.path(), &activations)?;
     let tx_b1_script = baseline.tx_b1_script.clone();
     let b2_old_roots = baseline.b2_old_roots;
+    let b2_old_raw_block_bytes = baseline.b2_old_raw_block_bytes.clone();
     let reorg = apply_live_reorg_and_append(&mut baseline, canonical_primary, &activations)?;
     drop(baseline);
 
@@ -997,6 +1011,7 @@ fn setup_canonical_chain_fixture() -> Result<ChainFixtureBundle> {
         canonical_secondary: Some(canonical_secondary),
         mv_secondary,
         b2_old_hash: BlockHash::from_bytes([0x20; 32]),
+        b2_old_raw_block_bytes,
         b2_new_hash: BlockHash::from_bytes([0x22; 32]),
         b2_old_roots,
         b2_new_roots: reorg.b2_new_roots,
@@ -1308,13 +1323,18 @@ async fn assert_commitment_root_search_rpc(
             .await?
             .into_inner();
         assert_eq!(displaced_search.matches, []);
-        assert_eq!(displaced_search.displaced_matches, []);
+        assert_eq!(displaced_search.displaced_matches.len(), 1);
+        assert_eq!(displaced_search.displaced_matches[0].block_height, 2);
+        assert_eq!(
+            displaced_search.displaced_matches[0].block_hash,
+            encode_rpc_block_hash_hex(fixture.b2_old_hash)
+        );
         let displaced_cov = displaced_search
             .displaced_coverage
             .ok_or_else(|| eyre!("missing displaced_coverage"))?;
         assert_eq!(displaced_cov.captured_block_count, 1);
-        assert_eq!(displaced_cov.root_artifact_unavailable_count, 1);
-        assert!(!displaced_cov.captured_range_complete);
+        assert_eq!(displaced_cov.root_artifact_unavailable_count, 0);
+        assert!(displaced_cov.captured_range_complete);
     }
     Ok(())
 }
@@ -1357,7 +1377,10 @@ async fn assert_displaced_block_rpcs(
         })
         .await?
         .into_inner();
-    assert_eq!(detail.raw_block_bytes, Some(vec![0xD2; 96]));
+    assert_eq!(
+        detail.raw_block_bytes,
+        Some(fixture.b2_old_raw_block_bytes.clone())
+    );
 
     let canonical_err = client
         .displaced_block_detail(DisplacedBlockDetailRequest {
@@ -1818,8 +1841,8 @@ async fn commitment_root_search_pages_past_ahead_mv_candidates_and_reports_displ
         .as_ref()
         .ok_or_else(|| eyre!("missing displaced coverage"))?;
     assert_eq!(displaced_coverage.captured_block_count, 4);
-    assert_eq!(displaced_coverage.root_artifact_unavailable_count, 4);
-    assert!(!displaced_coverage.captured_range_complete);
+    assert_eq!(displaced_coverage.root_artifact_unavailable_count, 0);
+    assert!(displaced_coverage.captured_range_complete);
     explorer_server.shutdown().await?;
     Ok(())
 }

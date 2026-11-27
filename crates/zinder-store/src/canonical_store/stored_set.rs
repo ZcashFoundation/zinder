@@ -1,4 +1,4 @@
-//! Canonical v7 physical inventory and retained block data.
+//! Canonical v2 physical inventory and retained block data.
 
 use std::{num::NonZeroU32, path::Path};
 
@@ -9,52 +9,44 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
-    CanonicalSubtreeRootLoadCoverage,
-    block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
+    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalSubtreeRootLoadCoverage,
     rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
-        CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
-        MEMPOOL_EVENT_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        CHAIN_EVENT_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY, LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
+        MEMPOOL_EVENT_COLUMN_FAMILY, SETTLED_SEGMENT_INDEX_COLUMN_FAMILY,
+        SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
 };
 use crate::RawBlobRetention;
 
-pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 15] = [
+pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 12] = [
     BLOCK_HEADER_COLUMN_FAMILY,
     BLOCK_HASH_INDEX_COLUMN_FAMILY,
-    BLOCK_REPLAY_COLUMN_FAMILY,
-    DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
     TRANSACTION_LOCATION_COLUMN_FAMILY,
-    COMPACT_BLOCK_COLUMN_FAMILY,
+    LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+    LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
+    SETTLED_SEGMENT_INDEX_COLUMN_FAMILY,
     TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-    BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
     SUBTREE_ROOT_COLUMN_FAMILY,
     CHAIN_EPOCH_COLUMN_FAMILY,
     CHAIN_EVENT_COLUMN_FAMILY,
     MEMPOOL_EVENT_COLUMN_FAMILY,
     DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
-    BLOCK_BLOB_COLUMN_FAMILY,
-    TRANSACTION_BLOB_COLUMN_FAMILY,
 ];
 
-pub(super) const CANONICAL_STAGED_SST_FAMILIES: [&str; 9] = [
-    BLOCK_BLOB_COLUMN_FAMILY,
-    BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+pub(super) const CANONICAL_STAGED_SST_FAMILIES: [&str; 7] = [
     BLOCK_HASH_INDEX_COLUMN_FAMILY,
     BLOCK_HEADER_COLUMN_FAMILY,
-    BLOCK_REPLAY_COLUMN_FAMILY,
-    COMPACT_BLOCK_COLUMN_FAMILY,
-    TRANSACTION_BLOB_COLUMN_FAMILY,
+    LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+    LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
+    SETTLED_SEGMENT_INDEX_COLUMN_FAMILY,
     TRANSACTION_LOCATION_COLUMN_FAMILY,
     TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
 ];
 
-pub(super) const CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES: [&str; 5] = [
-    DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY,
+pub(super) const CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES: [&str; 4] = [
     CHAIN_EPOCH_COLUMN_FAMILY,
     CHAIN_EVENT_COLUMN_FAMILY,
     MEMPOOL_EVENT_COLUMN_FAMILY,
@@ -71,8 +63,6 @@ pub enum CanonicalStoredData {
     TransactionBodies,
     /// Serialized blocks.
     BlockBodies,
-    /// Per-block final note-commitment roots where shielded pools are active.
-    FinalNoteCommitmentRoots,
 }
 
 /// Minimum retained block data and historical coverage required by a reader.
@@ -123,9 +113,7 @@ impl CanonicalStoreRequirements {
             CanonicalStoredData::TransactionBodies,
             CanonicalStoredData::BlockBodies,
         ] {
-            if retains(CanonicalStoreWorkload::Wallet, retention, kind)
-                && !self.additional_data.contains(&kind)
-            {
+            if retains(retention, kind) && !self.additional_data.contains(&kind) {
                 self.additional_data.push(kind);
             }
         }
@@ -134,10 +122,10 @@ impl CanonicalStoreRequirements {
 }
 
 impl CanonicalStoreBuildPlan {
-    /// Returns the stored data policy for this construction plan and workload.
+    /// Returns the stored data policy for this construction plan.
     #[must_use]
-    pub const fn stored_set(&self, workload: CanonicalStoreWorkload) -> CanonicalStoredSet {
-        CanonicalStoredSet::for_history(workload, self.raw_blob_retention(), self.history_bounds())
+    pub const fn stored_set(&self) -> CanonicalStoredSet {
+        CanonicalStoredSet::for_history(self.raw_blob_retention(), self.history_bounds())
     }
 
     pub(super) const fn first_retained_height(&self) -> BlockHeight {
@@ -146,10 +134,9 @@ impl CanonicalStoreBuildPlan {
 
     pub(super) fn admitted_stored_set(
         &self,
-        workload: CanonicalStoreWorkload,
         coverage: CanonicalSubtreeRootLoadCoverage,
     ) -> CanonicalStoredSet {
-        let mut stored_set = self.stored_set(workload);
+        let mut stored_set = self.stored_set();
         let predecessor = self.subtree_predecessor_metadata(coverage);
         stored_set.subtree_root_coverage = Some(coverage);
         stored_set.first_subtree_root_indices =
@@ -187,7 +174,6 @@ const SHIELDED_PROTOCOLS: [ShieldedProtocol; 3] = [
 /// Retention, historical floor, and any admitted subtree-root evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalStoredSet {
-    workload: CanonicalStoreWorkload,
     retention: RawBlobRetention,
     first_height: BlockHeight,
     subtree_root_coverage: Option<CanonicalSubtreeRootLoadCoverage>,
@@ -195,25 +181,16 @@ pub struct CanonicalStoredSet {
 }
 
 impl CanonicalStoredSet {
-    /// Describes the retained data a writer builds for its workload and history.
+    /// Describes the retained data a writer builds for its retention and history.
     ///
     /// Coverage authenticated by a published manifest is available after admission.
     #[must_use]
-    pub const fn for_history(
-        workload: CanonicalStoreWorkload,
-        retention: RawBlobRetention,
-        bounds: CanonicalHistoryBounds,
-    ) -> Self {
-        Self::new(workload, retention, Self::history_floor(bounds))
+    pub const fn for_history(retention: RawBlobRetention, bounds: CanonicalHistoryBounds) -> Self {
+        Self::new(retention, Self::history_floor(bounds))
     }
 
-    pub(super) const fn new(
-        workload: CanonicalStoreWorkload,
-        retention: RawBlobRetention,
-        first_height: BlockHeight,
-    ) -> Self {
+    pub(super) const fn new(retention: RawBlobRetention, first_height: BlockHeight) -> Self {
         Self {
-            workload,
             retention,
             first_height,
             subtree_root_coverage: None,
@@ -226,9 +203,6 @@ impl CanonicalStoredSet {
     }
 
     /// Returns the historical floor for a retained data kind.
-    ///
-    /// Sparse artifacts such as final roots follow their own activation rules
-    /// within retained history. This describes coverage policy.
     #[must_use]
     pub const fn first_height(self, kind: CanonicalStoredData) -> Option<BlockHeight> {
         if self.contains(kind) {
@@ -241,7 +215,7 @@ impl CanonicalStoredSet {
     /// Reports whether the store retains this data kind.
     #[must_use]
     pub const fn contains(&self, kind: CanonicalStoredData) -> bool {
-        retains(self.workload, self.retention, kind)
+        retains(self.retention, kind)
     }
 
     /// Returns the authenticated subtree-root coverage of an admitted store.
@@ -295,17 +269,9 @@ impl CanonicalStoredSet {
         self.retention
     }
 
-    pub(super) const fn requires_daily_value_pool_evidence(self) -> bool {
-        matches!(self.workload, CanonicalStoreWorkload::Explorer)
-    }
-
     pub(super) fn permits_construction_rows(self, family: &str) -> bool {
         match family {
-            BLOCK_BLOB_COLUMN_FAMILY => self.contains(CanonicalStoredData::BlockBodies),
-            TRANSACTION_BLOB_COLUMN_FAMILY => self.contains(CanonicalStoredData::TransactionBodies),
-            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY => {
-                self.contains(CanonicalStoredData::FinalNoteCommitmentRoots)
-            }
+            LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY => self.contains(CanonicalStoredData::BlockBodies),
             _ => !CANONICAL_PRE_PUBLICATION_EMPTY_FAMILIES.contains(&family),
         }
     }
@@ -341,24 +307,11 @@ pub(super) fn required_subtree_root_ranges(
     Ok(ranges)
 }
 
-const fn retains(
-    workload: CanonicalStoreWorkload,
-    retention: RawBlobRetention,
-    kind: CanonicalStoredData,
-) -> bool {
+const fn retains(retention: RawBlobRetention, kind: CanonicalStoredData) -> bool {
     match kind {
         CanonicalStoredData::BlockHistory => true,
         CanonicalStoredData::TransactionBodies => retention.retains_transaction_blobs(),
         CanonicalStoredData::BlockBodies => retention.retains_block_blobs(),
-        CanonicalStoredData::FinalNoteCommitmentRoots => workload.derives_final_roots(),
-    }
-}
-
-impl CanonicalStoreWorkload {
-    /// Reports whether construction derives per-block final note-commitment roots.
-    #[must_use]
-    pub const fn derives_final_roots(self) -> bool {
-        matches!(self, Self::Explorer)
     }
 }
 
@@ -372,7 +325,7 @@ impl RawBlobRetention {
     /// Whether transaction blobs are retained.
     #[must_use]
     pub const fn retains_transaction_blobs(self) -> bool {
-        matches!(self, Self::Transactions | Self::All)
+        matches!(self, Self::All)
     }
 }
 

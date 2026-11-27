@@ -326,7 +326,7 @@ fn explorer_print_config_redacts_cipherscan_and_wallet_query_urls() -> eyre::Res
 }
 
 #[test]
-fn unprofiled_transactions_policy_omits_injected_wallet_profile() -> eyre::Result<()> {
+fn legacy_transactions_raw_blob_policy_fails_closed() -> eyre::Result<()> {
     let sandbox = TempDir::new()?;
     let storage_root = sandbox.path().join("legacy-root");
     let config_body = format!(
@@ -342,21 +342,10 @@ fn unprofiled_transactions_policy_omits_injected_wallet_profile() -> eyre::Resul
 
     let validate = zinder_command(&["config", "validate", "--config", cfg_str]).output()?;
     assert!(
-        validate.status.success(),
-        "unprofiled raw_blob_policy = transactions should validate: {}",
-        String::from_utf8_lossy(&validate.stderr)
+        !validate.status.success(),
+        "legacy raw_blob_policy = transactions must fail closed"
     );
-
-    let printed = zinder_command(&["config", "print", "--config", cfg_str]).output()?;
-    assert!(printed.status.success());
-    let stdout = String::from_utf8_lossy(&printed.stdout);
-    assert!(
-        !stdout.contains("profile = \"wallet\""),
-        "must not inject profile = wallet into unprofiled transactions store:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("raw_blob_policy = \"transactions\""),
-        "{stdout}"
-    );
+    let stderr = String::from_utf8_lossy(&validate.stderr);
+    assert!(stderr.contains("transactions"), "{stderr}");
     Ok(())
 }

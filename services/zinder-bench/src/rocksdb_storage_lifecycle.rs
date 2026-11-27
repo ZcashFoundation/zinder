@@ -36,9 +36,8 @@ use zinder_source::{
 };
 use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
-    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreReadyEvidence, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_VALUE_ENCODING_VERSION,
@@ -246,13 +245,12 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
         &network_upgrade_activations,
         genesis.block_time_seconds,
         fixed_build_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
     )?;
     let canonical_store_initialization_started = Instant::now();
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &validated.canonical_store,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         canonical_resource_budget,
     )?;
@@ -322,8 +320,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let canonical_store = RocksDbCanonicalStore::open_ready(
         &validated.canonical_store,
         &network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;
@@ -350,8 +347,7 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
     let canonical_store = RocksDbCanonicalStore::open_ready(
         &validated.canonical_store,
         &network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(validated.supported_reorg_depth)?,
         canonical_resource_budget,
     )?;
@@ -637,7 +633,6 @@ fn canonical_ready_summary(
     );
     CanonicalStorageReadySummary {
         scope: "canonical-storage-ready",
-        workload: CanonicalStoreWorkload::Wallet.as_str(),
         first_retained_block: block_id_summary(ready.first_retained_block),
         visible_tip: block_id_summary(ready.visible_tip),
         visible_epoch_id: ready.visible_epoch.value(),

@@ -2685,9 +2685,8 @@ mod tests {
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalLiveAppend,
         CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-        CanonicalRetainedEvent, CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention,
-        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-        RocksDbResourceBudget,
+        CanonicalRetainedEvent, CanonicalStoreBuildPlan, RawBlobRetention, RocksDbCanonicalBuilder,
+        RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
     };
 
     #[test]
@@ -2714,12 +2713,11 @@ mod tests {
             &activations,
             0,
             block_one_id,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             reorg_policy,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             &canonical_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2791,9 +2789,7 @@ mod tests {
             &canonical_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3525,7 +3521,7 @@ mod tests {
                 temporary.path().join("canonical-secondary"),
                 &activations,
                 zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                    RawBlobRetention::Transactions,
+                    RawBlobRetention::None,
                 ),
                 reorg_policy,
                 RocksDbResourceBudget::for_local_tests(),
@@ -3598,12 +3594,11 @@ mod tests {
         );
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             canonical_path,
-            CanonicalStoreWorkload::Wallet,
             CanonicalStoreBuildPlan::complete(
                 &activations,
                 0,
                 block_one_id,
-                RawBlobRetention::Transactions,
+                RawBlobRetention::None,
                 reorg_policy,
             )?,
             RocksDbResourceBudget::for_local_tests(),
@@ -3686,7 +3681,7 @@ mod tests {
         let height = BlockHeight::new(height);
         let block_hash = BlockHash::from_bytes(block_hash);
         let parent_hash = BlockHash::from_bytes(parent_hash);
-        let (transaction, transaction_blob) = empty_coinbase(height, block_hash);
+        let (transaction, _transaction_blob) = empty_coinbase(height, block_hash);
         let facts = CanonicalBlockFacts {
             block_header: BlockHeaderArtifact::new(
                 height,
@@ -3729,8 +3724,7 @@ mod tests {
                 height.value(),
                 regtest_checkpoint_frontiers_at(height)?,
             )),
-            block_final_note_commitment_roots: None,
-            transaction_blobs: vec![transaction_blob],
+            transaction_blobs: Vec::new(),
             block_blob: None,
         })
     }
@@ -3863,12 +3857,11 @@ mod tests {
             &activations,
             0,
             block_one_id,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             reorg_policy,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             canonical_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;

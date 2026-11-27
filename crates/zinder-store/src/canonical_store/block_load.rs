@@ -10,11 +10,11 @@ use metrics::Histogram;
 
 use rust_rocksdb::{DB, IngestExternalFileOptions, IteratorMode};
 use zinder_core::{
-    BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, CanonicalBlockFacts,
+    BlockBlobArtifact, BlockHash, BlockHeight, CanonicalBlockFacts,
     CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
-    CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactBlockArtifact,
+    CommitmentTreeCheckpoint, CommitmentTreeFrontiers, CompactBlockArtifact, Network,
     NetworkUpgradeActivations, SerializedBytesDigest, TransactionBlobArtifact, TransactionLocation,
 };
 use zinder_rocksdb_bulk_load::{
@@ -25,26 +25,35 @@ use self::codec::{BLOCK_HASH_INDEX_RECORD_LEN, TRANSACTION_LOCATION_RECORD_LEN};
 
 pub(super) use self::codec::{
     BLOCK_HEADER_VALUE_LEN, StoredTreeStateRoots, TRANSACTION_LOCATION_VALUE_LEN,
-    decode_block_final_note_commitment_roots, decode_served_tree_state_checkpoint,
-    decode_stored_tree_state_roots, decode_tree_state_checkpoint,
-    encode_block_final_note_commitment_roots, encode_block_hash_location, encode_block_header,
-    encode_block_position, encode_transaction_location, encode_transaction_position,
-    encode_tree_state_checkpoint,
+    decode_served_tree_state_checkpoint, decode_stored_tree_state_roots,
+    decode_tree_state_checkpoint, encode_block_hash_location, encode_block_header,
+    encode_block_position, encode_transaction_location, encode_tree_state_checkpoint,
 };
 
 use super::{
     CanonicalSequenceCheckpoint, CanonicalStoreBuildError, CanonicalStoreBuildPlan,
-    CanonicalStoreError, CanonicalStoreWorkload, CanonicalStoredData, CanonicalStoredSet,
-    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
-    block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
+    CanonicalStoreError, CanonicalStoredData, CanonicalStoredSet, TREE_STATE_CHECKPOINT_STRIDE,
+    TreeStateCheckpointSelection,
     construction_manifest::CanonicalConstructionFamilyEvidence,
     frontier_presence_mismatch,
-    reader::read_compact_block_at,
     rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        CanonicalColumnFamilyOptions, TRANSACTION_BLOB_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CanonicalColumnFamilyOptions,
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY, LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
+        SETTLED_SEGMENT_INDEX_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
+        TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+    },
+    settled_segments::{
+        layout::{SettledSegmentIndexEntry, aligned_segment_end_height},
+        sealer::{
+            BulkSegmentSealer, DEFAULT_SETTLED_SEGMENT_BLOCKS, SettledSegmentBlockInput,
+            SettledSegmentSealerConfig,
+        },
+        store_access::{
+            EncodedSplitLiveTail, SegmentStoreContext, encode_split_live_tail_from_build_block,
+            live_tail_raw_block_from_blobs, read_compact_block_split,
+            read_persisted_tip_metadata as read_persisted_tip_metadata_v2,
+            segment_modules_for_stored_set, sync_segments_manifest_from_db,
+        },
     },
     tree_state_replay::recorded_tree_sizes,
 };
@@ -101,11 +110,9 @@ pub struct CanonicalBuildBlock {
     /// Typed commitment-tree state when required by the build's checkpoint coverage,
     /// or for every live block.
     pub tree_state_checkpoint: Option<CommitmentTreeCheckpoint>,
-    /// Per-block final roots retained only by the explorer workload.
-    pub block_final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
     /// Raw transactions in exact block order.
     pub transaction_blobs: Vec<TransactionBlobArtifact>,
-    /// Raw block bytes required by the explorer workload.
+    /// Raw block bytes required under full-block retention.
     pub block_blob: Option<BlockBlobArtifact>,
 }
 
@@ -136,39 +143,41 @@ pub struct CanonicalBlockLoadEvidence {
     pub block_header_count: u64,
     /// Number of hash-addressed block-location rows.
     pub block_hash_index_count: u64,
-    /// Number of height-addressed semantic replay rows.
-    pub block_replay_count: u64,
-    /// Number of height-addressed compact block rows.
-    pub compact_block_count: u64,
+    /// Number of aligned settled-segment index entries emitted before the reorg tail.
+    pub settled_segment_index_count: u64,
+    /// Number of unsealed per-block live-tail records staged in `live_tail_block`.
+    pub live_tail_block_count: u64,
+    /// Number of unsealed raw-block records staged in `live_tail_raw_block`.
+    pub live_tail_raw_block_count: u64,
     /// Number of transaction-id-addressed location rows.
     pub transaction_location_count: u64,
-    /// Number of position-addressed raw transaction rows.
+    /// Number of retained raw transaction blobs across settled segments and live tail.
     pub transaction_blob_count: u64,
-    /// Number of height-addressed raw block rows.
+    /// Number of retained raw block blobs across settled segments and live tail.
     pub block_blob_count: u64,
     /// Number of typed commitment-tree checkpoints, including the history predecessor.
     pub tree_state_checkpoint_count: u64,
-    /// Number of height-addressed final note-commitment-root rows.
-    pub block_final_note_commitment_roots_count: u64,
     /// Header-family key and value bytes submitted to the SST writers.
     pub block_header_logical_bytes: u64,
     /// Block-hash-index key and value bytes submitted to the SST writers.
     pub block_hash_index_logical_bytes: u64,
-    /// Replay-family key and value bytes submitted to the SST writers.
-    pub block_replay_logical_bytes: u64,
-    /// Compact-block key and value bytes submitted to the SST writers.
-    pub compact_block_logical_bytes: u64,
+    /// Cumulative canonical replay-envelope bytes across every retained block.
+    pub logical_replay_bytes: u64,
+    /// Settled-segment-index key and value bytes submitted to the SST writers.
+    pub settled_segment_index_logical_bytes: u64,
+    /// Live-tail block key and value bytes submitted to the SST writers.
+    pub live_tail_block_logical_bytes: u64,
+    /// Live-tail raw-block key and value bytes submitted to the SST writers.
+    pub live_tail_raw_block_logical_bytes: u64,
     /// Transaction-location key and value bytes submitted to the SST writers.
     pub transaction_location_logical_bytes: u64,
-    /// Transaction-blob key and value bytes submitted to the SST writers.
+    /// Retained raw transaction blob bytes (including 8-byte position framing) under retention.
     pub transaction_blob_logical_bytes: u64,
-    /// Block-blob key and value bytes submitted to the SST writers.
+    /// Retained raw block blob bytes (including 4-byte height framing) under retention.
     pub block_blob_logical_bytes: u64,
     /// Tree-checkpoint key and value bytes submitted to the SST writers.
     pub tree_state_checkpoint_logical_bytes: u64,
-    /// Final-root key and value bytes submitted to the SST writers.
-    pub block_final_note_commitment_roots_logical_bytes: u64,
-    /// Total key and value bytes submitted to the SST writers.
+    /// Total key and value bytes submitted across the 7 staged `RocksDB` SST families.
     pub logical_bytes: u64,
     /// Physical bytes occupied by every staged SST.
     pub sst_file_bytes: u64,
@@ -185,6 +194,7 @@ pub struct CanonicalBlockLoadEvidence {
 }
 
 pub(super) struct PreparedCanonicalBlockLoad {
+    network: Network,
     families: Vec<PreparedColumnFamily>,
     pub(super) evidence: CanonicalBlockLoadEvidence,
     trusted_fresh_evidence: CanonicalTrustedFreshBlockEvidence,
@@ -206,9 +216,9 @@ pub(super) struct CanonicalStagedSstEvidence {
 
 #[derive(Clone, Copy)]
 pub(super) struct CanonicalBlockSstConfig<'options> {
+    pub(super) store_path: &'options Path,
     pub(super) staging_path: &'options Path,
     pub(super) options: &'options CanonicalColumnFamilyOptions,
-    pub(super) workload: CanonicalStoreWorkload,
     pub(super) build_plan: &'options CanonicalStoreBuildPlan,
     /// The activation table the build plan fingerprints, which decides the
     /// pools each checkpoint carries a frontier for.
@@ -241,14 +251,14 @@ struct CanonicalBlockSstStager<'options> {
     config: CanonicalBlockSstConfig<'options>,
     stored_set: CanonicalStoredSet,
     header_writer: OrderedSstWriter<'options>,
-    replay_writer: OrderedSstWriter<'options>,
-    compact_writer: OrderedSstWriter<'options>,
-    transaction_blob_writer: OrderedSstWriter<'options>,
-    block_blob_writer: OrderedSstWriter<'options>,
+    live_tail_block_writer: OrderedSstWriter<'options>,
+    live_tail_raw_block_writer: OrderedSstWriter<'options>,
+    settled_segment_index_writer: OrderedSstWriter<'options>,
     tree_state_checkpoint_writer: OrderedSstWriter<'options>,
-    block_final_note_commitment_roots_writer: OrderedSstWriter<'options>,
     block_hash_sorter: FixedRecordSorter<BLOCK_HASH_INDEX_RECORD_LEN>,
     transaction_location_sorter: FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
+    sealer: BulkSegmentSealer,
+    sealable_ceiling: Option<BlockHeight>,
     sequence: Option<BlockSequence>,
     predecessor_checkpoint_logical_bytes: u64,
     checkpoint_tree_sizes: ChainTipMetadata,
@@ -310,19 +320,31 @@ impl<'options> CanonicalBlockSstStager<'options> {
         tree_state_checkpoint_writer.put(&predecessor_key, &predecessor_value)?;
         let predecessor_checkpoint_logical_bytes =
             checked_row_bytes(predecessor_key.len(), predecessor_value.len())?;
+        let stored_set = config.build_plan.stored_set();
+        let modules = segment_modules_for_stored_set(stored_set);
+        let sealer_config = SettledSegmentSealerConfig::new(
+            config.build_plan.network(),
+            super::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+            modules,
+        );
+        let sealer = BulkSegmentSealer::new(config.store_path, sealer_config, None)?;
+        let sealable_ceiling = config
+            .build_plan
+            .build_tip()
+            .height
+            .value()
+            .checked_sub(config.build_plan.reorg_policy().reorg_window_blocks())
+            .map(BlockHeight::new);
         Ok(Self {
-            stored_set: config.build_plan.stored_set(config.workload),
+            stored_set,
             header_writer: config.ordered_writer("block-header", BLOCK_HEADER_COLUMN_FAMILY)?,
-            replay_writer: config.ordered_writer("block-replay", BLOCK_REPLAY_COLUMN_FAMILY)?,
-            compact_writer: config.ordered_writer("compact-block", COMPACT_BLOCK_COLUMN_FAMILY)?,
-            transaction_blob_writer: config
-                .ordered_writer("transaction-blob", TRANSACTION_BLOB_COLUMN_FAMILY)?,
-            block_blob_writer: config.ordered_writer("block-blob", BLOCK_BLOB_COLUMN_FAMILY)?,
+            live_tail_block_writer: config
+                .ordered_writer("live-tail-block", LIVE_TAIL_BLOCK_COLUMN_FAMILY)?,
+            live_tail_raw_block_writer: config
+                .ordered_writer("live-tail-raw-block", LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY)?,
+            settled_segment_index_writer: config
+                .ordered_writer("settled-segment-index", SETTLED_SEGMENT_INDEX_COLUMN_FAMILY)?,
             tree_state_checkpoint_writer,
-            block_final_note_commitment_roots_writer: config.ordered_writer(
-                "block-final-note-commitment-roots",
-                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-            )?,
             block_hash_sorter: FixedRecordSorter::new(
                 config.staging_path,
                 "block-hash-index",
@@ -333,6 +355,8 @@ impl<'options> CanonicalBlockSstStager<'options> {
                 "transaction-location",
                 transaction_location_capacity,
             )?,
+            sealer,
+            sealable_ceiling,
             checkpoint_tree_sizes: predecessor.tip_metadata(),
             config,
             sequence: None,
@@ -343,6 +367,41 @@ impl<'options> CanonicalBlockSstStager<'options> {
 
     fn stage(&mut self, block: CanonicalBuildBlock) -> Result<(), CanonicalStoreError> {
         let started_at = Instant::now();
+        let checkpoint_required = self.validate_stage_block(&block)?;
+        let validated_at = Instant::now();
+        self.stage_timers
+            .validate
+            .record(validated_at.duration_since(started_at));
+        let stride_end = aligned_segment_end_height(
+            block.facts.block_header.height,
+            DEFAULT_SETTLED_SEGMENT_BLOCKS,
+        )?;
+        let goes_to_sealer = self
+            .sealable_ceiling
+            .is_some_and(|ceiling| stride_end <= ceiling);
+        let encoded = EncodedBlockValues::encode(&block, self.stored_set, goes_to_sealer)?;
+        let encoded_at = Instant::now();
+        self.stage_timers
+            .encode
+            .record(encoded_at.duration_since(validated_at));
+        let row = BlockSequenceRow::from_validated_block(&block, &encoded)?;
+        self.record_sequence_row(row)?;
+        let sequenced_at = Instant::now();
+        self.stage_timers
+            .sequence
+            .record(sequenced_at.duration_since(encoded_at));
+        self.write_staged_block(block, encoded)?;
+        if checkpoint_required {
+            self.checkpoint_tree_sizes = row.tip_metadata;
+        }
+        self.stage_timers.write.record(sequenced_at.elapsed());
+        Ok(())
+    }
+
+    fn validate_stage_block(
+        &self,
+        block: &CanonicalBuildBlock,
+    ) -> Result<bool, CanonicalStoreError> {
         let checkpoint_required = tree_state_checkpoint_required(
             block.facts.block_header.height,
             self.config.build_plan.build_tip().height,
@@ -353,22 +412,13 @@ impl<'options> CanonicalBlockSstStager<'options> {
             .is_some_and(|selection| {
                 selection.requires_checkpoint_since(self.checkpoint_tree_sizes, block.tip_metadata)
             });
-        validate_block(&self.stored_set, &block)?;
-        validate_tree_state_checkpoint_pools(self.config.network_upgrade_activations, &block)?;
-        validate_tree_state_checkpoint(checkpoint_required, &block)?;
-        if checkpoint_required {
-            self.checkpoint_tree_sizes = block.tip_metadata;
-        }
-        let validated_at = Instant::now();
-        self.stage_timers
-            .validate
-            .record(validated_at.duration_since(started_at));
-        let encoded = EncodedBlockValues::encode(&block);
-        let encoded_at = Instant::now();
-        self.stage_timers
-            .encode
-            .record(encoded_at.duration_since(validated_at));
-        let row = BlockSequenceRow::from_validated_block(&block, &encoded)?;
+        validate_block(&self.stored_set, block)?;
+        validate_tree_state_checkpoint_pools(self.config.network_upgrade_activations, block)?;
+        validate_tree_state_checkpoint(checkpoint_required, block)?;
+        Ok(checkpoint_required)
+    }
+
+    fn record_sequence_row(&mut self, row: BlockSequenceRow) -> Result<(), CanonicalStoreError> {
         if let Some(sequence) = &mut self.sequence {
             sequence.append(row)?;
         } else {
@@ -378,86 +428,183 @@ impl<'options> CanonicalBlockSstStager<'options> {
             .map_err(|_| CanonicalStoreError::block_load_sequence("reorg window exceeds usize"))?;
             self.sequence = Some(BlockSequence::new(row, retained_checkpoint_count)?);
         }
-        let sequenced_at = Instant::now();
-        self.stage_timers
-            .sequence
-            .record(sequenced_at.duration_since(encoded_at));
-        write_build_block(
-            block,
-            encoded,
-            &mut self.header_writer,
-            &mut self.replay_writer,
-            &mut self.compact_writer,
-            &mut self.transaction_blob_writer,
-            &mut self.block_blob_writer,
-            &mut self.tree_state_checkpoint_writer,
-            &mut self.block_final_note_commitment_roots_writer,
-            &mut self.block_hash_sorter,
-            &mut self.transaction_location_sorter,
-        )?;
-        self.stage_timers.write.record(sequenced_at.elapsed());
+        Ok(())
+    }
+
+    fn write_staged_block(
+        &mut self,
+        block: CanonicalBuildBlock,
+        encoded: EncodedBlockValues,
+    ) -> Result<(), CanonicalStoreError> {
+        let height_key = encode_block_position(block.facts.block_header.height);
+        self.write_common_index_rows(&block.facts, &encoded)?;
+        match encoded.tail_or_seal {
+            TailOrSeal::LiveTail(split) => {
+                self.live_tail_block_writer
+                    .put(&height_key, &split.block_bytes)?;
+                if let Some(raw_bytes) = split.raw_block_bytes {
+                    self.live_tail_raw_block_writer
+                        .put(&height_key, &raw_bytes)?;
+                }
+            }
+            TailOrSeal::Seal(native_bytes) => {
+                let raw_block = live_tail_raw_block_from_blobs(
+                    &block.facts,
+                    block.block_blob.as_ref(),
+                    &block.transaction_blobs,
+                    self.stored_set.raw_blob_retention(),
+                )?;
+                let sealer_input = SettledSegmentBlockInput {
+                    compact_block: block.compact_block,
+                    native_bytes,
+                    canonical_facts: block.facts,
+                    raw_block,
+                };
+                for entry in self.sealer.push_block(sealer_input)? {
+                    write_settled_segment_index_entry(
+                        &mut self.settled_segment_index_writer,
+                        self.sequence.as_mut(),
+                        &entry,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_common_index_rows(
+        &mut self,
+        facts: &CanonicalBlockFacts,
+        encoded: &EncodedBlockValues,
+    ) -> Result<(), CanonicalStoreError> {
+        let height = facts.block_header.height;
+        let height_key = encode_block_position(height);
+        let header_bytes = encode_block_header(&facts.block_header);
+        self.header_writer.put(&height_key, &header_bytes)?;
+        let block_hash_record = encode_block_hash_location(facts.block_header.block_hash, height);
+        self.block_hash_sorter.push(block_hash_record)?;
+        for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
+            let transaction_index = u32::try_from(transaction_index).map_err(|_| {
+                CanonicalStoreError::block_load_sequence(format!(
+                    "block {} transaction count exceeds u32::MAX",
+                    height.value()
+                ))
+            })?;
+            let location_record = encode_transaction_location(
+                TransactionLocation::new(
+                    transaction.public_facts.transaction_id,
+                    height,
+                    facts.block_header.block_hash,
+                    transaction_index,
+                ),
+                transaction.serialized_bytes_digest.as_bytes(),
+            );
+            self.transaction_location_sorter.push(location_record)?;
+        }
+        if let Some(checkpoint_bytes) = &encoded.tree_state_checkpoint {
+            self.tree_state_checkpoint_writer
+                .put(&height_key, checkpoint_bytes)?;
+        }
         Ok(())
     }
 
     fn finish(self) -> Result<PreparedCanonicalBlockLoad, CanonicalStoreError> {
-        let sequence = self.sequence.ok_or_else(|| {
+        let Self {
+            config,
+            header_writer,
+            live_tail_block_writer,
+            live_tail_raw_block_writer,
+            mut settled_segment_index_writer,
+            tree_state_checkpoint_writer,
+            block_hash_sorter,
+            transaction_location_sorter,
+            sealer,
+            mut sequence,
+            predecessor_checkpoint_logical_bytes,
+            ..
+        } = self;
+        if sealer.pending_len() != 0 {
+            return Err(CanonicalStoreError::block_load_sequence(
+                "unsealed blocks remained in settled segment sealer at finish",
+            ));
+        }
+        for entry in sealer.finish()? {
+            write_settled_segment_index_entry(
+                &mut settled_segment_index_writer,
+                sequence.as_mut(),
+                &entry,
+            )?;
+        }
+        let sequence = sequence.ok_or_else(|| {
             CanonicalStoreError::block_load_sequence(
                 "a canonical block load must contain at least one block",
             )
         })?;
-        let options = self.config.options;
-        let sst_target_logical_bytes = self.config.sst_target_logical_bytes;
+        let options = config.options;
+        let sst_target_logical_bytes = config.sst_target_logical_bytes;
         let artifacts = CanonicalBlockSstArtifacts {
             header: timed_finish_step("sst_finish", BLOCK_HEADER_COLUMN_FAMILY, || {
-                self.header_writer.finish()
+                header_writer.finish()
             })?,
             block_hash: timed_finish_step("sort_merge", BLOCK_HASH_INDEX_COLUMN_FAMILY, || {
-                self.block_hash_sorter.finish::<32>(
+                block_hash_sorter.finish::<32>(
                     options.for_family(BLOCK_HASH_INDEX_COLUMN_FAMILY),
                     sst_target_logical_bytes,
                 )
             })?,
-            replay: timed_finish_step("sst_finish", BLOCK_REPLAY_COLUMN_FAMILY, || {
-                self.replay_writer.finish()
-            })?,
-            compact: timed_finish_step("sst_finish", COMPACT_BLOCK_COLUMN_FAMILY, || {
-                self.compact_writer.finish()
-            })?,
+            live_tail_block: timed_finish_step(
+                "sst_finish",
+                LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+                || live_tail_block_writer.finish(),
+            )?,
+            live_tail_raw_block: timed_finish_step(
+                "sst_finish",
+                LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
+                || live_tail_raw_block_writer.finish(),
+            )?,
+            settled_segment_index: timed_finish_step(
+                "sst_finish",
+                SETTLED_SEGMENT_INDEX_COLUMN_FAMILY,
+                || settled_segment_index_writer.finish(),
+            )?,
             transaction_location: timed_finish_step(
                 "sort_merge",
                 TRANSACTION_LOCATION_COLUMN_FAMILY,
                 || {
-                    self.transaction_location_sorter.finish::<32>(
+                    transaction_location_sorter.finish::<32>(
                         options.for_family(TRANSACTION_LOCATION_COLUMN_FAMILY),
                         sst_target_logical_bytes,
                     )
                 },
             )?,
-            transaction_blob: timed_finish_step(
-                "sst_finish",
-                TRANSACTION_BLOB_COLUMN_FAMILY,
-                || self.transaction_blob_writer.finish(),
-            )?,
-            block_blob: timed_finish_step("sst_finish", BLOCK_BLOB_COLUMN_FAMILY, || {
-                self.block_blob_writer.finish()
-            })?,
             tree_state_checkpoint: timed_finish_step(
                 "sst_finish",
                 TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-                || self.tree_state_checkpoint_writer.finish(),
-            )?,
-            block_final_note_commitment_roots: timed_finish_step(
-                "sst_finish",
-                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-                || self.block_final_note_commitment_roots_writer.finish(),
+                || tree_state_checkpoint_writer.finish(),
             )?,
         };
         prepare_canonical_block_load(
+            config.build_plan.network(),
             sequence,
             artifacts,
-            self.predecessor_checkpoint_logical_bytes,
+            predecessor_checkpoint_logical_bytes,
         )
     }
+}
+
+fn write_settled_segment_index_entry(
+    writer: &mut OrderedSstWriter<'_>,
+    sequence: Option<&mut BlockSequence>,
+    entry: &SettledSegmentIndexEntry,
+) -> Result<(), CanonicalStoreError> {
+    let index_key = encode_block_position(entry.start_height);
+    let index_bytes = entry.encode_v1()?;
+    writer.put(&index_key, &index_bytes)?;
+    let index_row_bytes = checked_row_bytes(index_key.len(), index_bytes.len())?;
+    if let Some(seq) = sequence {
+        seq.record_sealed_segment(index_row_bytes)?;
+    }
+    Ok(())
 }
 
 impl<'options> CanonicalBlockSstConfig<'options> {
@@ -478,16 +625,15 @@ impl<'options> CanonicalBlockSstConfig<'options> {
 struct CanonicalBlockSstArtifacts {
     header: SstFileSet,
     block_hash: SstFileSet,
-    replay: SstFileSet,
-    compact: SstFileSet,
+    live_tail_block: SstFileSet,
+    live_tail_raw_block: SstFileSet,
+    settled_segment_index: SstFileSet,
     transaction_location: SstFileSet,
-    transaction_blob: SstFileSet,
-    block_blob: SstFileSet,
     tree_state_checkpoint: SstFileSet,
-    block_final_note_commitment_roots: SstFileSet,
 }
 
 fn prepare_canonical_block_load(
+    network: Network,
     sequence: BlockSequence,
     artifacts: CanonicalBlockSstArtifacts,
     predecessor_checkpoint_logical_bytes: u64,
@@ -495,40 +641,31 @@ fn prepare_canonical_block_load(
     let CanonicalBlockSstArtifacts {
         header,
         block_hash,
-        replay,
-        compact,
+        live_tail_block,
+        live_tail_raw_block,
+        settled_segment_index,
         transaction_location,
-        transaction_blob,
-        block_blob,
         tree_state_checkpoint,
-        block_final_note_commitment_roots,
     } = artifacts;
     let sst_file_bytes = [
         header.file_bytes,
         block_hash.file_bytes,
-        replay.file_bytes,
-        compact.file_bytes,
+        live_tail_block.file_bytes,
+        live_tail_raw_block.file_bytes,
+        settled_segment_index.file_bytes,
         transaction_location.file_bytes,
-        transaction_blob.file_bytes,
-        block_blob.file_bytes,
         tree_state_checkpoint.file_bytes,
-        block_final_note_commitment_roots.file_bytes,
     ]
     .into_iter()
     .try_fold(0_u64, checked_add_sst_bytes)?;
     let families = vec![
         PreparedColumnFamily::new(BLOCK_HEADER_COLUMN_FAMILY, header),
         PreparedColumnFamily::new(BLOCK_HASH_INDEX_COLUMN_FAMILY, block_hash),
-        PreparedColumnFamily::new(BLOCK_REPLAY_COLUMN_FAMILY, replay),
-        PreparedColumnFamily::new(COMPACT_BLOCK_COLUMN_FAMILY, compact),
+        PreparedColumnFamily::new(LIVE_TAIL_BLOCK_COLUMN_FAMILY, live_tail_block),
+        PreparedColumnFamily::new(LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY, live_tail_raw_block),
+        PreparedColumnFamily::new(SETTLED_SEGMENT_INDEX_COLUMN_FAMILY, settled_segment_index),
         PreparedColumnFamily::new(TRANSACTION_LOCATION_COLUMN_FAMILY, transaction_location),
-        PreparedColumnFamily::new(TRANSACTION_BLOB_COLUMN_FAMILY, transaction_blob),
-        PreparedColumnFamily::new(BLOCK_BLOB_COLUMN_FAMILY, block_blob),
         PreparedColumnFamily::new(TREE_STATE_CHECKPOINT_COLUMN_FAMILY, tree_state_checkpoint),
-        PreparedColumnFamily::new(
-            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-            block_final_note_commitment_roots,
-        ),
     ];
     let sst_file_count = families.iter().try_fold(0_u64, |count, family| {
         let family_count = u64::try_from(family.paths.len()).map_err(|_| {
@@ -549,6 +686,7 @@ fn prepare_canonical_block_load(
         predecessor_checkpoint_logical_bytes,
     )?;
     Ok(PreparedCanonicalBlockLoad {
+        network,
         families,
         evidence: finished_sequence.evidence,
         trusted_fresh_evidence: CanonicalTrustedFreshBlockEvidence {
@@ -559,102 +697,37 @@ fn prepare_canonical_block_load(
     })
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "each argument is one independently staged physical block family"
-)]
-fn write_build_block(
-    block: CanonicalBuildBlock,
-    encoded: EncodedBlockValues,
-    header_writer: &mut OrderedSstWriter<'_>,
-    replay_writer: &mut OrderedSstWriter<'_>,
-    compact_writer: &mut OrderedSstWriter<'_>,
-    transaction_blob_writer: &mut OrderedSstWriter<'_>,
-    block_blob_writer: &mut OrderedSstWriter<'_>,
-    tree_state_checkpoint_writer: &mut OrderedSstWriter<'_>,
-    block_final_note_commitment_roots_writer: &mut OrderedSstWriter<'_>,
-    block_hash_sorter: &mut FixedRecordSorter<BLOCK_HASH_INDEX_RECORD_LEN>,
-    transaction_location_sorter: &mut FixedRecordSorter<TRANSACTION_LOCATION_RECORD_LEN>,
-) -> Result<(), CanonicalStoreError> {
-    let CanonicalBuildBlock {
-        facts,
-        replay_envelope,
-        transaction_blobs,
-        block_blob,
-        ..
-    } = block;
-    let height = facts.block_header.height;
-    let height_key = encode_block_position(height);
-    let header_value = encode_block_header(&facts.block_header);
-    header_writer.put(&height_key, &header_value)?;
-    replay_writer.put(&height_key, replay_envelope.as_bytes())?;
-    compact_writer.put(&height_key, &encoded.compact_block)?;
-
-    let block_hash_record = encode_block_hash_location(facts.block_header.block_hash, height);
-    block_hash_sorter.push(block_hash_record)?;
-
-    for (transaction_index, transaction) in facts.transactions.iter().enumerate() {
-        let transaction_index = u32::try_from(transaction_index).map_err(|_| {
-            CanonicalStoreError::block_load_sequence(format!(
-                "block {} transaction count exceeds u32::MAX",
-                height.value()
-            ))
-        })?;
-        let location_record = encode_transaction_location(
-            TransactionLocation::new(
-                transaction.public_facts.transaction_id,
-                height,
-                facts.block_header.block_hash,
-                transaction_index,
-            ),
-            transaction.serialized_bytes_digest.as_bytes(),
-        );
-        transaction_location_sorter.push(location_record)?;
-    }
-
-    for (transaction_index, transaction_blob) in transaction_blobs.into_iter().enumerate() {
-        let transaction_index = u32::try_from(transaction_index).map_err(|_| {
-            CanonicalStoreError::block_load_sequence(format!(
-                "block {} transaction blob count exceeds u32::MAX",
-                height.value()
-            ))
-        })?;
-        let transaction_key = encode_transaction_position(height, transaction_index);
-        transaction_blob_writer.put(&transaction_key, &transaction_blob.raw_transaction_bytes)?;
-    }
-
-    if let Some(block_blob) = block_blob {
-        block_blob_writer.put(&height_key, &block_blob.raw_block_bytes)?;
-    }
-    if let Some(checkpoint_value) = encoded.tree_state_checkpoint {
-        tree_state_checkpoint_writer.put(&height_key, &checkpoint_value)?;
-    }
-    if let Some(roots_value) = encoded.block_final_note_commitment_roots {
-        block_final_note_commitment_roots_writer.put(&height_key, &roots_value)?;
-    }
-    Ok(())
+enum TailOrSeal {
+    LiveTail(EncodedSplitLiveTail),
+    Seal(usize),
 }
 
 /// Stored values encoded once per block for both the logical-byte accounting
-/// and the SST writers.
+/// and the SST/segment writers.
 struct EncodedBlockValues {
-    compact_block: Vec<u8>,
+    tail_or_seal: TailOrSeal,
     tree_state_checkpoint: Option<Vec<u8>>,
-    block_final_note_commitment_roots: Option<Vec<u8>>,
 }
 
 impl EncodedBlockValues {
-    fn encode(block: &CanonicalBuildBlock) -> Self {
-        Self {
-            compact_block: crate::encode_compact_block_artifact(&block.compact_block),
+    fn encode(
+        block: &CanonicalBuildBlock,
+        stored_set: CanonicalStoredSet,
+        goes_to_sealer: bool,
+    ) -> Result<Self, CanonicalStoreError> {
+        let tail_or_seal = if goes_to_sealer {
+            let native_bytes =
+                crate::proto_codec::encoded_compact_block_artifact_len(&block.compact_block);
+            TailOrSeal::Seal(native_bytes)
+        } else {
+            TailOrSeal::LiveTail(encode_split_live_tail_from_build_block(block, stored_set)?)
+        };
+        Ok(Self {
+            tail_or_seal,
             tree_state_checkpoint: block.tree_state_checkpoint.as_ref().map(|checkpoint| {
                 encode_tree_state_checkpoint(checkpoint.block_time_seconds, &checkpoint.frontiers)
             }),
-            block_final_note_commitment_roots: block
-                .block_final_note_commitment_roots
-                .as_ref()
-                .map(encode_block_final_note_commitment_roots),
-        }
+        })
     }
 }
 
@@ -687,6 +760,7 @@ pub(super) fn ingest_canonical_block_ssts(
         })?;
         staged_ssts.extend(family.staged_ssts);
     }
+    let _manifest = sync_segments_manifest_from_db(db, prepared.network)?;
     Ok(IngestedCanonicalBlockLoad {
         evidence: prepared.evidence,
         staged_ssts,
@@ -721,19 +795,17 @@ pub(super) fn canonical_block_families_are_empty(db: &DB) -> Result<bool, Canoni
 }
 
 pub(super) fn validate_persisted_commitment_tree_families(
-    db: &DB,
-    workload: CanonicalStoreWorkload,
+    ctx: SegmentStoreContext<'_>,
     build_plan: &CanonicalStoreBuildPlan,
     tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
     validate_persisted_tree_state_checkpoints(
-        db,
+        ctx,
         build_plan,
         tree_state_checkpoint_coverage,
         evidence,
-    )?;
-    validate_persisted_block_final_note_commitment_roots(db, workload, build_plan, evidence)
+    )
 }
 
 pub(super) fn validate_source_tip_checkpoint(
@@ -783,36 +855,10 @@ pub(super) fn validate_source_tip_checkpoint(
 }
 
 pub(super) fn read_persisted_tip_metadata(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     tip: zinder_core::BlockId,
 ) -> Result<ChainTipMetadata, CanonicalStoreError> {
-    let family = db.cf_handle(COMPACT_BLOCK_COLUMN_FAMILY).ok_or_else(|| {
-        CanonicalStoreError::block_load_sequence("compact_block column family is absent")
-    })?;
-    let encoded_compact_block = db
-        .get_cf(&family, encode_block_position(tip.height))
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "read published tip compact block",
-            source,
-        })?
-        .ok_or_else(|| {
-            CanonicalStoreError::block_load_sequence("published tip compact block is absent")
-        })?;
-    let compact =
-        crate::decode_compact_block_artifact(encoded_compact_block.as_slice()).map_err(|_| {
-            CanonicalStoreError::block_load_sequence("published tip compact block is invalid")
-        })?;
-    let metadata = compact.chain_metadata();
-    if compact.height() != tip.height || compact.block_hash() != tip.hash {
-        return Err(CanonicalStoreError::block_load_sequence(
-            "published tip compact block has the wrong canonical identity",
-        ));
-    }
-    Ok(ChainTipMetadata::new(
-        metadata.sapling_commitment_tree_size,
-        metadata.orchard_commitment_tree_size,
-        metadata.ironwood_commitment_tree_size,
-    ))
+    read_persisted_tip_metadata_v2(ctx, tip)
 }
 
 pub(super) fn read_persisted_tip_checkpoint(
@@ -849,11 +895,12 @@ pub(super) fn read_persisted_tip_checkpoint(
 }
 
 fn validate_persisted_tree_state_checkpoints(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     build_plan: &CanonicalStoreBuildPlan,
     coverage: TreeStateCheckpointCoverage,
     evidence: &CanonicalBlockLoadEvidence,
 ) -> Result<(), CanonicalStoreError> {
+    let db = ctx.db;
     let family = db
         .cf_handle(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)
         .ok_or_else(|| {
@@ -902,7 +949,7 @@ fn validate_persisted_tree_state_checkpoints(
                 if let Some(selection @ TreeStateCheckpointSelection::CommitmentBudget(_)) =
                     coverage.selection()
                 {
-                    validate_persisted_budget_step(db, build_plan, selection, previous, height)?;
+                    validate_persisted_budget_step(ctx, build_plan, selection, previous, height)?;
                 }
             }
             None => {}
@@ -962,7 +1009,7 @@ fn validate_persisted_checkpoint_step(
 }
 
 fn validate_persisted_budget_step(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     build_plan: &CanonicalStoreBuildPlan,
     selection: TreeStateCheckpointSelection,
     previous: BlockHeight,
@@ -973,7 +1020,7 @@ fn validate_persisted_budget_step(
         if height == predecessor.block_id.height {
             return Ok(predecessor.tip_metadata());
         }
-        let compact = read_compact_block_at(db, height)?.ok_or_else(|| {
+        let compact = read_compact_block_split(ctx, height)?.ok_or_else(|| {
             CanonicalStoreError::block_load_sequence(format!(
                 "compact block at height {} is absent during checkpoint validation",
                 height.value(),
@@ -1019,64 +1066,6 @@ fn validate_tree_state_checkpoint_readback(
         return Ok(());
     }
     Err(CanonicalStoreError::BlockLoadReadbackMismatch)
-}
-
-fn validate_persisted_block_final_note_commitment_roots(
-    db: &DB,
-    workload: CanonicalStoreWorkload,
-    build_plan: &CanonicalStoreBuildPlan,
-    evidence: &CanonicalBlockLoadEvidence,
-) -> Result<(), CanonicalStoreError> {
-    let family = db
-        .cf_handle(BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY)
-        .ok_or_else(|| {
-            CanonicalStoreError::block_load_sequence(
-                "block_final_note_commitment_roots column family is absent",
-            )
-        })?;
-    let mut row_count = 0_u64;
-    for row in db.iterator_cf(&family, IteratorMode::Start) {
-        let (key, encoded_roots) = row.map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "block final note-commitment roots persisted readback",
-            source,
-        })?;
-        let height = zinder_core::wire::decode_height_key_ascending(&key).map_err(|source| {
-            CanonicalStoreError::block_load_sequence(format!(
-                "block_final_note_commitment_roots has an invalid height key: {source}"
-            ))
-        })?;
-        if height < build_plan.first_retained_height() || height > build_plan.build_tip().height {
-            return Err(CanonicalStoreError::block_load_sequence(format!(
-                "block_final_note_commitment_roots height {} is outside retained history",
-                height.value()
-            )));
-        }
-        decode_block_final_note_commitment_roots(
-            height,
-            BlockHash::from_bytes([0; 32]),
-            &encoded_roots,
-        )
-        .map_err(|source| {
-            CanonicalStoreError::block_load_sequence(format!(
-                "block_final_note_commitment_roots at height {} is invalid: {source}",
-                height.value()
-            ))
-        })?;
-        row_count = row_count.checked_add(1).ok_or_else(|| {
-            CanonicalStoreError::block_load_sequence(
-                "persisted block final note-commitment roots count exceeds u64::MAX",
-            )
-        })?;
-    }
-    if row_count != evidence.block_final_note_commitment_roots_count
-        || (!build_plan
-            .stored_set(workload)
-            .contains(CanonicalStoredData::FinalNoteCommitmentRoots)
-            && row_count != 0)
-    {
-        return Err(CanonicalStoreError::BlockLoadReadbackMismatch);
-    }
-    Ok(())
 }
 
 /// Requires a loaded checkpoint to carry a frontier for exactly the pools
@@ -1150,8 +1139,7 @@ fn validate_block(
     }
     validate_compact_block_payload(block)?;
     validate_transaction_blobs(stored_set, block)?;
-    validate_block_blob(stored_set, block)?;
-    validate_block_final_note_commitment_roots(stored_set, block)
+    validate_block_blob(stored_set, block)
 }
 
 pub(super) fn validate_compact_block_payload(
@@ -1338,33 +1326,6 @@ fn tree_state_checkpoint_required(height: BlockHeight, build_tip_height: BlockHe
     height == build_tip_height || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE)
 }
 
-fn validate_block_final_note_commitment_roots(
-    stored_set: &CanonicalStoredSet,
-    block: &CanonicalBuildBlock,
-) -> Result<(), CanonicalStoreError> {
-    let header = &block.facts.block_header;
-    let height = header.height;
-    match (
-        stored_set.contains(CanonicalStoredData::FinalNoteCommitmentRoots),
-        block.block_final_note_commitment_roots,
-    ) {
-        (false, Some(_)) => {
-            return Err(CanonicalStoreError::block_load_sequence(format!(
-                "wallet block {} unexpectedly contains explorer final note-commitment roots",
-                height.value()
-            )));
-        }
-        (true, Some(roots)) if roots.height != height || roots.block_hash != header.block_hash => {
-            return Err(CanonicalStoreError::block_load_sequence(format!(
-                "explorer block {} final note-commitment roots do not match its canonical identity",
-                height.value()
-            )));
-        }
-        (false, None) | (true, None | Some(_)) => {}
-    }
-    Ok(())
-}
-
 struct BlockSequence {
     first_height: BlockHeight,
     first_parent_hash: BlockHash,
@@ -1374,11 +1335,16 @@ struct BlockSequence {
     tip_metadata: ChainTipMetadata,
     block_count: u64,
     transaction_count: u64,
+    settled_segment_index_count: u64,
+    live_tail_block_count: u64,
+    live_tail_raw_block_count: u64,
     transaction_blob_count: u64,
     block_blob_count: u64,
     tree_state_checkpoint_count: u64,
-    block_final_note_commitment_roots_count: u64,
     family_logical_bytes: BlockFamilyLogicalBytes,
+    settled_segment_index_logical_bytes: u64,
+    transaction_blob_logical_bytes: u64,
+    block_blob_logical_bytes: u64,
     logical_replay_bytes: u64,
     sequence_digest: CanonicalBlockFactsSequenceDigestBuilder,
     retained_checkpoint_count: usize,
@@ -1386,17 +1352,24 @@ struct BlockSequence {
 }
 
 #[derive(Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "per-block presence flags retained for cold readiness evidence"
+)]
 struct BlockSequenceRow {
     height: BlockHeight,
     block_hash: BlockHash,
     parent_hash: BlockHash,
     tip_metadata: ChainTipMetadata,
     transaction_count: u64,
+    has_live_tail_block: bool,
+    has_live_tail_raw_block: bool,
     transaction_blob_count: u64,
     has_block_blob: bool,
     has_tree_state_checkpoint: bool,
-    has_block_final_note_commitment_roots: bool,
     family_logical_bytes: BlockFamilyLogicalBytes,
+    transaction_blob_logical_bytes: u64,
+    block_blob_logical_bytes: u64,
     replay_value_bytes: u64,
     facts_digest: zinder_core::CanonicalBlockFactsDigest,
 }
@@ -1405,19 +1378,15 @@ struct BlockSequenceRow {
 struct BlockFamilyLogicalBytes {
     block_header: u64,
     block_hash_index: u64,
-    block_replay: u64,
-    compact_block: u64,
+    live_tail_block: u64,
+    live_tail_raw_block: u64,
     transaction_location: u64,
-    transaction_blob: u64,
-    block_blob: u64,
     tree_state_checkpoint: u64,
-    block_final_note_commitment_roots: u64,
 }
 
 impl BlockSequenceRow {
-    /// Measures a block that already passed [`validate_build_block`], which
-    /// requires its replay envelope's reference digest to equal its facts
-    /// digest, so the envelope's digest stands in for recomputing it.
+    /// Measures a block that already passed `validate_block`, which requires
+    /// its replay envelope's reference digest to equal its facts digest.
     fn from_validated_block(
         block: &CanonicalBuildBlock,
         encoded: &EncodedBlockValues,
@@ -1448,39 +1417,53 @@ impl BlockSequenceRow {
         let block_blob_logical_bytes = block.block_blob.as_ref().map_or(Ok(0), |block_blob| {
             checked_row_bytes(4, block_blob.raw_block_bytes.len())
         })?;
+        let (
+            has_live_tail_block,
+            live_tail_block_logical_bytes,
+            has_live_tail_raw_block,
+            live_tail_raw_block_logical_bytes,
+        ) = match &encoded.tail_or_seal {
+            TailOrSeal::LiveTail(split) => {
+                let raw = match &split.raw_block_bytes {
+                    Some(bytes) => (true, checked_row_bytes(4, bytes.len())?),
+                    None => (false, 0),
+                };
+                (
+                    true,
+                    checked_row_bytes(4, split.block_bytes.len())?,
+                    raw.0,
+                    raw.1,
+                )
+            }
+            TailOrSeal::Seal(_) => (false, 0, false, 0),
+        };
         let tree_state_checkpoint_logical_bytes = encoded
             .tree_state_checkpoint
             .as_ref()
-            .map_or(Ok(0), |checkpoint_value| {
-                checked_row_bytes(4, checkpoint_value.len())
+            .map_or(Ok(0), |checkpoint_bytes| {
+                checked_row_bytes(4, checkpoint_bytes.len())
             })?;
-        let block_final_note_commitment_roots_logical_bytes = encoded
-            .block_final_note_commitment_roots
-            .as_ref()
-            .map_or(Ok(0), |roots_value| checked_row_bytes(4, roots_value.len()))?;
         Ok(Self {
             height: block.facts.block_header.height,
             block_hash: block.facts.block_header.block_hash,
             parent_hash: block.facts.block_header.parent_hash,
             tip_metadata: block.tip_metadata,
             transaction_count,
+            has_live_tail_block,
+            has_live_tail_raw_block,
             transaction_blob_count,
             has_block_blob: block.block_blob.is_some(),
             has_tree_state_checkpoint: block.tree_state_checkpoint.is_some(),
-            has_block_final_note_commitment_roots: block
-                .block_final_note_commitment_roots
-                .is_some(),
             family_logical_bytes: BlockFamilyLogicalBytes {
                 block_header: checked_row_bytes(4, BLOCK_HEADER_VALUE_LEN)?,
                 block_hash_index: checked_row_bytes(32, 4)?,
-                block_replay: checked_row_bytes(4, block.replay_envelope.as_bytes().len())?,
-                compact_block: checked_row_bytes(4, encoded.compact_block.len())?,
+                live_tail_block: live_tail_block_logical_bytes,
+                live_tail_raw_block: live_tail_raw_block_logical_bytes,
                 transaction_location: transaction_location_logical_bytes,
-                transaction_blob: transaction_blob_logical_bytes,
-                block_blob: block_blob_logical_bytes,
                 tree_state_checkpoint: tree_state_checkpoint_logical_bytes,
-                block_final_note_commitment_roots: block_final_note_commitment_roots_logical_bytes,
             },
+            transaction_blob_logical_bytes,
+            block_blob_logical_bytes,
             replay_value_bytes: u64::try_from(block.replay_envelope.as_bytes().len()).map_err(
                 |_| CanonicalStoreError::block_load_sequence("replay byte length exceeds u64::MAX"),
             )?,
@@ -1497,24 +1480,18 @@ impl BlockFamilyLogicalBytes {
                 self.block_hash_index,
                 row.block_hash_index,
             )?,
-            block_replay: checked_add_logical_bytes(self.block_replay, row.block_replay)?,
-            compact_block: checked_add_logical_bytes(self.compact_block, row.compact_block)?,
+            live_tail_block: checked_add_logical_bytes(self.live_tail_block, row.live_tail_block)?,
+            live_tail_raw_block: checked_add_logical_bytes(
+                self.live_tail_raw_block,
+                row.live_tail_raw_block,
+            )?,
             transaction_location: checked_add_logical_bytes(
                 self.transaction_location,
                 row.transaction_location,
             )?,
-            transaction_blob: checked_add_logical_bytes(
-                self.transaction_blob,
-                row.transaction_blob,
-            )?,
-            block_blob: checked_add_logical_bytes(self.block_blob, row.block_blob)?,
             tree_state_checkpoint: checked_add_logical_bytes(
                 self.tree_state_checkpoint,
                 row.tree_state_checkpoint,
-            )?,
-            block_final_note_commitment_roots: checked_add_logical_bytes(
-                self.block_final_note_commitment_roots,
-                row.block_final_note_commitment_roots,
             )?,
         })
     }
@@ -1523,13 +1500,10 @@ impl BlockFamilyLogicalBytes {
         [
             self.block_header,
             self.block_hash_index,
-            self.block_replay,
-            self.compact_block,
+            self.live_tail_block,
+            self.live_tail_raw_block,
             self.transaction_location,
-            self.transaction_blob,
-            self.block_blob,
             self.tree_state_checkpoint,
-            self.block_final_note_commitment_roots,
         ]
         .into_iter()
         .try_fold(0_u64, checked_add_logical_bytes)
@@ -1556,13 +1530,16 @@ impl BlockSequence {
             tip_metadata: row.tip_metadata,
             block_count: 1,
             transaction_count: row.transaction_count,
+            settled_segment_index_count: 0,
+            live_tail_block_count: u64::from(row.has_live_tail_block),
+            live_tail_raw_block_count: u64::from(row.has_live_tail_raw_block),
             transaction_blob_count: row.transaction_blob_count,
             block_blob_count: u64::from(row.has_block_blob),
             tree_state_checkpoint_count: u64::from(row.has_tree_state_checkpoint),
-            block_final_note_commitment_roots_count: u64::from(
-                row.has_block_final_note_commitment_roots,
-            ),
             family_logical_bytes: row.family_logical_bytes,
+            settled_segment_index_logical_bytes: 0,
+            transaction_blob_logical_bytes: row.transaction_blob_logical_bytes,
+            block_blob_logical_bytes: row.block_blob_logical_bytes,
             logical_replay_bytes: row.replay_value_bytes,
             sequence_digest,
             retained_checkpoint_count,
@@ -1570,6 +1547,20 @@ impl BlockSequence {
         };
         sequence.retain_checkpoint();
         Ok(sequence)
+    }
+
+    fn record_sealed_segment(&mut self, row_bytes: u64) -> Result<(), CanonicalStoreError> {
+        self.settled_segment_index_count = self
+            .settled_segment_index_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence(
+                    "settled segment index count exceeds u64::MAX",
+                )
+            })?;
+        self.settled_segment_index_logical_bytes =
+            checked_add_logical_bytes(self.settled_segment_index_logical_bytes, row_bytes)?;
+        Ok(())
     }
 
     fn append(&mut self, row: BlockSequenceRow) -> Result<(), CanonicalStoreError> {
@@ -1630,6 +1621,20 @@ impl BlockSequence {
             .ok_or_else(|| {
                 CanonicalStoreError::block_load_sequence("transaction count exceeds u64::MAX")
             })?;
+        self.live_tail_block_count = self
+            .live_tail_block_count
+            .checked_add(u64::from(row.has_live_tail_block))
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence("live tail block count exceeds u64::MAX")
+            })?;
+        self.live_tail_raw_block_count = self
+            .live_tail_raw_block_count
+            .checked_add(u64::from(row.has_live_tail_raw_block))
+            .ok_or_else(|| {
+                CanonicalStoreError::block_load_sequence(
+                    "live tail raw block count exceeds u64::MAX",
+                )
+            })?;
         self.transaction_blob_count = self
             .transaction_blob_count
             .checked_add(row.transaction_blob_count)
@@ -1650,14 +1655,12 @@ impl BlockSequence {
                     "tree-state checkpoint count exceeds u64::MAX",
                 )
             })?;
-        self.block_final_note_commitment_roots_count = self
-            .block_final_note_commitment_roots_count
-            .checked_add(u64::from(row.has_block_final_note_commitment_roots))
-            .ok_or_else(|| {
-                CanonicalStoreError::block_load_sequence(
-                    "block final note-commitment roots count exceeds u64::MAX",
-                )
-            })?;
+        self.transaction_blob_logical_bytes = checked_add_logical_bytes(
+            self.transaction_blob_logical_bytes,
+            row.transaction_blob_logical_bytes,
+        )?;
+        self.block_blob_logical_bytes =
+            checked_add_logical_bytes(self.block_blob_logical_bytes, row.block_blob_logical_bytes)?;
         Ok(())
     }
 
@@ -1686,7 +1689,10 @@ impl BlockSequence {
             family_logical_bytes.tree_state_checkpoint,
             predecessor_checkpoint_logical_bytes,
         )?;
-        let logical_bytes = family_logical_bytes.checked_sum()?;
+        let logical_bytes = checked_add_logical_bytes(
+            family_logical_bytes.checked_sum()?,
+            self.settled_segment_index_logical_bytes,
+        )?;
         let evidence = CanonicalBlockLoadEvidence {
             first_height: self.first_height,
             first_parent_hash: self.first_parent_hash,
@@ -1698,8 +1704,9 @@ impl BlockSequence {
             transaction_count: self.transaction_count,
             block_header_count: self.block_count,
             block_hash_index_count: self.block_count,
-            block_replay_count: self.block_count,
-            compact_block_count: self.block_count,
+            settled_segment_index_count: self.settled_segment_index_count,
+            live_tail_block_count: self.live_tail_block_count,
+            live_tail_raw_block_count: self.live_tail_raw_block_count,
             transaction_location_count: self.transaction_count,
             transaction_blob_count: self.transaction_blob_count,
             block_blob_count: self.block_blob_count,
@@ -1711,17 +1718,16 @@ impl BlockSequence {
                         "tree-state checkpoint count exceeds u64::MAX",
                     )
                 })?,
-            block_final_note_commitment_roots_count: self.block_final_note_commitment_roots_count,
             block_header_logical_bytes: family_logical_bytes.block_header,
             block_hash_index_logical_bytes: family_logical_bytes.block_hash_index,
-            block_replay_logical_bytes: family_logical_bytes.block_replay,
-            compact_block_logical_bytes: family_logical_bytes.compact_block,
+            logical_replay_bytes: self.logical_replay_bytes,
+            settled_segment_index_logical_bytes: self.settled_segment_index_logical_bytes,
+            live_tail_block_logical_bytes: family_logical_bytes.live_tail_block,
+            live_tail_raw_block_logical_bytes: family_logical_bytes.live_tail_raw_block,
             transaction_location_logical_bytes: family_logical_bytes.transaction_location,
-            transaction_blob_logical_bytes: family_logical_bytes.transaction_blob,
-            block_blob_logical_bytes: family_logical_bytes.block_blob,
+            transaction_blob_logical_bytes: self.transaction_blob_logical_bytes,
+            block_blob_logical_bytes: self.block_blob_logical_bytes,
             tree_state_checkpoint_logical_bytes: family_logical_bytes.tree_state_checkpoint,
-            block_final_note_commitment_roots_logical_bytes: family_logical_bytes
-                .block_final_note_commitment_roots,
             logical_bytes,
             sst_file_bytes,
             sst_file_count,

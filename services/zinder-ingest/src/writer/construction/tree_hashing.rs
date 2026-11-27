@@ -21,7 +21,7 @@ use std::{
 use parking_lot::{Condvar, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
-use zinder_core::{BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, CommitmentTreeSnapshot};
+use zinder_core::BlockHeight;
 use zinder_store::{CanonicalBuildBlock, CanonicalBuildSubtreeRoot};
 
 use super::{CanonicalConstructionError, progress::ConstructionProgress};
@@ -317,17 +317,6 @@ impl Drop for PipelinedBuildBlocks {
             let _joined = handle.join();
         }
     }
-}
-
-/// Derives the explorer workload's final roots, omitting a block before any
-/// pool activates, as the serial loader does.
-pub(super) fn final_roots(
-    snapshot: &CommitmentTreeSnapshot,
-    block_hash: BlockHash,
-) -> Option<BlockFinalNoteCommitmentRoots> {
-    let roots = snapshot.final_note_commitment_roots(block_hash);
-    (roots.sapling.is_some() || roots.orchard.is_some() || roots.ironwood.is_some())
-        .then_some(roots)
 }
 
 #[cfg(test)]

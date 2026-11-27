@@ -1,25 +1,32 @@
 use std::{
+    borrow::Cow,
     collections::VecDeque,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
-use rust_rocksdb::{BoundColumnFamily, DB, DBRawIteratorWithThreadMode, ReadOptions};
+use rust_rocksdb::{DB, ReadOptions};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockHeightRangeIter, BlockId, CanonicalBlockFacts,
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFacts,
     CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalBlockReplayFormatVersion, ValidatedCanonicalBlockReplay,
-    decode_canonical_block_replay,
-    wire::{decode_height_key_ascending, encode_height_key_ascending},
+    wire::decode_height_key_ascending,
 };
 
 use super::{
     CanonicalBlockLoadEvidence, CanonicalSequenceCheckpoint, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, construction_manifest::CanonicalConstructionFamilyEvidence,
+    CanonicalStoreReadyEvidence,
+    block_load::encode_block_position,
+    construction_manifest::CanonicalConstructionFamilyEvidence,
+    rocksdb::{
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY, LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
+        SETTLED_SEGMENT_INDEX_COLUMN_FAMILY,
+    },
+    settled_segments::{
+        layout::SettledSegmentIndexEntry,
+        store_access::{self, SegmentStoreContext},
+    },
 };
-
-pub(super) const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
 
 /// Maximum rows returned by one incremental replay-range scan.
 ///
@@ -28,14 +35,19 @@ pub(super) const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
 /// incremental path back into an unbounded historical scan.
 pub const MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS: u32 = 4_096;
 
-/// One cache-bypassing, forward scan of the READY canonical replay family.
+const MAX_SETTLED_REPLAY_BATCH_BLOCKS: u32 = 255;
+
+/// One cache-bypassing, forward scan of the READY canonical replay state.
 ///
-/// Every yielded envelope is decoded and semantically validated. Reaching the
-/// end also authenticates the exact first block, visible tip, current row
-/// count, parent links, every block-local replay digest, and the complete
-/// visible sequence digest recorded by canonical publication.
+/// Every yielded block is decoded and semantically validated across settled
+/// external segments and the unsealed live tail. Reaching the end also
+/// authenticates the exact first block, visible tip, current block count, parent
+/// links, every block-local replay digest, and the complete visible sequence
+/// digest recorded by canonical publication.
 pub struct CanonicalReplayScan<'a> {
-    iterator: DBRawIteratorWithThreadMode<'a, DB>,
+    ctx: SegmentStoreContext<'a>,
+    remaining_range: Option<BlockHeightRange>,
+    buffered: VecDeque<(BlockHeight, ValidatedCanonicalBlockReplay)>,
     ready_evidence: CanonicalStoreReadyEvidence,
     previous_block: Option<(BlockHeight, BlockHash)>,
     observed_block_count: u64,
@@ -60,20 +72,24 @@ pub struct ObservedCanonicalReplaySequence {
 /// canonical replay fence concurrently.
 ///
 /// Each [`CanonicalReplaySliceScan`] decodes and verifies its slice's internal
-/// contiguity and parent links without populating the block cache. Callers
-/// that reconstruct a full history across multiple slices must verify the
-/// stitched boundaries and call [`Self::verify_complete_sequence`] before
-/// trusting the scan as a complete READY replay.
+/// contiguity and parent links across settled segments and the unsealed live
+/// tail without populating the `RocksDB` block cache. Callers that reconstruct a
+/// full history across multiple slices must verify the stitched boundaries and
+/// call [`Self::verify_complete_sequence`] before trusting the scan as a
+/// complete READY replay.
 #[derive(Clone, Copy)]
 pub struct CanonicalReplaySliceSource<'a> {
-    db: &'a DB,
+    ctx: SegmentStoreContext<'a>,
     ready_evidence: CanonicalStoreReadyEvidence,
 }
 
 impl<'a> CanonicalReplaySliceSource<'a> {
-    pub(super) const fn new(db: &'a DB, ready_evidence: &CanonicalStoreReadyEvidence) -> Self {
+    pub(super) const fn new(
+        ctx: SegmentStoreContext<'a>,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+    ) -> Self {
         Self {
-            db,
+            ctx,
             ready_evidence: *ready_evidence,
         }
     }
@@ -91,11 +107,11 @@ impl<'a> CanonicalReplaySliceSource<'a> {
         &self,
         range: BlockHeightRange,
     ) -> Result<CanonicalReplaySliceScan<'a>, CanonicalStoreError> {
-        CanonicalReplaySliceScan::new(self.db, &self.ready_evidence, range)
+        CanonicalReplaySliceScan::new(self.ctx, &self.ready_evidence, range)
     }
 
     /// Verifies that a stitched set of slices matches the complete READY fence
-    /// and that no replay rows exist past the visible tip.
+    /// and that no replay rows or settled segments exist past the visible tip.
     pub fn verify_complete_sequence(
         &self,
         observed: ObservedCanonicalReplaySequence,
@@ -124,36 +140,66 @@ impl<'a> CanonicalReplaySliceSource<'a> {
                 "replay scan sequence digest does not match READY",
             ));
         }
-        if let Some(after_tip) = self.ready_evidence.visible_tip.height.next() {
-            let block_replay = block_replay_column_family(self.db)?;
-            let mut read_options = ReadOptions::default();
-            read_options.fill_cache(false);
-            let mut iterator = self.db.raw_iterator_cf_opt(&block_replay, read_options);
-            iterator.seek(encode_height_key_ascending(after_tip));
-            iterator
-                .status()
-                .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                    operation: "canonical replay fence check",
-                    source,
-                })?;
-            if iterator.valid() {
-                return Err(CanonicalStoreError::block_replay_sequence(
-                    "replay scan contains rows beyond the visible fence",
-                ));
-            }
-        }
-        Ok(())
+        verify_no_rows_past_tip(self.ctx, self.ready_evidence.visible_tip.height)
     }
 }
 
-/// One cache-bypassing forward scan over a height-bounded slice of `block_replay`.
+fn verify_no_rows_past_tip(
+    ctx: SegmentStoreContext<'_>,
+    visible_tip_height: BlockHeight,
+) -> Result<(), CanonicalStoreError> {
+    if let Some(after_tip) = visible_tip_height.next() {
+        check_family_has_no_rows_from(ctx.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY, after_tip)?;
+        check_family_has_no_rows_from(ctx.db, LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY, after_tip)?;
+    }
+    let settled = match ctx.sealed_segments {
+        Some(entries) => Cow::Borrowed(entries),
+        None => Cow::Owned(store_access::read_all_settled_segment_entries(ctx.db)?),
+    };
+    if let Some(last) = settled.last()
+        && last.end_block.height > visible_tip_height
+    {
+        return Err(CanonicalStoreError::block_replay_sequence(
+            "settled segment index extends beyond the visible fence",
+        ));
+    }
+    Ok(())
+}
+
+fn check_family_has_no_rows_from(
+    db: &DB,
+    family_name: &'static str,
+    from_height: BlockHeight,
+) -> Result<(), CanonicalStoreError> {
+    let family = db.cf_handle(family_name).ok_or_else(|| {
+        CanonicalStoreError::block_replay_sequence(format!("{family_name} column family is absent"))
+    })?;
+    let mut iterator = db.raw_iterator_cf_opt(&family, store_access::uncached_read_options());
+    iterator.seek(encode_block_position(from_height));
+    iterator
+        .status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "canonical replay fence check",
+            source,
+        })?;
+    if iterator.valid() {
+        return Err(CanonicalStoreError::block_replay_sequence(
+            "replay scan contains rows beyond the visible fence",
+        ));
+    }
+    Ok(())
+}
+
+/// One cache-bypassing forward scan over a height-bounded slice of replay blocks.
 ///
 /// Every yielded row is decoded, version-checked, height-checked, and linked to
 /// its immediate predecessor within the slice. Reaching `None` verifies that
 /// every height in the requested slice was present with no gaps or trailing
 /// rows.
 pub struct CanonicalReplaySliceScan<'a> {
-    iterator: DBRawIteratorWithThreadMode<'a, DB>,
+    ctx: SegmentStoreContext<'a>,
+    remaining_range: Option<BlockHeightRange>,
+    buffered: VecDeque<(BlockHeight, ValidatedCanonicalBlockReplay)>,
     ready_evidence: CanonicalStoreReadyEvidence,
     range: BlockHeightRange,
     expected_block_count: u64,
@@ -164,7 +210,7 @@ pub struct CanonicalReplaySliceScan<'a> {
 
 impl<'a> CanonicalReplaySliceScan<'a> {
     fn new(
-        db: &'a DB,
+        ctx: SegmentStoreContext<'a>,
         ready_evidence: &CanonicalStoreReadyEvidence,
         range: BlockHeightRange,
     ) -> Result<Self, CanonicalStoreError> {
@@ -187,17 +233,10 @@ impl<'a> CanonicalReplaySliceScan<'a> {
             )));
         }
         let expected_block_count = u64::from(range.end.value() - range.start.value()) + 1;
-        let block_replay = block_replay_column_family(db)?;
-        let mut read_options = ReadOptions::default();
-        read_options.fill_cache(false);
-        read_options.set_readahead_size(2 * 1024 * 1024);
-        if let Some(upper_height) = range.end.next() {
-            read_options.set_iterate_upper_bound(encode_height_key_ascending(upper_height));
-        }
-        let mut iterator = db.raw_iterator_cf_opt(&block_replay, read_options);
-        iterator.seek(encode_height_key_ascending(range.start));
         Ok(Self {
-            iterator,
+            ctx,
+            remaining_range: Some(range),
+            buffered: VecDeque::new(),
             ready_evidence: *ready_evidence,
             range,
             expected_block_count,
@@ -208,12 +247,6 @@ impl<'a> CanonicalReplaySliceScan<'a> {
     }
 
     fn finish_slice(&self) -> Result<(), CanonicalStoreError> {
-        self.iterator
-            .status()
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "canonical replay slice scan",
-                source,
-            })?;
         if self.observed_block_count != self.expected_block_count {
             return Err(CanonicalStoreError::block_replay_sequence(format!(
                 "replay slice {}..={} contains {} blocks but observed {}",
@@ -280,20 +313,20 @@ impl Iterator for CanonicalReplaySliceScan<'_> {
         if self.finished {
             return None;
         }
-        if !self.iterator.valid() {
-            self.finished = true;
-            return self.finish_slice().err().map(Err);
-        }
-        let decoded_replay = self.iterator.item().map_or_else(
-            || {
-                Err(CanonicalStoreError::block_replay_sequence(
-                    "canonical replay slice iterator was valid without a row",
-                ))
-            },
-            |(key, encoded_replay)| decode_persisted_replay(key, encoded_replay),
-        );
-        let replay = (|| {
-            let (height, replay) = decoded_replay?;
+        let next_block =
+            next_buffered_replay(self.ctx, &mut self.remaining_range, &mut self.buffered);
+        let (height, replay) = match next_block {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                self.finished = true;
+                return self.finish_slice().err().map(Err);
+            }
+            Err(err) => {
+                self.finished = true;
+                return Some(Err(err));
+            }
+        };
+        let validated = (|| {
             let facts = replay.facts();
             self.validate_slice_position(
                 height,
@@ -314,11 +347,10 @@ impl Iterator for CanonicalReplaySliceScan<'_> {
             self.previous_block = Some((height, facts.block_header.block_hash));
             Ok(replay)
         })();
-        self.iterator.next();
-        if replay.is_err() {
+        if validated.is_err() {
             self.finished = true;
         }
-        Some(replay)
+        Some(validated)
     }
 }
 
@@ -346,8 +378,9 @@ fn expected_visible_block_count(
 /// version-checked, height-checked, and connected to the preceding canonical
 /// row so an incremental projection never accepts a gap or detached suffix.
 pub struct CanonicalReplayRangeScan<'a> {
-    db: &'a DB,
-    heights: BlockHeightRangeIter,
+    ctx: SegmentStoreContext<'a>,
+    remaining_range: Option<BlockHeightRange>,
+    buffered: VecDeque<(BlockHeight, ValidatedCanonicalBlockReplay)>,
     previous_hash: Option<BlockHash>,
     first_retained_block: BlockId,
     finished: bool,
@@ -355,7 +388,7 @@ pub struct CanonicalReplayRangeScan<'a> {
 
 impl<'a> CanonicalReplayRangeScan<'a> {
     pub(super) fn new(
-        db: &'a DB,
+        ctx: SegmentStoreContext<'a>,
         ready_evidence: &CanonicalStoreReadyEvidence,
         range: BlockHeightRange,
     ) -> Result<Self, CanonicalStoreError> {
@@ -377,7 +410,7 @@ impl<'a> CanonicalReplayRangeScan<'a> {
         {
             let predecessor_height = BlockHeight::new(range.start.value() - 1);
             Some(
-                read_persisted_replay(db, predecessor_height)?
+                read_persisted_replay(ctx, predecessor_height)?
                     .replay
                     .facts()
                     .block_header
@@ -387,8 +420,9 @@ impl<'a> CanonicalReplayRangeScan<'a> {
             None
         };
         Ok(Self {
-            db,
-            heights: range.into_iter(),
+            ctx,
+            remaining_range: (range.start <= range.end).then_some(range),
+            buffered: VecDeque::new(),
             previous_hash,
             first_retained_block: ready_evidence.first_retained_block,
             finished: false,
@@ -416,12 +450,19 @@ impl Iterator for CanonicalReplayRangeScan<'_> {
         if self.finished {
             return None;
         }
-        let Some(height) = self.heights.next() else {
-            self.finished = true;
-            return None;
-        };
-        let replay = (|| {
-            let replay = read_persisted_replay(self.db, height)?.replay;
+        let (height, replay) =
+            match next_buffered_replay(self.ctx, &mut self.remaining_range, &mut self.buffered) {
+                Ok(Some(block)) => block,
+                Ok(None) => {
+                    self.finished = true;
+                    return None;
+                }
+                Err(err) => {
+                    self.finished = true;
+                    return Some(Err(err));
+                }
+            };
+        let validated = (|| {
             let header = &replay.facts().block_header;
             match self.previous_hash {
                 Some(previous_hash) if header.parent_hash == previous_hash => {}
@@ -437,28 +478,27 @@ impl Iterator for CanonicalReplayRangeScan<'_> {
             self.previous_hash = Some(header.block_hash);
             Ok(replay)
         })();
-        if replay.is_err() {
+        if validated.is_err() {
             self.finished = true;
         }
-        Some(replay)
+        Some(validated)
     }
 }
 
 impl<'a> CanonicalReplayScan<'a> {
     pub(super) fn new(
-        db: &'a DB,
+        ctx: SegmentStoreContext<'a>,
         ready_evidence: &CanonicalStoreReadyEvidence,
     ) -> Result<Self, CanonicalStoreError> {
-        let block_replay = block_replay_column_family(db)?;
-        let mut read_options = ReadOptions::default();
-        read_options.fill_cache(false);
-        read_options.set_readahead_size(2 * 1024 * 1024);
-        let mut iterator = db.raw_iterator_cf_opt(&block_replay, read_options);
-        iterator.seek(encode_height_key_ascending(
+        let _ = expected_visible_block_count(ready_evidence)?;
+        let range = BlockHeightRange::inclusive(
             ready_evidence.first_retained_block.height,
-        ));
+            ready_evidence.visible_tip.height,
+        );
         Ok(Self {
-            iterator,
+            ctx,
+            remaining_range: Some(range),
+            buffered: VecDeque::new(),
             ready_evidence: *ready_evidence,
             previous_block: None,
             observed_block_count: 0,
@@ -470,25 +510,7 @@ impl<'a> CanonicalReplayScan<'a> {
     }
 
     fn finish_scan(&mut self) -> Result<(), CanonicalStoreError> {
-        self.iterator
-            .status()
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "canonical replay scan",
-                source,
-            })?;
-        let expected_block_count = u64::from(
-            self.ready_evidence
-                .visible_tip
-                .height
-                .value()
-                .checked_sub(self.ready_evidence.first_retained_block.height.value())
-                .and_then(|distance| distance.checked_add(1))
-                .ok_or_else(|| {
-                    CanonicalStoreError::block_replay_sequence(
-                        "READY visible range cannot produce a block count",
-                    )
-                })?,
-        );
+        let expected_block_count = expected_visible_block_count(&self.ready_evidence)?;
         if self.ready_evidence.visible_block_count != expected_block_count
             || self.observed_block_count != expected_block_count
         {
@@ -552,20 +574,19 @@ impl Iterator for CanonicalReplayScan<'_> {
         if self.finished {
             return None;
         }
-        if !self.iterator.valid() {
-            self.finished = true;
-            return self.finish_scan().err().map(Err);
-        }
-        let decoded_replay = self.iterator.item().map_or_else(
-            || {
-                Err(CanonicalStoreError::block_replay_sequence(
-                    "canonical replay iterator was valid without a row",
-                ))
-            },
-            |(key, encoded_replay)| decode_persisted_replay(key, encoded_replay),
-        );
-        let replay = (|| {
-            let (height, replay) = decoded_replay?;
+        let (height, replay) =
+            match next_buffered_replay(self.ctx, &mut self.remaining_range, &mut self.buffered) {
+                Ok(Some(block)) => block,
+                Ok(None) => {
+                    self.finished = true;
+                    return self.finish_scan().err().map(Err);
+                }
+                Err(err) => {
+                    self.finished = true;
+                    return Some(Err(err));
+                }
+            };
+        let validated = (|| {
             let facts = replay.facts();
             self.validate_replay_position(
                 height,
@@ -592,15 +613,69 @@ impl Iterator for CanonicalReplayScan<'_> {
             self.previous_block = Some((height, facts.block_header.block_hash));
             Ok(replay)
         })();
-        self.iterator.next();
-        if replay.is_err() {
+        if validated.is_err() {
             self.finished = true;
         }
-        Some(replay)
+        Some(validated)
     }
 }
 
-/// Cache-bypassing semantic proof of the persisted replay family.
+fn next_buffered_replay(
+    ctx: SegmentStoreContext<'_>,
+    remaining_range: &mut Option<BlockHeightRange>,
+    buffered: &mut VecDeque<(BlockHeight, ValidatedCanonicalBlockReplay)>,
+) -> Result<Option<(BlockHeight, ValidatedCanonicalBlockReplay)>, CanonicalStoreError> {
+    if let Some(front) = buffered.pop_front() {
+        return Ok(Some(front));
+    }
+    let Some(range) = *remaining_range else {
+        return Ok(None);
+    };
+    if let Some(entry) =
+        store_access::resolve_settled_segment_for_height(ctx.db, ctx.sealed_segments, range.start)?
+    {
+        let batch_limit = BlockHeight::new(
+            range
+                .start
+                .value()
+                .saturating_add(MAX_SETTLED_REPLAY_BATCH_BLOCKS - 1),
+        );
+        let batch_end = range.end.min(entry.end_block.height).min(batch_limit);
+        let readers = store_access::open_replay_segment_readers(ctx.db, ctx.segment_cache, &entry)?;
+        let rows = store_access::reconstruct_replay_range_from_segment(
+            ctx.db,
+            &readers,
+            BlockHeightRange::inclusive(range.start, batch_end),
+        )?;
+        *remaining_range = batch_end
+            .next()
+            .filter(|next| *next <= range.end)
+            .map(|start| BlockHeightRange::inclusive(start, range.end));
+        buffered.extend(rows);
+        return Ok(buffered.pop_front());
+    }
+    let encoded = store_access::read_live_tail_raw_bytes_with_options(
+        ctx.db,
+        range.start,
+        &store_access::uncached_read_options(),
+    )?
+    .ok_or_else(|| {
+        CanonicalStoreError::block_replay_sequence(format!(
+            "canonical replay at height {} is absent",
+            range.start.value()
+        ))
+    })?;
+    let step = store_access::replay_step_from_live_tail_bytes(range.start, &encoded)?;
+    validate_replay_versions(step.replay.format_version(), step.replay.reference_digest())?;
+    *remaining_range = range
+        .start
+        .next()
+        .filter(|next| *next <= range.end)
+        .map(|start| BlockHeightRange::inclusive(start, range.end));
+    Ok(Some((range.start, step.replay)))
+}
+
+/// Cache-bypassing semantic proof of the persisted replay state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PersistedBlockReplayEvidence {
     pub(super) first_height: BlockHeight,
@@ -609,13 +684,17 @@ pub(super) struct PersistedBlockReplayEvidence {
     pub(super) tip_height: BlockHeight,
     pub(super) tip_hash: BlockHash,
     pub(super) block_count: u64,
-    pub(super) logical_family_bytes: u64,
+    pub(super) settled_segment_index_count: u64,
+    pub(super) settled_segment_index_logical_bytes: u64,
+    pub(super) live_tail_block_count: u64,
+    pub(super) live_tail_block_logical_bytes: u64,
     pub(super) logical_replay_bytes: u64,
     pub(super) replay_format_version: CanonicalBlockReplayFormatVersion,
     pub(super) block_digest_version: CanonicalBlockFactsDigestVersion,
     pub(super) sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion,
     pub(super) sequence_digest: CanonicalBlockFactsSequenceDigest,
-    pub(super) family_evidence: CanonicalConstructionFamilyEvidence,
+    pub(super) settled_segment_index_evidence: CanonicalConstructionFamilyEvidence,
+    pub(super) live_tail_block_evidence: CanonicalConstructionFamilyEvidence,
     pub(super) elapsed: Duration,
 }
 
@@ -627,96 +706,225 @@ pub(super) struct PersistedBlockReplayValidation {
 /// Decodes every persisted replay row without populating the block cache.
 #[cfg(test)]
 pub(super) fn validate_persisted_block_replays(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
 ) -> Result<PersistedBlockReplayEvidence, CanonicalStoreError> {
-    Ok(validate_persisted_block_replays_with_checkpoints(db, 0)?.evidence)
+    Ok(validate_persisted_block_replays_with_checkpoints(ctx, 0)?.evidence)
 }
 
 pub(super) fn validate_persisted_block_replays_with_checkpoints(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     retained_checkpoint_count: usize,
 ) -> Result<PersistedBlockReplayValidation, CanonicalStoreError> {
     let started_at = Instant::now();
-    let block_replay = block_replay_column_family(db)?;
-    let mut read_options = ReadOptions::default();
-    read_options.fill_cache(false);
-    read_options.set_readahead_size(2 * 1024 * 1024);
-    let mut iterator = db.raw_iterator_cf_opt(&block_replay, read_options);
+    let mut state = ReplayValidationState::new(retained_checkpoint_count);
+    let (
+        settled_segment_index_count,
+        settled_segment_index_logical_bytes,
+        settled_segment_index_evidence,
+    ) = validate_settled_segments_replay(ctx, &mut state)?;
+    let (live_tail_block_count, live_tail_block_logical_bytes, live_tail_block_evidence) =
+        validate_live_tail_replay(ctx.db, &mut state)?;
+    let finished = state.sequence.map(ReplaySequence::finish).ok_or_else(|| {
+        CanonicalStoreError::block_replay_sequence(
+            "persisted canonical replay state must not be empty",
+        )
+    })?;
+    let evidence = PersistedBlockReplayEvidence {
+        first_height: finished.first_height,
+        first_parent_hash: finished.first_parent_hash,
+        first_hash: finished.first_hash,
+        tip_height: finished.tip_height,
+        tip_hash: finished.tip_hash,
+        block_count: finished.block_count,
+        settled_segment_index_count,
+        settled_segment_index_logical_bytes,
+        live_tail_block_count,
+        live_tail_block_logical_bytes,
+        logical_replay_bytes: finished.logical_replay_bytes,
+        replay_format_version: CanonicalBlockReplayFormatVersion::V1,
+        block_digest_version: CanonicalBlockFactsDigestVersion::V1,
+        sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
+        sequence_digest: finished.sequence_digest,
+        settled_segment_index_evidence,
+        live_tail_block_evidence,
+        elapsed: started_at.elapsed(),
+    };
+    Ok(PersistedBlockReplayValidation {
+        evidence,
+        retained_sequence_checkpoints: state.retained_checkpoints,
+    })
+}
+
+fn validate_settled_segments_replay(
+    ctx: SegmentStoreContext<'_>,
+    state: &mut ReplayValidationState,
+) -> Result<(u64, u64, CanonicalConstructionFamilyEvidence), CanonicalStoreError> {
+    let settled_family = ctx
+        .db
+        .cf_handle(SETTLED_SEGMENT_INDEX_COLUMN_FAMILY)
+        .ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence(
+                "settled_segment_index column family is absent",
+            )
+        })?;
+    let mut iterator = ctx
+        .db
+        .raw_iterator_cf_opt(&settled_family, store_access::uncached_read_options());
     iterator.seek_to_first();
-    let mut sequence: Option<ReplaySequence> = None;
     let mut family_evidence =
-        CanonicalConstructionFamilyEvidence::accumulator(BLOCK_REPLAY_COLUMN_FAMILY);
-    let mut retained_sequence_checkpoints = VecDeque::new();
+        CanonicalConstructionFamilyEvidence::accumulator(SETTLED_SEGMENT_INDEX_COLUMN_FAMILY);
+    let mut count = 0_u64;
+    let mut logical_bytes = 0_u64;
     while iterator.valid() {
-        let Some((key, encoded_replay)) = iterator.item() else {
-            iterator
-                .status()
-                .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                    operation: "block replay readback iteration",
-                    source,
-                })?;
+        let Some((key, encoded)) = iterator.item() else {
             break;
         };
-        let (height, replay) = decode_persisted_replay(key, encoded_replay)?;
-        family_evidence.observe(key, encoded_replay)?;
-        let facts = replay.facts();
-        let replay_bytes = u64::try_from(encoded_replay.len()).map_err(|_| {
-            CanonicalStoreError::block_replay_sequence("replay byte length exceeds u64::MAX")
+        family_evidence.observe(key, encoded)?;
+        let row_bytes = checked_key_value_bytes(key.len(), encoded.len())?;
+        logical_bytes = logical_bytes.checked_add(row_bytes).ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence(
+                "settled_segment_index logical bytes exceed u64::MAX",
+            )
         })?;
-        let logical_family_bytes = key
-            .len()
-            .checked_add(encoded_replay.len())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| {
-                CanonicalStoreError::block_replay_sequence(
-                    "replay family key and value bytes exceed u64::MAX",
-                )
-            })?;
-        let row = ReplaySequenceRow {
-            height,
-            block_hash: facts.block_header.block_hash,
-            parent_hash: facts.block_header.parent_hash,
-            reference_digest: replay.reference_digest(),
-            logical_family_bytes,
-            replay_bytes,
-        };
-        if let Some(sequence) = sequence.as_mut() {
-            sequence.append(row)?;
-        } else {
-            sequence = Some(ReplaySequence::new(row)?);
-        }
-        let sequence = sequence.as_ref().ok_or_else(|| {
-            CanonicalStoreError::block_replay_sequence("replay sequence state is absent")
+        count = count.checked_add(1).ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence("settled segment count exceeds u64::MAX")
         })?;
-        if retained_checkpoint_count > 0 {
-            retained_sequence_checkpoints.push_back(sequence.sequence_checkpoint());
-            if retained_sequence_checkpoints.len() > retained_checkpoint_count {
-                retained_sequence_checkpoints.pop_front();
-            }
-        }
         iterator.next();
     }
     iterator
         .status()
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "block replay readback iteration",
+            operation: "settled_segment_index readback iteration",
             source,
         })?;
-    let mut evidence = sequence.map(ReplaySequence::finish).ok_or_else(|| {
-        CanonicalStoreError::block_replay_sequence(
-            "persisted block replay family must not be empty",
-        )
+    let entries = store_access::read_all_settled_segment_entries(ctx.db)?;
+    if let Some(expected) = ctx.sealed_segments
+        && expected != entries.as_slice()
+    {
+        return Err(CanonicalStoreError::block_replay_sequence(
+            "settled_segment_index differs from cold-admitted segment list",
+        ));
+    }
+    for entry in &entries {
+        validate_single_settled_segment_replay(ctx, entry, state)?;
+    }
+    Ok((count, logical_bytes, family_evidence.finish()))
+}
+
+fn validate_single_settled_segment_replay(
+    ctx: SegmentStoreContext<'_>,
+    entry: &SettledSegmentIndexEntry,
+    state: &mut ReplayValidationState,
+) -> Result<(), CanonicalStoreError> {
+    let readers = store_access::open_replay_segment_readers(ctx.db, ctx.segment_cache, entry)?;
+    let mut next_height = Some(entry.start_height);
+    while let Some(chunk_start) = next_height.filter(|height| *height <= entry.end_block.height) {
+        let limit = BlockHeight::new(
+            chunk_start
+                .value()
+                .saturating_add(MAX_SETTLED_REPLAY_BATCH_BLOCKS - 1),
+        );
+        let chunk_end = entry.end_block.height.min(limit);
+        let rows = store_access::reconstruct_replay_range_from_segment(
+            ctx.db,
+            &readers,
+            BlockHeightRange::inclusive(chunk_start, chunk_end),
+        )?;
+        for (height, replay) in rows {
+            validate_replay_versions(replay.format_version(), replay.reference_digest())?;
+            let step = store_access::replay_step_from_validated(replay)?;
+            let facts = step.replay.facts();
+            state.append(ReplaySequenceRow {
+                height,
+                block_hash: facts.block_header.block_hash,
+                parent_hash: facts.block_header.parent_hash,
+                reference_digest: step.replay.reference_digest(),
+                replay_bytes: step.logical_replay_bytes,
+            })?;
+        }
+        next_height = chunk_end.next();
+    }
+    let observed = state
+        .sequence
+        .as_ref()
+        .map(ReplaySequence::sequence_checkpoint);
+    if observed != Some(entry.end_sequence_checkpoint) {
+        return Err(CanonicalStoreError::block_replay_sequence(format!(
+            "settled segment {}..={} sequence checkpoint mismatch",
+            entry.start_height.value(),
+            entry.end_block.height.value(),
+        )));
+    }
+    Ok(())
+}
+
+fn validate_live_tail_replay(
+    db: &DB,
+    state: &mut ReplayValidationState,
+) -> Result<(u64, u64, CanonicalConstructionFamilyEvidence), CanonicalStoreError> {
+    let live_tail_family = db.cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY).ok_or_else(|| {
+        CanonicalStoreError::block_replay_sequence("live_tail_block column family is absent")
     })?;
-    evidence.family_evidence = family_evidence.finish();
-    evidence.elapsed = started_at.elapsed();
-    Ok(PersistedBlockReplayValidation {
-        evidence,
-        retained_sequence_checkpoints,
-    })
+    let mut iterator =
+        db.raw_iterator_cf_opt(&live_tail_family, store_access::uncached_read_options());
+    iterator.seek_to_first();
+    let mut family_evidence =
+        CanonicalConstructionFamilyEvidence::accumulator(LIVE_TAIL_BLOCK_COLUMN_FAMILY);
+    let mut count = 0_u64;
+    let mut logical_bytes = 0_u64;
+    while iterator.valid() {
+        let Some((key, encoded)) = iterator.item() else {
+            break;
+        };
+        let height = decode_height_key_ascending(key).map_err(|source| {
+            CanonicalStoreError::BlockReplayKeyInvalid {
+                reason: source.to_string(),
+            }
+        })?;
+        family_evidence.observe(key, encoded)?;
+        let row_bytes = checked_key_value_bytes(key.len(), encoded.len())?;
+        logical_bytes = logical_bytes.checked_add(row_bytes).ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence(
+                "live_tail_block logical bytes exceed u64::MAX",
+            )
+        })?;
+        let step = store_access::replay_step_from_live_tail_bytes(height, encoded)?;
+        validate_replay_versions(step.replay.format_version(), step.replay.reference_digest())?;
+        let facts = step.replay.facts();
+        state.append(ReplaySequenceRow {
+            height,
+            block_hash: facts.block_header.block_hash,
+            parent_hash: facts.block_header.parent_hash,
+            reference_digest: step.replay.reference_digest(),
+            replay_bytes: step.logical_replay_bytes,
+        })?;
+        count = count.checked_add(1).ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence("live_tail_block count exceeds u64::MAX")
+        })?;
+        iterator.next();
+    }
+    iterator
+        .status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "live_tail_block readback iteration",
+            source,
+        })?;
+    Ok((count, logical_bytes, family_evidence.finish()))
+}
+
+fn checked_key_value_bytes(key_len: usize, value_len: usize) -> Result<u64, CanonicalStoreError> {
+    key_len
+        .checked_add(value_len)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| {
+            CanonicalStoreError::block_replay_sequence(
+                "replay family key and value bytes exceed u64::MAX",
+            )
+        })
 }
 
 pub(super) fn resume_persisted_sequence_checkpoint(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     checkpoint: CanonicalSequenceCheckpoint,
     through: BlockHeight,
     maximum_replay_blocks: u32,
@@ -741,13 +949,13 @@ pub(super) fn resume_persisted_sequence_checkpoint(
         .next()
         .filter(|height| *height <= through)
     {
-        resumed = super::replay_tail::authenticate_next_replay(db, resumed, height)?;
+        resumed = super::replay_tail::authenticate_next_replay(ctx, resumed, height)?;
     }
     Ok(resumed)
 }
 
-pub(super) fn read_replay_facts_at(
-    db: &DB,
+pub(super) fn read_replay_facts_at_with_cache(
+    ctx: SegmentStoreContext<'_>,
     ready_evidence: &CanonicalStoreReadyEvidence,
     height: BlockHeight,
 ) -> Result<Option<CanonicalBlockFacts>, CanonicalStoreError> {
@@ -756,27 +964,18 @@ pub(super) fn read_replay_facts_at(
     {
         return Ok(None);
     }
-    Ok(Some(read_persisted_replay(db, height)?.replay.into_facts()))
+    Ok(Some(
+        read_persisted_replay(ctx, height)?.replay.into_facts(),
+    ))
 }
 
-/// Replay rows one batched lookup of [`visit_replay_facts_at_heights`] holds
+/// Replay rows one batched lookup of [`visit_replay_facts_at_heights_with_cache`] holds
 /// at once.
-///
-/// Rows of transparent-dense blocks reach hundreds of kilobytes, so the bound
-/// keeps a reader's memory to a few megabytes however many heights it visits,
-/// while adjacent rows inside one batch still coalesce into one device read.
 const REPLAY_FACTS_BATCH_ROWS: usize = 32;
 
 /// Visits the canonical facts at several heights in height order.
-///
-/// `visit` receives each height's position in `heights` with its facts, or
-/// with `None` for a height outside the admitted retained range, as
-/// [`read_replay_facts_at`] answers. Rows are read in batched lookups of at
-/// most [`REPLAY_FACTS_BATCH_ROWS`] and bypass the block cache: a random
-/// historical row is rarely read twice, and admitting it would evict the
-/// smaller index and transaction-location blocks that every lookup reuses.
-pub(super) fn visit_replay_facts_at_heights<E>(
-    db: &DB,
+pub(super) fn visit_replay_facts_at_heights_with_cache<E>(
+    ctx: SegmentStoreContext<'_>,
     ready_evidence: &CanonicalStoreReadyEvidence,
     heights: &[BlockHeight],
     mut visit: impl FnMut(usize, Option<CanonicalBlockFacts>) -> Result<(), E>,
@@ -795,108 +994,94 @@ where
         }
     }
     retained.sort_unstable();
-    let family = block_replay_column_family(db)?;
-    let mut read_options = ReadOptions::default();
-    read_options.fill_cache(false);
-    for batch in retained.chunks(REPLAY_FACTS_BATCH_ROWS) {
-        let keys = batch
-            .iter()
-            .map(|(height, _)| encode_height_key_ascending(*height))
-            .collect::<Vec<_>>();
-        let rows = db.batched_multi_get_cf_slice_opt(
-            &family,
-            keys.iter().map(<[u8; 4]>::as_slice),
-            true,
-            &read_options,
-        );
-        for ((key, (height, index)), row) in keys.iter().zip(batch).zip(rows) {
-            let encoded_replay = row
-                .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                    operation: "canonical replay batch read",
-                    source,
-                })?
-                .ok_or_else(|| {
-                    CanonicalStoreError::block_replay_sequence(format!(
-                        "canonical replay at height {} is absent",
-                        height.value()
-                    ))
-                })?;
-            let (_, replay) = decode_persisted_replay(key, &encoded_replay)?;
-            visit(*index, Some(replay.into_facts()))?;
+    let uncached = store_access::uncached_read_options();
+    let mut live_batch = Vec::with_capacity(REPLAY_FACTS_BATCH_ROWS);
+    let mut cursor = 0;
+    while cursor < retained.len() {
+        let (height, _) = retained[cursor];
+        if let Some(entry) =
+            store_access::resolve_settled_segment_for_height(ctx.db, ctx.sealed_segments, height)?
+        {
+            if !live_batch.is_empty() {
+                visit_live_tail_facts_batch(ctx.db, &live_batch, &uncached, &mut visit)?;
+                live_batch.clear();
+            }
+            let readers =
+                store_access::open_replay_segment_readers(ctx.db, ctx.segment_cache, &entry)?;
+            while cursor < retained.len() && retained[cursor].0 <= entry.end_block.height {
+                let (target_height, orig_index) = retained[cursor];
+                let replay =
+                    store_access::reconstruct_replay_from_segment(ctx.db, &readers, target_height)?;
+                visit(orig_index, Some(replay.into_facts()))?;
+                cursor += 1;
+            }
+        } else {
+            live_batch.push(retained[cursor]);
+            cursor += 1;
+            if live_batch.len() >= REPLAY_FACTS_BATCH_ROWS {
+                visit_live_tail_facts_batch(ctx.db, &live_batch, &uncached, &mut visit)?;
+                live_batch.clear();
+            }
         }
+    }
+    if !live_batch.is_empty() {
+        visit_live_tail_facts_batch(ctx.db, &live_batch, &uncached, &mut visit)?;
     }
     Ok(())
 }
 
-pub(super) struct PersistedReplayStep {
-    pub(super) replay: ValidatedCanonicalBlockReplay,
-    pub(super) logical_replay_bytes: u64,
-}
-
-pub(super) fn read_persisted_replay(
+fn visit_live_tail_facts_batch<E>(
     db: &DB,
-    height: BlockHeight,
-) -> Result<PersistedReplayStep, CanonicalStoreError> {
-    let key = encode_height_key_ascending(height);
-    let encoded_replay = db
-        .get_cf(&block_replay_column_family(db)?, key)
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "canonical replay checkpoint read",
-            source,
-        })?
-        .ok_or_else(|| {
+    batch: &[(BlockHeight, usize)],
+    read_options: &ReadOptions,
+    visit: &mut impl FnMut(usize, Option<CanonicalBlockFacts>) -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<CanonicalStoreError>,
+{
+    let batch_heights = batch.iter().map(|(height, _)| *height).collect::<Vec<_>>();
+    let rows = store_access::fetch_live_tail_batch_pinned(db, &batch_heights, read_options)?;
+    for ((height, orig_index), row) in batch.iter().zip(rows) {
+        let slice = row?.ok_or_else(|| {
             CanonicalStoreError::block_replay_sequence(format!(
                 "canonical replay at height {} is absent",
                 height.value()
             ))
         })?;
-    let (_, replay) = decode_persisted_replay(&key, &encoded_replay)?;
-    let logical_replay_bytes = u64::try_from(encoded_replay.len()).map_err(|_| {
-        CanonicalStoreError::block_replay_sequence("replay byte length exceeds u64::MAX")
-    })?;
-    Ok(PersistedReplayStep {
-        replay,
-        logical_replay_bytes,
-    })
+        let step = store_access::replay_step_from_live_tail_bytes(*height, &slice)?;
+        validate_replay_versions(step.replay.format_version(), step.replay.reference_digest())?;
+        visit(*orig_index, Some(step.replay.into_facts()))?;
+    }
+    Ok(())
 }
 
-fn decode_persisted_replay(
-    key: &[u8],
-    encoded_replay: &[u8],
-) -> Result<(BlockHeight, ValidatedCanonicalBlockReplay), CanonicalStoreError> {
-    let height = decode_height_key_ascending(key).map_err(|source| {
-        CanonicalStoreError::BlockReplayKeyInvalid {
-            reason: source.to_string(),
-        }
-    })?;
-    let replay = decode_canonical_block_replay(encoded_replay)
-        .map_err(|source| CanonicalStoreError::block_replay_invalid(height, source.to_string()))?;
-    validate_replay_versions(replay.format_version(), replay.reference_digest())?;
-    if replay.facts().block_header.height != height {
-        return Err(CanonicalStoreError::block_replay_invalid(
-            height,
-            format!(
-                "row contains height {}",
-                replay.facts().block_header.height.value()
-            ),
-        ));
-    }
-    Ok((height, replay))
+#[derive(Debug)]
+pub(in crate::canonical_store) struct PersistedReplayStep {
+    pub(in crate::canonical_store) replay: zinder_core::ValidatedCanonicalBlockReplay,
+    pub(in crate::canonical_store) logical_replay_bytes: u64,
+}
+
+pub(super) fn read_persisted_replay(
+    ctx: SegmentStoreContext<'_>,
+    height: BlockHeight,
+) -> Result<PersistedReplayStep, CanonicalStoreError> {
+    store_access::read_replay_step_split(ctx, height)
 }
 
 impl PersistedBlockReplayEvidence {
     pub(super) fn has_same_sequence(&self, prepared: &CanonicalBlockLoadEvidence) -> bool {
-        let replay_counts_match = self.block_count == prepared.block_count
-            && prepared.block_count == prepared.block_replay_count;
-        let replay_logical_bytes_match =
-            self.logical_family_bytes == prepared.block_replay_logical_bytes;
         self.first_height == prepared.first_height
             && self.first_parent_hash == prepared.first_parent_hash
             && self.first_hash == prepared.first_hash
             && self.tip_height == prepared.tip_height
             && self.tip_hash == prepared.tip_hash
-            && replay_counts_match
-            && replay_logical_bytes_match
+            && self.block_count == prepared.block_count
+            && self.settled_segment_index_count == prepared.settled_segment_index_count
+            && self.settled_segment_index_logical_bytes
+                == prepared.settled_segment_index_logical_bytes
+            && self.live_tail_block_count == prepared.live_tail_block_count
+            && self.live_tail_block_logical_bytes == prepared.live_tail_block_logical_bytes
+            && self.logical_replay_bytes == prepared.logical_replay_bytes
             && self.replay_format_version == prepared.replay_format_version
             && self.block_digest_version == prepared.block_digest_version
             && self.sequence_digest_version == prepared.sequence_digest_version
@@ -904,10 +1089,38 @@ impl PersistedBlockReplayEvidence {
     }
 }
 
-fn block_replay_column_family(db: &DB) -> Result<Arc<BoundColumnFamily<'_>>, CanonicalStoreError> {
-    db.cf_handle(BLOCK_REPLAY_COLUMN_FAMILY).ok_or_else(|| {
-        CanonicalStoreError::block_replay_sequence("block_replay column family is absent")
-    })
+struct ReplayValidationState {
+    sequence: Option<ReplaySequence>,
+    retained_checkpoints: VecDeque<CanonicalSequenceCheckpoint>,
+    retained_checkpoint_count: usize,
+}
+
+impl ReplayValidationState {
+    const fn new(retained_checkpoint_count: usize) -> Self {
+        Self {
+            sequence: None,
+            retained_checkpoints: VecDeque::new(),
+            retained_checkpoint_count,
+        }
+    }
+
+    fn append(&mut self, row: ReplaySequenceRow) -> Result<(), CanonicalStoreError> {
+        if let Some(existing) = self.sequence.as_mut() {
+            existing.append(row)?;
+        } else {
+            self.sequence = Some(ReplaySequence::new(row)?);
+        }
+        if self.retained_checkpoint_count > 0
+            && let Some(active) = self.sequence.as_ref()
+        {
+            self.retained_checkpoints
+                .push_back(active.sequence_checkpoint());
+            if self.retained_checkpoints.len() > self.retained_checkpoint_count {
+                self.retained_checkpoints.pop_front();
+            }
+        }
+        Ok(())
+    }
 }
 
 struct ReplaySequence {
@@ -917,7 +1130,6 @@ struct ReplaySequence {
     tip_height: BlockHeight,
     tip_hash: BlockHash,
     block_count: u64,
-    logical_family_bytes: u64,
     logical_replay_bytes: u64,
     digest_builder: CanonicalBlockFactsSequenceDigestBuilder,
 }
@@ -928,8 +1140,18 @@ struct ReplaySequenceRow {
     block_hash: BlockHash,
     parent_hash: BlockHash,
     reference_digest: CanonicalBlockFactsDigest,
-    logical_family_bytes: u64,
     replay_bytes: u64,
+}
+
+struct FinishedReplaySequence {
+    first_height: BlockHeight,
+    first_parent_hash: BlockHash,
+    first_hash: BlockHash,
+    tip_height: BlockHeight,
+    tip_hash: BlockHash,
+    block_count: u64,
+    logical_replay_bytes: u64,
+    sequence_digest: CanonicalBlockFactsSequenceDigest,
 }
 
 impl ReplaySequence {
@@ -947,7 +1169,6 @@ impl ReplaySequence {
             tip_height: row.height,
             tip_hash: row.block_hash,
             block_count: 1,
-            logical_family_bytes: row.logical_family_bytes,
             logical_replay_bytes: row.replay_bytes,
             digest_builder,
         })
@@ -973,14 +1194,6 @@ impl ReplaySequence {
         self.block_count = self.block_count.checked_add(1).ok_or_else(|| {
             CanonicalStoreError::block_replay_sequence("block count exceeds u64::MAX")
         })?;
-        self.logical_family_bytes = self
-            .logical_family_bytes
-            .checked_add(row.logical_family_bytes)
-            .ok_or_else(|| {
-                CanonicalStoreError::block_replay_sequence(
-                    "replay family logical byte count exceeds u64::MAX",
-                )
-            })?;
         self.logical_replay_bytes = self
             .logical_replay_bytes
             .checked_add(row.replay_bytes)
@@ -1006,25 +1219,16 @@ impl ReplaySequence {
         )
     }
 
-    fn finish(self) -> PersistedBlockReplayEvidence {
-        PersistedBlockReplayEvidence {
+    fn finish(self) -> FinishedReplaySequence {
+        FinishedReplaySequence {
             first_height: self.first_height,
             first_parent_hash: self.first_parent_hash,
             first_hash: self.first_hash,
             tip_height: self.tip_height,
             tip_hash: self.tip_hash,
             block_count: self.block_count,
-            logical_family_bytes: self.logical_family_bytes,
             logical_replay_bytes: self.logical_replay_bytes,
-            replay_format_version: CanonicalBlockReplayFormatVersion::V1,
-            block_digest_version: CanonicalBlockFactsDigestVersion::V1,
-            sequence_digest_version: CanonicalBlockFactsSequenceDigestVersion::V1,
             sequence_digest: self.digest_builder.finish(),
-            family_evidence: CanonicalConstructionFamilyEvidence::accumulator(
-                BLOCK_REPLAY_COLUMN_FAMILY,
-            )
-            .finish(),
-            elapsed: Duration::ZERO,
         }
     }
 }
@@ -1212,6 +1416,10 @@ mod tests {
     #[test]
     fn replay_slice_source_rejects_deleted_and_detached_stored_rows()
     -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::live_tail::{LiveTailBlockRecord, LiveTailEncodeOptions};
+        use super::super::rocksdb::LIVE_TAIL_BLOCK_COLUMN_FAMILY;
+        use zinder_core::wire::encode_height_key_ascending;
+
         let temporary = TempDir::new()?;
         let slice_1_3 = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
 
@@ -1224,8 +1432,8 @@ mod tests {
         let internal_cf = missing_internal
             .bounded_open
             .db
-            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-            .ok_or("missing block_replay column family")?;
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("missing live_tail_block column family")?;
         missing_internal.bounded_open.db.delete_cf(
             &internal_cf,
             encode_height_key_ascending(BlockHeight::new(2)),
@@ -1244,8 +1452,8 @@ mod tests {
         let final_cf = missing_final
             .bounded_open
             .db
-            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-            .ok_or("missing block_replay column family")?;
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("missing live_tail_block column family")?;
         missing_final
             .bounded_open
             .db
@@ -1268,15 +1476,23 @@ mod tests {
             .as_bytes();
         wrong_parent[0] ^= 0xff;
         let replacement = canonical_block(BlockHeight::new(2), [0x22; 32], wrong_parent, 2);
+        let (encoded_replacement, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+            &replacement.compact_block,
+            Some(replacement.facts.clone()),
+            LiveTailEncodeOptions {
+                include_supplement: true,
+                retain_canonical_facts: true,
+            },
+        )?;
         let detached_cf = detached
             .bounded_open
             .db
-            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-            .ok_or("missing block_replay column family")?;
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("missing live_tail_block column family")?;
         detached.bounded_open.db.put_cf(
             &detached_cf,
             encode_height_key_ascending(BlockHeight::new(2)),
-            replacement.replay_envelope.as_bytes(),
+            encoded_replacement,
         )?;
         assert!(matches!(
             exhaust_slice(&detached.canonical_replay_slice_source(), slice_1_3),
@@ -1288,6 +1504,10 @@ mod tests {
     #[test]
     fn replay_slice_source_rejects_trailing_row_beyond_ready_fence()
     -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::live_tail::{LiveTailBlockRecord, LiveTailEncodeOptions};
+        use super::super::rocksdb::LIVE_TAIL_BLOCK_COLUMN_FAMILY;
+        use zinder_core::wire::encode_height_key_ascending;
+
         let temporary = TempDir::new()?;
         let store = published_store(
             &temporary.path().join("trailing-fence"),
@@ -1302,15 +1522,23 @@ mod tests {
             ready.visible_tip.hash.as_bytes(),
             9,
         );
+        let (encoded_trailing, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+            &trailing.compact_block,
+            Some(trailing.facts.clone()),
+            LiveTailEncodeOptions {
+                include_supplement: true,
+                retain_canonical_facts: true,
+            },
+        )?;
         let replay_cf = store
             .bounded_open
             .db
-            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-            .ok_or("missing block_replay column family")?;
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("missing live_tail_block column family")?;
         store.bounded_open.db.put_cf(
             &replay_cf,
             encode_height_key_ascending(BlockHeight::new(9)),
-            trailing.replay_envelope.as_bytes(),
+            encoded_trailing,
         )?;
 
         let slices = [

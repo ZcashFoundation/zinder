@@ -18,7 +18,7 @@ use super::{
     CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
     CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
+    ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     displaced_archive::{
         encode_test_archive_state, encode_test_hash_pointer_rows, encode_test_order_key,
@@ -789,8 +789,7 @@ fn retained_events_resume_exactly_and_leases_bound_pruning()
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -822,7 +821,7 @@ fn secondary_wallet_events_reconstruct_historical_branches_across_multiple_reorg
         &store_path,
         &secondary_path,
         &activations,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(32)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1045,7 +1044,7 @@ fn wallet_resume_stores(
         &path,
         temporary.path().join("secondary"),
         &super::test_network_upgrade_activations(Network::ZcashTestnet)?,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         store.reorg_policy(),
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1417,9 +1416,7 @@ fn writer_raises_the_reorg_window_in_place_across_restart_and_never_lowers_it()
                 &store_path,
                 temporary.path().join("stale-secondary"),
                 &activations,
-                crate::CanonicalStoreRequirements::for_blob_retention(
-                    RawBlobRetention::Transactions,
-                ),
+                crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
                 construction,
                 RocksDbResourceBudget::for_local_tests(),
             )
@@ -1436,7 +1433,7 @@ fn writer_raises_the_reorg_window_in_place_across_restart_and_never_lowers_it()
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         raised,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1505,7 +1502,7 @@ fn secondary_refuses_a_writer_raise_until_it_reopens_with_the_raised_window()
             &store_path,
             temporary.path().join(name),
             &activations,
-            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
             CanonicalReorgPolicy::new(window)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1546,13 +1543,13 @@ fn incremental_replay_tails_match_a_complete_derivation_across_appends_and_repla
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(window)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
-    let complete = |db: &DB, ready: CanonicalStoreReadyEvidence| {
+    let complete = |store_ref: &RocksDbCanonicalStore, ready: CanonicalStoreReadyEvidence| {
         super::replay_tail::AuthenticatedReplayTail::authenticate(
-            db,
+            store_ref.segment_context(),
             ready.sequence_checkpoint,
             ready.visible_tip.height,
             window,
@@ -1598,7 +1595,7 @@ fn incremental_replay_tails_match_a_complete_derivation_across_appends_and_repla
     )?;
     store = next;
 
-    let store_complete = complete(&store.bounded_open.db, store.ready_evidence())?;
+    let store_complete = complete(&store, store.ready_evidence())?;
     assert_eq!(store.replay_tail.checkpoints(), store_complete);
     secondary.try_catch_up()?;
     assert_eq!(secondary.event_fence(), store.event_fence());
@@ -1629,7 +1626,7 @@ fn secondary_lagging_beyond_one_window_matches_a_complete_derivation()
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(window)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1663,7 +1660,7 @@ fn secondary_lagging_beyond_one_window_matches_a_complete_derivation()
     secondary.try_catch_up()?;
     assert_eq!(secondary.event_fence(), store.event_fence());
     let complete = super::replay_tail::AuthenticatedReplayTail::authenticate(
-        &store.bounded_open.db,
+        store.segment_context(),
         store.ready_evidence().sequence_checkpoint,
         store.ready_evidence().visible_tip.height,
         window,
@@ -1701,20 +1698,23 @@ fn writer_detects_an_unannounced_replay_row_change_before_it_settles()
         4,
         128,
     );
-    let forged_replay = encode_canonical_block_replay(
-        &forged.facts,
-        CanonicalBlockReplayFormatVersion::V1,
-        CanonicalBlockFactsDigestVersion::V1,
-    );
+    let (encoded_forged, _) = super::live_tail::LiveTailBlockRecord::encode_from_compact_block_v1(
+        &forged.compact_block,
+        Some(forged.facts.clone()),
+        super::live_tail::LiveTailEncodeOptions {
+            include_supplement: true,
+            retain_canonical_facts: true,
+        },
+    )?;
     let replay_family = store
         .bounded_open
         .db
-        .cf_handle(super::block_replay::BLOCK_REPLAY_COLUMN_FAMILY)
-        .ok_or("replay family absent")?;
+        .cf_handle(super::rocksdb::LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+        .ok_or("live_tail_block family absent")?;
     store.bounded_open.db.put_cf(
         &replay_family,
         zinder_core::wire::encode_height_key_ascending(BlockHeight::new(3)),
-        forged_replay.as_bytes(),
+        encoded_forged,
     )?;
     drop(replay_family);
 
@@ -1926,7 +1926,7 @@ fn secondary_point_reads_agree_with_the_bounded_replay_range_scan()
         &store_path,
         &secondary_path,
         &activations,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -2105,7 +2105,7 @@ pub(super) fn published_store(
         reorg_window,
         build_tip_height,
         settled_height,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )
 }
 
@@ -2148,7 +2148,7 @@ pub(super) fn published_fork_store(
         build_tip_height,
         settled_height,
         PublishedChain {
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::All,
             fork_tag,
             note_commitments: false,
             history_floor: None,
@@ -2174,7 +2174,7 @@ pub(super) fn published_note_commitment_store(
         build_tip_height,
         settled_height,
         PublishedChain {
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::All,
             fork_tag: 0,
             note_commitments: true,
             history_floor,
@@ -2232,7 +2232,6 @@ fn published_chain_store(
     };
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -2334,12 +2333,7 @@ pub(super) fn open_store(
     activations: &zinder_core::NetworkUpgradeActivations,
     reorg_window: u32,
 ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
-    open_store_with_retention(
-        path,
-        activations,
-        reorg_window,
-        RawBlobRetention::Transactions,
-    )
+    open_store_with_retention(path, activations, reorg_window, RawBlobRetention::All)
 }
 
 pub(super) fn open_store_with_retention(
@@ -2351,7 +2345,6 @@ pub(super) fn open_store_with_retention(
     Ok(RocksDbCanonicalStore::open_ready(
         path,
         activations,
-        CanonicalStoreWorkload::Wallet,
         raw_blob_retention,
         CanonicalReorgPolicy::new(reorg_window)?,
         RocksDbResourceBudget::for_local_tests(),
@@ -2367,8 +2360,7 @@ fn open_writer(
         RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
             path,
             activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(reorg_window)?,
             RocksDbResourceBudget::for_local_tests(),
         )?,
@@ -2386,7 +2378,7 @@ pub(super) fn replacement_block(
         block_hash,
         parent_hash,
         transaction_tag,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )
 }
 
@@ -2499,7 +2491,6 @@ pub(super) fn canonical_block(
         replay_envelope,
         tip_metadata: ChainTipMetadata::new(0, 0, 0),
         tree_state_checkpoint: None,
-        block_final_note_commitment_roots: None,
         transaction_blobs: vec![TransactionBlobArtifact::new(
             transaction_location(height, block_hash, transaction_tag),
             raw_transaction_bytes,
@@ -2516,7 +2507,6 @@ fn apply_raw_blob_retention(
 ) {
     match raw_blob_retention {
         RawBlobRetention::None => block.transaction_blobs.clear(),
-        RawBlobRetention::Transactions => {}
         RawBlobRetention::All => {
             let raw_block_bytes = vec![block_tag];
             block.facts.serialized_bytes_digest =

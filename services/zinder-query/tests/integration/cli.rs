@@ -64,7 +64,7 @@ fn print_config_uses_native_ports_and_dedicated_secondary_roots() -> eyre::Resul
         "secondary_path = \"{}\"",
         temporary.path().join("wallet-secondary").display()
     )));
-    assert!(stdout.contains("raw_blob_policy = \"transactions\""));
+    assert!(stdout.contains("raw_blob_policy = \"none\""));
     assert!(!stdout.contains("9101"));
     Ok(())
 }
@@ -353,6 +353,48 @@ fn forwarded_read_settings_default_and_are_bounded() -> eyre::Result<()> {
     Ok(())
 }
 
+fn assert_profile_policy_rejections(
+    temporary: &TempDir,
+    secondary: &std::path::Path,
+    profile: &str,
+    full_blocks: Option<&str>,
+) -> eyre::Result<()> {
+    let conflicting_policy = if full_blocks == Some("true") {
+        "none"
+    } else {
+        "all"
+    };
+    let mut conflict_command = query_command(temporary, secondary);
+    conflict_command
+        .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+        .env("ZINDER_STORAGE__RAW_BLOB_POLICY", conflicting_policy);
+    if let Some(full_blocks) = full_blocks {
+        conflict_command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+    }
+    let conflict = conflict_command.output()?;
+    assert!(!conflict.status.success(), "{conflict:?}");
+    assert!(String::from_utf8(conflict.stderr)?.contains("storage.raw_blob_policy"));
+
+    let mut legacy_command = query_command(temporary, secondary);
+    legacy_command
+        .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+        .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions");
+    if let Some(full_blocks) = full_blocks {
+        legacy_command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+    }
+    let legacy_transactions = legacy_command.output()?;
+    assert!(
+        !legacy_transactions.status.success(),
+        "{legacy_transactions:?}"
+    );
+    let legacy_stderr = String::from_utf8(legacy_transactions.stderr)?;
+    assert!(
+        legacy_stderr.contains("does not have variant constructor transactions"),
+        "{legacy_stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn wallet_profiles_render_without_injected_retention() -> eyre::Result<()> {
     let temporary = TempDir::new()?;
@@ -378,12 +420,7 @@ fn wallet_profiles_render_without_injected_retention() -> eyre::Result<()> {
             assert!(stdout.contains("full_blocks = true"), "{stdout}");
         }
         assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
-        let conflict = query_command(&temporary, &secondary)
-            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
-            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
-            .output()?;
-        assert!(!conflict.status.success(), "{conflict:?}");
-        assert!(String::from_utf8(conflict.stderr)?.contains("storage.raw_blob_policy"));
+        assert_profile_policy_rejections(&temporary, &secondary, profile, full_blocks)?;
     }
 
     let root = temporary.path().join("derived-root");

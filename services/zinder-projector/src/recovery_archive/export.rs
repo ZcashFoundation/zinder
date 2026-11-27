@@ -155,7 +155,6 @@ fn require_private_archive_permissions(
     archive: &Path,
     outer: &RecoveryArchiveManifest,
 ) -> Result<(), RecoveryArchiveError> {
-    use std::os::unix::fs::PermissionsExt;
     for name in [
         "",
         super::CANONICAL_CHECKPOINT_DIRECTORY_NAME,
@@ -165,16 +164,63 @@ fn require_private_archive_permissions(
     .into_iter()
     .chain(outer.payload_files.iter().map(|file| file.path.as_str()))
     {
-        let path = archive.join(name);
-        let permissions = fs::metadata(&path)
-            .map_err(|source| RecoveryArchiveError::io(&path, source))?
-            .permissions();
-        require_contract(
-            permissions.mode().trailing_zeros() >= 6,
-            "existing private backup has group or other permissions",
-        )?;
+        require_private_entry_permissions(&archive.join(name))?;
+    }
+    require_private_segments_permissions(archive)
+}
+
+#[cfg(unix)]
+fn require_private_segments_permissions(archive: &Path) -> Result<(), RecoveryArchiveError> {
+    let segments_root = archive
+        .join(super::CANONICAL_CHECKPOINT_DIRECTORY_NAME)
+        .join(super::SEGMENTS_DIR_NAME);
+    if !require_private_dir_permissions_if_present(&segments_root)? {
+        return Ok(());
+    }
+    for subdir in [
+        super::SHIELDED_SEGMENT_DIR,
+        super::SUPPLEMENT_SEGMENT_DIR,
+        super::RAW_BLOCK_SEGMENT_DIR,
+    ] {
+        let _ = require_private_dir_permissions_if_present(&segments_root.join(subdir))?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn require_private_dir_permissions_if_present(path: &Path) -> Result<bool, RecoveryArchiveError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(RecoveryArchiveError::io(path, error)),
+    };
+    require_contract(
+        !metadata.file_type().is_symlink() && metadata.is_dir(),
+        "existing private backup segments entry must be a real directory",
+    )?;
+    require_contract(
+        metadata.permissions().mode().trailing_zeros() >= 6,
+        "existing private backup has group or other permissions",
+    )?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn require_private_entry_permissions(path: &Path) -> Result<(), RecoveryArchiveError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| RecoveryArchiveError::io(path, source))?;
+    require_contract(
+        !metadata.file_type().is_symlink(),
+        "existing private backup contains a symlink",
+    )?;
+    require_contract(
+        metadata.permissions().mode().trailing_zeros() >= 6,
+        "existing private backup has group or other permissions",
+    )
 }
 
 #[cfg(not(unix))]
@@ -220,6 +266,56 @@ mod tests {
             validate_private_backup_destination(&staging, &root.path().join("bundle-a"))?,
             "bundle-a"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_archive_permissions_check_nested_segments_directories()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new()?;
+        let archive = root.path().join("archive");
+        let shielded = archive
+            .join(super::super::CANONICAL_CHECKPOINT_DIRECTORY_NAME)
+            .join(super::super::SEGMENTS_DIR_NAME)
+            .join(super::super::SHIELDED_SEGMENT_DIR);
+        fs::create_dir_all(&shielded)?;
+        fs::create_dir(archive.join(super::super::WALLET_CHECKPOINT_DIRECTORY_NAME))?;
+        let state_bundle = crate::state_bundle::tests::sample_manifest()?;
+        fs::write(
+            archive.join(super::super::STATE_BUNDLE_MANIFEST_FILE_NAME),
+            b"inner",
+        )?;
+        fs::write(archive.join(RECOVERY_ARCHIVE_MANIFEST_FILE_NAME), b"outer")?;
+        let segment = shielded.join("0000000001-0000004096.zshrng02");
+        fs::write(&segment, b"segment")?;
+        let payload = collect_payload_files(&archive, PayloadLayout::SealedArchive)?;
+        let outer =
+            RecoveryArchiveManifest::from_state_bundle(&state_bundle, "11".repeat(32), payload)?;
+        for private_dir in [
+            archive.as_path(),
+            &archive.join(super::super::CANONICAL_CHECKPOINT_DIRECTORY_NAME),
+            &archive.join(super::super::WALLET_CHECKPOINT_DIRECTORY_NAME),
+            &archive
+                .join(super::super::CANONICAL_CHECKPOINT_DIRECTORY_NAME)
+                .join(super::super::SEGMENTS_DIR_NAME),
+            &shielded,
+        ] {
+            fs::set_permissions(private_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        for private_file in [
+            &archive.join(super::super::STATE_BUNDLE_MANIFEST_FILE_NAME),
+            &archive.join(RECOVERY_ARCHIVE_MANIFEST_FILE_NAME),
+            &segment,
+        ] {
+            fs::set_permissions(private_file, fs::Permissions::from_mode(0o600))?;
+        }
+        require_private_archive_permissions(&archive, &outer)?;
+
+        fs::set_permissions(&shielded, fs::Permissions::from_mode(0o755))?;
+        assert!(require_private_archive_permissions(&archive, &outer).is_err());
         Ok(())
     }
 }

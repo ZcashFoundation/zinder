@@ -16,8 +16,9 @@ use super::{
     ServedTreeState, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
     block_load::encode_block_position,
     live_replacement_tests::published_store,
+    live_tail::{LiveTailBlockRecord, LiveTailEncodeOptions},
     publication::column_family,
-    rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY},
+    rocksdb::{LIVE_TAIL_BLOCK_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY},
     test_checkpoint_frontiers, test_network_upgrade_activations,
 };
 use crate::{RawBlobRetention, RocksDbResourceBudget};
@@ -157,7 +158,7 @@ fn reconstruction_refuses_a_missing_compact_block() -> Result<(), Box<dyn std::e
     let temporary = TempDir::new()?;
     let store = gapped_store(&temporary)?;
     let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
-    let family = column_family(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     store
         .bounded_open
         .db
@@ -245,7 +246,7 @@ fn a_secondary_reconstructs_with_a_node_table_its_writer_has_not_admitted_yet()
         temporary.path().join("canonical"),
         temporary.path().join("canonical-secondary"),
         &baseline,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -618,11 +619,19 @@ fn replace_compact_block(
     store: &RocksDbCanonicalStore,
     compact_block: &CompactBlockArtifact,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let family = column_family(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let (encoded, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+        compact_block,
+        None,
+        LiveTailEncodeOptions {
+            include_supplement: true,
+            retain_canonical_facts: false,
+        },
+    )?;
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     store.bounded_open.db.put_cf(
         &family,
         encode_block_position(compact_block.height()),
-        crate::encode_compact_block_artifact(compact_block),
+        encoded,
     )?;
     Ok(())
 }

@@ -13,7 +13,7 @@ use zinder_core::{
 use super::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalSequenceCheckpoint,
     CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreBuildState,
-    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CanonicalStoreError, CanonicalStoreReadyEvidence,
 };
 use crate::RawBlobRetention;
 
@@ -21,10 +21,7 @@ const BUILDING_STATE: u8 = 1;
 const READY_STATE: u8 = 2;
 const COMPLETE_HISTORY: u8 = 0;
 const CHECKPOINTED_HISTORY: u8 = 1;
-const WALLET_WORKLOAD: u8 = 1;
-const EXPLORER_WORKLOAD: u8 = 2;
 const NO_RAW_BLOB_RETENTION: u8 = 0;
-const TRANSACTION_RAW_BLOB_RETENTION: u8 = 1;
 const ALL_RAW_BLOB_RETENTION: u8 = 2;
 const FRONTIER_ABSENT: u8 = 0;
 const FRONTIER_PRESENT: u8 = 1;
@@ -39,7 +36,6 @@ const STORE_CONTROL_MINIMUM_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
     + 4
     + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
     + 1
-    + 1
     + 4
     + HISTORY_FIXED_FIELDS_LENGTH
     + BUILD_TIP_FIELDS_LENGTH
@@ -51,7 +47,6 @@ const STORE_CONTROL_MINIMUM_LENGTH: usize = CANONICAL_STORE_IDENTITY.len()
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DecodedStoreControl {
     pub(super) network: Network,
-    pub(super) workload: CanonicalStoreWorkload,
     pub(super) build_plan: CanonicalStoreBuildPlan,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) build_state: CanonicalStoreBuildState,
@@ -91,11 +86,10 @@ pub(super) struct ActivationScheduleBinding {
 }
 
 pub(super) fn encode_building_store_control(
-    workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
 ) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
-    let mut encoded = encode_store_control_prefix(workload, build_plan, cursor_auth_key)?;
+    let mut encoded = encode_store_control_prefix(build_plan, cursor_auth_key)?;
     encoded.push(BUILDING_STATE);
     encoded.resize(encoded.len() + READY_FIELDS_LENGTH + 8 + 32, 0);
     encoded.extend_from_slice(
@@ -108,13 +102,12 @@ pub(super) fn encode_building_store_control(
 }
 
 pub(super) fn encode_ready_store_control_with_revisions(
-    workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
     ready_evidence: &CanonicalStoreReadyEvidence,
     revisions: ControlRevisions,
 ) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
-    let mut encoded = encode_store_control_prefix(workload, build_plan, cursor_auth_key)?;
+    let mut encoded = encode_store_control_prefix(build_plan, cursor_auth_key)?;
     encoded.push(READY_STATE);
     encoded.extend_from_slice(
         &ready_evidence
@@ -164,7 +157,6 @@ pub(super) fn encode_ready_store_control_with_revisions(
 }
 
 fn encode_store_control_prefix(
-    workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
 ) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
@@ -175,13 +167,8 @@ fn encode_store_control_prefix(
     let activations_fingerprint = build_plan.network_upgrade_activations_fingerprint();
     encoded.extend_from_slice(&activations_fingerprint.version().value().to_le_bytes());
     encoded.extend_from_slice(&activations_fingerprint.as_bytes());
-    encoded.push(match workload {
-        CanonicalStoreWorkload::Wallet => WALLET_WORKLOAD,
-        CanonicalStoreWorkload::Explorer => EXPLORER_WORKLOAD,
-    });
     encoded.push(match build_plan.raw_blob_retention() {
         RawBlobRetention::None => NO_RAW_BLOB_RETENTION,
-        RawBlobRetention::Transactions => TRANSACTION_RAW_BLOB_RETENTION,
         RawBlobRetention::All => ALL_RAW_BLOB_RETENTION,
     });
     encoded.extend_from_slice(
@@ -284,16 +271,6 @@ pub(super) fn decode_store_control(
     })?;
     let network_upgrade_activations_fingerprint =
         decode_network_upgrade_activations_fingerprint(&mut decoder)?;
-    let workload = match decoder.read_u8("workload")? {
-        WALLET_WORKLOAD => CanonicalStoreWorkload::Wallet,
-        EXPLORER_WORKLOAD => CanonicalStoreWorkload::Explorer,
-        workload => {
-            return Err(CanonicalStoreError::admission(
-                path,
-                format!("store control contains unknown workload {workload}"),
-            ));
-        }
-    };
     let raw_blob_retention = decode_raw_blob_retention(&mut decoder)?;
     let reorg_policy =
         super::CanonicalReorgPolicy::new(decoder.read_u32("reorg window blocks")?)
@@ -351,7 +328,6 @@ pub(super) fn decode_store_control(
     }
     Ok(DecodedStoreControl {
         network,
-        workload,
         build_plan,
         cursor_auth_key,
         build_state,
@@ -412,7 +388,6 @@ fn decode_raw_blob_retention(
 ) -> Result<RawBlobRetention, CanonicalStoreError> {
     Ok(match decoder.read_u8("raw blob retention")? {
         NO_RAW_BLOB_RETENTION => RawBlobRetention::None,
-        TRANSACTION_RAW_BLOB_RETENTION => RawBlobRetention::Transactions,
         ALL_RAW_BLOB_RETENTION => RawBlobRetention::All,
         retention => {
             return Err(CanonicalStoreError::admission(
@@ -774,39 +749,31 @@ mod tests {
             Network::ZcashTestnet,
             Network::ZcashRegtest,
         ] {
-            for workload in [
-                CanonicalStoreWorkload::Wallet,
-                CanonicalStoreWorkload::Explorer,
-            ] {
-                let build_plan = complete_build_plan(network);
-                let encoded =
-                    encode_building_store_control(workload, &build_plan, CURSOR_AUTH_KEY)?;
-                assert_eq!(
-                    decode_store_control(Path::new("canonical"), &encoded)?,
-                    DecodedStoreControl {
-                        network,
-                        workload,
-                        build_plan,
-                        cursor_auth_key: CURSOR_AUTH_KEY,
-                        build_state: CanonicalStoreBuildState::Building,
-                        activation_schedule_binding: None,
-                        revised_reorg_policy: None,
-                    }
-                );
-                assert_eq!(
-                    decode_store_control(Path::new("canonical"), &encoded)?
-                        .build_plan
-                        .reorg_policy()
-                        .reorg_window_blocks(),
-                    1
-                );
-            }
+            let build_plan = complete_build_plan(network);
+            let encoded = encode_building_store_control(&build_plan, CURSOR_AUTH_KEY)?;
+            assert_eq!(
+                decode_store_control(Path::new("canonical"), &encoded)?,
+                DecodedStoreControl {
+                    network,
+                    build_plan,
+                    cursor_auth_key: CURSOR_AUTH_KEY,
+                    build_state: CanonicalStoreBuildState::Building,
+                    activation_schedule_binding: None,
+                    revised_reorg_policy: None,
+                }
+            );
+            assert_eq!(
+                decode_store_control(Path::new("canonical"), &encoded)?
+                    .build_plan
+                    .reorg_policy()
+                    .reorg_window_blocks(),
+                1
+            );
         }
 
         let reorg_window_offset =
-            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1 + 1;
+            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1;
         let mut zero_reorg_window = encode_building_store_control(
-            CanonicalStoreWorkload::Wallet,
             &complete_build_plan(Network::ZcashTestnet),
             CURSOR_AUTH_KEY,
         )?;
@@ -819,11 +786,7 @@ mod tests {
         let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
         let history_bounds = CanonicalHistoryBounds::checkpointed(checkpoint)?;
         let build_plan = checkpointed_build_plan(checkpoint, history_bounds)?;
-        let encoded = encode_building_store_control(
-            CanonicalStoreWorkload::Wallet,
-            &build_plan,
-            CURSOR_AUTH_KEY,
-        )?;
+        let encoded = encode_building_store_control(&build_plan, CURSOR_AUTH_KEY)?;
         assert_eq!(
             decode_store_control(Path::new("canonical"), &encoded)?
                 .build_plan
@@ -858,7 +821,6 @@ mod tests {
         };
         assert_eq!(
             encode_ready_store_control_with_revisions(
-                decoded_ready.workload,
                 &decoded_ready.build_plan,
                 decoded_ready.cursor_auth_key,
                 &ready_evidence,
@@ -868,11 +830,7 @@ mod tests {
         );
 
         let building_plan = complete_build_plan(Network::ZcashTestnet);
-        let building_control = encode_building_store_control(
-            CanonicalStoreWorkload::Explorer,
-            &building_plan,
-            CURSOR_AUTH_KEY,
-        )?;
+        let building_control = encode_building_store_control(&building_plan, CURSOR_AUTH_KEY)?;
         let decoded_building = decode_store_control(Path::new("canonical"), &building_control)?;
         assert_ne!(decoded_building, decoded_ready);
 
@@ -880,7 +838,6 @@ mod tests {
             + 2
             + 4
             + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
-            + 1
             + 1
             + 4
             + HISTORY_FIXED_FIELDS_LENGTH
@@ -937,7 +894,6 @@ mod tests {
             ..expected.revisions()
         };
         let encoded = encode_ready_store_control_with_revisions(
-            expected.workload,
             &expected.build_plan,
             expected.cursor_auth_key,
             &ready,
@@ -972,17 +928,12 @@ mod tests {
     )]
     fn malformed_control_variants_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
         let build_plan = complete_build_plan(Network::ZcashTestnet);
-        let base = encode_building_store_control(
-            CanonicalStoreWorkload::Explorer,
-            &build_plan,
-            CURSOR_AUTH_KEY,
-        )?;
+        let base = encode_building_store_control(&build_plan, CURSOR_AUTH_KEY)?;
         let identity_end = CANONICAL_STORE_IDENTITY.len();
         let network_start = identity_end + 2;
         let activations_fingerprint_version = network_start + 4;
-        let workload_offset =
+        let raw_blob_retention_offset =
             activations_fingerprint_version + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH;
-        let raw_blob_retention_offset = workload_offset + 1;
         let history_kind = raw_blob_retention_offset + 1 + 4;
         let sapling_frontier_presence = history_kind + 1 + 4 + 32 + 4;
         let build_tip = history_kind + HISTORY_FIXED_FIELDS_LENGTH;
@@ -997,10 +948,18 @@ mod tests {
             },
             {
                 let mut encoded = base.clone();
+                encoded[identity_end..identity_end + 2].copy_from_slice(&1_u16.to_le_bytes());
+                (
+                    encoded,
+                    "store schema version 1 does not equal required version 2",
+                )
+            },
+            {
+                let mut encoded = base.clone();
                 encoded[identity_end..identity_end + 2].copy_from_slice(&7_u16.to_le_bytes());
                 (
                     encoded,
-                    "store schema version 7 does not equal required version 1",
+                    "store schema version 7 does not equal required version 2",
                 )
             },
             {
@@ -1022,13 +981,13 @@ mod tests {
             },
             {
                 let mut encoded = base.clone();
-                encoded[workload_offset] = 99;
-                (encoded, "unknown workload")
+                encoded[raw_blob_retention_offset] = 1;
+                (encoded, "unknown raw blob retention 1")
             },
             {
                 let mut encoded = base.clone();
                 encoded[raw_blob_retention_offset] = 99;
-                (encoded, "unknown raw blob retention")
+                (encoded, "unknown raw blob retention 99")
             },
             {
                 let mut encoded = base.clone();
@@ -1079,18 +1038,9 @@ mod tests {
         let checkpoint = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([9; 32]));
         let history_bounds = CanonicalHistoryBounds::checkpointed(checkpoint)?;
         let build_plan = checkpointed_build_plan(checkpoint, history_bounds)?;
-        let encoded = encode_building_store_control(
-            CanonicalStoreWorkload::Wallet,
-            &build_plan,
-            CURSOR_AUTH_KEY,
-        )?;
-        let history_kind = CANONICAL_STORE_IDENTITY.len()
-            + 2
-            + 4
-            + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH
-            + 1
-            + 1
-            + 4;
+        let encoded = encode_building_store_control(&build_plan, CURSOR_AUTH_KEY)?;
+        let history_kind =
+            CANONICAL_STORE_IDENTITY.len() + 2 + 4 + ACTIVATIONS_FINGERPRINT_FIELDS_LENGTH + 1 + 4;
         let sapling_presence = history_kind + 1 + 4 + 32 + 4;
         assert_eq!(encoded[sapling_presence], FRONTIER_PRESENT);
         let sapling_root = sapling_presence + 1;
@@ -1121,8 +1071,7 @@ mod tests {
         encoded.extend_from_slice(&Network::ZcashTestnet.id().to_le_bytes());
         encoded.extend_from_slice(&ACTIVATIONS_FINGERPRINT.version().value().to_le_bytes());
         encoded.extend_from_slice(&ACTIVATIONS_FINGERPRINT.as_bytes());
-        encoded.push(EXPLORER_WORKLOAD);
-        encoded.push(TRANSACTION_RAW_BLOB_RETENTION);
+        encoded.push(ALL_RAW_BLOB_RETENTION);
         encoded.extend_from_slice(&1_u32.to_le_bytes());
         encoded.push(COMPLETE_HISTORY);
         encoded.extend_from_slice(&0_u32.to_le_bytes());
@@ -1172,90 +1121,37 @@ mod tests {
         encoded
     }
 
-    // Fingerprints of the schema 1 encoding for each workload and retention policy.
-    const SCHEMA_1_CONTROL_DIGESTS: [(CanonicalStoreWorkload, RawBlobRetention, &str, &str); 6] = [
-        (
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::None,
-            "a0eadd365ba3e5cf89d00b8a9a09c59ca4118ff69a4088835c159a76ca1589cf",
-            "9e55f2790045c09aa59a3556e8c7e0778a31ba5a3a8362123aa5f397a2c47508",
-        ),
-        (
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
-            "ba00efad7d773f48de397e39fa67fa161ff72950fc2b51db3803ae0315619342",
-            "1d7bce9d313fa1ae14e2483e595de3abab8affeb86ecdf4f2c0027886bbc0e8f",
-        ),
-        (
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::All,
-            "156cca3b4db3d62eeb91246f3a110a31f9852196abf4d7fd89b97c106019113c",
-            "9dc50eb29e608cd17f1a0a2b4ece028d31c0b06c16e1b978409d7e69e46f4a5f",
-        ),
-        (
-            CanonicalStoreWorkload::Explorer,
-            RawBlobRetention::None,
-            "2edde2a54e994f4a962617591fad533c7191945ce69486ef1b3aa2be645d7d6f",
-            "02216863d81318ce0df3c0ed5530985d9aa4ade8b444f803c0a4df16f6f6f395",
-        ),
-        (
-            CanonicalStoreWorkload::Explorer,
-            RawBlobRetention::Transactions,
-            "3e2afca1978108213599d5036806968d4841a9812898977f30d0a5d1d86f6016",
-            "5244b637b4cc6b061e91b724a6ccb76114d0f170f59072b24c357cb0b0108720",
-        ),
-        (
-            CanonicalStoreWorkload::Explorer,
-            RawBlobRetention::All,
-            "248b83bebcdafe78d17576a76b53437134efd78c9f0d1b2fc00f4e1c39490bf6",
-            "54aa52eca305c8c02b87cb9b17ce99bf4ac584e3c1daa325e89e5dee2b96f9bc",
-        ),
-    ];
-
     #[test]
-    fn every_stored_set_round_trips_its_schema_1_control_bytes()
+    fn every_stored_set_round_trips_its_schema_2_control_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
         use sha2::{Digest as _, Sha256};
 
-        let sha256_hex = |bytes: &[u8]| {
-            Sha256::digest(bytes)
-                .iter()
-                .fold(String::new(), |mut hex, byte| {
-                    use std::fmt::Write as _;
-                    let _infallible = write!(hex, "{byte:02x}");
-                    hex
-                })
-        };
         let CanonicalStoreBuildState::Ready(ready_evidence) = expected_ready_control().build_state
         else {
             return Err("the READY fixture must carry READY evidence".into());
         };
-        for (workload, retention, building_digest, ready_digest) in SCHEMA_1_CONTROL_DIGESTS {
+        let mut seen = Vec::new();
+        for retention in [RawBlobRetention::None, RawBlobRetention::All] {
             let build_plan = CanonicalStoreBuildPlan {
                 raw_blob_retention: retention,
                 ..complete_build_plan(Network::ZcashTestnet)
             };
-            let building = encode_building_store_control(workload, &build_plan, CURSOR_AUTH_KEY)?;
+            let building = encode_building_store_control(&build_plan, CURSOR_AUTH_KEY)?;
             let ready = encode_ready_store_control_with_revisions(
-                workload,
                 &build_plan,
                 CURSOR_AUTH_KEY,
                 &ready_evidence,
                 expected_ready_control().revisions(),
             )?;
-            assert_eq!(
-                sha256_hex(&building),
-                building_digest,
-                "{workload:?} / {retention}"
-            );
-            assert_eq!(
-                sha256_hex(&ready),
-                ready_digest,
-                "{workload:?} / {retention}"
-            );
+            let building_digest: [u8; 32] = Sha256::digest(&building).into();
+            let ready_digest: [u8; 32] = Sha256::digest(&ready).into();
+            assert_ne!(building_digest, ready_digest);
+            assert!(!seen.contains(&building_digest));
+            assert!(!seen.contains(&ready_digest));
+            seen.push(building_digest);
+            seen.push(ready_digest);
             for encoded in [building, ready] {
                 let decoded = decode_store_control(Path::new("canonical"), &encoded)?;
-                assert_eq!(decoded.workload, workload);
                 assert_eq!(decoded.build_plan, build_plan);
             }
         }
@@ -1265,7 +1161,6 @@ mod tests {
     fn expected_ready_control() -> DecodedStoreControl {
         DecodedStoreControl {
             network: Network::ZcashTestnet,
-            workload: CanonicalStoreWorkload::Explorer,
             build_plan: complete_build_plan(Network::ZcashTestnet),
             cursor_auth_key: CURSOR_AUTH_KEY,
             activation_schedule_binding: Some(ActivationScheduleBinding {
@@ -1309,7 +1204,7 @@ mod tests {
         CanonicalStoreBuildPlan {
             network,
             network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::All,
             reorg_policy: CanonicalReorgPolicy {
                 reorg_window_blocks: NonZeroU32::MIN,
             },
@@ -1330,7 +1225,7 @@ mod tests {
         Ok(CanonicalStoreBuildPlan {
             network: Network::ZcashTestnet,
             network_upgrade_activations_fingerprint: ACTIVATIONS_FINGERPRINT,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::All,
             reorg_policy: CanonicalReorgPolicy {
                 reorg_window_blocks: NonZeroU32::MIN,
             },

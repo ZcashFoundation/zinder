@@ -603,7 +603,7 @@ fn stored_tree_sizes(
         return Ok(predecessor.tip_metadata());
     }
     let compact_block =
-        read_compact_block_at(&store.serving_open().db, height)?.ok_or_else(|| {
+        read_compact_block_at(store.serving_context(), height)?.ok_or_else(|| {
             stride_mismatch(
                 stride,
                 format!("compact block at height {} is absent", height.value()),
@@ -768,7 +768,9 @@ fn commitment_count(tree_sizes: ChainTipMetadata) -> u64 {
 /// Attributes store damage found while reading a stride, such as a row that
 /// does not decode, to that stride, so the pass can skip it.
 fn within_stride(stride: TreeStateStride, error: CanonicalStoreError) -> CanonicalStoreError {
-    if let CanonicalStoreError::PublicationRefused { reason } = error {
+    if let CanonicalStoreError::PublicationRefused { reason }
+    | CanonicalStoreError::SettledSegment { reason } = error
+    {
         return stride_mismatch(stride, reason);
     }
     error

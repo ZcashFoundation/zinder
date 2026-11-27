@@ -168,16 +168,12 @@ pub(super) fn build_supervision_plan(
         .preset
         .map(Preset::deployment_profile)
         .or(meta.deployment.profile);
-    let unprofiled_transactions = explicit_profile.is_none()
-        && !scope.full_blocks
-        && meta.storage.full_blocks != Some(true)
-        && meta.storage.raw_blob_policy.as_deref() == Some("transactions");
     let profile = explicit_profile.unwrap_or(DeploymentProfile::Wallet);
     let active_roles = active_roles_for(scope.mode, profile, scope.readers_only, &meta)?;
     let wiring = derive_wiring(
         scope,
         &meta,
-        (profile, !unprofiled_transactions),
+        (profile, true),
         effective_data_dir,
         &active_roles,
     )?;

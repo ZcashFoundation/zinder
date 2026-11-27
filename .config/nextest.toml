@@ -69,7 +69,7 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # then compact the files away under a secondary. Each takes about a second
 # alone, but under full-workspace parallelism every flush waits on a contended
 # disk, and they take 10-20s, which reaches the 20s default kill window.
-filter = "test(/table_file/) | test(a_stream_ends_with_its_epoch_unavailable_when_its_replacement_serves_a_newer_epoch) | test(a_corrupt_store_control_row_refuses_admission)"
+filter = "test(/table_file/) | test(a_stream_ends_with_its_epoch_unavailable_when_its_replacement_serves_a_newer_epoch) | test(a_corrupt_store_control_row_refuses_admission) | test(a_bounded_read_its_first_block_fills_fetches_only_that_block) | test(publisher_exports_live_sst_size_for_newest_published_pair_without_per_file_properties)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
@@ -110,6 +110,14 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # outstanding, which needs a kill window longer than the 20s default under
 # full-workspace parallelism.
 filter = "test(production_tip_change_publisher_observes_a_post_wait_canonical_event)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# This test builds two 6,100-block canonical and wallet store fixtures (each
+# sealing a 4,096-block settled segment) plus a 1,000-block legacy catalog. It
+# takes ~10-11s alone in a debug build and crosses the 20s default kill window
+# under 4-vCPU CI shard parallelism.
+filter = "package(=zinder-compat-lightwalletd) & test(=integration::lightwalletd_grpc::published_range::descending_gap_retry_delivers_every_previously_checked_retained_block)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.ci.overrides]]

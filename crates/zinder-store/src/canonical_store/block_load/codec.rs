@@ -119,6 +119,7 @@ pub(in crate::canonical_store) fn encode_block_header(
     encoded_header
 }
 
+#[cfg(test)]
 pub(in crate::canonical_store) fn encode_transaction_position(
     height: BlockHeight,
     transaction_index: u32,
@@ -307,39 +308,6 @@ fn decode_checkpoint_frontiers<Frontier>(
     Ok((block_time_seconds, [sapling, orchard, ironwood]))
 }
 
-/// Encodes one v1 block-root value without key/header-owned block identity.
-pub(in crate::canonical_store) fn encode_block_final_note_commitment_roots(
-    roots: &BlockFinalNoteCommitmentRoots,
-) -> Vec<u8> {
-    let presence_bitmap = optional_root_presence_bitmap(roots);
-    let mut encoded = Vec::with_capacity(1 + 3 * 32);
-    encoded.push(presence_bitmap);
-    for root in [roots.sapling, roots.orchard, roots.ironwood]
-        .into_iter()
-        .flatten()
-    {
-        encoded.extend_from_slice(&root.as_bytes());
-    }
-    encoded
-}
-
-/// Decodes one exact v1 block-root value and restores key/header-owned identity.
-pub(in crate::canonical_store) fn decode_block_final_note_commitment_roots(
-    height: BlockHeight,
-    block_hash: BlockHash,
-    encoded: &[u8],
-) -> Result<BlockFinalNoteCommitmentRoots, CanonicalFamilyValueDecodeError> {
-    let mut decoder = ValueDecoder::new("block_final_note_commitment_roots", encoded);
-    let presence_bitmap = decoder.read_presence_bitmap()?;
-    let sapling = decoder.read_optional_root(presence_bitmap, ShieldedProtocol::Sapling)?;
-    let orchard = decoder.read_optional_root(presence_bitmap, ShieldedProtocol::Orchard)?;
-    let ironwood = decoder.read_optional_root(presence_bitmap, ShieldedProtocol::Ironwood)?;
-    decoder.reject_trailing_bytes()?;
-    Ok(BlockFinalNoteCommitmentRoots::new(
-        height, block_hash, sapling, orchard, ironwood,
-    ))
-}
-
 fn encoded_frontiers_len(frontiers: &CommitmentTreeFrontiers) -> usize {
     shielded_protocols()
         .into_iter()
@@ -355,20 +323,6 @@ fn frontier_presence_bitmap(frontiers: &CommitmentTreeFrontiers) -> u8 {
         .fold(0, |bitmap, protocol| {
             bitmap | protocol_presence_bit(protocol)
         })
-}
-
-const fn optional_root_presence_bitmap(roots: &BlockFinalNoteCommitmentRoots) -> u8 {
-    let mut bitmap = 0;
-    if roots.sapling.is_some() {
-        bitmap |= SAPLING_PRESENCE_BIT;
-    }
-    if roots.orchard.is_some() {
-        bitmap |= ORCHARD_PRESENCE_BIT;
-    }
-    if roots.ironwood.is_some() {
-        bitmap |= IRONWOOD_PRESENCE_BIT;
-    }
-    bitmap
 }
 
 const fn protocol_presence_bit(protocol: ShieldedProtocol) -> u8 {
@@ -444,19 +398,6 @@ impl<'encoded> ValueDecoder<'encoded> {
             });
         }
         Ok(presence_bitmap)
-    }
-
-    fn read_optional_root(
-        &mut self,
-        presence_bitmap: u8,
-        protocol: ShieldedProtocol,
-    ) -> Result<Option<FinalNoteCommitmentRoot>, CanonicalFamilyValueDecodeError> {
-        if presence_bitmap & protocol_presence_bit(protocol) == 0 {
-            return Ok(None);
-        }
-        Ok(Some(FinalNoteCommitmentRoot::from_bytes(
-            self.read_array::<32>("final note-commitment root")?,
-        )))
     }
 
     fn read_u8(&mut self, field: &'static str) -> Result<u8, CanonicalFamilyValueDecodeError> {
@@ -644,29 +585,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn block_final_note_commitment_roots_v1_has_exact_known_bytes_and_round_trips() {
-        let height = BlockHeight::new(0x0102_0304);
-        let block_hash = BlockHash::from_bytes([9; 32]);
-        let roots = BlockFinalNoteCommitmentRoots::new(
-            height,
-            block_hash,
-            Some(FinalNoteCommitmentRoot::from_bytes([1; 32])),
-            None,
-            Some(FinalNoteCommitmentRoot::from_bytes([3; 32])),
-        );
-        let mut expected = vec![SAPLING_PRESENCE_BIT | IRONWOOD_PRESENCE_BIT];
-        expected.extend_from_slice(&[1; 32]);
-        expected.extend_from_slice(&[3; 32]);
-
-        let encoded = encode_block_final_note_commitment_roots(&roots);
-        assert_eq!(encoded, expected);
-        assert_eq!(
-            decode_block_final_note_commitment_roots(height, block_hash, &encoded),
-            Ok(roots)
-        );
-    }
-
     /// A checkpoint decode reduced to the block time it reads.
     type BlockTimeDecode = fn(&[u8]) -> Result<u32, CanonicalFamilyValueDecodeError>;
 
@@ -797,33 +715,5 @@ mod tests {
             "a stored-roots decode checks frontier framing and returns the stored root without hashing"
         );
         Ok(())
-    }
-
-    #[test]
-    fn block_final_note_commitment_roots_v1_rejects_non_exact_values() {
-        let height = BlockHeight::new(7);
-        let block_hash = BlockHash::from_bytes([7; 32]);
-        assert!(matches!(
-            decode_block_final_note_commitment_roots(height, block_hash, &[]),
-            Err(CanonicalFamilyValueDecodeError::Truncated { .. })
-        ));
-        assert_eq!(
-            decode_block_final_note_commitment_roots(height, block_hash, &[0x80]),
-            Err(CanonicalFamilyValueDecodeError::UnknownPresenceBits {
-                family: "block_final_note_commitment_roots",
-                presence_bitmap: 0x80,
-            })
-        );
-        assert!(matches!(
-            decode_block_final_note_commitment_roots(height, block_hash, &[SAPLING_PRESENCE_BIT]),
-            Err(CanonicalFamilyValueDecodeError::Truncated { .. })
-        ));
-        assert_eq!(
-            decode_block_final_note_commitment_roots(height, block_hash, &[0, 0]),
-            Err(CanonicalFamilyValueDecodeError::TrailingBytes {
-                family: "block_final_note_commitment_roots",
-                trailing_bytes: 1,
-            })
-        );
     }
 }

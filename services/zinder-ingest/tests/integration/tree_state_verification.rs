@@ -23,8 +23,7 @@ use zinder_ingest::{
 };
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness, ReadinessCause, ReadinessState};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, WalletServingStoreFixture,
@@ -718,7 +717,6 @@ impl PublishedStore {
             canonical_primary_path: self.primary_path.clone(),
             secondary_path: self.secondary_root.path().join("secondary"),
             network_upgrade_activations: Arc::new(self.activations.clone()),
-            workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),

@@ -157,6 +157,21 @@ impl ValidatedCanonicalBlockReplay {
     pub fn into_facts(self) -> CanonicalBlockFacts {
         self.facts
     }
+
+    /// Constructs a [`ValidatedCanonicalBlockReplay`] from already-authenticated block facts.
+    #[must_use]
+    pub fn from_authenticated_facts(
+        facts: CanonicalBlockFacts,
+        format_version: CanonicalBlockReplayFormatVersion,
+        digest_version: CanonicalBlockFactsDigestVersion,
+    ) -> Self {
+        let reference_digest = facts.digest(digest_version);
+        Self {
+            format_version,
+            reference_digest,
+            facts,
+        }
+    }
 }
 
 /// Failure to decode and validate a canonical-block replay envelope.
@@ -1066,7 +1081,8 @@ mod tests {
     use super::{
         CanonicalBlockReplayDecodeError, CanonicalBlockReplayEnvelopeRecord,
         CanonicalBlockReplayFormatVersion, CanonicalBlockReplayV1Record,
-        decode_canonical_block_replay, encode_canonical_block_replay,
+        ValidatedCanonicalBlockReplay, decode_canonical_block_replay,
+        encode_canonical_block_replay,
     };
     use crate::{
         AuthDigest, BlockHash, BlockHeaderArtifact, BlockHeight, CanonicalBlockFacts,
@@ -1139,6 +1155,27 @@ mod tests {
                 118, 158, 235, 74, 30, 229, 78, 251, 238, 132, 172, 7, 41, 163,
             ]
         );
+    }
+
+    #[test]
+    fn from_authenticated_facts_matches_decoded_replay() {
+        let facts = rich_block_facts();
+        let encoding = encode_canonical_block_replay(
+            &facts,
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        );
+        let direct = ValidatedCanonicalBlockReplay::from_authenticated_facts(
+            facts.clone(),
+            CanonicalBlockReplayFormatVersion::V1,
+            CanonicalBlockFactsDigestVersion::V1,
+        );
+        assert_eq!(
+            direct.format_version(),
+            CanonicalBlockReplayFormatVersion::V1
+        );
+        assert_eq!(direct.reference_digest(), encoding.reference_digest());
+        assert_eq!(direct.facts(), &facts);
     }
 
     #[test]

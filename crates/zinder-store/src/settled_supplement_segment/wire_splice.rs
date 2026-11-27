@@ -831,13 +831,22 @@ pub fn reconstruct_compact_block_artifact(
     supplement: &BlockSupplementRecord,
 ) -> Result<CompactBlockArtifact, SettledSupplementSegmentError> {
     validate_shielded_block_wire(shielded_payload)?;
-    validate_transparent_supplement_order(&supplement.transparent_transactions)?;
-    validate_canonical_order(supplement.canonical_metadata.as_ref())?;
     let proto_block = lightwalletd::CompactBlock::decode(shielded_payload).map_err(|err| {
         SettledSupplementSegmentError::PayloadIntegrity(format!(
             "failed to decode CompactBlock payload: {err}"
         ))
     })?;
+    reconstruct_compact_block_from_proto(&proto_block, supplement)
+}
+
+/// Losslessly reconstructs a [`CompactBlockArtifact`] from an already-validated and
+/// decoded `CompactBlock` protobuf message paired with its [`BlockSupplementRecord`].
+pub(crate) fn reconstruct_compact_block_from_proto(
+    proto_block: &lightwalletd::CompactBlock,
+    supplement: &BlockSupplementRecord,
+) -> Result<CompactBlockArtifact, SettledSupplementSegmentError> {
+    validate_transparent_supplement_order(&supplement.transparent_transactions)?;
+    validate_canonical_order(supplement.canonical_metadata.as_ref())?;
     let height = u32::try_from(proto_block.height).map_err(|_| {
         SettledSupplementSegmentError::PayloadIntegrity(
             "CompactBlock height exceeds u32".to_owned(),
@@ -849,7 +858,7 @@ pub fn reconstruct_compact_block_artifact(
     let prev_hash = decode_internal_block_hash(&proto_block.prev_hash).map_err(|err| {
         SettledSupplementSegmentError::PayloadIntegrity(format!("invalid prev_hash: {err}"))
     })?;
-    let meta = proto_block.chain_metadata.ok_or_else(|| {
+    let meta = proto_block.chain_metadata.as_ref().ok_or_else(|| {
         SettledSupplementSegmentError::PayloadIntegrity(
             "CompactBlock payload missing chain_metadata".to_owned(),
         )
@@ -1167,7 +1176,9 @@ fn check_unique_presence_mask(
     Ok(())
 }
 
-fn validate_shielded_block_wire(raw_payload: &[u8]) -> Result<(), SettledSupplementSegmentError> {
+pub(crate) fn validate_shielded_block_wire(
+    raw_payload: &[u8],
+) -> Result<(), SettledSupplementSegmentError> {
     let mut cursor = raw_payload;
     let mut presence = BlockHeaderPresence::empty();
     while !cursor.is_empty() {

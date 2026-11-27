@@ -308,7 +308,7 @@ async fn wallet_rpc_in_wallet_mode_counts_one_lightwalletd_range_across_query_re
     let handle = recorder.handle();
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+        .with_raw_blob_retention(zinder_store::RawBlobRetention::All)
         .extend_blocks(1);
     let mut store =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;

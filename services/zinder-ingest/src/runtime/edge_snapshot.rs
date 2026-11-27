@@ -17,7 +17,7 @@ use zinder_core::{
 };
 use zinder_source::{NodeSource, SourceError};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RocksDbCanonicalStore,
+    CanonicalReorgPolicy, RocksDbCanonicalStore,
     edge_snapshot::{
         DEFAULT_SPOT_CHECK_BLOCKS, EdgeSnapshotAttestation, EdgeSnapshotBootstrap,
         EdgeSnapshotDestination, EdgeSnapshotError, EdgeSnapshotManifest, EdgeSnapshotStoreConfig,
@@ -132,7 +132,6 @@ pub async fn run(
         configured_first_available_height(runtime.run_overrides.checkpoint_height);
     let store_config = EdgeSnapshotStoreConfig {
         activations: &activations,
-        workload: CanonicalStoreWorkload::Wallet,
         raw_blob_retention: runtime.raw_blob_policy.to_retention(),
         reorg_policy: policy,
         required_first_available_height,
@@ -143,7 +142,6 @@ pub async fn run(
             let mut store = RocksDbCanonicalStore::open_ready(
                 &runtime.storage_path,
                 &activations,
-                store_config.workload,
                 store_config.raw_blob_retention,
                 policy,
                 store_config.resource_budget,

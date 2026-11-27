@@ -328,9 +328,14 @@ impl CompatProcess {
         storage: tempfile::TempDir,
     ) -> Result<Self> {
         let network = Network::ZcashRegtest;
+        let retention = if serving == "wallet" {
+            RawBlobRetention::All
+        } else {
+            RawBlobRetention::None
+        };
         let chain = ChainFixture::new(network)
             .extend_blocks(3)
-            .with_raw_blob_retention(RawBlobRetention::Transactions);
+            .with_raw_blob_retention(retention);
         let writer = CanonicalWriterFixture::publish(
             &CanonicalBaseline::new(&chain),
             &sample_regtest_upgrade_activations(),
@@ -362,33 +367,19 @@ impl CompatProcess {
                 .await
         });
         let config = storage.path().join("compat.toml");
-        let origin_setting = origin.map_or_else(String::new, |origin| {
-            format!("browser_origins = [\"{origin}\"]")
-        });
+        let origin_setting =
+            origin.map_or_else(String::new, |o| format!("browser_origins = [\"{o}\"]"));
+        let canonical = writer.canonical_primary_path().display();
+        let reader = storage.path().join("canonical-reader");
         fs::write(
             &config,
             format!(
-                r#"[network]
-name = "zcash-regtest"
-[storage]
-path = "{}"
-secondary_path = "{}"
-raw_blob_policy = "transactions"
-{wallet_config}
-[ops]
-listen_addr = "127.0.0.1:0"
-[ingest_control]
-addr = "http://{control_addr}"
-[compat]
-serving = "{serving}"
-listen_addr = "127.0.0.1:0"
-reorg_window_blocks = 100
-stale_tip_limit_ms = 0
-{origin_setting}
-{history}
-"#,
-                writer.canonical_primary_path().display(),
-                storage.path().join("canonical-reader").display(),
+                "[network]\nname = \"zcash-regtest\"\n[storage]\npath = \"{canonical}\"\n\
+                 secondary_path = \"{}\"\nraw_blob_policy = \"{retention}\"\n{wallet_config}\n\
+                 [ops]\nlisten_addr = \"127.0.0.1:0\"\n[ingest_control]\naddr = \"http://{control_addr}\"\n\
+                 [compat]\nserving = \"{serving}\"\nlisten_addr = \"127.0.0.1:0\"\n\
+                 reorg_window_blocks = 100\nstale_tip_limit_ms = 0\n{origin_setting}\n{history}\n",
+                reader.display(),
             ),
         )?;
         let (addr, child) = start_listener(&config, &storage.path().join("compat.log"))

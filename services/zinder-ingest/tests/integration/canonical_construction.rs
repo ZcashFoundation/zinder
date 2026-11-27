@@ -38,9 +38,8 @@ use zinder_source::{
     SourceChainSegmentLimits, SourceError,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
-    TreeStateLookup,
+    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget, TreeStateLookup,
 };
 use zinder_testkit::frontier_from_note_commitments;
 
@@ -140,13 +139,10 @@ impl NodeSource for SingleBlockSource {
 }
 
 #[tokio::test]
-async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metadata()
+async fn none_canonical_blocks_omit_raw_blobs_and_position_compact_metadata()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (temporary, store_path, outcome, expected_tip_metadata) = load_ironwood_fixture(
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
-    )
-    .await?;
+    let (temporary, store_path, outcome, expected_tip_metadata) =
+        load_ironwood_fixture(RawBlobRetention::None).await?;
     let CanonicalBlockLoadOutcome {
         builder, evidence, ..
     } = outcome;
@@ -154,24 +150,22 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
     assert_eq!(evidence.block_count, 1);
     assert_eq!(evidence.block_header_count, 1);
     assert_eq!(evidence.block_hash_index_count, 1);
-    assert_eq!(evidence.block_replay_count, 1);
-    assert_eq!(evidence.compact_block_count, 1);
+    assert_eq!(evidence.settled_segment_index_count, 0);
+    assert_eq!(evidence.live_tail_block_count, 1);
+    assert!(evidence.logical_replay_bytes > 0);
+    assert_eq!(evidence.settled_segment_index_logical_bytes, 0);
+    assert!(evidence.live_tail_block_logical_bytes > 0);
     assert!(evidence.transaction_location_count > 0);
-    assert_eq!(
-        evidence.transaction_blob_count,
-        evidence.transaction_location_count
-    );
+    assert_eq!(evidence.transaction_blob_count, 0);
     assert_eq!(evidence.block_blob_count, 0);
     assert_eq!(evidence.tree_state_checkpoint_count, 2);
-    assert_eq!(evidence.block_final_note_commitment_roots_count, 0);
     assert_eq!(evidence.tip_metadata, expected_tip_metadata);
     drop(builder);
 
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
         &regtest_activations(),
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -183,15 +177,14 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
 }
 
 #[tokio::test]
-async fn explorer_canonical_blocks_add_block_blob_retention()
+async fn all_canonical_blocks_retain_block_and_transaction_blobs()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_temporary, _store_path, outcome, expected_tip_metadata) =
-        load_ironwood_fixture(CanonicalStoreWorkload::Explorer, RawBlobRetention::All).await?;
+        load_ironwood_fixture(RawBlobRetention::All).await?;
 
     assert_eq!(outcome.evidence.block_count, 1);
     assert_eq!(outcome.evidence.block_blob_count, 1);
     assert_eq!(outcome.evidence.tree_state_checkpoint_count, 2);
-    assert_eq!(outcome.evidence.block_final_note_commitment_roots_count, 1);
     assert!(outcome.evidence.transaction_location_count > 0);
     assert_eq!(
         outcome.evidence.transaction_blob_count,
@@ -201,21 +194,7 @@ async fn explorer_canonical_blocks_add_block_blob_retention()
     Ok(())
 }
 
-#[tokio::test]
-async fn wallet_all_retention_keeps_block_blobs_without_explorer_families()
--> Result<(), Box<dyn std::error::Error>> {
-    let (_temporary, _store_path, outcome, expected_tip_metadata) =
-        load_ironwood_fixture(CanonicalStoreWorkload::Wallet, RawBlobRetention::All).await?;
-
-    assert_eq!(outcome.evidence.block_count, 1);
-    assert_eq!(outcome.evidence.block_blob_count, 1);
-    assert_eq!(outcome.evidence.block_final_note_commitment_roots_count, 0);
-    assert_eq!(outcome.evidence.tip_metadata, expected_tip_metadata);
-    Ok(())
-}
-
 async fn load_ironwood_fixture(
-    workload: CanonicalStoreWorkload,
     raw_blob_retention: RawBlobRetention,
 ) -> Result<
     (
@@ -253,7 +232,6 @@ async fn load_ironwood_fixture(
     let store_path = temporary.path().join("canonical");
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &store_path,
-        workload,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -287,7 +265,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
@@ -295,7 +273,6 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
     let store_path = temporary.path().join("canonical");
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -308,14 +285,13 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
     assert_eq!(outcome.evidence.tip_height, fixed_tip.height);
     assert_eq!(outcome.evidence.tip_hash, fixed_tip.hash);
     assert_eq!(outcome.evidence.block_header_count, 1);
-    assert_eq!(outcome.evidence.block_replay_count, 1);
-    assert_eq!(outcome.evidence.compact_block_count, 1);
+    assert_eq!(outcome.evidence.settled_segment_index_count, 0);
+    assert_eq!(outcome.evidence.live_tail_block_count, 1);
+    assert!(outcome.evidence.logical_replay_bytes > 0);
+    assert_eq!(outcome.evidence.settled_segment_index_logical_bytes, 0);
+    assert!(outcome.evidence.live_tail_block_logical_bytes > 0);
     assert_eq!(outcome.evidence.tree_state_checkpoint_count, 2);
-    assert_eq!(outcome.evidence.block_final_note_commitment_roots_count, 0);
-    assert_eq!(
-        outcome.evidence.transaction_location_count,
-        outcome.evidence.transaction_blob_count
-    );
+    assert_eq!(outcome.evidence.transaction_blob_count, 0);
     assert!(outcome.evidence.logical_bytes > 0);
     assert!(outcome.evidence.sst_file_bytes > 0);
     drop(outcome.builder);
@@ -323,8 +299,7 @@ async fn canonical_blocks_reach_fixed_source_tip_without_wallet_state_writes()
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
         &regtest_activations(),
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -360,7 +335,7 @@ async fn canonical_source_families_authenticate_empty_subtree_ranges_and_fixed_t
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
@@ -376,7 +351,6 @@ async fn canonical_source_families_authenticate_empty_subtree_ranges_and_fixed_t
     let temporary = TempDir::new()?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -409,7 +383,7 @@ async fn construction_stops_when_the_build_tip_left_the_node_best_chain()
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
@@ -427,7 +401,6 @@ async fn construction_stops_when_the_build_tip_left_the_node_best_chain()
     let store_path = temporary.path().join("canonical");
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -455,8 +428,7 @@ async fn construction_stops_when_the_build_tip_left_the_node_best_chain()
     let reopen_error = RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -479,14 +451,13 @@ async fn canonical_construction_rejects_source_blocks_from_another_network()
         &activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
     let temporary = TempDir::new()?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -542,14 +513,13 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
         &store_activations,
         source_block.block_time_seconds.saturating_sub(1),
         fixed_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let history_predecessor = build_plan.history_predecessor().block_id;
     let temporary = TempDir::new()?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1906,42 +1876,6 @@ fn dense_multi_pool_source(
     })
 }
 
-async fn build_explorer_every_block_store(
-    source: &MultiBlockConstructionSource,
-    activations: &Arc<NetworkUpgradeActivations>,
-    store_path: &std::path::Path,
-    tree_hashing_workers: u32,
-    tip_height: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let tip = source.checkpoint_at(tip_height)?;
-    let genesis = source.checkpoint_at(0)?;
-    let build_plan = CanonicalStoreBuildPlan::complete(
-        activations,
-        genesis.block_time_seconds,
-        tip.block_id,
-        RawBlobRetention::Transactions,
-        CanonicalReorgPolicy::new(1)?,
-    )?;
-    let builder = RocksDbCanonicalBuilder::create_fresh(
-        store_path,
-        CanonicalStoreWorkload::Explorer,
-        build_plan,
-        RocksDbResourceBudget::for_local_tests(),
-    )?
-    .with_tree_state_checkpoint_selection(zinder_store::TreeStateCheckpointSelection::EveryBlock)?;
-    let mut config = CanonicalConstructionConfig::for_local_tests(
-        Duration::from_secs(5),
-        Arc::clone(activations),
-    );
-    config.pipeline_limits.tree_hashing_workers =
-        NonZeroU32::new(tree_hashing_workers).ok_or("tree hashing workers must be non-zero")?;
-    let loaded = load_fresh_canonical(builder, source, &config).await?;
-    // Explorer publication requires authenticated daily value-pool evidence, so
-    // stop after bulk loading ingests checkpoints, final roots, and subtrees.
-    drop(loaded);
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_block_construction_with_dense_and_multi_pool_commitments_matches_serial_across_workers()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1951,7 +1885,6 @@ async fn every_block_construction_with_dense_and_multi_pool_commitments_matches_
     let temporary = TempDir::new()?;
 
     let mut serial_checkpoints: Option<ColumnFamilyEntries> = None;
-    let mut serial_final_roots: Option<ColumnFamilyEntries> = None;
     let mut serial_subtrees: Option<ColumnFamilyEntries> = None;
     let mut serial_fence = None;
 
@@ -1983,25 +1916,15 @@ async fn every_block_construction_with_dense_and_multi_pool_commitments_matches_
         drop(wallet_store);
         let wallet_checkpoints = read_cf_entries(&wallet_path, "tree_state_checkpoint")?;
         assert_eq!(wallet_checkpoints.len(), 8);
-
-        let explorer_path = temporary.path().join(format!("explorer-{workers}"));
-        build_explorer_every_block_store(&source, &activations, &explorer_path, workers, 7).await?;
-        let explorer_checkpoints = read_cf_entries(&explorer_path, "tree_state_checkpoint")?;
-        let explorer_final_roots =
-            read_cf_entries(&explorer_path, "block_final_note_commitment_roots")?;
-        let explorer_subtrees = read_cf_entries(&explorer_path, "subtree_root")?;
-        assert_eq!(explorer_checkpoints, wallet_checkpoints);
-        assert_eq!(explorer_final_roots.len(), 7);
+        let wallet_subtrees = read_cf_entries(&wallet_path, "subtree_root")?;
 
         if let Some(expected_checkpoints) = &serial_checkpoints {
             assert_eq!(&wallet_checkpoints, expected_checkpoints);
-            assert_eq!(Some(&explorer_final_roots), serial_final_roots.as_ref());
-            assert_eq!(Some(&explorer_subtrees), serial_subtrees.as_ref());
+            assert_eq!(Some(&wallet_subtrees), serial_subtrees.as_ref());
             assert_eq!(Some(fence), serial_fence);
         } else {
             serial_checkpoints = Some(wallet_checkpoints);
-            serial_final_roots = Some(explorer_final_roots);
-            serial_subtrees = Some(explorer_subtrees);
+            serial_subtrees = Some(wallet_subtrees);
             serial_fence = Some(fence);
         }
     }
@@ -2506,7 +2429,6 @@ async fn every_block_multi_batch_construction_matches_serial_across_workers()
     let temporary = TempDir::new()?;
 
     let mut serial_checkpoints: Option<ColumnFamilyEntries> = None;
-    let mut serial_final_roots: Option<ColumnFamilyEntries> = None;
     let mut serial_subtrees: Option<ColumnFamilyEntries> = None;
     let mut serial_fence = None;
 
@@ -2541,26 +2463,15 @@ async fn every_block_multi_batch_construction_matches_serial_across_workers()
         drop(wallet_store);
         let wallet_checkpoints = read_cf_entries(&wallet_path, "tree_state_checkpoint")?;
         assert_eq!(wallet_checkpoints.len(), 141);
-
-        let explorer_path = temporary.path().join(format!("explorer-batch-{workers}"));
-        build_explorer_every_block_store(&source, &activations, &explorer_path, workers, 140)
-            .await?;
-        let explorer_checkpoints = read_cf_entries(&explorer_path, "tree_state_checkpoint")?;
-        let explorer_final_roots =
-            read_cf_entries(&explorer_path, "block_final_note_commitment_roots")?;
-        let explorer_subtrees = read_cf_entries(&explorer_path, "subtree_root")?;
-        assert_eq!(explorer_checkpoints, wallet_checkpoints);
-        assert_eq!(explorer_final_roots.len(), 140);
+        let wallet_subtrees = read_cf_entries(&wallet_path, "subtree_root")?;
 
         if let Some(expected_checkpoints) = &serial_checkpoints {
             assert_eq!(&wallet_checkpoints, expected_checkpoints);
-            assert_eq!(Some(&explorer_final_roots), serial_final_roots.as_ref());
-            assert_eq!(Some(&explorer_subtrees), serial_subtrees.as_ref());
+            assert_eq!(Some(&wallet_subtrees), serial_subtrees.as_ref());
             assert_eq!(Some(fence), serial_fence);
         } else {
             serial_checkpoints = Some(wallet_checkpoints);
-            serial_final_roots = Some(explorer_final_roots);
-            serial_subtrees = Some(explorer_subtrees);
+            serial_subtrees = Some(wallet_subtrees);
             serial_fence = Some(fence);
         }
     }
@@ -2575,7 +2486,7 @@ async fn every_block_multi_batch_construction_matches_serial_across_workers()
     Ok(())
 }
 
-fn assert_compose_legacy_transactions_print_config(
+fn assert_compose_legacy_transactions_fails_closed(
     temporary_root: &std::path::Path,
     store_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2595,19 +2506,17 @@ fn assert_compose_legacy_transactions_print_config(
             &token_path,
         )
         .output()?;
-    assert!(printed.status.success(), "{printed:?}");
-    let stdout = String::from_utf8(printed.stdout)?;
+    assert!(!printed.status.success(), "{printed:?}");
+    let stderr = String::from_utf8(printed.stderr)?;
     assert!(
-        stdout.contains("raw_blob_policy = \"transactions\""),
-        "{stdout}"
+        stderr.contains("does not have variant constructor transactions"),
+        "{stderr}"
     );
-    assert!(stdout.contains("coverage = \"wallet-serving\""), "{stdout}");
-    assert!(!stdout.contains("[deployment]"), "{stdout}");
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_transactions_compose_override_reopens_pre_change_store()
+async fn legacy_transactions_compose_override_fails_closed_and_binary_mismatch_is_refused()
 -> Result<(), Box<dyn std::error::Error>> {
     let (source_block, chain_checkpoint) = held_construction_chain()?;
     let fixed_tip = chain_checkpoint.block_id;
@@ -2615,72 +2524,59 @@ async fn legacy_transactions_compose_override_reopens_pre_change_store()
     source.release_chain_segments();
     let temporary = TempDir::new()?;
     let store_path = temporary.path().join("canonical");
-    let legacy_config = held_construction_writer_config(store_path.clone(), regtest_activations());
-    assert_eq!(
-        legacy_config.raw_blob_retention,
-        RawBlobRetention::Transactions
-    );
+    let none_config = held_construction_writer_config(store_path.clone(), regtest_activations());
+    assert_eq!(none_config.raw_blob_retention, RawBlobRetention::None);
+
+    assert_compose_legacy_transactions_fails_closed(temporary.path(), &store_path)?;
 
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let initial_store = admit_canonical_store(
         &source,
         regtest_activations(),
-        &legacy_config,
+        &none_config,
         &readiness,
         &CancellationToken::new(),
     )
     .await?;
-    assert_eq!(
-        initial_store.raw_blob_retention(),
-        RawBlobRetention::Transactions
-    );
+    assert_eq!(initial_store.raw_blob_retention(), RawBlobRetention::None);
     assert_eq!(initial_store.event_fence().visible_tip(), fixed_tip);
     let construction_requests = source.chain_segment_requests.load(Ordering::SeqCst);
     drop(initial_store);
 
-    // Upgrading to the default `wallet` profile (`raw_blob_policy = "none"`)
-    // must fail writer admission against a pre-change `transactions` store.
-    let wallet_profile_config = CanonicalWriterConfig {
-        raw_blob_retention: RawBlobRetention::None,
-        ..legacy_config.clone()
+    let all_config = CanonicalWriterConfig {
+        raw_blob_retention: RawBlobRetention::All,
+        ..none_config.clone()
     };
     let rejected = admit_canonical_store(
         &source,
         regtest_activations(),
-        &wallet_profile_config,
+        &all_config,
         &readiness,
         &CancellationToken::new(),
     )
     .await
     .err()
-    .ok_or("default wallet profile must reject reopening a pre-change transactions store")?;
+    .ok_or("reopening a none store under all retention must fail closed")?;
     assert!(
         matches!(
             &rejected,
             CanonicalWriterError::Store(CanonicalStoreError::AdmissionRefused { reason, .. })
                 if reason.contains("raw blob retention")
-                    && reason.contains("transactions")
                     && reason.contains("none")
+                    && reason.contains("all")
         ),
         "{rejected}"
     );
 
-    // Using explicit `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions` without
-    // `ZINDER_DEPLOYMENT__PROFILE` resolves cleanly and reopens the pre-change store.
-    assert_compose_legacy_transactions_print_config(temporary.path(), &store_path)?;
-
     let reopened = admit_canonical_store(
         &source,
         regtest_activations(),
-        &legacy_config,
+        &none_config,
         &readiness,
         &CancellationToken::new(),
     )
     .await?;
-    assert_eq!(
-        reopened.raw_blob_retention(),
-        RawBlobRetention::Transactions
-    );
+    assert_eq!(reopened.raw_blob_retention(), RawBlobRetention::None);
     assert_eq!(reopened.event_fence().visible_tip(), fixed_tip);
     assert_eq!(
         source.chain_segment_requests.load(Ordering::SeqCst),

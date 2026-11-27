@@ -102,7 +102,6 @@ impl TryFrom<&CanonicalOwnerCheckpointEvidence> for CanonicalAdmission {
             store_identity: evidence.store_identity.to_owned(),
             schema_version: evidence.schema_version,
             network: evidence.build_plan.network(),
-            workload: evidence.workload,
             build_plan: CanonicalBuildPlanAdmission::from(evidence.build_plan.clone()),
             first_retained_block: ready.first_retained_block,
             visible_tip: ready.visible_tip,

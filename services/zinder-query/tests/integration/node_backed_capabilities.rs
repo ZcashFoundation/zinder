@@ -295,7 +295,7 @@ async fn verified_broadcast_is_advertised_and_invokable_beside_stored_tree_state
 -> eyre::Result<()> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(2);
     let fixture_block = chain
         .block_at(BlockHeight::new(1))
@@ -429,7 +429,7 @@ async fn native_broadcast_carries_nu7_rejection_reasons_on_the_wire() -> eyre::R
 async fn query_without_a_node_omits_broadcast_and_keeps_tree_state() -> eyre::Result<()> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(1);
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
@@ -486,7 +486,7 @@ struct NodeQueryFixture {
 async fn serving_query(source: ProbedValuePoolSource) -> eyre::Result<NodeQueryFixture> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(1);
     serving_query_from_chain(source, &chain, &activations).await
 }

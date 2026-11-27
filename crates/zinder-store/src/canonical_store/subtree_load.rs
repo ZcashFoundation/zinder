@@ -757,8 +757,8 @@ mod tests {
     };
     use crate::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
-        RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+        CanonicalStoreBuildPlan, CanonicalStoreError, RawBlobRetention, RocksDbCanonicalBuilder,
+        RocksDbCanonicalStore, RocksDbResourceBudget,
     };
 
     const PREDECESSOR: BlockId =
@@ -966,8 +966,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             temporary.path().join("canonical"),
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1414,12 +1413,11 @@ mod tests {
                 predecessor_frontiers,
             ),
             BUILD_TIP,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1487,7 +1485,6 @@ mod tests {
             replay_envelope,
             tip_metadata,
             tree_state_checkpoint: None,
-            block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,

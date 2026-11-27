@@ -10,9 +10,7 @@ use tempfile::tempdir;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_core::{BlockHeight, BlockHeightRange, Network, NetworkUpgradeActivations};
 use zinder_source::NodeSource;
-use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RocksDbCanonicalStore, RocksDbResourceBudget,
-};
+use zinder_store::{CanonicalReorgPolicy, RocksDbCanonicalStore, RocksDbResourceBudget};
 use zinder_testkit::live::{init, require_live, require_live_for};
 
 use crate::common::{
@@ -86,7 +84,6 @@ async fn cli_constructs_bounded_canonical_store_from_config() -> Result<()> {
         .ok_or_else(|| eyre!("missing tip compact block"))?;
 
     assert_eq!(store.network(), env.network());
-    assert_eq!(store.workload(), CanonicalStoreWorkload::Wallet);
     assert_eq!(store.event_fence().visible_tip().height, target_height);
     assert_eq!(compact_block.height(), target_height);
     Ok(())
@@ -170,10 +167,9 @@ async fn cli_constructs_complete_wallet_serving_history_from_config() -> Result<
     let store = open_wallet_canonical_store(
         &storage_path,
         &activations,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
     )?;
     assert_eq!(store.network(), env.network());
-    assert_eq!(store.workload(), CanonicalStoreWorkload::Wallet);
     assert_eq!(store.event_fence().visible_tip().height, to_height);
     assert_eq!(
         store.history_bounds().first_available_height(),
@@ -212,7 +208,6 @@ fn open_wallet_canonical_store(
     Ok(RocksDbCanonicalStore::open_ready(
         storage_path,
         activations,
-        CanonicalStoreWorkload::Wallet,
         raw_blob_retention,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::canonical_writer_defaults(),

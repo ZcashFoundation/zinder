@@ -206,9 +206,7 @@ mod tests {
         BlockHeight, BlockId, CommitmentTreeFrontier, CommitmentTreeFrontiers,
         CompactBlockArtifact, CompactChainMetadata, Network, SUBTREE_LEAF_COUNT, SubtreeRootHash,
     };
-    use zinder_store::{
-        CanonicalBuildSubtreeRoot, CanonicalStoreWorkload, RawBlobRetention, RocksDbResourceBudget,
-    };
+    use zinder_store::{CanonicalBuildSubtreeRoot, RawBlobRetention, RocksDbResourceBudget};
     use zinder_testkit::{
         CanonicalBaseline, CanonicalWriterFixture, ChainFixture, frontier_of_size,
         sample_regtest_upgrade_activations,
@@ -225,8 +223,7 @@ mod tests {
             primary: writer.canonical_primary_path().to_path_buf(),
             secondary_root: scratch.path().to_path_buf(),
             activations: sample_regtest_upgrade_activations(),
-            workload: CanonicalStoreWorkload::Wallet,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::None,
             reorg_policy: writer.canonical_primary()?.reorg_policy(),
             budget: zinder_store::RocksDbResourceBudget {
                 preferred_io_mode: zinder_store::RocksDbIoMode::Buffered,
@@ -275,7 +272,7 @@ mod tests {
         let floor = BlockHeight::new(2);
         let tip = BlockHeight::new(3);
         let mut chain = ChainFixture::new(Network::ZcashRegtest)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .with_raw_blob_retention(RawBlobRetention::None)
             .extend_blocks(tip.value());
         for (height, completed) in [(floor, 1), (tip, 2)] {
             let block = chain

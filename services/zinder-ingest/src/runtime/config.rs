@@ -747,7 +747,6 @@ fn resolve_ingest_config(
 
     let raw_blob_policy = resolve_raw_blob_policy(
         config.deployment.profile,
-        coverage,
         storage_full_blocks,
         configured_raw_blob_policy,
     )?;
@@ -945,7 +944,6 @@ fn guard_ingest_control_bearer_token(
 fn raw_blob_retention_from_policy(policy: RawBlobPolicy) -> RawBlobRetention {
     match policy {
         RawBlobPolicy::None => RawBlobRetention::None,
-        RawBlobPolicy::Transactions => RawBlobRetention::Transactions,
         RawBlobPolicy::All => RawBlobRetention::All,
     }
 }
@@ -998,26 +996,18 @@ fn apply_deployment_profile(config: &mut IngestConfig) -> Result<(), ConfigError
 
 fn resolve_raw_blob_policy(
     profile: Option<DeploymentProfile>,
-    coverage: IngestCoverage,
     full_blocks: Option<bool>,
     configured_policy: Option<RawBlobPolicy>,
 ) -> Result<RawBlobPolicy, ConfigError> {
     if profile.is_some() {
-        return Ok(configured_policy.unwrap_or(RawBlobPolicy::Transactions));
+        return Ok(configured_policy.unwrap_or(DEFAULT_RAW_BLOB_POLICY));
     }
     let resolved_retention = resolve_manual_raw_blob_retention(
         full_blocks,
         configured_policy.map(raw_blob_retention_from_policy),
     )?;
     let resolved_policy = resolved_retention.map(RawBlobPolicy::from);
-    match (coverage, resolved_policy) {
-        (IngestCoverage::WalletServing, None) => Ok(RawBlobPolicy::Transactions),
-        (IngestCoverage::WalletServing, Some(RawBlobPolicy::None)) => Err(ConfigError::invalid(
-            "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
-        )),
-        (_, Some(raw_blob_policy)) => Ok(raw_blob_policy),
-        (_, None) => Ok(DEFAULT_RAW_BLOB_POLICY),
-    }
+    Ok(resolved_policy.unwrap_or(DEFAULT_RAW_BLOB_POLICY))
 }
 
 #[derive(Serialize)]

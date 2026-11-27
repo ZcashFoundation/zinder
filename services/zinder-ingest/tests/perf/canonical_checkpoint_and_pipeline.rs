@@ -36,8 +36,8 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalBlockLoadEvidence, CanonicalBuildSubtreeRoot, CanonicalReorgPolicy,
-    CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbResourceBudget, TreeStateCheckpointSelection,
+    CanonicalStoreBuildPlan, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbResourceBudget,
+    TreeStateCheckpointSelection,
 };
 
 use crate::common::construction_fixture::{
@@ -157,7 +157,6 @@ struct LoadedStoreSnapshot {
     evidence: CanonicalBlockLoadEvidence,
     derived_subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
     checkpoints_cf: Vec<(Vec<u8>, Vec<u8>)>,
-    final_roots_cf: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 fn read_raw_cf(path: &Path, family_name: &str) -> eyre::Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -178,7 +177,6 @@ fn read_raw_cf(path: &Path, family_name: &str) -> eyre::Result<Vec<(Vec<u8>, Vec
 async fn run_load_for_workers(
     source: &MainnetMixBenchSource,
     activations: &Arc<NetworkUpgradeActivations>,
-    workload: CanonicalStoreWorkload,
     workers: u32,
 ) -> eyre::Result<LoadedStoreSnapshot> {
     let directory = TempDir::new()?;
@@ -193,7 +191,6 @@ async fn run_load_for_workers(
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &store_path,
-        workload,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?
@@ -218,12 +215,10 @@ async fn run_load_for_workers(
     drop(outcome.builder);
 
     let checkpoints_cf = read_raw_cf(&store_path, "tree_state_checkpoint")?;
-    let final_roots_cf = read_raw_cf(&store_path, "block_final_note_commitment_roots")?;
     Ok(LoadedStoreSnapshot {
         evidence,
         derived_subtree_roots,
         checkpoints_cf,
-        final_roots_cf,
     })
 }
 
@@ -247,11 +242,9 @@ async fn mainnet_mix_pipelined_construction_batches_checkpoints_and_matches_seri
     let activations = regtest_activations();
     let source = build_mainnet_mix_source(PERF_CHAIN_BLOCKS)?;
 
-    let serial_wallet =
-        run_load_for_workers(&source, &activations, CanonicalStoreWorkload::Wallet, 1).await?;
+    let serial_wallet = run_load_for_workers(&source, &activations, 1).await?;
     let before_parallel = metrics_handle.render();
-    let parallel_wallet =
-        run_load_for_workers(&source, &activations, CanonicalStoreWorkload::Wallet, 8).await?;
+    let parallel_wallet = run_load_for_workers(&source, &activations, 8).await?;
     let after_parallel = metrics_handle.render();
 
     let ckpt_samples = metric_value(
@@ -296,27 +289,6 @@ async fn mainnet_mix_pipelined_construction_batches_checkpoints_and_matches_seri
     assert_eq!(
         parallel_wallet.derived_subtree_roots,
         serial_wallet.derived_subtree_roots
-    );
-
-    let serial_explorer =
-        run_load_for_workers(&source, &activations, CanonicalStoreWorkload::Explorer, 1).await?;
-    let parallel_explorer =
-        run_load_for_workers(&source, &activations, CanonicalStoreWorkload::Explorer, 8).await?;
-    assert_eq!(
-        parallel_explorer.evidence.sequence_digest,
-        serial_explorer.evidence.sequence_digest
-    );
-    assert_eq!(
-        parallel_explorer.checkpoints_cf,
-        serial_explorer.checkpoints_cf
-    );
-    assert_eq!(
-        parallel_explorer.final_roots_cf,
-        serial_explorer.final_roots_cf
-    );
-    assert_eq!(
-        parallel_explorer.final_roots_cf.len(),
-        usize::try_from(PERF_CHAIN_BLOCKS)?
     );
     Ok(())
 }

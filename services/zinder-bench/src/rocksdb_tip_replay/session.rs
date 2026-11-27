@@ -27,8 +27,8 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalReorgPolicy,
-    CanonicalRetainedEvent, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalRetainedEvent, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionReadyEvidence, WalletProjectionSourcePosition,
@@ -130,7 +130,6 @@ impl ReplayStores {
         let canonical = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
             paths.canonical,
             &settings.fixture_activations,
-            CanonicalStoreWorkload::Wallet,
             settings.raw_blob_retention,
             settings.reorg_policy,
             settings.canonical_writer_budget,

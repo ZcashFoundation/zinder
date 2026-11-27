@@ -31,9 +31,8 @@ use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalBuildSubtreeRoot,
     CanonicalEventFence, CanonicalEventRetentionReport, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore, RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE,
-    TreeStateCheckpointSelection,
+    CanonicalStoreBuildPlan, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
 };
 
 use crate::{ChainFixture, FixtureBlock, FixtureTransactionRows, WalletServingStoreFixture};
@@ -208,7 +207,6 @@ impl CanonicalWriterFixture {
         let canonical_primary_path = temporary_directory.path().join("canonical-primary");
         let builder = RocksDbCanonicalBuilder::create_fresh(
             &canonical_primary_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -657,7 +655,7 @@ impl FixtureChainArtifacts {
             })?
             .into_facts();
         let raw_blob_retention = self.chain.raw_blob_retention();
-        let transaction_blobs = if raw_blob_retention.retains_transaction_blobs() {
+        let transaction_blobs = if raw_blob_retention.full_blocks() {
             self.block_transaction_blobs(fixture_block)?
         } else {
             Vec::new()
@@ -675,10 +673,9 @@ impl FixtureChainArtifacts {
                     frontiers,
                 )
             }),
-            block_final_note_commitment_roots: None,
             transaction_blobs,
             block_blob: raw_blob_retention
-                .retains_block_blobs()
+                .full_blocks()
                 .then(|| fixture_block.block_blob_artifact()),
         })
     }

@@ -2,14 +2,6 @@
 //! unsealed canonical live-tail records (`ZSLVTL01` and split `ZSLVRB01`) at
 //! heights `> sealed_tip`.
 
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "canonical live_tail codecs are staged before canonical builder and reader wiring"
-    )
-)]
-
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use zinder_core::{
@@ -26,7 +18,7 @@ use zinder_core::{
         encode_internal_transaction_id, encode_internal_wtxid,
     },
 };
-use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
+use zinder_proto::compat::lightwalletd;
 
 use crate::{
     settled_raw_block_segment::{
@@ -35,10 +27,9 @@ use crate::{
     settled_shielded_segment::{PoolPresenceMask, SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES},
     settled_supplement_segment::{
         BlockSupplementRecord, CanonicalBlockSupplement, CanonicalTransactionSupplement,
-        CompactBlockSpliceSelection, CompactTransparentSupplementTx,
-        SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES, SupplementShieldedAnchors,
-        SupplementTxFeeAndBurn, exact_zip317_logical_actions_from_outputs,
-        reconstruct_compact_block_artifact, splice_compact_block_wire,
+        CompactTransparentSupplementTx, SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+        SupplementShieldedAnchors, SupplementTxFeeAndBurn,
+        exact_zip317_logical_actions_from_outputs, reconstruct_compact_block_artifact,
         transparent_supplement_from_compact,
     },
 };
@@ -64,6 +55,7 @@ const MAX_LIVE_TAIL_RAW_BLOCK_RECORD_BYTES: usize = 32 * 1024 * 1024;
 
 const MAX_LIVE_TAIL_TX_COUNT: usize = 250_000;
 const MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT: usize = 250_000;
+const MAX_LIVE_TAIL_PREALLOC_COUNT: usize = 1_024;
 const MAX_LIVE_TAIL_SCRIPT_PUB_KEY_BYTES: usize = 1024 * 1024;
 const MAX_LIVE_TAIL_UNSUPPORTED_SECTIONS: usize = 64;
 
@@ -356,6 +348,15 @@ pub(crate) struct LiveTailBlockRecord {
     pub(crate) canonical_facts: Option<CanonicalBlockFacts>,
 }
 
+/// Encoding toggles for [`LiveTailBlockRecord::encode_from_compact_block_v1`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LiveTailEncodeOptions {
+    /// Whether Tag-1/Tag-2 supplement metadata is included.
+    pub(crate) include_supplement: bool,
+    /// Whether canonical block facts remain embedded in the serialized record.
+    pub(crate) retain_canonical_facts: bool,
+}
+
 impl LiveTailBlockRecord {
     /// Constructs and validates one live-tail record from a [`CompactBlockArtifact`].
     pub(crate) fn from_compact_block(
@@ -363,6 +364,42 @@ impl LiveTailBlockRecord {
         include_supplement: bool,
         canonical_facts: Option<CanonicalBlockFacts>,
     ) -> Result<Self, SettledSegmentsError> {
+        let (record, _) = Self::construct_validated_from_compact_block(
+            block,
+            include_supplement,
+            canonical_facts,
+        )?;
+        Ok(record)
+    }
+
+    /// Constructs, validates, and `V1`-encodes one live-tail record from a
+    /// [`CompactBlockArtifact`] without re-decoding its freshly encoded shielded payload.
+    pub(crate) fn encode_from_compact_block_v1(
+        block: &CompactBlockArtifact,
+        canonical_facts: Option<CanonicalBlockFacts>,
+        options: LiveTailEncodeOptions,
+    ) -> Result<(Vec<u8>, usize), SettledSegmentsError> {
+        let (mut record, replay_envelope) = Self::construct_validated_from_compact_block(
+            block,
+            options.include_supplement,
+            canonical_facts,
+        )?;
+        let shielded_payload_len = record.shielded_payload.len();
+        let envelope = if options.retain_canonical_facts {
+            replay_envelope
+        } else {
+            record.canonical_facts = None;
+            None
+        };
+        let encoded = record.encode_v1_with_validated_envelope(envelope)?;
+        Ok((encoded, shielded_payload_len))
+    }
+
+    fn construct_validated_from_compact_block(
+        block: &CompactBlockArtifact,
+        include_supplement: bool,
+        canonical_facts: Option<CanonicalBlockFacts>,
+    ) -> Result<(Self, Option<CanonicalBlockReplayEnvelope>), SettledSegmentsError> {
         let (shielded_payload, pool_presence) =
             encode_default_shielded_payload_with_options(block, include_supplement)?;
         let supplement = if include_supplement {
@@ -387,14 +424,170 @@ impl LiveTailBlockRecord {
             supplement,
             canonical_facts,
         };
-        record.validate()?;
-        Ok(record)
+        let replay_envelope = record.validate_from_compact_block(block)?;
+        Ok((record, replay_envelope))
+    }
+
+    /// Authenticates a `V1` record and reconstructs only its [`CompactBlockArtifact`] and
+    /// canonical compact-wire budget length.
+    pub(crate) fn decode_compact_block_v1(
+        bytes: &[u8],
+        expected_height: BlockHeight,
+    ) -> Result<(CompactBlockArtifact, usize), SettledSegmentsError> {
+        let (header, mut cursor) = parse_authenticated_header_v1(bytes, expected_height)?;
+        let shielded_payload = cursor.read_len_prefixed_slice(
+            SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
+            "live_tail.shielded",
+        )?;
+        let supplement = if (header.flags & LIVE_TAIL_FLAG_SUPPLEMENT) != 0 {
+            Some(decode_supplement_record(&mut cursor)?)
+        } else {
+            None
+        };
+        if (header.flags & LIVE_TAIL_FLAG_CANONICAL_FACTS) != 0 {
+            let _ = cursor.read_len_prefixed_slice(
+                SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+                "live_tail.facts",
+            )?;
+        }
+        cursor.finish("LiveTailBlockRecord")?;
+        let proto_block = decode_and_validate_shielded_payload(
+            shielded_payload,
+            header.block_id,
+            header.previous_block_hash,
+            header.block_time,
+            header.pool_presence,
+        )?;
+        let empty_sup = BlockSupplementRecord {
+            transparent_transactions: Vec::new(),
+            canonical_metadata: None,
+        };
+        let compact_block = match &supplement {
+            Some(sup) => {
+                validate_supplement_limits(sup)?;
+                validate_supplement_against_payload(&proto_block, sup)?
+            }
+            None => crate::settled_supplement_segment::reconstruct_compact_block_from_proto(
+                &proto_block,
+                &empty_sup,
+            )?,
+        };
+        let compact_wire_budget_len =
+            crate::proto_codec::encoded_compact_block_artifact_len(&compact_block)
+                .max(shielded_payload.len());
+        Ok((compact_block, compact_wire_budget_len))
+    }
+
+    /// Authenticates a `V1` record and extracts only [`CanonicalBlockFacts`] when present,
+    /// skipping compact-block protobuf decoding.
+    pub(crate) fn decode_canonical_facts_v1(
+        bytes: &[u8],
+        expected_height: BlockHeight,
+    ) -> Result<Option<CanonicalBlockFacts>, SettledSegmentsError> {
+        let (header, mut cursor) = parse_authenticated_header_v1(bytes, expected_height)?;
+        let _ = cursor.read_len_prefixed_slice(
+            SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
+            "live_tail.shielded",
+        )?;
+        if (header.flags & LIVE_TAIL_FLAG_SUPPLEMENT) != 0 {
+            skip_supplement_record(&mut cursor)?;
+        }
+        let canonical_facts = if (header.flags & LIVE_TAIL_FLAG_CANONICAL_FACTS) != 0 {
+            let encoded_replay = cursor.read_len_prefixed_slice(
+                SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+                "live_tail.facts",
+            )?;
+            let decoded = decode_canonical_block_replay(encoded_replay).map_err(|err| {
+                SettledSegmentsError::Integrity(format!(
+                    "live-tail canonical block replay failed validation: {err}"
+                ))
+            })?;
+            let facts = decoded.into_facts();
+            verify_facts_header_matches_record(&header, &facts)?;
+            Some(facts)
+        } else {
+            None
+        };
+        cursor.finish("LiveTailBlockRecord")?;
+        Ok(canonical_facts)
     }
 
     /// Authenticates internal wire payload, supplement, canonical facts, and limits.
+    #[cfg(test)]
     pub(crate) fn validate(&self) -> Result<(), SettledSegmentsError> {
         let _ = self.validate_for_encode()?;
         Ok(())
+    }
+
+    fn validate_from_compact_block(
+        &self,
+        block: &CompactBlockArtifact,
+    ) -> Result<Option<CanonicalBlockReplayEnvelope>, SettledSegmentsError> {
+        if let Some(sup) = &self.supplement {
+            validate_supplement_limits(sup)?;
+            validate_transparent_supplement_entries(sup, block)?;
+            if let Some(meta) = &sup.canonical_metadata {
+                validate_canonical_meta_order(meta, block)?;
+            }
+        }
+        if let Some(facts) = &self.canonical_facts {
+            self.validate_canonical_facts_match(facts, block)?;
+        }
+        let replay_envelope = self
+            .canonical_facts
+            .as_ref()
+            .map(validate_canonical_facts_replay)
+            .transpose()?;
+        let replay_len = replay_envelope.as_ref().map(|env| env.as_bytes().len());
+        let predicted_len = self.predict_encoded_len(replay_len)?;
+        if !(LIVE_TAIL_HEADER_MIN_LEN..=MAX_LIVE_TAIL_RECORD_BYTES).contains(&predicted_len) {
+            return Err(SettledSegmentsError::InvalidFormat(format!(
+                "live-tail encoded record length {predicted_len} outside allowed range"
+            )));
+        }
+        Ok(replay_envelope)
+    }
+
+    fn encode_v1_with_validated_envelope(
+        &self,
+        replay_envelope: Option<CanonicalBlockReplayEnvelope>,
+    ) -> Result<Vec<u8>, SettledSegmentsError> {
+        let mut flags = 0_u8;
+        if self.supplement.is_some() {
+            flags |= LIVE_TAIL_FLAG_SUPPLEMENT;
+        }
+        if replay_envelope.is_some() {
+            flags |= LIVE_TAIL_FLAG_CANONICAL_FACTS;
+        }
+        let mut out = Vec::with_capacity(self.shielded_payload.len() + 256);
+        out.extend_from_slice(LIVE_TAIL_MAGIC);
+        out.extend_from_slice(&LIVE_TAIL_RECORD_VERSION_V1.to_be_bytes());
+        out.push(flags);
+        out.push(0);
+        out.extend_from_slice(&self.block_id.height.value().to_be_bytes());
+        out.extend_from_slice(&encode_internal_block_hash(self.block_id.hash));
+        out.extend_from_slice(&encode_internal_block_hash(self.previous_block_hash));
+        out.extend_from_slice(&self.block_time.to_be_bytes());
+        out.push(self.pool_presence.bits());
+        push_len_prefixed_bytes(&mut out, &self.shielded_payload, "live_tail.shielded")?;
+        if let Some(sup) = &self.supplement {
+            encode_supplement_record(&mut out, sup)?;
+        }
+        if let Some(envelope) = replay_envelope {
+            push_len_prefixed_bytes(&mut out, envelope.as_bytes(), "live_tail.facts")?;
+        }
+        let total_len = out
+            .len()
+            .checked_add(LIVE_TAIL_TRAILER_LEN)
+            .ok_or_else(live_tail_size_overflow)?;
+        if !(LIVE_TAIL_HEADER_MIN_LEN..=MAX_LIVE_TAIL_RECORD_BYTES).contains(&total_len) {
+            return Err(SettledSegmentsError::InvalidFormat(format!(
+                "live-tail encoded record length {total_len} outside allowed range"
+            )));
+        }
+        let digest: [u8; 32] = Sha256::digest(&out).into();
+        out.extend_from_slice(&digest);
+        Ok(out)
     }
 
     fn validate_for_encode(
@@ -417,7 +610,7 @@ impl LiveTailBlockRecord {
     }
 
     fn validate_core(&self) -> Result<(), SettledSegmentsError> {
-        validate_shielded_payload(
+        let proto_block = decode_and_validate_shielded_payload(
             &self.shielded_payload,
             self.block_id,
             self.previous_block_hash,
@@ -431,9 +624,12 @@ impl LiveTailBlockRecord {
         let reconstructed = match &self.supplement {
             Some(sup) => {
                 validate_supplement_limits(sup)?;
-                validate_supplement_against_payload(&self.shielded_payload, sup)?
+                validate_supplement_against_payload(&proto_block, sup)?
             }
-            None => reconstruct_compact_block_artifact(&self.shielded_payload, &empty_sup)?,
+            None => crate::settled_supplement_segment::reconstruct_compact_block_from_proto(
+                &proto_block,
+                &empty_sup,
+            )?,
         };
         if let Some(facts) = &self.canonical_facts {
             self.validate_canonical_facts_match(facts, &reconstructed)?;
@@ -522,10 +718,11 @@ impl LiveTailBlockRecord {
 
     /// Splices a gRPC-framed [`EncodedBlock`] according to `selection`, failing closed
     /// when transparent data or all-transaction retention is requested without a supplement.
+    #[cfg(test)]
     pub(crate) fn splice_compact_block(
         &self,
-        selection: CompactBlockSpliceSelection,
-    ) -> Result<EncodedBlock, SettledSegmentsError> {
+        selection: crate::settled_supplement_segment::CompactBlockSpliceSelection,
+    ) -> Result<zinder_proto::compat::lightwalletd::EncodedBlock, SettledSegmentsError> {
         if (selection.include_transparent || selection.retain_all_transactions)
             && self.supplement.is_none()
         {
@@ -545,45 +742,19 @@ impl LiveTailBlockRecord {
             .supplement
             .as_ref()
             .map_or(&[][..], |sup| &sup.transparent_transactions);
-        Ok(splice_compact_block_wire(
-            &self.shielded_payload,
-            transparent,
-            selection,
-        )?)
+        Ok(
+            crate::settled_supplement_segment::splice_compact_block_wire(
+                &self.shielded_payload,
+                transparent,
+                selection,
+            )?,
+        )
     }
 
     /// Encodes this record in strict versioned `V1` big-endian format with trailing SHA-256.
     pub(crate) fn encode_v1(&self) -> Result<Vec<u8>, SettledSegmentsError> {
         let replay_envelope = self.validate_for_encode()?;
-        let mut out = Vec::with_capacity(self.shielded_payload.len() + 256);
-        out.extend_from_slice(LIVE_TAIL_MAGIC);
-        out.extend_from_slice(&LIVE_TAIL_RECORD_VERSION_V1.to_be_bytes());
-        out.push(self.presence_flags());
-        out.push(0);
-        out.extend_from_slice(&self.block_id.height.value().to_be_bytes());
-        out.extend_from_slice(&encode_internal_block_hash(self.block_id.hash));
-        out.extend_from_slice(&encode_internal_block_hash(self.previous_block_hash));
-        out.extend_from_slice(&self.block_time.to_be_bytes());
-        out.push(self.pool_presence.bits());
-        push_len_prefixed_bytes(&mut out, &self.shielded_payload, "live_tail.shielded")?;
-        if let Some(sup) = &self.supplement {
-            encode_supplement_record(&mut out, sup)?;
-        }
-        if let Some(envelope) = replay_envelope {
-            push_len_prefixed_bytes(&mut out, envelope.as_bytes(), "live_tail.facts")?;
-        }
-        let total_len = out
-            .len()
-            .checked_add(LIVE_TAIL_TRAILER_LEN)
-            .ok_or_else(live_tail_size_overflow)?;
-        if !(LIVE_TAIL_HEADER_MIN_LEN..=MAX_LIVE_TAIL_RECORD_BYTES).contains(&total_len) {
-            return Err(SettledSegmentsError::InvalidFormat(format!(
-                "live-tail encoded record length {total_len} outside allowed range"
-            )));
-        }
-        let digest: [u8; 32] = Sha256::digest(&out).into();
-        out.extend_from_slice(&digest);
-        Ok(out)
+        self.encode_v1_with_validated_envelope(replay_envelope)
     }
 
     /// Decodes and authenticates a `V1` live-tail record, failing closed on any tamper.
@@ -619,21 +790,11 @@ impl LiveTailBlockRecord {
         record.validate_core()?;
         Ok(record)
     }
-
-    const fn presence_flags(&self) -> u8 {
-        let mut flags = 0_u8;
-        if self.supplement.is_some() {
-            flags |= LIVE_TAIL_FLAG_SUPPLEMENT;
-        }
-        if self.canonical_facts.is_some() {
-            flags |= LIVE_TAIL_FLAG_CANONICAL_FACTS;
-        }
-        flags
-    }
 }
 
 /// Encodes one [`CompactBlockArtifact`] into the `DEFAULT_RANGE` `CompactBlock` protobuf
 /// payload paired with its [`PoolPresenceMask`].
+#[cfg(test)]
 pub(crate) fn encode_default_shielded_payload(
     block: &CompactBlockArtifact,
 ) -> Result<(Vec<u8>, PoolPresenceMask), SettledSegmentsError> {
@@ -790,18 +951,19 @@ fn validate_raw_block_size(byte_len: usize) -> Result<(), SettledSegmentsError> 
     Ok(())
 }
 
-fn validate_shielded_payload(
+fn decode_and_validate_shielded_payload(
     shielded_payload: &[u8],
     expected_block_id: BlockId,
     expected_prev_hash: BlockHash,
     expected_block_time: u32,
     expected_pool_presence: PoolPresenceMask,
-) -> Result<(), SettledSegmentsError> {
+) -> Result<lightwalletd::CompactBlock, SettledSegmentsError> {
     if shielded_payload.len() > SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES {
         return Err(SettledSegmentsError::InvalidFormat(
             "live-tail shielded payload exceeds size bound".to_owned(),
         ));
     }
+    crate::settled_supplement_segment::validate_shielded_block_wire(shielded_payload)?;
     let proto_block = lightwalletd::CompactBlock::decode(shielded_payload).map_err(|err| {
         SettledSegmentsError::Integrity(format!("invalid CompactBlock protobuf: {err}"))
     })?;
@@ -821,6 +983,257 @@ fn validate_shielded_payload(
         return Err(SettledSegmentsError::Integrity(
             "live-tail pool_presence does not match shielded payload transactions".to_owned(),
         ));
+    }
+    Ok(proto_block)
+}
+
+struct LiveTailHeader {
+    flags: u8,
+    block_id: BlockId,
+    previous_block_hash: BlockHash,
+    block_time: u32,
+    pool_presence: PoolPresenceMask,
+}
+
+fn parse_authenticated_header_v1(
+    bytes: &[u8],
+    expected_height: BlockHeight,
+) -> Result<(LiveTailHeader, ByteReader<'_>), SettledSegmentsError> {
+    let body = verify_outer_digest_and_len(bytes)?;
+    let mut cursor = ByteReader::new(body);
+    let magic = cursor.read_array::<8>("live_tail.magic")?;
+    if &magic != LIVE_TAIL_MAGIC {
+        return Err(SettledSegmentsError::InvalidFormat(
+            "live-tail record magic mismatch".to_owned(),
+        ));
+    }
+    let version = cursor.read_u16_be("live_tail.version")?;
+    if version != LIVE_TAIL_RECORD_VERSION_V1 {
+        return Err(SettledSegmentsError::InvalidFormat(format!(
+            "unsupported live-tail record version {version}"
+        )));
+    }
+    let flags = cursor.read_u8("live_tail.flags")?;
+    if (flags & !LIVE_TAIL_KNOWN_FLAGS) != 0 {
+        return Err(SettledSegmentsError::InvalidFormat(format!(
+            "unsupported live-tail flag bits {flags:#04x}"
+        )));
+    }
+    let reserved = cursor.read_u8("live_tail.reserved")?;
+    if reserved != 0 {
+        return Err(SettledSegmentsError::InvalidFormat(format!(
+            "non-zero reserved byte {reserved} in live-tail record"
+        )));
+    }
+    let height = BlockHeight::new(cursor.read_u32_be("live_tail.height")?);
+    if height != expected_height {
+        return Err(SettledSegmentsError::ChainLinkage(format!(
+            "live_tail_block key {} disagrees with record height {}",
+            expected_height.value(),
+            height.value()
+        )));
+    }
+    let block_hash_bytes = cursor.read_array::<32>("live_tail.block_hash")?;
+    let block_hash = decode_internal_block_hash(&block_hash_bytes).map_err(|err| {
+        SettledSegmentsError::InvalidFormat(format!("invalid live-tail block_hash: {err}"))
+    })?;
+    let prev_hash_bytes = cursor.read_array::<32>("live_tail.previous_block_hash")?;
+    let previous_block_hash = decode_internal_block_hash(&prev_hash_bytes).map_err(|err| {
+        SettledSegmentsError::InvalidFormat(format!("invalid live-tail previous_block_hash: {err}"))
+    })?;
+    let block_time = cursor.read_u32_be("live_tail.block_time")?;
+    let presence_bits = cursor.read_u8("live_tail.pool_presence")?;
+    let pool_presence = PoolPresenceMask::from_bits(presence_bits).ok_or_else(|| {
+        SettledSegmentsError::InvalidFormat(format!(
+            "live-tail record has unknown pool_presence bits {presence_bits:#04x}"
+        ))
+    })?;
+    Ok((
+        LiveTailHeader {
+            flags,
+            block_id: BlockId::new(height, block_hash),
+            previous_block_hash,
+            block_time,
+            pool_presence,
+        },
+        cursor,
+    ))
+}
+
+fn verify_facts_header_matches_record(
+    header: &LiveTailHeader,
+    facts: &CanonicalBlockFacts,
+) -> Result<(), SettledSegmentsError> {
+    let block_header = &facts.block_header;
+    if block_header.height != header.block_id.height
+        || block_header.block_hash != header.block_id.hash
+        || block_header.parent_hash != header.previous_block_hash
+        || block_header.block_time != i64::from(header.block_time)
+    {
+        return Err(SettledSegmentsError::ChainLinkage(
+            "canonical block facts header disagrees with live-tail block identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn skip_opt(
+    cursor: &mut ByteReader<'_>,
+    len: usize,
+    field_label: &str,
+) -> Result<(), SettledSegmentsError> {
+    if cursor.read_bool(field_label)? {
+        let _ = cursor.read_slice(len, field_label)?;
+    }
+    Ok(())
+}
+
+fn skip_supplement_record(cursor: &mut ByteReader<'_>) -> Result<(), SettledSegmentsError> {
+    let tx_count = read_bounded_count(
+        cursor,
+        MAX_LIVE_TAIL_TX_COUNT,
+        "supplement.transparent_count",
+    )?;
+    for _ in 0..tx_count {
+        let _ = cursor.read_slice(8 + 32, "supplement_tx.head")?;
+        skip_opt(cursor, 8, "supplement_tx.fee_zat")?;
+        let vin_count = read_bounded_count(
+            cursor,
+            MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT,
+            "supplement_tx.vin_count",
+        )?;
+        let vin_bytes = vin_count
+            .checked_mul(36)
+            .ok_or_else(live_tail_size_overflow)?;
+        let _ = cursor.read_slice(vin_bytes, "supplement_tx.vins")?;
+        let vout_count = read_bounded_count(
+            cursor,
+            MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT,
+            "supplement_tx.vout_count",
+        )?;
+        for _ in 0..vout_count {
+            let _ = cursor.read_slice(8, "supplement_vout.value_zat")?;
+            let _ = cursor.read_len_prefixed_slice(
+                MAX_LIVE_TAIL_SCRIPT_PUB_KEY_BYTES,
+                "supplement_vout.script",
+            )?;
+        }
+    }
+    if cursor.read_bool("supplement.has_canonical_metadata")? {
+        let _ = cursor.read_slice(32, "canonical_sup.serialized_bytes_digest")?;
+        let meta_tx_count =
+            read_bounded_count(cursor, MAX_LIVE_TAIL_TX_COUNT, "canonical_sup.tx_count")?;
+        for _ in 0..meta_tx_count {
+            skip_canonical_tx_supplement(cursor)?;
+        }
+    }
+    Ok(())
+}
+
+fn skip_canonical_tx_supplement(cursor: &mut ByteReader<'_>) -> Result<(), SettledSegmentsError> {
+    let _ = cursor.read_slice(8, "canonical_tx_sup.tx_index")?;
+    skip_public_facts(cursor)?;
+    let _ = cursor.read_slice(32 + 32, "canonical_tx_sup.digest_and_balances")?;
+    skip_opt(cursor, 32, "canonical_tx_sup.orchard_anchor")?;
+    skip_opt(cursor, 32, "canonical_tx_sup.ironwood_anchor")?;
+    skip_opt(cursor, 32, "canonical_tx_sup.sapling_anchor")?;
+    skip_opt(cursor, 4, "canonical_tx_sup.zip317")?;
+    skip_opt(cursor, 8, "canonical_tx_sup.fee_zat")?;
+    skip_opt(cursor, 8, "canonical_tx_sup.burn_zat")?;
+    skip_explicit_transparent_facts(cursor)
+}
+
+fn skip_public_facts(cursor: &mut ByteReader<'_>) -> Result<(), SettledSegmentsError> {
+    let _ = cursor.read_slice(32, "public_facts.txid")?;
+    skip_opt(cursor, 32, "public_facts.auth_digest")?;
+    skip_opt(cursor, 64, "public_facts.wtxid")?;
+    match cursor.read_u8("public_facts.tx_version")? {
+        1..=6 => {}
+        7 => {
+            let _ = cursor.read_slice(4, "tx_version.effective_version")?;
+            skip_opt(cursor, 4, "tx_version.version_group_id")?;
+        }
+        kind => {
+            return Err(SettledSegmentsError::InvalidFormat(format!(
+                "unknown transaction version discriminant {kind}"
+            )));
+        }
+    }
+    skip_opt(cursor, 4, "public_facts.branch_id")?;
+    match cursor.read_u8("public_facts.lock_time")? {
+        1 => {}
+        2 => {
+            let _ = cursor.read_slice(4, "lock_time.height")?;
+        }
+        3 => {
+            let _ = cursor.read_slice(8, "lock_time.unix_seconds")?;
+        }
+        kind => {
+            return Err(SettledSegmentsError::InvalidFormat(format!(
+                "unknown lock_time discriminant {kind}"
+            )));
+        }
+    }
+    skip_opt(cursor, 4, "public_facts.expiry")?;
+    let _ = cursor.read_slice(4 + 28, "public_facts.size_and_counts")?;
+    skip_opt(cursor, 8, "public_facts.orchard_vb")?;
+    skip_opt(cursor, 32, "public_facts.orchard_anchor")?;
+    skip_opt(cursor, 8, "public_facts.ironwood_vb")?;
+    let _ = decode_privacy_shape(cursor.read_u8("public_facts.privacy_shape")?)?;
+    let _ = cursor.read_bool("public_facts.is_coinbase")?;
+    let unsup_count = read_bounded_count(
+        cursor,
+        MAX_LIVE_TAIL_UNSUPPORTED_SECTIONS,
+        "public_facts.unsupported_count",
+    )?;
+    for _ in 0..unsup_count {
+        match cursor.read_u8("public_facts.unsupported_section")? {
+            1 | 2 => {}
+            code => {
+                return Err(SettledSegmentsError::InvalidFormat(format!(
+                    "unknown unsupported section discriminant {code}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+const EXPLICIT_TRANSPARENT_FACTS_VERSION_V1: u8 = 1;
+
+fn skip_explicit_transparent_facts(
+    cursor: &mut ByteReader<'_>,
+) -> Result<(), SettledSegmentsError> {
+    if !cursor.read_bool("canonical_tx_sup.has_explicit_transparent")? {
+        return Ok(());
+    }
+    let version = cursor.read_u8("explicit_transparent.version")?;
+    if version != EXPLICIT_TRANSPARENT_FACTS_VERSION_V1 {
+        return Err(SettledSegmentsError::InvalidFormat(format!(
+            "unsupported explicit transparent facts version {version}"
+        )));
+    }
+    let vin_count = read_bounded_count(
+        cursor,
+        MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT,
+        "explicit_transparent.vin_count",
+    )?;
+    let vin_bytes = vin_count
+        .checked_mul(40)
+        .ok_or_else(live_tail_size_overflow)?;
+    let _ = cursor.read_slice(vin_bytes, "explicit_transparent.vins")?;
+    let vout_count = read_bounded_count(
+        cursor,
+        MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT,
+        "explicit_transparent.vout_count",
+    )?;
+    for _ in 0..vout_count {
+        let _ = cursor.read_slice(4 + 8, "explicit_transparent.vout_head")?;
+        let _ = cursor.read_len_prefixed_slice(
+            MAX_LIVE_TAIL_SCRIPT_PUB_KEY_BYTES,
+            "explicit_transparent.script_pub_key",
+        )?;
+        let _ = cursor.read_slice(32, "explicit_transparent.address_script_hash")?;
     }
     Ok(())
 }
@@ -859,19 +1272,18 @@ fn inspect_proto_vtx_pool_mask(
     Ok(mask)
 }
 
-fn validate_supplement_against_payload(
-    shielded_payload: &[u8],
+fn validate_transparent_supplement_entries(
     sup: &BlockSupplementRecord,
-) -> Result<CompactBlockArtifact, SettledSegmentsError> {
-    let reconstructed = reconstruct_compact_block_artifact(shielded_payload, sup)?;
+    block: &CompactBlockArtifact,
+) -> Result<(), SettledSegmentsError> {
     for sup_tx in &sup.transparent_transactions {
         if sup_tx.transparent_inputs.is_empty()
             && sup_tx.transparent_outputs.is_empty()
             && sup_tx.fee_zat.is_none()
-            && let Ok(pos) = reconstructed
+            && let Ok(pos) = block
                 .transactions()
                 .binary_search_by_key(&sup_tx.index, |tx| tx.index)
-            && !transaction_pool_mask(&reconstructed.transactions()[pos].data).is_empty()
+            && !transaction_pool_mask(&block.transactions()[pos].data).is_empty()
         {
             return Err(SettledSegmentsError::InvalidFormat(
                 "empty transparent supplement entry duplicates shielded transaction without fee"
@@ -879,6 +1291,16 @@ fn validate_supplement_against_payload(
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_supplement_against_payload(
+    proto_block: &lightwalletd::CompactBlock,
+    sup: &BlockSupplementRecord,
+) -> Result<CompactBlockArtifact, SettledSegmentsError> {
+    let reconstructed =
+        crate::settled_supplement_segment::reconstruct_compact_block_from_proto(proto_block, sup)?;
+    validate_transparent_supplement_entries(sup, &reconstructed)?;
     if let Some(meta) = &sup.canonical_metadata {
         validate_canonical_meta_order(meta, &reconstructed)?;
     }
@@ -938,6 +1360,14 @@ fn validate_canonical_tx_zip317_actions(
     let exact = if counts.transparent_input_count == 0 {
         if counts.transparent_output_count == 0 {
             exact_zip317_logical_actions_from_outputs(counts, std::iter::empty())
+        } else if let Some(explicit) = &tx_sup.explicit_transparent_facts {
+            exact_zip317_logical_actions_from_outputs(
+                counts,
+                explicit
+                    .transparent_outputs
+                    .iter()
+                    .map(|out| out.script_pub_key.len()),
+            )
         } else if let Some(compact_tx) = matched_compact_tx {
             exact_zip317_logical_actions_from_outputs(
                 counts,
@@ -979,6 +1409,7 @@ fn validate_canonical_tx_zip317_actions(
     Ok(())
 }
 
+#[cfg(test)]
 fn supplement_has_wide_fee(sup: &BlockSupplementRecord) -> bool {
     sup.transparent_transactions
         .iter()
@@ -1146,6 +1577,25 @@ fn validate_canonical_block_supplement_limits(
         for &section in &tx_sup.public_facts.unsupported_sections {
             unsupported_section_code(section)?;
         }
+        if let Some(explicit) = &tx_sup.explicit_transparent_facts {
+            ensure_within_limit(
+                explicit.transparent_inputs.len(),
+                MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT,
+                "explicit_transparent.vin_count",
+            )?;
+            ensure_within_limit(
+                explicit.transparent_outputs.len(),
+                MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT,
+                "explicit_transparent.vout_count",
+            )?;
+            for tx_out in &explicit.transparent_outputs {
+                ensure_within_limit(
+                    tx_out.script_pub_key.len(),
+                    MAX_LIVE_TAIL_SCRIPT_PUB_KEY_BYTES,
+                    "explicit_transparent.script_pub_key",
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -1291,7 +1741,7 @@ fn encode_canonical_tx_supplement(
     encode_opt_u32(out, tx_sup.zip317_logical_actions);
     encode_opt_u64(out, tx_sup.fee_and_burn.fee_zat);
     encode_opt_u64(out, tx_sup.fee_and_burn.burn_zat);
-    Ok(())
+    encode_explicit_transparent_facts(out, tx_sup.explicit_transparent_facts.as_ref())
 }
 
 fn decode_canonical_tx_supplement(
@@ -1323,6 +1773,7 @@ fn decode_canonical_tx_supplement(
         fee_zat: decode_opt_u64(cursor, "canonical_tx_sup.fee_zat")?,
         burn_zat: decode_opt_u64(cursor, "canonical_tx_sup.burn_zat")?,
     };
+    let explicit_transparent_facts = decode_explicit_transparent_facts(cursor)?;
     Ok(CanonicalTransactionSupplement {
         tx_index,
         public_facts,
@@ -1331,7 +1782,128 @@ fn decode_canonical_tx_supplement(
         shielded_anchors,
         zip317_logical_actions,
         fee_and_burn,
+        explicit_transparent_facts,
     })
+}
+
+fn encode_explicit_transparent_facts(
+    out: &mut Vec<u8>,
+    explicit_transparent: Option<&crate::settled_supplement_segment::ExplicitTransparentFacts>,
+) -> Result<(), SettledSegmentsError> {
+    let Some(explicit) = explicit_transparent else {
+        out.push(0);
+        return Ok(());
+    };
+    if explicit.transparent_inputs.len() > MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT
+        || explicit.transparent_outputs.len() > MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT
+    {
+        return Err(SettledSegmentsError::InvalidFormat(
+            "explicit transparent facts IO count exceeds limit".to_owned(),
+        ));
+    }
+    out.push(1);
+    out.push(EXPLICIT_TRANSPARENT_FACTS_VERSION_V1);
+    push_count_u32(
+        out,
+        explicit.transparent_inputs.len(),
+        "explicit_transparent.vin_count",
+    )?;
+    for tx_in in &explicit.transparent_inputs {
+        out.extend_from_slice(&tx_in.input_index.to_be_bytes());
+        out.extend_from_slice(&encode_internal_transaction_id(
+            tx_in.spent_outpoint.transaction_id,
+        ));
+        out.extend_from_slice(&tx_in.spent_outpoint.output_index.to_be_bytes());
+    }
+    push_count_u32(
+        out,
+        explicit.transparent_outputs.len(),
+        "explicit_transparent.vout_count",
+    )?;
+    for tx_out in &explicit.transparent_outputs {
+        if tx_out.script_pub_key.len() > MAX_LIVE_TAIL_SCRIPT_PUB_KEY_BYTES {
+            return Err(SettledSegmentsError::InvalidFormat(
+                "explicit transparent script_pub_key exceeds size limit".to_owned(),
+            ));
+        }
+        out.extend_from_slice(&tx_out.output_index.to_be_bytes());
+        out.extend_from_slice(&tx_out.value_zat.to_be_bytes());
+        push_len_prefixed_bytes(
+            out,
+            &tx_out.script_pub_key,
+            "explicit_transparent.script_pub_key",
+        )?;
+        out.extend_from_slice(&zinder_core::wire::encode_address_script_hash(
+            tx_out.address_script_hash,
+        ));
+    }
+    Ok(())
+}
+
+fn decode_explicit_transparent_facts(
+    cursor: &mut ByteReader<'_>,
+) -> Result<Option<crate::settled_supplement_segment::ExplicitTransparentFacts>, SettledSegmentsError>
+{
+    if !cursor.read_bool("canonical_tx_sup.has_explicit_transparent")? {
+        return Ok(None);
+    }
+    let version = cursor.read_u8("explicit_transparent.version")?;
+    if version != EXPLICIT_TRANSPARENT_FACTS_VERSION_V1 {
+        return Err(SettledSegmentsError::InvalidFormat(format!(
+            "unsupported explicit transparent facts version {version}"
+        )));
+    }
+    let vin_count = read_bounded_count(
+        cursor,
+        MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT,
+        "explicit_transparent.vin_count",
+    )?;
+    let mut transparent_inputs = Vec::with_capacity(vin_count.min(MAX_LIVE_TAIL_PREALLOC_COUNT));
+    for _ in 0..vin_count {
+        let input_index = cursor.read_u32_be("explicit_transparent.input_index")?;
+        let txid_bytes = cursor.read_array::<32>("explicit_transparent.prev_txid")?;
+        let transaction_id = decode_internal_transaction_id(&txid_bytes).map_err(|err| {
+            SettledSegmentsError::InvalidFormat(format!("invalid explicit vin txid: {err}"))
+        })?;
+        let output_index = cursor.read_u32_be("explicit_transparent.prev_vout")?;
+        transparent_inputs.push(zinder_core::TransparentInputFact::new(
+            input_index,
+            zinder_core::TransparentOutPoint::new(transaction_id, output_index),
+        ));
+    }
+    let vout_count = read_bounded_count(
+        cursor,
+        MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT,
+        "explicit_transparent.vout_count",
+    )?;
+    let mut transparent_outputs = Vec::with_capacity(vout_count.min(MAX_LIVE_TAIL_PREALLOC_COUNT));
+    for _ in 0..vout_count {
+        let output_index = cursor.read_u32_be("explicit_transparent.output_index")?;
+        let amount_zat = cursor.read_u64_be("explicit_transparent.value_zat")?;
+        let script_pub_key = cursor.read_len_prefixed_vec(
+            MAX_LIVE_TAIL_SCRIPT_PUB_KEY_BYTES,
+            "explicit_transparent.script_pub_key",
+        )?;
+        let hash_bytes = cursor.read_array::<32>("explicit_transparent.address_script_hash")?;
+        let address_script_hash = zinder_core::wire::decode_address_script_hash(&hash_bytes)
+            .map_err(|err| {
+                SettledSegmentsError::InvalidFormat(format!(
+                    "invalid explicit address_script_hash: {err}"
+                ))
+            })?;
+        transparent_outputs.push(zinder_core::TransparentOutputFact::new(
+            output_index,
+            amount_zat,
+            script_pub_key,
+            address_script_hash,
+        ));
+    }
+    Ok(Some(
+        crate::settled_supplement_segment::ExplicitTransparentFacts {
+            transparent_inputs,
+            transparent_outputs,
+        },
+    ))
 }
 
 fn encode_public_facts(
@@ -1711,9 +2283,37 @@ fn encoded_canonical_tx_sup_len(
         + encoded_opt_u32_len(tx_sup.zip317_logical_actions)
         + encoded_opt_u64_len(tx_sup.fee_and_burn.fee_zat)
         + encoded_opt_u64_len(tx_sup.fee_and_burn.burn_zat);
+    let explicit_len =
+        encoded_explicit_transparent_facts_len(tx_sup.explicit_transparent_facts.as_ref())?;
     fixed_len
         .checked_add(facts.unsupported_sections.len())
+        .and_then(|acc| acc.checked_add(explicit_len))
         .ok_or_else(live_tail_size_overflow)
+}
+
+fn encoded_explicit_transparent_facts_len(
+    explicit_transparent: Option<&crate::settled_supplement_segment::ExplicitTransparentFacts>,
+) -> Result<usize, SettledSegmentsError> {
+    let Some(explicit) = explicit_transparent else {
+        return Ok(1);
+    };
+    let vin_bytes = explicit
+        .transparent_inputs
+        .len()
+        .checked_mul(40)
+        .ok_or_else(live_tail_size_overflow)?;
+    let mut total = 10_usize
+        .checked_add(vin_bytes)
+        .ok_or_else(live_tail_size_overflow)?;
+    for tx_out in &explicit.transparent_outputs {
+        let out_bytes = 48_usize
+            .checked_add(tx_out.script_pub_key.len())
+            .ok_or_else(live_tail_size_overflow)?;
+        total = total
+            .checked_add(out_bytes)
+            .ok_or_else(live_tail_size_overflow)?;
+    }
+    Ok(total)
 }
 
 fn encoded_raw_block_v1_len(raw: &LiveTailRawBlock) -> Result<usize, SettledSegmentsError> {
@@ -1865,5 +2465,182 @@ fn decode_opt_fixed<const N: usize>(
         Ok(Some(cursor.read_array::<N>(field_label)?))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zinder_core::{
+        BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
+        CanonicalTransactionFacts, CompactBlockArtifact, CompactChainMetadata, CompactTransaction,
+        CompactTransactionData, ConsensusBranchId, LockTime, PrivacyShape, SerializedBytesDigest,
+        TransactionComponentCounts, TransactionId, TransactionIntrinsicValueBalances,
+        TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash,
+        TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
+    };
+
+    use super::{
+        LiveTailBlockRecord, LiveTailEncodeOptions, decode_explicit_transparent_facts,
+        encode_explicit_transparent_facts,
+    };
+    use crate::canonical_store::settled_segments::ByteReader;
+    use crate::settled_supplement_segment::ExplicitTransparentFacts;
+
+    fn roundtrip_test_transaction(
+        txid: TransactionId,
+        script: Vec<u8>,
+        custom_hash: TransparentAddressScriptHash,
+    ) -> CanonicalTransactionFacts {
+        CanonicalTransactionFacts {
+            public_facts: TransactionPublicFacts {
+                transaction_id: txid,
+                auth_digest: None,
+                wtxid: None,
+                version: TransactionVersion::V5,
+                consensus_branch_id: Some(ConsensusBranchId::new(0xC2D6_D0B4)),
+                lock_time: LockTime::Unlocked,
+                expiry_height: None,
+                size_bytes: 128,
+                counts: TransactionComponentCounts {
+                    transparent_input_count: 1,
+                    transparent_output_count: 1,
+                    sprout_joinsplit_count: 0,
+                    sapling_spend_count: 0,
+                    sapling_output_count: 0,
+                    orchard_action_count: 0,
+                    ironwood_action_count: 0,
+                },
+                orchard_value_balance_zat: Some(0),
+                orchard_anchor: None,
+                ironwood_value_balance_zat: None,
+                privacy_shape: PrivacyShape::Coinbase,
+                is_coinbase: true,
+                unsupported_sections: Vec::new(),
+            },
+            serialized_bytes_digest: SerializedBytesDigest::from_bytes([0x77; 32]),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            transparent_outputs: vec![TransparentOutputFact::new(0, 50_000, script, custom_hash)],
+        }
+    }
+
+    fn roundtrip_test_fixture()
+    -> Result<(CompactBlockArtifact, CanonicalBlockFacts), Box<dyn std::error::Error>> {
+        let block_hash = BlockHash::from_bytes([0x11; 32]);
+        let prev_hash = BlockHash::from_bytes([0x00; 32]);
+        let height = BlockHeight::new(42);
+        let block_id = BlockId::new(height, block_hash);
+        let txid = TransactionId::from_bytes([0x22; 32]);
+        let script = vec![0x76, 0xa9, 0x14, 0x01];
+        let custom_hash = TransparentAddressScriptHash::from_bytes([0xcd; 32]);
+        let compact = CompactBlockArtifact::new(
+            block_id,
+            prev_hash,
+            1_700_000_042,
+            vec![CompactTransaction {
+                index: 0,
+                transaction_id: txid,
+                data: CompactTransactionData {
+                    fee_zat: Some(1_000),
+                    transparent_outputs: vec![zinder_core::CompactTransparentOutput {
+                        value_zat: 50_000,
+                        script_pub_key: script.clone(),
+                    }],
+                    ..Default::default()
+                },
+            }],
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 1,
+                orchard_commitment_tree_size: 2,
+                ironwood_commitment_tree_size: 0,
+            },
+        )?;
+        let facts = CanonicalBlockFacts {
+            block_header: BlockHeaderArtifact::new(
+                height,
+                block_hash,
+                prev_hash,
+                [0x33; 32],
+                [0x44; 32],
+                1_700_000_042,
+                0x1f07_ffff,
+                [0x55; 32],
+                1,
+                128,
+            ),
+            serialized_bytes_digest: SerializedBytesDigest::from_bytes([0x66; 32]),
+            transactions: vec![roundtrip_test_transaction(txid, script, custom_hash)],
+        };
+        Ok((compact, facts))
+    }
+
+    #[test]
+    fn encode_from_compact_and_targeted_decoders_roundtrip_with_and_without_supplement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (compact, facts) = roundtrip_test_fixture()?;
+        let height = compact.height();
+
+        let (encoded_full, shielded_len) = LiveTailBlockRecord::encode_from_compact_block_v1(
+            &compact,
+            Some(facts.clone()),
+            LiveTailEncodeOptions {
+                include_supplement: true,
+                retain_canonical_facts: true,
+            },
+        )?;
+        assert!(shielded_len > 0);
+        let (decoded_compact, budget_len) =
+            LiveTailBlockRecord::decode_compact_block_v1(&encoded_full, height)?;
+        assert_eq!(decoded_compact, compact);
+        assert!(budget_len >= shielded_len);
+        let decoded_facts = LiveTailBlockRecord::decode_canonical_facts_v1(&encoded_full, height)?;
+        assert_eq!(decoded_facts, Some(facts));
+
+        let record = LiveTailBlockRecord::decode_v1(&encoded_full)?;
+        let sup_meta = record
+            .supplement
+            .as_ref()
+            .and_then(|sup| sup.canonical_metadata.as_ref())
+            .ok_or("canonical meta missing")?;
+        assert!(
+            sup_meta.transactions[0]
+                .explicit_transparent_facts
+                .is_some()
+        );
+        let mut raw_explicit = Vec::new();
+        encode_explicit_transparent_facts(
+            &mut raw_explicit,
+            sup_meta.transactions[0].explicit_transparent_facts.as_ref(),
+        )?;
+        assert_eq!(raw_explicit[0], 1);
+        let mut cursor = ByteReader::new(&raw_explicit);
+        let roundtrip: Option<ExplicitTransparentFacts> =
+            decode_explicit_transparent_facts(&mut cursor)?;
+        assert_eq!(
+            roundtrip,
+            sup_meta.transactions[0].explicit_transparent_facts
+        );
+        raw_explicit[1] = 2;
+        let mut bad_cursor = ByteReader::new(&raw_explicit);
+        assert!(decode_explicit_transparent_facts(&mut bad_cursor).is_err());
+
+        let (encoded_min, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+            &compact,
+            None,
+            LiveTailEncodeOptions {
+                include_supplement: false,
+                retain_canonical_facts: false,
+            },
+        )?;
+        let (min_compact, _) = LiveTailBlockRecord::decode_compact_block_v1(&encoded_min, height)?;
+        assert_eq!(min_compact.transactions(), []);
+        assert_eq!(
+            LiveTailBlockRecord::decode_canonical_facts_v1(&encoded_min, height)?,
+            None
+        );
+        Ok(())
     }
 }

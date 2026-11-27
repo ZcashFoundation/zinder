@@ -30,8 +30,8 @@ use zinder_query::{
 };
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbResourceBudget,
+    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbResourceBudget,
 };
 use zinder_testkit::{IngestControlFixture, WalletServingStoreFixture, live::LiveTestEnv};
 
@@ -147,14 +147,13 @@ async fn build_live_serving_pair(
         activations,
         genesis_block.block_time_seconds,
         build_tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(LIVE_CANONICAL_REORG_WINDOW_BLOCKS)?,
     )?;
     let temporary_directory = tempdir()?;
     let canonical_primary_path = temporary_directory.path().join("canonical-primary");
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &canonical_primary_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;

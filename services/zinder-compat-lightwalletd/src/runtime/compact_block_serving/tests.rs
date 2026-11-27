@@ -31,8 +31,8 @@ use zinder_query::{CanonicalReader, RocksDbCanonicalReader};
 use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend, CanonicalReorgPolicy,
-    CanonicalStoreBuildPlan, CanonicalStoreRequirements, CanonicalStoreWorkload, RawBlobRetention,
-    ResourceGaugeThrottle, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalStoreBuildPlan, CanonicalStoreRequirements, RawBlobRetention, ResourceGaugeThrottle,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 
 use crate::{CanonicalReaderSlot, CompactBlocksGrpcAdapter};
@@ -57,7 +57,7 @@ impl CompactBlockPublisher {
 }
 
 fn transaction_requirements() -> CanonicalStoreRequirements {
-    CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions)
+    CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None)
 }
 
 #[derive(Clone)]
@@ -219,7 +219,6 @@ fn lifecycle_build_block(
             block.block_time_seconds,
             lifecycle_frontiers(activations, block.height)?,
         )),
-        block_final_note_commitment_roots: None,
         transaction_blobs: Vec::new(),
         block_blob: None,
         facts,
@@ -314,12 +313,11 @@ fn lifecycle_store(
         activations,
         first.block_time_seconds.saturating_sub(1),
         BlockId::new(first.height, first.hash),
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         root,
-        CanonicalStoreWorkload::Wallet,
         builder_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -768,7 +766,7 @@ async fn generations_open_on_one_block_cache() -> Result<(), Box<dyn std::error:
 
 /// Exports `rocksdb.live-sst-files-size` from the single active generation.
 ///
-/// Flushes additional `compact_block` SST bytes before replacement so the
+/// Flushes additional `live_tail_block` SST bytes before replacement so the
 /// retained and active generations report distinct sizes, propagates a
 /// fixture-scoped recorder into the blocking sampler so parallel `cargo test`
 /// runs never cross-contaminate, and verifies no per-file estimates are
@@ -821,12 +819,12 @@ async fn publisher_exports_live_sst_size_for_active_generation_without_per_file_
         CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
     publisher.metrics_recorder = Some(Arc::clone(&recorder));
     let initial = slot.capture();
-    let retained_compact_sst_bytes = initial
+    let retained_live_tail_sst_bytes = initial
         .secondary()
-        .rocksdb_property_value_cf("compact_block", "rocksdb.live-sst-files-size")?
-        .ok_or("retained secondary must report compact_block live SST size")?
+        .rocksdb_property_value_cf("live_tail_block", "rocksdb.live-sst-files-size")?
+        .ok_or("retained secondary must report live_tail_block live SST size")?
         .parse::<f64>()?;
-    assert!(retained_compact_sst_bytes > 0.0);
+    assert!(retained_live_tail_sst_bytes > 0.0);
 
     let second = blocks
         .get(1)
@@ -849,38 +847,38 @@ async fn publisher_exports_live_sst_size_for_active_generation_without_per_file_
         let families = rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), &primary_path)?;
         let db =
             rust_rocksdb::DB::open_cf(&rust_rocksdb::Options::default(), &primary_path, &families)?;
-        let compact_cf = db
-            .cf_handle("compact_block")
-            .ok_or("compact_block family must open")?;
-        db.flush_cf(&compact_cf)?;
+        let live_tail_cf = db
+            .cf_handle("live_tail_block")
+            .ok_or("live_tail_block family must open")?;
+        db.flush_cf(&live_tail_cf)?;
     }
     publisher.refresh().await;
     let active = slot.capture();
     assert!(!Arc::ptr_eq(&initial, &active));
 
-    let active_compact_sst_bytes = active
+    let active_live_tail_sst_bytes = active
         .secondary()
-        .rocksdb_property_value_cf("compact_block", "rocksdb.live-sst-files-size")?
-        .ok_or("active secondary must report compact_block live SST size")?
+        .rocksdb_property_value_cf("live_tail_block", "rocksdb.live-sst-files-size")?
+        .ok_or("active secondary must report live_tail_block live SST size")?
         .parse::<f64>()?;
     assert!(
-        active_compact_sst_bytes > retained_compact_sst_bytes,
-        "flushed compact_block append must increase active SST size ({active_compact_sst_bytes}) above retained ({retained_compact_sst_bytes})"
+        active_live_tail_sst_bytes > retained_live_tail_sst_bytes,
+        "flushed live_tail_block append must increase active SST size ({active_live_tail_sst_bytes}) above retained ({retained_live_tail_sst_bytes})"
     );
 
     publisher.instance_memory_throttle = ResourceGaugeThrottle::new(Duration::ZERO);
     publisher.record_resource_gauges().await;
     let exposition = rendered_metrics.render();
-    let compact_sst_gauge = exposition.lines().find_map(|line| {
+    let live_tail_sst_gauge = exposition.lines().find_map(|line| {
         (line.starts_with("zinder_store_rocksdb_property{")
             && line.contains("store_role=\"canonical_secondary\"")
-            && line.contains("cf=\"compact_block\"")
+            && line.contains("cf=\"live_tail_block\"")
             && line.contains("property=\"rocksdb.live-sst-files-size\""))
         .then(|| line.rsplit_once(' ')?.1.parse::<f64>().ok())
         .flatten()
     });
-    assert_eq!(compact_sst_gauge, Some(active_compact_sst_bytes));
-    assert_ne!(compact_sst_gauge, Some(retained_compact_sst_bytes));
+    assert_eq!(live_tail_sst_gauge, Some(active_live_tail_sst_bytes));
+    assert_ne!(live_tail_sst_gauge, Some(retained_live_tail_sst_bytes));
     assert!(exposition.contains("zinder_store_block_cache_entries{"));
     assert_eq!(
         exposition
@@ -1304,7 +1302,7 @@ async fn publisher_with_stalled_writer_read(
     converge_candidate: bool,
 ) -> Result<LongRangeHarness, Box<dyn std::error::Error>> {
     let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(2);
     let mut harness = LongRangeHarness::start(
         &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(1)),
@@ -2196,7 +2194,7 @@ async fn light_wallet_probe_halt_requires_a_confirmed_writer_at_the_served_fence
 -> Result<(), Box<dyn std::error::Error>> {
     use zinder_query::{AdmittedIngestControl, spawn_wallet_ingest_control_readiness_probe};
     let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(2);
     let readiness = CompactServingReadiness::for_light_wallet(Readiness::default());
     let mut harness = LongRangeHarness::start_with_readiness(
@@ -2268,7 +2266,7 @@ async fn light_wallet_probe_halt_requires_a_confirmed_writer_at_the_served_fence
 async fn a_checkpointed_replacement_backs_off_cold_opens() -> Result<(), Box<dyn std::error::Error>>
 {
     let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(3);
     let baseline = zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(2));
     let mut harness = LongRangeHarness::start(&baseline).await?;
@@ -2343,7 +2341,7 @@ async fn a_checkpointed_replacement_backs_off_cold_opens() -> Result<(), Box<dyn
 async fn light_wallet_replaces_the_reader_after_a_fixed_fence_schedule_change()
 -> Result<(), Box<dyn std::error::Error>> {
     let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(3);
     let mut harness = LongRangeHarness::start_with_readiness(
         &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(2)),
@@ -2431,7 +2429,7 @@ async fn a_slow_block_range_stream_does_not_hold_a_generation_between_chunks()
 -> Result<(), Box<dyn std::error::Error>> {
     const TIP_HEIGHT: u32 = 2_100;
     let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(TIP_HEIGHT + 2);
     let mut harness = LongRangeHarness::start(
         &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP_HEIGHT)),
@@ -2487,7 +2485,7 @@ async fn a_descending_block_range_stream_crosses_chunks_and_publications()
 -> Result<(), Box<dyn std::error::Error>> {
     const TIP_HEIGHT: u32 = 2_100;
     let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(TIP_HEIGHT + 1);
     let mut harness = LongRangeHarness::start(
         &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP_HEIGHT)),
@@ -2548,7 +2546,7 @@ async fn stream_across_reorg(
     let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
     let chunk_reads = || block_range_stage_samples(&metrics_handle.render(), "read").unwrap_or(0);
     let mut chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(TIP_HEIGHT);
     for height in fork_height..=TIP_HEIGHT {
         let displaced = chain
@@ -2677,7 +2675,7 @@ async fn block_range_streams_past_the_limit_are_refused_until_a_slot_returns()
     let metrics_handle = metrics_recorder.handle();
     let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
     let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(TIP_HEIGHT);
     let harness = LongRangeHarness::start(
         &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP_HEIGHT)),
@@ -2767,7 +2765,7 @@ fn a_request_cancelled_during_its_first_read_keeps_its_slot_until_the_read_ends(
 async fn cancel_during_a_gated_first_read() -> Result<(), Box<dyn std::error::Error>> {
     const TIP_HEIGHT: u32 = 10;
     let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(TIP_HEIGHT);
     let harness = LongRangeHarness::start(
         &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP_HEIGHT)),
@@ -3463,7 +3461,10 @@ async fn serve_a_chain_with_an_unconvertible_block(
         unconvertible,
         zinder_core::CompactTransactionData {
             fee_zat: Some(u64::from(u32::MAX) + 1),
-            sapling_spends: vec![zinder_core::CompactSaplingSpend { nullifier: [7; 32] }],
+            transparent_outputs: vec![zinder_core::CompactTransparentOutput {
+                value_zat: 1,
+                script_pub_key: vec![0x51],
+            }],
             ..zinder_core::CompactTransactionData::default()
         },
     )?;
@@ -3646,7 +3647,7 @@ async fn stream_with_a_queued_later_chunk(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     const TIP_HEIGHT: u32 = 2_100;
     let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(TIP_HEIGHT);
     let harness = LongRangeHarness::start(&zinder_testkit::CanonicalBaseline::new(&chain)).await?;
     let entry_generation = Arc::downgrade(&harness.slot.capture());

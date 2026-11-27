@@ -10,6 +10,7 @@ use prost::Message;
 use zinder_core::wire::encode_rpc_block_hash_hex;
 use zinder_core::{
     BlockBlobArtifact, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, Network,
+    TransactionId,
 };
 use zinder_proto::{
     capabilities::{WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1},
@@ -21,7 +22,10 @@ use zinder_query::{
     WalletServingReadPair,
 };
 use zinder_store::{ArtifactFamily, RawBlobRetention};
-use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    ChainFixture, FixtureTransactionRows, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
+};
 
 use crate::common::{serving_query_after_live_append, serving_query_over};
 
@@ -337,7 +341,7 @@ async fn serving_pair_full_block_range_outside_retained_history_is_artifact_unav
 #[tokio::test]
 async fn serving_pair_without_block_retention_omits_and_rejects_full_blocks() -> eyre::Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(1);
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
@@ -380,5 +384,37 @@ async fn serving_pair_without_block_retention_omits_and_rejects_full_blocks() ->
             capability: WALLET_READ_FULL_BLOCK_RANGE_V1,
         })
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_block_at_serves_tail_sliced_block_and_transaction_blobs() -> eyre::Result<()> {
+    let base = all_retention_chain(1);
+    let block_one = base
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("missing fixture block 1"))?
+        .clone();
+    let tx_id = TransactionId::from_bytes([0xab; 32]);
+    let tx_bytes = b"tail-sliced-tx-0".to_vec();
+    let chain = base.with_transaction_rows(FixtureTransactionRows::coinbase(
+        tx_id,
+        block_one.height,
+        block_one.hash,
+        tx_bytes.clone(),
+    ));
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
+
+    let full_block = wallet_query
+        .full_block_at(BlockHeight::new(1), None)
+        .await?;
+    let expected = expected_block_blobs(&chain)
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("missing expected block blob"))?;
+    assert_eq!(full_block.block_blob, expected);
+    assert!(full_block.block_blob.raw_block_bytes.ends_with(&tx_bytes));
+
+    let fetched_tx = wallet_query.raw_transaction(tx_id, None).await?;
+    assert_eq!(fetched_tx.transaction.raw_transaction_bytes, tx_bytes);
     Ok(())
 }

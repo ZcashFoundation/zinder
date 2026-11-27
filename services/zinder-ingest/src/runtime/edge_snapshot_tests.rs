@@ -196,7 +196,6 @@ impl Validator {
     fn config(&self) -> TestResult<EdgeSnapshotStoreConfig<'_>> {
         Ok(EdgeSnapshotStoreConfig {
             activations: &self.activations,
-            workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(1)?,
             required_first_available_height: HISTORY_FLOOR,
@@ -215,7 +214,6 @@ impl Validator {
             compact_block: positioned.compact_block,
             tip_metadata: positioned.tip_metadata,
             tree_state_checkpoint: Some(self.checkpoint_at(block)),
-            block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
         })
@@ -230,12 +228,8 @@ impl Validator {
             config.raw_blob_retention,
             config.reorg_policy,
         )?;
-        let mut builder = RocksDbCanonicalBuilder::create_fresh(
-            path,
-            config.workload,
-            plan,
-            config.resource_budget,
-        )?;
+        let mut builder =
+            RocksDbCanonicalBuilder::create_fresh(path, plan, config.resource_budget)?;
         builder.bulk_load_blocks(
             config.activations,
             [Ok::<_, io::Error>(self.build_block(4096)?)],
@@ -366,7 +360,6 @@ fn assert_append_restored(validator: &Validator, target: &Path) -> TestResult {
     let store = RocksDbCanonicalStore::open_ready(
         target,
         config.activations,
-        config.workload,
         config.raw_blob_retention,
         config.reorg_policy,
         config.resource_budget,
@@ -480,11 +473,7 @@ async fn http_preflight_refusals_fetch_no_payload() -> TestResult {
             ..config
         },
         EdgeSnapshotStoreConfig {
-            workload: CanonicalStoreWorkload::Explorer,
-            ..config
-        },
-        EdgeSnapshotStoreConfig {
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::All,
             ..config
         },
         EdgeSnapshotStoreConfig {

@@ -574,7 +574,7 @@ async fn get_transaction_without_retention_reads_node_bytes_only_for_the_served_
 async fn retained_mined_and_ingest_pending_transactions_survive_a_stopped_node() -> Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(1)
-        .with_raw_blob_retention(RawBlobRetention::Transactions);
+        .with_raw_blob_retention(RawBlobRetention::All);
     let block = chain
         .blocks()
         .first()
@@ -1461,7 +1461,7 @@ async fn lean_wallet_verifies_and_caches_mined_bytes_without_forwarding_address_
 async fn lean_wallet_miss_verifies_the_node_before_the_mempool_and_retained_bodies_do_not()
 -> Result<()> {
     let control = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
-    for retention in [RawBlobRetention::None, RawBlobRetention::Transactions] {
+    for retention in [RawBlobRetention::None, RawBlobRetention::All] {
         assert_miss_behavior(retention, &control).await?;
     }
     control.shutdown().await?;

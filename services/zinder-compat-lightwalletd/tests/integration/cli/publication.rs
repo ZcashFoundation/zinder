@@ -29,7 +29,7 @@ fn history_publisher_prints_its_effective_configuration() -> Result<()> {
             "[storage]\n",
             "path = \"/var/lib/zinder/canonical\"\n",
             "secondary_path = \"/tmp/secondary\"\n",
-            "raw_blob_policy = \"transactions\"\n\n",
+            "raw_blob_policy = \"none\"\n\n",
             "[compat]\n",
             "serving = \"compact-blocks\"\n",
             "reorg_window_blocks = 1000\n",
@@ -132,11 +132,7 @@ serving = "compact-blocks"
 
 #[tokio::test]
 async fn publisher_with_light_wallet_profile_publishes_under_every_blob_policy() -> Result<()> {
-    for retention in [
-        RawBlobRetention::None,
-        RawBlobRetention::Transactions,
-        RawBlobRetention::All,
-    ] {
+    for retention in [RawBlobRetention::None, RawBlobRetention::All] {
         let files = tempfile::tempdir()?;
         let (private, public) = shielded_catalog_keys(files.path())?;
         let catalog = files.path().join("catalog");
@@ -174,7 +170,7 @@ async fn publisher_follows_settlement_and_resumes_a_checkpointed_store() -> Resu
     let manifest = catalog.join("current.json");
     let mut chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(3)
-        .with_raw_blob_retention(RawBlobRetention::Transactions);
+        .with_raw_blob_retention(RawBlobRetention::None);
     let baseline = CanonicalBaseline::new(&chain)
         .through(BlockHeight::new(2))
         .with_history_floor(BlockHeight::new(1));
@@ -262,7 +258,7 @@ async fn publisher_recovers_a_missing_table_while_holding_the_catalog_lock() -> 
     let manifest = catalog.join("current.json");
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(128)
-        .with_raw_blob_retention(RawBlobRetention::Transactions);
+        .with_raw_blob_retention(RawBlobRetention::None);
     let mut writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain),
         &sample_regtest_upgrade_activations(),
@@ -271,6 +267,7 @@ async fn publisher_recovers_a_missing_table_while_holding_the_catalog_lock() -> 
     let primary = writer.canonical_primary_path();
     let db = split_compact_blocks_into_tables(primary)?;
     let mut process = follow_command(primary, &scratch, &catalog, &private)
+        .args(["--workers", "1"])
         .env("ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES", "64")
         .spawn()?;
     wait_for_change(&manifest, &[]).await?;
@@ -359,13 +356,13 @@ async fn compact_away_the_old_tables(db: &rust_rocksdb::DB) -> Result<()> {
     let old = db
         .live_files()?
         .into_iter()
-        .filter(|file| file.column_family_name == "compact_block" && file.level == 0)
+        .filter(|file| file.column_family_name == "live_tail_block" && file.level == 0)
         .map(|file| Path::new(&file.directory).join(file.name.trim_start_matches('/')))
         .collect::<Vec<_>>();
-    eyre::ensure!(!old.is_empty(), "missing level-zero compact-block tables");
+    eyre::ensure!(!old.is_empty(), "missing level-zero live-tail-block tables");
     let family = db
-        .cf_handle("compact_block")
-        .ok_or_else(|| eyre::eyre!("missing compact-block family"))?;
+        .cf_handle("live_tail_block")
+        .ok_or_else(|| eyre::eyre!("missing live-tail-block family"))?;
     db.compact_range_cf(&family, None::<&[u8]>, None::<&[u8]>);
     tokio::time::timeout(Duration::from_secs(15), async {
         while old.iter().any(|table| table.exists()) {
@@ -385,8 +382,8 @@ fn split_compact_blocks_into_tables(primary: &Path) -> Result<rust_rocksdb::DB> 
         rust_rocksdb::DB::list_cf(&options, primary)?,
     )?;
     let family = db
-        .cf_handle("compact_block")
-        .ok_or_else(|| eyre::eyre!("missing compact-block family"))?;
+        .cf_handle("live_tail_block")
+        .ok_or_else(|| eyre::eyre!("missing live-tail-block family"))?;
     // Each old row needs a distinct table so the secondary's 64-file cache
     // cannot keep the entire unpublished suffix alive across compaction.
     db.set_options_cf(
@@ -443,7 +440,7 @@ async fn publisher_creates_nested_missing_directory_and_secondary_root() -> Resu
     let (private, public) = shielded_catalog_keys(files.path())?;
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(2)
-        .with_raw_blob_retention(RawBlobRetention::Transactions);
+        .with_raw_blob_retention(RawBlobRetention::None);
     let mut writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain),
         &sample_regtest_upgrade_activations(),
@@ -480,7 +477,7 @@ async fn publisher_reports_exact_paths_and_os_errors_for_missing_inputs() -> Res
     let (private, _) = shielded_catalog_keys(files.path())?;
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(2)
-        .with_raw_blob_retention(RawBlobRetention::Transactions);
+        .with_raw_blob_retention(RawBlobRetention::None);
     let writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain),
         &sample_regtest_upgrade_activations(),
@@ -539,7 +536,7 @@ async fn publisher_rejects_oversized_and_non_regular_signing_keys() -> Result<()
     let files = tempfile::tempdir()?;
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(2)
-        .with_raw_blob_retention(RawBlobRetention::Transactions);
+        .with_raw_blob_retention(RawBlobRetention::None);
     let writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain),
         &sample_regtest_upgrade_activations(),
@@ -593,7 +590,7 @@ async fn publisher_accepts_symlinked_catalog_directory() -> Result<()> {
     let (private, public) = shielded_catalog_keys(files.path())?;
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(2)
-        .with_raw_blob_retention(RawBlobRetention::Transactions);
+        .with_raw_blob_retention(RawBlobRetention::None);
     let mut writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain),
         &sample_regtest_upgrade_activations(),
@@ -655,7 +652,7 @@ async fn wait_for_change(path: &Path, previous: &[u8]) -> Result<Vec<u8>> {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await??)
@@ -689,7 +686,7 @@ async fn publisher_workers_4_produces_identical_catalog_to_workers_1() -> Result
     let (private, public) = shielded_catalog_keys(files.path())?;
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(12)
-        .with_raw_blob_retention(RawBlobRetention::Transactions);
+        .with_raw_blob_retention(RawBlobRetention::None);
     let mut writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain),
         &sample_regtest_upgrade_activations(),
@@ -765,7 +762,7 @@ async fn publisher_workers_follow_mode_publishes_initial_and_incremental() -> Re
     let manifest = catalog.join("current.json");
     let mut chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(6)
-        .with_raw_blob_retention(RawBlobRetention::Transactions);
+        .with_raw_blob_retention(RawBlobRetention::None);
     let mut writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain),
         &sample_regtest_upgrade_activations(),

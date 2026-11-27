@@ -24,8 +24,7 @@ use crate::{
 const DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_INITIAL_CATCHUP_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS: u64 = 4;
-const DEFAULT_CANONICAL_SECONDARY_RAW_BLOB_RETENTION: RawBlobRetention =
-    RawBlobRetention::Transactions;
+const DEFAULT_CANONICAL_SECONDARY_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::None;
 const DEFAULT_SERVING_PAIR_STALENESS_CEILING_MS: u64 = 300_000;
 
 /// Raw role-scoped `rocksdb` sub-section.
@@ -709,10 +708,7 @@ mod tests {
             resolved.secondary_path,
             PathBuf::from("/tmp/store-secondary")
         );
-        assert_eq!(
-            resolved.expected_raw_blob_retention,
-            RawBlobRetention::Transactions
-        );
+        assert_eq!(resolved.expected_raw_blob_retention, RawBlobRetention::None);
         assert_eq!(
             resolved.secondary_catchup_interval,
             Duration::from_millis(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS)

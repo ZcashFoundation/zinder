@@ -893,7 +893,7 @@ mod server_info_tests {
         .await?;
         let metadata = WalletEndpointMetadata::default();
         let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             &admitted_ingest_control,
         );
         let mut upstream = UpstreamNodeCapabilities::from_probed(NodeCapabilities::new([
@@ -937,7 +937,7 @@ mod server_info_tests {
         .await?;
         let metadata = WalletEndpointMetadata::default();
         let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             &admitted_ingest_control,
         );
         let descriptor = build_wallet_server_info(metadata, &capabilities, None);
@@ -966,8 +966,8 @@ mod server_info_tests {
             zinder_core::Network::ZcashRegtest,
         )
         .await?;
-        let transactions = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::Transactions,
+        let lean = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::None,
             &admitted_ingest_control,
         );
         for always_supported in [
@@ -980,25 +980,19 @@ mod server_info_tests {
             WALLET_READ_SERVER_INFO_V2,
             WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
             WALLET_READ_TRANSACTION_BY_ID_V2,
-            WALLET_READ_TRANSACTION_BYTES_V1,
             WALLET_SNAPSHOT_MEMPOOL_V3,
             WALLET_EVENTS_MEMPOOL_V2,
         ] {
-            assert!(transactions.contains(always_supported));
+            assert!(lean.contains(always_supported));
         }
         for structurally_absent in [
+            WALLET_READ_TRANSACTION_BYTES_V1,
             WALLET_READ_FULL_BLOCK_AT_V1,
             WALLET_READ_FULL_BLOCK_RANGE_V1,
             WALLET_BROADCAST_TRANSACTION_V1,
         ] {
-            assert!(!transactions.contains(structurally_absent));
+            assert!(!lean.contains(structurally_absent));
         }
-
-        let lean = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::None,
-            &admitted_ingest_control,
-        );
-        assert!(!lean.contains(WALLET_READ_TRANSACTION_BYTES_V1));
         let with_verified_node = lean.with_cold_transaction_bytes();
         assert!(with_verified_node.contains(WALLET_READ_TRANSACTION_BYTES_V1));
         assert!(!with_verified_node.contains(WALLET_READ_FULL_BLOCK_AT_V1));

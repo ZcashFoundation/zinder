@@ -389,7 +389,7 @@ jq -e \
           "wallet_value_encoding_version"
         ])
       and .canonical_store_identity == "canonical"
-      and .canonical_store_schema_version == 1
+      and .canonical_store_schema_version == 2
       and .wallet_store_identity == "wallet"
       and .wallet_store_schema_version == 1
       and .wallet_projection_schema_version == 1
@@ -520,12 +520,10 @@ jq -e \
             "visible_epoch_id",
             "visible_event_sequence",
             "visible_tip",
-            "workload",
             "tree_state_checkpoint_count"
           ]
         )
       and .scope == "canonical-storage-ready"
-      and .workload == "wallet"
       and (.first_retained_block | block_id)
       and .first_retained_block.height == 1
       and (.visible_tip | block_id)

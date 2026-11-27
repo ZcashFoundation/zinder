@@ -1049,7 +1049,7 @@ async fn light_wallet_profile_serves_canonical_and_forwarded_reads_from_the_bina
 async fn every_light_wallet_selection_refuses_the_same_checkpointed_history() -> Result<()> {
     let schedule = one_upgrade_per_height()?;
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+        .with_raw_blob_retention(zinder_store::RawBlobRetention::None)
         .extend_blocks(2);
     let baseline = CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(1));
     let writer = CanonicalWriterFixture::publish(&baseline, &schedule)?;
@@ -1123,7 +1123,7 @@ async fn wallet_pair_bootstraps_and_serves_with_a_missing_early_root() -> Result
     use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
 
     let writer = super::lightwalletd_grpc::floor_with_completed_subtree_writer(
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::All,
     )?;
     let primary = writer.canonical_primary()?;
     let files = tempfile::tempdir()?;

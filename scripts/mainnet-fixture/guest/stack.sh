@@ -41,7 +41,7 @@ method = "cookie"
 path = "$cookie"
 [storage]
 path = "$canonical"
-raw_blob_policy = "transactions"
+raw_blob_policy = "none"
 [ingest]
 source = "zebra-json-rpc"
 explorer_views = false
@@ -64,7 +64,7 @@ name = "zcash-mainnet"
 [storage]
 canonical_path = "$canonical"
 canonical_secondary_path = "$root/projector/canonical-secondary"
-raw_blob_policy = "transactions"
+raw_blob_policy = "none"
 [wallet]
 path = "$wallet"
 [projector]
@@ -97,7 +97,7 @@ path = "$cookie"
 [storage]
 path = "$canonical"
 secondary_path = "$root/$role/canonical-secondary"
-raw_blob_policy = "transactions"
+raw_blob_policy = "none"
 [wallet]
 path = "$wallet"
 secondary_path = "$root/$role/wallet-secondary"

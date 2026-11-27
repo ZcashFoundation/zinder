@@ -5,7 +5,10 @@ use std::{
     fs::File,
     io::{self, Read as _, Write as _},
     path::Path,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use parking_lot::Mutex;
@@ -28,6 +31,7 @@ use crate::{
 
 use super::{
     EntryKind, SettledSegmentsError, VerifiedDir,
+    cache::SettledSegmentReaderCache,
     layout::{
         CanonicalSegmentsManifest, SEGMENTS_DIR_NAME, SEGMENTS_STAGING_DIR_NAME,
         SettledSegmentIndexEntry, SettledSegmentKind, format_segment_filename,
@@ -58,6 +62,7 @@ pub(crate) fn snapshot_pinned_segments(
 }
 
 /// Testable snapshot entrypoint parameterizing the hard-link primitive for `EXDEV` simulation.
+#[cfg(test)]
 pub(crate) fn snapshot_pinned_segments_with_linker<F>(
     source_root: &Path,
     target_root: &Path,
@@ -108,10 +113,31 @@ where
 /// Opens and authenticates every pinned segment file referenced by `entries`
 /// in parallel across workers against its committed hashes, consecutive-stride
 /// parent linkage, and optional `fs-verity`.
+#[cfg(test)]
 pub(crate) fn verify_pinned_segments(
     store_root: &Path,
     entries: &[SettledSegmentIndexEntry],
     require_fs_verity: bool,
+) -> Result<(), SettledSegmentsError> {
+    verify_pinned_segments_internal(store_root, entries, require_fs_verity, None)
+}
+
+/// Opens, authenticates, and populates `cache` with every verified reader opened
+/// for `entries` so subsequent cold replay avoids reopening segment files.
+pub(crate) fn verify_pinned_segments_into_cache(
+    store_root: &Path,
+    entries: &[SettledSegmentIndexEntry],
+    require_fs_verity: bool,
+    cache: &SettledSegmentReaderCache,
+) -> Result<(), SettledSegmentsError> {
+    verify_pinned_segments_internal(store_root, entries, require_fs_verity, Some(cache))
+}
+
+fn verify_pinned_segments_internal(
+    store_root: &Path,
+    entries: &[SettledSegmentIndexEntry],
+    require_fs_verity: bool,
+    cache: Option<&SettledSegmentReaderCache>,
 ) -> Result<(), SettledSegmentsError> {
     validate_contiguous_index_entries(entries)?;
     let root_dir = VerifiedDir::open_existing(store_root, &[])?;
@@ -127,12 +153,12 @@ pub(crate) fn verify_pinned_segments(
     if worker_count <= 1 {
         let mut expected_prev_hash: Option<BlockHash> = None;
         for entry in entries {
-            verify_single_entry_files(&dirs, entry, expected_prev_hash, require_fs_verity)?;
+            verify_single_entry_files(&dirs, entry, expected_prev_hash, require_fs_verity, cache)?;
             expected_prev_hash = Some(entry.end_block.hash);
         }
         return Ok(());
     }
-    verify_entries_parallel(&dirs, entries, require_fs_verity, worker_count)
+    verify_entries_parallel(&dirs, entries, require_fs_verity, worker_count, cache)
 }
 
 fn verify_entries_parallel(
@@ -140,6 +166,7 @@ fn verify_entries_parallel(
     entries: &[SettledSegmentIndexEntry],
     require_fs_verity: bool,
     worker_count: usize,
+    cache: Option<&SettledSegmentReaderCache>,
 ) -> Result<(), SettledSegmentsError> {
     let next_idx = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -160,6 +187,7 @@ fn verify_entries_parallel(
                         entry,
                         expected_prev_hash,
                         require_fs_verity,
+                        cache,
                     ) {
                         failed.store(true, Ordering::Release);
                         record_earliest_error(&earliest_error, idx, err);
@@ -190,6 +218,7 @@ fn record_earliest_error(
 
 /// Loads `segments-manifest.json` from `store_root` and verifies every pinned
 /// segment listed in it against its committed metadata.
+#[cfg(test)]
 pub(crate) fn verify_pinned_manifest_and_segments(
     store_root: &Path,
     require_fs_verity: bool,
@@ -625,6 +654,7 @@ fn verify_single_entry_files(
     entry: &SettledSegmentIndexEntry,
     expected_prev_hash: Option<BlockHash>,
     require_fs_verity: bool,
+    cache: Option<&SettledSegmentReaderCache>,
 ) -> Result<(), SettledSegmentsError> {
     let start = entry.start_height;
     let end = entry.end_block.height;
@@ -667,10 +697,26 @@ fn verify_single_entry_files(
         None
     };
 
-    if let (Some(raw_dir), Some(raw_id)) =
+    let raw_reader = if let (Some(raw_dir), Some(raw_id)) =
         (dirs.raw_block.as_ref(), entry.raw_block_identity.as_ref())
     {
-        verify_raw_block_linkage(&ctx, raw_dir, raw_id, sup_reader.as_ref())?;
+        Some(verify_raw_block_linkage(
+            &ctx,
+            raw_dir,
+            raw_id,
+            sup_reader.as_ref(),
+        )?)
+    } else {
+        None
+    };
+
+    if let Some(target_cache) = cache {
+        target_cache.insert_verified_readers(
+            entry,
+            Arc::new(shielded_reader),
+            sup_reader.map(Arc::new),
+            raw_reader.map(Arc::new),
+        )?;
     }
     Ok(())
 }
@@ -831,7 +877,7 @@ fn verify_raw_block_linkage(
     raw_dir: &VerifiedDir,
     raw_id: &crate::settled_raw_block_segment::RawBlockSegmentIdentity,
     sup_reader: Option<&SettledSupplementSegmentReader>,
-) -> Result<(), SettledSegmentsError> {
+) -> Result<SettledRawBlockSegmentReader, SettledSegmentsError> {
     let filename = format_segment_filename(
         SettledSegmentKind::RawBlock,
         ctx.entry.start_height,
@@ -883,7 +929,7 @@ fn verify_raw_block_linkage(
             &raw_rows,
         )?;
     }
-    Ok(())
+    Ok(raw_reader)
 }
 
 fn verify_raw_boundary_digests(

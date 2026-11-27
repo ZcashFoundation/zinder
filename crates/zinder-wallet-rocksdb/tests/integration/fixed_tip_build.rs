@@ -24,17 +24,17 @@ use zinder_store::{
     CanonicalBuildBlock, CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest,
     CanonicalLiveAppend, CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
     CanonicalReplayScan, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId,
-    RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     RocksDbResourceBudget,
 };
 use zinder_testkit::process_crash;
 use zinder_wallet_projection::{
-    WALLET_PROJECTION_STORE_IDENTITY, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
-    WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildLease,
-    WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner, WalletProjectionContractError,
-    WalletProjectionFamilyRowCounts, WalletProjectionRetainedEventAnchor,
-    WalletProjectionSourcePosition,
+    REQUIRED_CANONICAL_STORE_SCHEMA_VERSION, WALLET_PROJECTION_STORE_IDENTITY,
+    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
+    WalletOutpointKey, WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest,
+    WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionFamilyRowCounts,
+    WalletProjectionRetainedEventAnchor, WalletProjectionSourcePosition,
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildReport,
@@ -239,7 +239,6 @@ fn owner_checkpoints_are_cold_admitted_and_remain_exact_after_sources_advance()
         CANONICAL_STORE_SCHEMA_VERSION
     );
     assert_eq!(canonical_checkpoint.ready_evidence, canonical_before);
-    assert_eq!(canonical_checkpoint.workload, canonical_store.workload());
     assert_eq!(
         canonical_checkpoint.build_plan,
         *canonical_store.build_plan()
@@ -301,8 +300,7 @@ fn owner_checkpoints_are_cold_admitted_and_remain_exact_after_sources_advance()
     let cold_canonical_checkpoint = RocksDbCanonicalStore::open_ready(
         &canonical_checkpoint_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -718,9 +716,7 @@ fn closed_canonical_primary_secondary_build_matches_primary_oracle()
         temporary.path().join("canonical"),
         temporary.path().join("canonical-secondary"),
         &inactive_upgrade_activations()?,
-        zinder_store::CanonicalStoreRequirements::for_blob_retention(
-            RawBlobRetention::Transactions,
-        ),
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -929,8 +925,7 @@ fn reopen_canonical_primary(
     Ok(RocksDbCanonicalStore::open_ready(
         root.join("canonical"),
         &inactive_upgrade_activations()?,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
@@ -1011,7 +1006,7 @@ fn schema_version_mismatch_source<'a>(
     scan_invocations: &'a AtomicU64,
 ) -> SchemaVersionMismatchReplaySource<'a> {
     let mut ready = canonical_store.ready_evidence();
-    ready.schema_version = 2;
+    ready.schema_version = REQUIRED_CANONICAL_STORE_SCHEMA_VERSION.saturating_add(1);
     SchemaVersionMismatchReplaySource {
         network: canonical_store.network(),
         ready,
@@ -1653,12 +1648,11 @@ fn build_ready_canonical_store(
         &inactive_upgrade_activations()?,
         0,
         tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical"),
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1693,12 +1687,11 @@ fn build_ready_checkpointed_canonical_store(
         &inactive_upgrade_activations()?,
         checkpoint,
         tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         temporary.path().join("canonical-checkpointed"),
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1706,7 +1699,9 @@ fn build_ready_checkpointed_canonical_store(
     let build_blocks = blocks
         .iter()
         .enumerate()
-        .map(|(index, facts)| canonical_build_block(facts.clone(), index == last_index))
+        .map(|(index, facts)| {
+            canonical_build_block_without_blobs(facts.clone(), index == last_index)
+        })
         .map(Ok::<_, std::io::Error>);
     builder.bulk_load_blocks(&inactive_upgrade_activations()?, build_blocks)?;
     builder.load_subtree_roots(std::iter::empty())?;
@@ -1730,9 +1725,7 @@ fn open_incremental_secondary(
         temporary.path().join("canonical"),
         temporary.path().join(secondary_name),
         activations,
-        zinder_store::CanonicalStoreRequirements::for_blob_retention(
-            RawBlobRetention::Transactions,
-        ),
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
@@ -2224,7 +2217,11 @@ fn inactive_upgrade_activations()
     NetworkUpgradeActivations::new(Network::ZcashRegtest, activations)
 }
 
-fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalBuildBlock {
+fn canonical_build_block_inner(
+    facts: CanonicalBlockFacts,
+    is_tip: bool,
+    retain_blobs: bool,
+) -> CanonicalBuildBlock {
     let height = facts.block_header.height;
     let block_hash = facts.block_header.block_hash;
     let parent_hash = facts.block_header.parent_hash;
@@ -2238,22 +2235,33 @@ fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalB
             ironwood_commitment_tree_size: 0,
         },
     );
-    let transaction_blobs = facts
-        .transactions
-        .iter()
-        .enumerate()
-        .map(|(index, transaction)| {
-            TransactionBlobArtifact::new(
-                TransactionLocation::new(
-                    transaction.public_facts.transaction_id,
-                    height,
-                    block_hash,
-                    u32::try_from(index).unwrap_or(u32::MAX),
-                ),
-                transaction.public_facts.transaction_id.as_bytes(),
-            )
-        })
-        .collect();
+    let (transaction_blobs, block_blob) = if retain_blobs {
+        let transaction_blobs: Vec<TransactionBlobArtifact> = facts
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(index, transaction)| {
+                TransactionBlobArtifact::new(
+                    TransactionLocation::new(
+                        transaction.public_facts.transaction_id,
+                        height,
+                        block_hash,
+                        u32::try_from(index).unwrap_or(u32::MAX),
+                    ),
+                    transaction.public_facts.transaction_id.as_bytes(),
+                )
+            })
+            .collect();
+        let mut raw_block_bytes = block_hash.as_bytes().to_vec();
+        for blob in &transaction_blobs {
+            raw_block_bytes.extend_from_slice(&blob.raw_transaction_bytes);
+        }
+        let block_blob =
+            zinder_core::BlockBlobArtifact::new(height, block_hash, parent_hash, raw_block_bytes);
+        (transaction_blobs, Some(block_blob))
+    } else {
+        (Vec::new(), None)
+    };
     let tree_state_checkpoint = is_tip.then(|| {
         CommitmentTreeCheckpoint::new(
             BlockId::new(height, block_hash),
@@ -2272,10 +2280,20 @@ fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalB
         compact_block,
         tip_metadata: ChainTipMetadata::new(0, 0, 0),
         tree_state_checkpoint,
-        block_final_note_commitment_roots: None,
         transaction_blobs,
-        block_blob: None,
+        block_blob,
     }
+}
+
+fn canonical_build_block(facts: CanonicalBlockFacts, is_tip: bool) -> CanonicalBuildBlock {
+    canonical_build_block_inner(facts, is_tip, true)
+}
+
+fn canonical_build_block_without_blobs(
+    facts: CanonicalBlockFacts,
+    is_tip: bool,
+) -> CanonicalBuildBlock {
+    canonical_build_block_inner(facts, is_tip, false)
 }
 
 fn block_id(facts: &CanonicalBlockFacts) -> BlockId {
@@ -2288,6 +2306,10 @@ fn block_facts(
     block_hash: [u8; 32],
     transactions: Vec<CanonicalTransactionFacts>,
 ) -> CanonicalBlockFacts {
+    let mut raw_block_bytes = block_hash.to_vec();
+    for transaction in &transactions {
+        raw_block_bytes.extend_from_slice(&transaction.public_facts.transaction_id.as_bytes());
+    }
     CanonicalBlockFacts {
         block_header: BlockHeaderArtifact::new(
             BlockHeight::new(height),
@@ -2301,7 +2323,7 @@ fn block_facts(
             0,
             0,
         ),
-        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&block_hash),
+        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&raw_block_bytes),
         transactions,
     }
 }

@@ -389,8 +389,7 @@ fn open_ready_canonical(
     Ok(RocksDbCanonicalStore::open_ready(
         path,
         activations,
-        zinder_store::CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         zinder_store::CanonicalReorgPolicy::new(4)?,
         zinder_store::RocksDbResourceBudget::for_local_tests(),
     )?)

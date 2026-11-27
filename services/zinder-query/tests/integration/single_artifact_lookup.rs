@@ -134,7 +134,7 @@ async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result
 #[tokio::test]
 async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([0xAB; 32]);
-    let chain = chain_with_transaction(RawBlobRetention::Transactions, transaction_id)?;
+    let chain = chain_with_transaction(RawBlobRetention::All, transaction_id)?;
     let block = chain
         .block_at(BlockHeight::new(1))
         .cloned()

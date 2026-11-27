@@ -31,8 +31,8 @@ use zinder_source::{
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalBuildSubtreeRoot,
     CanonicalEventFence, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, CanonicalSubtreeRootLoadEvidence,
-    RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalStoreReadyEvidence, CanonicalSubtreeRootLoadEvidence, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 
 use crate::{
@@ -468,7 +468,6 @@ fn admit_canonical_fixture_replay(
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &config.canonical_store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         config.resource_budget,
     )?;
@@ -572,7 +571,6 @@ fn certify_reopened_canonical_fixture(
     let reopened_store = RocksDbCanonicalStore::open_ready(
         &config.canonical_store_path,
         expected.activations,
-        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.supported_reorg_depth)?,
         config.resource_budget,

@@ -712,7 +712,7 @@ fn open_verifier_with_budget(
         temporary.path().join("canonical"),
         temporary.path().join(secondary_dir),
         &activations()?,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
         resource_budget,
     )?)

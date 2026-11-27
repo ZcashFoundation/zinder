@@ -103,10 +103,7 @@ fn store_at(
 #[test]
 fn a_mined_transaction_comes_back_with_its_location_and_bytes() -> TestResult {
     let temporary = TempDir::new()?;
-    let store = store_at(
-        &temporary.path().join("canonical"),
-        RawBlobRetention::Transactions,
-    )?;
+    let store = store_at(&temporary.path().join("canonical"), RawBlobRetention::All)?;
 
     let (location, blob) =
         assert_by_id_matches_two_reads(&store, mined_at(3))?.ok_or("transaction 103 is mined")?;
@@ -143,10 +140,7 @@ fn a_mined_transaction_comes_back_with_its_location_and_bytes() -> TestResult {
 #[test]
 fn a_transaction_the_chain_never_mined_is_a_proven_absence() -> TestResult {
     let temporary = TempDir::new()?;
-    let store = store_at(
-        &temporary.path().join("canonical"),
-        RawBlobRetention::Transactions,
-    )?;
+    let store = store_at(&temporary.path().join("canonical"), RawBlobRetention::All)?;
 
     assert_eq!(assert_by_id_matches_two_reads(&store, never_mined())?, None);
     Ok(())
@@ -231,10 +225,7 @@ fn transaction_location_rejects_legacy_and_other_non_exact_value_lengths() -> Te
 #[test]
 fn a_reorg_moves_or_removes_the_transaction_a_by_id_read_returns() -> TestResult {
     let temporary = TempDir::new()?;
-    let store = store_at(
-        &temporary.path().join("canonical"),
-        RawBlobRetention::Transactions,
-    )?;
+    let store = store_at(&temporary.path().join("canonical"), RawBlobRetention::All)?;
     let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
     let stale_location = store
         .transaction_location(mined_at(3))?
@@ -268,10 +259,7 @@ fn a_reorg_moves_or_removes_the_transaction_a_by_id_read_returns() -> TestResult
 #[test]
 fn a_location_row_that_disagrees_with_the_blob_rows_answers_as_the_two_reads_do() -> TestResult {
     let temporary = TempDir::new()?;
-    let store = store_at(
-        &temporary.path().join("canonical"),
-        RawBlobRetention::Transactions,
-    )?;
+    let store = store_at(&temporary.path().join("canonical"), RawBlobRetention::All)?;
     let written = store
         .transaction_location(mined_at(3))?
         .ok_or("transaction 103 is mined")?;
@@ -357,14 +345,11 @@ fn a_by_id_read_reads_the_location_row_once() -> TestResult {
 fn batched_locations_blobs_and_headers_preserve_request_order_and_skip_unretained_blobs()
 -> TestResult {
     let temporary = TempDir::new()?;
-    let retained_store = store_at(
-        &temporary.path().join("retained"),
-        RawBlobRetention::Transactions,
-    )?;
+    let retained_store = store_at(&temporary.path().join("retained"), RawBlobRetention::All)?;
     let requested = [mined_at(4), never_mined(), mined_at(2), mined_at(4)];
     let retained_before = multiget_keys_read(&retained_store);
     let batched = retained_store.transaction_locations_and_blobs(&requested)?;
-    assert_eq!(multiget_keys_read(&retained_store) - retained_before, 7);
+    assert_eq!(multiget_keys_read(&retained_store) - retained_before, 6);
     let individual = requested
         .iter()
         .map(|id| retained_store.transaction_location_and_blob(*id))

@@ -2,11 +2,16 @@
 //! multi-module segment sealing under `.staging/`, and crash-recovery cleanup.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::File,
     io::{self, BufReader, BufWriter, Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
+    sync::{Arc, mpsc},
+    thread,
 };
+
+use parking_lot::Mutex;
 
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockFacts, CanonicalBlockFactsSequenceDigestBuilder,
@@ -116,6 +121,7 @@ impl SettledSegmentSealerConfig {
     }
 
     /// Overrides the aligned `segment_blocks` stride (useful for compact tests).
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn with_segment_blocks(mut self, segment_blocks: u32) -> Self {
         self.segment_blocks = segment_blocks;
@@ -123,6 +129,7 @@ impl SettledSegmentSealerConfig {
     }
 
     /// Overrides `ZSTSUP01` chunking/compression options.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn with_supplement_options(
         mut self,
@@ -133,6 +140,7 @@ impl SettledSegmentSealerConfig {
     }
 
     /// Overrides `ZSBLKB01` compression codec.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn with_raw_block_codec(mut self, raw_block_codec: RawBlockCodec) -> Self {
         self.raw_block_codec = raw_block_codec;
@@ -242,11 +250,7 @@ pub(crate) struct SettledSegmentBlockInput {
 /// `<= 256 MiB` segment caps, and seals/commits atomically.
 #[derive(Debug)]
 pub(crate) struct SettledSegmentSealer {
-    store_root: PathBuf,
-    config: SettledSegmentSealerConfig,
-    prior_checkpoint: Option<CanonicalSequenceCheckpoint>,
-    active_stride: Option<ActiveStrideState>,
-    poisoned: bool,
+    accumulator: StrideAccumulator,
 }
 
 struct ActiveStrideState {
@@ -331,9 +335,30 @@ impl fmt::Debug for ActiveStrideState {
     }
 }
 
-impl SettledSegmentSealer {
-    /// Creates a new sealer rooted at `store_root`, optionally resuming after `prior_checkpoint`.
-    pub(crate) fn new(
+/// Shared stride accumulation, presplitting, and sequence-checkpoint state machine.
+struct StrideAccumulator {
+    store_root: PathBuf,
+    config: SettledSegmentSealerConfig,
+    prior_checkpoint: Option<CanonicalSequenceCheckpoint>,
+    active_stride: Option<ActiveStrideState>,
+    poisoned: bool,
+}
+
+impl fmt::Debug for StrideAccumulator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StrideAccumulator")
+            .field("store_root", &self.store_root)
+            .field("config", &self.config)
+            .field("prior_checkpoint", &self.prior_checkpoint)
+            .field("active_stride", &self.active_stride)
+            .field("poisoned", &self.poisoned)
+            .finish()
+    }
+}
+
+impl StrideAccumulator {
+    fn new(
         store_root: impl AsRef<Path>,
         config: SettledSegmentSealerConfig,
         prior_checkpoint: Option<CanonicalSequenceCheckpoint>,
@@ -353,60 +378,27 @@ impl SettledSegmentSealer {
         })
     }
 
-    /// Returns the number of unsealed blocks currently staged for the active stride.
-    #[must_use]
-    pub(crate) const fn pending_len(&self) -> usize {
+    const fn pending_len(&self) -> usize {
         match &self.active_stride {
             Some(active) => active.block_count,
             None => 0,
         }
     }
 
-    /// Returns the latest committed checkpoint, if at least one stride has been sealed.
-    #[must_use]
-    pub(crate) const fn prior_checkpoint(&self) -> Option<CanonicalSequenceCheckpoint> {
-        self.prior_checkpoint
+    fn poison(&mut self) {
+        self.active_stride = None;
+        self.poisoned = true;
     }
 
-    /// Returns whether the sealer is poisoned after a post-seal or append failure.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn is_poisoned(&self) -> bool {
-        self.poisoned
-    }
-
-    /// Pushes the next contiguous canonical block. Returns zero or more sealed
-    /// segment entries whenever the block completes its aligned stride or forces a
-    /// size/transaction presplit of the prior active segment.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "Ingest API accepts SettledSegmentBlockInput by value."
-    )]
-    pub(crate) fn push_block(
-        &mut self,
-        block: SettledSegmentBlockInput,
-    ) -> Result<Vec<SettledSegmentIndexEntry>, SettledSegmentsError> {
-        self.push_block_internal(&block, false)
-    }
-
-    /// Test helper simulating an I/O or budget failure immediately after a cap rollover seals.
-    #[cfg(test)]
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "Test helper mirrors push_block ownership signature."
-    )]
-    pub(crate) fn push_block_with_injected_append_failure(
-        &mut self,
-        block: SettledSegmentBlockInput,
-    ) -> Result<Vec<SettledSegmentIndexEntry>, SettledSegmentsError> {
-        self.push_block_internal(&block, true)
-    }
-
-    fn push_block_internal(
+    fn push_block_with<F>(
         &mut self,
         block: &SettledSegmentBlockInput,
         fail_append_for_test: bool,
-    ) -> Result<Vec<SettledSegmentIndexEntry>, SettledSegmentsError> {
+        mut on_stride_ready: F,
+    ) -> Result<(), SettledSegmentsError>
+    where
+        F: FnMut(ActiveStrideState) -> Result<CanonicalSequenceCheckpoint, SettledSegmentsError>,
+    {
         if self.poisoned {
             return Err(SettledSegmentsError::ChainLinkage(
                 "settled segment sealer is poisoned after a post-seal or append failure; reconstruct from the caller's durable checkpoint"
@@ -422,7 +414,6 @@ impl SettledSegmentSealer {
         let spooled = encode_spool_record(block, &self.config)?;
         validate_single_block_fits_segment_caps(&spooled, &self.config)?;
 
-        let mut sealed = Vec::new();
         if let Some(active) = &self.active_stride
             && active.should_presplit_for(&spooled, &self.config)
         {
@@ -431,40 +422,62 @@ impl SettledSegmentSealer {
                     "missing active stride state on cap presplit".to_owned(),
                 )
             })?;
-            match self.seal_active_stride(prior_active) {
-                Ok(entry) => sealed.push(entry),
+            match on_stride_ready(prior_active) {
+                Ok(checkpoint) => self.prior_checkpoint = Some(checkpoint),
                 Err(err) => {
-                    self.poisoned = true;
+                    self.poison();
                     return Err(err);
                 }
             }
         }
+        #[cfg(test)]
+        let outcome = if fail_append_for_test {
+            Err(SettledSegmentsError::Io(io::Error::other(
+                "injected post-rollover append failure",
+            )))
+        } else {
+            self.push_into_current_or_seal(
+                block_id,
+                checkpoint_step,
+                &spooled,
+                &mut on_stride_ready,
+            )
+        };
         #[cfg(not(test))]
-        let _ = fail_append_for_test;
-        let post_result: Result<(), SettledSegmentsError> = (|| {
-            #[cfg(test)]
-            if fail_append_for_test {
-                return Err(SettledSegmentsError::Io(io::Error::other(
-                    "injected post-rollover append failure",
-                )));
-            }
-            let target_end = self.append_to_active_stride(block_id, checkpoint_step, &spooled)?;
-            if block_id.height >= target_end {
-                let active = self.active_stride.take().ok_or_else(|| {
-                    SettledSegmentsError::ChainLinkage(
-                        "missing active stride state on seal".to_owned(),
-                    )
-                })?;
-                sealed.push(self.seal_active_stride(active)?);
-            }
-            Ok(())
-        })();
-        if let Err(err) = post_result {
-            self.active_stride = None;
-            self.poisoned = true;
+        let outcome = {
+            let _ = fail_append_for_test;
+            self.push_into_current_or_seal(
+                block_id,
+                checkpoint_step,
+                &spooled,
+                &mut on_stride_ready,
+            )
+        };
+        if let Err(err) = outcome {
+            self.poison();
             return Err(err);
         }
-        Ok(sealed)
+        Ok(())
+    }
+
+    fn push_into_current_or_seal<F>(
+        &mut self,
+        block_id: BlockId,
+        checkpoint_step: IncrementalCheckpointStep,
+        spooled: &SpooledBlockRecord,
+        on_stride_ready: &mut F,
+    ) -> Result<(), SettledSegmentsError>
+    where
+        F: FnMut(ActiveStrideState) -> Result<CanonicalSequenceCheckpoint, SettledSegmentsError>,
+    {
+        let target_end = self.append_to_active_stride(block_id, checkpoint_step, spooled)?;
+        if block_id.height >= target_end {
+            let active = self.active_stride.take().ok_or_else(|| {
+                SettledSegmentsError::ChainLinkage("missing active stride state on seal".to_owned())
+            })?;
+            self.prior_checkpoint = Some(on_stride_ready(active)?);
+        }
+        Ok(())
     }
 
     fn next_incremental_checkpoint(
@@ -618,29 +631,325 @@ impl SettledSegmentSealer {
                     .map(CanonicalSequenceCheckpoint::through)
             })
     }
+}
 
-    fn seal_active_stride(
+impl SettledSegmentSealer {
+    /// Creates a new sealer rooted at `store_root`, optionally resuming after `prior_checkpoint`.
+    pub(crate) fn new(
+        store_root: impl AsRef<Path>,
+        config: SettledSegmentSealerConfig,
+        prior_checkpoint: Option<CanonicalSequenceCheckpoint>,
+    ) -> Result<Self, SettledSegmentsError> {
+        Ok(Self {
+            accumulator: StrideAccumulator::new(store_root, config, prior_checkpoint)?,
+        })
+    }
+
+    /// Returns the number of unsealed blocks currently staged for the active stride.
+    #[must_use]
+    pub(crate) const fn pending_len(&self) -> usize {
+        self.accumulator.pending_len()
+    }
+
+    /// Returns the latest committed checkpoint, if at least one stride has been sealed.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn prior_checkpoint(&self) -> Option<CanonicalSequenceCheckpoint> {
+        self.accumulator.prior_checkpoint
+    }
+
+    /// Returns whether the sealer is poisoned after a post-seal or append failure.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn is_poisoned(&self) -> bool {
+        self.accumulator.poisoned
+    }
+
+    /// Pushes the next contiguous canonical block. Returns zero or more sealed
+    /// segment entries whenever the block completes its aligned stride or forces a
+    /// size/transaction presplit of the prior active segment.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Ingest API accepts SettledSegmentBlockInput by value."
+    )]
+    pub(crate) fn push_block(
         &mut self,
-        active: ActiveStrideState,
-    ) -> Result<SettledSegmentIndexEntry, SettledSegmentsError> {
-        if active.block_count == 0 {
+        block: SettledSegmentBlockInput,
+    ) -> Result<Vec<SettledSegmentIndexEntry>, SettledSegmentsError> {
+        self.push_block_internal(&block, false)
+    }
+
+    /// Test helper simulating an I/O or budget failure immediately after a cap rollover seals.
+    #[cfg(test)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Test helper mirrors push_block ownership signature."
+    )]
+    pub(crate) fn push_block_with_injected_append_failure(
+        &mut self,
+        block: SettledSegmentBlockInput,
+    ) -> Result<Vec<SettledSegmentIndexEntry>, SettledSegmentsError> {
+        self.push_block_internal(&block, true)
+    }
+
+    fn push_block_internal(
+        &mut self,
+        block: &SettledSegmentBlockInput,
+        fail_append_for_test: bool,
+    ) -> Result<Vec<SettledSegmentIndexEntry>, SettledSegmentsError> {
+        let store_root = self.accumulator.store_root.clone();
+        let config = self.accumulator.config;
+        let mut sealed = Vec::new();
+        self.accumulator
+            .push_block_with(block, fail_append_for_test, |active| {
+                let entry = seal_active_stride_in_root(&store_root, &config, active)?;
+                let checkpoint = entry.end_sequence_checkpoint;
+                sealed.push(entry);
+                Ok(checkpoint)
+            })?;
+        Ok(sealed)
+    }
+}
+
+struct BulkSealJob {
+    seq: usize,
+    active: ActiveStrideState,
+}
+
+type BulkSealOutcome = (
+    usize,
+    Result<SettledSegmentIndexEntry, SettledSegmentsError>,
+);
+
+/// Bounded multi-threaded settled-segment sealer (`2..=4` workers) preserving strict
+/// ascending height ordering and deterministic earliest-stride error propagation.
+#[derive(Debug)]
+pub(crate) struct BulkSegmentSealer {
+    accumulator: StrideAccumulator,
+    dispatch_tx: Option<mpsc::SyncSender<BulkSealJob>>,
+    result_rx: mpsc::Receiver<BulkSealOutcome>,
+    workers: Vec<thread::JoinHandle<()>>,
+    next_dispatch_seq: usize,
+    next_emit_seq: usize,
+    completed: BTreeMap<usize, Result<SettledSegmentIndexEntry, SettledSegmentsError>>,
+    worker_panic: bool,
+}
+
+impl BulkSegmentSealer {
+    /// Creates a bounded multi-threaded sealer (`2..=4` workers) rooted at `store_root`.
+    pub(crate) fn new(
+        store_root: impl AsRef<Path>,
+        config: SettledSegmentSealerConfig,
+        prior_checkpoint: Option<CanonicalSequenceCheckpoint>,
+    ) -> Result<Self, SettledSegmentsError> {
+        let workers = thread::available_parallelism().map_or(2, |count| count.get().clamp(2, 4));
+        Self::new_with_worker_count(store_root, config, prior_checkpoint, workers)
+    }
+
+    pub(crate) fn new_with_worker_count(
+        store_root: impl AsRef<Path>,
+        config: SettledSegmentSealerConfig,
+        prior_checkpoint: Option<CanonicalSequenceCheckpoint>,
+        requested_workers: usize,
+    ) -> Result<Self, SettledSegmentsError> {
+        let worker_count = requested_workers.clamp(2, 4);
+        let accumulator = StrideAccumulator::new(store_root, config, prior_checkpoint)?;
+        let _ = prepare_segment_directories(&accumulator.store_root, config.modules)?;
+        let (dispatch_tx, work_rx) = mpsc::sync_channel::<BulkSealJob>(worker_count * 2);
+        let (result_tx, result_rx) = mpsc::channel::<BulkSealOutcome>();
+        let shared_rx = Arc::new(Mutex::new(work_rx));
+        let mut workers = Vec::with_capacity(worker_count);
+        for idx in 0..worker_count {
+            let worker_rx = Arc::clone(&shared_rx);
+            let worker_tx = result_tx.clone();
+            let root = accumulator.store_root.clone();
+            let handle = thread::Builder::new()
+                .name(format!("zinder-bulk-sealer-{idx}"))
+                .spawn(move || run_bulk_worker(&root, &config, &worker_rx, &worker_tx))
+                .map_err(|err| {
+                    SettledSegmentsError::Io(io::Error::other(format!(
+                        "failed spawning bulk segment sealer worker {idx}: {err}"
+                    )))
+                })?;
+            workers.push(handle);
+        }
+        Ok(Self {
+            accumulator,
+            dispatch_tx: Some(dispatch_tx),
+            result_rx,
+            workers,
+            next_dispatch_seq: 0,
+            next_emit_seq: 0,
+            completed: BTreeMap::new(),
+            worker_panic: false,
+        })
+    }
+
+    /// Returns the active bounded worker thread count (`2..=4`).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Returns the number of unsealed blocks currently staged in the active stride.
+    #[must_use]
+    pub(crate) const fn pending_len(&self) -> usize {
+        self.accumulator.pending_len()
+    }
+
+    /// Pushes one contiguous block, dispatching completed strides to workers under backpressure
+    /// and returning any contiguous prefix of newly completed sorted index entries.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Bulk ingest API takes ownership matching SettledSegmentSealer::push_block."
+    )]
+    pub(crate) fn push_block(
+        &mut self,
+        block: SettledSegmentBlockInput,
+    ) -> Result<Vec<SettledSegmentIndexEntry>, SettledSegmentsError> {
+        let mut emitted = Vec::new();
+        self.poll_ready(&mut emitted)?;
+        let dispatch_tx = self.dispatch_tx.clone().ok_or_else(|| {
+            SettledSegmentsError::ChainLinkage(
+                "bulk segment sealer channel closed after failure or finish".to_owned(),
+            )
+        })?;
+        let next_seq = &mut self.next_dispatch_seq;
+        let outcome = self.accumulator.push_block_with(&block, false, |active| {
+            let checkpoint = checkpoint_from_active(&active);
+            let seq = *next_seq;
+            *next_seq += 1;
+            dispatch_tx.send(BulkSealJob { seq, active }).map_err(|_| {
+                SettledSegmentsError::Io(io::Error::other("bulk segment sealer worker exited"))
+            })?;
+            Ok(checkpoint)
+        });
+        if let Err(err) = outcome {
+            self.shutdown_workers();
+            return Err(err);
+        }
+        self.poll_ready(&mut emitted)?;
+        Ok(emitted)
+    }
+
+    /// Drains all in-flight sealing jobs, joins all worker threads cleanly, and returns
+    /// remaining sorted entries (or the earliest-stride failure).
+    pub(crate) fn finish(mut self) -> Result<Vec<SettledSegmentIndexEntry>, SettledSegmentsError> {
+        self.shutdown_workers();
+        let mut emitted = Vec::new();
+        self.poll_ready(&mut emitted)?;
+        if self.worker_panic {
+            return Err(SettledSegmentsError::Io(io::Error::other(
+                "bulk segment sealer worker panicked",
+            )));
+        }
+        if self.next_emit_seq < self.next_dispatch_seq {
+            return Err(SettledSegmentsError::Io(io::Error::other(format!(
+                "bulk segment sealer missing completion for stride {}",
+                self.next_emit_seq
+            ))));
+        }
+        if self.accumulator.poisoned {
             return Err(SettledSegmentsError::ChainLinkage(
-                "cannot seal empty pending stride".to_owned(),
+                "bulk segment sealer entered poisoned state prior to finish".to_owned(),
             ));
         }
-        let dirs = prepare_segment_directories(&self.store_root, self.config.modules)?;
-        let staged = stage_stride_files(&dirs.staging, &self.config, active)?;
-        let end_checkpoint = staged.end_checkpoint;
-        let entry = promote_staged_stride(
-            &dirs,
-            staged.start_height,
-            staged.end_block,
-            &staged,
-            end_checkpoint,
-        )?;
-        self.prior_checkpoint = Some(end_checkpoint);
-        Ok(entry)
+        if self.accumulator.pending_len() != 0 {
+            return Err(SettledSegmentsError::ChainLinkage(
+                "bulk segment sealer finished with unsealed trailing blocks".to_owned(),
+            ));
+        }
+        Ok(emitted)
     }
+
+    fn poll_ready(
+        &mut self,
+        emitted: &mut Vec<SettledSegmentIndexEntry>,
+    ) -> Result<(), SettledSegmentsError> {
+        for (seq, outcome) in self.result_rx.try_iter() {
+            self.completed.insert(seq, outcome);
+        }
+        while let Some(outcome) = self.completed.remove(&self.next_emit_seq) {
+            self.next_emit_seq += 1;
+            match outcome {
+                Ok(entry) => emitted.push(entry),
+                Err(err) => {
+                    self.accumulator.poison();
+                    self.shutdown_workers();
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn shutdown_workers(&mut self) {
+        drop(self.dispatch_tx.take());
+        for handle in self.workers.drain(..) {
+            if handle.join().is_err() {
+                self.worker_panic = true;
+            }
+        }
+    }
+}
+
+impl Drop for BulkSegmentSealer {
+    fn drop(&mut self) {
+        self.shutdown_workers();
+    }
+}
+
+fn run_bulk_worker(
+    store_root: &Path,
+    config: &SettledSegmentSealerConfig,
+    work_rx: &Mutex<mpsc::Receiver<BulkSealJob>>,
+    result_tx: &mpsc::Sender<BulkSealOutcome>,
+) {
+    loop {
+        let maybe_job = {
+            let guard = work_rx.lock();
+            guard.recv()
+        };
+        let Ok(job) = maybe_job else {
+            break;
+        };
+        let outcome = seal_active_stride_in_root(store_root, config, job.active);
+        if result_tx.send((job.seq, outcome)).is_err() {
+            break;
+        }
+    }
+}
+
+fn checkpoint_from_active(active: &ActiveStrideState) -> CanonicalSequenceCheckpoint {
+    CanonicalSequenceCheckpoint::from_admitted_parts(
+        active.last_block_id,
+        active.retained_count,
+        active.digest_builder.clone().finish(),
+        active.logical_replay_bytes,
+    )
+}
+
+fn seal_active_stride_in_root(
+    store_root: &Path,
+    config: &SettledSegmentSealerConfig,
+    active: ActiveStrideState,
+) -> Result<SettledSegmentIndexEntry, SettledSegmentsError> {
+    if active.block_count == 0 {
+        return Err(SettledSegmentsError::ChainLinkage(
+            "cannot seal empty pending stride".to_owned(),
+        ));
+    }
+    let dirs = prepare_segment_directories(store_root, config.modules)?;
+    let staged = stage_stride_files(&dirs.staging, config, active)?;
+    let end_checkpoint = staged.end_checkpoint;
+    promote_staged_stride(
+        &dirs,
+        staged.start_height,
+        staged.end_block,
+        &staged,
+        end_checkpoint,
+    )
 }
 
 /// Removes orphaned temporary files in `<store_root>/segments/.staging/` on reopen recovery,
@@ -671,6 +980,84 @@ pub(crate) fn cleanup_stale_staging_files(
         staging_dir.sync()?;
     }
     Ok(removed)
+}
+
+/// Removes orphaned segment files inside `<store_root>/segments/{shielded,supplement,raw_block}`
+/// that are not present in `admitted_entries`, refusing symlinks or non-regular entries.
+pub(crate) fn cleanup_unreferenced_segment_files(
+    store_root: &Path,
+    admitted_entries: &[SettledSegmentIndexEntry],
+) -> Result<usize, SettledSegmentsError> {
+    let Some(root_dir) = VerifiedDir::open_existing_optional(store_root, &[])? else {
+        return Ok(0);
+    };
+    let Some(segments_dir) = root_dir.open_child_dir_optional(SEGMENTS_DIR_NAME)? else {
+        return Ok(0);
+    };
+    let [keep_shielded, keep_supplement, keep_raw] = collect_admitted_filenames(admitted_entries)?;
+    let dirs = [
+        (SettledSegmentKind::Shielded, &keep_shielded),
+        (SettledSegmentKind::Supplement, &keep_supplement),
+        (SettledSegmentKind::RawBlock, &keep_raw),
+    ];
+    let mut total_removed = 0_usize;
+    for (kind, keep_names) in dirs {
+        let Some(target_dir) = segments_dir.open_child_dir_optional(kind.subdir_name())? else {
+            continue;
+        };
+        let mut removed = 0_usize;
+        for entry_name in target_dir.list_entry_names()? {
+            if target_dir.stat_entry_nofollow(&entry_name)? != Some(EntryKind::RegularFile) {
+                return Err(SettledSegmentsError::InvalidLayout(format!(
+                    "refusing non-regular entry {entry_name:?} inside segments/{}",
+                    kind.subdir_name()
+                )));
+            }
+            if keep_names.contains(&entry_name) {
+                continue;
+            }
+            target_dir.unlink_file(&entry_name)?;
+            removed += 1;
+        }
+        if removed > 0 {
+            target_dir.sync()?;
+        }
+        total_removed = total_removed.saturating_add(removed);
+    }
+    Ok(total_removed)
+}
+
+fn collect_admitted_filenames(
+    admitted_entries: &[SettledSegmentIndexEntry],
+) -> Result<[BTreeSet<String>; 3], SettledSegmentsError> {
+    let mut shielded = BTreeSet::new();
+    let mut supplement = BTreeSet::new();
+    let mut raw_block = BTreeSet::new();
+    for entry in admitted_entries {
+        entry.validate()?;
+        let start = entry.start_height;
+        let end = entry.end_block.height;
+        shielded.insert(format_segment_filename(
+            SettledSegmentKind::Shielded,
+            start,
+            end,
+        )?);
+        if entry.modules.supplement {
+            supplement.insert(format_segment_filename(
+                SettledSegmentKind::Supplement,
+                start,
+                end,
+            )?);
+        }
+        if entry.modules.raw_bodies {
+            raw_block.insert(format_segment_filename(
+                SettledSegmentKind::RawBlock,
+                start,
+                end,
+            )?);
+        }
+    }
+    Ok([shielded, supplement, raw_block])
 }
 
 fn predicted_shielded_segment_bytes(block_count: u64, slab_bytes: u64) -> u64 {

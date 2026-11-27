@@ -28,7 +28,7 @@ use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
 use zinder_wallet_rocksdb::{MAX_ACCUMULATOR_HASHING_WORKERS, RocksDbWalletBuildOptions};
 
 const DEFAULT_CANONICAL_SECONDARY_PATH: &str = "/var/lib/zinder/projector/canonical-secondary";
-const DEFAULT_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::Transactions;
+const DEFAULT_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::None;
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 const DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS: u64 = 30;
 /// ADR-0004 permits at most two hours for wallet construction after canonical.
@@ -1454,7 +1454,7 @@ mod tests {
             canonical_path: root.path().join("canonical"),
             canonical_secondary_path: root.path().join("canonical-secondary/projector"),
             storage_full_blocks: None,
-            expected_canonical_raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            expected_canonical_raw_blob_retention: zinder_store::RawBlobRetention::None,
             wallet_path,
             canonical_rocksdb_budget:
                 zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),

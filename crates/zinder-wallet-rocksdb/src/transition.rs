@@ -2192,17 +2192,17 @@ mod tests {
         CommitmentTreeAccumulator, CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
         CompactBlockArtifact, CompactChainMetadata, ConsensusBranchId, LockTime, Network,
         NetworkUpgradeActivation, NetworkUpgradeActivations, PrivacyShape, SerializedBytesDigest,
-        TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
-        TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
-        TransactionVersion, TransparentAddressScriptHash, TransparentInputFact,
-        TransparentOutPoint, TransparentOutputFact, TransparentUtxoSetCommitment,
-        UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
+        TransactionComponentCounts, TransactionId, TransactionIntrinsicValueBalances,
+        TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash,
+        TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
+        TransparentUtxoSetCommitment, UnixTimestampMillis, UnsupportedSection,
+        encode_canonical_block_replay,
     };
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalLiveReplacement,
         CanonicalReorgPolicy, CanonicalReplacementBlock, CanonicalRetainedEvent,
-        CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
+        CanonicalStoreBuildPlan, RawBlobRetention, RocksDbCanonicalBuilder,
         RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbOpenRole, RocksDbResourceBudget,
         build_block_based_table_factory, open_bounded_rocksdb,
     };
@@ -2300,9 +2300,7 @@ mod tests {
             &canonical_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2450,9 +2448,7 @@ mod tests {
             &canonical_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2728,9 +2724,7 @@ mod tests {
             root.join("canonical"),
             root.join(secondary_directory),
             &checkpointed_activations()?,
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?)
@@ -2755,12 +2749,11 @@ mod tests {
             &activations,
             CommitmentTreeCheckpoint::new(predecessor, 99, CommitmentTreeFrontiers::default()),
             checkpoint_block,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut canonical_builder = RocksDbCanonicalBuilder::create_fresh(
             root.join("canonical"),
-            CanonicalStoreWorkload::Wallet,
             plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3008,21 +3001,6 @@ mod tests {
     ) -> CanonicalBuildBlock {
         let block_height = BlockHeight::new(height);
         let block_hash = BlockHash::from_bytes(block_hash);
-        let transaction_blobs = transactions
-            .iter()
-            .enumerate()
-            .map(|(transaction_index, transaction)| {
-                TransactionBlobArtifact::new(
-                    TransactionLocation::new(
-                        transaction.public_facts.transaction_id,
-                        block_height,
-                        block_hash,
-                        u32::try_from(transaction_index).unwrap_or(u32::MAX),
-                    ),
-                    vec![0x66],
-                )
-            })
-            .collect();
         let facts = CanonicalBlockFacts {
             block_header: BlockHeaderArtifact::new(
                 block_height,
@@ -3068,8 +3046,7 @@ mod tests {
                     CommitmentTreeFrontiers::default(),
                 )
             }),
-            block_final_note_commitment_roots: None,
-            transaction_blobs,
+            transaction_blobs: Vec::new(),
             block_blob: None,
         }
     }

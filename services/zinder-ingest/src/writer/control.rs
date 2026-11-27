@@ -1516,7 +1516,7 @@ fn owner_checkpoint_response(
         candidate_id,
         store_identity: evidence.store_identity.to_owned(),
         schema_version: u32::from(evidence.schema_version),
-        workload: evidence.workload.as_str().to_owned(),
+        workload: String::new(),
         network_name: encode_zinder_native_chain_name(evidence.build_plan.network()).to_owned(),
         ready_evidence: Some(checkpoint_ready_evidence_message(&evidence.ready_evidence)),
         build_plan: Some(checkpoint_build_plan_message(&evidence.build_plan)),
@@ -1833,10 +1833,10 @@ pub(crate) mod test_support {
         CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
         CanonicalTransactionFacts, ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata,
         CompactTransactionData, LockTime, MempoolEntry, MempoolEvictionReason, MempoolObservation,
-        Network, PrivacyShape, RawTransactionBytes, SerializedBytesDigest, TransactionBlobArtifact,
+        Network, PrivacyShape, RawTransactionBytes, SerializedBytesDigest,
         TransactionComponentCounts, TransactionId, TransactionIntrinsicValueBalances,
-        TransactionLocation, TransactionPublicFacts, TransactionVersion, UnixTimestampMillis,
-        UnsupportedSection, encode_canonical_block_replay,
+        TransactionPublicFacts, TransactionVersion, UnixTimestampMillis, UnsupportedSection,
+        encode_canonical_block_replay,
     };
     use zinder_proto::v1::ingest::{
         AcquireCanonicalProjectionBuildLeaseRequest, CanonicalEventPageRequest,
@@ -1847,10 +1847,9 @@ pub(crate) mod test_support {
     };
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, MempoolEvent,
-        MempoolEventHistoryRequest, MempoolEventRetentionConfig, MempoolEventRetentionReport,
-        MempoolEventRetentionStepStop, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
-        RocksDbResourceBudget,
+        CanonicalStoreBuildPlan, CanonicalStoreError, MempoolEvent, MempoolEventHistoryRequest,
+        MempoolEventRetentionConfig, MempoolEventRetentionReport, MempoolEventRetentionStepStop,
+        RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
     };
 
     use super::*;
@@ -2281,7 +2280,7 @@ pub(crate) mod test_support {
             checkpoint.schema_version,
             u32::from(zinder_store::CANONICAL_STORE_SCHEMA_VERSION)
         );
-        assert_eq!(checkpoint.workload, "wallet");
+        assert_eq!(checkpoint.workload, "");
         assert_eq!(checkpoint.network_name, "zcash-testnet");
         assert_ne!(checkpoint.database_identity, [] as [u8; 0]);
         let ready_evidence = checkpoint
@@ -2306,7 +2305,7 @@ pub(crate) mod test_support {
             .build_plan
             .ok_or("checkpoint response omitted build-plan identity")?;
         assert_eq!(build_plan.activation_fingerprint_version, 1);
-        assert_eq!(build_plan.raw_blob_retention, "transactions");
+        assert_eq!(build_plan.raw_blob_retention, "none");
         assert_eq!(build_plan.reorg_window_blocks, 1);
         assert_eq!(
             build_plan
@@ -2665,8 +2664,7 @@ pub(crate) mod test_support {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2817,8 +2815,7 @@ pub(crate) mod test_support {
         let corrupted = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2847,8 +2844,7 @@ pub(crate) mod test_support {
         let repaired = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2898,8 +2894,7 @@ pub(crate) mod test_support {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3252,12 +3247,11 @@ pub(crate) mod test_support {
             &activations,
             0,
             tip,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3350,11 +3344,7 @@ pub(crate) mod test_support {
                 1,
                 zinder_core::CommitmentTreeFrontiers::default(),
             )),
-            block_final_note_commitment_roots: None,
-            transaction_blobs: vec![TransactionBlobArtifact::new(
-                TransactionLocation::new(transaction_id, height, facts.block_header.block_hash, 0),
-                raw_transaction_bytes,
-            )],
+            transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
         }

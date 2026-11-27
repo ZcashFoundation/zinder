@@ -308,7 +308,7 @@ async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Re
 async fn serving_query_rejects_oversized_subtree_root_range() -> eyre::Result<()> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(1);
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
@@ -553,7 +553,7 @@ async fn serving_pair_compact_range_enforces_the_release_limit_before_storage() 
 {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(1);
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
@@ -606,7 +606,7 @@ async fn serving_pair_compact_range_outside_retained_history_is_artifact_unavail
 
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(3);
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;

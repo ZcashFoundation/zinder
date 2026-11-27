@@ -454,7 +454,7 @@ mod tests {
     fn the_reader_measurement_refuses_a_secondary_at_another_ready_fence()
     -> Result<(), Box<dyn std::error::Error>> {
         let chain = zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest)
-            .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+            .with_raw_blob_retention(zinder_store::RawBlobRetention::None)
             .extend_blocks(4);
         let activations = zinder_testkit::sample_regtest_upgrade_activations();
         let mut writer = zinder_testkit::CanonicalWriterFixture::publish(
@@ -469,8 +469,7 @@ mod tests {
             secondary_root: secondaries.path().to_owned(),
             activations,
             reorg_policy,
-            workload: zinder_store::CanonicalStoreWorkload::Wallet,
-            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            raw_blob_retention: zinder_store::RawBlobRetention::None,
             budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
             evict_page_cache: false,
         };
@@ -491,7 +490,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         use zinder_store::{HeightOrder, RocksDbStatisticsLevel};
         let chain = zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest)
-            .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+            .with_raw_blob_retention(zinder_store::RawBlobRetention::None)
             .extend_blocks(4);
         let activations = zinder_testkit::sample_regtest_upgrade_activations();
         let writer = zinder_testkit::CanonicalWriterFixture::publish(
@@ -504,8 +503,7 @@ mod tests {
             secondary_root: scratch.path().into(),
             activations,
             reorg_policy: writer.canonical_primary()?.reorg_policy(),
-            workload: zinder_store::CanonicalStoreWorkload::Wallet,
-            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            raw_blob_retention: zinder_store::RawBlobRetention::None,
             budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
             evict_page_cache: false,
         };
@@ -560,7 +558,7 @@ mod tests {
         use zinder_store::{HeightOrder, encode_compact_block_artifact};
 
         let chain = zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest)
-            .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions)
+            .with_raw_blob_retention(zinder_store::RawBlobRetention::None)
             .extend_blocks(3);
         let activations = zinder_testkit::sample_regtest_upgrade_activations();
         let writer = zinder_testkit::CanonicalWriterFixture::publish(
@@ -573,8 +571,7 @@ mod tests {
             secondary_root: scratch.path().into(),
             activations,
             reorg_policy: writer.canonical_primary()?.reorg_policy(),
-            workload: zinder_store::CanonicalStoreWorkload::Wallet,
-            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            raw_blob_retention: zinder_store::RawBlobRetention::None,
             budget: zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
             evict_page_cache: false,
         };

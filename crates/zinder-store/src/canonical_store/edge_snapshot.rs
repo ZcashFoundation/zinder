@@ -27,14 +27,17 @@ use zinder_core::{
 use crate::RocksDbResourceBudget;
 
 use super::{
-    CANONICAL_STORE_SCHEMA_VERSION, CanonicalReorgPolicy, CanonicalStoreError,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalStore,
+    CANONICAL_STORE_SCHEMA_VERSION, CanonicalReorgPolicy, CanonicalStoreError, RawBlobRetention,
+    RocksDbCanonicalStore,
     block_replay::read_persisted_replay,
     construction_manifest::CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME,
     control::{decode_store_control, encode_ready_store_control_with_revisions},
     mempool_lifecycle::{MEMPOOL_EVENT_RETENTION_FLOOR_KEY, MEMPOOL_EVENT_SEQUENCE_KEY},
     publication::column_family,
     rocksdb::{MEMPOOL_EVENT_COLUMN_FAMILY, STORE_CONTROL_KEY},
+    settled_segments::layout::{
+        SEGMENTS_DIR_NAME, SEGMENTS_MANIFEST_FILE_NAME, validate_settled_segment_filename,
+    },
 };
 
 /// Signed manifest filename.
@@ -104,7 +107,6 @@ struct ManifestAnchors {
     network_id: u32,
     genesis_hash: [u8; 32],
     activation_fingerprint: [u8; 32],
-    workload: CanonicalStoreWorkload,
     raw_blob_retention: RawBlobRetention,
     reorg_window_blocks: u32,
     history_floor: ManifestBlock,
@@ -182,7 +184,7 @@ impl EdgeSnapshotManifest {
     ///
     /// # Errors
     ///
-    /// Returns a refusal when the network, genesis, activation schedule, workload,
+    /// Returns a refusal when the network, genesis, activation schedule,
     /// raw blob retention, or replacement depth differs.
     pub fn validate_store_config(
         &self,
@@ -196,7 +198,6 @@ impl EdgeSnapshotManifest {
         if anchors.network_id != network.id()
             || anchors.genesis_hash != network.genesis_hash().as_bytes()
             || anchors.activation_fingerprint != fingerprint.as_bytes()
-            || anchors.workload != config.workload
             || anchors.raw_blob_retention != config.raw_blob_retention
             || anchors.reorg_window_blocks != config.reorg_policy.reorg_window_blocks()
         {
@@ -228,6 +229,9 @@ impl EdgeSnapshotManifest {
                 || !components.iter().all(|name| valid_component(name))
                 || !match components.as_slice() {
                     [CANONICAL, name] => checkpoint_file(name),
+                    [CANONICAL, seg_dir, subdir, file_name] if *seg_dir == SEGMENTS_DIR_NAME => {
+                        validate_settled_segment_filename(subdir, file_name)
+                    }
                     [SEALED, _, ..] => true,
                     _ => false,
                 }
@@ -244,6 +248,7 @@ impl EdgeSnapshotManifest {
             || !paths.contains(
                 format!("{CANONICAL}/{CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME}").as_str(),
             )
+            || !paths.contains(format!("{CANONICAL}/{SEGMENTS_MANIFEST_FILE_NAME}").as_str())
             || !paths
                 .iter()
                 .any(|path| path.starts_with("canonical-rocksdb/MANIFEST-"))
@@ -269,7 +274,10 @@ fn checkpoint_file(name: &str) -> bool {
     let numbered = |suffix: &str| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit());
     matches!(
         name,
-        "CURRENT" | "IDENTITY" | CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME
+        "CURRENT"
+            | "IDENTITY"
+            | CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME
+            | SEGMENTS_MANIFEST_FILE_NAME
     ) || ["MANIFEST-", "OPTIONS-"]
         .iter()
         .any(|prefix| name.strip_prefix(prefix).is_some_and(numbered))
@@ -286,8 +294,6 @@ fn signature_message(manifest: &[u8]) -> Vec<u8> {
 pub struct EdgeSnapshotStoreConfig<'a> {
     /// Activation schedule fetched from the configured validator.
     pub activations: &'a NetworkUpgradeActivations,
-    /// Canonical workload expected by the writer.
-    pub workload: CanonicalStoreWorkload,
     /// Raw block retention expected by the writer.
     pub raw_blob_retention: RawBlobRetention,
     /// Exact configured canonical replacement depth.
@@ -303,7 +309,6 @@ impl EdgeSnapshotStoreConfig<'_> {
         Ok(RocksDbCanonicalStore::open_ready(
             path,
             self.activations,
-            self.workload,
             self.raw_blob_retention,
             self.reorg_policy,
             self.resource_budget,
@@ -388,7 +393,6 @@ impl EdgeSnapshotAttestation {
             network_id: store.network().id(),
             genesis_hash: store.network().genesis_hash().as_bytes(),
             activation_fingerprint: schedule.activations_fingerprint().as_bytes(),
-            workload: store.workload(),
             raw_blob_retention: store.raw_blob_retention(),
             reorg_window_blocks: store.reorg_policy().reorg_window_blocks(),
             history_floor: self.history_floor.into(),
@@ -435,7 +439,7 @@ impl EdgeSnapshotAttestation {
             let height = BlockHeight::new(
                 u32::try_from(first + offset).map_err(|_| refused("invalid sampled height"))?,
             );
-            let replay = read_persisted_replay(&store.bounded_open.db, height)?.replay;
+            let replay = read_persisted_replay(store.segment_context(), height)?.replay;
             let facts = replay.facts();
             let header = store
                 .block_header_at(height)?
@@ -512,7 +516,6 @@ fn reset_local_state(store: &RocksDbCanonicalStore) -> Result<(), EdgeSnapshotEr
     let control = decode_store_control(db.path(), &encoded)?;
     let key = entropy()?;
     let control_bytes = encode_ready_store_control_with_revisions(
-        control.workload,
         &control.build_plan,
         key,
         &store.ready_evidence(),
@@ -593,7 +596,6 @@ pub fn export_edge_snapshot(
         activations: store
             .network_upgrade_activations()
             .ok_or_else(|| refused("missing admitted schedule"))?,
-        workload: store.workload(),
         raw_blob_retention: store.raw_blob_retention(),
         reorg_policy: store.reorg_policy(),
         required_first_available_height: store.ready_evidence().first_retained_block.height,

@@ -524,8 +524,8 @@ pub enum AdvertisePolicy {
     /// Wallet: requires a store that retains full block blobs (ingest
     /// `raw_blob_policy = all`).
     RequiresBlockBlobs,
-    /// Wallet: requires a store that retains transaction blobs
-    /// (ingest `raw_blob_policy` in `{transactions, all}`).
+    /// Wallet: requires a store that retains transaction and block blobs
+    /// (ingest `raw_blob_policy = all`).
     RequiresTransactionBlobs,
     /// Wallet: requires an available transparent-address history projection.
     RequiresTransparentAddressHistory,
