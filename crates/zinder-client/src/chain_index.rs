@@ -1333,6 +1333,8 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// A successful stream covers every requested height at one chain epoch.
     /// For descending requests, set `start_height` above `end_height`.
     ///
+    /// # Examples
+    ///
     /// ```no_run
     /// # use zinder_client::{BlockHeight, ChainIndex, CompactPool, CompactRangeQuery, IndexerError};
     /// # async fn scan<T: ChainIndex>(index: &T) -> Result<(), IndexerError> {
@@ -1363,6 +1365,16 @@ pub trait ChainIndex: Send + Sync + 'static {
     ///
     /// This stream carries block identities and selected nullifiers for spend
     /// detection. It can scan heights in either direction.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, ChainIndex, CompactRangeQuery, IndexerError};
+    /// # async fn scan<T: ChainIndex>(index: &T) -> Result<(), IndexerError> {
+    /// let query = CompactRangeQuery::new(BlockHeight::new(1), BlockHeight::new(100));
+    /// let _nullifiers = index.scan_compact_nullifiers(query).await?;
+    /// # Ok(()) }
+    /// ```
     async fn scan_compact_nullifiers(
         &self,
         _query: CompactRangeQuery,
@@ -1375,6 +1387,16 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// Returns the confirmed balance across a bounded address batch at one epoch.
     ///
     /// Supply 1 to 256 script hashes. Duplicate addresses count once.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransparentAddressScriptHash};
+    /// # async fn balances<T: ChainIndex>(index: &T, addresses: &[TransparentAddressScriptHash]) -> Result<(), IndexerError> {
+    /// let snapshot = index.snapshot().await?;
+    /// let balance = snapshot.transparent_address_balances(addresses).await?;
+    /// # let _ = balance.confirmed_zat; Ok(()) }
+    /// ```
     async fn transparent_address_balances(
         &self,
         _addresses: &[TransparentAddressScriptHash],
@@ -1389,6 +1411,18 @@ pub trait ChainIndex: Send + Sync + 'static {
     ///
     /// Supply 1 to 256 script hashes. Outputs are grouped by each distinct
     /// address in first-seen order. The mined height floor applies to every address.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, ChainIndex, IndexerError, TransparentAddressScriptHash};
+    /// # async fn outputs<T: ChainIndex>(index: &T, addresses: &[TransparentAddressScriptHash]) -> Result<(), IndexerError> {
+    /// let snapshot = index.snapshot().await?;
+    /// let _outputs = snapshot
+    ///     .transparent_addresses_unspent_outputs(addresses, BlockHeight::new(1))
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
     async fn transparent_addresses_unspent_outputs(
         &self,
         _addresses: &[TransparentAddressScriptHash],
@@ -1529,6 +1563,15 @@ pub trait EndpointBackedIndex: ChainIndex {
     async fn server_info(&self) -> Result<ServerInfo, IndexerError>;
 
     /// Reads the recommended fee per logical action from a verified upstream node.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{EndpointBackedIndex, IndexerError};
+    /// # async fn recommended_fee<T: EndpointBackedIndex>(index: &T) -> Result<(), IndexerError> {
+    /// let fee = index.standard_fee().await?;
+    /// # let _ = fee.fee_zat(); Ok(()) }
+    /// ```
     async fn standard_fee(&self) -> Result<StandardFee, IndexerError> {
         Err(IndexerError::FailedPrecondition {
             reason: "the endpoint does not support standard fee reads".to_owned(),
