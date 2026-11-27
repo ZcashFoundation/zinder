@@ -994,31 +994,31 @@ fn chain_event_message(
 }
 
 /// Replays one stream and optionally advertises a wallet contract revision.
-struct MalformedEventService<Request, Event> {
+struct ScriptedWalletStream<Request, Event> {
     method_path: &'static str,
-    events: Arc<Vec<Event>>,
+    chunks: Arc<Vec<Result<Event, Status>>>,
     revision: WalletRevision,
     request: PhantomData<fn() -> Request>,
 }
 
-impl<Request, Event> Clone for MalformedEventService<Request, Event> {
+impl<Request, Event> Clone for ScriptedWalletStream<Request, Event> {
     fn clone(&self) -> Self {
         Self {
             method_path: self.method_path,
             revision: self.revision,
-            events: Arc::clone(&self.events),
+            chunks: Arc::clone(&self.chunks),
             request: PhantomData,
         }
     }
 }
 
-impl<Request, Event> NamedService for MalformedEventService<Request, Event> {
+impl<Request, Event> NamedService for ScriptedWalletStream<Request, Event> {
     const NAME: &'static str = "zinder.v1.wallet.WalletQuery";
 }
 
-struct ReplayEventsMethod<Event>(Arc<Vec<Event>>);
+struct ReplayWalletChunks<Event>(Arc<Vec<Result<Event, Status>>>);
 
-impl<Req, Event> ServerStreamingService<Req> for ReplayEventsMethod<Event>
+impl<Req, Event> ServerStreamingService<Req> for ReplayWalletChunks<Event>
 where
     Event: Clone + Send + Sync + 'static,
 {
@@ -1028,9 +1028,9 @@ where
     type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
 
     fn call(&mut self, _request: tonic::Request<Req>) -> Self::Future {
-        let events = Arc::clone(&self.0);
+        let chunks = Arc::clone(&self.0);
         Box::pin(async move {
-            let stream = tokio_stream::iter(events.as_ref().clone().into_iter().map(Ok));
+            let stream = tokio_stream::iter(chunks.as_ref().clone());
             Ok(Response::new(Box::pin(stream) as Self::ResponseStream))
         })
     }
@@ -1039,6 +1039,7 @@ where
 #[derive(Clone, Copy)]
 enum WalletRevision {
     Reported(u32),
+    WithCapabilities(u32, &'static [&'static str]),
     Unavailable,
     Stalled,
 }
@@ -1050,8 +1051,9 @@ impl UnaryService<wallet::ServerInfoRequest> for WalletRevision {
     fn call(&mut self, _: tonic::Request<wallet::ServerInfoRequest>) -> Self::Future {
         let reply = *self;
         Box::pin(async move {
-            let revision = match reply {
-                Self::Reported(revision) => revision,
+            let (revision, capabilities) = match reply {
+                Self::Reported(revision) => (revision, &[][..]),
+                Self::WithCapabilities(revision, capabilities) => (revision, capabilities),
                 Self::Unavailable => return Err(Status::unimplemented("no ServerInfo")),
                 Self::Stalled => return std::future::pending().await,
             };
@@ -1063,6 +1065,10 @@ impl UnaryService<wallet::ServerInfoRequest> for WalletRevision {
                         )
                         .to_owned(),
                         contract_revision: revision,
+                        capabilities: capabilities
+                            .iter()
+                            .map(|&capability| capability.to_owned())
+                            .collect(),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1072,7 +1078,7 @@ impl UnaryService<wallet::ServerInfoRequest> for WalletRevision {
     }
 }
 
-impl<B, Req, Event> Service<http::Request<B>> for MalformedEventService<Req, Event>
+impl<B, Req, Event> Service<http::Request<B>> for ScriptedWalletStream<Req, Event>
 where
     B: Body + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
@@ -1111,12 +1117,12 @@ where
             });
         }
 
-        let events = Arc::clone(&self.events);
+        let chunks = Arc::clone(&self.chunks);
         Box::pin(async move {
             let codec = tonic_prost::ProstCodec::<Event, Req>::default();
             let mut grpc = tonic::server::Grpc::new(codec);
             Ok(grpc
-                .server_streaming(ReplayEventsMethod(events), request)
+                .server_streaming(ReplayWalletChunks(chunks), request)
                 .await)
         })
     }
@@ -1131,13 +1137,30 @@ where
     Request: tonic_prost::prost::Message + Default + Send + 'static,
     Event: tonic_prost::prost::Message + Clone + Send + Sync + 'static,
 {
+    spawn_scripted_wallet_stream::<Request, _>(
+        method_path,
+        events.into_iter().map(Ok).collect(),
+        revision,
+    )
+    .await
+}
+
+async fn spawn_scripted_wallet_stream<Request, Event>(
+    method_path: &'static str,
+    chunks: Vec<Result<Event, Status>>,
+    revision: WalletRevision,
+) -> eyre::Result<String>
+where
+    Request: tonic_prost::prost::Message + Default + Send + 'static,
+    Event: tonic_prost::prost::Message + Clone + Send + Sync + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let incoming = TcpListenerStream::new(listener);
-    let service = MalformedEventService::<Request, Event> {
+    let service = ScriptedWalletStream::<Request, Event> {
         method_path,
         revision,
-        events: Arc::new(events),
+        chunks: Arc::new(chunks),
         request: PhantomData,
     };
     tokio::spawn(async move {
@@ -1289,4 +1312,210 @@ async fn wallet_scan_extensions_require_exact_capabilities_on_older_endpoints() 
         );
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UnspentStreamFailure {
+    MissingHeader,
+    DuplicateHeader,
+    ItemBeforeHeader,
+    ForeignAddress,
+    BeforeFloor,
+    AboveTip,
+    Transport,
+    EpochPin,
+}
+
+impl UnspentStreamFailure {
+    fn script(
+        self,
+        epoch: zinder_client::ChainEpoch,
+        address: TransparentAddressScriptHash,
+    ) -> Vec<Result<wallet::TransparentUnspentOutputsChunk, Status>> {
+        use wallet::transparent_unspent_outputs_chunk::Body;
+
+        let header = wallet::TransparentUnspentOutputsChunk {
+            body: Some(Body::Header(zinder_store::chain_view_message(epoch))),
+        };
+        let output = |address: TransparentAddressScriptHash, height| {
+            wallet::TransparentUnspentOutputsChunk {
+                body: Some(Body::Item(wallet::TransparentUnspentOutput {
+                    address_script_hash: address.as_bytes().to_vec(),
+                    value_zat: 1000,
+                    block_height: height,
+                    block_hash: zinder_core::wire::encode_rpc_block_hash_hex(
+                        epoch.visible_tip_hash,
+                    ),
+                    outpoint: Some(wallet::OutPoint {
+                        transaction_id: zinder_core::wire::encode_rpc_transaction_id_hex(
+                            TransactionId::from_bytes([0x33; 32]),
+                        ),
+                        output_index: 0,
+                    }),
+                    script_pub_key: vec![0x51],
+                })),
+            }
+        };
+        let good_output = || Ok(output(address, 2));
+        match self {
+            Self::MissingHeader => Vec::new(),
+            Self::DuplicateHeader => vec![Ok(header.clone()), Ok(header), good_output()],
+            Self::ItemBeforeHeader => vec![good_output(), Ok(header), good_output()],
+            Self::ForeignAddress => vec![
+                Ok(header),
+                Ok(output(
+                    TransparentAddressScriptHash::from_bytes([0x99; 32]),
+                    2,
+                )),
+                good_output(),
+            ],
+            Self::BeforeFloor => vec![Ok(header), Ok(output(address, 1)), good_output()],
+            Self::AboveTip => vec![Ok(header), Ok(output(address, 3)), good_output()],
+            Self::Transport => vec![
+                Ok(header),
+                good_output(),
+                Err(Status::unavailable("stream interrupted")),
+            ],
+            Self::EpochPin => vec![
+                Ok(header),
+                good_output(),
+                Err(zinder_proto::status_for_reason(
+                    zinder_proto::v1::ops::ErrorReason::ChainEpochPinUnavailable,
+                    "epoch retired",
+                )),
+            ],
+        }
+    }
+
+    fn matches_error(self, error: &IndexerError) -> bool {
+        match self {
+            Self::MissingHeader => matches!(
+                error,
+                IndexerError::MalformedResponse {
+                    field: "transparent_unspent_outputs.header",
+                    ..
+                }
+            ),
+            Self::DuplicateHeader => matches!(
+                error,
+                IndexerError::MalformedResponse {
+                    field: "stream.header",
+                    ..
+                }
+            ),
+            Self::ItemBeforeHeader => matches!(
+                error,
+                IndexerError::MalformedResponse {
+                    field: "stream.item",
+                    ..
+                }
+            ),
+            Self::ForeignAddress | Self::BeforeFloor | Self::AboveTip => matches!(
+                error,
+                IndexerError::MalformedResponse {
+                    field: "transparent_unspent_output",
+                    ..
+                }
+            ),
+            Self::Transport => matches!(error, IndexerError::ServiceUnavailable { .. }),
+            Self::EpochPin => matches!(error, IndexerError::ChainEpochPinUnavailable),
+        }
+    }
+}
+
+#[tokio::test]
+async fn public_unspent_streams_emit_each_failure_once() -> eyre::Result<()> {
+    let epoch = ChainFixture::new(Network::ZcashRegtest)
+        .extend_blocks(2)
+        .chain_epoch(zinder_client::ChainEpochId::new(7))
+        .ok_or_else(|| eyre!("missing fixture epoch"))?;
+    let address = TransparentAddressScriptHash::from_bytes([0x51; 32]);
+    for batch in [false, true] {
+        for failure in [
+            UnspentStreamFailure::MissingHeader,
+            UnspentStreamFailure::DuplicateHeader,
+            UnspentStreamFailure::ItemBeforeHeader,
+            UnspentStreamFailure::ForeignAddress,
+            UnspentStreamFailure::BeforeFloor,
+            UnspentStreamFailure::AboveTip,
+            UnspentStreamFailure::Transport,
+            UnspentStreamFailure::EpochPin,
+        ] {
+            let mut stream = open_scripted_unspent_stream(batch, failure, epoch, address).await?;
+            if matches!(
+                failure,
+                UnspentStreamFailure::Transport | UnspentStreamFailure::EpochPin
+            ) {
+                let output = stream
+                    .next()
+                    .await
+                    .ok_or_else(|| eyre!("missing valid output"))??;
+                assert_eq!(output.chain_epoch, epoch);
+                assert_eq!(output.output.address_script_hash, address);
+                assert_eq!(output.output.block_height, BlockHeight::new(2));
+            }
+            let error = stream
+                .next()
+                .await
+                .ok_or_else(|| eyre!("missing terminal error for {failure:?}, batch={batch}"))?
+                .err()
+                .ok_or_else(|| eyre!("received output for {failure:?}, batch={batch}"))?;
+            assert!(
+                failure.matches_error(&error),
+                "{failure:?}, batch={batch}: {error:?}"
+            );
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+        }
+    }
+    Ok(())
+}
+
+async fn open_scripted_unspent_stream(
+    batch: bool,
+    failure: UnspentStreamFailure,
+    epoch: zinder_client::ChainEpoch,
+    address: TransparentAddressScriptHash,
+) -> eyre::Result<zinder_client::TransparentAddressUnspentOutputsStream> {
+    let revision = WalletRevision::WithCapabilities(
+        zinder_proto::CONTRACT_REVISION,
+        &[zinder_proto::capabilities::WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1],
+    );
+    let script = failure.script(epoch, address);
+    let endpoint = if batch {
+        spawn_scripted_wallet_stream::<wallet::TransparentAddressesUnspentOutputsRequest, _>(
+            "/zinder.v1.wallet.WalletQuery/TransparentAddressesUnspentOutputs",
+            script,
+            revision,
+        )
+        .await?
+    } else {
+        spawn_scripted_wallet_stream::<wallet::TransparentAddressUnspentOutputsRequest, _>(
+            "/zinder.v1.wallet.WalletQuery/TransparentAddressUnspentOutputs",
+            script,
+            revision,
+        )
+        .await?
+    };
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: epoch.network,
+    })?;
+    let start_height = BlockHeight::new(2);
+    let at_epoch_id = Some(epoch.id);
+    Ok(if batch {
+        index
+            .transparent_addresses_unspent_outputs(&[address], start_height, at_epoch_id)
+            .await?
+    } else {
+        index
+            .transparent_address_unspent_outputs(
+                zinder_client::TransparentAddressUnspentOutputsQuery {
+                    address_script_hash: address,
+                    start_height,
+                    at_epoch_id,
+                },
+            )
+            .await?
+    })
 }

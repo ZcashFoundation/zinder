@@ -330,53 +330,49 @@ impl RemoteChainIndex {
     ) -> TransparentAddressUnspentOutputsStream {
         let recovery = self.clone();
         let addresses = Arc::new(addresses);
-        Box::pin(futures_util::stream::unfold(
-            Some((response, None)),
-            move |state| {
-                let recovery = recovery.clone();
-                let addresses = Arc::clone(&addresses);
-                async move {
-                    let (mut response, mut chain_epoch) = state?;
-                    loop {
-                        let message = match response.message().await {
-                            Ok(Some(message)) => message,
-                            Ok(None) => {
-                                return missing_transparent_unspent_header_error(
-                                    chain_epoch.is_some(),
-                                )
+        let decoded = futures_util::stream::unfold(Some((response, None)), move |state| {
+            let recovery = recovery.clone();
+            let addresses = Arc::clone(&addresses);
+            async move {
+                let (mut response, mut chain_epoch) = state?;
+                loop {
+                    let message = match response.message().await {
+                        Ok(Some(message)) => message,
+                        Ok(None) => {
+                            return missing_transparent_unspent_header_error(chain_epoch.is_some())
                                 .map(|error| (Err(error), None));
-                            }
-                            Err(status) => return Some((Err(recovery.map_status(status)), None)),
-                        };
-                        match transparent_unspent_output_stream_item(
-                            recovery.network,
-                            at_epoch_id,
-                            &mut chain_epoch,
-                            message,
-                        ) {
-                            Ok(None) => {}
-                            Ok(Some(output)) => {
-                                if !addresses.contains(&output.output.address_script_hash)
-                                    || output.output.block_height < start_height
-                                    || output.output.block_height
-                                        > output.chain_epoch.visible_tip_height
-                                {
-                                    return Some((
-                                        Err(IndexerError::malformed(
-                                            "transparent_unspent_output",
-                                            "output does not match the requested addresses and height bounds",
-                                        )),
-                                        None,
-                                    ));
-                                }
-                                return Some((Ok(output), Some((response, chain_epoch))));
-                            }
-                            Err(error) => return Some((Err(error), None)),
                         }
+                        Err(status) => return Some((Err(recovery.map_status(status)), None)),
+                    };
+                    match transparent_unspent_output_stream_item(
+                        recovery.network,
+                        at_epoch_id,
+                        &mut chain_epoch,
+                        message,
+                    ) {
+                        Ok(None) => {}
+                        Ok(Some(output)) => {
+                            if !addresses.contains(&output.output.address_script_hash)
+                                || output.output.block_height < start_height
+                                || output.output.block_height
+                                    > output.chain_epoch.visible_tip_height
+                            {
+                                return Some((
+                                    Err(IndexerError::malformed(
+                                        "transparent_unspent_output",
+                                        "output does not match the requested addresses and height bounds",
+                                    )),
+                                    None,
+                                ));
+                            }
+                            return Some((Ok(output), Some((response, chain_epoch))));
+                        }
+                        Err(error) => return Some((Err(error), None)),
                     }
                 }
-            },
-        ))
+            }
+        });
+        Box::pin(futures_util::StreamExt::fuse(decoded))
     }
 
     /// Maps a tonic [`Status`](tonic::Status) into the typed [`IndexerError`]
