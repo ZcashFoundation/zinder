@@ -33,101 +33,172 @@ changes its default.
 
 `RocksDbCanonicalStore` is the writer's handle, and
 `RocksDbCanonicalSecondary` is a reader's handle. The store's identity is
-`canonical`, and `CANONICAL_STORE_SCHEMA_VERSION` versions its layout. Callers
-use domain operations. Column family names and keys are private to
-`zinder-store`.
+`canonical`, and `CANONICAL_STORE_SCHEMA_VERSION = 2` versions its layout
+(`Canonical Schema v2`). Callers use domain operations; column family names,
+keys, and external segment formats are internal to `zinder-store`.
+
+Schema v2 separates compact hot indexes and unsealed recent blocks (in RocksDB)
+from immutable settled block payloads stored in external aligned segment files
+under `<store_root>/segments/`:
 
 | Column family | Contents |
 | --- | --- |
-| `block_replay` | Reversible `CanonicalBlockFacts` envelope per height, the source for every derived record |
-| `block_header` | Header by height |
-| `block_hash_index` | Height by block hash |
-| `transaction_location` | Block position and serialized byte digest by transaction ID |
-| `compact_block` | Compact block per height |
-| `tree_state_checkpoint` | Commitment tree checkpoint at least every 100 blocks |
-| `subtree_root` | Completed shielded subtree roots |
-| `block_final_note_commitment_roots` | Final commitment roots per block (explorer workload only) |
-| `daily_value_pool_balance` | Reserved for daily value-pool evidence. Explorer construction refuses READY publication pending authentication. |
+| `default` | Store control (`store_control`: identity, schema `v2`, network, activation binding, retention, reorg window, manifest binding, READY evidence, cursor auth key) |
+| `block_header` | Fixed `184`-byte header (including `32`-byte `commitment_bytes`) keyed by height BE |
+| `block_hash_index` | `4`-byte height BE keyed by `32`-byte block hash |
+| `transaction_location` | `72`-byte location and serialized-transaction SHA-256 digest keyed by `32`-byte txid |
+| `live_tail_block` | Versioned `ZSLVTL01` (`V1`) record for unsealed heights `> sealed_tip`: pre-encoded `DEFAULT_RANGE` shielded wire payload, `PoolPresenceMask`, optional Tag-1/Tag-2 supplement, and optional `CanonicalBlockFacts` |
+| `live_tail_raw_block` | Split versioned `ZSLVRB01` (`V1`) full block bytes and per-tx slice descriptors/SHA-256 digests for unsealed heights `> sealed_tip` when `storage.raw_blob_policy = "all"` (`0` rows when `none`) |
+| `settled_segment_index` | `SettledSegmentIndexEntry` (`V1`) keyed by segment start height BE, pinning module flags (`supplement`, `raw_bodies`), external `ZSHRNG02`/`ZSTSUP01`/`ZSBLKB01` digests (`sha256`, `index_sha256`, optional `fs_verity_sha256`), and cumulative `end_sequence_checkpoint` |
+| `tree_state_checkpoint` | Commitment tree frontier checkpoints (`V1`) stored at least every `100` blocks (`TREE_STATE_CHECKPOINT_STRIDE`) |
+| `subtree_root` | Completed shielded subtree roots per pool (`Sapling`, `Orchard`, `Ironwood`) |
 | `chain_epoch` | Retained chain epochs |
 | `chain_event` | Authenticated append and reorg history |
 | `mempool_event` | Retained mempool history |
-| `displaced_block_facts` | Blocks removed by a reorg |
-| `block_blob`, `transaction_blob` | Raw bytes, kept according to `storage.raw_blob_policy` |
+| `displaced_block_facts` | Full `CanonicalBlockFacts` archived for blocks replaced by a reorg |
 
-Canonical schema v1 uses a 72-byte value for each 32-byte transaction ID
-in `transaction_location`. The value contains a 4-byte big-endian block
-height, the 32-byte block hash, a 4-byte big-endian transaction index, and
-the 32-byte SHA-256 digest committed by canonical transaction facts. A
-location lookup returns the digest even when raw blob retention is disabled.
-The reader requires exactly 72 bytes. Rebuild any pre-release schema v1
-canonical store constructed with 40-byte transaction locations.
+At `READY` publication, fresh construction stages SSTs for the seven bulk
+families (`block_hash_index`, `block_header`, `live_tail_block`,
+`live_tail_raw_block`, `settled_segment_index`, `transaction_location`,
+`tree_state_checkpoint`), verifies `canonical-construction-manifest.v2.json`
+(`CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION = 2`), and verifies zero
+initial rows across the four post-publication families (`chain_epoch`,
+`chain_event`, `mempool_event`, `displaced_block_facts`).
 
-RocksDB applies these codecs per data column family.
+Canonical Schema v2 retains the `72`-byte value for each `32`-byte transaction
+ID in `transaction_location`: `4`-byte big-endian block height, `32`-byte block
+hash, `4`-byte big-endian transaction index, and the `32`-byte SHA-256 digest of
+the exact serialized transaction bytes. A location lookup returns this digest
+even when `storage.raw_blob_policy = "none"`.
 
-| Canonical column families | Upper levels | Bottommost level and bulk SSTs |
-| --- | --- | --- |
-| `block_replay`, `compact_block`, `tree_state_checkpoint`, `transaction_blob`, `block_blob`, `displaced_block_facts` | LZ4 | Zstandard level 3 |
-| `block_hash_index`, `transaction_location` | None | None |
-| Other canonical data families | LZ4 | LZ4 |
+RocksDB applies these codecs per data column family:
 
-`block_hash_index` and `transaction_location` also carry partitioned hybrid
-Ribbon filters (10 bits per key; Bloom filters before level 1 and Ribbon
-filters at deeper levels) with two-level indexes and top-level index and filter
-blocks pinned in the block cache. `chain_epoch` and `chain_event` carry
-10-bits-per-key full-table Bloom filters cached in the block cache. Other
-canonical families use no filters.
+| Canonical column families | Upper levels | Bottommost level and bulk SSTs | Filter |
+| --- | --- | --- | --- |
+| `tree_state_checkpoint`, `displaced_block_facts`, `live_tail_raw_block` | LZ4 | Zstandard level 3 | None |
+| `block_hash_index`, `transaction_location` | None | None | Partitioned hybrid Ribbon (`10` bits/key) + two-level index (top-level blocks pinned) |
+| `chain_epoch`, `chain_event` | LZ4 | LZ4 | Full-table Bloom (`10` bits/key) |
+| `block_header`, `subtree_root`, `live_tail_block`, `settled_segment_index`, `mempool_event` | LZ4 | LZ4 | None |
 
-A control record ties the store to its network, workload (`wallet` or
-`explorer`), raw-blob retention, reorg window, network-upgrade activations,
-construction manifest, and current chain event. Admission checks all of them,
-as described under [schema admission](#schema-admission).
+A control record binds the store to its network, raw-blob retention
+(`none` or `all`; legacy `transactions` is removed and refused), reorg window,
+network-upgrade activation schedule, `canonical-construction-manifest.v2.json`
+digest, and current chain event. Admission checks all of them, as described under
+[schema admission](#schema-admission).
 
 A fresh store is built in an inactive staging path and published once as a
-validated baseline. After that, each new block or reorg is one atomic write
-batch. The batch advances the facts, indexes, chain epoch, chain event, and
-sequence digest together, so a reader never sees part of a transition.
-[Chain ingestion](chain-ingestion.md) describes construction and following.
+validated baseline. After that, each live block commit or reorg applies atomically:
+any newly completed aligned `4,096`-block settled boundary is sealed into external
+segment files under `segments/` first (staged in `segments/.staging`, fsynced,
+renamed into `segments/{shielded,supplement,raw_block}/`, with parent directories
+synced), and one RocksDB `WriteBatch` then inserts `settled_segment_index`,
+deletes the newly sealed `live_tail_block` and `live_tail_raw_block` rows, and
+advances indexes, chain epoch, chain event, and sequence digest together before
+updating `segments-manifest.json` (`CANONICAL_SEGMENTS_MANIFEST_SCHEMA_VERSION = 2`).
+Because `live_tail_block` only holds heights above `sealed_tip` (`<= sealed_tip + 4,095`
+alongside the live reorg suffix, up to `reorg_window_blocks + 4,095` physical rows),
+bounded compaction keeps unsealed tail storage small while reorg eligibility
+remains strictly bounded by `settled_tip` / `reorg_window_blocks`. On primary
+reopen, crash recovery cleans stale `segments/.staging` files and any
+unreferenced segment files, then resynchronizes `segments-manifest.json` from
+`settled_segment_index`. [Chain ingestion](chain-ingestion.md) describes
+construction and following.
 
-Construction and every transition check a block's compact block against its
-header before they write either row. A compact-block range read therefore
-reads only `compact_block` and does not read `block_header`. The read first
-checks every requested height against retained history. A height below the
-first retained block or above the visible tip fails the read as an unavailable
-artifact, even when a row is stored for it.
+### External settled segments and cache
 
-The read then fetches rows with batched point lookups (`MultiGet`):
+Settled blocks (`height <= sealed_tip` aligned to `DEFAULT_SETTLED_SEGMENT_BLOCKS = 4,096`)
+reside outside RocksDB as immutable, `fs-verity`-compatible files under
+`<store_root>/segments/` capped at `<= 256 MiB` (`DEFAULT_MAX_SETTLED_SEGMENT_BYTES`)
+per segment across all three formats so each segment also fits single-object
+PostgreSQL `BYTEA STORAGE EXTERNAL` and object-storage bounds (oversized strides
+presplit deterministically):
 
-- An unbounded range read fetches up to 1,024 heights per batch.
-- The tree-state replay fetches up to 16 heights per batch and checks for cancellation after each block. Wallet queries at the same height and chain fence share a reconstruction. The last wallet to leave cancels the work. Each query runtime caches up to 256 settled answers, scoped to the epoch, sequence digest, and retained history.
-- A byte-bounded read fetches one row first. Each later batch holds as many
-  rows as the budget left fits at the size of the largest row read so far,
-  from 1 to 16.
+- **`ZSHRNG02` (`segments/shielded/<start:010>-<end:010>.zshrng02`, always present):**
+  128-byte fixed big-endian header, `Slab 0` containing 5-byte gRPC-framed
+  pre-encoded `DEFAULT_RANGE` lightwalletd `CompactBlock` payloads, an `80`-byte
+  per-block row index (block hash, `payload_sha256`, `block_time`, slab offset,
+  length, `PoolPresenceMask` distinguishing Sapling spends from Sapling outputs
+  plus Orchard and Ironwood), and a 32-byte whole-body SHA-256 trailer. Cold
+  admission validates `index_sha256` in one positioned read (`O(index)`),
+  retaining `12 B/block` compact rows (`+ 0.5 B/block` 64-row page digests when
+  not backed by kernel `fs-verity`). Sans-I/O `ByteRange` planning groups short
+  rows (`< 32 KiB`) into `512 KiB` slabs, isolates large rows (`>= 32 KiB`), skips
+  `Slab 0` on unmatched/empty blocks for `GetBlockRangeNullifiers`, and projects
+  narrowed pool subsets or nullifier wire payloads on the fly without decoding
+  full blocks.
+- **`ZSTSUP01` (`segments/supplement/<start:010>-<end:010>.zstsup01`, supplement module):**
+  `16`-block `Zstd` level-3 (or uncompressed) compressed chunks of per-block
+  tagged sections: Tag `1` compact transparent supplement (`tx.index`, `txid`,
+  `fee_zat`, `vin`, `vout`) and Tag `2` extensible canonical block/tx metadata
+  (ZIP 229/258/248/226/270/272 fields, explicit anchors,
+  `zip317_logical_actions`, `paid_fee`, and `burn_zat`), with `O(index)` cold
+  `index_sha256` verification and sans-I/O `ByteRange` planning. Together with
+  `ZSHRNG02` `Slab 0`, `splice_compact_block_wire` yields byte-identical
+  transparent-inclusive `CompactBlock` frames and
+  `reconstruct_compact_block_artifact` / `reconstruct_canonical_block_facts`
+  recover full canonical records for native query, wallet projection, and
+  Explorer views.
+- **`ZSBLKB01` (`segments/raw_block/<start:010>-<end:010>.zsblkb01`, when `raw_blob_policy = "all"`):**
+  single-copy full consensus block vault storing each block once (`Zstd` level 3
+  or uncompressed), a flat `40`-byte per-transaction slice table `(tx_offset,
+  tx_len, tx_sha256)` read on demand without retaining an in-memory tx vector, a
+  `128`-byte per-block row index, and a 32-byte trailer, with `O(index)` cold
+  `index_sha256` admission and sans-I/O `ByteRange` planning. Setting
+  `storage.full_blocks = true` (`storage.raw_blob_policy = "all"`) enables
+  `ZSBLKB01` + `live_tail_raw_block` with one copy of full block bytes instead
+  of separate transaction and block blob copies.
 
-Each row must decode to the block at its key's height. A height missing inside
-retained history fails the read as store damage.
+`SettledSegmentReaderCache` holds a thread-safe bounded-LRU lazy cache (default
+`1,024` entries) keyed by `(start_height, SettledSegmentKind)` with miss
+singleflight deduplication. Opening `ZSHRNG02` never touches `ZSTSUP01` or
+`ZSBLKB01`, and opening `ZSTSUP01` never touches `ZSBLKB01`.
 
-The read never builds an iterator. `RocksDB` opens every level-0 table file of
-a family to build an iterator, including files that hold no requested height.
-A point lookup checks each level-0 file's key range before it opens the file,
-unless level 0 is the only non-empty level and holds at most three files. A
-point lookup can still open a file that does not hold its key. That happens
-when the file's key range covers the key, or when `RocksDB` skips the range
-check. On a secondary that the primary's compaction has overtaken, a range
-read fails with the missing-table-file error only when one of its lookups
-opens a deleted file. The `RocksDB` reader reports that error as an
-invalidated reader, and `zinder-query` answers it by replacing the pair, as
-[ADR-0015](../adrs/0015-wallet-runtime-composition.md) records.
+### Canonical read path
 
-A lookup of transaction bytes by ID reads the `transaction_location` row
-once, then the `transaction_blob` row at the position that row names. Both
-reads go through one store handle, and successful reads through that handle
-see the same canonical transaction mapping, because no commit or catch-up can
-run while the read holds it. The location therefore needs no second check. A
-read of raw bytes at a location the caller supplies first compares it with the
-current location row, and returns no bytes when that row is missing or differs
-in block height, block hash, transaction index, or a digest supplied by the
-caller. A location saved before later commits, such as an unrelated
-append or a reorg strictly above its block, still matches and returns bytes.
+Construction and every transition verify each block's compact block and
+supplement against its canonical header before committing. Reads first validate
+every requested height against retained history: a height below the first
+retained block or above the visible tip fails as an unavailable artifact even
+when an unsealed or historical row is present on disk.
+
+Heights are routed in memory via `O(log N)` binary search over the contiguous
+`settled_segment_index` vector (for settled heights `<= sealed_tip`) and batched
+`MultiGet` point lookups into `live_tail_block` / `live_tail_raw_block` (for
+unsealed heights `> sealed_tip`):
+
+- Direct lightwalletd shielded and nullifier streaming
+  (`encoded_compact_block_range_up_to`) reads `ZSHRNG02` `Slab 0` through
+  `SettledSegmentReaderCache` (using sans-I/O `ByteRange` plans) and
+  `live_tail_block`, verifying frame lengths, digests, and `(height, block_hash,
+  previous_block_hash)` linkage across segment and tail boundaries.
+- Full `CompactBlockArtifact` and `CanonicalBlockFacts` reads splice `ZSHRNG02`
+  plus `ZSTSUP01` for settled heights and decode `ZSLVTL01` rows in `MultiGet`
+  batches for unsealed tail heights:
+  - An unbounded range read fetches up to `1,024` unsealed tail heights per batch.
+  - Tree-state replay fetches up to `16` heights per batch and checks for
+    cancellation after each block. Wallet queries at the same height and chain
+    fence share a reconstruction; the last caller to leave cancels the work.
+    Each query runtime caches up to `256` settled answers scoped to the epoch,
+    sequence digest, and retained history.
+  - A byte-bounded read fetches one row first, then adapts subsequent batch sizes
+    from `1` to `16` within the remaining byte budget.
+
+Reads verify block height linkage across every decoded row and fail on missing
+rows inside retained history as store damage. Canonical reads never construct
+RocksDB iterators over range data families (preventing L0 SST open amplification
+and keeping secondary invalidation strictly limited to `MultiGet` lookups that
+hit compacted-away SSTs, handled by reader-pair replacement as recorded in
+[ADR-0015](../adrs/0015-wallet-runtime-composition.md)).
+
+A transaction byte lookup by ID reads the `72`-byte `transaction_location` row
+once through the active handle (seeing one immutable chain view). When
+`storage.raw_blob_policy = "all"`, it reads the exact transaction slice from the
+indexed `ZSBLKB01` segment (for settled heights) or `live_tail_raw_block`
+(`ZSLVRB01`, for unsealed heights) and verifies the slice's `tx_sha256`; when
+`none`, callers fetch bytes from the verified primary node and compare against
+the indexed `32`-byte SHA-256 digest. A caller-supplied location check compares
+first against `transaction_location` and returns no bytes if the row is missing
+or differs in height, block hash, index, or digest.
 
 ## Wallet store
 
@@ -182,7 +253,8 @@ be rebuilt.
 
 The row digest and the UTXO set commitment are sums of per-row hashes, so they
 do not depend on the order rows are hashed in. Construction also scans the
-settled canonical replay prefix in 4,096-block height chunks across
+settled canonical prefix (`ZSHRNG02` + `ZSTSUP01` segments) in `4,096`-block
+height chunks across
 `projector.build.accumulator_hashing_workers` threads into sharded outpoint
 sorters that split `projector.build.max_outpoint_sort_memory_bytes` evenly
 while sharing `projector.build.max_temporary_file_bytes_per_sorter`, bounding
@@ -299,9 +371,10 @@ one read where it needs several lookups:
 - `mined_transaction` returns a transaction's location, its block's header,
   and its bytes, or proves the transaction absent.
 - `block_header_by_hash` and `compact_block_by_hash` resolve a block hash
-  through the best-chain index and read the block it names. A resolved hash
-  whose compact block the store lacks fails `compact_block_by_hash` as that
-  block's unavailable artifact, so it never reads as an unknown hash.
+  through `block_hash_index` and read the block (`ZSHRNG02` + `ZSTSUP01` or
+  `live_tail_block`) it names. A resolved hash whose compact block the store
+  lacks fails `compact_block_by_hash` as that block's unavailable artifact, so
+  it never reads as an unknown hash.
 - `total_address_balance` sums up to 256 addresses.
 - `outpoint_spend_statuses` classifies a batch of outpoints. On checkpointed
   history a missing outpoint fails the request, so there the read ends at the
@@ -406,27 +479,30 @@ read-only probe before a primary opens for writes. Their secondaries validate
 through the bounded secondary handle. The open fails without changing anything when any of these
 differ from what the process expects:
 
-- the store identity or layout version;
+- the store identity or layout version (`CANONICAL_STORE_SCHEMA_VERSION = 2`);
 - the network;
-- the required retained data and its historical floor for a canonical reader;
-- the exact canonical workload and raw-blob retention for a writer or recovery checkpoint;
+- the required retained data (`CanonicalStoreRequirements`) and its historical floor for a canonical reader;
+- the exact `raw_blob_policy` (`none` or `all`) for a writer or recovery checkpoint (legacy `"transactions"` and Schema v1 stores fail closed);
 - the network-upgrade activations at or below the visible tip;
 - the reorg window;
 - for the wallet store, the canonical source it was built from.
 
-Schema v1 requires every family listed above plus the default control
-family, including physically present families with no rows under the
-admitted workload and blob policy. The construction manifest must bind the
-same workload, blob policy, and build plan as the control record and have
-evidence for the full family inventory. At construction, families outside
-the stored set and families reserved for post-publication writes must report
-zero rows.
+Canonical Schema v2 requires all 12 data column families plus `default` listed
+above, `canonical-construction-manifest.v2.json`, and `segments-manifest.json`
+together with every `settled_segment_index`-referenced external segment file
+(`ZSHRNG02`, plus `ZSTSUP01` and `ZSBLKB01` according to the admitted
+modules). The construction manifest must bind the same raw-blob retention and
+build plan as the control record and carry evidence for the full family
+inventory, including zero-row checks on post-publication families (`chain_epoch`,
+`chain_event`, `mempool_event`, `displaced_block_facts`) and on
+`live_tail_raw_block` when `raw_blob_policy = "none"`.
 
 `CanonicalStoredSet` derives retained block data and its history floor from
-the build plan and workload. Readers can specify minimum data and a starting
-height with `CanonicalStoreRequirements`. A richer store satisfies these
-requirements when it covers the requested history. Missing data or an
-insufficient history floor returns `CanonicalStoreError::MissingStoredData`.
+the build plan. Readers specify minimum data and a starting height with
+`CanonicalStoreRequirements` (checked by `CanonicalStoredSet::require`). A richer
+store (such as `raw_blob_policy = "all"`) satisfies a `none` requirement when it
+covers the requested history. Missing data or an insufficient history floor
+returns `CanonicalStoreError::MissingStoredData`.
 The native query and compatibility listeners keep their first admitted
 stored set across generation changes. Restart the process to
 admit a different stored set that meets its requirements.

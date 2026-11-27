@@ -638,7 +638,7 @@ transaction, which every blob-retention policy keeps. Other bytes return
 `DATA_LOSS`. A transaction the served chain does not mine is looked up in the
 ingest mempool, as wallet serving does, even when the node has mined it in a
 later block. To exercise local mined-transaction reads, repeat with fresh store
-paths. Unset `ZINDER_DEPLOYMENT__PROFILE`, set `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`
+paths. Unset `ZINDER_DEPLOYMENT__PROFILE`, set `ZINDER_STORAGE__RAW_BLOB_POLICY=all`
 for both binaries, set `ZINDER_INGEST__RUN_OVERRIDES__COVERAGE=wallet-serving`
 for ingest, and pass `--serving light-wallet` to compatibility.
 
@@ -828,11 +828,11 @@ the JSON reports on failure. Timing is recorded without a latency threshold.
 
 ## Specialized procedures
 
-### Canonical schema v1 admission
+### Canonical schema v2 admission
 
 Run the canonical-store tests after changing construction, admission, or
-persisted rows. The control-record tests check exact schema v1 bytes for
-every workload and retention policy. The store-open tests check that admission
+persisted rows. The control-record tests check exact schema v2 bytes for
+every retention policy. The store-open tests check that admission
 refuses unsupported schema markers without rewriting store control. The
 publication crash tests check that the initial schedule and READY control
 survive together. The wallet adapter integration tests check that the wallet

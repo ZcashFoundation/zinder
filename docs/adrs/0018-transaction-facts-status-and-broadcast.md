@@ -61,10 +61,10 @@ matched substrings of node messages broke whenever the wording changed.
    runtime forwards the node's error code and message for every rejection and
    reports queued as code `-25`. It invents no Zinder-specific codes.
 
-8. **Mined locations carry the byte commitment.** The schema v1 canonical
+8. **Mined locations carry the byte commitment.** The canonical
    transaction index stores the SHA-256 commitment to the exact serialized
-   transaction bytes alongside the block position. This lets a reader obtain
-   the commitment in one index lookup under every raw-blob retention policy.
+   transaction bytes alongside the block position (`transaction_location`, 72 bytes per entry). This lets a reader obtain
+   the commitment in one index lookup under every raw-blob retention policy (`none` or `all`).
    Lean wallet serving uses this commitment to validate mined transaction bytes
    fetched from the primary node against the captured canonical epoch. The
    node verifies against the captured schedule and tip on a cache miss and
@@ -114,6 +114,8 @@ with their retry rules are in
   the reason to learn the transaction is still in flight.
 
 ## Revision history
+
+- 2026-11-27. Updated decision 8 to reflect Canonical Schema v2 (`none` or `all` raw-blob retention on `transaction_location`).
 
 - 2026-11-24. Mined byte reads can use the verified primary node and a bounded cache.
 

@@ -111,7 +111,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Coordinates the consumer preset (`light-wallet`, `wallet`, or `explorer`; defaults to `wallet` when configuring a preset; deprecated `wallet-archive` aliases `wallet` with `storage.full_blocks = true`). Combine with `ZINDER_STORAGE__FULL_BLOCKS=true` to retain full raw blocks. See [deployment profiles](#deployment-profiles).",
+        description: "Coordinates the consumer preset (`light-wallet`, `wallet`, or `explorer`; defaults to `wallet` when configuring a preset). Combine with `ZINDER_STORAGE__FULL_BLOCKS=true` to retain full raw blocks. See [deployment profiles](#deployment-profiles).",
     },
     EnvVarDoc {
         name: "ZINDER_NETWORK__NAME",
@@ -1617,7 +1617,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "The raw-blob policy accepts `none`, `transactions`, or `all`. The ingest writer defaults to `none` for explicit coverage and `transactions` for wallet-serving coverage. Consumer presets default to `none` (or `all` when `storage.full_blocks = true`). Projector, query, and compatibility readers use the value as a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an existing canonical store requires a rebuild.",
+        description: "The raw-blob policy accepts `none` or `all` (legacy `transactions` was removed in Canonical Schema v2 and is refused). The ingest writer and consumer presets default to `none`, or `all` when `storage.full_blocks = true`. Projector, query, and compatibility readers use the value as a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an existing canonical store requires a rebuild.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__REORG_WINDOW_BLOCKS",
