@@ -76,11 +76,30 @@ class MockR2Handler(BaseHTTPRequestHandler):
             self.wfile.write(encoded)
 
     def _read_body(self) -> bytes | None:
-        raw_len = self.headers.get("Content-Length")
-        if raw_len is None:
-            return b""
+        if self.headers.get_all("Transfer-Encoding"):
+            self.close_connection = True
+            self._send_json(
+                HTTPStatus.NOT_IMPLEMENTED,
+                {"error": "Transfer-Encoding is not supported; supply Content-Length"},
+            )
+            return None
+        raw_lengths = self.headers.get_all("Content-Length") or []
+        if not raw_lengths:
+            self.close_connection = True
+            self._send_json(
+                HTTPStatus.LENGTH_REQUIRED,
+                {"error": "Content-Length header is required"},
+            )
+            return None
+        if len(raw_lengths) > 1:
+            self.close_connection = True
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "multiple Content-Length headers are not allowed"},
+            )
+            return None
         try:
-            length = int(raw_len)
+            length = int(raw_lengths[0])
         except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid Content-Length"})
             return None

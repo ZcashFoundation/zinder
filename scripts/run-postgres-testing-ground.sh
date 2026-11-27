@@ -438,6 +438,43 @@ with urllib.request.urlopen(
 ) as resp:
     assert resp.status == 201, f"expected 201 on complete retry, got {resp.status}"
 
+# Chunked PUT must fail closed (501) without creating an immutable empty object and must allow a complete retry.
+chunked_key = "seg-chunked.bin"
+with socket.create_connection(("127.0.0.1", r2_port), timeout=5.0) as sock:
+    sock.sendall(
+        (
+            f"PUT /segments/{chunked_key} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{r2_port}\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "5\r\nhello\r\n0\r\n\r\n"
+        ).encode("ascii")
+    )
+    sock.shutdown(socket.SHUT_WR)
+    chunked_reply = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunked_reply += chunk
+    chunked_status_line = chunked_reply.split(b"\r\n", 1)[0]
+    assert b" 501 " in chunked_status_line, chunked_reply
+try:
+    urllib.request.urlopen(urllib.request.Request(f"{r2_base}/segments/{chunked_key}"), timeout=5.0)
+    raise AssertionError("chunked PUT unexpectedly persisted segment object")
+except urllib.error.HTTPError as err:
+    assert err.code == 404, f"expected 404 after rejected chunked PUT, got {err.code}"
+with urllib.request.urlopen(
+    urllib.request.Request(
+        f"{r2_base}/segments/{chunked_key}",
+        data=b"hello",
+        method="PUT",
+    ),
+    timeout=5.0,
+) as resp:
+    assert resp.status == 201, f"expected 201 on complete Content-Length retry, got {resp.status}"
+
 with urllib.request.urlopen(urllib.request.Request(f"{r2_base}/segments/seg-0001.bin"), timeout=5.0) as resp:
     assert resp.status == 200
     assert resp.read() == payload
