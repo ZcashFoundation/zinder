@@ -1,0 +1,6 @@
+kind: changed
+body: Serve core ExplorerQuery gRPC RPCs and Cipherscan REST routes directly from the canonical store without requiring materialized views, and promote block-header selector reads to production readiness.
+time: 2026-11-27T03:42:18Z
+custom:
+  Bump: minor
+  PR: "668"
