@@ -140,7 +140,7 @@ def stop_relay(directory, state):
         except ConnectionRefusedError:
             pass
         except OSError as error:
-            raise RuntimeError('fixture relay shutdown failed; retry fixture down') from error
+            raise RuntimeError('fixture relay shutdown failed. Retry fixture down.') from error
     control_path.unlink(missing_ok=True)
 
 
@@ -194,14 +194,14 @@ def start_relay(directory, state, serving=False, direct_bridge=True):
 
         def relay_tip():
             if relay.poll() is not None:
-                raise subprocess.SubprocessError(f'fixture relay exited during startup; see {directory / "relay.log"}')
+                raise subprocess.SubprocessError(f'fixture relay exited during startup. See {directory / "relay.log"}.')
             if (directory / 'relay-control.json').exists():
                 return rpc(state, 'getblockcount', [])
 
         try:
             wait(relay_tip, lambda h: isinstance(h, int), 60)
         except RuntimeError as error:
-            raise RuntimeError(f'fixture relay could not reach node RPC; see {directory / "relay.log"}') from error
+            raise RuntimeError(f'fixture relay could not reach node RPC. See {directory / "relay.log"}.') from error
     except BaseException:
         if relay.poll() is None:
             with suppress(RuntimeError, OSError):
@@ -319,7 +319,7 @@ def provision(args, directory):
             try:
                 sock.bind(('127.0.0.1', port))
             except OSError as error:
-                raise RuntimeError(f'cannot bind 127.0.0.1:{port}; choose another --port-base') from error
+                raise RuntimeError(f'cannot bind 127.0.0.1:{port}. Choose another --port-base.') from error
     finally:
         for sock in sockets:
             sock.close()
