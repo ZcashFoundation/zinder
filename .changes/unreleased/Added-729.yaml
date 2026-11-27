@@ -1,0 +1,6 @@
+kind: added
+body: Enable native binary and text gRPC-Web on WalletQuery and ExplorerQuery by setting browser origins on each listener. ExplorerQuery supports bearer-token authorization for browser calls.
+time: 2026-11-27T23:14:18.863780889Z
+custom:
+    Bump: minor
+    PR: "729"
