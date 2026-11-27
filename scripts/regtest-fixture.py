@@ -30,8 +30,11 @@ RELAY_DOCKER_TIMEOUT = 10
 RELAY_STOP_GRACE = 5
 
 
-def run(*args, env=None, timeout=None):
-    return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, env=env, timeout=timeout).strip()
+def run(*args, env=None, timeout=None, stdin_bytes=None):
+    completed = subprocess.run(args, check=True, text=stdin_bytes is None, input=stdin_bytes,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=timeout)
+    output = completed.stdout
+    return (output.decode(errors='replace') if isinstance(output, bytes) else output).strip()
 
 
 def digest(path):
@@ -426,7 +429,9 @@ def provision(args, directory):
         start_relay(directory, state, direct_bridge=direct_bridge)
         wait(lambda: rpc(state, 'getblockcount', []), lambda h: h == 0, args.timeout)
         if default_schedule:
-            run(bash, (ROOT / 'scripts/mine-live-regtest.sh').as_posix(), state['node_rpc'], str(args.tip))
+            # Binary stdin preserves the shell script's LF line endings on Windows.
+            mining_script = (ROOT / 'scripts/mine-live-regtest.sh').read_bytes().replace(b'\r\n', b'\n')
+            run(bash, '-s', '--', state['node_rpc'], str(args.tip), stdin_bytes=mining_script)
         else:
             rpc(state, 'generate', [args.tip])
         compose(directory, 'up', '-d', '--wait', '--wait-timeout', str(args.timeout),
@@ -507,4 +512,5 @@ if __name__ == '__main__':
     try:
         main()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        sys.exit(error.output if isinstance(error, subprocess.CalledProcessError) else str(error))
+        message = error.output if isinstance(error, subprocess.CalledProcessError) else str(error)
+        sys.exit(message.decode(errors='replace') if isinstance(message, bytes) else message)

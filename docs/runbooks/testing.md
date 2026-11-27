@@ -1293,8 +1293,9 @@ Use `scripts/regtest-fixture.py` to give a real wallet a fresh, owned node and
 following single-host Zinder endpoints (`zinder-index` and `zinder-serve` from `deploy/docker-compose.yml`). Use a local Docker Engine on Linux or Docker Desktop
 in Linux container mode on macOS or Windows. You need Python 3.11 or later and
 Docker Compose. Native Linux Engine also needs iproute2. The default mining
-schedule needs Bash, curl, and jq. On Windows, put a Bash distribution such as
-Git Bash on your PATH and invoke the scripts with Python. Start from the checkout matching
+schedule needs Bash, curl, and jq. On Windows, make a native Windows distribution
+such as Git Bash the first Bash on your PATH and invoke the scripts with Python.
+Start from the checkout matching
 the candidate release. Pull the unified `ghcr.io/zcashfoundation/zinder` image first, or build `--target zinder` via
 `deploy/Dockerfile`.
 

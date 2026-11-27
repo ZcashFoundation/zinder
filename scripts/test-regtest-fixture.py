@@ -20,6 +20,12 @@ operator = runpy.run_path(str(FIXTURE))['start_relay'].__globals__
 
 
 class FixtureTests(unittest.TestCase):
+    def test_subprocess_preserves_lf_on_binary_stdin(self):
+        script = b'first line\nsecond line\n'
+        received = operator['run'](sys.executable, '-c', 'import sys; print(sys.stdin.buffer.read().hex())',
+                                   stdin_bytes=script)
+        self.assertEqual(received, script.hex())
+
     def test_host_route_selection(self):
         for platform, engine, expected in [
             ('linux', 'Ubuntu', True), ('linux', 'Docker Desktop', False),
