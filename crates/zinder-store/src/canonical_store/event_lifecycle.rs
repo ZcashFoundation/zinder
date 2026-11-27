@@ -13,7 +13,7 @@ use zinder_core::{BlockHeight, BlockHeightRange, ChainEpochId, UnixTimestampMill
 use super::{
     CanonicalEventFence, CanonicalStoreError, CanonicalStoreReadyEvidence, RocksDbCanonicalStore,
     mempool_lifecycle::{MEMPOOL_EVENT_RETENTION_FLOOR_KEY, MEMPOOL_EVENT_SEQUENCE_KEY},
-    publication::{canonical_event_created_at, column_family, decode_chain_event},
+    publication::{ChainEpochCreatedAtCursor, column_family, decode_chain_event},
     rocksdb::{CHAIN_EVENT_COLUMN_FAMILY, STORE_CONTROL_KEY},
 };
 
@@ -295,6 +295,100 @@ impl ProjectionBuildLease {
     }
 }
 
+/// Default maximum event timestamps inspected in one canonical retention pass.
+pub const DEFAULT_CANONICAL_EVENT_RETENTION_MAX_INSPECTED_EVENTS: NonZeroU32 =
+    NonZeroU32::MIN.saturating_add(1_023);
+/// Default maximum canonical event rows deleted in one retention pass.
+pub const DEFAULT_CANONICAL_EVENT_RETENTION_MAX_DELETED_EVENTS: NonZeroU32 =
+    NonZeroU32::MIN.saturating_add(1_023);
+
+/// Work budget for one synchronous canonical event retention step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalEventRetentionStepBudget {
+    max_inspected_events: NonZeroU32,
+    max_deleted_events: NonZeroU32,
+}
+
+impl CanonicalEventRetentionStepBudget {
+    /// Creates a non-zero per-step inspection and deletion budget.
+    #[must_use]
+    pub const fn new(max_inspected_events: NonZeroU32, max_deleted_events: NonZeroU32) -> Self {
+        Self {
+            max_inspected_events,
+            max_deleted_events,
+        }
+    }
+
+    /// Maximum epoch timestamps inspected by one retention pass.
+    #[must_use]
+    pub const fn max_inspected_events(self) -> NonZeroU32 {
+        self.max_inspected_events
+    }
+
+    /// Maximum `chain_event` rows deleted by one retention pass.
+    #[must_use]
+    pub const fn max_deleted_events(self) -> NonZeroU32 {
+        self.max_deleted_events
+    }
+}
+
+impl Default for CanonicalEventRetentionStepBudget {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_CANONICAL_EVENT_RETENTION_MAX_INSPECTED_EVENTS,
+            DEFAULT_CANONICAL_EVENT_RETENTION_MAX_DELETED_EVENTS,
+        )
+    }
+}
+
+/// Reason one bounded canonical event retention pass stopped scanning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CanonicalEventRetentionStepStop {
+    /// The per-pass inspection or deletion budget was exhausted before reaching
+    /// an unexpired event, the live-lease anchor, or the latest event.
+    BudgetExhausted,
+    /// The retention floor reached the latest canonical event.
+    ReachedHead,
+    /// The first event within the retention window stopped the prefix scan.
+    ReachedUnexpiredEvent,
+    /// The earliest live projection-build lease pins the remaining prefix.
+    LeaseProtected,
+}
+
+impl CanonicalEventRetentionStepStop {
+    /// Stable diagnostic label for logs.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::ReachedHead => "reached_head",
+            Self::ReachedUnexpiredEvent => "reached_unexpired_event",
+            Self::LeaseProtected => "lease_protected",
+        }
+    }
+}
+
+/// Result of one bounded canonical event retention pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalEventRetentionStepOutcome {
+    /// Retention floor, deletions, and lease protection after this pass.
+    pub report: CanonicalEventRetentionReport,
+    /// Number of epoch timestamps inspected by this pass.
+    pub inspected_event_count: u32,
+    /// Reason this pass stopped scanning.
+    pub stop: CanonicalEventRetentionStepStop,
+}
+
+impl CanonicalEventRetentionStepOutcome {
+    /// Returns whether more expired events may remain before the normal check
+    /// interval elapses.
+    #[must_use]
+    pub const fn has_immediate_work(self) -> bool {
+        matches!(self.stop, CanonicalEventRetentionStepStop::BudgetExhausted)
+    }
+}
+
 /// Retained-event state after a pruning pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalEventRetentionReport {
@@ -470,33 +564,20 @@ impl RocksDbCanonicalStore {
         }
 
         let (live_leases, expired_lease_ids) = self.live_projection_build_lease_state(now)?;
-        let earliest_live_anchor = live_leases
-            .iter()
-            .map(|lease| lease.anchor)
-            .min_by_key(|anchor| anchor.event_cursor.event_sequence());
+        let earliest_live_anchor = earliest_live_lease_anchor(&live_leases);
         let retained_floor = earliest_live_anchor.map_or(requested_oldest_sequence, |anchor| {
             requested_oldest_sequence.min(anchor.event_cursor.event_sequence())
         });
-        let mut batch = WriteBatch::default();
-        let event_family = column_family(&self.bounded_open.db, CHAIN_EVENT_COLUMN_FAMILY)?;
-        for event_sequence in oldest_retained_sequence..retained_floor {
-            if event_sequence != 1 {
-                batch.delete_cf(&event_family, event_sequence.to_be_bytes());
-            }
-        }
         // Epoch records are permanent cursor witnesses. A pruned event cursor
         // can still require the exact historical epoch whose branch is being
         // reverted; projecting the current epoch onto that range would lie
         // about its tip and settlement boundary.
-        if retained_floor != oldest_retained_sequence {
-            batch.put(RETENTION_FLOOR_KEY, retained_floor.to_be_bytes());
-        }
-        for lease_id in expired_lease_ids {
-            batch.delete(projection_build_lease_key(lease_id));
-        }
-        if !batch.is_empty() {
-            write_lifecycle_batch(self, &batch, "canonical event prune")?;
-        }
+        write_pruned_event_chunks(
+            self,
+            oldest_retained_sequence,
+            retained_floor,
+            expired_lease_ids,
+        )?;
         let first_deletable_sequence = oldest_retained_sequence.max(2);
         Ok(CanonicalEventRetentionReport {
             current_event_sequence,
@@ -506,23 +587,98 @@ impl RocksDbCanonicalStore {
         })
     }
 
-    /// Prunes retained events older than `cutoff` using their resulting epoch timestamps.
+    /// Prunes retained events older than `cutoff` using their resulting epoch
+    /// timestamps with the default per-pass budget.
     pub fn prune_canonical_events_before_created_at(
         &self,
         cutoff: UnixTimestampMillis,
         now: UnixTimestampMillis,
     ) -> Result<CanonicalEventRetentionReport, CanonicalStoreError> {
+        self.advance_canonical_event_retention(
+            cutoff,
+            now,
+            CanonicalEventRetentionStepBudget::default(),
+        )
+        .map(|outcome| outcome.report)
+    }
+
+    /// Advances bounded retained-event pruning older than `cutoff`, checking the
+    /// earliest live projection-build lease anchor before inspecting timestamps.
+    ///
+    /// Both inspected epoch timestamps and deleted `chain_event` rows are
+    /// bounded per pass, resuming cleanly from the durable floor across passes
+    /// and restarts while preserving permanent `chain_epoch` witnesses and
+    /// atomically discarding expired leases.
+    pub fn advance_canonical_event_retention(
+        &self,
+        cutoff: UnixTimestampMillis,
+        now: UnixTimestampMillis,
+        budget: CanonicalEventRetentionStepBudget,
+    ) -> Result<CanonicalEventRetentionStepOutcome, CanonicalStoreError> {
+        self.advance_canonical_event_retention_observed(cutoff, now, budget, |_| {})
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance_canonical_event_retention_with_observer(
+        &self,
+        cutoff: UnixTimestampMillis,
+        now: UnixTimestampMillis,
+        budget: CanonicalEventRetentionStepBudget,
+        on_timestamp_inspected: impl FnMut(u64),
+    ) -> Result<CanonicalEventRetentionStepOutcome, CanonicalStoreError> {
+        self.advance_canonical_event_retention_observed(cutoff, now, budget, on_timestamp_inspected)
+    }
+
+    fn advance_canonical_event_retention_observed(
+        &self,
+        cutoff: UnixTimestampMillis,
+        now: UnixTimestampMillis,
+        budget: CanonicalEventRetentionStepBudget,
+        on_timestamp_inspected: impl FnMut(u64),
+    ) -> Result<CanonicalEventRetentionStepOutcome, CanonicalStoreError> {
         let _lifecycle_guard = self.lifecycle_lock.lock();
-        let current = self.ready_evidence.visible_event_sequence;
-        let floor = self.canonical_event_retention_floor()?;
-        let mut requested_floor = current;
-        for event_sequence in floor..=current {
-            if canonical_event_created_at(&self.bounded_open.db, event_sequence)? >= cutoff {
-                requested_floor = event_sequence;
-                break;
-            }
+        let current_event_sequence = self.ready_evidence.visible_event_sequence;
+        let oldest_retained_sequence = self.canonical_event_retention_floor()?;
+        let (live_leases, expired_lease_ids) = self.live_projection_build_lease_state(now)?;
+        let earliest_live_anchor = earliest_live_lease_anchor(&live_leases);
+        let effective_ceiling = earliest_live_anchor.map_or(current_event_sequence, |anchor| {
+            current_event_sequence.min(anchor.event_cursor.event_sequence())
+        });
+        let mut batch = WriteBatch::default();
+        let scan_outcome = scan_bounded_retention_batch(
+            BoundedRetentionScanRequest {
+                store: self,
+                cutoff,
+                budget,
+                oldest_retained_sequence,
+                effective_ceiling,
+                current_event_sequence,
+                on_timestamp_inspected,
+            },
+            &mut batch,
+        )?;
+        if scan_outcome.retained_floor != oldest_retained_sequence {
+            batch.put(
+                RETENTION_FLOOR_KEY,
+                scan_outcome.retained_floor.to_be_bytes(),
+            );
         }
-        self.prune_canonical_events_before_locked(requested_floor, now)
+        for lease_id in expired_lease_ids {
+            batch.delete(projection_build_lease_key(lease_id));
+        }
+        if !batch.is_empty() {
+            write_lifecycle_batch(self, &batch, "canonical event prune")?;
+        }
+        Ok(CanonicalEventRetentionStepOutcome {
+            report: CanonicalEventRetentionReport {
+                current_event_sequence,
+                oldest_retained_sequence: scan_outcome.retained_floor,
+                pruned_event_count: u64::from(scan_outcome.deleted_event_count),
+                lease_protected_anchor: earliest_live_anchor,
+            },
+            inspected_event_count: scan_outcome.inspected_event_count,
+            stop: scan_outcome.stop,
+        })
     }
 
     pub(super) fn clear_restored_retention_leases(&self) -> Result<(), CanonicalStoreError> {
@@ -579,6 +735,125 @@ impl RocksDbCanonicalStore {
         }
         Ok((live_leases, expired_lease_ids))
     }
+}
+
+fn earliest_live_lease_anchor(leases: &[ProjectionBuildLease]) -> Option<ProjectionBuildAnchor> {
+    leases
+        .iter()
+        .map(|lease| lease.anchor)
+        .min_by_key(|anchor| anchor.event_cursor.event_sequence())
+}
+
+fn write_pruned_event_chunks(
+    store: &RocksDbCanonicalStore,
+    oldest_retained_sequence: u64,
+    retained_floor: u64,
+    mut expired_lease_ids: Vec<ProjectionBuildLeaseId>,
+) -> Result<(), CanonicalStoreError> {
+    let chunk_size = u64::from(DEFAULT_CANONICAL_EVENT_RETENTION_MAX_DELETED_EVENTS.get());
+    let event_family = column_family(&store.bounded_open.db, CHAIN_EVENT_COLUMN_FAMILY)?;
+    let mut chunk_start = oldest_retained_sequence;
+    while chunk_start < retained_floor {
+        let chunk_end = chunk_start.saturating_add(chunk_size).min(retained_floor);
+        let mut batch = WriteBatch::default();
+        for event_sequence in chunk_start..chunk_end {
+            if event_sequence != 1 {
+                batch.delete_cf(&event_family, event_sequence.to_be_bytes());
+            }
+        }
+        batch.put(RETENTION_FLOOR_KEY, chunk_end.to_be_bytes());
+        for lease_id in std::mem::take(&mut expired_lease_ids) {
+            batch.delete(projection_build_lease_key(lease_id));
+        }
+        write_lifecycle_batch(store, &batch, "canonical event prune")?;
+        chunk_start = chunk_end;
+    }
+    if !expired_lease_ids.is_empty() {
+        let mut batch = WriteBatch::default();
+        for lease_id in expired_lease_ids {
+            batch.delete(projection_build_lease_key(lease_id));
+        }
+        write_lifecycle_batch(store, &batch, "canonical event prune")?;
+    }
+    Ok(())
+}
+
+struct BoundedRetentionScanRequest<'a, Observer> {
+    store: &'a RocksDbCanonicalStore,
+    cutoff: UnixTimestampMillis,
+    budget: CanonicalEventRetentionStepBudget,
+    oldest_retained_sequence: u64,
+    effective_ceiling: u64,
+    current_event_sequence: u64,
+    on_timestamp_inspected: Observer,
+}
+
+struct BoundedRetentionScanOutcome {
+    retained_floor: u64,
+    inspected_event_count: u32,
+    deleted_event_count: u32,
+    stop: CanonicalEventRetentionStepStop,
+}
+
+fn scan_bounded_retention_batch<Observer: FnMut(u64)>(
+    mut request: BoundedRetentionScanRequest<'_, Observer>,
+    batch: &mut WriteBatch,
+) -> Result<BoundedRetentionScanOutcome, CanonicalStoreError> {
+    if request.oldest_retained_sequence >= request.effective_ceiling {
+        let stop = if request.oldest_retained_sequence >= request.current_event_sequence {
+            CanonicalEventRetentionStepStop::ReachedHead
+        } else {
+            CanonicalEventRetentionStepStop::LeaseProtected
+        };
+        return Ok(BoundedRetentionScanOutcome {
+            retained_floor: request.oldest_retained_sequence,
+            inspected_event_count: 0,
+            deleted_event_count: 0,
+            stop,
+        });
+    }
+
+    let event_family = column_family(&request.store.bounded_open.db, CHAIN_EVENT_COLUMN_FAMILY)?;
+    let mut epoch_cursor = ChainEpochCreatedAtCursor::open_from_sequence(
+        &request.store.bounded_open.db,
+        request.oldest_retained_sequence,
+    )?;
+    let mut retained_floor = request.oldest_retained_sequence;
+    let mut inspected_event_count = 0_u32;
+    let mut deleted_event_count = 0_u32;
+    let mut step_stop = None;
+    while retained_floor < request.effective_ceiling {
+        if inspected_event_count >= request.budget.max_inspected_events.get()
+            || (retained_floor != 1
+                && deleted_event_count >= request.budget.max_deleted_events.get())
+        {
+            step_stop = Some(CanonicalEventRetentionStepStop::BudgetExhausted);
+            break;
+        }
+        (request.on_timestamp_inspected)(retained_floor);
+        let created_at = epoch_cursor.read_expected_created_at_and_advance(retained_floor)?;
+        inspected_event_count = inspected_event_count.saturating_add(1);
+        if created_at >= request.cutoff {
+            step_stop = Some(CanonicalEventRetentionStepStop::ReachedUnexpiredEvent);
+            break;
+        }
+        if retained_floor != 1 {
+            batch.delete_cf(&event_family, retained_floor.to_be_bytes());
+            deleted_event_count = deleted_event_count.saturating_add(1);
+        }
+        retained_floor = retained_floor.saturating_add(1);
+    }
+    let stop = step_stop.unwrap_or(if retained_floor >= request.current_event_sequence {
+        CanonicalEventRetentionStepStop::ReachedHead
+    } else {
+        CanonicalEventRetentionStepStop::LeaseProtected
+    });
+    Ok(BoundedRetentionScanOutcome {
+        retained_floor,
+        inspected_event_count,
+        deleted_event_count,
+        stop,
+    })
 }
 
 pub(super) fn canonical_event_history_from_db(
