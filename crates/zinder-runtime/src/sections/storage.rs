@@ -265,6 +265,12 @@ pub fn derive_explorer_secondary_path(data_dir: &Path) -> PathBuf {
     data_dir.join("explorer")
 }
 
+/// Derives `<data_dir>/checkpoints`.
+#[must_use]
+pub fn derive_checkpoints_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("checkpoints")
+}
+
 fn resolve_rocksdb_resource_budget(
     section: RocksDbResourceBudgetSection,
     defaults: RocksDbResourceBudget,

@@ -28,7 +28,7 @@ use zinder_runtime::{
     RetentionSection, RetentionToml, RuntimeService, SecuritySection, SecurityToml,
     StorageRoleSection, StorageRoleToml, derive_canonical_path, duration_as_millis_u64,
     guard_optional_serving_bind, require_field, resolve_allow_public_bind,
-    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer,
+    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer_with_data_dir,
     resolve_manual_raw_blob_retention, resolve_materialized_view_writer_rocksdb_budget,
     resolve_ops_listen_addr, resolve_retention, section_defaults::DEFAULT_DATA_DIR,
     validate_optional_data_dir,
@@ -709,7 +709,10 @@ fn resolve_ingest_config(
         checkpoint_bearer_token: ingest_control_checkpoint_bearer_token,
         checkpoint_bearer_token_path: ingest_control_checkpoint_bearer_token_path,
         checkpoint_staging_root: ingest_control_checkpoint_staging_root,
-    } = resolve_ingest_control_writer(config.ingest_control)?;
+    } = resolve_ingest_control_writer_with_data_dir(
+        config.ingest_control,
+        storage_data_dir.as_deref(),
+    )?;
     let retention = resolve_retention(config.retention)?;
     let tree_state_verification =
         resolve_tree_state_verification(config.ingest.tree_state_verification)?;

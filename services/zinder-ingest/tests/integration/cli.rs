@@ -633,17 +633,11 @@ const REMOVED_INGEST_SETTINGS: &[(&str, &str, &str)] = &[
         "allow_reorg_window_settlement",
         "ZINDER_INGEST__RUN_OVERRIDES__ALLOW_REORG_WINDOW_SETTLEMENT",
     ),
-    (
-        "storage",
-        "secondary_path",
-        "ZINDER_STORAGE__SECONDARY_PATH",
-    ),
 ];
 
 fn removed_setting_toml_value(field: &str) -> &'static str {
     match field {
         "allow_reorg_window_settlement" => "true",
-        "secondary_path" => "\"/var/lib/zinder/ingest-secondary\"",
         _ => "1",
     }
 }
@@ -655,11 +649,7 @@ fn removed_ingest_settings_are_rejected_from_config_files() -> Result<(), Box<dy
         assert_ingest_cli_rejects(
             |root| {
                 let base = ingest_config_toml(&root.join("removed-setting-store"))?;
-                Ok(if *section == "storage" {
-                    base.replacen("[storage]\n", &format!("[storage]\n{field} = {value}\n"), 1)
-                } else {
-                    format!("{base}\n[{section}]\n{field} = {value}\n")
-                })
+                Ok(format!("{base}\n[{section}]\n{field} = {value}\n"))
             },
             &[],
             &[],
@@ -672,11 +662,7 @@ fn removed_ingest_settings_are_rejected_from_config_files() -> Result<(), Box<dy
 #[test]
 fn removed_ingest_settings_are_rejected_from_the_environment() -> Result<(), Box<dyn Error>> {
     for (_, field, environment_variable) in REMOVED_INGEST_SETTINGS {
-        let value = if *field == "secondary_path" {
-            "/var/lib/zinder/ingest-secondary"
-        } else {
-            removed_setting_toml_value(field)
-        };
+        let value = removed_setting_toml_value(field);
         assert_ingest_cli_rejects(
             |root| ingest_config_toml(&root.join("removed-setting-environment-store")),
             &[],
@@ -1736,6 +1722,76 @@ async fn mounted_toml_wallet_profile_with_full_blocks_preserves_all_retention()
                     && reason.contains("none")
         ),
         "{rejected}"
+    );
+    Ok(())
+}
+
+#[test]
+fn data_dir_derives_checkpoint_staging_root_and_rejects_sibling_typo() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempdir()?;
+    let custom_dir = directory.path().join("ingest-root");
+    let shared_toml = directory.path().join("shared.toml");
+    fs::write(
+        &shared_toml,
+        concat!(
+            "[deployment]\nprofile = \"wallet-archive\"\n",
+            "[storage]\n",
+            "canonical_path = \"/unused/by/ingest\"\n",
+            "secondary_path = \"/unused/by/ingest/secondary\"\n",
+            "[wallet]\n",
+            "path = \"/unused/wallet\"\n",
+            "secondary_path = \"/unused/wsec\"\n",
+            "[query]\nlisten_addr = \"127.0.0.1:9102\"\n",
+        ),
+    )?;
+
+    let output = zinder_ingest_command()
+        .arg("--print-config")
+        .arg("--config")
+        .arg(&shared_toml)
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:39232")
+        .env("ZINDER_STORAGE__DATA_DIR", &custom_dir)
+        .env("ZINDER_STORAGE__CANONICAL_PATH", "/unused/by/ingest/env")
+        .env(
+            "ZINDER_STORAGE__SECONDARY_PATH",
+            "/unused/by/ingest/sec-env",
+        )
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("profile = \"wallet-archive\""), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "checkpoint_staging_root = \"{}\"",
+            custom_dir.join("checkpoints").display()
+        )),
+        "{stdout}"
+    );
+
+    let sibling_env_typo = zinder_ingest_command()
+        .arg("--print-config")
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:39232")
+        .env("ZINDER_QUERY__LISTEN_ADRR", "127.0.0.1:9102")
+        .output()?;
+    assert!(!sibling_env_typo.status.success());
+    let stderr = String::from_utf8(sibling_env_typo.stderr)?;
+    assert!(stderr.contains("ZINDER_QUERY__LISTEN_ADRR"), "{stderr}");
+    assert!(stderr.contains("ZINDER_QUERY__LISTEN_ADDR"), "{stderr}");
+
+    let storage_env_typo = zinder_ingest_command()
+        .arg("--print-config")
+        .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:39232")
+        .env("ZINDER_STORAGE__SECONDRY_PATH", "/typo")
+        .output()?;
+    assert!(!storage_env_typo.status.success());
+    let storage_stderr = String::from_utf8(storage_env_typo.stderr)?;
+    assert!(
+        storage_stderr.contains("unknown field `secondry_path`"),
+        "{storage_stderr}"
     );
     Ok(())
 }

@@ -13,7 +13,9 @@ use crate::{
     config::{parse_socket_addr, resolve_optional_bearer_token},
 };
 
-use super::defaults::DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT;
+use super::{
+    defaults::DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT, storage::derive_checkpoints_path,
+};
 
 /// Raw `[projector_control]` configuration.
 ///
@@ -67,6 +69,15 @@ pub struct ResolvedProjectorControl {
 pub fn resolve_projector_control(
     section: ProjectorControlSection,
 ) -> Result<ResolvedProjectorControl, ConfigError> {
+    resolve_projector_control_with_data_dir(section, None)
+}
+
+/// Resolves private projector owner control without a public-bind escape hatch,
+/// deriving an omitted `checkpoint_staging_root` from `data_dir` when set.
+pub fn resolve_projector_control_with_data_dir(
+    section: ProjectorControlSection,
+    data_dir: Option<&Path>,
+) -> Result<ResolvedProjectorControl, ConfigError> {
     let listen_addr = match section.listen_addr {
         None => None,
         Some(text) if text.trim().is_empty() => None,
@@ -95,9 +106,12 @@ pub fn resolve_projector_control(
         listen_addr,
         bearer_token_path: section.bearer_token_path,
         bearer_token,
-        checkpoint_staging_root: section
-            .checkpoint_staging_root
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT)),
+        checkpoint_staging_root: section.checkpoint_staging_root.unwrap_or_else(|| {
+            data_dir.map_or_else(
+                || PathBuf::from(DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT),
+                derive_checkpoints_path,
+            )
+        }),
     })
 }
 
@@ -170,5 +184,19 @@ mod tests {
             ..ProjectorControlSection::default()
         });
         assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn owner_control_derives_checkpoint_staging_root_from_data_dir()
+    -> Result<(), crate::ConfigError> {
+        let derived = super::resolve_projector_control_with_data_dir(
+            ProjectorControlSection::default(),
+            Some(std::path::Path::new("/custom/zinder-data")),
+        )?;
+        assert_eq!(
+            derived.checkpoint_staging_root,
+            std::path::Path::new("/custom/zinder-data/checkpoints")
+        );
+        Ok(())
     }
 }

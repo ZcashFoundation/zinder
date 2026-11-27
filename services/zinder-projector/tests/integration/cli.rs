@@ -775,6 +775,40 @@ fn data_dir_optional_build_owner_and_inline_bearer_tokens_work() -> eyre::Result
     Ok(())
 }
 
+#[test]
+fn projector_tolerates_shared_storage_and_wallet_archive_profile() -> eyre::Result<()> {
+    let scratch = tempdir()?;
+    let custom_dir = scratch.path().join("projector-root");
+    let shared_toleration = projector_command()
+        .env_clear()
+        .args([
+            "--print-config",
+            "--network",
+            "zcash-regtest",
+            "--lease-duration-seconds",
+            "14400",
+        ])
+        .env("ZINDER_STORAGE__DATA_DIR", &custom_dir)
+        .env("ZINDER_STORAGE__PATH", custom_dir.join("canonical"))
+        .env("ZINDER_WALLET__SECONDARY_PATH", custom_dir.join("wsec"))
+        .env("ZINDER_DEPLOYMENT__PROFILE", "wallet-archive")
+        .output()?;
+    assert!(shared_toleration.status.success(), "{shared_toleration:?}");
+    let shared_stdout = String::from_utf8(shared_toleration.stdout)?;
+    assert!(
+        shared_stdout.contains("profile = \"wallet-archive\""),
+        "{shared_stdout}"
+    );
+    assert!(
+        shared_stdout.contains(&format!(
+            "checkpoint_staging_root = \"{}\"",
+            custom_dir.join("checkpoints").display()
+        )),
+        "{shared_stdout}"
+    );
+    Ok(())
+}
+
 fn run_print_config_with_env(extra_env: &[(&str, &str)]) -> eyre::Result<String> {
     let mut command = projector_command();
     command.env_clear();

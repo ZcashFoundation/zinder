@@ -23,6 +23,9 @@ pub enum DeploymentProfile {
     /// without raw transaction blobs by default (`storage.full_blocks = true`
     /// retains full blocks).
     Explorer,
+    /// Deprecated compatibility alias for [`Self::Wallet`] paired with
+    /// `storage.full_blocks = true` (`raw_blob_policy = "all"`).
+    WalletArchive,
 }
 
 impl DeploymentProfile {
@@ -33,6 +36,7 @@ impl DeploymentProfile {
             Self::LightWallet => "light-wallet",
             Self::Wallet => "wallet",
             Self::Explorer => "explorer",
+            Self::WalletArchive => "wallet-archive",
         }
     }
 
@@ -52,6 +56,7 @@ impl DeploymentProfile {
     pub const fn raw_blob_retention(self) -> RawBlobRetention {
         match self {
             Self::LightWallet | Self::Wallet | Self::Explorer => RawBlobRetention::None,
+            Self::WalletArchive => RawBlobRetention::All,
         }
     }
 
@@ -67,6 +72,11 @@ impl DeploymentProfile {
         full_blocks: Option<bool>,
         configured: Option<RawBlobRetention>,
     ) -> Result<RawBlobRetention, crate::ConfigError> {
+        if self == Self::WalletArchive && full_blocks == Some(false) {
+            return Err(crate::ConfigError::invalid(
+                "deployment.profile = \"wallet-archive\" requires raw_blob_policy = \"all\" and conflicts with storage.full_blocks = false; use deployment.profile = \"wallet\" instead",
+            ));
+        }
         let retention = if full_blocks == Some(true) {
             RawBlobRetention::All
         } else {
@@ -185,12 +195,26 @@ mod tests {
             ("light-wallet", DeploymentProfile::LightWallet),
             ("wallet", DeploymentProfile::Wallet),
             ("explorer", DeploymentProfile::Explorer),
+            ("wallet-archive", DeploymentProfile::WalletArchive),
         ] {
             let section: DeploymentSection = toml::from_str(&format!("profile = \"{encoded}\""))?;
             assert_eq!(section.profile, Some(expected));
         }
-        assert!(toml::from_str::<DeploymentSection>(r#"profile = "wallet-archive""#).is_err());
         assert_eq!(DeploymentProfile::default(), DeploymentProfile::Wallet);
+        assert_eq!(
+            DeploymentProfile::WalletArchive.raw_blob_retention(),
+            zinder_store::RawBlobRetention::All
+        );
+        assert!(
+            DeploymentProfile::WalletArchive
+                .resolve_raw_blob_retention_with_full_blocks(Some(false), None)
+                .is_err()
+        );
+        assert_eq!(
+            DeploymentProfile::WalletArchive
+                .resolve_raw_blob_retention_with_full_blocks(None, None)?,
+            zinder_store::RawBlobRetention::All
+        );
         Ok(())
     }
 

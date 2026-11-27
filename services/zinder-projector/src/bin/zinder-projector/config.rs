@@ -1,7 +1,7 @@
 //! Configuration loading for the `zinder-projector` binary.
 
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{ErrorKind, Write as _},
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU64},
@@ -21,7 +21,7 @@ use zinder_runtime::{
     derive_canonical_secondary_path, derive_wallet_path, guard_optional_serving_bind,
     require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
     resolve_ingest_control_reader, resolve_manual_raw_blob_retention, resolve_ops_listen_addr,
-    resolve_projector_control, resolve_wallet_projection_writer_rocksdb_budget,
+    resolve_projector_control_with_data_dir, resolve_wallet_projection_writer_rocksdb_budget,
     section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
 };
 use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
@@ -355,11 +355,16 @@ pub(crate) fn load_backup_config(
             || name.starts_with("ZINDER_NETWORK_")
             || name == "ZINDER_PROJECTOR_CONTROL"
             || name.starts_with("ZINDER_PROJECTOR_CONTROL_")
+            || name == "ZINDER_STORAGE__DATA_DIR"
     });
     let raw = load_raw_projector_config(config_path, overrides, capture_settings)?;
+    let storage_data_dir = validate_optional_data_dir(raw.storage.data_dir)?;
     Ok((
         raw.network.resolve()?,
-        resolve_projector_control(raw.projector_control)?,
+        resolve_projector_control_with_data_dir(
+            raw.projector_control,
+            storage_data_dir.as_deref(),
+        )?,
     ))
 }
 
@@ -600,7 +605,10 @@ fn resolve_projector_config(
     let build = resolve_build_config(&raw.projector.build)?;
     let follow = resolve_follow_config(&raw.projector.follow)?;
     let ingest_control = resolve_ingest_control_reader(raw.ingest_control)?;
-    let projector_control = resolve_projector_control(raw.projector_control)?;
+    let projector_control = resolve_projector_control_with_data_dir(
+        raw.projector_control,
+        storage_data_dir.as_deref(),
+    )?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
     let allow_public_bind = resolve_allow_public_bind(raw.security)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
@@ -776,18 +784,56 @@ pub(crate) fn ensure_build_owner(config: &mut ProjectorConfig) -> Result<[u8; 16
     if let Some(parent) = owner_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(|source| {
-            ConfigError::invalid(format!(
-                "could not create persisted build-owner directory {}: {source}",
-                parent.display()
-            ))
-        })?;
+        create_dir_all_and_sync(parent)?;
     }
     let mut generated = [0_u8; 16];
     getrandom::fill(&mut generated)?;
     let persisted = persist_new_build_owner(&owner_path, generated)?;
     config.build_owner = Some(persisted);
     Ok(persisted)
+}
+
+fn sync_directory(directory: &Path) -> Result<(), ConfigError> {
+    File::open(directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| {
+            ConfigError::invalid(format!(
+                "could not sync directory {}: {error}",
+                directory.display()
+            ))
+        })
+}
+
+fn create_dir_all_and_sync(directory: &Path) -> Result<(), ConfigError> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(directory);
+    while let Some(path) = cursor {
+        if path.as_os_str().is_empty() || path.exists() {
+            break;
+        }
+        missing.push(path.to_path_buf());
+        cursor = path.parent();
+    }
+    missing.reverse();
+    for dir in missing {
+        let created = match std::fs::create_dir(&dir) {
+            Ok(()) => true,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(ConfigError::invalid(format!(
+                    "could not create persisted build-owner directory {}: {error}",
+                    dir.display()
+                )));
+            }
+        };
+        if created
+            && let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty())
+        {
+            sync_directory(parent)?;
+        }
+        sync_directory(&dir)?;
+    }
+    Ok(())
 }
 
 fn persisted_build_owner_path(wallet_path: &Path) -> Result<PathBuf, ConfigError> {
@@ -860,11 +906,22 @@ fn persist_new_build_owner(
         )));
     }
     drop(temp_file);
+    let parent = owner_path
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let link_outcome = std::fs::hard_link(&temp_path, owner_path);
+    if link_outcome.is_ok() {
+        sync_directory(parent)?;
+    }
     let _ = std::fs::remove_file(&temp_path);
     match link_outcome {
-        Ok(()) => Ok(generated),
+        Ok(()) => {
+            sync_directory(parent)?;
+            Ok(generated)
+        }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            sync_directory(parent)?;
             read_persisted_build_owner(owner_path)?.ok_or_else(|| {
                 ConfigError::invalid(format!(
                     "persisted projector build-owner file {} disappeared during creation race",
@@ -1307,7 +1364,7 @@ mod tests {
     fn optional_build_owner_persists_once_and_does_not_write_before_ensure()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
-        let wallet_path = root.path().join("wallet");
+        let wallet_path = root.path().join("nested/state/wallet");
         let owner_path = super::persisted_build_owner_path(&wallet_path)?;
         assert!(!owner_path.exists());
         assert_eq!(super::read_persisted_build_owner(&owner_path)?, None);

@@ -44,6 +44,15 @@ use crate::sections::{
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
+const HISTORY_PUBLISHER_LEAF_PATHS: &[&str] = &[
+    "history_publisher.enabled",
+    "history_publisher.directory",
+    "history_publisher.signing_key",
+    "history_publisher.first_height",
+    "history_publisher.segment_blocks",
+    "history_publisher.workers",
+    "history_publisher.follow_interval_secs",
+];
 
 const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'static str] {
     match service {
@@ -255,8 +264,8 @@ impl From<NodeConfigError> for ConfigError {
             | NodeConfigError::IndexerTlsPathAndPemConflict { .. }
             | NodeConfigError::Fallback { .. }
             | NodeConfigError::FallbackPositionMissing { .. }
-            | NodeConfigError::FallbacksWithoutPrimary
-            | _ => Self::invalid(error.to_string()),
+            | NodeConfigError::FallbacksWithoutPrimary => Self::invalid(error.to_string()),
+            other => Self::invalid(other.to_string()),
         }
     }
 }
@@ -298,10 +307,7 @@ pub fn zinder_environment_source_from_map<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    Ok(filtered_zinder_environment_source(
-        collect_zinder_env_entries(env_iter),
-        &[],
-    ))
+    filtered_zinder_environment_source(collect_zinder_env_entries(env_iter), None)
 }
 
 fn collect_zinder_env_entries<I>(env_iter: I) -> Vec<(String, String)>
@@ -323,30 +329,150 @@ where
         .collect()
 }
 
-fn is_ignored_sibling_env_key(env_key: &str, ignored_sections: &[&str]) -> bool {
-    if ignored_sections.is_empty() {
+fn top_level_segment(config_path: &str) -> &str {
+    config_path
+        .split_once('.')
+        .map_or(config_path, |(section, _)| section)
+}
+
+fn is_positive_position_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('0')
+        && segment.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn config_path_matches_doc_pattern(config_path: &str, pattern: &str) -> bool {
+    let mut path_segments = config_path.split('.');
+    let mut pattern_segments = pattern.split('.');
+    loop {
+        match (path_segments.next(), pattern_segments.next()) {
+            (None, None) => return true,
+            (Some(actual), Some("<N>")) => {
+                if !is_positive_position_segment(actual) {
+                    return false;
+                }
+            }
+            (Some(actual), Some(expected)) => {
+                if actual != expected {
+                    return false;
+                }
+            }
+            (None, Some(_)) | (Some(_), None) => return false,
+        }
+    }
+}
+
+fn is_known_zinder_leaf_path(config_path: &str) -> bool {
+    HISTORY_PUBLISHER_LEAF_PATHS.contains(&config_path)
+        || crate::env_var_docs::ENVIRONMENT_VARIABLES
+            .iter()
+            .any(|doc| config_path_matches_doc_pattern(config_path, doc.toml_path))
+}
+
+fn is_unconsumed_shared_path(service: RuntimeService, config_path: &str) -> bool {
+    match service {
+        RuntimeService::Ingest => matches!(
+            config_path,
+            "storage.canonical_path"
+                | "storage.canonical_secondary_path"
+                | "storage.secondary_path"
+                | "storage.initial_catchup_timeout_ms"
+                | "storage.secondary_catchup_interval_ms"
+                | "storage.secondary_replica_lag_threshold_chain_epochs"
+                | "storage.serving_pair_staleness_ceiling_ms"
+        ),
+        RuntimeService::Projector => {
+            matches!(
+                config_path,
+                "storage.path"
+                    | "storage.secondary_path"
+                    | "storage.initial_catchup_timeout_ms"
+                    | "storage.secondary_catchup_interval_ms"
+                    | "storage.secondary_replica_lag_threshold_chain_epochs"
+                    | "storage.serving_pair_staleness_ceiling_ms"
+                    | "wallet.secondary_path"
+            ) || config_path.starts_with("storage.materialized_views.")
+        }
+        RuntimeService::Query | RuntimeService::CompatLightwalletd => {
+            matches!(
+                config_path,
+                "storage.canonical_path" | "storage.canonical_secondary_path"
+            ) || config_path.starts_with("storage.materialized_views.")
+        }
+        RuntimeService::Explorer => matches!(
+            config_path,
+            "storage.canonical_path"
+                | "storage.canonical_secondary_path"
+                | "storage.raw_blob_policy"
+                | "storage.serving_pair_staleness_ceiling_ms"
+        ),
+        RuntimeService::CompatCipherscan => false,
+    }
+}
+
+fn is_unconsumed_known_path_for_service(service: RuntimeService, config_path: &str) -> bool {
+    if !is_known_zinder_leaf_path(config_path) {
         return false;
     }
-    let top_level = env_key
-        .split_once("__")
-        .map_or(env_key, |(section, _)| section)
-        .to_ascii_lowercase();
-    ignored_sections.contains(&top_level.as_str())
+    sibling_sections_for_service(service).contains(&top_level_segment(config_path))
+        || is_unconsumed_shared_path(service, config_path)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut previous_row: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current_row = vec![0_usize; right_chars.len() + 1];
+    for (left_idx, left_char) in left.chars().enumerate() {
+        current_row[0] = left_idx + 1;
+        for (right_idx, right_char) in right_chars.iter().enumerate() {
+            let cost = usize::from(left_char != *right_char);
+            current_row[right_idx + 1] = (current_row[right_idx] + 1)
+                .min(previous_row[right_idx + 1] + 1)
+                .min(previous_row[right_idx] + cost);
+        }
+        std::mem::swap(&mut previous_row, &mut current_row);
+    }
+    previous_row[right_chars.len()]
+}
+
+fn suggest_known_env_var(rejected_key: &str) -> Option<String> {
+    let section = top_level_segment(rejected_key);
+    crate::env_var_docs::ENVIRONMENT_VARIABLES
+        .iter()
+        .filter(|doc| top_level_segment(doc.toml_path) == section)
+        .filter_map(|doc| {
+            let distance = edit_distance(rejected_key, doc.toml_path);
+            (distance <= 3).then_some((distance, doc.name))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, name)| name.to_owned())
 }
 
 fn filtered_zinder_environment_source(
     entries: Vec<(String, String)>,
-    ignored_sections: &[&str],
-) -> ZinderEnvironmentSource {
+    service: Option<RuntimeService>,
+) -> Result<ZinderEnvironmentSource, ConfigError> {
     let mut filtered_env = HashMap::new();
     let mut reverse_index = HashMap::new();
 
     for (env_key, env_value) in entries {
-        if is_ignored_sibling_env_key(&env_key, ignored_sections) {
-            continue;
-        }
+        let config_key = env_key_to_config_key(&env_key);
         let original_name = format!("{ENV_PREFIX}{env_key}");
-        reverse_index.insert(env_key_to_config_key(&env_key), original_name);
+        if let Some(runtime_service) = service {
+            if is_unconsumed_known_path_for_service(runtime_service, &config_key) {
+                continue;
+            }
+            if sibling_sections_for_service(runtime_service)
+                .contains(&top_level_segment(&config_key))
+            {
+                return Err(ConfigError::RejectedEnvVar {
+                    original_name,
+                    suggested_name: suggest_known_env_var(&config_key),
+                    rejected_key: config_key,
+                });
+            }
+        }
+        reverse_index.insert(config_key, original_name);
         filtered_env.insert(env_key, env_value);
     }
 
@@ -355,10 +481,10 @@ fn filtered_zinder_environment_source(
         .try_parsing(true)
         .source(Some(filtered_env));
 
-    ZinderEnvironmentSource {
+    Ok(ZinderEnvironmentSource {
         source,
         reverse_index,
-    }
+    })
 }
 
 /// Mirrors how `config-rs` transforms an env-var key (post-`ZINDER_`
@@ -616,15 +742,14 @@ impl ConfigLoader {
     where
         T: DeserializeOwned,
     {
-        let ignored_sections = self.service.map_or(&[][..], sibling_sections_for_service);
         let mut reverse_index: Option<HashMap<String, String>> = None;
         for source in self.sources {
             match source {
                 LoaderSource::File(path) => {
-                    self.builder = add_filtered_toml_file(self.builder, path, ignored_sections);
+                    self.builder = add_filtered_toml_file(self.builder, path, self.service)?;
                 }
                 LoaderSource::Env(entries) => {
-                    let env_source = filtered_zinder_environment_source(entries, ignored_sections);
+                    let env_source = filtered_zinder_environment_source(entries, self.service)?;
                     self.builder = self.builder.add_source(env_source.source);
                     reverse_index =
                         Some(merge_reverse_index(reverse_index, env_source.reverse_index));
@@ -643,20 +768,65 @@ impl ConfigLoader {
 fn add_filtered_toml_file(
     builder: ConfigBuilder<DefaultState>,
     path: PathBuf,
-    ignored_sections: &[&str],
-) -> ConfigBuilder<DefaultState> {
-    if !ignored_sections.is_empty()
+    service: Option<RuntimeService>,
+) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
+    if let Some(runtime_service) = service
         && let Ok(raw_toml) = std::fs::read_to_string(&path)
         && let Ok(mut table) = toml::from_str::<toml::Table>(&raw_toml)
     {
-        for section in ignored_sections {
-            let _removed = table.remove(*section);
+        prune_toml_table(&mut table, "", runtime_service)?;
+        let filtered_toml = toml::to_string(&table)
+            .map_err(|source| ConfigError::load(InnerConfigError::Foreign(Box::new(source))))?;
+        return Ok(builder.add_source(File::from_str(&filtered_toml, FileFormat::Toml)));
+    }
+    Ok(builder.add_source(File::from(path).format(FileFormat::Toml).required(true)))
+}
+
+fn prune_toml_table(
+    table: &mut toml::Table,
+    prefix: &str,
+    service: RuntimeService,
+) -> Result<bool, ConfigError> {
+    let keys: Vec<String> = table.keys().cloned().collect();
+    let mut removed_any = false;
+    for key in keys {
+        let field_path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        let is_table = matches!(table.get(&key), Some(toml::Value::Table(_)));
+        if is_table {
+            let should_remove_empty =
+                if let Some(toml::Value::Table(subtable)) = table.get_mut(&key) {
+                    let child_removed = prune_toml_table(subtable, &field_path, service)?;
+                    subtable.is_empty()
+                        && (child_removed
+                            || sibling_sections_for_service(service).contains(&field_path.as_str()))
+                } else {
+                    false
+                };
+            if should_remove_empty {
+                let _removed = table.remove(&key);
+                removed_any = true;
+            }
+            continue;
         }
-        if let Ok(filtered_toml) = toml::to_string(&table) {
-            return builder.add_source(File::from_str(&filtered_toml, FileFormat::Toml));
+        if is_unconsumed_known_path_for_service(service, &field_path) {
+            let _removed = table.remove(&key);
+            removed_any = true;
+        } else if sibling_sections_for_service(service).contains(&top_level_segment(&field_path)) {
+            let suffix = if prefix.is_empty() {
+                String::new()
+            } else {
+                format!(" for key `{prefix}`")
+            };
+            return Err(ConfigError::load(InnerConfigError::Message(format!(
+                "unknown field `{key}`{suffix}"
+            ))));
         }
     }
-    builder.add_source(File::from(path).format(FileFormat::Toml).required(true))
+    Ok(removed_any)
 }
 
 fn merge_reverse_index(
@@ -1154,6 +1324,187 @@ mod tests {
             "test.bearer_token",
         );
         assert!(token_conflict.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_sibling_typos_fail_closed_for_env_and_toml() -> Result<(), ConfigError> {
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct ProbeConfig {
+            network: NetworkSection,
+            ops: crate::sections::OpsSection,
+        }
+
+        let dir = tempfile::tempdir().map_err(|err| ConfigError::invalid(err.to_string()))?;
+        let nested_env_typo = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_zinder_env_from_map([(
+                "ZINDER_QUERY__LISTEN_ADRR".to_owned(),
+                "127.0.0.1:9102".to_owned(),
+            )])?
+            .load::<ProbeConfig>();
+        assert!(matches!(
+            nested_env_typo,
+            Err(ConfigError::RejectedEnvVar {
+                ref original_name,
+                ref suggested_name,
+                ..
+            }) if original_name == "ZINDER_QUERY__LISTEN_ADRR"
+                && suggested_name.as_deref() == Some("ZINDER_QUERY__LISTEN_ADDR")
+        ));
+
+        let nested_toml_typo_path = dir.path().join("nested_typo.toml");
+        std::fs::write(
+            &nested_toml_typo_path,
+            "[network]\nname = \"zcash-regtest\"\n[query]\nlisten_adrr = \"127.0.0.1:9102\"\n",
+        )
+        .map_err(|err| ConfigError::invalid(err.to_string()))?;
+        let nested_toml_typo = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_file(Some(nested_toml_typo_path))
+            .load::<ProbeConfig>();
+        assert!(nested_toml_typo.is_err());
+        Ok(())
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedIngestStorageProbe {
+        data_dir: Option<PathBuf>,
+        path: Option<PathBuf>,
+        raw_blob_policy: Option<String>,
+        full_blocks: Option<bool>,
+        canonical: crate::sections::StorageRoleSection,
+        materialized_views: crate::sections::StorageRoleSection,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedProjectorStorageProbe {
+        data_dir: Option<PathBuf>,
+        canonical_path: Option<PathBuf>,
+        canonical_secondary_path: Option<PathBuf>,
+        canonical: crate::sections::StorageRoleSection,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedQueryProbeConfig {
+        network: NetworkSection,
+        ops: crate::sections::OpsSection,
+        storage: crate::sections::CanonicalSecondaryStorageSection,
+        wallet: toml::Table,
+        query: toml::Table,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedProjectorProbeConfig {
+        network: NetworkSection,
+        ops: crate::sections::OpsSection,
+        storage: SharedProjectorStorageProbe,
+        wallet: toml::Table,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedIngestProbeConfig {
+        network: NetworkSection,
+        ops: crate::sections::OpsSection,
+        storage: SharedIngestStorageProbe,
+    }
+
+    #[test]
+    fn shared_sections_tolerate_unconsumed_fields_across_services() -> Result<(), ConfigError> {
+        let dir = tempfile::tempdir().map_err(|err| ConfigError::invalid(err.to_string()))?;
+        let shared_toml_path = dir.path().join("all_services_shared.toml");
+        std::fs::write(
+            &shared_toml_path,
+            concat!(
+                "[network]\nname = \"zcash-regtest\"\n",
+                "[storage]\n",
+                "data_dir = \"/var/lib/zinder\"\n",
+                "path = \"/var/lib/zinder/canonical\"\n",
+                "canonical_path = \"/var/lib/zinder/canonical\"\n",
+                "secondary_path = \"/var/lib/zinder/sec\"\n",
+                "canonical_secondary_path = \"/var/lib/zinder/psec\"\n",
+                "materialized_views.rocksdb.block_cache_bytes = 67108864\n",
+                "[wallet]\n",
+                "path = \"/var/lib/zinder/wallet\"\n",
+                "secondary_path = \"/var/lib/zinder/wsec\"\n",
+                "[query]\nlisten_addr = \"127.0.0.1:9102\"\n",
+            ),
+        )
+        .map_err(|err| ConfigError::invalid(err.to_string()))?;
+
+        let shared_env = [
+            (
+                "ZINDER_STORAGE__CANONICAL_PATH".to_owned(),
+                "/env/canonical".to_owned(),
+            ),
+            (
+                "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES".to_owned(),
+                "128".to_owned(),
+            ),
+            (
+                "ZINDER_WALLET__SECONDARY_PATH".to_owned(),
+                "/env/wsec".to_owned(),
+            ),
+        ];
+        let loaded_query: SharedQueryProbeConfig = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Query)?
+            .with_file(Some(shared_toml_path.clone()))
+            .with_zinder_env_from_map(shared_env.clone())?
+            .load()?;
+        assert_eq!(loaded_query.network.name.as_deref(), Some("zcash-regtest"));
+
+        let loaded_projector: SharedProjectorProbeConfig = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Projector)?
+            .with_file(Some(shared_toml_path.clone()))
+            .with_zinder_env_from_map(shared_env.clone())?
+            .load()?;
+        assert_eq!(
+            loaded_projector.network.name.as_deref(),
+            Some("zcash-regtest")
+        );
+
+        let loaded_ingest: SharedIngestProbeConfig = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_file(Some(shared_toml_path))
+            .with_zinder_env_from_map(shared_env)?
+            .load()?;
+        assert_eq!(loaded_ingest.network.name.as_deref(), Some("zcash-regtest"));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_sections_reject_misspelled_fields() -> Result<(), ConfigError> {
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct SharedProbeConfig {
+            network: NetworkSection,
+            ops: crate::sections::OpsSection,
+            storage: crate::sections::CanonicalSecondaryStorageSection,
+        }
+
+        let shared_typo = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Query)?
+            .with_zinder_env_from_map([(
+                "ZINDER_STORAGE__CANONICL_PATH".to_owned(),
+                "/typo".to_owned(),
+            )])?
+            .load::<SharedProbeConfig>();
+        assert!(shared_typo.is_err());
+
+        let wallet_typo = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_zinder_env_from_map([(
+                "ZINDER_WALLET__SECONDRY_PATH".to_owned(),
+                "/typo".to_owned(),
+            )])?
+            .load::<SharedProbeConfig>();
+        assert!(wallet_typo.is_err());
         Ok(())
     }
 

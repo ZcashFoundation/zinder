@@ -18,9 +18,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BearerToken,
     config::{ConfigError, parse_socket_addr, resolve_optional_bearer_token},
-    sections::defaults::{
-        DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT, DEFAULT_INGEST_CONTROL_LISTEN_ADDR,
-        DEFAULT_INGEST_CONTROL_READER_URL,
+    sections::{
+        defaults::{
+            DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT, DEFAULT_INGEST_CONTROL_LISTEN_ADDR,
+            DEFAULT_INGEST_CONTROL_READER_URL,
+        },
+        storage::derive_checkpoints_path,
     },
 };
 
@@ -125,6 +128,16 @@ pub struct ResolvedIngestControlReader {
 pub fn resolve_ingest_control_writer(
     section: IngestControlSection,
 ) -> Result<ResolvedIngestControlWriter, ConfigError> {
+    resolve_ingest_control_writer_with_data_dir(section, None)
+}
+
+/// Validates and resolves an [`IngestControlSection`] for the writer
+/// (`zinder-ingest`), deriving an omitted
+/// [`IngestControlSection::checkpoint_staging_root`] from `data_dir` when set.
+pub fn resolve_ingest_control_writer_with_data_dir(
+    section: IngestControlSection,
+    data_dir: Option<&Path>,
+) -> Result<ResolvedIngestControlWriter, ConfigError> {
     let listen_addr_text = section
         .listen_addr
         .unwrap_or_else(|| DEFAULT_INGEST_CONTROL_LISTEN_ADDR.to_owned());
@@ -154,9 +167,12 @@ pub fn resolve_ingest_control_writer(
         bearer_token,
         checkpoint_bearer_token,
         checkpoint_bearer_token_path: section.checkpoint_bearer_token_path,
-        checkpoint_staging_root: section
-            .checkpoint_staging_root
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT)),
+        checkpoint_staging_root: section.checkpoint_staging_root.unwrap_or_else(|| {
+            data_dir.map_or_else(
+                || PathBuf::from(DEFAULT_INGEST_CONTROL_CHECKPOINT_STAGING_ROOT),
+                derive_checkpoints_path,
+            )
+        }),
     })
 }
 
@@ -333,6 +349,31 @@ mod tests {
             ..IngestControlSection::default()
         });
         assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
+    }
+
+    #[test]
+    fn writer_derives_checkpoint_staging_root_from_data_dir() -> Result<(), ConfigError> {
+        let derived = resolve_ingest_control_writer_with_data_dir(
+            IngestControlSection::default(),
+            Some(Path::new("/custom/zinder-data")),
+        )?;
+        assert_eq!(
+            derived.checkpoint_staging_root,
+            Path::new("/custom/zinder-data/checkpoints")
+        );
+
+        let explicit = resolve_ingest_control_writer_with_data_dir(
+            IngestControlSection {
+                checkpoint_staging_root: Some(PathBuf::from("/explicit/checkpoints")),
+                ..IngestControlSection::default()
+            },
+            Some(Path::new("/custom/zinder-data")),
+        )?;
+        assert_eq!(
+            explicit.checkpoint_staging_root,
+            Path::new("/explicit/checkpoints")
+        );
+        Ok(())
     }
 
     #[test]

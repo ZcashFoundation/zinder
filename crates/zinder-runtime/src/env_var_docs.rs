@@ -111,7 +111,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Coordinates the consumer preset (`light-wallet`, `wallet`, or `explorer`; defaults to `wallet` when configuring a preset). Combine with `ZINDER_STORAGE__FULL_BLOCKS=true` to retain full raw blocks. See [deployment profiles](#deployment-profiles).",
+        description: "Coordinates the consumer preset (`light-wallet`, `wallet`, or `explorer`; defaults to `wallet` when configuring a preset; deprecated `wallet-archive` aliases `wallet` with `storage.full_blocks = true`). Combine with `ZINDER_STORAGE__FULL_BLOCKS=true` to retain full raw blocks. See [deployment profiles](#deployment-profiles).",
     },
     EnvVarDoc {
         name: "ZINDER_NETWORK__NAME",
@@ -785,6 +785,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       canonical checkpoint at `<root>/<candidate-id>/canonical.rocksdb`; \
                       production mounts this path from a dedicated staging volume into ingest \
                       and projector only, never query or compatibility. Defaults to \
+                      `<storage.data_dir>/checkpoints` when `storage.data_dir` is set, or \
                       `/var/lib/zinder/checkpoints`.",
     },
     EnvVarDoc {
@@ -836,7 +837,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Shared candidate root whose realpath must match \
-                      ingest_control.checkpoint_staging_root. The projector sends only a SHA-256 \
+                      ingest_control.checkpoint_staging_root (defaults to \
+                      `<storage.data_dir>/checkpoints` when `storage.data_dir` is set, or \
+                      `/var/lib/zinder/checkpoints`). The projector sends only a SHA-256 \
                       root binding to canonical control, never a path.",
     },
     EnvVarDoc {
