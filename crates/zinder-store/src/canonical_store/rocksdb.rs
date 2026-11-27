@@ -325,6 +325,10 @@ impl RocksDbCanonicalStore {
         }
     }
 
+    pub(super) fn path(&self) -> &Path {
+        self.bounded_open.db.path()
+    }
+
     pub(super) fn segment_context(&self) -> SegmentStoreContext<'_> {
         SegmentStoreContext {
             db: &self.bounded_open.db,

@@ -620,3 +620,105 @@ async fn substituted_directories_are_refused_after_attestation() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn export_refuses_source_path_children_and_symlink_aliases() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let (fixture, mut source) = admitted_source()?;
+    let store_path = fixture.canonical_primary_path().to_path_buf();
+    let signing_key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| "key generation failed")?;
+    let key_file = root.path().join("signer.der");
+    fs::write(&key_file, signing_key.as_ref())?;
+
+    let direct_failure = export_edge_snapshot(&mut source, &store_path, &key_file);
+    assert!(matches!(direct_failure, Err(EdgeSnapshotError::Refused(_))));
+
+    let absent_child = store_path.join("bundle");
+    let absent_child_failure = export_edge_snapshot(&mut source, &absent_child, &key_file);
+    assert!(
+        matches!(
+            absent_child_failure,
+            Err(EdgeSnapshotError::Refused(ref reason)) if reason == "snapshot paths must not overlap"
+        ),
+        "expected overlap refusal for child path, got {absent_child_failure:?}"
+    );
+    assert!(!absent_child.exists());
+
+    let empty_child = store_path.join("empty-child");
+    fs::create_dir(&empty_child)?;
+    let empty_child_failure = export_edge_snapshot(&mut source, &empty_child, &key_file);
+    assert!(
+        matches!(
+            empty_child_failure,
+            Err(EdgeSnapshotError::Refused(ref reason)) if reason == "snapshot paths must not overlap"
+        ),
+        "expected overlap refusal for empty child dir, got {empty_child_failure:?}"
+    );
+    assert_eq!(fs::read_dir(&empty_child)?.count(), 0);
+    fs::remove_dir(&empty_child)?;
+
+    let store_alias = root.path().join("store-alias");
+    std::os::unix::fs::symlink(&store_path, &store_alias)?;
+    let alias_failure = export_edge_snapshot(&mut source, &store_alias, &key_file);
+    assert!(matches!(alias_failure, Err(EdgeSnapshotError::Refused(_))));
+
+    let alias_child = store_alias.join("bundle");
+    let alias_child_failure = export_edge_snapshot(&mut source, &alias_child, &key_file);
+    assert!(
+        matches!(
+            alias_child_failure,
+            Err(EdgeSnapshotError::Refused(ref reason)) if reason == "snapshot paths must not overlap"
+        ),
+        "expected overlap refusal for symlink alias child, got {alias_child_failure:?}"
+    );
+    assert!(!alias_child.exists());
+    assert!(!store_path.join("bundle.export.staging").exists());
+    Ok(())
+}
+
+#[test]
+fn export_refuses_source_overlapping_staging_path() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let activations =
+        crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let chain = ChainFixture::new(Network::ZcashTestnet).extend_blocks(4096);
+    let baseline = CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(4059));
+    let mut fixture = CanonicalWriterFixture::publish(&baseline, &activations)
+        .map_err(|error| error.to_string())?;
+    let handle = fixture
+        .take_canonical_primary()
+        .map_err(|error| error.to_string())?;
+    let reorg_policy = CanonicalReorgPolicy::new(handle.reorg_policy().reorg_window_blocks())?;
+    drop(handle);
+    let original_path = fixture.canonical_primary_path().to_path_buf();
+    let parent_dir = original_path.parent().ok_or("missing parent directory")?;
+    let staging_named_store = parent_dir.join("bundle.export.staging");
+    fs::rename(&original_path, &staging_named_store)?;
+    let mut source = RocksDbCanonicalStore::open_ready(
+        &staging_named_store,
+        &activations,
+        RawBlobRetention::None,
+        reorg_policy,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let signing_key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| "key generation failed")?;
+    let key_file = root.path().join("signer.der");
+    fs::write(&key_file, signing_key.as_ref())?;
+
+    let output_bundle = parent_dir.join("bundle");
+    let stage_failure = export_edge_snapshot(&mut source, &output_bundle, &key_file);
+    assert!(
+        matches!(
+            stage_failure,
+            Err(EdgeSnapshotError::Refused(ref reason)) if reason == "snapshot paths must not overlap"
+        ),
+        "expected overlap refusal when source collides with staging path, got {stage_failure:?}"
+    );
+    assert!(!output_bundle.exists());
+    drop(source);
+    let _ = fixture.take_canonical_primary();
+    Ok(())
+}
