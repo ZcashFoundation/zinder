@@ -201,8 +201,8 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
         }
     }
 
-    /// Serves at most `max_streams` `CompactBlocksInRange` streams at once,
-    /// and refuses the rest with `RESOURCE_EXHAUSTED`.
+    /// Admits up to `max_streams` active compact-block and nullifier ranges.
+    /// Additional streams fail with `RESOURCE_EXHAUSTED`.
     ///
     /// The default is
     /// [`DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS`](crate::DEFAULT_MAX_CONCURRENT_COMPACT_BLOCK_STREAMS).

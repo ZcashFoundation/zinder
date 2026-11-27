@@ -133,17 +133,15 @@ async fn drive_range<Block, Read, PageFuture>(
         let next = page.last_height.and_then(|last| read.after(last));
         let sent = tokio::select! {
             biased;
-            () = pair.reads_revoked() => {
-                let error = pair.revoked_read_error();
-                drop(pair);
-                let _ = blocks.send(Err(error)).await;
-                return;
-            }
+            () = pair.reads_revoked() => return fail_revoked_pair(pair, &blocks).await,
             sent = send_page(&blocks, page.blocks) => sent,
         };
         let Some(next) = next.filter(|_| sent) else {
             return;
         };
+        if pair.are_reads_revoked() {
+            return fail_revoked_pair(pair, &blocks).await;
+        }
         read = next;
         let next_page =
             serving_read::read_pair(&slot, pair, Some(chain_epoch_id), move |pair| async move {
@@ -162,6 +160,15 @@ async fn drive_range<Block, Read, PageFuture>(
             }
         }
     }
+}
+
+async fn fail_revoked_pair<Block>(
+    pair: Arc<WalletServingReadPair>,
+    blocks: &mpsc::Sender<Result<Block, QueryError>>,
+) {
+    let error = pair.revoked_read_error();
+    drop(pair);
+    let _ = blocks.send(Err(error)).await;
 }
 
 async fn send_page<Block>(
@@ -190,8 +197,8 @@ pub(crate) async fn read_blocks(
     }
     let last_height = blocks.last().map(CompactBlockArtifact::height);
     Ok(CompactRangePage {
-        blocks,
         last_height,
+        blocks,
     })
 }
 

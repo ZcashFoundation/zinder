@@ -697,6 +697,10 @@ pub const FULL_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 4;
 /// gRPC adapter, one mempool point lookup), so an unbounded list would let one
 /// request issue thousands of reads. `u32` matches the `address_count` field
 /// on the response so the bound check happens in the wire type's native width.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "The shared cap is 256 selectors and fits this preexisting u32 constant."
+)]
 pub const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 =
     zinder_core::MAX_TRANSPARENT_ADDRESSES_PER_BATCH as u32;
 

@@ -363,15 +363,6 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         config.query.reorg_window_blocks,
         "query.reorg_window_blocks",
     )?)?;
-    let pair_convergence_attempts =
-        require_pair_convergence_attempts(config.query.pair_convergence_attempts)?;
-    let epoch_pin_retention =
-        resolve_epoch_pin_retention(config.query.epoch_pin_retention_seconds)?;
-    let tree_state_replay_wait =
-        require_tree_state_replay_wait(config.query.tree_state_replay_wait_ms)?;
-    let tree_state_replay_waiters_per_slot = require_tree_state_replay_waiters_per_slot(
-        config.query.tree_state_replay_waiters_per_slot,
-    )?;
     let forwarded_reads = ForwardedReadConfig::resolve(
         config.query.forwarded_read_max_concurrent,
         config.query.forwarded_read_wait_ms,
@@ -407,10 +398,16 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         proxy_protocol,
         range_admission: config.query.range_admission,
         canonical_reorg_policy,
-        pair_convergence_attempts,
-        epoch_pin_retention,
-        tree_state_replay_wait,
-        tree_state_replay_waiters_per_slot,
+        pair_convergence_attempts: require_pair_convergence_attempts(
+            config.query.pair_convergence_attempts,
+        )?,
+        epoch_pin_retention: resolve_epoch_pin_retention(config.query.epoch_pin_retention_seconds)?,
+        tree_state_replay_wait: require_tree_state_replay_wait(
+            config.query.tree_state_replay_wait_ms,
+        )?,
+        tree_state_replay_waiters_per_slot: require_tree_state_replay_waiters_per_slot(
+            config.query.tree_state_replay_waiters_per_slot,
+        )?,
         forwarded_reads,
         node,
         node_fallbacks,
