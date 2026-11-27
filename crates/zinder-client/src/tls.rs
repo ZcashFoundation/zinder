@@ -54,13 +54,14 @@ impl TlsRoots {
 fn validate_pem_framing(bundle: &[u8]) -> Result<(), IndexerError> {
     let malformed = || IndexerError::invalid_request("invalid TLS CA PEM framing");
     let mut open_label = None;
-    // Rustls skips text outside blocks and replaces an open label on a second BEGIN.
+    // Rustls skips non-certificate blocks and text outside blocks.
+    // A second BEGIN can replace an open label.
     for line in bundle.split(|byte| matches!(byte, b'\r' | b'\n')) {
         let line = line.trim_ascii_end();
         if let Some(label) = line.strip_prefix(b"-----BEGIN ") {
             let label = label
                 .strip_suffix(b"-----")
-                .filter(|label| !label.is_empty())
+                .filter(|label| *label == b"CERTIFICATE")
                 .ok_or_else(malformed)?;
             if open_label.replace(label).is_some() {
                 return Err(malformed());

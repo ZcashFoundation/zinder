@@ -460,7 +460,8 @@ async fn dropping_a_read_cancels_backoff() -> eyre::Result<()> {
 async fn malformed_ca_bundles_fail_before_dialing() -> eyre::Result<()> {
     let mut ca = CertificateParams::default();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let certificate = ca.self_signed(&KeyPair::generate()?)?.pem();
+    let ca_key = KeyPair::generate()?;
+    let certificate = ca.self_signed(&ca_key)?.pem();
     let endpoint = "https://127.0.0.1:443";
 
     let padded_bundle = format!(" \t\r\n{certificate}\r\n \t");
@@ -478,6 +479,10 @@ async fn malformed_ca_bundles_fail_before_dialing() -> eyre::Result<()> {
         (
             "truncated certificate",
             format!("{certificate}\n-----BEGIN CERTIFICATE-----\nAAAA\n"),
+        ),
+        (
+            "non-certificate block",
+            format!("{certificate}\n{}", ca_key.serialize_pem()),
         ),
     ] {
         let outcome = connect(
