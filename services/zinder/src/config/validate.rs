@@ -6,8 +6,7 @@ use zinder_compat_cipherscan::runtime::{
     CipherscanConfigOverrides, cipherscan_config_toml, load_cipherscan_config_with_env,
 };
 use zinder_compat_lightwalletd::runtime::{
-    LightwalletdConfigOverrides, lightwalletd_config_toml, load_history_publisher_config_with_env,
-    load_lightwalletd_config_with_env,
+    LightwalletdConfigOverrides, lightwalletd_config_toml, load_lightwalletd_config_with_env,
 };
 use zinder_explorer::runtime::{
     ExplorerConfigOverrides, explorer_config_toml, load_explorer_config_with_env,
@@ -22,14 +21,13 @@ use zinder_query::runtime::{QueryConfigOverrides, load_query_config_with_env, qu
 
 use crate::cli::ServiceRole;
 
-use super::{HistoryPublisherPlan, RoleLaunchSpec, SupervisionPlan, UnifiedConfigError};
+use super::{RoleLaunchSpec, SupervisionPlan, UnifiedConfigError};
 
 /// Collected per-role redacted TOML outputs produced during validation.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ValidatedRoleRenderings {
     pub(super) ops_listen_addr: String,
     pub(super) role_tomls: Vec<(ServiceRole, String)>,
-    pub(super) history_publisher: Option<HistoryPublisherPlan>,
 }
 
 pub(super) fn validate_all_roles(
@@ -50,7 +48,6 @@ pub(super) fn validate_all_roles(
             .ops_listen_addr
             .map_or_else(String::new, |addr| addr.to_string()),
         role_tomls,
-        history_publisher: plan.history_publisher.clone(),
     })
 }
 
@@ -130,17 +127,6 @@ fn validate_single_role(
             .map_err(|err| role_err(role, &err.to_string()))?;
             cipherscan_config_toml(&loaded).map_err(|err| role_err(role, &err.to_string()))
         }
-        ServiceRole::HistoryPublisher => {
-            let loaded = load_history_publisher_config_with_env(
-                path_opt,
-                LightwalletdConfigOverrides::default(),
-                env_pairs,
-            )
-            .map_err(|err| role_err(role, &err.to_string()))?;
-            loaded
-                .to_toml()
-                .map_err(|err| role_err(role, &err.to_string()))
-        }
     }
 }
 
@@ -167,17 +153,10 @@ pub fn render_combined_redacted_toml(plan: &SupervisionPlan) -> String {
     );
     combined.insert("ops".to_owned(), TomlValue::Table(ops_tbl));
 
-    if let Some(publisher) = &plan.redacted_sections.history_publisher {
-        combined.insert(
-            "history_publisher".to_owned(),
-            TomlValue::Table(redacted_history_publisher_table(publisher)),
-        );
-    }
-
     toml::to_string_pretty(&combined).unwrap_or_default()
 }
 
-fn merge_role_rendered_table(combined: &mut toml::Table, role: ServiceRole, parsed: toml::Table) {
+fn merge_role_rendered_table(combined: &mut toml::Table, _role: ServiceRole, parsed: toml::Table) {
     for (section, section_val) in parsed {
         match section.as_str() {
             "ops" => {}
@@ -187,7 +166,6 @@ fn merge_role_rendered_table(combined: &mut toml::Table, role: ServiceRole, pars
             "storage" | "wallet" | "ingest_control" => {
                 merge_subtable(combined, &section, section_val);
             }
-            "compat" if role == ServiceRole::HistoryPublisher => {}
             _ => {
                 combined.insert(section, section_val);
             }
@@ -208,39 +186,4 @@ fn merge_subtable(combined: &mut toml::Table, section: &str, incoming: TomlValue
     for (field, field_val) in incoming_tbl {
         target.entry(field).or_insert(field_val);
     }
-}
-
-fn redacted_history_publisher_table(publisher: &HistoryPublisherPlan) -> toml::Table {
-    let mut tbl = toml::Table::new();
-    tbl.insert(
-        "directory".to_owned(),
-        TomlValue::String(publisher.directory.display().to_string()),
-    );
-    tbl.insert(
-        "signing_key".to_owned(),
-        TomlValue::String("[REDACTED]".to_owned()),
-    );
-    tbl.insert(
-        "follow_interval_secs".to_owned(),
-        TomlValue::Integer(i64::from(publisher.follow_interval_secs.get())),
-    );
-    if let Some(height) = publisher.first_height {
-        tbl.insert(
-            "first_height".to_owned(),
-            TomlValue::Integer(i64::from(height)),
-        );
-    }
-    if let Some(segment) = publisher.segment_blocks {
-        tbl.insert(
-            "segment_blocks".to_owned(),
-            TomlValue::Integer(i64::from(segment.get())),
-        );
-    }
-    if let Some(workers) = publisher.workers {
-        tbl.insert(
-            "workers".to_owned(),
-            TomlValue::Integer(i64::try_from(workers.get()).unwrap_or(i64::MAX)),
-        );
-    }
-    tbl
 }

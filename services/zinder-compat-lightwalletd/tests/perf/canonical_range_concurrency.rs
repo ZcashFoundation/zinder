@@ -1,23 +1,19 @@
-//! High-concurrency 2-worker benchmark and regression gate for published block-range streams.
+//! High-concurrency 2-worker benchmark and regression gate for canonical block-range streams.
 
 use std::{
     collections::HashSet,
     net::SocketAddr,
     num::{NonZeroU32, NonZeroUsize},
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use eyre::{Result, ensure, eyre};
 use parking_lot::Mutex;
-use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint as TonicEndpoint};
-use zinder_compat_lightwalletd::{
-    LightwalletdGrpcAdapter, PublishedShieldedHistory, ShieldedCatalogPublisher,
-};
+use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
     BlockHeight, BlockId, CompactBlockArtifact, CompactChainMetadata, CompactSaplingSpend,
     CompactTransaction, CompactTransactionData, Network, TransactionId,
@@ -39,9 +35,9 @@ use zinder_testkit::{
     WalletServingStoreFixture, sample_regtest_upgrade_activations,
 };
 
-const TOTAL_BLOCKS: u32 = 4_050;
-const SEGMENT_BLOCKS: u32 = 2_000;
-const SETTLED_BLOCKS: u32 = 4_000;
+const SEALED_SEGMENT_BLOCKS: u32 = 4_096;
+const SETTLED_BLOCKS: u32 = 4_150;
+const TOTAL_BLOCKS: u32 = 4_250;
 
 #[cfg(debug_assertions)]
 const MAX_BURST_MS: u128 = 30_000;
@@ -49,10 +45,8 @@ const MAX_BURST_MS: u128 = 30_000;
 const MAX_BURST_MS: u128 = 10_000;
 
 struct BenchFixture {
-    _dir: TempDir,
     _store: WalletServingStoreFixture,
     query: WalletServingQuery<()>,
-    history: Arc<PublishedShieldedHistory>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -135,49 +129,32 @@ fn build_mixed_chain() -> Result<ChainFixture> {
     Ok(chain)
 }
 
-async fn publish_catalog(
-    root: &Path,
-    reader: &RocksDbCanonicalReader,
-) -> Result<Arc<PublishedShieldedHistory>> {
-    let (signer, verification_key) = crate::common::shielded_catalog_keys(root)?;
-    let catalog_dir = root.join("catalog");
-    let mut publisher = ShieldedCatalogPublisher::open(
-        &catalog_dir,
-        &signer,
-        BlockHeight::new(1),
-        NonZeroU32::new(SEGMENT_BLOCKS).ok_or_else(|| eyre!("zero segment width"))?,
-    )?;
-    while publisher.publish_next(reader)? {}
-    let history = PublishedShieldedHistory::open(
-        &catalog_dir.join("current.json"),
-        &verification_key,
-        false,
-        reader,
-    )
-    .await?;
-    Ok(Arc::new(history))
-}
-
-async fn build_bench_fixture() -> Result<BenchFixture> {
-    let dir = TempDir::new()?;
+fn build_bench_fixture() -> Result<BenchFixture> {
     let chain = build_mixed_chain()?;
     let writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(SETTLED_BLOCKS)),
         &sample_regtest_upgrade_activations(),
     )?;
+    let sealed_segment = writer
+        .canonical_primary_path()
+        .join("segments")
+        .join("shielded")
+        .join(format!("0000000001-{SEALED_SEGMENT_BLOCKS:010}.zshrng02"));
+    ensure!(
+        sealed_segment.is_file(),
+        "expected sealed canonical ZSHRNG02 segment at {}",
+        sealed_segment.display()
+    );
     let mut store = writer.into_serving_store_fixture()?;
     let (mut canonical, wallet) = store.take_readers()?;
     canonical.try_catch_up()?;
     let reader = Arc::new(RocksDbCanonicalReader::new(canonical)?);
-    let history = publish_catalog(dir.path(), reader.as_ref()).await?;
     let pair = WalletServingReadPair::new(reader, Arc::new(RocksDbWalletReader::new(wallet)))?;
     let query =
         WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)));
     Ok(BenchFixture {
-        _dir: dir,
         _store: store,
         query,
-        history,
     })
 }
 
@@ -228,10 +205,7 @@ struct TwoWorkerServer {
 }
 
 impl TwoWorkerServer {
-    fn start(
-        query: WalletServingQuery<()>,
-        history: Arc<PublishedShieldedHistory>,
-    ) -> Result<Self> {
+    fn start(query: WalletServingQuery<()>) -> Result<Self> {
         let tids = Arc::new(Mutex::new(HashSet::new()));
         let recorded_tids = Arc::clone(&tids);
         let shutdown = CancellationToken::new();
@@ -256,7 +230,6 @@ impl TwoWorkerServer {
                 let receive_slots =
                     NonZeroUsize::new(256).ok_or_else(|| eyre!("zero receive slots"))?;
                 let adapter = LightwalletdGrpcAdapter::new(query)
-                    .with_published_shielded_history(history)
                     .with_max_concurrent_block_range_streams(max_streams);
                 let router = public_grpc_server_with(
                     GrpcReceiveLimits::new(receive_slots, DEFAULT_GRPC_RECEIVE_TIMEOUT),
@@ -364,14 +337,14 @@ async fn run_concurrent_ranges(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_worker_published_block_ranges_scale_under_high_concurrency() -> Result<()> {
-    let fixture = build_bench_fixture().await?;
-    let server = TwoWorkerServer::start(fixture.query, fixture.history)?;
+async fn two_worker_canonical_block_ranges_scale_under_high_concurrency() -> Result<()> {
+    let fixture = build_bench_fixture()?;
+    let server = TwoWorkerServer::start(fixture.query)?;
     let clients = connect_clients(server.addr, 32).await?;
 
-    // Warm up segment validation verdicts and blocking threads once.
-    let warmed = run_concurrent_ranges(&clients, 1, (1, u64::from(SETTLED_BLOCKS))).await?;
-    assert_eq!(warmed, usize::try_from(SETTLED_BLOCKS)?);
+    // Warm up segment validation verdicts and blocking threads once across sealed + live tail.
+    let warmed = run_concurrent_ranges(&clients, 1, (1, u64::from(TOTAL_BLOCKS))).await?;
+    assert_eq!(warmed, usize::try_from(TOTAL_BLOCKS)?);
 
     let io_before_burst = server.io_snapshot();
     let started_burst = Instant::now();
@@ -381,10 +354,10 @@ async fn two_worker_published_block_ranges_scale_under_high_concurrency() -> Res
     assert_eq!(burst_blocks, 200_000);
 
     let started_wide = Instant::now();
-    let wide_blocks = run_concurrent_ranges(&clients, 100, (1, u64::from(SETTLED_BLOCKS))).await?;
+    let wide_blocks = run_concurrent_ranges(&clients, 100, (1, u64::from(TOTAL_BLOCKS))).await?;
     let wide_elapsed = started_wide.elapsed();
     let io_after_wide = server.io_snapshot();
-    assert_eq!(wide_blocks, 100 * usize::try_from(SETTLED_BLOCKS)?);
+    assert_eq!(wide_blocks, 100 * usize::try_from(TOTAL_BLOCKS)?);
 
     let burst_secs = burst_elapsed.as_secs_f64();
     let wide_secs = wide_elapsed.as_secs_f64();
@@ -398,7 +371,7 @@ async fn two_worker_published_block_ranges_scale_under_high_concurrency() -> Res
     )]
     {
         eprintln!(
-            "published_range_2w_burst200x1k elapsed_ms={} req_s={:.1} blk_s={:.0} preads={} syscr={} syscw={}",
+            "canonical_range_2w_burst200x1k elapsed_ms={} req_s={:.1} blk_s={:.0} preads={} syscr={} syscw={}",
             burst_elapsed.as_millis(),
             200.0 / burst_secs,
             200_000.0 / burst_secs,
@@ -407,7 +380,7 @@ async fn two_worker_published_block_ranges_scale_under_high_concurrency() -> Res
             burst_io.writes,
         );
         eprintln!(
-            "published_range_2w_wide100x4k elapsed_ms={} req_s={:.1} blk_s={:.0} preads={} syscr={} syscw={}",
+            "canonical_range_2w_wide100x4k elapsed_ms={} req_s={:.1} blk_s={:.0} preads={} syscr={} syscw={}",
             wide_elapsed.as_millis(),
             100.0 / wide_secs,
             wide_total / wide_secs,

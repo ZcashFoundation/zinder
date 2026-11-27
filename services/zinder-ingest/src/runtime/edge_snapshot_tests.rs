@@ -351,7 +351,7 @@ fn signed_bundle(root: &Path, validator: &Validator) -> TestResult<(PathBuf, [[u
     let bundle = root.join("bundle");
     let key_file = root.join("signing-key.der");
     fs::write(&key_file, signing_key)?;
-    export_edge_snapshot(&mut canonical, &bundle, &key_file, None)?;
+    export_edge_snapshot(&mut canonical, &bundle, &key_file)?;
     Ok((bundle, keys))
 }
 
@@ -433,7 +433,6 @@ fn bootstrap_args(source: String, keys: [[u8; 32]; 1]) -> BootstrapArgs {
         source,
         public_key: keys.to_vec(),
         spot_check_blocks: NonZeroU32::MIN,
-        sealed_history_output: None,
     }
 }
 
@@ -444,7 +443,8 @@ async fn http_preflight_refusals_fetch_no_payload() -> TestResult {
     let config = validator.config()?;
     let (bundle, keys) = signed_bundle(root.path(), &validator)?;
     let (url, requests, server) = serve_bundle(bundle).await?;
-    let mut args = bootstrap_args(url, keys);
+    let args = bootstrap_args(url, keys);
+    let target = root.path().join("restored");
     let occupied = root.path().join("occupied");
     fs::create_dir(&occupied)?;
     fs::write(occupied.join("marker"), b"preserve")?;
@@ -453,14 +453,6 @@ async fn http_preflight_refusals_fetch_no_payload() -> TestResult {
         matches!(failure, Err(SnapshotCommandError::Snapshot(EdgeSnapshotError::Refused(reason))) if reason.contains("occupied"))
     );
 
-    let target = root.path().join("restored");
-    args.sealed_history_output = Some(occupied);
-    let failure = prepare_source(&args, &target, &config).await;
-    assert!(
-        matches!(failure, Err(SnapshotCommandError::Snapshot(EdgeSnapshotError::Refused(reason))) if reason.contains("occupied"))
-    );
-
-    args.sealed_history_output = None;
     let other_network = NetworkUpgradeActivations::new(Network::ZcashTestnet, Vec::new())?;
     let other_schedule = NetworkUpgradeActivations::new(config.activations.network(), Vec::new())?;
     for incompatible in [
@@ -510,7 +502,7 @@ async fn validator_refuses_each_mismatched_anchor_before_publication() -> TestRe
         let required = config.required_first_available_height;
         let activations = &publisher.activations;
         let failure = prepare_bootstrapped_store(
-            EdgeSnapshotDestination::reserve(&target, None, false)?,
+            EdgeSnapshotDestination::reserve(&target, false)?,
             EdgeSnapshotBootstrap {
                 source: &bundle,
                 trusted_keys: &keys,
@@ -666,7 +658,7 @@ async fn bootstrap_terminal_fixture(
     let policy = config.reorg_policy;
     let required = config.required_first_available_height;
     prepare_bootstrapped_store(
-        EdgeSnapshotDestination::reserve(target, None, false)?,
+        EdgeSnapshotDestination::reserve(target, false)?,
         EdgeSnapshotBootstrap {
             source: bundle,
             trusted_keys: keys,

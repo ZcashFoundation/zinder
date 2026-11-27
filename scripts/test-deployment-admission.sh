@@ -120,15 +120,6 @@ docker compose \
   config --format json > "$resolved_compose"
 bash "$validator" --compose-contract "$resolved_compose"
 
-resolved_compose_full="$temporary_directory/resolved-compose-full.json"
-ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-docker compose \
-  --env-file "$repository_root/deploy/.env.testnet" \
-  -f "$repository_root/deploy/docker-compose.yml" \
-  --profile observability \
-  --profile history-publisher \
-  config --format json > "$resolved_compose_full"
-bash "$validator" --compose-contract "$resolved_compose_full"
 jq -e '
   .services as $services
   | $services["zinder-index"].command == ["index", "--preset", "wallet"]
@@ -139,22 +130,19 @@ jq -e '
   and $services["zinder-serve"].environment.ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS == "false"
   and $services["zinder-serve"].environment.ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS == "false"
   and $services["zinder-serve"].environment.ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS == "false"
-  and (($services["zinder-history-publisher"].tmpfs // []) == ["/tmp:rw,noexec,nosuid,size=512m"])
-  and ($services["zinder-history-publisher"].command as $cmd
-    | ($cmd | index("--workers")) as $idx
-    | $idx != null and $cmd[$idx + 1] == "1")
-' "$resolved_compose_full" >/dev/null \
-  || fail "the default Compose topology does not select the wallet preset, zebra-json-rpc source, default proxy untrust, and bounded history-publisher defaults"
+  and ($services | has("zinder-history-publisher") | not)
+  and (($services["zinder-serve"].environment // {})
+    | keys | all(startswith("ZINDER_COMPAT__SHIELDED_HISTORY__") | not))
+' "$resolved_compose" >/dev/null \
+  || fail "the default Compose topology does not select the wallet preset, zebra-json-rpc source, default proxy untrust, and canonical serving without history-publisher"
 
 explorer_preset_compose="$temporary_directory/explorer-preset-compose.json"
 ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
 ZINDER_PRESET=explorer \
 ZINDER_INGEST__SOURCE=zebra-indexer-grpc \
-ZINDER_HISTORY_PUBLISHER_WORKERS=4 \
 docker compose \
   --env-file "$repository_root/deploy/.env.testnet" \
   -f "$repository_root/deploy/docker-compose.yml" \
-  --profile history-publisher \
   config --format json > "$explorer_preset_compose"
 bash "$validator" --compose-contract "$explorer_preset_compose"
 jq -e '
@@ -164,11 +152,8 @@ jq -e '
   and $services["zinder-index"].environment.ZINDER_DEPLOYMENT__PROFILE == "explorer"
   and $services["zinder-serve"].environment.ZINDER_DEPLOYMENT__PROFILE == "explorer"
   and $services["zinder-index"].environment.ZINDER_INGEST__SOURCE == "zebra-indexer-grpc"
-  and ($services["zinder-history-publisher"].command as $cmd
-    | ($cmd | index("--workers")) as $idx
-    | $idx != null and $cmd[$idx + 1] == "4")
 ' "$explorer_preset_compose" >/dev/null \
-  || fail "the Compose topology does not forward ZINDER_PRESET=explorer, ZINDER_INGEST__SOURCE, or ZINDER_HISTORY_PUBLISHER_WORKERS overrides"
+  || fail "the Compose topology does not forward ZINDER_PRESET=explorer or ZINDER_INGEST__SOURCE overrides"
 
 light_wallet_preset_compose="$temporary_directory/light-wallet-preset-compose.json"
 ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
@@ -211,134 +196,53 @@ ZINDER_VERSION=v9.8.7 \
 docker compose \
   --env-file "$repository_root/deploy/.env.testnet" \
   -f "$repository_root/deploy/docker-compose.yml" \
-  --profile history-publisher \
   config --format json > "$released_compose"
 jq -e '
-  ["zinder-index", "zinder-serve", "zinder-history-publisher"]
+  ["zinder-index", "zinder-serve"]
   | all(. as $service
     | $released[0].services[$service].image == "ghcr.io/zcashfoundation/zinder:v9.8.7"
     and $released[0].services[$service].build.target == "zinder"
     and $source[0].services[$service].image == "ghcr.io/zcashfoundation/zinder:local")
-' --slurpfile released "$released_compose" --slurpfile source "$resolved_compose_full" \
+' --slurpfile released "$released_compose" --slurpfile source "$resolved_compose" \
   -n >/dev/null \
   || fail "ZINDER_VERSION does not select ghcr.io/zcashfoundation/zinder:v9.8.7 while keeping its source build"
 
-history_dir="$temporary_directory/history"
-history_compose="$temporary_directory/history-compose.json"
-ZINDER_HISTORY_DIR="$history_dir" ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
-  docker compose --env-file "$repository_root/deploy/.env.testnet" \
-  -f "$repository_root/deploy/docker-compose.yml" --profile history-publisher \
-  config --format json > "$history_compose"
-bash "$validator" --compose-contract "$history_compose"
-jq -e --arg generation "$history_dir" '
-  any(.services["zinder-history-publisher"].volumes[]; .source == ($generation + "/publisher.pk8"))
-' "$history_compose" >/dev/null || fail "the publisher ignored the selected generation"
+invalid_compose="$temporary_directory/invalid-compose.json"
+jq '.services["zinder-history-publisher"] = .services["zinder-serve"]' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a Compose contract declaring retired zinder-history-publisher" \
+  --compose-contract "$invalid_compose"
 
-invalid_history_compose="$temporary_directory/invalid-history-compose.json"
-jq '.services["zinder-serve"].volumes += [
-  (.services["zinder-history-publisher"].volumes[] | select(.target == "/run/zinder-history/publisher.pk8"))]
-' "$history_compose" > "$invalid_history_compose"
-expect_rejected "a reader service with access to the publisher signing key" --compose-contract "$invalid_history_compose"
-jq '(.services["zinder-serve"].volumes[] | select(.target == "/var/lib/zinder-history")).read_only = false' \
-  "$history_compose" > "$invalid_history_compose"
-expect_rejected "a writer-capable catalog mount in zinder-serve" --compose-contract "$invalid_history_compose"
-for history_source in catalog catalog/segment.bin publisher.pub; do
-  for read_only in true false; do
-    jq --arg source "$history_dir/$history_source" --argjson readonly "$read_only" '
-      .services["zinder-serve"].volumes += [
-        {type: "bind", source: $source, target: "/run/history-input", read_only: $readonly,
-         bind: {create_host_path: false}}]
-    ' "$history_compose" > "$invalid_history_compose"
-    if [[ "$read_only" == true ]]; then
-      bash "$validator" --compose-contract "$invalid_history_compose"
-    else
-      expect_rejected "writable signed-history input $history_source outside the publisher" \
-        --compose-contract "$invalid_history_compose"
-    fi
-  done
-done
+jq '.services["zinder-serve"].environment.ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY = "/var/lib/zinder-history"' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a zinder-serve contract configuring retired ZINDER_COMPAT__SHIELDED_HISTORY__" \
+  --compose-contract "$invalid_compose"
 
-check_named_history_input() {
-  local subpath="$1" read_only="$2" expected="$3"
-  jq --arg backing "$temporary_directory" --arg subpath "$subpath" --argjson readonly "$read_only" '
-    .volumes.fixture = {name: "fixture", driver: "local", driver_opts: {device: $backing, o: "bind"}}
-    | .volumes.fixture_view = {name: "fixture", external: true}
-    | .services["zinder-serve"].volumes += [{
-        type: "volume", source: "fixture_view", target: "/run/fixture",
-        volume: {subpath: $subpath}
-      } + (if $readonly == null then {} else {read_only: $readonly} end)]
-  ' "$history_compose" > "$invalid_history_compose"
-  if [[ "$expected" == accept ]]; then
-    bash "$validator" --compose-contract "$invalid_history_compose"
-  else
-    expect_rejected_because "named volume with history input $subpath" \
-      "invalid signed wallet history publication or reader mounts" --compose-contract "$invalid_history_compose"
-  fi
-}
-check_named_history_input unrelated false accept
-check_named_history_input history/catalog true accept
-check_named_history_input history/publisher.pub true accept
-check_named_history_input history/catalog null reject
-check_named_history_input history/catalog/segment.bin false reject
-check_named_history_input history/publisher.pub false reject
-check_named_history_input history/publisher.pk8 true reject
-check_named_history_input history true reject
+jq '.services["zinder-index"].environment.ZINDER_HISTORY_PUBLISHER__DIRECTORY = "/var/lib/zinder-history"' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a Compose contract configuring retired ZINDER_HISTORY_PUBLISHER__" \
+  --compose-contract "$invalid_compose"
 
-reject_history_contract() {
-  expect_rejected_because "$1" "invalid signed wallet history publication or reader mounts" \
-    --compose-contract "$invalid_history_compose"
-}
+jq '.services["zinder-serve"].volumes += [{type:"bind",source:"/srv/zinder-history/catalog",target:"/var/lib/zinder-history",read_only:true}]' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a zinder-serve contract mounting retired /var/lib/zinder-history" \
+  --compose-contract "$invalid_compose"
 
-for options in '{"type":"fixture-fs"}' '{"o":"fixture-option"}' '{"device":"relative","o":"bind"}'; do
-  jq --argjson options "$options" '.volumes.data.driver_opts = $options' \
-    "$history_compose" > "$invalid_history_compose"
-  reject_history_contract "an unresolved local volume backing"
-done
-jq '.volumes.data.driver = "fixture-driver"' "$history_compose" > "$invalid_history_compose"
-reject_history_contract "a named volume using an unverified driver"
-jq --arg device "$temporary_directory/unrelated" '
-  .volumes.data.driver_opts = {type: "none", device: $device, o: "rbind,ro,nodev"}
-' "$history_compose" > "$invalid_history_compose"
-bash "$validator" --compose-contract "$invalid_history_compose"
+jq '.services["zinder-serve"].volumes += [{type:"bind",source:"/srv/zinder-history/publisher.pub",target:"/run/zinder-history/publisher.pub",read_only:true}]' \
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "a zinder-serve contract mounting retired /run/zinder-history/publisher.pub" \
+  --compose-contract "$invalid_compose"
 
-for resource in configs secrets; do
-  for file in publisher.pub publisher.pk8; do
-    jq --arg resource "$resource" --arg file "$history_dir/$file" '
-      .[$resource].fixture = {file: $file}
-      | .services["zinder-serve"][$resource] = [{source: "fixture", target: "fixture-input"}]
-    ' "$history_compose" > "$invalid_history_compose"
-    if [[ "$file" == publisher.pub ]]; then
-      bash "$validator" --compose-contract "$invalid_history_compose"
-    else
-      reject_history_contract "a $resource grant from the publisher signing key"
-    fi
-  done
-  jq --arg resource "$resource" '
-    .[$resource].fixture = {external: true}
-    | .services["zinder-serve"][$resource] = ["fixture"]
-  ' "$history_compose" > "$invalid_history_compose"
-  reject_history_contract "a $resource grant with an external, unverified source"
-done
-
-jq '.services["zinder-serve"].volumes_from = ["state-init:ro"]' \
-  "$history_compose" > "$invalid_history_compose"
-reject_history_contract "a non-publisher service inheriting mounts"
-jq --arg source "$history_dir/" '
-  (.services[].volumes[] | select(.type == "bind" and (.source | startswith($source))) | .source)
-  |= ("/./" + ltrimstr($source))
-' "$history_compose" > "$invalid_history_compose"
-reject_history_contract "a history generation whose normalized path is root"
-
-jq 'del(.services["zinder-serve"].ulimits.nofile)' "$history_compose" > "$invalid_history_compose"
-expect_rejected "zinder-serve inheriting open-file limits" --compose-contract "$invalid_history_compose"
+jq 'del(.services["zinder-serve"].ulimits.nofile)' "$resolved_compose" > "$invalid_compose"
+expect_rejected "zinder-serve inheriting open-file limits" --compose-contract "$invalid_compose"
 jq '.services["zinder-serve"].ulimits.nofile = {"soft":1024,"hard":524288}' \
-  "$history_compose" > "$invalid_history_compose"
-expect_rejected "zinder-serve using the exhausted Mainnet soft limit" --compose-contract "$invalid_history_compose"
-jq 'del(.services["zinder-index"].ulimits.nofile)' "$history_compose" > "$invalid_history_compose"
-expect_rejected "zinder-index inheriting open-file limits" --compose-contract "$invalid_history_compose"
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "zinder-serve using the exhausted Mainnet soft limit" --compose-contract "$invalid_compose"
+jq 'del(.services["zinder-index"].ulimits.nofile)' "$resolved_compose" > "$invalid_compose"
+expect_rejected "zinder-index inheriting open-file limits" --compose-contract "$invalid_compose"
 jq '.services["zinder-index"].ulimits.nofile = {"soft":1024,"hard":524288}' \
-  "$history_compose" > "$invalid_history_compose"
-expect_rejected "zinder-index using the exhausted Mainnet soft limit" --compose-contract "$invalid_history_compose"
+  "$resolved_compose" > "$invalid_compose"
+expect_rejected "zinder-index using the exhausted Mainnet soft limit" --compose-contract "$invalid_compose"
 
 for deployment_env in "${deployment_env_names[@]}"; do
   resolved_env_compose="$temporary_directory/resolved-$deployment_env-compose.json"
@@ -347,7 +251,6 @@ for deployment_env in "${deployment_env_names[@]}"; do
     --env-file "$repository_root/deploy/.env.$deployment_env" \
     -f "$repository_root/deploy/docker-compose.yml" \
     --profile observability \
-    --profile history-publisher \
     config --format json > "$resolved_env_compose"
   bash "$validator" --compose-contract "$resolved_env_compose"
   jq -e \
@@ -361,8 +264,6 @@ for deployment_env in "${deployment_env_names[@]}"; do
     and .volumes["node-cookie"].external == true
     and .volumes["node-cookie"].name == $cookie_volume
     and .volumes.data.name == "zinder-\($deploy_network)-data"
-    and any(.services["zinder-history-publisher"].volumes[];
-      .source == "/srv/zinder-history/\($deploy_network)/key-1/publisher.pk8")
     and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_GRPC_ADDR == ""
     and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__SERVER_NAME == ""
     and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM == ""
@@ -373,7 +274,6 @@ for deployment_env in "${deployment_env_names[@]}"; do
     and (.services["zinder-serve"].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr)
     and (.services["zinder-index"].ulimits.nofile == {"soft":65536,"hard":65536})
     and (.services["zinder-serve"].ulimits.nofile == {"soft":65536,"hard":65536})
-    and (.services["zinder-history-publisher"].ulimits.nofile == {"soft":65536,"hard":65536})
   ' "$resolved_env_compose" >/dev/null \
     || fail "the $deployment_env env file does not resolve to its expected network, cookie volume, endpoints, and ulimits"
 done
@@ -408,10 +308,10 @@ if grep -Ev '^[[:space:]]*#' "$systemd_unit" | grep -Eq 'ExecStartPre|--remove-o
 fi
 
 jq 'del(.services["zinder-prometheus"].networks.observability.aliases)' \
-  "$resolved_compose" > "$invalid_history_compose"
+  "$resolved_compose" > "$invalid_compose"
 expect_rejected \
   "a Compose contract omitting the prometheus network alias for Grafana" \
-  --compose-contract "$invalid_history_compose"
+  --compose-contract "$invalid_compose"
 
 missing_state_init_compose="$temporary_directory/missing-state-init-compose.json"
 jq 'del(.services["state-init"]) | del(.services["zinder-index"].depends_on["state-init"])' \
@@ -529,13 +429,6 @@ jq '.services["zinder-serve"].environment.ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN
 expect_rejected \
   "a Compose contract exposing projector control configuration to zinder-serve" \
   --compose-contract "$serve_projector_control_compose"
-
-legacy_publisher_subcommand_compose="$temporary_directory/legacy-publisher-subcommand-compose.json"
-jq '.services["zinder-history-publisher"].command += ["publish-shielded-history"]' \
-  "$resolved_compose_full" > "$legacy_publisher_subcommand_compose"
-expect_rejected \
-  "a Compose contract passing the legacy publish-shielded-history subcommand under zinder run" \
-  --compose-contract "$legacy_publisher_subcommand_compose"
 
 split_namespace_compose="$temporary_directory/split-namespace-compose.json"
 jq '.services["zinder-serve"].network_mode = null' \

@@ -11,7 +11,7 @@ Zinder is a self-hosted Zcash indexer. It reads an archive [Zebra](https://githu
 - **One binary, zero required config files.** Run `zinder serve --preset <light-wallet|wallet|explorer>` (or Compose `zinder-index` + `zinder-serve`) configured strictly via `ZINDER_*` environment variables, with optional TOML when needed.
 - **Reorg-safe snapshots and resumable events.** Pin multiple native calls to one chain epoch so syncs never mix competing tips, and follow blocks and reorgs through durable `ChainEvents` cursors.
 - **Serving through node outages.** Keep answering stored block, tree-state, and transparent queries while the node is down, with ingest and broadcast failover across certified Zebra 7.1.0 and Zakura 1.8.6 nodes.
-- **Verified data path.** Serve Ed25519-signed `fs-verity` shielded segments, SHA-256 verified transaction bodies, and verified edge-snapshot bootstraps.
+- **Verified data path.** Serve SHA-256 and optional `fs-verity`-verified canonical `ZSHRNG02` settled segments, SHA-256 verified transaction bodies, and verified edge-snapshot bootstraps.
 
 See [Features and roadmap](docs/features.md) for the full breakdown and [Indexer comparison](docs/reference/indexer-comparison.md) for a side-by-side matrix against Zebra, Zakura, ztreamer, Zingod, and Go lightwalletd.
 
@@ -29,17 +29,14 @@ flowchart LR
 
 ## Quickstart
 
-Start Zinder on Testnet with Docker Compose (requires an archive node URL in `deploy/.env.testnet`, control token files in `${ZINDER_CONTROL_SECRETS_DIR}`, and an initialized history directory via `scripts/prepare-shielded-history.sh`; zero TOML config files needed):
+Start Zinder on Testnet with Docker Compose (requires an archive node URL in `deploy/.env.testnet` and control token files in `${ZINDER_CONTROL_SECRETS_DIR}`; zero TOML config files needed):
 
 ```bash
 export ZINDER_CONTROL_SECRETS_DIR=/etc/zinder/control-secrets
 sudo install -d -o root -g 10001 -m 0750 "$ZINDER_CONTROL_SECRETS_DIR"
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin "$ZINDER_CONTROL_SECRETS_DIR/ingest.token"
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin "$ZINDER_CONTROL_SECRETS_DIR/checkpoint.token"
-sudo install -d -m 0700 /srv/zinder-history/testnet
-sudo ./scripts/prepare-shielded-history.sh /srv/zinder-history/testnet/key-1
-docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml \
-  --profile history-publisher up -d
+docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml up -d
 ```
 
 Or run the unified `zinder` CLI directly against an existing store or node:

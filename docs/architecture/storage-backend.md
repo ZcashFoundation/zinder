@@ -428,8 +428,7 @@ height with `CanonicalStoreRequirements`. A richer store satisfies these
 requirements when it covers the requested history. Missing data or an
 insufficient history floor returns `CanonicalStoreError::MissingStoredData`.
 The native query and compatibility listeners keep their first admitted
-stored set across generation changes. A running signed-history publisher
-also checks that set when it reopens its secondary. Restart the process to
+stored set across generation changes. Restart the process to
 admit a different stored set that meets its requirements.
 
 An admitted stored set also carries authenticated subtree-root coverage from

@@ -18,7 +18,7 @@ use zinder_runtime::cancel_on_terminating_signal;
 
 use crate::{
     cli::ServiceRole,
-    config::{HistoryPublisherPlan, RoleLaunchSpec, SupervisionPlan},
+    config::{RoleLaunchSpec, SupervisionPlan},
     ops::{
         RoleOpsSnapshot, SharedOpsState, StartupStage, SupervisorOpsError, SupervisorOpsHandle,
         fetch_child_capabilities, fetch_child_readyz, spawn_supervisor_ops,
@@ -207,7 +207,7 @@ async fn supervise_lifecycle(
             return Ok(());
         }
         let role = managed[idx].spec.role;
-        let child = spawn_role_process(exe_path, &managed[idx], plan.history_publisher.as_ref())?;
+        let child = spawn_role_process(exe_path, &managed[idx])?;
         managed[idx].process = Some(child);
         tracing::info!(
             target: "zinder::supervisor",
@@ -259,9 +259,7 @@ fn startup_gate_after(role: ServiceRole, plan: &SupervisionPlan) -> StartupGate 
                     addr: loopback_connect_addr(addr),
                 })
         }
-        ServiceRole::CompatLightwalletd
-        | ServiceRole::CompatCipherscan
-        | ServiceRole::HistoryPublisher => StartupGate::None,
+        ServiceRole::CompatLightwalletd | ServiceRole::CompatCipherscan => StartupGate::None,
     }
 }
 
@@ -302,18 +300,12 @@ async fn gate_satisfied(gate: &StartupGate) -> bool {
 fn spawn_role_process(
     exe_path: &Path,
     entry: &ManagedChild,
-    history_publisher: Option<&HistoryPublisherPlan>,
 ) -> Result<tokio::process::Child, SupervisorError> {
     let mut cmd = Command::new(exe_path);
     cmd.arg("run")
         .arg(entry.spec.role.label())
         .arg("--config")
         .arg(&entry.config_file);
-    if entry.spec.role == ServiceRole::HistoryPublisher
-        && let Some(hp) = history_publisher
-    {
-        append_history_publisher_args(&mut cmd, hp);
-    }
     for (env_name, _) in std::env::vars_os() {
         if let Some(as_str) = env_name.to_str()
             && as_str.starts_with("ZINDER_")
@@ -332,24 +324,6 @@ fn spawn_role_process(
         role: entry.spec.role.label(),
         source,
     })
-}
-
-fn append_history_publisher_args(cmd: &mut Command, hp: &HistoryPublisherPlan) {
-    cmd.arg("--directory")
-        .arg(&hp.directory)
-        .arg("--signing-key")
-        .arg(&hp.signing_key)
-        .arg("--follow-interval-secs")
-        .arg(hp.follow_interval_secs.to_string());
-    if let Some(first_height) = hp.first_height {
-        cmd.arg("--first-height").arg(first_height.to_string());
-    }
-    if let Some(segment_blocks) = hp.segment_blocks {
-        cmd.arg("--segment-blocks").arg(segment_blocks.to_string());
-    }
-    if let Some(workers) = hp.workers {
-        cmd.arg("--workers").arg(workers.to_string());
-    }
 }
 
 async fn poll_children_and_publish(
@@ -393,11 +367,6 @@ async fn poll_children_and_publish(
 }
 
 async fn refresh_child_snapshot(entry: &mut ManagedChild) {
-    if entry.spec.role == ServiceRole::HistoryPublisher {
-        "running".clone_into(&mut entry.snapshot.state);
-        entry.snapshot.ready = true;
-        return;
-    }
     if let Some((is_ready, payload)) = fetch_child_readyz(entry.ops_addr).await {
         if !entry.snapshot.capabilities_loaded
             && let Some(capabilities) = fetch_child_capabilities(entry.ops_addr).await

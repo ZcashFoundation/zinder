@@ -1,6 +1,6 @@
 //! Typed serving reads for an admitted canonical store.
 
-use std::mem::size_of;
+use std::{mem::size_of, sync::atomic::AtomicBool};
 
 use crate::{BlockHashLookup, BoundedRocksDbOpen};
 use rust_rocksdb::{DB, Direction, IteratorMode};
@@ -22,6 +22,10 @@ use super::{
         decode_tree_state_checkpoint, encode_block_position, encode_tree_state_checkpoint,
     },
     block_replay::validate_incremental_replay_range_bound,
+    encoded_compact_range::{
+        EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
+        encoded_compact_block_range_up_to,
+    },
     live_tail::LiveTailBlockRecord,
     pool_presence_mismatch,
     publication::column_family,
@@ -273,6 +277,21 @@ macro_rules! impl_canonical_typed_reads {
                 max_bytes: usize,
             ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
                 read_compact_blocks_up_to(self, range, order, max_bytes, |block, _| block)
+            }
+
+            /// Reads encoded lightwalletd `CompactBlock` wire payloads or pre-batched
+            /// frames directly from canonical `ZSHRNG02` segments and `live_tail_block`,
+            /// stopping at `request.max_bytes` while always keeping at least one block.
+            ///
+            /// Returns `Ok(None)` when `request.range` is empty (`start > end`), or
+            /// [`CanonicalStoreError::ArtifactUnavailable`] if any height in `request.range`
+            /// lies outside retained history.
+            pub fn encoded_compact_block_range_up_to(
+                &self,
+                request: EncodedCompactBlockRangeRequest,
+                cancel: Option<&AtomicBool>,
+            ) -> Result<Option<EncodedCompactBlockRange>, CanonicalStoreError> {
+                encoded_compact_block_range_up_to(self, request, cancel)
             }
 
             /// Reads the canonical location of one transaction.
@@ -586,29 +605,6 @@ macro_rules! impl_canonical_typed_reads {
 
 impl_canonical_typed_reads!(RocksDbCanonicalStore);
 impl_canonical_typed_reads!(RocksDbCanonicalSecondary);
-
-impl RocksDbCanonicalSecondary {
-    /// Reads ascending blocks and their original stored lengths for a derived history segment.
-    /// The byte budget includes the first row even when that row alone exceeds it.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same retention, missing-row, and decoding errors as
-    /// [`Self::compact_blocks_in_range_up_to`].
-    pub fn compact_block_rows_with_lengths(
-        &self,
-        range: BlockHeightRange,
-        max_bytes: usize,
-    ) -> Result<Vec<(CompactBlockArtifact, usize)>, CanonicalStoreError> {
-        read_compact_blocks_up_to(
-            self,
-            range,
-            HeightOrder::Ascending,
-            max_bytes,
-            |block, len| (block, len),
-        )
-    }
-}
 
 fn read_chain_epoch(store: &impl CanonicalServingRead) -> Result<ChainEpoch, CanonicalStoreError> {
     read_chain_epoch_at(store, store.serving_ready_evidence().visible_epoch)
@@ -934,7 +930,7 @@ where
             match LiveTailBlockRecord::decode_compact_block_v1(&slice, height) {
                 Ok(decoded) => decoded,
                 Err(_) if raw_exceeds_budget => return Ok(false),
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(store_access::map_settled_segments_read_error(error)),
             };
         if compact_block.height() != height {
             return Err(CanonicalStoreError::publication(
@@ -1000,7 +996,7 @@ fn visit_compact_block_batches(
 /// the rows past the point where the budget stops the read. Sizing each batch
 /// to the budget left keeps those rows within that budget as long as no row is
 /// larger than the largest already read.
-fn bounded_batch_len(remaining_bytes: usize, largest_row_bytes: usize) -> usize {
+pub(super) fn bounded_batch_len(remaining_bytes: usize, largest_row_bytes: usize) -> usize {
     remaining_bytes
         .checked_div(largest_row_bytes)
         .unwrap_or(1)
@@ -1013,7 +1009,7 @@ fn bounded_batch_len(remaining_bytes: usize, largest_row_bytes: usize) -> usize 
 /// A range read checks this before it reads any row, so a row stored outside
 /// that span, such as one above the visible tip of the admitted epoch, is
 /// never served.
-fn require_retained_compact_blocks(
+pub(super) fn require_retained_compact_blocks(
     store: &impl CanonicalServingRead,
     range: BlockHeightRange,
 ) -> Result<(), CanonicalStoreError> {
@@ -1117,7 +1113,8 @@ fn fetch_live_tail_compact_run(
     for (height, row) in heights.iter().copied().zip(rows) {
         let slice = row?.ok_or_else(|| missing_compact_block_row(height))?;
         let (compact_block, compact_len) =
-            LiveTailBlockRecord::decode_compact_block_v1(&slice, height)?;
+            LiveTailBlockRecord::decode_compact_block_v1(&slice, height)
+                .map_err(store_access::map_settled_segments_read_error)?;
         if compact_block.height() != height {
             return Err(CanonicalStoreError::publication(
                 "compact block row has the wrong height",
@@ -1129,7 +1126,7 @@ fn fetch_live_tail_compact_run(
 }
 
 /// Reports a missing compact-block row at a height inside retained history.
-fn missing_compact_block_row(height: BlockHeight) -> CanonicalStoreError {
+pub(super) fn missing_compact_block_row(height: BlockHeight) -> CanonicalStoreError {
     CanonicalStoreError::publication(format!(
         "compact block at height {} is absent",
         height.value()

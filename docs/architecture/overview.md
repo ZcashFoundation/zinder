@@ -23,7 +23,7 @@ Operators run the unified `zinder` binary (`services/zinder`):
 
 - `zinder serve [--preset <light-wallet|wallet|explorer>]`: supervises the selected role processes in one container or host process, exposing T=0 `/healthz`, `/readyz`, and aggregated `/metrics` on `:9108`. Adding `--readers-only` runs only serving readers against an existing writer.
 - `zinder index [--preset <light-wallet|wallet|explorer>]`: runs the canonical writer (and projector for `wallet` and `explorer`) cleanly separated from reader processes, as in the two-container [Docker Compose deployment](../../deploy/docker-compose.yml).
-- `zinder run <role>`: invokes an individual role process directly (`ingest`, `projector`, `query`, `compat-lightwalletd`, `explorer`, `compat-cipherscan`, or `history-publisher`). Thin per-crate binaries also remain in the workspace.
+- `zinder run <role>`: invokes an individual role process directly (`ingest`, `projector`, `query`, `compat-lightwalletd`, `explorer`, or `compat-cipherscan`). Thin per-crate binaries also remain in the workspace.
 
 Inside those presets, Zinder separates storage writes from reads cleanly. A deployment keeps the RocksDB stores its runtimes need on one host filesystem. Each store has exactly one writer, and every other runtime opens it read-only as a RocksDB secondary.
 
@@ -35,7 +35,7 @@ Inside those presets, Zinder separates storage writes from reads cleanly. A depl
 | `zinder-compat-lightwalletd` | Serves the lightwalletd `CompactTxStreamer` protocol (plus gRPC-Web) | Nothing | Canonical store and ingest control (plus wallet store and optional node in `wallet`/`explorer`; node forwarding in `light-wallet`) | All |
 | `zinder-explorer` | Serves `ExplorerQuery` for block explorers | Nothing | Canonical secondary store, optional materialized-view store, optional `WalletQuery`, optional `[node]` for tip observation | `explorer` (or standalone) |
 | `zinder-compat-cipherscan` | Serves Cipherscan-compatible REST and WebSocket endpoints | Nothing | `ExplorerQuery` and `WalletQuery` | `explorer` (or standalone) |
-| `publish-shielded-history` | Seals settled compact-block and nullifier ranges (`ZSHRNG01`) with Ed25519 signatures and `fs-verity` | Signed segment directory | Canonical secondary store | Optional (`history_publisher` config) |
+| `zinder-compat-lightwalletd` | Translates `CompactTxStreamer` gRPC queries and streams canonical `ZSHRNG02` settled segments and `live_tail_block` wire payloads directly | gRPC endpoint | Canonical/wallet secondaries + `IngestControl` (and node for `light-wallet`) | Optional (`light-wallet` / `wallet`) |
 
 The three stores hold different things:
 

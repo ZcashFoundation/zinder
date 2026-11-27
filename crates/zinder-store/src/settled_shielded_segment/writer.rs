@@ -131,8 +131,10 @@ impl SettledShieldedSegmentWriter {
 
     /// Encodes and writes one contiguous canonical compact block when paired with a
     /// `ZSTSUP01` supplement segment, zeroing shielded wire fees above `u32::MAX`
-    /// in `Slab 0` and marking the row flag so direct wire reads fail closed while
-    /// canonical reconstruction reads recover full `Option<u64>` fees from `ZSTSUP01`.
+    /// in `Slab 0` and marking the row flag on any transaction fee above `u32::MAX`
+    /// (including omitted non-shielded transactions) so direct wire serving fails
+    /// closed while canonical reconstruction reads recover full `Option<u64>` fees
+    /// from `ZSTSUP01`.
     ///
     /// # Errors
     ///

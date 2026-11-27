@@ -54,7 +54,6 @@ const SIGNATURE_DOMAIN: &[u8] = b"zinder-edge-snapshot.v1\0";
 const WORKSPACE_MARKER: &str = ".zinder-snapshot-workspace";
 const MAX_SNAPSHOT_ENTRIES: usize = 65_536;
 const CANONICAL: &str = "canonical-rocksdb";
-const SEALED: &str = "sealed-history";
 const POOLS: [ShieldedProtocol; 3] = [
     ShieldedProtocol::Sapling,
     ShieldedProtocol::Orchard,
@@ -232,7 +231,6 @@ impl EdgeSnapshotManifest {
                     [CANONICAL, seg_dir, subdir, file_name] if *seg_dir == SEGMENTS_DIR_NAME => {
                         validate_settled_segment_filename(subdir, file_name)
                     }
-                    [SEALED, _, ..] => true,
                     _ => false,
                 }
                 || !paths.insert(file.path.as_str())
@@ -562,8 +560,8 @@ fn reset_local_state(store: &RocksDbCanonicalStore) -> Result<(), EdgeSnapshotEr
 
 /// Exports a settled boundary from an admitted canonical owner.
 ///
-/// The optional sealed-history directory contributes opaque files. Both the
-/// checkpoint and the inventory are complete before the output becomes visible.
+/// Both the checkpoint and the inventory are complete before the output becomes
+/// visible.
 ///
 /// # Errors
 ///
@@ -573,18 +571,11 @@ pub fn export_edge_snapshot(
     store: &mut RocksDbCanonicalStore,
     output: &Path,
     signing_key: &Path,
-    sealed_history: Option<&Path>,
 ) -> Result<(), EdgeSnapshotError> {
     let output = resolve_destination(output)?;
     let stage = sibling_path(&output, ".export.staging")?;
     require_disjoint(&[&output, &stage])?;
-    let signing_path = signing_key.canonicalize()?;
-    let key_file = open_regular(&signing_path)?;
-    let metadata = key_file.metadata()?;
-    let signing_identity = (metadata.dev(), metadata.ino());
-    let sealed = sealed_history
-        .map(|path| ExportHistory::inspect(path, &output, &stage, &signing_path, signing_identity))
-        .transpose()?;
+    let key_file = open_regular(&signing_key.canonicalize()?)?;
     // PKCS#8 v1 carries only the seed. Ring checks the embedded public key in v2.
     let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&read_bounded(&key_file, 1024)?)
         .map_err(|_| refused("invalid Ed25519 PKCS#8 signing key"))?;
@@ -624,9 +615,6 @@ pub fn export_edge_snapshot(
             sha256,
         });
     }
-    if let Some(sealed) = sealed {
-        sealed.copy_to(&clean_bundle, &mut files)?;
-    }
     let manifest = EdgeSnapshotManifest {
         format: FORMAT.to_owned(),
         anchors,
@@ -646,84 +634,6 @@ pub fn export_edge_snapshot(
     publish(&clean_bundle, &output)
 }
 
-struct ExportHistory<'a> {
-    root: PathBuf,
-    paths: Vec<String>,
-    signing_path: &'a Path,
-    signing_identity: (u64, u64),
-}
-
-impl<'a> ExportHistory<'a> {
-    fn inspect(
-        root: &Path,
-        output: &Path,
-        stage: &Path,
-        signing_path: &'a Path,
-        signing_identity: (u64, u64),
-    ) -> Result<Self, EdgeSnapshotError> {
-        if !fs::symlink_metadata(root)?.is_dir() {
-            return Err(refused("sealed-history input must be a real directory"));
-        }
-        let root = root.canonicalize()?;
-        require_disjoint(&[&root, output, stage])?;
-        let mut paths = Vec::new();
-        let mut directories = BTreeSet::from([directory_identity(&fs::symlink_metadata(&root)?)?]);
-        walk_inventory(&root, |relative, path, is_directory| {
-            if is_directory {
-                directories.insert(directory_identity(&fs::symlink_metadata(path)?)?);
-            } else {
-                paths.push(relative.to_owned());
-            }
-            Ok(())
-        })?;
-        let destinations = [PathIdentity::read(output)?, PathIdentity::read(stage)?];
-        reject_history_ancestor_overlap(&directories, &destinations)?;
-        let sealed = Self {
-            root,
-            paths,
-            signing_path,
-            signing_identity,
-        };
-        for relative in &sealed.paths {
-            sealed.open_file(relative)?;
-        }
-        Ok(sealed)
-    }
-
-    fn open_file(&self, relative: &str) -> Result<File, EdgeSnapshotError> {
-        let input = open_snapshot_file(&self.root, relative)?;
-        let metadata = input.metadata()?;
-        if self.root.join(relative) == self.signing_path
-            || (metadata.dev(), metadata.ino()) == self.signing_identity
-        {
-            return Err(refused(
-                "sealed-history input contains the publisher signing key",
-            ));
-        }
-        Ok(input)
-    }
-
-    fn copy_to(
-        &self,
-        bundle: &Path,
-        files: &mut Vec<SnapshotFile>,
-    ) -> Result<(), EdgeSnapshotError> {
-        for relative in &self.paths {
-            let input = self.open_file(relative)?;
-            let path = format!("{SEALED}/{relative}");
-            let destination = bundle.join(&path);
-            fs::create_dir_all(parent(&destination))?;
-            let (bytes, sha256) = transfer_from(input, Some(&destination), None)?;
-            files.push(SnapshotFile {
-                path,
-                bytes,
-                sha256,
-            });
-        }
-        Ok(())
-    }
-}
-
 /// A canonical destination and its exclusively reserved private workspaces.
 ///
 /// Dropping the reservation removes the workspaces it created. Destination
@@ -732,7 +642,6 @@ pub struct EdgeSnapshotDestination {
     target: PathBuf,
     stage: Workspace,
     download: Option<Workspace>,
-    sealed: Option<(PathBuf, Workspace)>,
 }
 
 impl EdgeSnapshotDestination {
@@ -743,34 +652,19 @@ impl EdgeSnapshotDestination {
     /// # Errors
     ///
     /// Refuses occupied or overlapping destinations and preexisting scratch directories.
-    pub fn reserve(
-        target: &Path,
-        sealed_history_output: Option<&Path>,
-        download: bool,
-    ) -> Result<Self, EdgeSnapshotError> {
+    pub fn reserve(target: &Path, download: bool) -> Result<Self, EdgeSnapshotError> {
         let target = resolve_destination(target)?;
         let stage = sibling_path(&target, ".bootstrap.staging")?;
         let download = download
             .then(|| sibling_path(&target, ".bootstrap.download"))
             .transpose()?;
-        let sealed = sealed_history_output.map(resolve_destination).transpose()?;
-        let sealed_stage = sealed
-            .as_deref()
-            .map(|path| sibling_path(path, ".bootstrap.staging"))
-            .transpose()?;
         let mut paths = vec![target.as_path(), stage.as_path()];
         paths.extend(download.as_deref());
-        paths.extend(sealed.as_deref());
-        paths.extend(sealed_stage.as_deref());
         require_disjoint(&paths)?;
         Ok(Self {
             target,
             stage: Workspace::create(stage)?,
             download: download.map(Workspace::create).transpose()?,
-            sealed: sealed
-                .zip(sealed_stage)
-                .map(|(path, stage)| Ok::<_, EdgeSnapshotError>((path, Workspace::create(stage)?)))
-                .transpose()?,
         })
     }
 
@@ -827,17 +721,14 @@ where
     reset_local_state(&staged_store)?;
     drop(staged_store);
     drop(config.open(&canonical)?);
-    let has_sealed = manifest
-        .files()
-        .any(|(path, _, _)| path.starts_with("sealed-history/"));
-    let staged = PinnedBootstrap::open(&destination, has_sealed)?;
+    let staged = PinnedBootstrap::open(&destination)?;
     attest(evidence).await?;
     staged.verify(&destination)?;
     rustix::fs::fchmod(&staged.canonical.directory, rustix::fs::Mode::RWXU)
         .map_err(io::Error::from)
         .map_err(EdgeSnapshotError::from)?;
     sync_tree_at(&staged.canonical.directory)?;
-    commit_bootstrap(&destination, &staged, &manifest.files)?;
+    commit_bootstrap(&destination, &staged)?;
     Ok(())
 }
 
@@ -906,20 +797,13 @@ impl PinnedDirectory {
 
 struct PinnedBootstrap {
     canonical: PinnedDirectory,
-    sealed: Option<PinnedDirectory>,
 }
 
 impl PinnedBootstrap {
-    fn open(
-        destination: &EdgeSnapshotDestination,
-        has_sealed: bool,
-    ) -> Result<Self, EdgeSnapshotError> {
+    fn open(destination: &EdgeSnapshotDestination) -> Result<Self, EdgeSnapshotError> {
         let stage = &destination.stage.directory;
         let staged = Self {
             canonical: PinnedDirectory::open(stage, CANONICAL)?,
-            sealed: has_sealed
-                .then(|| PinnedDirectory::open(stage, SEALED))
-                .transpose()?,
         };
         staged.verify(destination)?;
         Ok(staged)
@@ -927,17 +811,7 @@ impl PinnedBootstrap {
 
     fn verify(&self, destination: &EdgeSnapshotDestination) -> Result<(), EdgeSnapshotError> {
         let stage = &destination.stage;
-        if !stage.matches_entry()
-            || !self.canonical.matches(&stage.directory, CANONICAL)
-            || !self
-                .sealed
-                .as_ref()
-                .is_none_or(|sealed| sealed.matches(&stage.directory, SEALED))
-            || !destination
-                .sealed
-                .as_ref()
-                .is_none_or(|(_, workspace)| workspace.matches_entry())
-        {
+        if !stage.matches_entry() || !self.canonical.matches(&stage.directory, CANONICAL) {
             return Err(refused(
                 "snapshot workspace was substituted during attestation",
             ));
@@ -966,77 +840,10 @@ fn rename_canonical(
 fn commit_bootstrap(
     destination: &EdgeSnapshotDestination,
     staged: &PinnedBootstrap,
-    inventory: &[SnapshotFile],
 ) -> Result<(), EdgeSnapshotError> {
-    let canonical_parent = &destination.stage.parent_dir;
-    let sidecar = destination
-        .sealed
-        .as_ref()
-        .map(|(output, sidecar)| {
-            let name = destination_name(output)?;
-            require_empty_or_absent_at(&sidecar.parent_dir, name)?;
-            Ok::<_, EdgeSnapshotError>((sidecar, name))
-        })
-        .transpose()?;
-    let Some(((sidecar, output_name), sealed)) = sidecar.zip(staged.sealed.as_ref()) else {
-        rename_canonical(destination, staged)?;
-        canonical_parent.sync_all()?;
-        return Ok(());
-    };
-
-    let files = copy_sealed_history(sealed, sidecar, inventory)?;
-    staged.verify(destination)?;
-    if !files.matches(&sidecar.directory, SEALED) {
-        return Err(refused("snapshot sidecar workspace was substituted"));
-    }
-    let output_parent = &sidecar.parent_dir;
-    rename_no_replace_at(
-        &sidecar.directory,
-        OsStr::new(SEALED),
-        output_parent,
-        output_name,
-    )?;
-    let commit = output_parent
-        .sync_all()
-        .map_err(EdgeSnapshotError::from)
-        .and_then(|()| rename_canonical(destination, staged));
-    if let Err(error) = commit {
-        let rollback =
-            remove_owned_directory(output_parent, output_name, &files.directory, files.identity);
-        let sync = output_parent.sync_all();
-        if let Err(error) = rollback.and(sync) {
-            tracing::warn!(output = ?output_name, %error, "failed to roll back snapshot sidecar");
-        }
-        return Err(error);
-    }
-    canonical_parent.sync_all()?;
+    rename_canonical(destination, staged)?;
+    destination.stage.parent_dir.sync_all()?;
     Ok(())
-}
-
-fn copy_sealed_history(
-    sealed: &PinnedDirectory,
-    sidecar: &Workspace,
-    inventory: &[SnapshotFile],
-) -> Result<PinnedDirectory, EdgeSnapshotError> {
-    use rustix::fs::{Mode, mkdirat};
-
-    mkdirat(&sidecar.directory, SEALED, Mode::RWXU).map_err(io::Error::from)?;
-    let files = PinnedDirectory::open(&sidecar.directory, SEALED)?;
-    for file in inventory {
-        let Some(relative) = file.path.strip_prefix("sealed-history/") else {
-            continue;
-        };
-        let input = open_snapshot_file_at(&sealed.directory, relative)?;
-        let output = create_snapshot_file_at(&files.directory, relative)?;
-        if transfer_open_files(input, Some(output), Some(file.bytes))? != (file.bytes, file.sha256)
-        {
-            return Err(refused(
-                "staged sealed-history file differs from the signed inventory",
-            ));
-        }
-    }
-    sync_tree_at(&files.directory)?;
-    Ok(files)
 }
 
 fn read_bounded(input: impl Read, limit: u64) -> Result<Vec<u8>, EdgeSnapshotError> {
@@ -1087,34 +894,6 @@ fn open_snapshot_file_at(root: &File, relative: &str) -> Result<File, EdgeSnapsh
         directory = open_directory(&directory, OsStr::new(name))?;
     }
     Err(refused("empty snapshot path"))
-}
-
-fn create_snapshot_file_at(root: &File, relative: &str) -> io::Result<File> {
-    use rustix::{
-        fs::{Mode, OFlags, mkdirat, openat},
-        io::Errno,
-    };
-
-    let mut directory = root.try_clone()?;
-    let mut components = relative.split('/').peekable();
-    while let Some(name) = components.next() {
-        if components.peek().is_none() {
-            return openat(
-                &directory,
-                name,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            )
-            .map(File::from)
-            .map_err(io::Error::from);
-        }
-        match mkdirat(&directory, name, Mode::RWXU) {
-            Ok(()) | Err(Errno::EXIST) => {}
-            Err(error) => return Err(error.into()),
-        }
-        directory = open_directory(&directory, OsStr::new(name))?;
-    }
-    Err(io::Error::other("empty snapshot path"))
 }
 
 fn transfer(
@@ -1464,22 +1243,6 @@ fn require_disjoint(paths: &[&Path]) -> Result<(), EdgeSnapshotError> {
         {
             return Err(refused("snapshot paths must not overlap"));
         }
-    }
-    Ok(())
-}
-
-fn reject_history_ancestor_overlap(
-    history: &BTreeSet<DirectoryIdentity>,
-    destinations: &[PathIdentity<'_>],
-) -> Result<(), EdgeSnapshotError> {
-    if destinations.iter().any(|path| {
-        path.ancestors
-            .iter()
-            .any(|ancestor| history.contains(ancestor))
-    }) {
-        return Err(refused(
-            "snapshot export overlaps a sealed-history directory",
-        ));
     }
     Ok(())
 }

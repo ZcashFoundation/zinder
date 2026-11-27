@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     future::ready,
     num::{NonZeroU16, NonZeroU32},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use async_trait::async_trait;
@@ -13,7 +13,7 @@ use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
-    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
+    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip,
     MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction, MinedTransactionChainContext,
     NetworkUpgradeActivations, RawTransactionBytes, StandardFee, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
@@ -27,7 +27,8 @@ use zinder_proto::capabilities::{
 use zinder_source::TransactionBroadcaster;
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEventStreamFamily, ChainEventStreamResume,
-    EventStreamStartPosition, HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
+    EncodedCompactBlockRange, EncodedCompactBlockRangeRequest, EventStreamStartPosition,
+    HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -922,15 +923,6 @@ where
     Broadcaster: TransactionBroadcaster + Clone,
     NativeIngest: Send + Sync + 'static,
 {
-    fn compact_block_fence(&self, epoch: ChainEpoch) -> Option<crate::CompactBlockFence> {
-        let pair = self.serving_pair_slot.capture_at(Some(epoch.id));
-        (pair.chain_epoch() == epoch).then(|| crate::CompactBlockFence {
-            event_fence: pair.canonical_fence(),
-            history_bounds: pair.canonical().history_bounds(),
-            source: crate::CompactBlockSource::of(&pair),
-        })
-    }
-
     fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
         Some(self.serving_pair_slot.subscribe_publications())
     }
@@ -1177,22 +1169,29 @@ where
         .await
     }
 
-    async fn compact_block_rows_with_lengths(
+    async fn encoded_compact_block_range_up_to(
         &self,
-        block_range: BlockHeightRange,
-        max_bytes: usize,
+        request: EncodedCompactBlockRangeRequest,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
-        let requested_blocks = Some(block_range.into_iter().len());
-        serving_read::record("compact_block_rows_with_lengths", requested_blocks, async {
-            validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
-            serving_read::read_at(self.pin(at_epoch_id), move |pair| async move {
-                let _ = Self::chain_epoch(&pair, at_epoch_id)?;
-                pair.canonical()
-                    .compact_block_rows_with_lengths(block_range, max_bytes)
-                    .await
-                    .map(Some)
-                    .map_err(QueryError::canonical_read)
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, QueryError> {
+        if request.range.start > request.range.end {
+            return Err(QueryError::InvalidBlockRange {
+                start_height: request.range.start,
+                end_height: request.range.end,
+            });
+        }
+        let requested_blocks = Some(request.range.into_iter().len());
+        serving_read::record("compact_blocks_in_range", requested_blocks, async {
+            serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+                let cancel = cancel.clone();
+                async move {
+                    let _ = Self::chain_epoch(&pair, at_epoch_id)?;
+                    pair.canonical()
+                        .encoded_compact_block_range_up_to(request, cancel)
+                        .await
+                        .map_err(QueryError::canonical_read)
+                }
             })
             .await
         })

@@ -25,12 +25,6 @@ final-status-level = "fail"
 junit = { path = "target/nextest/junit.xml" }
 
 [[profile.default.overrides]]
-# This fixture flushes 128 separate tables and waits for RocksDB to delete
-# them during compaction before resuming the publisher.
-filter = "package(=zinder-compat-lightwalletd) & test(=integration::cli::publication::publisher_recovers_a_missing_table_while_holding_the_catalog_lock)"
-slow-timeout = { period = "20s", terminate-after = 3 }
-
-[[profile.default.overrides]]
 # Concurrent canonical and wallet fixture builds stall on filesystem journal
 # commits. Each replay then copies and syncs both stores and opens a secondary.
 # Limit overlapping fixtures. Even two can cross 20s when other suites share
@@ -41,8 +35,8 @@ slow-timeout = { period = "20s", terminate-after = 3 }
 
 [[profile.default.overrides]]
 # Active-writer publication tests build canonical and wallet stores across a
-# 4,096-block segment boundary, clone them into four matched modes, and drive
-# concurrent RocksDB writers, projector, publisher, and gRPC readers.
+# 4,096-block segment boundary, clone them into three matched modes, and drive
+# concurrent RocksDB writers, projector, and gRPC readers.
 filter = "package(=zinder-bench) & test(/^integration::active_writer_publication::/)"
 test-group = "rocksdb-tip-replay"
 slow-timeout = { period = "30s", terminate-after = 3 }
@@ -114,10 +108,10 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
 # This test builds two 6,100-block canonical and wallet store fixtures (each
-# sealing a 4,096-block settled segment) plus a 1,000-block legacy catalog. It
-# takes ~10-11s alone in a debug build and crosses the 20s default kill window
-# under 4-vCPU CI shard parallelism.
-filter = "package(=zinder-compat-lightwalletd) & test(=integration::lightwalletd_grpc::published_range::descending_gap_retry_delivers_every_previously_checked_retained_block)"
+# sealing a 4,096-block settled segment). It takes ~10-11s alone in a debug
+# build and crosses the 20s default kill window under 4-vCPU CI shard
+# parallelism.
+filter = "package(=zinder-compat-lightwalletd) & test(=integration::lightwalletd_grpc::canonical_range::descending_gap_retry_delivers_every_previously_checked_retained_block)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.ci.overrides]]

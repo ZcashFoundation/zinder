@@ -1,5 +1,4 @@
 use std::{
-    path::Path,
     sync::Arc,
     task::{Context, Poll, Wake, Waker},
     time::Duration,
@@ -17,31 +16,23 @@ use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, sample_regtest_upgrade_activations,
 };
 
-use super::{
-    EpochPinRecorder, ReaderFixture, SEALED_END, block_range_request, wallet_chain, writer,
-};
+use super::{EpochPinRecorder, ReaderFixture, block_range_request, wallet_chain, writer};
 use crate::integration::lightwalletd_grpc::GatedChunkRead;
 
 type Adapter = LightwalletdGrpcAdapter<EpochPinRecorder<WalletServingQuery<()>>>;
 
-async fn gated_adapter(
+fn gated_adapter(
     store: &ReaderFixture,
-    directory: &Path,
     later_views: Vec<WalletServingQuery<()>>,
-) -> Result<(Adapter, mpsc::UnboundedReceiver<GatedChunkRead>)> {
-    let history = store
-        .publish(&directory.join("shielded"), SEALED_END)
-        .await?;
+) -> (Adapter, mpsc::UnboundedReceiver<GatedChunkRead>) {
     let (gates, reads) = mpsc::unbounded_channel();
     let mut recorder = EpochPinRecorder::new(store.query.clone()).with_later_views(later_views);
+    recorder.expose_encoded_range = true;
     recorder.gated_chunk_reads = Some(gates);
-    // Keep requests eligible for signed reads. A failed initial block hash
-    // check sends them to the observable canonical read after admission.
+    // Keep requests eligible for direct canonical reads. A failed initial block hash
+    // check sends them to the observable canonical fallback read after admission.
     recorder.refuse_block_header_reads = true;
-    Ok((
-        LightwalletdGrpcAdapter::new(recorder).with_published_shielded_history(history),
-        reads,
-    ))
+    (LightwalletdGrpcAdapter::new(recorder), reads)
 }
 
 fn gated_range(start: u64, end: u64) -> Request<lightwalletd::BlockRange> {
@@ -77,8 +68,7 @@ async fn next_read(reads: &mut mpsc::UnboundedReceiver<GatedChunkRead>) -> Resul
 }
 
 #[tokio::test]
-async fn published_reads_keep_fifo_order_and_capacity_across_cancellation() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+async fn canonical_encoded_reads_keep_fifo_order_and_capacity_across_cancellation() -> Result<()> {
     let chain = wallet_chain(10_000)?;
     let store = ReaderFixture::new(writer(&chain)?.into_serving_store_fixture()?)?;
     let shorter = CanonicalWriterFixture::publish(
@@ -86,8 +76,7 @@ async fn published_reads_keep_fifo_order_and_capacity_across_cancellation() -> R
         &sample_regtest_upgrade_activations(),
     )?;
     let shorter = ReaderFixture::new(shorter.into_serving_store_fixture()?)?;
-    let (adapter, mut reads) =
-        gated_adapter(&store, dir.path(), vec![shorter.query.clone()]).await?;
+    let (adapter, mut reads) = gated_adapter(&store, vec![shorter.query.clone()]);
     tokio::time::timeout(
         Duration::from_secs(10),
         check_read_admission(&adapter, &mut reads),
@@ -162,10 +151,10 @@ async fn check_read_admission(
 }
 
 #[tokio::test]
-async fn published_first_and_later_reads_share_the_byte_budget_across_open_streams() -> Result<()> {
-    let dir = tempfile::tempdir()?;
+async fn canonical_encoded_first_and_later_reads_share_the_byte_budget_across_open_streams()
+-> Result<()> {
     let store = ReaderFixture::new(writer(&wallet_chain(10_000)?)?.into_serving_store_fixture()?)?;
-    let (adapter, mut reads) = gated_adapter(&store, dir.path(), Vec::new()).await?;
+    let (adapter, mut reads) = gated_adapter(&store, Vec::new());
     let mut held = Vec::new();
     for (streams, later_budget) in [(16, 2 * 1024 * 1024), (32, 1024 * 1024)] {
         while held.len() < streams - 1 {

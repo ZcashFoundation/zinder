@@ -19,19 +19,15 @@ sudo git -C /opt/zinder checkout vX.Y.Z
 
 See [Releasing](releasing.md) to verify the signed release image and binary archive.
 
-### 2. Prepare host control tokens and signed shielded-history storage
+### 2. Prepare host control tokens
 
-`deploy/docker-compose.yml` requires host control tokens in `${ZINDER_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`) and bind-mounts `publisher.pub` and `catalog/` from `${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}` with `create_host_path: false` (`state-init` creates neither). Initialize both before starting Compose (substitute `testnet` or `regtest` as needed):
+`deploy/docker-compose.yml` requires host control tokens in `${ZINDER_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`). Initialize both before starting Compose:
 
 ```bash
 sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin /etc/zinder/control-secrets/ingest.token
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin /etc/zinder/control-secrets/checkpoint.token
-sudo install -d -m 0700 /srv/zinder-history/mainnet
-sudo /opt/zinder/scripts/prepare-shielded-history.sh /srv/zinder-history/mainnet/key-1
 ```
-
-Reuse the same key generation directory across restarts; `prepare-shielded-history.sh` refuses to overwrite an existing generation. Keep `--profile history-publisher` enabled until the catalog contains its initial signed checkpoint (or continuously to keep sealing settled segments).
 
 ### 3. Write the environment file
 
@@ -46,7 +42,6 @@ Copy the env file matching your node and network to `/etc/zinder/env`:
 sudo install -d -o root -g root -m 0755 /etc/zinder
 sudo cp /opt/zinder/deploy/.env.mainnet /etc/zinder/env
 echo 'ZINDER_VERSION=vX.Y.Z' | sudo tee -a /etc/zinder/env >/dev/null
-echo 'COMPOSE_PROFILES=history-publisher' | sudo tee -a /etc/zinder/env >/dev/null
 ```
 
 Check these core variables in `/etc/zinder/env`:
@@ -55,7 +50,7 @@ Check these core variables in `/etc/zinder/env`:
 | --- | --- |
 | `ZINDER_DEPLOY_NETWORK` | `mainnet`, `testnet`, or `regtest` (names the Compose project and volumes). |
 | `ZINDER_PRESET` | Deployment preset: `light-wallet`, `wallet` (default), or `explorer`. |
-| `COMPOSE_PROFILES` | `history-publisher` by default so Compose starts `zinder-history-publisher` under both manual commands and `zinder.service` (add `,observability` for Prometheus + Grafana). |
+| `COMPOSE_PROFILES` | Optional Compose profiles (set `observability` for Prometheus + Grafana). |
 | `ZINDER_SOURCE_NETWORK_NAME` | Node's external Docker network. |
 | `ZINDER_SOURCE_COOKIE_VOLUME_NAME` | Node's external `.cookie` volume. |
 | `ZINDER_NETWORK__NAME` | `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. |
@@ -64,16 +59,16 @@ Check these core variables in `/etc/zinder/env`:
 
 - **Presets and raw-blob retention:** `deploy/docker-compose.yml` defaults `ZINDER_PRESET` to `wallet` (`raw_blob_policy = "none"`), passes `--preset`, and forwards `ZINDER_STORAGE__FULL_BLOCKS` (`false` by default). Set `ZINDER_PRESET=light-wallet` for minimal shielded-only serving, `ZINDER_PRESET=explorer` to add `ExplorerQuery`, `explorer_views`, and `zinder-compat-cipherscan`, and add `ZINDER_STORAGE__FULL_BLOCKS=true` (`raw_blob_policy = "all"`) to retain full raw block and transaction blobs. Changing persisted retention requires rebuilding on fresh volumes; keeping an existing pre-profile `raw_blob_policy = "transactions"` store in place requires running standalone `zinder serve` / `zinder index` (or using a `docker-compose.override.yml` that clears `ZINDER_DEPLOYMENT__PROFILE`, omits `--preset` from `command`, and sets `ZINDER_STORAGE__RAW_BLOB_POLICY: "transactions"`) rather than default `deploy/docker-compose.yml`.
 - **Streaming mempool & binary block fetch:** Set `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` in Z3's `.env`, restart Z3, and set `ZINDER_NODE__INDEXER_GRPC_ADDR=http://zebra:8155` and `ZINDER_INGEST__SOURCE=zebra-indexer-grpc` in `/etc/zinder/env` (or export `ZINDER_INGEST__SOURCE=zebra-indexer-grpc` for standalone binaries).
-- **High-concurrency Mainnet endpoints:** On 64+ GiB hosts, size `zinder-serve`'s memory ceiling above 32 GiB (`ZINDER_SERVE_MEMORY_LIMIT`) for the ~21+ GB signed catalog page cache; see [Size your host](deploying.md#what-you-need).
+- **High-concurrency Mainnet endpoints:** On 64+ GiB hosts, size `zinder-serve`'s memory ceiling above 32 GiB (`ZINDER_SERVE_MEMORY_LIMIT`) to hold the OS page cache for canonical `ZSHRNG02` settled segments; see [Size your host](deploying.md#what-you-need).
 - Leave `ZINDER_VERSION` unset to build `:local` from the checkout instead of pulling the release image, or pin `ghcr.io/zcashfoundation/zinder@sha256:...` via `ZINDER_IMAGE`.
 
 ### 4. Start the runtimes
 
 ```bash
 cd /opt/zinder
-docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml --profile history-publisher config -q
-docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml --profile history-publisher pull
-docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml --profile history-publisher up -d --no-build
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml config -q
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml pull
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml up -d --no-build
 ```
 
 If `ZINDER_VERSION` is unset, skip `pull` and use `up -d --build` here and in later commands. Wait for `zinder-index` (`:9105/readyz`) and `zinder-serve` (`:9108/readyz`) to finish initial construction without restarting them; see [Initial sync](initial-sync.md).
@@ -93,7 +88,7 @@ sudo systemctl enable --now zinder
 sudo journalctl -u zinder.service -f
 ```
 
-`deploy/systemd/zinder.service` runs `docker compose --env-file /etc/zinder/env -f docker-compose.yml up --no-build` with `Restart=on-failure` and tears down only on explicit `ExecStop` so failed restarts do not discard an active sync or build images unintentionally. `zinder.service` reads `COMPOSE_PROFILES` from `/etc/zinder/env` automatically (keeping `history-publisher` and optional `observability` active without modifying the unit); set `COMPOSE_FILE` in `/etc/zinder/env` or override `ExecStart=` and `ExecStop=` with `sudo systemctl edit zinder` when attaching a custom `-f /etc/zinder/docker-compose.override.yml` overlay.
+`deploy/systemd/zinder.service` runs `docker compose --env-file /etc/zinder/env -f docker-compose.yml up --no-build` with `Restart=on-failure` and tears down only on explicit `ExecStop` so failed restarts do not discard an active sync or build images unintentionally. `zinder.service` reads `COMPOSE_PROFILES` from `/etc/zinder/env` automatically (allowing optional profiles such as `observability` without modifying the unit); set `COMPOSE_FILE` in `/etc/zinder/env` or override `ExecStart=` and `ExecStop=` with `sudo systemctl edit zinder` when attaching a custom `-f /etc/zinder/docker-compose.override.yml` overlay.
 
 ### 7. Put TLS in front
 
@@ -148,7 +143,7 @@ Apply the change with both Compose files (and update your `zinder.service` syste
 cd /opt/zinder
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml -f /etc/zinder/docker-compose.override.yml \
-  --profile history-publisher up -d --no-build
+  up -d --no-build
 ```
 
 Ingest `/readyz` reports `active_node.position`, and failovers log `node_endpoint_switched`.
@@ -173,14 +168,6 @@ services:
 
 Recreate with `-f deploy/docker-compose.yml -f /etc/zinder/docker-compose.override.yml` when using an override file (also in `zinder.service` overrides).
 
-## Publish signed wallet history
-
-In Compose, the isolated `zinder-history-publisher` service (`network_mode: none`, `--profile history-publisher`) opens the canonical store read-only, builds initial 4,096-block settled segments using `min(available CPUs, 4)` workers by default (`ZINDER_HISTORY_PUBLISHER_WORKERS`), enables `fs-verity` on Linux `ext4 -O verity` filesystems, and commits new settled segments every 60 seconds ([Signed settled history](../reference/lightwalletd-compatibility.md#signed-settled-history)). In standalone all-in-one deployments (`zinder serve`), setting `ZINDER_HISTORY_PUBLISHER__DIRECTORY`, `ZINDER_HISTORY_PUBLISHER__SIGNING_KEY`, and `ZINDER_COMPAT__SHIELDED_HISTORY__*` supervises `history-publisher` inside `zinder serve` (or run `zinder run history-publisher` explicitly).
-
-- **Mount & permissions:** Keep `publisher.pk8` restricted to UID 10001 (`0700` directory / private volume) while keeping `publisher.pub` and `catalog/` readable by the reader process, matching `reorg_window_blocks` with the canonical store.
-- **Back up and restore:** In Compose, stopping `zinder-serve` alone does **not** quiesce `zinder-history-publisher`. Stop `zinder-history-publisher` first (`docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml --profile history-publisher stop zinder-history-publisher`), copy `publisher.pk8`, `publisher.pub`, and all of `catalog/` (including `.publisher-head.json`) together, then start `zinder-history-publisher` again (stopping `zinder serve` quiesces publishing only in standalone all-in-one deployments).
-- **Serve canonical ranges during an incident or rotate keys:** Clearing `ZINDER_COMPAT__SHIELDED_HISTORY__*` in `/etc/zinder/env` does **not** disable signed history in `deploy/docker-compose.yml` because those env vars and read-only binds are hardcoded on `zinder-serve` while `zinder-history-publisher` runs separately. During an incident, stop `zinder-history-publisher` and apply a temporary recovery override (`!reset` on `volumes` to drop `/var/lib/zinder-history` and `/run/zinder-history/publisher.pub` plus empty overrides on `ZINDER_COMPAT__SHIELDED_HISTORY__*`), recreate `zinder-serve` with that override, provision a fresh generation (`scripts/prepare-shielded-history.sh /srv/zinder-history/<network>/key-2`), point `ZINDER_HISTORY_DIR=/srv/zinder-history/<network>/key-2` in `/etc/zinder/env`, remove the temporary override, and recreate `zinder-serve` and `--profile history-publisher`.
-
 ## Add the Explorer
 
 Set `ZINDER_PRESET=explorer` (or `ZINDER_DEPLOYMENT__PROFILE=explorer`) in `/etc/zinder/env` and update the Compose deployment:
@@ -188,7 +175,7 @@ Set `ZINDER_PRESET=explorer` (or `ZINDER_DEPLOYMENT__PROFILE=explorer`) in `/etc
 ```bash
 cd /opt/zinder
 docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml --profile history-publisher up -d --no-build
+  -f deploy/docker-compose.yml up -d --no-build
 ```
 
 `zinder-index` enables `explorer_views = true`, and `zinder-serve` adds `zinder-explorer` (`:9068`) and `zinder-compat-cipherscan` (`:9070`). Views live under `<data_dir>/canonical/materialized-views` and pause automatically on low free space ([Explorer plane](../architecture/explorer-plane.md#what-it-needs)). Canonical-only displaced-block RPCs (`DisplacedBlockHistory`, `DisplacedBlockDetail`) begin serving once `zinder-index` reaches canonical READY (restart `zinder-serve` if `zinder-explorer` started before canonical primary became READY); `BlockDetail`, block production, `BlockTransactions`, `CommitmentRootSearch`, and aggregate/search methods additionally depend on `explorer_views` catch-up/backfill coverage and `WalletQuery` readiness. If an upgrade changes view schemas (`materialized_view_store_open_failed`):

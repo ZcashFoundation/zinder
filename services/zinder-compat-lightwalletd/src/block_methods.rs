@@ -17,7 +17,7 @@
 
 use std::{
     num::NonZeroU32,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -33,7 +33,7 @@ use zinder_core::{
     },
 };
 use zinder_proto::compat::lightwalletd::{self, LIGHTWALLETD_PROTOCOL_VERSION};
-use zinder_store::HeightOrder;
+use zinder_store::{EncodedCompactBlockRange, EncodedCompactBlockRangeRequest, HeightOrder};
 
 use crate::block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES, BlockRangeChunks,
@@ -41,6 +41,7 @@ use crate::block_range::{
     BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, RangeBlock,
 };
 use crate::compact_block_messages::{CompactBlockShape, ironwood_active_at_or_below};
+use crate::encoded_range::{EncodedFrameRangeRead, EncodedRangeRead};
 use crate::network_tip_estimate::estimated_network_height;
 use crate::node_tip_witness::NodeTipWitness;
 use crate::stale_tip::{StaleTipLimit, TipBlockTime, TipBlockTimeCache, unix_now_seconds};
@@ -95,6 +96,23 @@ pub(crate) struct ChunkReadOutcome<Output> {
     pub(crate) read_duration: Option<Duration>,
     /// What the conversion returned, or why no conversion ran.
     pub(crate) converted: Result<Output, ChunkReadFailure>,
+}
+
+/// Outcome of a canonical encoded-range chunk read.
+pub(crate) enum EncodedChunkReadOutcome<View> {
+    /// The canonical reader returned an encoded slice at `read_at` in `read_duration`.
+    Direct {
+        read_at: ChainEpoch,
+        range: EncodedCompactBlockRange,
+        read_duration: Duration,
+    },
+    /// The canonical reader deferred to [`CompactBlockReads::read_compact_block_chunk`].
+    Fallback(ChunkView<View>),
+    /// The read failed or stopped before reading a slice.
+    Failed {
+        read_duration: Option<Duration>,
+        failure: ChunkReadFailure,
+    },
 }
 
 impl<Output> ChunkReadOutcome<Output> {
@@ -191,16 +209,6 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
     /// Returns the chain epoch `view` reads.
     fn view_chain_epoch(view: &Self::View) -> ChainEpoch;
 
-    fn range_fence(
-        &self,
-        _view: &Self::View,
-    ) -> Option<(
-        zinder_store::CanonicalEventFence,
-        zinder_core::CanonicalHistoryBounds,
-    )> {
-        None
-    }
-
     /// Returns the network-upgrade activations the canonical writer admitted
     /// with `view` or with a newer view.
     fn view_activations(
@@ -220,33 +228,17 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
         block: RequestedBlock,
     ) -> impl Future<Output = Result<CompactBlockArtifact, Status>> + Send;
 
-    fn block_hash_at(
+    /// Streams encoded compact-block wire payloads directly from `ZSHRNG02`
+    /// settled segments and `live_tail_block`, or defers to
+    /// [`Self::read_compact_block_chunk`] when falling back.
+    fn read_encoded_compact_block_chunk(
         &self,
-        view: &Self::View,
-        height: BlockHeight,
-    ) -> impl Future<Output = Result<BlockHash, Status>> + Send {
-        async move {
-            self.read_compact_block(view, RequestedBlock::Height(height))
-                .await
-                .map(|block| block.block_hash())
-        }
-    }
-
-    /// Returns the fence of `view` with the admitted data it reads, which
-    /// together key the encoded rows the live tail may reuse for `view`.
-    fn tail_source(&self, _view: &Self::View) -> Option<zinder_query::CompactBlockFence> {
-        None
-    }
-
-    /// Reads ascending compact blocks with their original stored lengths up to `max_bytes`.
-    fn read_compact_block_rows_with_lengths(
-        &self,
-        _view: &Self::View,
-        _range: BlockHeightRange,
-        _max_bytes: usize,
-    ) -> impl Future<Output = Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status>> + Send
-    {
-        std::future::ready(Ok(None))
+        view: ChunkView<Self::View>,
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> impl Future<Output = EncodedChunkReadOutcome<Self::View>> + Send {
+        let _ = (request, cancel);
+        std::future::ready(EncodedChunkReadOutcome::Fallback(view))
     }
 
     /// Reads the blocks of `read.chunk` that fit `read.max_bytes`, from the
@@ -506,51 +498,32 @@ impl BlockMethods {
         stream_range(reads, range, is_descending, slot, conversion).await
     }
 
-    pub(crate) async fn published_block_range<Reads: CompactBlockReads>(
+    pub(crate) async fn encoded_block_range<Reads: CompactBlockReads>(
         &self,
         reads: &Reads,
         request: &lightwalletd::BlockRange,
-        (history, live_tail): (
-            Option<Arc<crate::published_range::PublishedShieldedCatalog>>,
-            crate::published_range::ShieldedTailBuffer,
-        ),
         select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<lightwalletd::EncodedBlockRangeStream, Status> {
         let (range, is_descending) = block_range_from_request(request)?;
         let shape = select(&request.pool_types)?;
         let slot = self.block_range_streams.open().await?;
-        let shape = resolve_published_shape(reads, shape, range.end).await;
-        let source = crate::published_range::PublishedRangeRead::new(
-            history,
-            live_tail,
-            shape,
-            is_descending,
-            self.block_range_streams.clone(),
-        );
+        let shape = resolve_shielded_shape(reads, shape, range.end).await;
+        let source = EncodedRangeRead::new(shape, is_descending, self.block_range_streams.clone());
         stream_range(reads, range, is_descending, slot, source).await
     }
 
-    pub(crate) async fn published_block_range_frames<Reads: CompactBlockReads>(
+    pub(crate) async fn encoded_block_range_frames<Reads: CompactBlockReads>(
         &self,
         reads: &Reads,
         request: &lightwalletd::BlockRange,
-        (history, live_tail): (
-            Option<Arc<crate::published_range::PublishedShieldedCatalog>>,
-            crate::published_range::ShieldedTailBuffer,
-        ),
         select: fn(&[i32]) -> Result<CompactBlockShape, Status>,
     ) -> Result<lightwalletd::EncodedBlockFrameStream, Status> {
         let (range, is_descending) = block_range_from_request(request)?;
         let shape = select(&request.pool_types)?;
         let slot = self.block_range_streams.open().await?;
-        let shape = resolve_published_shape(reads, shape, range.end).await;
-        let source = crate::published_range::PublishedBatchedRangeRead::new(
-            history,
-            live_tail,
-            shape,
-            is_descending,
-            self.block_range_streams.clone(),
-        );
+        let shape = resolve_shielded_shape(reads, shape, range.end).await;
+        let source =
+            EncodedFrameRangeRead::new(shape, is_descending, self.block_range_streams.clone());
         stream_range(reads, range, is_descending, slot, source).await
     }
 
@@ -596,20 +569,22 @@ impl BlockMethods {
 }
 
 fn chunk_budget(limit: Option<&BlockRangeStreamLimit>, max_bytes: usize) -> usize {
-    limit.map_or(max_bytes, |limit| limit.published_chunk_budget(max_bytes))
+    limit.map_or(max_bytes, |limit| {
+        limit.encoded_range_chunk_budget(max_bytes)
+    })
 }
 
-async fn published_read_permit(
+async fn encoded_range_read_permit(
     limit: Option<&BlockRangeStreamLimit>,
 ) -> Result<Option<OwnedSemaphorePermit>, Status> {
     match limit {
-        Some(limit) => limit.published_read_permit().await.map(Some),
+        Some(limit) => limit.encoded_range_read_permit().await.map(Some),
         None => Ok(None),
     }
 }
 
-/// Upgrades a pool selection that omits only Ironwood to its zero-copy
-/// published shape when the current chain schedule proves Ironwood has not
+/// Upgrades a pool selection that omits only Ironwood to its default all-pool
+/// zero-copy shape when the current chain schedule proves Ironwood has not
 /// activated at or below `end`.
 ///
 /// The caller holds its ordinary stream slot first, so a saturated listener
@@ -622,17 +597,17 @@ async fn published_read_permit(
 /// while a view below the end can still lack an activation the writer admits
 /// before a later chunk's view sees the end. When Ironwood is active at or
 /// below `end`, or when the view or schedule cannot prove equivalence, the
-/// explicit selection stays in place so `PublishedRangeRead` wire-projects
-/// authenticated frames instead of slicing default frames directly.
-async fn resolve_published_shape<Reads: CompactBlockReads>(
+/// explicit selection stays in place so canonical `ZSHRNG02` streaming
+/// wire-projects the selected pools instead of slicing default frames.
+async fn resolve_shielded_shape<Reads: CompactBlockReads>(
     reads: &Reads,
     shape: CompactBlockShape,
     end: BlockHeight,
 ) -> CompactBlockShape {
-    if shape.is_zero_copy_published() {
+    if shape.is_default_shielded_shape() {
         return shape;
     }
-    let Some(equivalent) = shape.published_equivalent() else {
+    let Some(equivalent) = shape.default_shielded_equivalent() else {
         return shape;
     };
     let Ok(view) = reads.capture_ephemeral_view().await else {
@@ -653,9 +628,9 @@ async fn resolve_published_shape<Reads: CompactBlockReads>(
 async fn first_chunk_view<Reads: CompactBlockReads>(
     reads: &Reads,
     end: BlockHeight,
-    published_limit: Option<&BlockRangeStreamLimit>,
+    encoded_limit: Option<&BlockRangeStreamLimit>,
 ) -> Result<(Reads::View, Option<OwnedSemaphorePermit>), Status> {
-    let Some(limit) = published_limit else {
+    let Some(limit) = encoded_limit else {
         return Ok((checked_first_view(reads, end).await?, None));
     };
     // A request that waits for a permit holds no view, so an unadmitted
@@ -664,9 +639,9 @@ async fn first_chunk_view<Reads: CompactBlockReads>(
     let tip_view = reads.capture_ephemeral_view().await?;
     reject_future_block_height(end, Reads::view_chain_epoch(&tip_view).visible_tip_height)?;
     drop(tip_view);
-    let permit = match limit.try_published_read_permit() {
+    let permit = match limit.try_encoded_range_read_permit() {
         Some(permit) => permit,
-        None => limit.published_read_permit().await?,
+        None => limit.encoded_range_read_permit().await?,
     };
     Ok((checked_first_view(reads, end).await?, Some(permit)))
 }
@@ -688,11 +663,11 @@ async fn stream_range<Reads: CompactBlockReads, Source: RangeSource<Reads>>(
     conversion: Source,
 ) -> Result<BlockRangeResponse<Result<Source::Message, Status>>, Status> {
     let chunks = BlockRangeChunks::new(block_range, is_descending);
-    let published_limit = chunks
+    let encoded_limit = chunks
         .next_chunk()
-        .and_then(|chunk| conversion.published_read_limit(chunk, None));
-    let (view, read_permit) = first_chunk_view(reads, block_range.end, published_limit).await?;
-    let max_bytes = chunk_budget(published_limit, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES);
+        .and_then(|chunk| conversion.encoded_range_read_limit(chunk, None));
+    let (view, read_permit) = first_chunk_view(reads, block_range.end, encoded_limit).await?;
+    let max_bytes = chunk_budget(encoded_limit, BLOCK_RANGE_FIRST_CHUNK_MAX_BYTES);
     let first_cancel = CancellationToken::new();
     let _cancel_on_drop = CancelOnDrop(first_cancel.clone());
     let first_read = read_first_chunk(
@@ -908,9 +883,9 @@ pub(crate) trait RangeSource<Reads: CompactBlockReads>:
     type Chunk: RangeChunk;
     type Message: Send + 'static;
 
-    /// Returns the published-read limit if the offered chunk or its possible
-    /// retry can open signed segment files.
-    fn published_read_limit(
+    /// Returns the encoded-range read limit if the offered chunk or its possible
+    /// retry uses canonical `ZSHRNG02` / `live_tail_block` streaming.
+    fn encoded_range_read_limit(
         &self,
         _chunk: BlockHeightRange,
         _retry: Option<BlockHeightRange>,
@@ -1094,11 +1069,11 @@ async fn stream_later_chunks<Reads: CompactBlockReads, Source: RangeSource<Reads
             return;
         };
         let checked = chunks.checked_heights();
-        let limit = conversion.published_read_limit(chunk, checked.map(|(range, _)| range));
+        let limit = conversion.encoded_range_read_limit(chunk, checked.map(|(range, _)| range));
         let read_permit = tokio::select! {
             biased;
             () = sink.closed() => return,
-            admission = published_read_permit(limit) => match admission {
+            admission = encoded_range_read_permit(limit) => match admission {
                 Ok(permit) => permit,
                 Err(status) => { room.fill(vec![Err(status)]); return; }
             }
@@ -1259,7 +1234,7 @@ mod tests {
 
     use super::{
         BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, CompactBlockReads,
-        RequestedBlock, lightd_info, resolve_published_shape,
+        RequestedBlock, lightd_info, resolve_shielded_shape,
     };
     use crate::{compact_block_messages::CompactBlockShape, stale_tip::StaleTipLimit};
 
@@ -1520,8 +1495,8 @@ mod tests {
     async fn two_pool_equivalence_needs_a_view_that_reaches_the_request_end() -> Result<(), Status>
     {
         let explicit = sapling_orchard()?;
-        let published = explicit
-            .published_equivalent()
+        let default_shape = explicit
+            .default_shielded_equivalent()
             .ok_or_else(|| Status::internal("the selection omits only Ironwood"))?;
         let scheduled = zinder_testkit::sample_regtest_upgrade_activations();
         let unscheduled = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
@@ -1531,19 +1506,19 @@ mod tests {
         // it proves equivalence.
         let covering = ScriptedViews::new([(700, unscheduled.clone())]);
         assert_eq!(
-            resolve_published_shape(&covering, explicit, end).await,
-            published
+            resolve_shielded_shape(&covering, explicit, end).await,
+            default_shape
         );
         // An activation at or below the end disproves it.
         let activated = ScriptedViews::new([(700, scheduled.clone())]);
         assert_eq!(
-            resolve_published_shape(&activated, explicit, end).await,
+            resolve_shielded_shape(&activated, explicit, end).await,
             explicit
         );
         let below_activation = ScriptedViews::new([(700, scheduled.clone())]);
         assert_eq!(
-            resolve_published_shape(&below_activation, explicit, BlockHeight::new(602)).await,
-            published
+            resolve_shielded_shape(&below_activation, explicit, BlockHeight::new(602)).await,
+            default_shape
         );
 
         // The first view stops short of the end and has no activation yet; the
@@ -1551,7 +1526,7 @@ mod tests {
         // short view proves nothing, so the explicit pools stay.
         let successive = ScriptedViews::new([(100, unscheduled), (700, scheduled)]);
         assert_eq!(
-            resolve_published_shape(&successive, explicit, end).await,
+            resolve_shielded_shape(&successive, explicit, end).await,
             explicit
         );
         assert_eq!(successive.ephemeral_captures(), 1);
@@ -1559,14 +1534,15 @@ mod tests {
         Ok(())
     }
 
-    /// A request that waits for a published-read permit holds no observed
+    /// A request that waits for an encoded-range permit holds no observed
     /// view while it waits, and captures one only once it is admitted.
     #[tokio::test]
     async fn a_queued_first_chunk_captures_an_observed_view_only_once_admitted()
     -> Result<(), Status> {
         let one_stream = NonZeroU32::new(1).ok_or_else(|| Status::internal("zero streams"))?;
         let limit = crate::block_range::BlockRangeStreamLimit::new(one_stream);
-        let mut held: Vec<_> = std::iter::from_fn(|| limit.try_published_read_permit()).collect();
+        let mut held: Vec<_> =
+            std::iter::from_fn(|| limit.try_encoded_range_read_permit()).collect();
         let reads =
             ScriptedViews::new([(700, NetworkUpgradeActivations::empty(Network::ZcashRegtest))]);
         let waiting = tokio::spawn({
@@ -1615,12 +1591,7 @@ mod tests {
             ],
         };
         let refused = methods
-            .published_block_range(
-                &reads,
-                &request,
-                (None, crate::published_range::ShieldedTailBuffer::default()),
-                CompactBlockShape::for_range,
-            )
+            .encoded_block_range(&reads, &request, CompactBlockShape::for_range)
             .await;
         assert_eq!(
             refused.err().map(|status| status.code()),

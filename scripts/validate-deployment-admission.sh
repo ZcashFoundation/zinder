@@ -111,14 +111,13 @@ EOF
   configured_release_images="$(jq -r '.[]' "$release_images_catalog" | sort)"
 }
 
-validate_signed_history_compose_contract() {
+validate_compose_open_file_limits() {
   local contract_file="$1"
 
   jq -e '
     [
       "zinder-index",
-      "zinder-serve",
-      "zinder-history-publisher"
+      "zinder-serve"
     ] as $store_services
     | .services as $services
     | all($store_services[] | . as $service | select($services | has($service));
@@ -126,91 +125,6 @@ validate_signed_history_compose_contract() {
         | [.soft, .hard] | all(type == "number" and . >= 65536))
   ' "$contract_file" >/dev/null || {
     echo "release admission rejected: every Zinder store-opening service in Compose requires soft and hard open-file limits of at least 65536" >&2
-    exit 1
-  }
-
-  jq -e '
-    .services as $services
-    | . as $compose
-    | (.volumes // {}) as $volumes
-    | ($services["zinder-history-publisher"] // null) as $publisher
-    | $services["zinder-serve"] as $reader
-    | "/var/lib/zinder-history" as $catalog
-    | "/run/zinder-history/publisher.pub" as $public_key
-    | "/run/zinder-history/publisher.pk8" as $private_key
-    | (if $publisher != null then
-        ($publisher.volumes[]? | select(.target == $private_key) | .source | rtrimstr("/publisher.pk8"))
-      else
-        ($reader.volumes[]? | select(.target == $public_key) | .source | rtrimstr("/publisher.pub"))
-      end) as $generation
-    | def binds($source; $target; $readonly):
-        any(.volumes[]?; .type == "bind" and .source == $source and .target == $target
-          and ((.read_only // false) == $readonly) and (.bind.create_host_path == false));
-      def host_path:
-        if type != "string" or (startswith("/") | not) or (split("/") | index("..") != null)
-        then error("expected an absolute host mount path without parent traversal")
-        else "/" + (split("/") | map(select(. != "" and . != ".")) | join("/"))
-        end;
-      def volume_backing($mount):
-        (.driver_opts // {}) as $opts
-        | if (.driver // "local") != "local" then error("unsupported named volume driver")
-          elif $opts == {} then empty
-          else ($opts.o // "" | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $flags
-          | if ($opts | keys - ["device", "o", "type"]) == [] and ($opts.type // "none") == "none"
-               and any($flags[]; . == "bind" or . == "rbind")
-               and ($flags - ["bind", "rbind", "ro", "rw", "nodev", "nosuid", "noexec"]) == []
-               and (($mount.volume.subpath // "") | startswith("/") | not)
-            then ($opts.device | host_path) + "/" + ($mount.volume.subpath // "") | host_path
-            else error("unsupported named volume backing options") end
-          end;
-      def backing_paths($mount):
-        if $mount.type == "bind" then $mount.source | host_path
-        elif $mount.type == "tmpfs" or ($mount.type == "volume" and $mount.source == null) then empty
-        elif $mount.type == "volume" then
-          ($volumes[$mount.source] // error("undeclared named volume")) as $declared
-          | ($declared.name // $mount.source) as $name
-          | $volumes | to_entries[] | select((.value.name // .key) == $name) | .value | volume_backing($mount)
-        else error("unsupported mount type") end;
-      def granted_file($definitions):
-        (if type == "string" then . else .source end) as $source
-        | ($definitions[$source] // error("undeclared config or secret"))
-        | if .external == true then error("unresolved config or secret")
-          elif has("file") then .file | host_path
-          elif has("content") or has("environment") then empty
-          else error("unsupported config or secret source") end;
-      def permitted_source($dir; $readonly):
-        . as $path
-        | ($dir + "/publisher.pk8") as $key
-        | $path != "/" and $path != $key and ($key | startswith($path + "/") | not)
-          and (if $path == ($dir + "/publisher.pub") or $path == ($dir + "/catalog")
-                 or ($path | startswith($dir + "/catalog/"))
-               then $readonly == true else true end);
-      ($generation | host_path) as $dir
-      | $dir != "/"
-      and (if $publisher != null then
-          $publisher.network_mode == "none"
-          and $publisher.image == $reader.image
-          and ($publisher.command[0] == "run"
-            and $publisher.command[1] == "history-publisher"
-            and ($publisher.command | index("publish-shielded-history") == null)
-            and ($publisher.command | index("--follow-interval-secs") != null)
-            and ($publisher.command | index("--workers") != null))
-          and (($publisher.tmpfs // []) | any(. == "/tmp:rw,noexec,nosuid,size=512m"))
-          and ($publisher | any(.volumes[]?; .type == "volume" and .source == "data" and .target == "/var/lib/zinder" and .read_only))
-          and ($publisher | binds($generation + "/publisher.pk8"; $private_key; true))
-          and ($publisher | binds($generation + "/catalog"; $catalog; false))
-        else true end)
-      and ($reader | binds($generation + "/publisher.pub"; $public_key; true))
-      and ($reader | binds($generation + "/catalog"; $catalog; true))
-      and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY == $catalog
-      and $reader.environment.ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY == $public_key
-      and all($services | del(.["zinder-history-publisher"]) | .[];
-        (.volumes_from // [] | length) == 0
-        and all(.volumes[]?; . as $mount | all(backing_paths($mount); permitted_source($dir; $mount.read_only)))
-        and all((.configs[]? | granted_file($compose.configs)), (.secrets[]? | granted_file($compose.secrets));
-          permitted_source($dir; true)))
-  ' "$contract_file" >/dev/null || {
-    echo "release admission rejected: invalid signed wallet history publication or reader mounts" >&2
     exit 1
   }
 }
@@ -222,7 +136,7 @@ if [[ -n "$compose_contract" ]]; then
     exit 1
   }
 
-  validate_signed_history_compose_contract "$compose_contract"
+  validate_compose_open_file_limits "$compose_contract"
 
   jq -e '
     .services as $services
@@ -263,9 +177,20 @@ if [[ -n "$compose_contract" ]]; then
         "zinder-projector",
         "zinder-query",
         "zinder-compat-lightwalletd",
-        "zinder-explorer"
+        "zinder-explorer",
+        "zinder-history-publisher"
       ] | all(. as $legacy | ($services | has($legacy) | not)))
-    and all($services[]; (.volumes // []) | all(.target != "/etc/zinder/config.toml"))
+    and all($services[];
+      (.volumes // []) | all(
+        .target != "/etc/zinder/config.toml"
+        and .target != "/var/lib/zinder-history"
+        and (.target | startswith("/run/zinder-history/") | not)
+      ))
+    and all($services[];
+      ((.environment // {}) | keys | all(
+        (startswith("ZINDER_COMPAT__SHIELDED_HISTORY__") | not)
+        and (startswith("ZINDER_HISTORY_PUBLISHER__") | not)
+      )))
     and ($services["state-init"].user == "0:0")
     and ($services["state-init"].network_mode == "none")
     and ($services["state-init"].restart == "no")

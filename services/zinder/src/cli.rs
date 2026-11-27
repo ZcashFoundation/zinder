@@ -93,9 +93,6 @@ pub enum ServiceRole {
     /// Cipherscan-compatible REST adapter (`zinder-compat-cipherscan`).
     #[value(name = "compat-cipherscan", alias = "cipherscan")]
     CompatCipherscan,
-    /// Signed shielded-history catalog publisher (`publish-shielded-history`).
-    #[value(name = "history-publisher", alias = "publish-history")]
-    HistoryPublisher,
 }
 
 impl ServiceRole {
@@ -109,7 +106,6 @@ impl ServiceRole {
             Self::CompatLightwalletd => "zinder-compat-lightwalletd",
             Self::Explorer => "zinder-explorer",
             Self::CompatCipherscan => "zinder-compat-cipherscan",
-            Self::HistoryPublisher => "zinder-history-publisher",
         }
     }
 
@@ -123,7 +119,6 @@ impl ServiceRole {
             Self::CompatLightwalletd => "compat-lightwalletd",
             Self::Explorer => "explorer",
             Self::CompatCipherscan => "compat-cipherscan",
-            Self::HistoryPublisher => "history-publisher",
         }
     }
 }

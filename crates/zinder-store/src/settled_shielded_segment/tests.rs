@@ -1782,57 +1782,56 @@ fn writer_push_with_supplement_marks_wide_fees_for_reconstruction_only() -> Test
     Ok(())
 }
 
-#[test]
-fn writer_push_rejects_omitted_transparent_and_componentless_wide_fees() -> TestOutcome {
-    let dir = TempDir::new()?;
-    let wide_fee = Some(u64::from(u32::MAX) + 1);
+fn build_omitted_wide_fee_block(
+    seed: u8,
+    transparent_outputs: Vec<CompactTransparentOutput>,
+) -> Result<CompactBlockArtifact, Box<dyn std::error::Error + Send + Sync>> {
+    let h = u32::from(seed);
     let metadata = CompactChainMetadata {
         sapling_commitment_tree_size: 0,
         orchard_commitment_tree_size: 0,
         ironwood_commitment_tree_size: 0,
     };
-    let build_omitted = |seed: u8, tx_scan: CompactTransactionData| {
-        let h = u32::from(seed);
-        CompactBlockArtifact::new(
-            BlockId::new(BlockHeight::new(h), block_hash(h)),
-            block_hash(h - 1),
-            1_700_000_000 + h,
-            vec![make_tx(0, seed, tx_scan)],
-            metadata,
-        )
+    let tx_scan = CompactTransactionData {
+        fee_zat: Some(u64::from(u32::MAX) + 1),
+        transparent_outputs,
+        ..CompactTransactionData::default()
     };
-    let transparent_block = build_omitted(
-        11,
-        CompactTransactionData {
-            fee_zat: wide_fee,
-            transparent_outputs: vec![CompactTransparentOutput {
-                value_zat: 1_000,
-                script_pub_key: vec![0x51],
-            }],
-            ..CompactTransactionData::default()
-        },
-    )?;
-    let componentless_block = build_omitted(
-        12,
-        CompactTransactionData {
-            fee_zat: wide_fee,
-            ..CompactTransactionData::default()
-        },
-    )?;
+    Ok(CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(h), block_hash(h)),
+        block_hash(h - 1),
+        1_700_000_000 + h,
+        vec![make_tx(0, seed, tx_scan)],
+        metadata,
+    )?)
+}
+
+fn single_block_span(blk: &CompactBlockArtifact) -> ShieldedSegmentIdentity {
+    ShieldedSegmentIdentity::span(
+        TEST_NETWORK,
+        TEST_SCHEMA,
+        blk.height(),
+        BlockId::new(blk.height(), blk.block_hash()),
+    )
+}
+
+#[test]
+fn writer_push_rejects_omitted_transparent_and_componentless_wide_fees() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let transparent_output = CompactTransparentOutput {
+        value_zat: 1_000,
+        script_pub_key: vec![0x51],
+    };
+    let transparent_block = build_omitted_wide_fee_block(11, vec![transparent_output])?;
+    let componentless_block = build_omitted_wide_fee_block(12, Vec::new())?;
     for (idx, blk) in [&transparent_block, &componentless_block]
         .iter()
         .enumerate()
     {
-        let span = ShieldedSegmentIdentity::span(
-            TEST_NETWORK,
-            TEST_SCHEMA,
-            blk.height(),
-            BlockId::new(blk.height(), blk.block_hash()),
-        );
         let mut writer = SettledShieldedSegmentWriter::create(
             &dir.path().join(format!("strict-{idx}.zshrng02")),
             NamedTempFile::new_in(dir.path())?,
-            span,
+            single_block_span(blk),
         )?;
         assert!(matches!(
             writer.push(blk, 256),
@@ -1840,16 +1839,10 @@ fn writer_push_rejects_omitted_transparent_and_componentless_wide_fees() -> Test
         ));
     }
     let sup_path = dir.path().join("transparent-wide-sup.zshrng02");
-    let sup_span = ShieldedSegmentIdentity::span(
-        TEST_NETWORK,
-        TEST_SCHEMA,
-        transparent_block.height(),
-        BlockId::new(transparent_block.height(), transparent_block.block_hash()),
-    );
     let mut sup_writer = SettledShieldedSegmentWriter::create(
         &sup_path,
         NamedTempFile::new_in(dir.path())?,
-        sup_span,
+        single_block_span(&transparent_block),
     )?;
     sup_writer.push_with_supplement(&transparent_block, 256)?;
     let identity = sup_writer.finish()?;
@@ -1858,10 +1851,12 @@ fn writer_push_rejects_omitted_transparent_and_componentless_wide_fees() -> Test
         &identity,
         SettledShieldedSegmentOpenOptions::default(),
     )?;
-    let frames = reader.read_default_range(
-        BlockHeightRange::inclusive(transparent_block.height(), transparent_block.height()),
-        HeightOrder::Ascending,
-    )?;
+    let range = BlockHeightRange::inclusive(transparent_block.height(), transparent_block.height());
+    assert!(matches!(
+        reader.read_default_range(range, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    let frames = reader.read_default_range_for_reconstruction(range, HeightOrder::Ascending)?;
     assert_eq!(frames.len(), 1);
     Ok(())
 }

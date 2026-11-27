@@ -44,15 +44,6 @@ use crate::sections::{
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
-const HISTORY_PUBLISHER_LEAF_PATHS: &[&str] = &[
-    "history_publisher.enabled",
-    "history_publisher.directory",
-    "history_publisher.signing_key",
-    "history_publisher.first_height",
-    "history_publisher.segment_blocks",
-    "history_publisher.workers",
-    "history_publisher.follow_interval_secs",
-];
 
 const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'static str] {
     match service {
@@ -64,7 +55,6 @@ const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'st
             "cipherscan",
             "projector_control",
             "wallet",
-            "history_publisher",
         ],
         RuntimeService::Projector => &[
             "ingest",
@@ -73,7 +63,6 @@ const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'st
             "explorer",
             "cipherscan",
             "retention",
-            "history_publisher",
             "node",
             "node_fallbacks",
         ],
@@ -85,7 +74,6 @@ const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'st
             "cipherscan",
             "projector_control",
             "retention",
-            "history_publisher",
         ],
         RuntimeService::CompatLightwalletd => &[
             "ingest",
@@ -95,7 +83,6 @@ const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'st
             "cipherscan",
             "projector_control",
             "retention",
-            "history_publisher",
         ],
         RuntimeService::Explorer => &[
             "deployment",
@@ -108,7 +95,6 @@ const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'st
             "projector_control",
             "wallet",
             "retention",
-            "history_publisher",
         ],
         RuntimeService::CompatCipherscan => &[
             "deployment",
@@ -124,7 +110,6 @@ const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'st
             "projector_control",
             "wallet",
             "retention",
-            "history_publisher",
         ],
     }
 }
@@ -363,10 +348,9 @@ fn config_path_matches_doc_pattern(config_path: &str, pattern: &str) -> bool {
 }
 
 fn is_known_zinder_leaf_path(config_path: &str) -> bool {
-    HISTORY_PUBLISHER_LEAF_PATHS.contains(&config_path)
-        || crate::env_var_docs::ENVIRONMENT_VARIABLES
-            .iter()
-            .any(|doc| config_path_matches_doc_pattern(config_path, doc.toml_path))
+    crate::env_var_docs::ENVIRONMENT_VARIABLES
+        .iter()
+        .any(|doc| config_path_matches_doc_pattern(config_path, doc.toml_path))
 }
 
 fn is_unconsumed_shared_path(service: RuntimeService, config_path: &str) -> bool {

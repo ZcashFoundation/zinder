@@ -54,7 +54,7 @@ use super::{
 };
 
 /// Default number of contiguous blocks sealed per aligned settled segment stride.
-pub(crate) const DEFAULT_SETTLED_SEGMENT_BLOCKS: u32 = 4_096;
+pub const DEFAULT_SETTLED_SEGMENT_BLOCKS: u32 = 4_096;
 /// Default sealed segment byte cap (`256 MiB`) across `ZSHRNG02`, `ZSTSUP01`, and `ZSBLKB01`.
 pub(crate) const DEFAULT_MAX_SETTLED_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_STAGING_SPOOL_BYTES: u64 = 16 * 1024 * 1024 * 1024;

@@ -39,12 +39,11 @@ that boundary. The publisher keeps its own store and credentials.
   manifest required for READY admission. Export clears projection build leases
   and durable mempool events, replaces the publisher's cursor key in the copy,
   and compacts the affected families before checkpointing the export.
-- Optional opaque files beneath `sealed-history/`. The signature attests
-  their paths, lengths, and digests. The compatibility runtime retains
-  responsibility for admitting their format and chain linkage. Export refuses
-  a history source that overlaps the bundle or its staging directory, including
-  through an alias of a history subdirectory. It also
-  refuses the signing key itself and hard links to that key.
+
+Before export begins, the writer is quiesced at a boundary divisible by 4,096
+blocks (`settled_tip_height == visible_tip_height`). Export refuses any source
+workspace that aliases or overlaps `--output-dir` or its temporary staging
+directory.
 
 Each file record gives a slash-separated relative path, byte length, and
 SHA-256 digest. The receiver refuses unknown fields, duplicate or conflicting
@@ -64,15 +63,6 @@ the block after the override otherwise. Manifest preflight enforces this before
 any payload is copied or downloaded, and attestation enforces it again. A
 writer started with the same `checkpoint_height` applies the same rule, so
 normal writer startup never rejects a published bootstrap.
-
-Bundled sealed history must fit the snapshot's canonical store. When the
-compatibility runtime admits the catalog, its first segment must not start below
-the store's first retained block, and its last segment must not end above the
-settled canonical tip, which is the snapshot boundary until ingest advances. A
-bundle copies files without their fs-verity protection, so a reader that sets
-`require_fs_verity = true` needs `fsverity enable --hash-alg sha256
---block-size 4096 FILE` run on each destination segment before it admits the
-catalog.
 
 After cold admission, the receiver compares the signed anchors with evidence
 read back from the store. The configured `NodeSource` must also attest:
@@ -99,31 +89,27 @@ for the accuracy of historical rows outside those checks.
 ## Publication and recovery
 
 Bootstrap prepares the store beneath `<target>.bootstrap.staging`, with the
-stage accessible only to the current operator. The canonical and optional
-sealed-history destinations must be absent or empty, even when the bundle
-contains no sealed history. Their resolved paths must be separate from one
-another and from the private workspaces. Reservation checks device and inode
+stage accessible only to the current operator. The canonical destination must be
+absent or empty, and its resolved path must be separate from the private
+workspaces. Reservation checks device and inode
 identity as well as paths, including aliases through bind mounts. Each
 workspace holds a private marker. Recursive cleanup starts only after the
 workspace creates its marker exclusively. Before that, a reservation
 failure can remove only an empty directory with the reserved identity.
-Cleanup and sidecar rollback traverse open directory descriptors and verify
+Cleanup traverses open directory descriptors and verifies
 ownership before unlinking the directory. Bootstrap reserves workspaces before starting
 an HTTP transfer. Before publication it clears inherited projection build
 leases and mempool events, generates a fresh `cursor_auth_key` using the OS
 CSPRNG, and runs normal READY admission on the resulting store. Bootstrap pins the admitted
-canonical and optional sealed-history directories before attestation. It
+canonical directory before attestation. It
 rechecks workspace and staged directory identities before descriptor-relative
 publication. The receiver syncs files and
 directories, publishes the canonical directory by atomic no-replace rename,
 and syncs the destination parent directory. Normal ingest resumes ownership
 and follows from the snapshot tip.
 
-When a sealed-history output is requested, the receiver verifies it with the
-rest of the bundle and publishes it before the canonical rename. The two
-destinations have separate publication points. A crash between renames can
-leave verified opaque files at their destination. An ordinary failure before
-canonical publication cleans up the stage and any sidecar published by that run.
+An ordinary failure before
+canonical publication cleans up the stage.
 An interrupted process can leave private staging or download directories.
 After confirming no snapshot process is active, the operator can remove these
 directories and retry. If the parent directory sync fails after canonical
@@ -138,15 +124,14 @@ require separate qualification.
 
 With the normal ingest config and the source writer stopped, run
 `zinder-ingest export-edge-snapshot --output-dir BUNDLE --signing-key KEY.der`.
-Pass `--include-sealed-history DIR` to package opaque files from that directory.
 
 Point the receiving configuration at the empty canonical destination and
 its validator. Run `zinder-ingest bootstrap-from-snapshot --source BUNDLE
 --public-key HEX`, using a local directory or an HTTP(S) base URL for
 `BUNDLE`. Repeat `--public-key` during a publisher key transition.
-`--spot-check-blocks` sets a positive sample count, and
-`--sealed-history-output DIR` publishes the verified optional files.
+`--spot-check-blocks` sets a positive sample count.
 
 ## Revision history
 
+- 2026-11-27. Retired the optional `sealed-history/` snapshot sidecar (`--include-sealed-history` / `--sealed-history-output`) after cutting lightwalletd streaming over directly to canonical `ZSHRNG02` segments inside the canonical store.
 - 2026-11-24. Renamed topology identifier `rocksdb-single-host` to `rocksdb` to match ADR-0004.

@@ -34,7 +34,8 @@ pub(crate) struct ParityProbeRequest<'a> {
     pub(crate) wallet_serving: bool,
     pub(crate) base_tip_height: u32,
     pub(crate) final_tip_height: u32,
-    pub(crate) segment_boundary_height: u32,
+    /// Canonical settled boundary (for >=4,096 runs) or base settled tip (for live-tail-only runs).
+    pub(crate) probe_anchor_height: u32,
     pub(crate) wallet_addresses: &'a [String],
     pub(crate) probe_txids: &'a [[u8; 32]],
 }
@@ -95,10 +96,10 @@ pub(crate) async fn collect_final_tip_parity(
         .max_decoding_message_size(CLIENT_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(CLIENT_MAX_MESSAGE_BYTES);
     let settled_start = req.base_tip_height.saturating_sub(128).max(1);
-    let settled_end = req.segment_boundary_height.min(req.final_tip_height);
-    let boundary_start = req.segment_boundary_height.saturating_sub(6).max(1);
+    let settled_end = req.probe_anchor_height.min(req.final_tip_height);
+    let boundary_start = req.probe_anchor_height.saturating_sub(6).max(1);
     let tail_start = req
-        .segment_boundary_height
+        .probe_anchor_height
         .saturating_add(1)
         .min(req.final_tip_height);
 
@@ -110,11 +111,7 @@ pub(crate) async fn collect_final_tip_parity(
         hash_block_range(&mut grpc, tail_start, req.final_tip_height).await?;
     let tree_states_sha256 = hash_tree_states(
         &mut grpc,
-        &[
-            settled_start,
-            req.segment_boundary_height,
-            req.final_tip_height,
-        ],
+        &[settled_start, req.probe_anchor_height, req.final_tip_height],
     )
     .await?;
 

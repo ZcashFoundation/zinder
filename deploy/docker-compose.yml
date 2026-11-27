@@ -135,18 +135,6 @@ services:
       - data:/var/lib/zinder
       - node-cookie:/var/run/auth:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
-      - type: bind
-        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/publisher.pub
-        target: /run/zinder-history/publisher.pub
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/catalog
-        target: /var/lib/zinder-history
-        read_only: true
-        bind:
-          create_host_path: false
     command: ["serve", "--readers-only", "--preset", "${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}"]
     environment:
       ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}
@@ -164,8 +152,6 @@ services:
       ZINDER_EXPLORER__LISTEN_ADDR: "[::]:9068"
       ZINDER_CIPHERSCAN__LISTEN_ADDR: "[::]:9070"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
-      ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY: /var/lib/zinder-history
-      ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY: /run/zinder-history/publisher.pub
       # Proxy trust is an explicit opt-in after verifying the reverse proxy and network isolation.
       ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS:-false}
       ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS:-false}
@@ -176,58 +162,6 @@ services:
       timeout: 5s
       start_period: 30s
       retries: 3
-
-  zinder-history-publisher:
-    <<: *zinder-image
-    profiles: [history-publisher]
-    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-4g}
-    ulimits:
-      nofile:
-        soft: ${ZINDER_NOFILE_SOFT_LIMIT:-65536}
-        hard: ${ZINDER_NOFILE_HARD_LIMIT:-65536}
-    network_mode: none
-    restart: unless-stopped
-    depends_on:
-      zinder-index:
-        condition: service_healthy
-    healthcheck:
-      disable: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=512m
-    command:
-      - run
-      - history-publisher
-      - --canonical-primary-path
-      - /var/lib/zinder/canonical
-      - --canonical-secondary-root
-      - /tmp/secondary
-      - --reorg-window-blocks
-      - "${ZINDER_COMPAT__REORG_WINDOW_BLOCKS:-1000}"
-      - --directory
-      - /var/lib/zinder-history
-      - --signing-key
-      - /run/zinder-history/publisher.pk8
-      - --workers
-      - "${ZINDER_HISTORY_PUBLISHER_WORKERS:-1}"
-      - --follow-interval-secs
-      - "60"
-    environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
-      ZINDER_COMPAT__SERVING: compact-blocks
-      ZINDER_STORAGE__RAW_BLOB_POLICY: ${ZINDER_STORAGE__RAW_BLOB_POLICY:-none}
-    volumes:
-      - data:/var/lib/zinder:ro
-      - type: bind
-        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/publisher.pk8
-        target: /run/zinder-history/publisher.pk8
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/catalog
-        target: /var/lib/zinder-history
-        bind:
-          create_host_path: false
 
   zinder-prometheus:
     image: prom/prometheus:v3.16.0

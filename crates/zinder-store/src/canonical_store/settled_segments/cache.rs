@@ -130,9 +130,8 @@ impl CachedOpenFailure {
                 }
                 SettledShieldedSegmentError::PayloadIntegrity(_)
                 | SettledShieldedSegmentError::PayloadLimitExceeded { .. }
-                | SettledShieldedSegmentError::HeightOutOfRange { .. } => {
-                    Self::Integrity(other.to_string())
-                }
+                | SettledShieldedSegmentError::HeightOutOfRange { .. }
+                | SettledShieldedSegmentError::Cancelled => Self::Integrity(other.to_string()),
             },
             SettledSegmentsError::Supplement(other) => match other {
                 SettledSupplementSegmentError::Io(source) => Self::Io {

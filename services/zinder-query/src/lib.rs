@@ -7,6 +7,7 @@
 
 use std::{
     num::{NonZeroU16, NonZeroU32},
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 
@@ -26,13 +27,13 @@ use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_source::SourceError;
 use zinder_store::{
     ArtifactFamily, ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume,
-    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition, HeightOrder, StoreError,
+    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, StoreError,
     StreamCursorTokenV1,
 };
 
 mod broadcast_byte_budget;
 mod cold_transaction;
-mod compact_block_fence;
 mod forwarded_read;
 mod grpc;
 mod ingest_control;
@@ -54,7 +55,6 @@ mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
 
 pub use broadcast_byte_budget::BROADCAST_BYTE_BUDGET;
-pub use compact_block_fence::{CompactBlockFence, CompactBlockSource};
 pub use forwarded_read::{
     DEFAULT_FORWARDED_READ_MAX_CONCURRENT, DEFAULT_FORWARDED_READ_WAIT,
     DEFAULT_FORWARDED_READ_WAITERS_PER_SLOT, DEFAULT_FORWARDED_TRANSACTION_CACHE_BYTES,
@@ -110,6 +110,13 @@ pub use wallet_serving_pair_publisher::{
     spawn_wallet_node_readiness_probe,
 };
 pub use wallet_serving_query::WalletServingQuery;
+pub use zinder_store::{
+    EncodedCompactBlockLink as CanonicalEncodedCompactBlockLink,
+    EncodedCompactBlockOutput as CanonicalEncodedCompactBlockOutput,
+    EncodedCompactBlockPayload as CanonicalEncodedCompactBlockPayload,
+    EncodedCompactBlockRange as CanonicalEncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest as CanonicalEncodedCompactBlockRangeRequest,
+};
 /// Wallet-facing read API backed by epoch-bound canonical reads.
 ///
 /// Canonical reads take `at_epoch_id: Option<ChainEpochId>`. `None` resolves to
@@ -118,13 +125,6 @@ pub use wallet_serving_query::WalletServingQuery;
 /// instead of accepting a pin.
 #[async_trait]
 pub trait WalletQueryApi: Send + Sync + 'static {
-    /// Returns the canonical fence, retention bounds, and source of a locally
-    /// admitted epoch. Adapters can use this identity to reuse derived
-    /// compact-block bytes.
-    fn compact_block_fence(&self, _epoch: ChainEpoch) -> Option<CompactBlockFence> {
-        None
-    }
-
     /// Subscribes to replacements of the serving data this query reads, so a
     /// caller can wait for a newer visible tip without polling.
     ///
@@ -291,18 +291,18 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
 
-    /// Reads ascending compact blocks with their original stored byte lengths
-    /// up to `max_bytes`.
+    /// Reads pre-encoded lightwalletd compact-block wire payloads or batched frames
+    /// directly from canonical `ZSHRNG02` settled segments and `live_tail_block`,
+    /// bounded by `request.max_bytes` while always keeping at least one block.
     ///
-    /// Local canonical query implementations override this to supply exact
-    /// stored byte lengths for live-tail caching; implementations without
-    /// stored-length metadata may keep the default `Ok(None)`.
-    async fn compact_block_rows_with_lengths(
+    /// Implementations without direct canonical segment access keep the default
+    /// `Ok(None)` so callers can fall back to [`Self::compact_blocks_in_range_up_to`].
+    async fn encoded_compact_block_range_up_to(
         &self,
-        _block_range: BlockHeightRange,
-        _max_bytes: usize,
+        _request: EncodedCompactBlockRangeRequest,
         _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
+        _cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, QueryError> {
         Ok(None)
     }
 
@@ -1447,8 +1447,12 @@ impl QueryError {
                 Self::ChainEventCursorInvalid { reason }
             }
             StorageReadError::ReadTaskFailed { reason } => Self::BlockingTaskFailed { reason },
+            StorageReadError::ArtifactCorrupt { family, reason } => {
+                Self::ArtifactCorrupt { family, reason }
+            }
             failure @ (StorageReadError::ReaderInvalidated { .. }
-            | StorageReadError::Unavailable { .. }) => storage_failure(failure),
+            | StorageReadError::Unavailable { .. }
+            | StorageReadError::Cancelled) => storage_failure(failure),
         }
     }
 }

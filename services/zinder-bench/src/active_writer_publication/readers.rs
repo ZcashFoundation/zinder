@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use metrics_exporter_prometheus::PrometheusHandle;
 use parking_lot::Mutex;
 use prost::Message as _;
 use tokio::{sync::watch, task::JoinHandle};
@@ -26,7 +25,6 @@ use super::{
         LatencySummaryMs, MempoolTierMetrics, ProtocolErrorCounts, StreamLatencyReport,
         WalletRpcMetrics, WriterMode,
     },
-    serving::EncodedTailMetricSnapshot,
     trace::WorkloadTrace,
 };
 use crate::BenchError;
@@ -79,8 +77,6 @@ pub(crate) struct ReaderFleetContext {
     pub(crate) commit_instants: Arc<Mutex<BTreeMap<u32, Instant>>>,
     pub(crate) cancel: CancellationToken,
     pub(crate) error_collector: Arc<Mutex<ErrorCollector>>,
-    pub(crate) prom_handle: PrometheusHandle,
-    pub(crate) server_port: u16,
     pub(crate) quiescent_rotator: Option<ModeServingHandle>,
     pub(crate) rotation_requester: Option<ModeServingHandle>,
 }
@@ -90,18 +86,9 @@ pub(crate) struct ReaderFleetOutput {
     pub(crate) latest_block_rpc_ms: LatencySummaryMs,
     pub(crate) commit_to_served_tip_ms: LatencySummaryMs,
     pub(crate) catalog_range: StreamLatencyReport,
-    pub(crate) catalog_range_unpublished: StreamLatencyReport,
-    pub(crate) catalog_range_published: StreamLatencyReport,
-    pub(crate) catalog_range_during_seal: StreamLatencyReport,
     pub(crate) tail_cold_after_advance: StreamLatencyReport,
     pub(crate) tail_warm_repeat: StreamLatencyReport,
-    pub(crate) tail_unpublished_cold_after_advance: StreamLatencyReport,
-    pub(crate) tail_unpublished_warm_repeat: StreamLatencyReport,
-    pub(crate) tail_published_cold_after_advance: StreamLatencyReport,
-    pub(crate) tail_published_warm_repeat: StreamLatencyReport,
-    pub(crate) published_mismatched_span_pairs: u64,
     pub(crate) peak_tail_response_bytes: u64,
-    pub(crate) peak_encoded_tail_bytes: u64,
     pub(crate) unpaired_tail_probes: u64,
     pub(crate) slow_boundary_range: StreamLatencyReport,
     pub(crate) tree_state_ms: LatencySummaryMs,
@@ -165,7 +152,7 @@ pub(crate) fn spawn_reader_fleet(
 
         let (latest_block_rpc_ms, commit_to_served_tip_ms) =
             tip_res.map_err(|err| BenchError::canonical_read(err.to_string()))?;
-        let catalog_out = cat_res.map_err(|err| BenchError::canonical_read(err.to_string()))?;
+        let catalog_range = cat_res.map_err(|err| BenchError::canonical_read(err.to_string()))?;
         let tail_out = tail_res.map_err(|err| BenchError::canonical_read(err.to_string()))?;
         let slow_boundary_range =
             slow_res.map_err(|err| BenchError::canonical_read(err.to_string()))?;
@@ -177,19 +164,10 @@ pub(crate) fn spawn_reader_fleet(
         Ok(ReaderFleetOutput {
             latest_block_rpc_ms,
             commit_to_served_tip_ms,
-            catalog_range: catalog_out.combined,
-            catalog_range_unpublished: catalog_out.unpublished,
-            catalog_range_published: catalog_out.published,
-            catalog_range_during_seal: catalog_out.during_seal,
+            catalog_range,
             tail_cold_after_advance: tail_out.cold.finish(),
             tail_warm_repeat: tail_out.warm.finish(),
-            tail_unpublished_cold_after_advance: tail_out.unpublished_cold.finish(),
-            tail_unpublished_warm_repeat: tail_out.unpublished_warm.finish(),
-            tail_published_cold_after_advance: tail_out.published_cold.finish(),
-            tail_published_warm_repeat: tail_out.published_warm.finish(),
-            published_mismatched_span_pairs: tail_out.published_mismatched_span_pairs,
             peak_tail_response_bytes: tail_out.peak_response_bytes,
-            peak_encoded_tail_bytes: tail_out.peak_encoded_tail_bytes,
             unpaired_tail_probes: tail_out.unpaired_tail_probes,
             slow_boundary_range,
             tree_state_ms,
@@ -347,58 +325,31 @@ fn drain_committed_delays(
     }
 }
 
-#[derive(Default)]
-struct CatalogReaderOutput {
-    combined: StreamLatencyReport,
-    unpublished: StreamLatencyReport,
-    published: StreamLatencyReport,
-    during_seal: StreamLatencyReport,
-}
-
 async fn run_catalog_reader(
     channel: AuthenticatedChannel,
     mut ctx: ReaderFleetContext,
-) -> CatalogReaderOutput {
+) -> StreamLatencyReport {
     let mut client = streamer_client(channel);
-    let mut combined = StreamStatsTracker::default();
-    let mut unpublished = StreamStatsTracker::default();
-    let mut published = StreamStatsTracker::default();
-    let mut during_seal = StreamStatsTracker::default();
+    let mut tracker = StreamStatsTracker::default();
     let mut round = 0_u32;
 
     loop {
         if ctx.cancel.is_cancelled() {
             break;
         }
-        let before = *ctx.served_rx.borrow();
-        let (start_height, end_height) = ctx.trace.catalog_range(before.tip_height.max(1));
-        let sample_opt = measure_range_sample(
-            &mut client,
-            RangeProbe {
-                label: "GetBlockRange(catalog)",
-                request: range_request(start_height, end_height),
-                frame_delay: Duration::ZERO,
-                probe_id: None,
-            },
-            &ctx,
-        )
-        .await;
-        let after = *ctx.served_rx.borrow();
-
-        if let Some(sample) = sample_opt {
-            combined.record_sample(&sample);
-            let covered_before = before
-                .catalog_end_height
-                .is_some_and(|cat_end| cat_end >= end_height);
-            let covered_after = after
-                .catalog_end_height
-                .is_some_and(|cat_end| cat_end >= end_height);
-            match (covered_before, covered_after) {
-                (false, false) => unpublished.record_sample(&sample),
-                (true, true) => published.record_sample(&sample),
-                _ => during_seal.record_sample(&sample),
-            }
-        }
+        let tip = ctx.served_rx.borrow().tip_height.max(1);
+        let (start_height, end_height) = ctx.trace.catalog_range(tip);
+        tracker
+            .probe_range(
+                &mut client,
+                RangeProbe {
+                    label: "GetBlockRange(catalog)",
+                    request: range_request(start_height, end_height),
+                    frame_delay: Duration::ZERO,
+                },
+                &ctx,
+            )
+            .await;
 
         round = round.saturating_add(1);
         if should_stop_reader(&mut ctx, round) {
@@ -411,91 +362,15 @@ async fn run_catalog_reader(
         }
     }
 
-    CatalogReaderOutput {
-        combined: combined.finish(),
-        unpublished: unpublished.finish(),
-        published: published.finish(),
-        during_seal: during_seal.finish(),
-    }
+    tracker.finish()
 }
 
 #[derive(Default)]
 struct TailTrackers {
     cold: StreamStatsTracker,
     warm: StreamStatsTracker,
-    unpublished_cold: StreamStatsTracker,
-    unpublished_warm: StreamStatsTracker,
-    published_cold: StreamStatsTracker,
-    published_warm: StreamStatsTracker,
-    published_mismatched_span_pairs: u64,
     peak_response_bytes: u64,
-    peak_encoded_tail_bytes: u64,
     unpaired_tail_probes: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct VerifiedColdTail {
-    chain_epoch: u64,
-    visible_tip_height: u32,
-    catalog_end_height: u32,
-    tail_generation: u64,
-    byte_capped: bool,
-    first_range_end: u32,
-}
-
-fn tail_followups_match(
-    rest: &[crate::recorder::EncodedTailLookupRecord],
-    cold: VerifiedColdTail,
-) -> bool {
-    rest.iter().all(|ev| {
-        ev.order == "descending"
-            && ev.chain_epoch == cold.chain_epoch
-            && ev.catalog_end_height == cold.catalog_end_height
-            && ((ev.outcome == "hit" && ev.tail_generation == cold.tail_generation)
-                || (cold.byte_capped
-                    && ev.outcome == "fallback_native"
-                    && ev.range_end < cold.first_range_end))
-    })
-}
-
-fn verify_cold_tail_events(
-    events: &[crate::recorder::EncodedTailLookupRecord],
-) -> Option<VerifiedColdTail> {
-    let first = events.first()?;
-    if first.order != "descending" || first.outcome != "rebuild" || first.tail_generation == 0 {
-        return None;
-    }
-    let cold = VerifiedColdTail {
-        chain_epoch: first.chain_epoch,
-        visible_tip_height: first.visible_tip_height,
-        catalog_end_height: first.catalog_end_height,
-        tail_generation: first.tail_generation,
-        byte_capped: first.byte_capped,
-        first_range_end: first.range_end,
-    };
-    tail_followups_match(&events[1..], cold).then_some(cold)
-}
-
-fn verify_warm_tail_events(
-    events: &[crate::recorder::EncodedTailLookupRecord],
-    cold: VerifiedColdTail,
-) -> bool {
-    let Some(first) = events.first() else {
-        return false;
-    };
-    first.order == "descending"
-        && first.outcome == "hit"
-        && first.tail_generation == cold.tail_generation
-        && first.chain_epoch == cold.chain_epoch
-        && first.visible_tip_height == cold.visible_tip_height
-        && first.catalog_end_height == cold.catalog_end_height
-        && tail_followups_match(
-            &events[1..],
-            VerifiedColdTail {
-                first_range_end: first.range_end,
-                ..cold
-            },
-        )
 }
 
 async fn run_tail_refill_reader(
@@ -560,15 +435,13 @@ async fn run_active_tail_loop(
     trackers: &mut TailTrackers,
 ) {
     let mut last_tip = ctx.trace.base_tip_height;
-    let mut last_catalog_gen = ctx.served_rx.borrow().catalog_generation;
     loop {
         let served = *ctx.served_rx.borrow_and_update();
         if ctx.cancel.is_cancelled() || served.serving_caught_up_done {
             break;
         }
-        if served.tip_height > last_tip || served.catalog_generation > last_catalog_gen {
+        if served.tip_height > last_tip {
             last_tip = last_tip.max(served.tip_height);
-            last_catalog_gen = last_catalog_gen.max(served.catalog_generation);
             let (start, end) = ctx.trace.descending_tail_range(served.tip_height);
             let _ = probe_tail_pair(client, ctx, trackers, start, end).await;
             continue;
@@ -594,90 +467,66 @@ async fn probe_tail_pair(
     end: u32,
 ) -> bool {
     let req = range_request(start, end);
-    let cold_guard = crate::recorder::begin_probe_capture(ctx.server_port);
-    let cold_opt = measure_range_sample(
+    let before = *ctx.served_rx.borrow();
+    let Some(cold) = measure_range_sample(
         client,
         RangeProbe {
             label: "GetBlockRange(tail-cold)",
             request: req.clone(),
             frame_delay: Duration::ZERO,
-            probe_id: Some(cold_guard.probe_id()),
         },
         ctx,
     )
-    .await;
-    let cold_events = cold_guard.take_events();
-    let Some(cold) = cold_opt else {
+    .await
+    else {
         return false;
     };
-    if cold.retries > 0
-        || (ctx.mode != WriterMode::QuiescentControl
-            && ctx.served_rx.borrow().serving_caught_up_done)
-    {
+    let mid = *ctx.served_rx.borrow();
+    if !tail_sample_is_stable(&cold, before, mid, ctx) {
         trackers.unpaired_tail_probes = trackers.unpaired_tail_probes.saturating_add(1);
         return false;
     }
-    let Some(cold_meta) = verify_cold_tail_events(&cold_events) else {
-        trackers.unpaired_tail_probes = trackers.unpaired_tail_probes.saturating_add(1);
-        return false;
-    };
 
-    let warm_guard = crate::recorder::begin_probe_capture(ctx.server_port);
-    let warm_opt = measure_range_sample(
+    let Some(warm) = measure_range_sample(
         client,
         RangeProbe {
             label: "GetBlockRange(tail-warm)",
             request: req,
             frame_delay: Duration::ZERO,
-            probe_id: Some(warm_guard.probe_id()),
         },
         ctx,
     )
-    .await;
-    let warm_events = warm_guard.take_events();
-    let Some(warm) = warm_opt else {
+    .await
+    else {
         return false;
     };
-    if warm.retries > 0
-        || (ctx.mode != WriterMode::QuiescentControl
-            && ctx.served_rx.borrow().serving_caught_up_done)
-        || !verify_warm_tail_events(&warm_events, cold_meta)
+    let after = *ctx.served_rx.borrow();
+    if !tail_sample_is_stable(&warm, before, after, ctx)
+        || cold.frames != warm.frames
+        || cold.payload_bytes != warm.payload_bytes
     {
         trackers.unpaired_tail_probes = trackers.unpaired_tail_probes.saturating_add(1);
         return false;
     }
 
-    record_verified_tail_pair(trackers, ctx, (start, end), (cold, warm), cold_meta);
-    true
-}
-
-fn record_verified_tail_pair(
-    trackers: &mut TailTrackers,
-    ctx: &ReaderFleetContext,
-    (start, end): (u32, u32),
-    (cold, warm): (StreamSample, StreamSample),
-    cold_meta: VerifiedColdTail,
-) {
     trackers.cold.record_sample(&cold);
     trackers.warm.record_sample(&warm);
     trackers.peak_response_bytes = trackers
         .peak_response_bytes
         .max(cold.payload_bytes.max(warm.payload_bytes));
-    trackers.peak_encoded_tail_bytes = trackers
-        .peak_encoded_tail_bytes
-        .max(EncodedTailMetricSnapshot::capture(&ctx.prom_handle).current_bytes);
-    if cold_meta.catalog_end_height == 0 {
-        trackers.unpublished_cold.record_sample(&cold);
-        trackers.unpublished_warm.record_sample(&warm);
-    } else if WorkloadTrace::tail_probe_span(start, end, cold_meta.catalog_end_height)
-        == ctx.trace.published_control_tail_span()
-    {
-        trackers.published_cold.record_sample(&cold);
-        trackers.published_warm.record_sample(&warm);
-    } else {
-        trackers.published_mismatched_span_pairs =
-            trackers.published_mismatched_span_pairs.saturating_add(1);
-    }
+    true
+}
+
+fn tail_sample_is_stable(
+    sample: &StreamSample,
+    expected: ServedState,
+    observed: ServedState,
+    ctx: &ReaderFleetContext,
+) -> bool {
+    sample.retries == 0
+        && (ctx.mode == WriterMode::QuiescentControl || !observed.serving_caught_up_done)
+        && observed.epoch_id == expected.epoch_id
+        && observed.generation_seq == expected.generation_seq
 }
 
 async fn run_slow_boundary_reader(
@@ -702,7 +551,6 @@ async fn run_slow_boundary_reader(
                     label: "GetBlockRange(slow-boundary)",
                     request: range_request(start, end),
                     frame_delay,
-                    probe_id: None,
                 },
                 &ctx,
             )
@@ -1190,7 +1038,6 @@ struct RangeProbe<'a> {
     label: &'a str,
     request: BlockRange,
     frame_delay: Duration,
-    probe_id: Option<u64>,
 }
 
 impl StreamStatsTracker {
@@ -1237,7 +1084,6 @@ async fn measure_range_sample(
             client,
             probe.request.clone(),
             probe.frame_delay,
-            probe.probe_id,
             logical_started,
         );
         let step = tokio::select! {
@@ -1284,18 +1130,12 @@ async fn try_single_range_stream(
     client: &mut CompactTxStreamerClient<AuthenticatedChannel>,
     request: BlockRange,
     frame_delay: Duration,
-    probe_id: Option<u64>,
     logical_started: Instant,
 ) -> Result<StreamSample, Status> {
-    let mut tonic_req = tonic::Request::new(request);
-    if let Some(id) = probe_id
-        && let Ok(val) = id.to_string().parse()
-    {
-        tonic_req
-            .metadata_mut()
-            .insert(crate::recorder::BENCH_PROBE_ID_HEADER, val);
-    }
-    let mut stream = client.get_block_range(tonic_req).await?.into_inner();
+    let mut stream = client
+        .get_block_range(tonic::Request::new(request))
+        .await?
+        .into_inner();
     let mut first_elapsed = None;
     let mut frames = 0_u64;
     let mut payload_bytes = 0_u64;
@@ -1363,20 +1203,14 @@ mod tests {
     use super::{
         ErrorCollector, ReaderFleetContext, ServedState, TailTrackers, WriterMode, WriterProgress,
         await_commit_progress_or_done, await_next_tip_poll, drain_committed_delays,
-        run_active_tail_loop, streamer_client, verify_cold_tail_events, verify_warm_tail_events,
+        run_active_tail_loop, streamer_client,
     };
-    use crate::{
-        active_writer_publication::{
-            ActiveWriterPublicationConfig, serving::EncodedTailMetricSnapshot, trace::WorkloadTrace,
-        },
-        recorder::EncodedTailLookupRecord,
-    };
+    use crate::active_writer_publication::{ActiveWriterPublicationConfig, trace::WorkloadTrace};
 
     fn test_ctx(
         writer_rx: watch::Receiver<WriterProgress>,
         served_rx: watch::Receiver<ServedState>,
-    ) -> Result<ReaderFleetContext, Box<dyn Error>> {
-        let (prom_handle, _) = EncodedTailMetricSnapshot::install_and_capture()?;
+    ) -> ReaderFleetContext {
         let config = ActiveWriterPublicationConfig {
             base_blocks: 20,
             live_blocks: 6,
@@ -1385,8 +1219,8 @@ mod tests {
             mempool_churn_sizes: vec![10],
             ..ActiveWriterPublicationConfig::default()
         };
-        let trace = WorkloadTrace::build(&config, 16, Vec::new(), Vec::new(), Vec::new());
-        Ok(ReaderFleetContext {
+        let trace = WorkloadTrace::build(&config, 18, Vec::new(), Vec::new(), Vec::new());
+        ReaderFleetContext {
             mode: WriterMode::IngestActive,
             wallet_serving: false,
             trace,
@@ -1398,29 +1232,8 @@ mod tests {
             error_collector: std::sync::Arc::new(
                 parking_lot::Mutex::new(ErrorCollector::default()),
             ),
-            prom_handle,
-            server_port: 0,
             quiescent_rotator: None,
             rotation_requester: None,
-        })
-    }
-
-    fn lookup_event(
-        outcome: &str,
-        (tail_generation, chain_epoch, catalog_end_height): (u64, u64, u32),
-        range_end: u32,
-        byte_capped: bool,
-    ) -> EncodedTailLookupRecord {
-        EncodedTailLookupRecord {
-            order: "descending".to_owned(),
-            range_start: range_end.saturating_sub(5),
-            range_end,
-            outcome: outcome.to_owned(),
-            chain_epoch,
-            visible_tip_height: 26,
-            catalog_end_height,
-            tail_generation,
-            byte_capped,
         }
     }
 
@@ -1429,7 +1242,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let (writer_tx, writer_rx) = watch::channel(WriterProgress::default());
         let (_served_tx, served_rx) = watch::channel(ServedState::default());
-        let ctx = test_ctx(writer_rx, served_rx)?;
+        let ctx = test_ctx(writer_rx, served_rx);
 
         let noop_waker = Waker::noop();
         {
@@ -1448,44 +1261,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn verify_cold_and_warm_tail_events_require_matching_rebuild_hit_and_snapshot() {
-        let cold_rebuild = [lookup_event("rebuild", (11, 5, 16), 26, false)];
-        let verified = verify_cold_tail_events(&cold_rebuild);
-        assert!(verified.is_some());
-        let Some(cold_meta) = verified else {
-            return;
-        };
-        assert!(verify_warm_tail_events(
-            &[lookup_event("hit", (11, 5, 16), 26, false)],
-            cold_meta,
-        ));
-        assert!(!verify_warm_tail_events(
-            &[lookup_event("hit", (12, 5, 16), 26, false)],
-            cold_meta,
-        ));
-        assert!(!verify_warm_tail_events(
-            &[lookup_event("hit", (11, 6, 16), 26, false)],
-            cold_meta,
-        ));
-        assert!(!verify_warm_tail_events(
-            &[lookup_event("hit", (11, 5, 32), 26, false)],
-            cold_meta,
-        ));
-        assert!(verify_cold_tail_events(&[lookup_event("hit", (11, 5, 16), 26, false)]).is_none());
-
-        let capped_cold = [
-            lookup_event("rebuild", (15, 7, 0), 26, true),
-            lookup_event("fallback_native", (0, 7, 0), 18, false),
-        ];
-        assert!(verify_cold_tail_events(&capped_cold).is_some());
-        let bad_uncapped = [
-            lookup_event("rebuild", (15, 7, 0), 26, false),
-            lookup_event("fallback_native", (0, 7, 0), 18, false),
-        ];
-        assert!(verify_cold_tail_events(&bad_uncapped).is_none());
-    }
-
     #[tokio::test]
     async fn coalesced_serving_caught_up_done_stops_active_tail_loop_before_idle_probe()
     -> Result<(), Box<dyn Error>> {
@@ -1494,11 +1269,9 @@ mod tests {
             tip_height: 26,
             epoch_id: 2,
             generation_seq: 2,
-            catalog_end_height: None,
-            catalog_generation: 0,
             serving_caught_up_done: true,
         });
-        let mut ctx = test_ctx(writer_rx, served_rx)?;
+        let mut ctx = test_ctx(writer_rx, served_rx);
         let channel = tonic::service::interceptor::InterceptedService::new(
             tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
             zinder_runtime::BearerTokenClientInterceptor::new(None)?,
@@ -1543,7 +1316,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let (_writer_tx, writer_rx) = watch::channel(WriterProgress::default());
         let (served_tx, served_rx) = watch::channel(ServedState::default());
-        let mut ctx = test_ctx(writer_rx, served_rx)?;
+        let mut ctx = test_ctx(writer_rx, served_rx);
         served_tx.send_modify(|state| state.serving_caught_up_done = true);
         drop(served_tx);
         let _ = *ctx.served_rx.borrow_and_update();
@@ -1567,7 +1340,7 @@ mod tests {
 
         let (_writer_tx2, writer_rx2) = watch::channel(WriterProgress::default());
         let (abnormal_tx, abnormal_rx) = watch::channel(ServedState::default());
-        let mut abnormal_ctx = test_ctx(writer_rx2, abnormal_rx)?;
+        let mut abnormal_ctx = test_ctx(writer_rx2, abnormal_rx);
         drop(abnormal_tx);
         let mut abnormal_open = true;
         let abnormal = tokio::time::timeout(

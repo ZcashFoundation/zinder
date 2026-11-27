@@ -106,9 +106,6 @@ async fn run_single_role(args: cli::RunArgs) -> ExitCode {
         ServiceRole::CompatCipherscan => {
             zinder_compat_cipherscan::runtime::run_from_args(forwarded).await
         }
-        ServiceRole::HistoryPublisher => {
-            zinder_compat_lightwalletd::runtime::run_history_publisher_from_args(forwarded).await
-        }
     }
 }
 

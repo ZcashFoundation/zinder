@@ -1,9 +1,7 @@
-//! Production-faithful 2-generation secondary publishers, swappable
-//! wallet-serving query, supervised single-server lifecycle, and Prometheus
-//! `EncodedTail` counter delta scraping.
+//! Two-generation secondary publishers, swappable wallet-serving query, and
+//! supervised single-server lifecycle.
 
 use std::{
-    borrow::Borrow,
     collections::VecDeque,
     net::SocketAddr,
     num::{NonZeroU16, NonZeroU32},
@@ -16,7 +14,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use metrics_exporter_prometheus::PrometheusHandle;
 use parking_lot::Mutex;
 use tokio::{
     net::TcpListener,
@@ -27,41 +24,37 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use zinder_compat_lightwalletd::{
-    CanonicalReaderSlot, LightwalletdGrpcAdapter, PublishedShieldedHistory, SharedMempoolSurface,
-    SharedTipChangeWatcher, TipWait,
+    CanonicalReaderSlot, LightwalletdGrpcAdapter, SharedMempoolSurface, SharedTipChangeWatcher,
+    TipWait,
 };
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockSelector, CanonicalHistoryBounds, ChainEpoch, ChainEpochId,
-    ChainValuePoolsAtTip, CompactBlockArtifact, Network, NetworkUpgradeActivations,
-    RawTransactionBytes, StandardFee, SubtreeRootRange, TransactionBroadcastOutcome, TransactionId,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentOutPoint,
+    ChainValuePoolsAtTip, Network, NetworkUpgradeActivations, RawTransactionBytes, StandardFee,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressBalance,
+    TransparentAddressScriptHash, TransparentOutPoint,
 };
 use zinder_query::{
-    BlockHeaderAtEpoch, BlockIdAtEpoch, CanonicalReader, ChainEvents, CompactBlock,
-    CompactBlockFence, CompactBlockRange, CompactBlockStream, ForwardedReadLimit, FullBlock,
-    FullBlockStream, NativeWalletEndpointCapabilities, QueryError, RawTransaction,
-    RocksDbCanonicalReader, RocksDbWalletReader, ServedTipSnapshot, ServedTreeStateHex,
-    SettledTipBlock, StorageReadError, SubtreeRoots, Transaction, TransactionStatus,
-    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
-    TransparentOutpointSpendStatuses, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
-    WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    BlockHeaderAtEpoch, BlockIdAtEpoch, CanonicalReader as _, ChainEvents, CompactBlock,
+    CompactBlockRange, CompactBlockStream, ForwardedReadLimit, FullBlock, FullBlockStream,
+    NativeWalletEndpointCapabilities, QueryError, RawTransaction, RocksDbCanonicalReader,
+    RocksDbWalletReader, ServedTipSnapshot, ServedTreeStateHex, SettledTipBlock, StorageReadError,
+    SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
+    UpstreamNodeCapabilities, VisibleTipBlock, WalletQueryApi, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{NodeAuth, ZebraJsonRpcSource};
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreRequirements, ChainEventStreamFamily,
-    ChainEventStreamResume, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    RocksDbCanonicalSecondary, RocksDbResourceBudget, SharedSecondaryResources,
-    StreamCursorTokenV1,
+    ChainEventStreamResume, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
+    EventStreamStartPosition, HeightOrder, RawBlobRetention, RocksDbCanonicalSecondary,
+    RocksDbResourceBudget, SharedSecondaryResources, StreamCursorTokenV1,
 };
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
 
 use super::report::{StoreTickerDelta, TickerCounterSnapshot};
-use crate::{
-    BenchError,
-    metrics_scrape::{MetricSample, parse_prometheus_samples, sum_by_name},
-    recorder::install_recorder,
-};
+use crate::BenchError;
 
 const TWO_GENERATION_SLOTS: usize = 2;
 const WALLET_GENERATION_SLOTS: usize = 4;
@@ -107,26 +100,6 @@ pub(crate) fn catch_up_wallet_secondary(
 /// projector compaction removed an SST file needed by a stale secondary view.
 pub(crate) const fn is_storage_read_invalidated(err: &StorageReadError) -> bool {
     matches!(err, StorageReadError::ReaderInvalidated { .. })
-}
-
-/// Borrowable wrapper so [`PublishedShieldedHistory`] accepts a dynamic
-/// [`CanonicalReader`] captured from either serving mode.
-pub(crate) struct CapturedCanonical(pub(crate) Arc<RocksDbCanonicalReader>);
-
-impl Borrow<dyn CanonicalReader> for CapturedCanonical {
-    fn borrow(&self) -> &(dyn CanonicalReader + 'static) {
-        self.0.as_ref()
-    }
-}
-
-/// Borrowable wrapper so [`PublishedShieldedHistory`] accepts a captured
-/// [`WalletServingReadPair`] without holding the slot lock.
-pub(crate) struct CapturedWalletPair(pub(crate) Arc<WalletServingReadPair>);
-
-impl Borrow<dyn CanonicalReader> for CapturedWalletPair {
-    fn borrow(&self) -> &(dyn CanonicalReader + 'static) {
-        self.0.canonical()
-    }
 }
 
 struct PublishedWalletViews {
@@ -247,8 +220,15 @@ fn swap_published_views(
 
 #[async_trait]
 impl WalletQueryApi for SwappableWalletQuery {
-    fn compact_block_fence(&self, epoch: ChainEpoch) -> Option<CompactBlockFence> {
-        self.for_epoch(Some(epoch.id)).compact_block_fence(epoch)
+    async fn encoded_compact_block_range_up_to(
+        &self,
+        request: EncodedCompactBlockRangeRequest,
+        at_epoch_id: Option<ChainEpochId>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, QueryError> {
+        self.for_epoch(at_epoch_id)
+            .encoded_compact_block_range_up_to(request, at_epoch_id, cancel)
+            .await
     }
 
     fn subscribe_publications(&self) -> Option<watch::Receiver<()>> {
@@ -364,17 +344,6 @@ impl WalletQueryApi for SwappableWalletQuery {
     ) -> Result<CompactBlockRange, QueryError> {
         self.for_epoch(at_epoch_id)
             .compact_blocks_in_range_up_to(block_range, order, max_bytes, at_epoch_id)
-            .await
-    }
-
-    async fn compact_block_rows_with_lengths(
-        &self,
-        block_range: BlockHeightRange,
-        max_bytes: usize,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
-        self.for_epoch(at_epoch_id)
-            .compact_block_rows_with_lengths(block_range, max_bytes, at_epoch_id)
             .await
     }
 
@@ -1321,129 +1290,6 @@ fn build_wallet_serving_pair(
     Ok(Arc::new(pair))
 }
 
-/// Captures `zinder-compat-lightwalletd` `EncodedTail` Prometheus metrics before
-/// and after one benchmark mode run.
-pub(crate) struct EncodedTailMetricSnapshot {
-    pub(crate) hit: u64,
-    pub(crate) fallback_native: u64,
-    pub(crate) bypass: u64,
-    pub(crate) fill_rebuild: u64,
-    pub(crate) fill_prepend: u64,
-    pub(crate) byte_capped_fills: u64,
-    pub(crate) byte_cap_evictions: u64,
-    pub(crate) current_bytes: u64,
-}
-
-impl EncodedTailMetricSnapshot {
-    /// Parses the global Prometheus exposition handle.
-    pub(crate) fn capture(handle: &PrometheusHandle) -> Self {
-        let samples = parse_prometheus_samples(&handle.render());
-        Self::from_samples(&samples)
-    }
-
-    pub(crate) fn install_and_capture() -> Result<(PrometheusHandle, Self), BenchError> {
-        let handle = install_recorder()?;
-        let snap = Self::capture(&handle);
-        Ok((handle, snap))
-    }
-
-    fn from_samples(samples: &[MetricSample]) -> Self {
-        Self {
-            hit: labeled_counter(
-                samples,
-                "zinder_compat_encoded_tail_lookups_total",
-                "outcome",
-                "hit",
-            ),
-            fallback_native: labeled_counter(
-                samples,
-                "zinder_compat_encoded_tail_lookups_total",
-                "outcome",
-                "fallback_native",
-            ),
-            bypass: labeled_counter(
-                samples,
-                "zinder_compat_encoded_tail_lookups_total",
-                "outcome",
-                "bypass",
-            ),
-            fill_rebuild: labeled_counter(
-                samples,
-                "zinder_compat_encoded_tail_fills_total",
-                "kind",
-                "rebuild",
-            ),
-            fill_prepend: labeled_counter(
-                samples,
-                "zinder_compat_encoded_tail_fills_total",
-                "kind",
-                "prepend",
-            ),
-            byte_capped_fills: u64_from_f64_saturating(sum_by_name(
-                samples,
-                "zinder_compat_encoded_tail_byte_capped_fills_total",
-            )),
-            byte_cap_evictions: u64_from_f64_saturating(sum_by_name(
-                samples,
-                "zinder_compat_encoded_tail_byte_cap_evictions_total",
-            )),
-            current_bytes: u64_from_f64_saturating(sum_by_name(
-                samples,
-                "zinder_compat_encoded_tail_bytes",
-            )),
-        }
-    }
-
-    pub(crate) fn delta_since(&self, before: &Self) -> EncodedTailMetricDelta {
-        EncodedTailMetricDelta {
-            hits: self.hit.saturating_sub(before.hit),
-            fills: self
-                .fill_rebuild
-                .saturating_sub(before.fill_rebuild)
-                .saturating_add(self.fill_prepend.saturating_sub(before.fill_prepend)),
-            fallback_native: self.fallback_native.saturating_sub(before.fallback_native),
-            bypass: self.bypass.saturating_sub(before.bypass),
-            byte_capped_fills: self
-                .byte_capped_fills
-                .saturating_sub(before.byte_capped_fills),
-            byte_cap_evictions: self
-                .byte_cap_evictions
-                .saturating_sub(before.byte_cap_evictions),
-        }
-    }
-}
-
-pub(crate) struct EncodedTailMetricDelta {
-    pub(crate) hits: u64,
-    pub(crate) fills: u64,
-    pub(crate) fallback_native: u64,
-    pub(crate) bypass: u64,
-    pub(crate) byte_capped_fills: u64,
-    pub(crate) byte_cap_evictions: u64,
-}
-
-fn labeled_counter(samples: &[MetricSample], name: &str, key: &str, expected_label: &str) -> u64 {
-    let reading: f64 = samples
-        .iter()
-        .filter(|sample| sample.name == name && sample.label(key) == Some(expected_label))
-        .map(|sample| sample.reading)
-        .sum();
-    u64_from_f64_saturating(reading)
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "Prometheus counter and gauge totals are non-negative integers"
-)]
-fn u64_from_f64_saturating(raw_sample: f64) -> u64 {
-    if raw_sample.is_finite() && raw_sample > 0.0 {
-        raw_sample.round() as u64
-    } else {
-        0
-    }
-}
-
 /// Supervised single gRPC listener per mode with clean shutdown and exit check.
 pub(crate) struct SupervisedGrpcServer {
     pub(crate) addr: SocketAddr,
@@ -1455,7 +1301,6 @@ impl SupervisedGrpcServer {
     /// Spawns one canonical-only compatibility listener (`ingest_active`).
     pub(crate) async fn spawn_canonical_only(
         slot: CanonicalReaderSlot,
-        history: Arc<PublishedShieldedHistory>,
         mempool: SharedMempoolSurface,
         tip_watcher: SharedTipChangeWatcher,
     ) -> Result<Self, BenchError> {
@@ -1472,29 +1317,13 @@ impl SupervisedGrpcServer {
             NonZeroU32::new(4).unwrap_or(NonZeroU32::MIN),
             ForwardedReadLimit::default(),
         )
-        .with_published_shielded_history(history)
         .with_mempool_surface(mempool)
         .with_tip_change_watcher(tip_watcher)
         .with_tip_wait(TipWait::default());
         let (addr, incoming, shutdown_tx, shutdown_rx) = bind_listener().await?;
-        let port = addr.port();
         let service = adapter.into_server();
         let handle = tokio::spawn(async move {
             Server::builder()
-                .trace_fn(move |req| {
-                    let probe_id = req
-                        .headers()
-                        .get(crate::recorder::BENCH_PROBE_ID_HEADER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    tracing::debug_span!(
-                        target: crate::recorder::BENCH_SERVER_SPAN_TARGET,
-                        "bench_grpc_request",
-                        server_port = u64::from(port),
-                        probe_id
-                    )
-                })
                 .add_service(service)
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = shutdown_rx.await;
@@ -1512,34 +1341,17 @@ impl SupervisedGrpcServer {
     /// Spawns one full wallet-projection compatibility listener.
     pub(crate) async fn spawn_wallet_serving(
         query: SwappableWalletQuery,
-        history: Arc<PublishedShieldedHistory>,
         mempool: SharedMempoolSurface,
         tip_watcher: SharedTipChangeWatcher,
     ) -> Result<Self, BenchError> {
         let adapter = LightwalletdGrpcAdapter::new(query)
-            .with_published_shielded_history(history)
             .with_mempool_surface(mempool)
             .with_tip_change_watcher(tip_watcher)
             .with_tip_wait(TipWait::default());
         let (addr, incoming, shutdown_tx, shutdown_rx) = bind_listener().await?;
-        let port = addr.port();
         let service = adapter.into_server();
         let handle = tokio::spawn(async move {
             Server::builder()
-                .trace_fn(move |req| {
-                    let probe_id = req
-                        .headers()
-                        .get(crate::recorder::BENCH_PROBE_ID_HEADER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    tracing::debug_span!(
-                        target: crate::recorder::BENCH_SERVER_SPAN_TARGET,
-                        "bench_grpc_request",
-                        server_port = u64::from(port),
-                        probe_id
-                    )
-                })
                 .add_service(service)
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = shutdown_rx.await;
@@ -1616,11 +1428,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use zinder_core::{BlockHeight, BlockHeightRange, ChainEpoch, TransparentAddressScriptHash};
     use zinder_query::{CanonicalReader as _, WalletQueryApi as _};
-    use zinder_store::{RocksDbIoMode, RocksDbResourceBudget};
+    use zinder_store::{
+        EncodedCompactBlockOutput, EncodedCompactBlockRangeRequest, HeightOrder, RocksDbIoMode,
+        RocksDbResourceBudget, ShieldedProjectionSelection,
+    };
 
     use super::{
-        EncodedTailMetricSnapshot, TwoGenCanonicalPublisher, TwoGenWalletPairPublisher,
-        WalletPairOpenConfig, capture_canonical_sec_tickers, capture_wallet_sec_tickers,
+        TwoGenCanonicalPublisher, TwoGenWalletPairPublisher, WalletPairOpenConfig,
+        capture_canonical_sec_tickers, capture_wallet_sec_tickers,
     };
     use crate::{
         BenchError,
@@ -1718,7 +1533,6 @@ mod tests {
         let (_, _, seq_after) = publisher.rotate_generation_for_cold_tail(&cancel).await?;
         assert!(seq_after > last_seq);
         publisher.wait_reclaim_all().await;
-        let _ = EncodedTailMetricSnapshot::install_and_capture()?;
         Ok(())
     }
 
@@ -1765,7 +1579,24 @@ mod tests {
         let (_, _, rotated_seq) = publisher.try_catch_up_and_publish().await?;
         assert!(rotated_seq > 1);
         assert!(!publisher.has_rotation_request());
-        assert!(query.compact_block_fence(initial_epoch).is_some());
+        let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(16));
+        assert!(
+            query
+                .encoded_compact_block_range_up_to(
+                    EncodedCompactBlockRangeRequest {
+                        range,
+                        order: HeightOrder::Ascending,
+                        selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                        output: EncodedCompactBlockOutput::Blocks,
+                        max_bytes: 1024 * 1024,
+                        enforce_wire_fee_limit: true,
+                    },
+                    Some(initial_epoch.id),
+                    None,
+                )
+                .await?
+                .is_some()
+        );
         publisher.wait_reclaim_all().await;
         Ok(())
     }

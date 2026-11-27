@@ -13,7 +13,7 @@
 
 use std::{
     num::{NonZeroU16, NonZeroU32},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use async_trait::async_trait;
@@ -26,9 +26,9 @@ use zinder_core::{
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence,
     CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily,
-    ChainEventStreamResume, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    RocksDbCanonicalSecondary, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
-    TreeStateReplay, TreeStateReplayOutcome,
+    ChainEventStreamResume, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
+    EventStreamStartPosition, HeightOrder, RawBlobRetention, RocksDbCanonicalSecondary,
+    ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
@@ -298,13 +298,15 @@ impl CanonicalReader for RocksDbCanonicalReader {
             .await
     }
 
-    async fn compact_block_rows_with_lengths(
+    async fn encoded_compact_block_range_up_to(
         &self,
-        range: BlockHeightRange,
-        max_bytes: usize,
-    ) -> Result<Vec<(CompactBlockArtifact, usize)>, StorageReadError> {
-        self.read(move |secondary| secondary.compact_block_rows_with_lengths(range, max_bytes))
-            .await
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, StorageReadError> {
+        self.read(move |secondary| {
+            secondary.encoded_compact_block_range_up_to(request, cancel.as_deref())
+        })
+        .await
     }
 
     async fn block_blob_at(
@@ -731,6 +733,10 @@ fn canonical_read_error(error: CanonicalStoreError) -> StorageReadError {
                 reason: "cursor version is unsupported",
             }
         }
+        CanonicalStoreError::ArtifactCorrupt { family, reason } => {
+            StorageReadError::ArtifactCorrupt { family, reason }
+        }
+        CanonicalStoreError::ReplayCancelled => StorageReadError::Cancelled,
         other => StorageReadError::Unavailable {
             source: Box::new(other),
         },

@@ -920,6 +920,11 @@ fn shared_read_error(error: Arc<StorageReadError>) -> QueryError {
             oldest_retained_sequence,
         },
         E::ChainEventCursorInvalid { reason } => E::ChainEventCursorInvalid { reason },
+        E::ArtifactCorrupt { family, ref reason } => E::ArtifactCorrupt {
+            family,
+            reason: reason.clone(),
+        },
+        E::Cancelled => E::Cancelled,
     };
     QueryError::canonical_read(copy)
 }

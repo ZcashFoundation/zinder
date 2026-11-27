@@ -141,13 +141,13 @@ impl CanonicalReader for GatedBatchCanonicalReader {
             .await
     }
 
-    async fn compact_block_rows_with_lengths(
+    async fn encoded_compact_block_range_up_to(
         &self,
-        range: BlockHeightRange,
-        max_bytes: usize,
-    ) -> Result<Vec<(CompactBlockArtifact, usize)>, StorageReadError> {
+        request: zinder_store::EncodedCompactBlockRangeRequest,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Option<zinder_store::EncodedCompactBlockRange>, StorageReadError> {
         self.inner
-            .compact_block_rows_with_lengths(range, max_bytes)
+            .encoded_compact_block_range_up_to(request, cancel)
             .await
     }
 

@@ -769,7 +769,8 @@ fn commitment_count(tree_sizes: ChainTipMetadata) -> u64 {
 /// does not decode, to that stride, so the pass can skip it.
 fn within_stride(stride: TreeStateStride, error: CanonicalStoreError) -> CanonicalStoreError {
     if let CanonicalStoreError::PublicationRefused { reason }
-    | CanonicalStoreError::SettledSegment { reason } = error
+    | CanonicalStoreError::SettledSegment { reason }
+    | CanonicalStoreError::ArtifactCorrupt { reason, .. } = error
     {
         return stride_mismatch(stride, reason);
     }

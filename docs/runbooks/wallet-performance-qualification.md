@@ -66,6 +66,6 @@ For restore performance, run the same wallet cohort on the same frozen window an
 
 For moving-tip behavior, append the same block on both arms and check the published height and hash. Measure the first request after publication separately from repeated requests. Record CPU and canonical MultiGet calls, keys, and bytes at several request rates. [Disposable wallet Regtest fixtures](testing.md#disposable-wallet-regtest-fixtures)
 
-For startup and replacement, hold the binary and store fixed. Vary signed catalog coverage and filesystem protection. Record time to READY, resident memory, physical reads, open descriptors, and wire parity. Include overlapping reader generations when measuring peak memory. [Signed-history deployment](deploying-on-a-vm.md)
+For startup and replacement, hold the binary and store fixed. Record time to READY, resident memory, physical reads, open descriptors, and wire parity across canonical `ZSHRNG02` settled segments and live tail reads. Include overlapping reader generations when measuring peak memory. [VM deployment](deploying-on-a-vm.md)
 
 Construction and cross-host topology have separate qualification procedures. [Initial sync](initial-sync.md) · [Storage benchmark](../../deploy/storage-benchmark.md) · [Topology decision](../adrs/0004-storage-and-deployment-topologies.md)

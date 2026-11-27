@@ -1,4 +1,4 @@
-mod published_range;
+mod canonical_range;
 
 use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
@@ -249,16 +249,28 @@ async fn read_web_response(
         .get("grpc-status")
         .map(|code| code.to_str()?.parse::<i32>().map_err(eyre::Report::from))
         .transpose()?;
-    let mut body = response.bytes().await?;
-    if encoding == TEXT_CONTENT_TYPE {
+    let body = response.bytes().await?;
+    decode_web_frames(&body, encoding, header_status, expected_status)
+}
+
+fn decode_web_frames(
+    body: &[u8],
+    encoding: &str,
+    header_status: Option<i32>,
+    expected_status: i32,
+) -> Result<Vec<Vec<u8>>> {
+    let decoded;
+    let mut remaining = if encoding == TEXT_CONTENT_TYPE {
         // A flush can introduce base64 padding before the end of the stream.
-        let mut decoded = Vec::new();
+        let mut buf = Vec::new();
         for quartet in body.chunks(4) {
-            STANDARD.decode_vec(quartet, &mut decoded)?;
+            STANDARD.decode_vec(quartet, &mut buf)?;
         }
-        body = decoded.into();
-    }
-    let mut remaining = body.as_ref();
+        decoded = buf;
+        decoded.as_slice()
+    } else {
+        body
+    };
     let mut trailer_status = None;
     let mut messages = Vec::new();
     while !remaining.is_empty() {
@@ -299,7 +311,6 @@ struct CompatProcess {
     control: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     storage: tempfile::TempDir,
     writer: CanonicalWriterFixture,
-    writer_control: MutableCanonicalControl,
 }
 
 impl Drop for CompatProcess {
@@ -310,23 +321,6 @@ impl Drop for CompatProcess {
 
 impl CompatProcess {
     async fn start(serving: &str, origin: Option<&str>) -> Result<Self> {
-        Self::start_with_history(serving, origin, "").await
-    }
-
-    async fn start_with_history(
-        serving: &str,
-        origin: Option<&str>,
-        history: &str,
-    ) -> Result<Self> {
-        Self::start_with_history_in(serving, origin, history, tempfile::tempdir()?).await
-    }
-
-    async fn start_with_history_in(
-        serving: &str,
-        origin: Option<&str>,
-        history: &str,
-        storage: tempfile::TempDir,
-    ) -> Result<Self> {
         let network = Network::ZcashRegtest;
         let retention = if serving == "wallet" {
             RawBlobRetention::All
@@ -340,6 +334,17 @@ impl CompatProcess {
             &CanonicalBaseline::new(&chain),
             &sample_regtest_upgrade_activations(),
         )?;
+        Self::start_with_writer(serving, origin, writer, retention).await
+    }
+
+    async fn start_with_writer(
+        serving: &str,
+        origin: Option<&str>,
+        writer: CanonicalWriterFixture,
+        retention: RawBlobRetention,
+    ) -> Result<Self> {
+        let storage = tempfile::tempdir()?;
+        let network = Network::ZcashRegtest;
         let primary = writer.canonical_primary()?;
         let wallet_config = if serving == "wallet" {
             build_wallet_config(primary, storage.path())?
@@ -356,7 +361,6 @@ impl CompatProcess {
         let control_service = MutableCanonicalControl {
             status: Arc::new(Mutex::new(status)),
         };
-        let writer_control = control_service.clone();
         let control = tokio::spawn(async move {
             Server::builder()
                 .add_service(IngestControlServer::new(IngestControlFixtureService::new(
@@ -378,7 +382,7 @@ impl CompatProcess {
                  secondary_path = \"{}\"\nraw_blob_policy = \"{retention}\"\n{wallet_config}\n\
                  [ops]\nlisten_addr = \"127.0.0.1:0\"\n[ingest_control]\naddr = \"http://{control_addr}\"\n\
                  [compat]\nserving = \"{serving}\"\nlisten_addr = \"127.0.0.1:0\"\n\
-                 reorg_window_blocks = 100\nstale_tip_limit_ms = 0\n{origin_setting}\n{history}\n",
+                 reorg_window_blocks = 100\nstale_tip_limit_ms = 0\n{origin_setting}\n",
                 reader.display(),
             ),
         )?;
@@ -391,7 +395,6 @@ impl CompatProcess {
             control,
             storage,
             writer,
-            writer_control,
         })
     }
 
@@ -422,22 +425,32 @@ impl CompatProcess {
         encoding: &str,
         message: &impl Message,
     ) -> Result<Response> {
-        let mut body = vec![0];
-        body.extend_from_slice(&u32::try_from(message.encoded_len())?.to_be_bytes());
-        message.encode(&mut body)?;
-        if encoding == TEXT_CONTENT_TYPE {
-            body = STANDARD.encode(&body).into_bytes();
-        }
-        Ok(http
-            .post(self.method_url(method))
-            .header(header::ORIGIN, ORIGIN)
-            .header(header::CONTENT_TYPE, encoding)
-            .header(header::ACCEPT, encoding)
-            .header("x-grpc-web", "1")
-            .body(body)
-            .send()
-            .await?)
+        post_web_request(http, self.addr, method, encoding, message).await
     }
+}
+
+async fn post_web_request(
+    http: &Client,
+    addr: SocketAddr,
+    method: &str,
+    encoding: &str,
+    message: &impl Message,
+) -> Result<Response> {
+    let mut body = vec![0];
+    body.extend_from_slice(&u32::try_from(message.encoded_len())?.to_be_bytes());
+    message.encode(&mut body)?;
+    if encoding == TEXT_CONTENT_TYPE {
+        body = STANDARD.encode(&body).into_bytes();
+    }
+    Ok(http
+        .post(format!("http://{addr}/{SERVICE}/{method}"))
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::CONTENT_TYPE, encoding)
+        .header(header::ACCEPT, encoding)
+        .header("x-grpc-web", "1")
+        .body(body)
+        .send()
+        .await?)
 }
 
 async fn start_listener(config: &Path, log: &Path) -> Result<(SocketAddr, tokio::process::Child)> {

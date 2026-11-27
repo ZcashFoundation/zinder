@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
 };
 
@@ -22,15 +21,14 @@ use crate::{
 };
 
 use super::{
-    ConfigScope, HistoryPublisherPlan, RoleLaunchSpec, SupervisionPlan, SupervisorMode,
-    UnifiedConfigError, validate::ValidatedRoleRenderings,
+    ConfigScope, RoleLaunchSpec, SupervisionPlan, SupervisorMode, UnifiedConfigError,
+    validate::ValidatedRoleRenderings,
 };
 
 const DEFAULT_INDEX_OPS_LISTEN_ADDR: &str = "127.0.0.1:9105";
 const DEFAULT_INGEST_CONTROL_ADDR: &str = "127.0.0.1:9100";
 const DEFAULT_QUERY_ADDR: &str = "127.0.0.1:9102";
 const DEFAULT_EXPLORER_ADDR: &str = "127.0.0.1:9068";
-const DEFAULT_HISTORY_FOLLOW_INTERVAL_SECS: u32 = 60;
 
 const ALLOWED_TOP_LEVEL_SECTIONS: &[&str] = &[
     "deployment",
@@ -50,7 +48,6 @@ const ALLOWED_TOP_LEVEL_SECTIONS: &[&str] = &[
     "compat",
     "explorer",
     "cipherscan",
-    "history_publisher",
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -65,9 +62,7 @@ struct CombinedMetaRaw {
     ingest_control: IngestControlSection,
     projector_control: ProjectorControlSection,
     query: ListenOnlySection,
-    compat: CompatMetaSection,
     explorer: ExplorerMetaSection,
-    history_publisher: HistoryPublisherSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -104,33 +99,9 @@ struct ListenOnlySection {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct CompatMetaSection {
-    shielded_history: Option<CompatShieldedHistoryMeta>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct CompatShieldedHistoryMeta {
-    directory: Option<PathBuf>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
 struct ExplorerMetaSection {
     listen_addr: Option<String>,
     wallet_query_endpoint: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct HistoryPublisherSection {
-    enabled: Option<bool>,
-    directory: Option<PathBuf>,
-    signing_key: Option<PathBuf>,
-    first_height: Option<u32>,
-    segment_blocks: Option<NonZeroU32>,
-    workers: Option<NonZeroUsize>,
-    follow_interval_secs: Option<NonZeroU32>,
 }
 
 struct DerivedWiring {
@@ -151,7 +122,6 @@ struct DerivedWiring {
     generated_read_token: Option<String>,
     generated_checkpoint_token: Option<String>,
     generated_projector_token: Option<String>,
-    history_publisher: Option<HistoryPublisherPlan>,
 }
 
 pub(super) fn build_supervision_plan(
@@ -169,7 +139,7 @@ pub(super) fn build_supervision_plan(
         .map(Preset::deployment_profile)
         .or(meta.deployment.profile);
     let profile = explicit_profile.unwrap_or(DeploymentProfile::Wallet);
-    let active_roles = active_roles_for(scope.mode, profile, scope.readers_only, &meta)?;
+    let active_roles = active_roles_for(scope.mode, profile, scope.readers_only)?;
     let wiring = derive_wiring(
         scope,
         &meta,
@@ -194,7 +164,6 @@ pub(super) fn build_supervision_plan(
         ingest_control_addr: wiring.ingest_control_addr,
         query_listen_addr: wiring.query_listen_addr,
         explorer_listen_addr: wiring.explorer_listen_addr,
-        history_publisher: wiring.history_publisher,
         roles,
         redacted_sections: ValidatedRoleRenderings::default(),
     })
@@ -268,7 +237,6 @@ fn active_roles_for(
     mode: SupervisorMode,
     profile: DeploymentProfile,
     readers_only: bool,
-    meta: &CombinedMetaRaw,
 ) -> Result<Vec<ServiceRole>, UnifiedConfigError> {
     if mode == SupervisorMode::Index {
         return match profile {
@@ -282,7 +250,6 @@ fn active_roles_for(
             ))),
         };
     }
-    let publisher_enabled = is_history_publisher_enabled(meta)?;
     let mut roles = Vec::new();
     match profile {
         DeploymentProfile::LightWallet => {
@@ -290,9 +257,6 @@ fn active_roles_for(
                 roles.push(ServiceRole::Ingest);
             }
             roles.push(ServiceRole::CompatLightwalletd);
-            if !readers_only && publisher_enabled {
-                roles.push(ServiceRole::HistoryPublisher);
-            }
         }
         DeploymentProfile::Wallet | DeploymentProfile::WalletArchive => {
             if !readers_only {
@@ -301,9 +265,6 @@ fn active_roles_for(
             }
             roles.push(ServiceRole::Query);
             roles.push(ServiceRole::CompatLightwalletd);
-            if !readers_only && publisher_enabled {
-                roles.push(ServiceRole::HistoryPublisher);
-            }
         }
         DeploymentProfile::Explorer => {
             if !readers_only {
@@ -314,9 +275,6 @@ fn active_roles_for(
             roles.push(ServiceRole::CompatLightwalletd);
             roles.push(ServiceRole::Explorer);
             roles.push(ServiceRole::CompatCipherscan);
-            if !readers_only && publisher_enabled {
-                roles.push(ServiceRole::HistoryPublisher);
-            }
         }
         _ => {
             return Err(UnifiedConfigError::Invalid(format!(
@@ -326,21 +284,6 @@ fn active_roles_for(
         }
     }
     Ok(roles)
-}
-
-fn is_history_publisher_enabled(meta: &CombinedMetaRaw) -> Result<bool, UnifiedConfigError> {
-    if meta.history_publisher.enabled == Some(false) {
-        return Ok(false);
-    }
-    if meta.history_publisher.signing_key.is_some() {
-        return Ok(true);
-    }
-    if meta.history_publisher.enabled == Some(true) {
-        return Err(UnifiedConfigError::Invalid(
-            "history_publisher.enabled = true requires history_publisher.signing_key".to_owned(),
-        ));
-    }
-    Ok(false)
 }
 
 fn derive_wiring(
@@ -381,7 +324,6 @@ fn derive_wiring(
     let generated_projector_token =
         generate_projector_control_token(meta, active_roles.contains(&ServiceRole::Projector))?;
     let (query_listen_addr, explorer_listen_addr) = resolve_explorer_endpoints(meta, active_roles)?;
-    let history_publisher = resolve_history_publisher_plan(meta, active_roles)?;
 
     Ok(DerivedWiring {
         profile,
@@ -401,7 +343,6 @@ fn derive_wiring(
         generated_read_token,
         generated_checkpoint_token,
         generated_projector_token,
-        history_publisher,
     })
 }
 
@@ -557,51 +498,6 @@ fn resolve_explorer_endpoints(
     Ok((query_addr, explorer_addr))
 }
 
-fn resolve_history_publisher_plan(
-    meta: &CombinedMetaRaw,
-    active_roles: &[ServiceRole],
-) -> Result<Option<HistoryPublisherPlan>, UnifiedConfigError> {
-    if !active_roles.contains(&ServiceRole::HistoryPublisher) {
-        return Ok(None);
-    }
-    let signing_key = meta.history_publisher.signing_key.clone().ok_or_else(|| {
-        UnifiedConfigError::Invalid(
-            "history_publisher.signing_key is required when history publisher is enabled"
-                .to_owned(),
-        )
-    })?;
-    let directory = meta
-        .history_publisher
-        .directory
-        .clone()
-        .or_else(|| {
-            meta.compat
-                .shielded_history
-                .as_ref()
-                .and_then(|sh| sh.directory.clone())
-        })
-        .ok_or_else(|| {
-            UnifiedConfigError::Invalid(
-                "history_publisher.directory or compat.shielded_history.directory is required when publishing shielded history"
-                    .to_owned(),
-            )
-        })?;
-    let follow_interval_secs = meta
-        .history_publisher
-        .follow_interval_secs
-        .unwrap_or_else(|| {
-            NonZeroU32::new(DEFAULT_HISTORY_FOLLOW_INTERVAL_SECS).unwrap_or(NonZeroU32::MIN)
-        });
-    Ok(Some(HistoryPublisherPlan {
-        directory,
-        signing_key,
-        first_height: meta.history_publisher.first_height,
-        segment_blocks: meta.history_publisher.segment_blocks,
-        workers: meta.history_publisher.workers,
-        follow_interval_secs,
-    }))
-}
-
 const fn loopback_target(addr: SocketAddr) -> SocketAddr {
     match addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => {
@@ -631,7 +527,7 @@ fn build_role_spec(
         role,
         filtered_toml,
         filtered_env,
-        required_for_readyz: role != ServiceRole::HistoryPublisher,
+        required_for_readyz: true,
     })
 }
 
@@ -663,13 +559,6 @@ fn filter_toml_for_role(
             "ingest_control" => {
                 if let TomlValue::Table(tbl) = section_val {
                     TomlValue::Table(filter_ingest_control_table(role, tbl))
-                } else {
-                    section_val.clone()
-                }
-            }
-            "compat" if role == ServiceRole::HistoryPublisher => {
-                if let TomlValue::Table(tbl) = section_val {
-                    TomlValue::Table(filter_history_publisher_compat(tbl))
                 } else {
                     section_val.clone()
                 }
@@ -746,12 +635,6 @@ fn role_accepts_section(role: ServiceRole, section: &str, profile: DeploymentPro
         ServiceRole::CompatCipherscan => {
             matches!(section, "network" | "ops" | "security" | "cipherscan")
         }
-        ServiceRole::HistoryPublisher => {
-            matches!(
-                section,
-                "network" | "ops" | "security" | "compat" | "storage"
-            )
-        }
     }
 }
 
@@ -777,7 +660,7 @@ fn filter_storage_table(
             "full_blocks",
             "canonical",
         ],
-        ServiceRole::Query | ServiceRole::CompatLightwalletd | ServiceRole::HistoryPublisher => &[
+        ServiceRole::Query | ServiceRole::CompatLightwalletd => &[
             "data_dir",
             "path",
             "secondary_path",
@@ -858,18 +741,6 @@ fn filter_ingest_control_table(role: ServiceRole, table: &toml::Table) -> toml::
         }
         filtered.insert(field.clone(), val.clone());
     }
-    filtered
-}
-
-fn filter_history_publisher_compat(table: &toml::Table) -> toml::Table {
-    let mut filtered = toml::Table::new();
-    if let Some(reorg) = table.get("reorg_window_blocks") {
-        filtered.insert("reorg_window_blocks".to_owned(), reorg.clone());
-    }
-    filtered.insert(
-        "serving".to_owned(),
-        TomlValue::String("compact-blocks".to_owned()),
-    );
     filtered
 }
 
@@ -957,10 +828,7 @@ fn apply_secondary_storage_paths(
                 ServiceRole::Query => "query",
                 ServiceRole::CompatLightwalletd => "compat-lightwalletd",
                 ServiceRole::Explorer => "explorer",
-                ServiceRole::Ingest
-                | ServiceRole::Projector
-                | ServiceRole::CompatCipherscan
-                | ServiceRole::HistoryPublisher => "",
+                ServiceRole::Ingest | ServiceRole::Projector | ServiceRole::CompatCipherscan => "",
             };
             if let Some(sec_val) = storage_tbl
                 .get("secondary_path")
@@ -985,30 +853,6 @@ fn apply_secondary_storage_paths(
                 );
             }
         }
-        ServiceRole::HistoryPublisher => {
-            let sec = wiring.effective_data_dir.as_ref().map_or_else(
-                || {
-                    storage_tbl
-                        .get("secondary_path")
-                        .and_then(TomlValue::as_str)
-                        .map_or_else(
-                            || {
-                                let base = wiring
-                                    .secondary_base
-                                    .as_deref()
-                                    .unwrap_or_else(|| Path::new(DEFAULT_DATA_DIR));
-                                derive_canonical_secondary_path(base, "history-publisher")
-                            },
-                            |sec_val| Path::new(sec_val).join("history-publisher"),
-                        )
-                },
-                |dir| derive_canonical_secondary_path(dir, "history-publisher"),
-            );
-            storage_tbl.insert(
-                "secondary_path".to_owned(),
-                TomlValue::String(sec.display().to_string()),
-            );
-        }
         ServiceRole::Ingest | ServiceRole::Projector | ServiceRole::CompatCipherscan => {}
     }
 }
@@ -1029,8 +873,7 @@ fn apply_wallet_secondary_overrides(
         ServiceRole::Ingest
         | ServiceRole::Projector
         | ServiceRole::Explorer
-        | ServiceRole::CompatCipherscan
-        | ServiceRole::HistoryPublisher => "",
+        | ServiceRole::CompatCipherscan => "",
     };
     if let Some(TomlValue::Table(wallet_tbl)) = table.get_mut("wallet")
         && let Some(sec) = wallet_tbl.get("secondary_path").and_then(TomlValue::as_str)
@@ -1123,8 +966,7 @@ fn apply_unprofiled_transaction_defaults(role: ServiceRole, table: &mut toml::Ta
         ServiceRole::Projector
         | ServiceRole::Query
         | ServiceRole::Explorer
-        | ServiceRole::CompatCipherscan
-        | ServiceRole::HistoryPublisher => {}
+        | ServiceRole::CompatCipherscan => {}
     }
 }
 
@@ -1164,12 +1006,6 @@ fn filter_env_for_role(
         if !role_accepts_env_subfield(role, section, field_path) {
             continue;
         }
-        if role == ServiceRole::HistoryPublisher
-            && section == "compat"
-            && field_path != "reorg_window_blocks"
-        {
-            continue;
-        }
         if section == "ops" && field_path == "listen_addr" {
             continue;
         }
@@ -1184,10 +1020,7 @@ fn filter_env_for_role(
             && field_path == "secondary_path"
             && matches!(
                 role,
-                ServiceRole::Query
-                    | ServiceRole::CompatLightwalletd
-                    | ServiceRole::Explorer
-                    | ServiceRole::HistoryPublisher
+                ServiceRole::Query | ServiceRole::CompatLightwalletd | ServiceRole::Explorer
             )
         {
             continue;
@@ -1225,9 +1058,7 @@ fn role_accepts_env_subfield(role: ServiceRole, section: &str, field_path: &str)
                     | "full_blocks"
                     | "canonical"
             ),
-            ServiceRole::Query
-            | ServiceRole::CompatLightwalletd
-            | ServiceRole::HistoryPublisher => matches!(
+            ServiceRole::Query | ServiceRole::CompatLightwalletd => matches!(
                 top_field,
                 "data_dir"
                     | "path"

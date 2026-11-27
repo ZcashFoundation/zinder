@@ -1079,17 +1079,8 @@ impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<NodeBackedLight
         self.block_methods
             .await_range_tip(&self.query_api.slot, "get_encoded_block_range", &request)
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range(
-                &self.query_api.slot,
-                &request,
-                range,
-                CompactBlockShape::for_range,
-            )
+            .encoded_block_range(&self.query_api.slot, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }
@@ -1106,15 +1097,10 @@ impl lightwalletd::EncodedBlockRange for LightwalletdGrpcAdapter<NodeBackedLight
         self.block_methods
             .await_range_tip(&self.query_api.slot, "get_encoded_block_range", &request)
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range_frames(
+            .encoded_block_range_frames(
                 &self.query_api.slot,
                 &request,
-                range,
                 CompactBlockShape::for_range,
             )
             .await
@@ -1136,15 +1122,10 @@ impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<NodeB
                 &request,
             )
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range(
+            .encoded_block_range(
                 &self.query_api.slot,
                 &request,
-                range,
                 CompactBlockShape::for_nullifier_range,
             )
             .await
@@ -1167,15 +1148,10 @@ impl lightwalletd::EncodedBlockRangeNullifiers for LightwalletdGrpcAdapter<NodeB
                 &request,
             )
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range_frames(
+            .encoded_block_range_frames(
                 &self.query_api.slot,
                 &request,
-                range,
                 CompactBlockShape::for_nullifier_range,
             )
             .await
