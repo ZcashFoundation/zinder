@@ -305,7 +305,14 @@ where
             return Either::Left(self.inner.call(request));
         };
         if request.method() != http::Method::POST {
-            return Either::Left(self.inner.call(request));
+            return Either::Right(Box::pin(async {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = http::StatusCode::METHOD_NOT_ALLOWED;
+                response
+                    .headers_mut()
+                    .insert(http::header::ALLOW, http::HeaderValue::from_static("POST"));
+                Ok(response)
+            }));
         }
         let method = WalletRpcMethod {
             surface: self.surface.label(),
@@ -722,6 +729,38 @@ mod tests {
             assert_eq!(described, measured);
             assert_eq!(described.len(), surface.methods().len());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_post_native_block_range_never_reaches_dispatch() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let service = WalletRpcMetricsLayer::WalletQuery
+            .with_range_admission(
+                GrpcRangeAdmission::default(),
+                ClientAddressSource::Connection,
+            )
+            .layer(service_fn(|_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                future::ready(Ok::<_, Infallible>(Response::new(Body::empty())))
+            }));
+        let request = |method| {
+            Request::builder()
+                .method(method)
+                .uri("/zinder.v1.wallet.WalletQuery/CompactBlocksInRange")
+                .body(Body::empty())
+        };
+
+        let refused = service.clone().oneshot(request(http::Method::GET)?).await?;
+        assert_eq!(refused.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(refused.headers()[http::header::ALLOW], "POST");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let admitted = service.oneshot(request(http::Method::POST)?).await?;
+        assert_eq!(admitted.status(), http::StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
         Ok(())
     }
 
