@@ -251,7 +251,7 @@ services:
     image: ${ZINDER_BENCH_PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e}
     profiles: [postgres-segmented]
     restart: "no"
-    cpus: ${ZINDER_BENCH_PGBOUNCER_CPUS:-1.0}
+    cpus: ${ZINDER_BENCH_PGBOUNCER_CPUS:-0.5}
     mem_limit: ${ZINDER_BENCH_PGBOUNCER_MEMORY_LIMIT_BYTES:-536870912}
     networks: [storage-benchmark]
     depends_on:
@@ -281,8 +281,8 @@ services:
     restart: "no"
     init: true
     cgroup: private
-    cpus: ${ZINDER_BENCH_POSTGRES_CLIENT_CPUS:-2.0}
-    mem_limit: ${ZINDER_BENCH_POSTGRES_CLIENT_MEMORY_LIMIT_BYTES:-8589934592}
+    cpus: ${ZINDER_BENCH_SEGMENTED_CLIENT_CPUS:-1.5}
+    mem_limit: ${ZINDER_BENCH_SEGMENTED_CLIENT_MEMORY_LIMIT_BYTES:-8053063680}
     networks: [storage-benchmark]
     depends_on:
       postgres-database:
@@ -333,15 +333,21 @@ services:
       - --memory-limit-bytes
       - ${ZINDER_BENCH_POSTGRES_TOTAL_MEMORY_LIMIT_BYTES:-17179869184}
       - --client-cpu-limit-cores
-      - ${ZINDER_BENCH_POSTGRES_CLIENT_CPUS:-2.0}
+      - ${ZINDER_BENCH_SEGMENTED_CLIENT_CPUS:-1.5}
       - --client-memory-limit-bytes
-      - ${ZINDER_BENCH_POSTGRES_CLIENT_MEMORY_LIMIT_BYTES:-8589934592}
+      - ${ZINDER_BENCH_SEGMENTED_CLIENT_MEMORY_LIMIT_BYTES:-8053063680}
       - --database-cpu-limit-cores
       - ${ZINDER_BENCH_POSTGRES_DATABASE_CPUS:-6.0}
       - --database-memory-limit-bytes
       - ${ZINDER_BENCH_POSTGRES_DATABASE_MEMORY_LIMIT_BYTES:-8589934592}
       - --database-image-reference
       - ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+      - --pooler-cpu-limit-cores
+      - ${ZINDER_BENCH_PGBOUNCER_CPUS:-0.5}
+      - --pooler-memory-limit-bytes
+      - ${ZINDER_BENCH_PGBOUNCER_MEMORY_LIMIT_BYTES:-536870912}
+      - --pooler-image-reference
+      - ${ZINDER_BENCH_PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e}
       - --storage-class
       - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
       - --image-reference

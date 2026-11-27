@@ -1,17 +1,22 @@
-//! Tip-following commit loop, mempool churn driver, bounded live-tail sealing,
-//! and nearest-rank latency statistics.
+//! Streaming tip-following commit loop, mempool churn driver, pre-commit
+//! atomic live-tail settlement, and nearest-rank latency statistics.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
 use zinder_core::{BlockHeight, Network};
+use zinder_source::NodeSource;
 
 use crate::error::BenchError;
+use crate::fixture::FixtureNodeSource;
 
 use super::database::{candidate_error, postgres_error, u32_to_i64, usize_to_i64};
-use super::loader::{TipCommitPayload, persist_sealed_tail_transition, persist_tip_block_in_txn};
+use super::loader::{
+    PendingSealTransition, StreamingPrepareState, TipCommitPayload, WriterFenceHandle,
+    persist_tip_block_in_txn,
+};
 use super::segment_builder::{PreparedSegmentedBlock, seal_settled_segments};
 use super::wallet_projection::ProvisionalWalletProjection;
 
@@ -66,8 +71,10 @@ fn nearest_rank(sorted: &[f64], percentile: usize) -> f64 {
 pub struct TipFollowParameters {
     /// Active network.
     pub network: Network,
-    /// Validated target PostgreSQL schema name.
+    /// Validated target `PostgreSQL` schema name.
     pub schema_name: String,
+    /// Active fenced writer term verified on every tip commit.
+    pub fence: WriterFenceHandle,
     /// First block height of the benchmark chain.
     pub first_height: BlockHeight,
     /// Whether `ZSBLKB01` / `raw_block_bytes` retention is enabled.
@@ -80,6 +87,16 @@ pub struct TipFollowParameters {
     pub live_tail_max_blocks: u32,
     /// Number of synthetic mempool transactions admitted+evicted per tip block.
     pub mempool_churn_txs_per_block: u32,
+}
+
+/// Shared source + preparation + wallet accumulator advanced across tip blocks.
+pub struct TipAdvanceTarget<'a> {
+    /// Random-access streaming fixture block source.
+    pub source: &'a FixtureNodeSource,
+    /// Shared canonical sequence & tree-size preparation accumulator.
+    pub prepare_state: &'a mut StreamingPrepareState,
+    /// Provisional wallet projection state updated upon commit.
+    pub wallet_projection: &'a mut ProvisionalWalletProjection,
 }
 
 /// Accumulated tip-follow outcome returned at end of both tip-follow phases.
@@ -103,6 +120,7 @@ pub struct TipFollowRunMetrics {
 pub struct TipFollowState {
     network: Network,
     schema_name: String,
+    fence: WriterFenceHandle,
     first_height: BlockHeight,
     full_blocks: bool,
     max_segment_bytes: u64,
@@ -116,6 +134,7 @@ pub struct TipFollowState {
     tail_seal_transitions: u64,
     mempool_admits: u64,
     mempool_evictions: u64,
+    extra_prepare_duration: Duration,
 }
 
 impl TipFollowState {
@@ -129,6 +148,7 @@ impl TipFollowState {
         Self {
             network: params.network,
             schema_name: params.schema_name,
+            fence: params.fence,
             first_height: params.first_height,
             full_blocks: params.full_blocks,
             max_segment_bytes: params.max_segment_bytes,
@@ -142,61 +162,151 @@ impl TipFollowState {
             tail_seal_transitions: 0,
             mempool_admits: 0,
             mempool_evictions: 0,
+            extra_prepare_duration: Duration::ZERO,
         }
     }
 
-    /// Commits each block sequentially: admits mempool entries, atomically persists tip
-    /// block + writer fence + wallet delta + mined mempool evictions, and seals excess tail.
-    pub async fn advance_blocks(
+    /// Streams `[start_height..=end_height]` one block at a time, admits mempool entries,
+    /// pre-seals any excess tail batch, and atomically commits tip + settlement under fence.
+    pub async fn advance_height_range(
         &mut self,
         client: &mut Client,
-        tip_blocks: &[PreparedSegmentedBlock],
-        wallet_projection: &mut ProvisionalWalletProjection,
+        target: &mut TipAdvanceTarget<'_>,
+        height_range: Option<(u32, u32)>,
     ) -> Result<LatencyPercentilesMillis, BenchError> {
-        let mut commit_samples_ms = Vec::with_capacity(tip_blocks.len());
-        for block in tip_blocks {
-            let started = Instant::now();
-            self.admit_mempool_entries(client, block.height).await?;
-
-            let staged_wallet = wallet_projection.stage_block(&block.facts)?;
-            let evict_count = self.planned_mined_eviction_count();
-            let evicted_txids: Vec<[u8; 32]> = self
-                .active_mempool_txids
-                .iter()
-                .take(evict_count)
-                .copied()
-                .collect();
-
-            let txn = client
-                .transaction()
+        let Some((start_h, end_h)) = height_range else {
+            return Ok(LatencyPercentilesMillis::default());
+        };
+        if start_h > end_h {
+            return Ok(LatencyPercentilesMillis::default());
+        }
+        let block_span = usize::try_from(end_h - start_h + 1).unwrap_or(0);
+        let mut commit_samples_ms = Vec::with_capacity(block_span);
+        for height_val in start_h..=end_h {
+            let prep_started = Instant::now();
+            let source_block = target
+                .source
+                .fetch_block_at(BlockHeight::new(height_val))
                 .await
-                .map_err(|err| postgres_error("starting tip-follow transaction", &err))?;
-            let payload = TipCommitPayload {
-                full_blocks: self.full_blocks,
-                first_height: self.first_height,
-                block,
-                wallet_delta: &staged_wallet.delta,
-                evicted_mempool_txids: &evicted_txids,
-            };
-            persist_tip_block_in_txn(&txn, &self.schema_name, &payload).await?;
-            txn.commit()
-                .await
-                .map_err(|err| postgres_error("committing tip-follow transaction", &err))?;
+                .map_err(|err| {
+                    candidate_error(format!("fetching tip block {height_val}: {err}"))
+                })?;
+            let block = target.prepare_state.prepare_source_block(&source_block)?;
+            self.extra_prepare_duration += prep_started.elapsed();
 
-            wallet_projection.commit_staged(staged_wallet);
-            for _ in 0..evicted_txids.len() {
-                let _ = self.active_mempool_txids.pop_front();
-            }
-            self.mempool_evictions = self
-                .mempool_evictions
-                .saturating_add(u64::try_from(evicted_txids.len()).unwrap_or(0));
-
-            self.tail_buffer.push(block.clone());
-            self.seal_excess_tail_if_needed(client).await?;
-
-            commit_samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            let commit_ms = self
+                .commit_prepared_tip_block(client, &block, target.wallet_projection)
+                .await?;
+            self.tail_buffer.push(block);
+            commit_samples_ms.push(commit_ms);
         }
         Ok(LatencyPercentilesMillis::from_samples(&commit_samples_ms))
+    }
+
+    async fn commit_prepared_tip_block(
+        &mut self,
+        client: &mut Client,
+        block: &PreparedSegmentedBlock,
+        wallet_projection: &mut ProvisionalWalletProjection,
+    ) -> Result<f64, BenchError> {
+        let started = Instant::now();
+        self.admit_mempool_entries(client, block.height).await?;
+
+        let staged_wallet = wallet_projection.stage_block(&block.facts)?;
+        let evict_count = self.planned_mined_eviction_count();
+        let evicted_txids: Vec<[u8; 32]> = self
+            .active_mempool_txids
+            .iter()
+            .take(evict_count)
+            .copied()
+            .collect();
+        let pending_seal = self.prepare_precommit_seal_transition().await?;
+
+        let txn = client
+            .transaction()
+            .await
+            .map_err(|err| postgres_error("starting tip-follow transaction", &err))?;
+        let payload = TipCommitPayload {
+            fence: self.fence,
+            full_blocks: self.full_blocks,
+            first_height: self.first_height,
+            block,
+            wallet_delta: &staged_wallet.delta,
+            evicted_mempool_txids: &evicted_txids,
+            pending_seal: pending_seal.as_ref(),
+        };
+        persist_tip_block_in_txn(&txn, &self.schema_name, &payload).await?;
+        txn.commit()
+            .await
+            .map_err(|err| postgres_error("committing tip-follow transaction", &err))?;
+
+        wallet_projection.commit_staged(staged_wallet);
+        for _ in 0..evicted_txids.len() {
+            let _ = self.active_mempool_txids.pop_front();
+        }
+        self.mempool_evictions = self
+            .mempool_evictions
+            .saturating_add(u64::try_from(evicted_txids.len()).unwrap_or(0));
+
+        if let Some(seal) = pending_seal {
+            self.tail_buffer.drain(..seal.seal_count);
+            self.max_segment_bytes_observed = self
+                .max_segment_bytes_observed
+                .max(seal.max_segment_bytes_observed);
+            self.tail_seal_transitions = self.tail_seal_transitions.saturating_add(1);
+        }
+
+        Ok(started.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    async fn prepare_precommit_seal_transition(
+        &self,
+    ) -> Result<Option<PendingSealTransition>, BenchError> {
+        let max_tail = usize::try_from(self.live_tail_max_blocks)
+            .unwrap_or(128)
+            .max(1);
+        let projected_len = self.tail_buffer.len().saturating_add(1);
+        if projected_len <= max_tail || self.tail_buffer.is_empty() {
+            return Ok(None);
+        }
+        let excess = projected_len.saturating_sub(max_tail);
+        let preferred_batch = (self.tail_buffer.len() / 2).max(excess).min(
+            usize::try_from(self.settled_segment_blocks)
+                .unwrap_or(1)
+                .max(excess),
+        );
+        let seal_count = preferred_batch.min(self.tail_buffer.len());
+        let candidate_slice = self.tail_buffer[..seal_count].to_vec();
+        let last = candidate_slice
+            .last()
+            .ok_or_else(|| candidate_error("empty tail seal slice"))?;
+        let settled_height = last.height;
+        let settled_hash = last.block_hash;
+        let settled_prev = last.previous_block_hash;
+
+        let sealed = seal_settled_segments(
+            self.network,
+            candidate_slice,
+            self.settled_segment_blocks,
+            self.full_blocks,
+            self.max_segment_bytes,
+        )
+        .await?;
+
+        Ok(Some(PendingSealTransition {
+            bundles: sealed.bundles,
+            settled_height,
+            settled_hash,
+            settled_prev,
+            seal_count,
+            max_segment_bytes_observed: sealed.max_segment_bytes_observed,
+        }))
+    }
+
+    /// Returns extra source-prepare duration accumulated while streaming tip blocks.
+    #[must_use]
+    pub const fn extra_prepare_duration(&self) -> Duration {
+        self.extra_prepare_duration
     }
 
     /// Returns cumulative mempool/sealing totals alongside uncontended & contended percentiles.
@@ -245,10 +355,10 @@ impl TipFollowState {
             .await
             .map_err(|err| postgres_error("starting mempool admit txn", &err))?;
 
-        let mut next_seq = self.mempool_seq_counter;
+        let mut bumped_seq = self.mempool_seq_counter;
         for _ in 0..self.mempool_churn_txs_per_block {
-            next_seq = next_seq.saturating_add(1);
-            let txid = synthetic_mempool_txid(block_height, next_seq);
+            bumped_seq = bumped_seq.saturating_add(1);
+            let txid = synthetic_mempool_txid(block_height, bumped_seq);
             let payload = vec![0x05_u8; 256];
             let payload_len = usize_to_i64(payload.len(), "mempool tx len")?;
             txn.execute(
@@ -273,52 +383,11 @@ impl TipFollowState {
             .await
             .map_err(|err| postgres_error("committing mempool admit txn", &err))?;
 
-        self.mempool_seq_counter = next_seq;
+        self.mempool_seq_counter = bumped_seq;
         self.mempool_admits = self
             .mempool_admits
             .saturating_add(u64::try_from(staged_txids.len()).unwrap_or(0));
         self.active_mempool_txids.extend(staged_txids);
-        Ok(())
-    }
-
-    async fn seal_excess_tail_if_needed(&mut self, client: &mut Client) -> Result<(), BenchError> {
-        let max_tail = usize::try_from(self.live_tail_max_blocks).unwrap_or(128);
-        if self.tail_buffer.len() <= max_tail {
-            return Ok(());
-        }
-        let excess = self.tail_buffer.len().saturating_sub(max_tail);
-        let preferred_batch = (self.tail_buffer.len() / 2)
-            .max(excess)
-            .min(usize::try_from(self.settled_segment_blocks).unwrap_or(1));
-        let seal_count = preferred_batch.min(self.tail_buffer.len());
-        let candidate_slice = self.tail_buffer[..seal_count].to_vec();
-        let last = candidate_slice
-            .last()
-            .ok_or_else(|| candidate_error("empty tail seal slice"))?;
-        let last_block = (last.height, last.block_hash, last.previous_block_hash);
-
-        let sealed_output = seal_settled_segments(
-            self.network,
-            candidate_slice,
-            self.settled_segment_blocks,
-            self.full_blocks,
-            self.max_segment_bytes,
-        )
-        .await?;
-        persist_sealed_tail_transition(
-            client,
-            &self.schema_name,
-            self.full_blocks,
-            &sealed_output.bundles,
-            last_block,
-        )
-        .await?;
-
-        self.tail_buffer.drain(..seal_count);
-        self.max_segment_bytes_observed = self
-            .max_segment_bytes_observed
-            .max(sealed_output.max_segment_bytes_observed);
-        self.tail_seal_transitions = self.tail_seal_transitions.saturating_add(1);
         Ok(())
     }
 }

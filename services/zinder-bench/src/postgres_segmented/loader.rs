@@ -1,7 +1,7 @@
-//! Bulk fixture preparation, binary `COPY` ingestion, finalized index creation,
-//! and incremental single-block persistence primitives.
+//! Streaming bulk fixture preparation, binary `COPY` ingestion, finalized index
+//! creation, fenced lease management, and atomic incremental tip+settlement commits.
 
-use std::path::Path;
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -20,17 +20,18 @@ use zinder_core::{
 use zinder_ingest::{
     CommitmentTreeSizes, RawBlobPolicy, position_canonical_block, prepare_canonical_block,
 };
-use zinder_source::SourceBlock;
+use zinder_source::{
+    NodeSource, SourceBlock, SourceChainCursor, SourceChainSegmentLimits, SourceChainUpdate,
+};
 use zinder_store::TREE_STATE_CHECKPOINT_STRIDE;
 
 use crate::error::BenchError;
-use crate::fixture::{FixtureManifest, read_segment_blocks};
+use crate::fixture::{FixtureManifest, FixtureNodeSource};
 
 use super::database::{candidate_error, postgres_error, u32_to_i64, u64_to_i64, usize_to_i64};
 use super::schema::{
-    BENCHMARK_LEASE_DURATION_MS, BENCHMARK_WRITER_ID, POSTGRES_SEGMENTED_CONTRACT_IDENTITY,
-    POSTGRES_SEGMENTED_SCHEMA_VERSION, build_analyze_sql, build_create_schema_sql,
-    build_finalize_schema_sql,
+    BENCHMARK_WRITER_ID, POSTGRES_SEGMENTED_CONTRACT_IDENTITY, POSTGRES_SEGMENTED_SCHEMA_VERSION,
+    build_analyze_sql, build_create_schema_sql, build_finalize_schema_sql,
 };
 use super::segment_builder::{
     PreparedSegmentedBlock, SealedSegmentBundle, SealedSegmentBytes, encode_compact_block_for_tail,
@@ -40,31 +41,175 @@ use super::wallet_projection::{
     ProvisionalWalletProjection, WalletAddressTxRow, WalletBlockDelta, WalletUtxoRow,
 };
 
-/// Prepared benchmark fixture blocks partitioned for bulk ingest + incremental tip-follow.
-pub struct PreparedBenchmarkChain {
-    /// Chain blocks ordered ascending from `manifest.from_height`.
-    pub blocks: Vec<PreparedSegmentedBlock>,
-    /// Subtree roots emitted by the fixture manifest.
-    pub subtree_roots: Vec<SubtreeRootArtifact>,
-    /// Canonical sequence digest hex computed across ALL `blocks`.
-    pub full_sequence_digest_hex: String,
-    /// Total canonical transaction count across ALL `blocks`.
-    pub total_tx_count: u64,
-    /// Deterministic count of strided `tree_state_checkpoint` rows over ALL `blocks`.
-    pub total_checkpoint_count: u64,
+const STREAM_FETCH_WINDOW_BLOCKS: u32 = 64;
+const STREAM_MAX_BATCH_BLOCKS: usize = 2_048;
+const STREAM_SOURCE_RESPONSE_CAP_BYTES: u64 = 256 * 1024 * 1024;
+const TRANSACTION_LOCATION_KIND_LIVE: i16 = 0;
+const TRANSACTION_LOCATION_KIND_SETTLED: i16 = 1;
+
+/// Active fenced writer ownership term passed into tip-commit and settlement transactions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriterFenceHandle {
+    /// Expected monotonic `writer_epoch` held in `{schema}.canonical_writer_fence`.
+    pub writer_epoch: i64,
+    /// Lease extension duration applied on successful fencing renewal, in milliseconds.
+    pub lease_duration_ms: i64,
+}
+
+/// Pre-sealed settled-segment bundle trio applied atomically inside a fenced commit.
+#[derive(Clone, Debug)]
+pub struct PendingSealTransition {
+    /// Sealed `ZSHRNG02`, `ZSTSUP01`, and optional `ZSBLKB01` segments.
+    pub bundles: Vec<SealedSegmentBundle>,
+    /// Inclusive highest block height covered by `bundles`.
+    pub settled_height: BlockHeight,
+    /// Block hash at `settled_height` recorded in `chain_event`.
+    pub settled_hash: BlockHash,
+    /// Previous block hash at `settled_height` recorded in `chain_event`.
+    pub settled_prev: BlockHash,
+    /// Number of tail blocks evicted from `{schema}.canonical_live_tail`.
+    pub seal_count: usize,
+    /// Largest single settled segment payload across `bundles`.
+    pub max_segment_bytes_observed: u64,
 }
 
 /// Breakdown of bulk-load build durations before steady-state tip-following.
 #[derive(Clone, Debug, Default)]
 pub struct BulkLoadTimings {
-    /// Block parse, fact synthesis, compact-block positioning, and replay encoding.
+    /// Source-open, fixture block decode, canonical construction, and replay encoding.
     pub prepare_duration: Duration,
+    /// DDL schema and table creation time (`CREATE SCHEMA`, `CREATE TABLE`, `STORAGE EXTERNAL`).
+    pub schema_create_duration: Duration,
+    /// Provisional wallet projection construction and final UTXO sort duration.
+    pub wallet_projection_duration: Duration,
     /// Blocking `ZSHRNG02`, `ZSTSUP01`, and optional `ZSBLKB01` segment sealing duration.
     pub seal_duration: Duration,
-    /// Binary `COPY` stream time into unindexed tables.
+    /// Binary `COPY` stream time into unindexed bulk tables.
     pub copy_duration: Duration,
-    /// Primary key + secondary index creation + `ANALYZE` time.
+    /// Primary key/index creation, `ANALYZE`, and post-finalize writer term acquisition.
     pub finalize_duration: Duration,
+}
+
+/// Configuration driving streaming bulk ingest without retaining all fixture blocks in RAM.
+pub struct BulkStreamConfig<'a> {
+    /// Parsed fixture manifest.
+    pub manifest: &'a FixtureManifest,
+    /// Normalized SHA-256 hex digest of `manifest`.
+    pub manifest_sha256: &'a str,
+    /// Target isolated schema name.
+    pub schema_name: &'a str,
+    /// Retain raw consensus block payloads (`ZSBLKB01` + `raw_block_bytes`).
+    pub full_blocks: bool,
+    /// Maximum single settled segment size (`<= 256 MiB`).
+    pub max_segment_bytes: u64,
+    /// Target block span per settled segment batch.
+    pub settled_segment_blocks: u32,
+    /// Upper bound on `{schema}.canonical_live_tail` rows.
+    pub live_tail_max_blocks: u32,
+    /// Number of initial blocks loaded by the streaming bulk phase.
+    pub bulk_block_count: usize,
+    /// Initial seed lease duration applied during bulk control-row creation.
+    pub seed_lease_duration_ms: i64,
+    /// Fresh lease duration granted when acquiring the post-finalize writer term.
+    pub post_finalize_lease_duration_ms: i64,
+}
+
+/// Incremental block-preparation accumulator shared across bulk streaming and tip-follow.
+pub struct StreamingPrepareState {
+    /// Network consensus upgrade schedule.
+    pub activations: NetworkUpgradeActivations,
+    /// Cumulative commitment tree sizes tracked sequentially across blocks.
+    pub tree_sizes: CommitmentTreeSizes,
+    /// Whether `ZSBLKB01` raw block slicing is enabled.
+    pub full_blocks: bool,
+    /// First chain height (governs checkpoint cadence).
+    pub first_height: BlockHeight,
+    /// Streaming sequence digest builder updated per connected block.
+    pub sequence_builder: CanonicalBlockFactsSequenceDigestBuilder,
+    /// Total canonical transactions processed so far.
+    pub total_tx_count: u64,
+    /// Total strided tree-state checkpoints created so far.
+    pub total_checkpoint_count: u64,
+    /// First block identity (`height`, `hash`, `previous_hash`).
+    pub first_block_meta: Option<(BlockHeight, BlockHash, BlockHash)>,
+    /// Most recent block identity (`height`, `hash`, `previous_hash`).
+    pub last_block_meta: Option<(BlockHeight, BlockHash, BlockHash)>,
+}
+
+impl StreamingPrepareState {
+    /// Initializes an empty accumulator rooted at `first_height`.
+    #[must_use]
+    pub fn new(
+        activations: NetworkUpgradeActivations,
+        full_blocks: bool,
+        first_height: BlockHeight,
+    ) -> Self {
+        Self {
+            activations,
+            tree_sizes: CommitmentTreeSizes {
+                sapling: 0,
+                orchard: 0,
+                ironwood: 0,
+            },
+            full_blocks,
+            first_height,
+            sequence_builder: CanonicalBlockFactsSequenceDigestBuilder::new(
+                CanonicalBlockFactsSequenceDigestVersion::CURRENT,
+            ),
+            total_tx_count: 0,
+            total_checkpoint_count: 0,
+            first_block_meta: None,
+            last_block_meta: None,
+        }
+    }
+
+    /// Prepares one [`SourceBlock`] into [`PreparedSegmentedBlock`] and advances digest/counts.
+    pub fn prepare_source_block(
+        &mut self,
+        source_block: &SourceBlock,
+    ) -> Result<PreparedSegmentedBlock, BenchError> {
+        let prepared = prepare_single_block(
+            source_block,
+            &self.activations,
+            &mut self.tree_sizes,
+            self.full_blocks,
+        )?;
+        self.sequence_builder
+            .try_append(prepared.facts.digest(CanonicalBlockFactsDigestVersion::V1))
+            .map_err(|err| candidate_error(format!("sequence builder append: {err}")))?;
+        self.total_tx_count = self
+            .total_tx_count
+            .saturating_add(u64::try_from(prepared.facts.transactions.len()).unwrap_or(0));
+        if should_checkpoint_height(self.first_height, prepared.height) {
+            self.total_checkpoint_count = self.total_checkpoint_count.saturating_add(1);
+        }
+        let meta = (
+            prepared.height,
+            prepared.block_hash,
+            prepared.previous_block_hash,
+        );
+        if self.first_block_meta.is_none() {
+            self.first_block_meta = Some(meta);
+        }
+        self.last_block_meta = Some(meta);
+        Ok(prepared)
+    }
+}
+
+/// Outputs produced by [`execute_streaming_bulk_load`] to initialize tip-following.
+pub struct BulkStreamOutcome {
+    /// Phased build durations measured across streaming preparation, DDL, wallet, seal, COPY, finalize.
+    pub timings: BulkLoadTimings,
+    /// Unsealed live-tail blocks remaining at the end of bulk ingest (`<= live_tail_max_blocks`).
+    pub initial_tail: Vec<PreparedSegmentedBlock>,
+    /// Largest single settled segment byte length produced during bulk sealing.
+    pub initial_max_segment_bytes: u64,
+    /// Active fenced `writer_epoch` acquired after `FINALIZE` + `ANALYZE`.
+    pub writer_epoch: i64,
+    /// Cumulative preparation state ready to continue over tip-follow blocks.
+    pub prepare_state: StreamingPrepareState,
+    /// Number of subtree roots copied during bulk ingest.
+    pub subtree_root_count: u64,
 }
 
 /// Seeded schema metadata parameters inserted into `{schema}.schema_meta`.
@@ -91,6 +236,8 @@ pub struct SchemaSeedMetadata<'a> {
 
 /// All atomic updates applied during a single incremental tip-follow block commit.
 pub struct TipCommitPayload<'a> {
+    /// Active fenced writer term verified inside the tip transaction.
+    pub fence: WriterFenceHandle,
     /// Whether raw block retention is active.
     pub full_blocks: bool,
     /// First chain height (governs checkpoint cadence).
@@ -101,6 +248,8 @@ pub struct TipCommitPayload<'a> {
     pub wallet_delta: &'a WalletBlockDelta,
     /// Mempool transaction IDs evicted atomically as mined in this block.
     pub evicted_mempool_txids: &'a [[u8; 32]],
+    /// Optional pre-sealed settled transition committed atomically with the tip append.
+    pub pending_seal: Option<&'a PendingSealTransition>,
 }
 
 /// Deterministic checkpoint predicate: persists at `first_height` and every
@@ -111,76 +260,50 @@ pub const fn should_checkpoint_height(first_height: BlockHeight, height: BlockHe
         || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE)
 }
 
-/// Reads all segments from `fixture_dir` and prepares all canonical/compact/raw
-/// blocks in a blocking worker thread, computing the full reference digest oracle.
-pub async fn prepare_all_fixture_blocks(
-    fixture_dir: &Path,
-    manifest: &FixtureManifest,
-    full_blocks: bool,
-) -> Result<(PreparedBenchmarkChain, Duration), BenchError> {
-    let dir = fixture_dir.to_path_buf();
-    let cloned_manifest = manifest.clone();
-    let started = Instant::now();
-    let chain = tokio::task::spawn_blocking(move || {
-        prepare_fixture_blocks_sync(&dir, &cloned_manifest, full_blocks)
-    })
-    .await
-    .map_err(|err| candidate_error(format!("fixture block preparation panicked: {err}")))??;
-    Ok((chain, started.elapsed()))
-}
-
-fn prepare_fixture_blocks_sync(
-    fixture_dir: &Path,
-    manifest: &FixtureManifest,
-    full_blocks: bool,
-) -> Result<PreparedBenchmarkChain, BenchError> {
-    let network = manifest.network_typed()?;
-    let activations = manifest.activations_typed()?;
-    let subtree_roots = manifest.subtree_root_artifacts()?;
-    let total_expected = usize::try_from(manifest.block_count)
-        .map_err(|_| BenchError::fixture_format("block_count exceeds usize"))?;
-
-    let mut tree_sizes = CommitmentTreeSizes {
-        sapling: 0,
-        orchard: 0,
-        ironwood: 0,
-    };
-    let mut seq_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
-        CanonicalBlockFactsSequenceDigestVersion::CURRENT,
-    );
-    let mut blocks = Vec::with_capacity(total_expected);
-    let mut total_tx_count = 0_u64;
-    let mut total_checkpoint_count = 0_u64;
-    let first_height = BlockHeight::new(manifest.from_height);
-
-    for descriptor in &manifest.segments {
-        let segment_blocks = read_segment_blocks(fixture_dir, descriptor, network)?;
-        for source_block in &segment_blocks {
-            let prepared =
-                prepare_single_block(source_block, &activations, &mut tree_sizes, full_blocks)?;
-            seq_builder
-                .try_append(prepared.facts.digest(CanonicalBlockFactsDigestVersion::V1))
-                .map_err(|err| candidate_error(format!("sequence builder append: {err}")))?;
-            total_tx_count = total_tx_count
-                .saturating_add(u64::try_from(prepared.facts.transactions.len()).unwrap_or(0));
-            if should_checkpoint_height(first_height, prepared.height) {
-                total_checkpoint_count = total_checkpoint_count.saturating_add(1);
+/// Fetches and prepares contiguous fixture blocks `[start_height..=end_height]`
+/// from `source` using bounded worker calls.
+pub async fn prepare_block_range_from_source(
+    source: &FixtureNodeSource,
+    prepare_state: &mut StreamingPrepareState,
+    start_height: u32,
+    end_height: u32,
+) -> Result<Vec<PreparedSegmentedBlock>, BenchError> {
+    let mut prepared_blocks = Vec::new();
+    if start_height > end_height {
+        return Ok(prepared_blocks);
+    }
+    let mut cursor_height = start_height;
+    while cursor_height <= end_height {
+        let remaining = end_height - cursor_height + 1;
+        let max_connected = remaining.min(STREAM_FETCH_WINDOW_BLOCKS);
+        let limit_count =
+            NonZeroU32::new(max_connected).unwrap_or(const { NonZeroU32::new(1).unwrap() });
+        let limits = SourceChainSegmentLimits::new(
+            SourceChainCursor::before_height(BlockHeight::new(cursor_height)),
+            limit_count,
+            STREAM_SOURCE_RESPONSE_CAP_BYTES,
+            STREAM_SOURCE_RESPONSE_CAP_BYTES,
+        );
+        let seg = source
+            .fetch_chain_segment(limits)
+            .await
+            .map_err(|err| candidate_error(format!("fixture segment fetch: {err}")))?;
+        let mut received = 0_u32;
+        for update in seg.updates() {
+            if let SourceChainUpdate::ConnectedBlock { block, .. } = update {
+                let prepared = prepare_state.prepare_source_block(block)?;
+                prepared_blocks.push(prepared);
+                received = received.saturating_add(1);
             }
-            blocks.push(prepared);
         }
+        if received == 0 {
+            return Err(candidate_error(format!(
+                "fixture source returned zero connected blocks at height {cursor_height}"
+            )));
+        }
+        cursor_height = cursor_height.saturating_add(received);
     }
-
-    if blocks.is_empty() {
-        return Err(BenchError::fixture_format("fixture contains zero blocks"));
-    }
-
-    Ok(PreparedBenchmarkChain {
-        blocks,
-        subtree_roots,
-        full_sequence_digest_hex: hex::encode(seq_builder.finish().as_bytes()),
-        total_tx_count,
-        total_checkpoint_count,
-    })
+    Ok(prepared_blocks)
 }
 
 fn prepare_single_block(
@@ -246,96 +369,414 @@ fn prepare_single_block(
     })
 }
 
-/// Splits `bulk_blocks` into settled prefix and initial bounded live tail, seals
-/// settled segments, bulk-loads all tables via binary `COPY`, and finalizes indexes.
-pub async fn load_bulk_prefix(
-    client: &mut Client,
-    meta: &SchemaSeedMetadata<'_>,
-    bulk_blocks: &[PreparedSegmentedBlock],
-    subtree_roots: &[SubtreeRootArtifact],
-    wallet_projection: &mut ProvisionalWalletProjection,
-) -> Result<(BulkLoadTimings, u64), BenchError> {
-    let first_block = bulk_blocks
-        .first()
-        .ok_or_else(|| BenchError::invalid_argument("bulk prefix must contain at least 1 block"))?;
-    let last_block = bulk_blocks
-        .last()
-        .ok_or_else(|| candidate_error("bulk_blocks unexpectedly empty"))?;
-    let schema = meta.schema_name;
-    let max_tail = usize::try_from(meta.live_tail_max_blocks).unwrap_or(128);
-    let settled_count = bulk_blocks.len().saturating_sub(max_tail);
-    let (settled_slice, tail_slice) = bulk_blocks.split_at(settled_count);
-
-    let seal_started = Instant::now();
-    let sealed_output = seal_settled_segments(
-        meta.network,
-        settled_slice.to_vec(),
-        meta.settled_segment_blocks,
-        meta.full_blocks,
-        meta.max_segment_bytes,
+fn estimated_prepared_block_bytes(block: &PreparedSegmentedBlock) -> u64 {
+    let raw_len = block.raw_block_bytes.as_ref().map_or(0, Vec::len);
+    u64::try_from(
+        block.compact_block_bytes.len()
+            + block.canonical_facts_bytes.len()
+            + raw_len
+            + block.raw_tx_slices.len() * 16,
     )
-    .await?;
-    let seal_duration = seal_started.elapsed();
+    .unwrap_or(u64::MAX)
+}
 
-    for block in bulk_blocks {
-        let _ = wallet_projection.apply_block(&block.facts)?;
+/// Streams settled batches + initial tail from `source` into `PostgreSQL` without
+/// keeping full fixture blocks resident in RAM, timing every build stage accurately.
+pub async fn execute_streaming_bulk_load(
+    client: &mut Client,
+    source: &FixtureNodeSource,
+    cfg: &BulkStreamConfig<'_>,
+    wallet_projection: &mut ProvisionalWalletProjection,
+) -> Result<BulkStreamOutcome, BenchError> {
+    if cfg.bulk_block_count == 0 {
+        return Err(BenchError::invalid_argument(
+            "bulk prefix must contain at least 1 block",
+        ));
     }
+    let network = cfg.manifest.network_typed()?;
+    let activations = cfg.manifest.activations_typed()?;
+    let subtree_roots = cfg.manifest.subtree_root_artifacts()?;
+    let first_height = BlockHeight::new(cfg.manifest.from_height);
+    let mut prepare_state = StreamingPrepareState::new(activations, cfg.full_blocks, first_height);
+    let mut timings = BulkLoadTimings::default();
 
+    let schema_started = Instant::now();
     client
-        .batch_execute(&build_create_schema_sql(schema)?)
+        .batch_execute(&build_create_schema_sql(cfg.schema_name)?)
         .await
         .map_err(|err| postgres_error("creating postgres-segmented schema", &err))?;
+    timings.schema_create_duration = schema_started.elapsed();
 
-    let copy_started = Instant::now();
-    let settled_tip = settled_slice.last().map(|block| block.height);
     let txn = client
         .transaction()
         .await
         .map_err(|err| postgres_error("starting bulk load transaction", &err))?;
-    seed_control_tables(&txn, meta, settled_tip, (first_block, last_block)).await?;
-    copy_settled_bundles(&txn, schema, meta.full_blocks, &sealed_output.bundles).await?;
-    copy_canonical_live_tail(&txn, schema, meta.full_blocks, tail_slice).await?;
-    copy_canonical_indexes(&txn, schema, first_block.height, bulk_blocks).await?;
-    copy_subtree_roots(&txn, schema, subtree_roots).await?;
-    copy_wallet_projection(&txn, schema, wallet_projection).await?;
+
+    let mut ctx = StreamingTxnContext {
+        txn: &txn,
+        source,
+        cfg,
+        network,
+        prepare_state: &mut prepare_state,
+        wallet_projection,
+        timings: &mut timings,
+        max_segment_bytes_observed: 0,
+        settled_tip: None,
+    };
+
+    let bulk_u32 = u32::try_from(cfg.bulk_block_count)
+        .map_err(|_| BenchError::invalid_argument("bulk_block_count exceeds u32"))?;
+    let settled_count = cfg
+        .bulk_block_count
+        .saturating_sub(usize::try_from(cfg.live_tail_max_blocks).unwrap_or(128));
+    let settled_end_h = u32::try_from(settled_count)
+        .ok()
+        .filter(|&c| c > 0)
+        .map(|c| cfg.manifest.from_height + c - 1);
+    let tail_start_h = settled_end_h.map_or(cfg.manifest.from_height, |s| s + 1);
+    let bulk_end_h = cfg.manifest.from_height + bulk_u32 - 1;
+
+    if let Some(settled_end) = settled_end_h {
+        stream_and_copy_settled_prefix(&mut ctx, cfg.manifest.from_height, settled_end).await?;
+    }
+    let (initial_tail, first_tail_bounds) =
+        stream_and_copy_tail_and_finalize_bulk(&mut ctx, tail_start_h, bulk_end_h, &subtree_roots)
+            .await?;
+
+    let settled_tip = ctx.settled_tip;
+    let max_segment_bytes_observed = ctx.max_segment_bytes_observed;
+    seed_and_commit_bulk_txn(
+        txn,
+        SeedAndCommitBulkArgs {
+            cfg,
+            network,
+            settled_tip,
+            first_tail_bounds,
+            timings: &mut timings,
+        },
+    )
+    .await?;
+
+    let writer_epoch = finalize_schema_and_acquire_term(client, cfg, &mut timings).await?;
+
+    Ok(BulkStreamOutcome {
+        timings,
+        initial_tail,
+        initial_max_segment_bytes: max_segment_bytes_observed,
+        writer_epoch,
+        prepare_state,
+        subtree_root_count: u64::try_from(subtree_roots.len()).unwrap_or(0),
+    })
+}
+
+struct SeedAndCommitBulkArgs<'a> {
+    cfg: &'a BulkStreamConfig<'a>,
+    network: Network,
+    settled_tip: Option<BlockHeight>,
+    first_tail_bounds: (BlockHeight, BlockHash, BlockHash, BlockHeight, BlockHash),
+    timings: &'a mut BulkLoadTimings,
+}
+
+async fn seed_and_commit_bulk_txn(
+    txn: Transaction<'_>,
+    args: SeedAndCommitBulkArgs<'_>,
+) -> Result<(), BenchError> {
+    let copy_seed_started = Instant::now();
+    let seed_meta = SchemaSeedMetadata {
+        schema_name: args.cfg.schema_name,
+        network: args.network,
+        full_blocks: args.cfg.full_blocks,
+        max_segment_bytes: args.cfg.max_segment_bytes,
+        settled_segment_blocks: args.cfg.settled_segment_blocks,
+        live_tail_max_blocks: args.cfg.live_tail_max_blocks,
+        fixture_format_version: args.cfg.manifest.fixture_format_version,
+        fixture_manifest_sha256: args.cfg.manifest_sha256,
+        expected_sequence_digest_hex: &args
+            .cfg
+            .manifest
+            .canonical_block_facts_digest_evidence
+            .sequence_digest_sha256,
+    };
+    seed_control_tables(
+        &txn,
+        &seed_meta,
+        args.settled_tip,
+        args.cfg.seed_lease_duration_ms,
+        args.first_tail_bounds,
+    )
+    .await?;
     txn.commit()
         .await
         .map_err(|err| postgres_error("committing bulk COPY payload", &err))?;
-    let copy_duration = copy_started.elapsed();
+    args.timings.copy_duration += copy_seed_started.elapsed();
+    Ok(())
+}
 
+struct StreamingTxnContext<'a, 't> {
+    txn: &'a Transaction<'t>,
+    source: &'a FixtureNodeSource,
+    cfg: &'a BulkStreamConfig<'a>,
+    network: Network,
+    prepare_state: &'a mut StreamingPrepareState,
+    wallet_projection: &'a mut ProvisionalWalletProjection,
+    timings: &'a mut BulkLoadTimings,
+    max_segment_bytes_observed: u64,
+    settled_tip: Option<BlockHeight>,
+}
+
+async fn stream_and_copy_settled_prefix(
+    ctx: &mut StreamingTxnContext<'_, '_>,
+    start_height: u32,
+    end_height: u32,
+) -> Result<(), BenchError> {
+    let max_batch_blocks = usize::try_from(ctx.cfg.settled_segment_blocks)
+        .unwrap_or(1_000)
+        .clamp(1, STREAM_MAX_BATCH_BLOCKS);
+    let max_batch_bytes = ctx.cfg.max_segment_bytes;
+    let mut batch_blocks = Vec::new();
+    let mut batch_est_bytes = 0_u64;
+    let mut cursor_h = start_height;
+
+    while cursor_h <= end_height {
+        let slots_left = max_batch_blocks.saturating_sub(batch_blocks.len()).max(1);
+        let win_u32 = u32::try_from(slots_left)
+            .unwrap_or(STREAM_FETCH_WINDOW_BLOCKS)
+            .min(STREAM_FETCH_WINDOW_BLOCKS);
+        let chunk_end = cursor_h.saturating_add(win_u32 - 1).min(end_height);
+
+        let prep_started = Instant::now();
+        let chunk =
+            prepare_block_range_from_source(ctx.source, ctx.prepare_state, cursor_h, chunk_end)
+                .await?;
+        ctx.timings.prepare_duration += prep_started.elapsed();
+
+        let wallet_started = Instant::now();
+        for prepared in &chunk {
+            let _ = ctx.wallet_projection.apply_block(&prepared.facts)?;
+        }
+        ctx.timings.wallet_projection_duration += wallet_started.elapsed();
+
+        for prepared in chunk {
+            batch_est_bytes =
+                batch_est_bytes.saturating_add(estimated_prepared_block_bytes(&prepared));
+            batch_blocks.push(prepared);
+        }
+        cursor_h = chunk_end.saturating_add(1);
+
+        if batch_blocks.len() >= max_batch_blocks
+            || batch_est_bytes >= max_batch_bytes
+            || cursor_h > end_height
+        {
+            let batch = std::mem::take(&mut batch_blocks);
+            batch_est_bytes = 0;
+            flush_settled_batch(ctx, batch).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn flush_settled_batch(
+    ctx: &mut StreamingTxnContext<'_, '_>,
+    batch: Vec<PreparedSegmentedBlock>,
+) -> Result<(), BenchError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    if let Some(last) = batch.last() {
+        ctx.settled_tip = Some(last.height);
+    }
+
+    let schema = ctx.cfg.schema_name;
+    let first_height = ctx.prepare_state.first_height;
+    let copy_idx_started = Instant::now();
+    copy_canonical_indexes(
+        ctx.txn,
+        schema,
+        first_height,
+        &batch,
+        TRANSACTION_LOCATION_KIND_SETTLED,
+    )
+    .await?;
+    let addr_rows = ctx.wallet_projection.drain_address_tx_rows();
+    copy_wallet_address_txs(ctx.txn, schema, &addr_rows).await?;
+    ctx.timings.copy_duration += copy_idx_started.elapsed();
+
+    let seal_started = Instant::now();
+    let sealed = seal_settled_segments(
+        ctx.network,
+        batch,
+        ctx.cfg.settled_segment_blocks,
+        ctx.cfg.full_blocks,
+        ctx.cfg.max_segment_bytes,
+    )
+    .await?;
+    ctx.timings.seal_duration += seal_started.elapsed();
+    ctx.max_segment_bytes_observed = ctx
+        .max_segment_bytes_observed
+        .max(sealed.max_segment_bytes_observed);
+
+    let copy_seg_started = Instant::now();
+    copy_settled_bundles(ctx.txn, schema, ctx.cfg.full_blocks, &sealed.bundles).await?;
+    ctx.timings.copy_duration += copy_seg_started.elapsed();
+    Ok(())
+}
+
+async fn stream_and_copy_tail_and_finalize_bulk(
+    ctx: &mut StreamingTxnContext<'_, '_>,
+    tail_start_h: u32,
+    bulk_end_h: u32,
+    subtree_roots: &[SubtreeRootArtifact],
+) -> Result<
+    (
+        Vec<PreparedSegmentedBlock>,
+        (BlockHeight, BlockHash, BlockHash, BlockHeight, BlockHash),
+    ),
+    BenchError,
+> {
+    let prep_started = Instant::now();
+    let initial_tail =
+        prepare_block_range_from_source(ctx.source, ctx.prepare_state, tail_start_h, bulk_end_h)
+            .await?;
+    ctx.timings.prepare_duration += prep_started.elapsed();
+
+    let wallet_started = Instant::now();
+    for prepared in &initial_tail {
+        let _ = ctx.wallet_projection.apply_block(&prepared.facts)?;
+    }
+    let sorted_utxos = ctx.wallet_projection.sorted_utxo_rows();
+    let remaining_addr_rows = ctx.wallet_projection.drain_address_tx_rows();
+    ctx.timings.wallet_projection_duration += wallet_started.elapsed();
+
+    let schema = ctx.cfg.schema_name;
+    let first_height = ctx.prepare_state.first_height;
+    let copy_started = Instant::now();
+    copy_canonical_live_tail(ctx.txn, schema, ctx.cfg.full_blocks, &initial_tail).await?;
+    copy_canonical_indexes(
+        ctx.txn,
+        schema,
+        first_height,
+        &initial_tail,
+        TRANSACTION_LOCATION_KIND_LIVE,
+    )
+    .await?;
+    copy_subtree_roots(ctx.txn, schema, subtree_roots).await?;
+    copy_wallet_utxos(ctx.txn, schema, &sorted_utxos).await?;
+    copy_wallet_address_txs(ctx.txn, schema, &remaining_addr_rows).await?;
+    ctx.timings.copy_duration += copy_started.elapsed();
+
+    let (first_h, first_hash, first_prev) = ctx
+        .prepare_state
+        .first_block_meta
+        .ok_or_else(|| candidate_error("missing first block identity after bulk stream"))?;
+    let (tip_h, tip_hash, _tip_prev) = ctx
+        .prepare_state
+        .last_block_meta
+        .ok_or_else(|| candidate_error("missing tip block identity after bulk stream"))?;
+
+    Ok((
+        initial_tail,
+        (first_h, first_hash, first_prev, tip_h, tip_hash),
+    ))
+}
+
+async fn finalize_schema_and_acquire_term(
+    client: &Client,
+    cfg: &BulkStreamConfig<'_>,
+    timings: &mut BulkLoadTimings,
+) -> Result<i64, BenchError> {
     let finalize_started = Instant::now();
     client
-        .batch_execute(&build_finalize_schema_sql(schema)?)
+        .batch_execute(&build_finalize_schema_sql(cfg.schema_name)?)
         .await
         .map_err(|err| postgres_error("finalizing segmented schema indexes", &err))?;
     client
-        .batch_execute(&build_analyze_sql(schema)?)
+        .batch_execute(&build_analyze_sql(cfg.schema_name)?)
         .await
         .map_err(|err| postgres_error("analyzing segmented schema tables", &err))?;
-    let finalize_duration = finalize_started.elapsed();
+    let writer_epoch = acquire_post_finalize_writer_term(
+        client,
+        cfg.schema_name,
+        1,
+        cfg.post_finalize_lease_duration_ms,
+    )
+    .await?;
+    timings.finalize_duration = finalize_started.elapsed();
+    Ok(writer_epoch)
+}
 
-    Ok((
-        BulkLoadTimings {
-            prepare_duration: Duration::ZERO,
-            seal_duration,
-            copy_duration,
-            finalize_duration,
-        },
-        sealed_output.max_segment_bytes_observed,
-    ))
+/// Atomically advances `writer_epoch` after bulk finalization and grants a fresh lease.
+///
+/// Replaces the seed term without requiring `lease_expires_at > clock_timestamp()` so
+/// slow bulk builds recover cleanly while still rejecting superseded epochs/writers.
+pub async fn acquire_post_finalize_writer_term(
+    client: &Client,
+    schema_name: &str,
+    expected_epoch: i64,
+    lease_duration_ms: i64,
+) -> Result<i64, BenchError> {
+    if lease_duration_ms <= 0 {
+        return Err(BenchError::invalid_argument(
+            "writer lease duration must be positive",
+        ));
+    }
+    let bumped_epoch = expected_epoch
+        .checked_add(1)
+        .ok_or_else(|| candidate_error("writer_epoch overflow during post-finalize renewal"))?;
+    let row = client
+        .query_opt(
+            &format!(
+                r"
+UPDATE {schema_name}.canonical_writer_fence
+SET
+    writer_epoch = $1,
+    lease_expires_at = clock_timestamp() + ($2::BIGINT * INTERVAL '1 millisecond'),
+    updated_at = clock_timestamp()
+WHERE singleton
+  AND writer_epoch = $3
+  AND writer_id = $4
+RETURNING writer_epoch
+"
+            ),
+            &[
+                &bumped_epoch,
+                &lease_duration_ms,
+                &expected_epoch,
+                &BENCHMARK_WRITER_ID,
+            ],
+        )
+        .await
+        .map_err(|err| postgres_error("acquiring post-finalize writer fence term", &err))?;
+    let granted = row.ok_or_else(|| {
+        candidate_error("post-finalize writer fence superseded before acquiring tip term")
+    })?;
+    Ok(granted.get(0))
 }
 
 async fn seed_control_tables(
     txn: &Transaction<'_>,
     meta: &SchemaSeedMetadata<'_>,
     settled_tip: Option<BlockHeight>,
-    bounds: (&PreparedSegmentedBlock, &PreparedSegmentedBlock),
+    seed_lease_duration_ms: i64,
+    bounds: (BlockHeight, BlockHash, BlockHash, BlockHeight, BlockHash),
 ) -> Result<(), BenchError> {
-    let (first_block, canonical_tip) = bounds;
     let schema = meta.schema_name;
     let network_name = encode_zinder_native_chain_name(meta.network);
-    insert_schema_meta_row(txn, meta, network_name, settled_tip, bounds).await?;
-    insert_fence_and_epoch(txn, schema, network_name, first_block, canonical_tip).await
+    insert_schema_meta_row(
+        txn,
+        meta,
+        network_name,
+        settled_tip,
+        (bounds.0, bounds.3, bounds.4),
+    )
+    .await?;
+    insert_fence_and_epoch(
+        txn,
+        schema,
+        network_name,
+        seed_lease_duration_ms,
+        (bounds.2, bounds.3, bounds.4),
+    )
+    .await
 }
 
 async fn insert_schema_meta_row(
@@ -343,12 +784,12 @@ async fn insert_schema_meta_row(
     meta: &SchemaSeedMetadata<'_>,
     network_name: &str,
     settled_tip: Option<BlockHeight>,
-    bounds: (&PreparedSegmentedBlock, &PreparedSegmentedBlock),
+    tip_bounds: (BlockHeight, BlockHeight, BlockHash),
 ) -> Result<(), BenchError> {
-    let (first_block, canonical_tip) = bounds;
+    let (first_height, canonical_tip_height, canonical_tip_hash) = tip_bounds;
     let schema = meta.schema_name;
     let settled_tip_pg = settled_tip.map(|h| u32_to_i64(h.value()));
-    let tip_hash_wire = encode_internal_block_hash(canonical_tip.block_hash);
+    let tip_hash_wire = encode_internal_block_hash(canonical_tip_hash);
     txn.execute(
         &format!(
             r"
@@ -369,9 +810,9 @@ INSERT INTO {schema}.schema_meta (
             &u64_to_i64(meta.max_segment_bytes, "max_segment_bytes")?,
             &u32_to_i64(meta.settled_segment_blocks),
             &u32_to_i64(meta.live_tail_max_blocks),
-            &u32_to_i64(first_block.height.value()),
+            &u32_to_i64(first_height.value()),
             &settled_tip_pg,
-            &u32_to_i64(canonical_tip.height.value()),
+            &u32_to_i64(canonical_tip_height.value()),
             &tip_hash_wire.as_slice(),
             &meta.expected_sequence_digest_hex,
             &i32::try_from(meta.fixture_format_version)
@@ -388,9 +829,10 @@ async fn insert_fence_and_epoch(
     txn: &Transaction<'_>,
     schema: &str,
     network_name: &str,
-    first_block: &PreparedSegmentedBlock,
-    canonical_tip: &PreparedSegmentedBlock,
+    seed_lease_duration_ms: i64,
+    chain_bounds: (BlockHash, BlockHeight, BlockHash),
 ) -> Result<(), BenchError> {
+    let (genesis_prev_hash, canonical_tip_height, canonical_tip_hash) = chain_bounds;
     txn.execute(
         &format!(
             r"
@@ -403,7 +845,7 @@ INSERT INTO {schema}.canonical_writer_fence (
 )
 "
         ),
-        &[&BENCHMARK_WRITER_ID, &BENCHMARK_LEASE_DURATION_MS],
+        &[&BENCHMARK_WRITER_ID, &seed_lease_duration_ms],
     )
     .await
     .map_err(|err| postgres_error("seeding canonical_writer_fence", &err))?;
@@ -414,7 +856,7 @@ INSERT INTO {schema}.canonical_writer_fence (
         ),
         &[
             &network_name,
-            &encode_internal_block_hash(first_block.previous_block_hash).as_slice(),
+            &encode_internal_block_hash(genesis_prev_hash).as_slice(),
         ],
     )
     .await
@@ -425,9 +867,9 @@ INSERT INTO {schema}.canonical_writer_fence (
             "INSERT INTO {schema}.chain_event (epoch, event_kind, height, block_hash, previous_hash) VALUES (1, 'bulk_seed', $1, $2, $3)"
         ),
         &[
-            &u32_to_i64(canonical_tip.height.value()),
-            &encode_internal_block_hash(canonical_tip.block_hash).as_slice(),
-            &encode_internal_block_hash(canonical_tip.previous_block_hash).as_slice(),
+            &u32_to_i64(canonical_tip_height.value()),
+            &encode_internal_block_hash(canonical_tip_hash).as_slice(),
+            &encode_internal_block_hash(genesis_prev_hash).as_slice(),
         ],
     )
     .await
@@ -611,11 +1053,15 @@ async fn copy_canonical_indexes(
     schema: &str,
     first_height: BlockHeight,
     blocks: &[PreparedSegmentedBlock],
+    tx_segment_kind: i16,
 ) -> Result<(), BenchError> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
     copy_block_headers(txn, schema, blocks).await?;
     copy_block_hash_index(txn, schema, blocks).await?;
     copy_tree_state_checkpoints(txn, schema, first_height, blocks).await?;
-    copy_transaction_locations(txn, schema, blocks).await
+    copy_transaction_locations(txn, schema, blocks, tx_segment_kind).await
 }
 
 async fn copy_block_headers(
@@ -767,6 +1213,7 @@ async fn copy_transaction_locations(
     txn: &Transaction<'_>,
     schema: &str,
     blocks: &[PreparedSegmentedBlock],
+    tx_segment_kind: i16,
 ) -> Result<(), BenchError> {
     let sink = txn
         .copy_in(&format!(
@@ -792,7 +1239,7 @@ async fn copy_transaction_locations(
                     &height_pg,
                     &block_hash_wire.as_slice(),
                     &tx_idx_pg,
-                    &1_i16,
+                    &tx_segment_kind,
                 ])
                 .await
                 .map_err(|err| postgres_error("writing transaction_location COPY row", &err))?;
@@ -855,15 +1302,6 @@ async fn copy_subtree_roots(
         .await
         .map_err(|err| postgres_error("finishing subtree_root COPY", &err))?;
     Ok(())
-}
-
-async fn copy_wallet_projection(
-    txn: &Transaction<'_>,
-    schema: &str,
-    wallet_projection: &ProvisionalWalletProjection,
-) -> Result<(), BenchError> {
-    copy_wallet_utxos(txn, schema, &wallet_projection.sorted_utxo_rows()).await?;
-    copy_wallet_address_txs(txn, schema, wallet_projection.address_tx_rows()).await
 }
 
 async fn copy_wallet_utxos(
@@ -960,22 +1398,32 @@ async fn copy_wallet_address_txs(
     Ok(())
 }
 
-/// Persists a newly mined tip block, writer-lease renewal, canonical index rows,
-/// wallet delta, live-tail insert, AND atomic mined-mempool eviction in one ACID txn.
+/// Atomically persists a tip block, fence renewal, and optional pre-sealed tail transition.
+///
+/// Updates canonical index tables, wallet delta, mempool evictions, `canonical_live_tail`,
+/// and (when `pending_seal` is present) `canonical_settled_segment` eviction in one txn.
 pub async fn persist_tip_block_in_txn(
     txn: &Transaction<'_>,
     schema: &str,
     payload: &TipCommitPayload<'_>,
 ) -> Result<(), BenchError> {
-    renew_writer_fence(txn, schema).await?;
+    renew_writer_fence(txn, schema, payload.fence).await?;
     let block = payload.block;
     insert_single_header_and_indexes(txn, schema, payload.first_height, block).await?;
     insert_single_wallet_delta(txn, schema, payload.wallet_delta).await?;
     evict_mined_mempool_in_txn(txn, schema, block.height, payload.evicted_mempool_txids).await?;
-    insert_live_tail_and_advance_tip(txn, schema, payload.full_blocks, block).await
+    insert_live_tail_and_advance_tip(txn, schema, payload.full_blocks, block).await?;
+    if let Some(seal) = payload.pending_seal {
+        apply_sealed_tail_transition_in_txn(txn, schema, payload.full_blocks, seal).await?;
+    }
+    Ok(())
 }
 
-async fn renew_writer_fence(txn: &Transaction<'_>, schema: &str) -> Result<(), BenchError> {
+async fn renew_writer_fence(
+    txn: &Transaction<'_>,
+    schema: &str,
+    fence: WriterFenceHandle,
+) -> Result<(), BenchError> {
     let renewed = txn
         .query_opt(
             &format!(
@@ -985,13 +1433,17 @@ SET
     lease_expires_at = clock_timestamp() + ($1::BIGINT * INTERVAL '1 millisecond'),
     updated_at = clock_timestamp()
 WHERE singleton
-  AND writer_epoch = 1
-  AND writer_id = $2
+  AND writer_epoch = $2
+  AND writer_id = $3
   AND lease_expires_at > clock_timestamp()
 RETURNING writer_epoch
 "
             ),
-            &[&BENCHMARK_LEASE_DURATION_MS, &BENCHMARK_WRITER_ID],
+            &[
+                &fence.lease_duration_ms,
+                &fence.writer_epoch,
+                &BENCHMARK_WRITER_ID,
+            ],
         )
         .await
         .map_err(|err| postgres_error("renewing canonical_writer_fence", &err))?;
@@ -1246,23 +1698,36 @@ pub async fn mark_schema_completed(client: &Client, schema_name: &str) -> Result
     Ok(())
 }
 
-/// Seals and atomically persists `bundles` while evicting covered rows from `canonical_live_tail`
-/// and advancing `schema_meta.settled_tip_height` + `transaction_location.segment_kind`.
+/// Fences, seals, and atomically commits `seal` inside its own transaction when
+/// invoked standalone (also called in-transaction from `persist_tip_block_in_txn`).
 pub async fn persist_sealed_tail_transition(
     client: &mut Client,
     schema: &str,
+    fence: WriterFenceHandle,
     full_blocks: bool,
-    bundles: &[SealedSegmentBundle],
-    last_block: (BlockHeight, BlockHash, BlockHash),
+    seal: &PendingSealTransition,
 ) -> Result<(), BenchError> {
     let txn = client
         .transaction()
         .await
         .map_err(|err| postgres_error("starting settled transition txn", &err))?;
-    copy_settled_bundles(&txn, schema, full_blocks, bundles).await?;
+    renew_writer_fence(&txn, schema, fence).await?;
+    apply_sealed_tail_transition_in_txn(&txn, schema, full_blocks, seal).await?;
+    txn.commit()
+        .await
+        .map_err(|err| postgres_error("committing settled segment transition", &err))?;
+    Ok(())
+}
 
-    let (settled_height, settled_hash, settled_prev) = last_block;
-    let settled_h_pg = u32_to_i64(settled_height.value());
+async fn apply_sealed_tail_transition_in_txn(
+    txn: &Transaction<'_>,
+    schema: &str,
+    full_blocks: bool,
+    seal: &PendingSealTransition,
+) -> Result<(), BenchError> {
+    copy_settled_bundles(txn, schema, full_blocks, &seal.bundles).await?;
+
+    let settled_h_pg = u32_to_i64(seal.settled_height.value());
     txn.execute(
         &format!("DELETE FROM {schema}.canonical_live_tail WHERE height <= $1"),
         &[&settled_h_pg],
@@ -1285,8 +1750,8 @@ pub async fn persist_sealed_tail_transition(
         ),
         &[
             &settled_h_pg,
-            &encode_internal_block_hash(settled_hash).as_slice(),
-            &encode_internal_block_hash(settled_prev).as_slice(),
+            &encode_internal_block_hash(seal.settled_hash).as_slice(),
+            &encode_internal_block_hash(seal.settled_prev).as_slice(),
         ],
     )
     .await
@@ -1298,9 +1763,5 @@ pub async fn persist_sealed_tail_transition(
     )
     .await
     .map_err(|err| postgres_error("updating settled_tip_height", &err))?;
-
-    txn.commit()
-        .await
-        .map_err(|err| postgres_error("committing settled segment transition", &err))?;
     Ok(())
 }

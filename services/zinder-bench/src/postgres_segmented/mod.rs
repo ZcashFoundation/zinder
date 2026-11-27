@@ -18,26 +18,26 @@ use zinder_core::{BlockHash, BlockHeight, Network};
 
 use crate::canonical_replay_storage::postgres::PostgresServerSettings;
 use crate::error::BenchError;
-use crate::fixture::FixtureManifest;
+use crate::fixture::{FixtureManifest, FixtureNodeSource};
 
 use database::{
     PostgresConnection, WalLsn, close_postgres, connect_postgres, measure_wal_lsn,
     read_server_settings, reject_existing_schema, validate_required_posture, wal_bytes_delta,
 };
 use loader::{
-    BulkLoadTimings, PreparedBenchmarkChain, SchemaSeedMetadata, load_bulk_prefix,
-    mark_schema_completed, prepare_all_fixture_blocks,
+    BulkStreamConfig, BulkStreamOutcome, WriterFenceHandle, execute_streaming_bulk_load,
+    mark_schema_completed,
 };
 use reader::{
     ConcurrentReaderPoolConfig, ConcurrentReaderSummary, PersistedValidationSummary,
     ReaderConnectionMode, ValidationExpectations, spawn_concurrent_readers,
     validate_persisted_state_read_only,
 };
-use schema::{MAX_SETTLED_SEGMENT_BYTES, validate_schema_name};
-use segment_builder::PreparedSegmentedBlock;
+use schema::{BENCHMARK_LEASE_DURATION_MS, MAX_SETTLED_SEGMENT_BYTES, validate_schema_name};
 use storage_footprint::{StorageFootprintSummary, measure_storage_footprint};
 use tip_follow::{
-    LatencyPercentilesMillis, TipFollowParameters, TipFollowRunMetrics, TipFollowState,
+    LatencyPercentilesMillis, TipAdvanceTarget, TipFollowParameters, TipFollowRunMetrics,
+    TipFollowState,
 };
 use wallet_projection::ProvisionalWalletProjection;
 
@@ -105,11 +105,15 @@ pub struct PostgresSegmentedBuildTimings {
     pub wall_clock_seconds: f64,
     /// Fixture parse, canonical construction, and replay encoding duration.
     pub prepare_seconds: f64,
+    /// Schema and table creation DDL duration.
+    pub schema_create_seconds: f64,
+    /// Provisional wallet projection construction and final UTXO sort duration.
+    pub wallet_projection_seconds: f64,
     /// Settled segment sealing duration (`ZSHRNG02`, `ZSTSUP01`, optional `ZSBLKB01`).
     pub seal_seconds: f64,
     /// Binary `COPY` persistence duration for bulk tables.
     pub bulk_copy_seconds: f64,
-    /// PK/index construction and `ANALYZE` duration.
+    /// PK/index construction, `ANALYZE`, and post-finalize writer-term acquisition duration.
     pub finalize_seconds: f64,
     /// Uncontended tip-follow phase duration (`0` concurrent readers).
     pub uncontended_tip_follow_seconds: f64,
@@ -178,12 +182,12 @@ pub struct PostgresSegmentedRunReport {
     pub footprint: StorageFootprintSummary,
 }
 
-struct PreparedRunInputs {
+struct PreparedSourceInputs {
     network: Network,
     manifest: FixtureManifest,
     manifest_sha256: String,
-    chain: PreparedBenchmarkChain,
-    prepare_duration: Duration,
+    source: FixtureNodeSource,
+    source_open_duration: Duration,
     bulk_count: usize,
     tip_count: usize,
 }
@@ -191,8 +195,7 @@ struct PreparedRunInputs {
 struct BulkSessionOutcome {
     writer_conn: PostgresConnection,
     server_settings: PostgresServerSettings,
-    bulk_timings: BulkLoadTimings,
-    initial_max_seg_bytes: u64,
+    bulk_stream: BulkStreamOutcome,
     wal_after_bulk: WalLsn,
     bulk_wal_bytes: u64,
     wallet_projection: ProvisionalWalletProjection,
@@ -202,10 +205,18 @@ struct TipAndFootprintOutcome {
     uncontended_duration: Duration,
     contended_duration: Duration,
     footprint_duration: Duration,
+    extra_prepare_duration: Duration,
     tip_follow: TipFollowRunMetrics,
     reader_workload: ConcurrentReaderSummary,
     reader_latencies_ms: LatencyPercentilesMillis,
     footprint: StorageFootprintSummary,
+    first_height: BlockHeight,
+    tip_height: BlockHeight,
+    tip_hash: BlockHash,
+    oracle_sequence_digest_hex: String,
+    total_tx_count: u64,
+    total_checkpoint_count: u64,
+    subtree_root_count: u64,
     wallet_utxo_rows: u64,
     wallet_address_tx_rows: u64,
 }
@@ -214,7 +225,7 @@ struct ContendedPhaseContext<'a> {
     config: &'a PostgresSegmentedConfig,
     network: Network,
     tip_state: &'a mut TipFollowState,
-    wallet_projection: &'a mut ProvisionalWalletProjection,
+    advance_target: &'a mut TipAdvanceTarget<'a>,
 }
 
 /// Runs the segmented `PostgreSQL` build, tip-following, mempool churn, pooled reader
@@ -225,8 +236,8 @@ pub async fn run_postgres_segmented_benchmark(
     let run_started = Instant::now();
     validate_run_config(&config)?;
 
-    let prepared = load_and_split_fixture(&config).await?;
-    let mut bulk = execute_writer_bulk_phase(&config, &prepared, prepared.bulk_count).await?;
+    let prepared = open_streaming_source(&config).await?;
+    let mut bulk = execute_writer_bulk_phase(&config, &prepared).await?;
     let tip_outcome = execute_tip_and_footprint_phase(&config, &prepared, &mut bulk).await?;
 
     let expectations = build_validation_expectations(&config, &prepared, &tip_outcome);
@@ -237,56 +248,46 @@ pub async fn run_postgres_segmented_benchmark(
     let (validation, fresh_val_duration) =
         run_fresh_reader_validation(validation_url, &expectations).await?;
 
-    let first_block = prepared
-        .chain
-        .blocks
-        .first()
-        .ok_or_else(|| BenchError::fixture_format("fixture chain is empty"))?;
-    let last_block = prepared
-        .chain
-        .blocks
-        .last()
-        .ok_or_else(|| BenchError::fixture_format("fixture chain is empty"))?;
-
     Ok(assemble_run_report(
         &config,
         &prepared,
-        first_block.height,
-        last_block,
         bulk.server_settings,
-        PostgresSegmentedBuildTimings {
-            wall_clock_seconds: run_started.elapsed().as_secs_f64(),
-            prepare_seconds: prepared.prepare_duration.as_secs_f64(),
-            seal_seconds: bulk.bulk_timings.seal_duration.as_secs_f64(),
-            bulk_copy_seconds: bulk.bulk_timings.copy_duration.as_secs_f64(),
-            finalize_seconds: bulk.bulk_timings.finalize_duration.as_secs_f64(),
-            uncontended_tip_follow_seconds: tip_outcome.uncontended_duration.as_secs_f64(),
-            contended_tip_follow_seconds: tip_outcome.contended_duration.as_secs_f64(),
-            fresh_validation_seconds: fresh_val_duration.as_secs_f64(),
-            footprint_measurement_seconds: tip_outcome.footprint_duration.as_secs_f64(),
-        },
+        &bulk.bulk_stream,
+        run_started.elapsed(),
+        fresh_val_duration,
         tip_outcome,
         validation,
     ))
 }
 
-async fn load_and_split_fixture(
+async fn open_streaming_source(
     config: &PostgresSegmentedConfig,
-) -> Result<PreparedRunInputs, BenchError> {
+) -> Result<PreparedSourceInputs, BenchError> {
     let manifest = FixtureManifest::read(&config.fixture_directory)?;
     let network = manifest.network_typed()?;
     let manifest_sha256 = manifest.digest_sha256()?;
-    let (chain, prepare_duration) =
-        prepare_all_fixture_blocks(&config.fixture_directory, &manifest, config.full_blocks)
-            .await?;
-    let tip_count = resolve_tip_follow_block_count(chain.blocks.len(), config.tip_follow_blocks)?;
-    let bulk_count = chain.blocks.len() - tip_count;
-    Ok(PreparedRunInputs {
+    let total_blocks = usize::try_from(manifest.block_count)
+        .map_err(|_| BenchError::fixture_format("manifest.block_count exceeds usize"))?;
+    let tip_count = resolve_tip_follow_block_count(total_blocks, config.tip_follow_blocks)?;
+    let bulk_count = total_blocks - tip_count;
+
+    let dir = config.fixture_directory.clone();
+    let manifest_for_open = manifest.clone();
+    let started = Instant::now();
+    let source =
+        tokio::task::spawn_blocking(move || FixtureNodeSource::open(&dir, &manifest_for_open))
+            .await
+            .map_err(|err| {
+                database::candidate_error(format!("opening streaming fixture source: {err}"))
+            })??;
+    let source_open_duration = started.elapsed();
+
+    Ok(PreparedSourceInputs {
         network,
         manifest,
         manifest_sha256,
-        chain,
-        prepare_duration,
+        source,
+        source_open_duration,
         bulk_count,
         tip_count,
     })
@@ -294,8 +295,7 @@ async fn load_and_split_fixture(
 
 async fn execute_writer_bulk_phase(
     config: &PostgresSegmentedConfig,
-    prepared: &PreparedRunInputs,
-    bulk_count: usize,
+    prepared: &PreparedSourceInputs,
 ) -> Result<BulkSessionOutcome, BenchError> {
     let mut writer_conn =
         connect_postgres(&config.database_url, "connecting postgres writer").await?;
@@ -305,23 +305,22 @@ async fn execute_writer_bulk_phase(
 
     let wal_start = measure_wal_lsn(&writer_conn.client).await?;
     let mut wallet_projection = ProvisionalWalletProjection::new();
-    let bulk_blocks = &prepared.chain.blocks[..bulk_count];
-    let seed_meta = SchemaSeedMetadata {
+    let stream_cfg = BulkStreamConfig {
+        manifest: &prepared.manifest,
+        manifest_sha256: &prepared.manifest_sha256,
         schema_name: &config.schema_name,
-        network: prepared.network,
         full_blocks: config.full_blocks,
         max_segment_bytes: config.max_segment_bytes,
         settled_segment_blocks: config.settled_segment_blocks,
         live_tail_max_blocks: config.live_tail_max_blocks,
-        fixture_format_version: prepared.manifest.fixture_format_version,
-        fixture_manifest_sha256: &prepared.manifest_sha256,
-        expected_sequence_digest_hex: &prepared.chain.full_sequence_digest_hex,
+        bulk_block_count: prepared.bulk_count,
+        seed_lease_duration_ms: BENCHMARK_LEASE_DURATION_MS,
+        post_finalize_lease_duration_ms: BENCHMARK_LEASE_DURATION_MS,
     };
-    let (bulk_timings, initial_max_seg_bytes) = load_bulk_prefix(
+    let bulk_stream = execute_streaming_bulk_load(
         &mut writer_conn.client,
-        &seed_meta,
-        bulk_blocks,
-        &prepared.chain.subtree_roots,
+        &prepared.source,
+        &stream_cfg,
         &mut wallet_projection,
     )
     .await?;
@@ -331,8 +330,7 @@ async fn execute_writer_bulk_phase(
     Ok(BulkSessionOutcome {
         writer_conn,
         server_settings,
-        bulk_timings,
-        initial_max_seg_bytes,
+        bulk_stream,
         wal_after_bulk,
         bulk_wal_bytes,
         wallet_projection,
@@ -341,37 +339,45 @@ async fn execute_writer_bulk_phase(
 
 async fn execute_tip_and_footprint_phase(
     config: &PostgresSegmentedConfig,
-    prepared: &PreparedRunInputs,
+    prepared: &PreparedSourceInputs,
     bulk: &mut BulkSessionOutcome,
 ) -> Result<TipAndFootprintOutcome, BenchError> {
-    let (bulk_blocks, tip_blocks) = prepared.chain.blocks.split_at(prepared.bulk_count);
-    let (uncontended_tips, contended_tips) = split_tip_follow_phases(tip_blocks);
-    let first_block = prepared
-        .chain
-        .blocks
-        .first()
-        .ok_or_else(|| BenchError::fixture_format("fixture chain is empty"))?;
+    let initial_tail = std::mem::take(&mut bulk.bulk_stream.initial_tail);
+    let first_height = BlockHeight::new(prepared.manifest.from_height);
     let mut tip_state = TipFollowState::new(
         TipFollowParameters {
             network: prepared.network,
             schema_name: config.schema_name.clone(),
-            first_height: first_block.height,
+            fence: WriterFenceHandle {
+                writer_epoch: bulk.bulk_stream.writer_epoch,
+                lease_duration_ms: BENCHMARK_LEASE_DURATION_MS,
+            },
+            first_height,
             full_blocks: config.full_blocks,
             max_segment_bytes: config.max_segment_bytes,
             settled_segment_blocks: config.settled_segment_blocks,
             live_tail_max_blocks: config.live_tail_max_blocks,
             mempool_churn_txs_per_block: config.mempool_churn_txs_per_block,
         },
-        initial_tail_slice(bulk_blocks, config.live_tail_max_blocks),
-        bulk.initial_max_seg_bytes,
+        initial_tail,
+        bulk.bulk_stream.initial_max_segment_bytes,
     );
+
+    let (uncontended_range, contended_range) =
+        split_tip_follow_heights(&prepared.manifest, prepared.bulk_count, prepared.tip_count)?;
+
+    let mut advance_target = TipAdvanceTarget {
+        source: &prepared.source,
+        prepare_state: &mut bulk.bulk_stream.prepare_state,
+        wallet_projection: &mut bulk.wallet_projection,
+    };
 
     let uncontended_started = Instant::now();
     let uncontended_stats = tip_state
-        .advance_blocks(
+        .advance_height_range(
             &mut bulk.writer_conn.client,
-            uncontended_tips,
-            &mut bulk.wallet_projection,
+            &mut advance_target,
+            uncontended_range,
         )
         .await?;
     let uncontended_duration = uncontended_started.elapsed();
@@ -381,14 +387,41 @@ async fn execute_tip_and_footprint_phase(
             config,
             network: prepared.network,
             tip_state: &mut tip_state,
-            wallet_projection: &mut bulk.wallet_projection,
+            advance_target: &mut advance_target,
         },
         &mut bulk.writer_conn.client,
-        contended_tips,
+        contended_range,
     )
     .await?;
 
     mark_schema_completed(&bulk.writer_conn.client, &config.schema_name).await?;
+    measure_final_tip_and_footprint(
+        config,
+        bulk,
+        (uncontended_duration, contended_duration),
+        tip_state,
+        (uncontended_stats, contended_stats),
+        reader_workload,
+        first_height,
+    )
+    .await
+}
+
+type TipPhaseHeightRanges = (Option<(u32, u32)>, Option<(u32, u32)>);
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "packages finished tip-follow metrics and queries final WAL/relation footprint"
+)]
+async fn measure_final_tip_and_footprint(
+    config: &PostgresSegmentedConfig,
+    bulk: &BulkSessionOutcome,
+    durations: (Duration, Duration),
+    tip_state: TipFollowState,
+    latencies: (LatencyPercentilesMillis, LatencyPercentilesMillis),
+    reader_workload: ConcurrentReaderSummary,
+    first_height: BlockHeight,
+) -> Result<TipAndFootprintOutcome, BenchError> {
     let wal_end = measure_wal_lsn(&bulk.writer_conn.client).await?;
     let tip_follow_wal_bytes =
         wal_bytes_delta(&bulk.writer_conn.client, &bulk.wal_after_bulk, &wal_end).await?;
@@ -402,56 +435,90 @@ async fn execute_tip_and_footprint_phase(
     )
     .await?;
     let footprint_duration = fp_started.elapsed();
-    let wallet_utxo_rows =
-        u64::try_from(bulk.wallet_projection.sorted_utxo_rows().len()).unwrap_or(0);
-    let wallet_address_tx_rows =
-        u64::try_from(bulk.wallet_projection.address_tx_rows().len()).unwrap_or(0);
-
+    let extra_prepare_duration = tip_state.extra_prepare_duration();
     let reader_latencies_ms =
         LatencyPercentilesMillis::from_samples(&reader_workload.tx_latencies_ms);
-    let tip_follow = tip_state.into_metrics(uncontended_stats, contended_stats);
+    let tip_follow = tip_state.into_metrics(latencies.0, latencies.1);
+
+    let (tip_height, tip_hash, _) =
+        bulk.bulk_stream
+            .prepare_state
+            .last_block_meta
+            .ok_or_else(|| {
+                database::candidate_error("missing tip block identity after benchmark completion")
+            })?;
+    let oracle_sequence_digest_hex = hex::encode(
+        bulk.bulk_stream
+            .prepare_state
+            .sequence_builder
+            .clone()
+            .finish()
+            .as_bytes(),
+    );
 
     Ok(TipAndFootprintOutcome {
-        uncontended_duration,
-        contended_duration,
+        uncontended_duration: durations.0,
+        contended_duration: durations.1,
         footprint_duration,
+        extra_prepare_duration,
         tip_follow,
         reader_workload,
         reader_latencies_ms,
         footprint,
-        wallet_utxo_rows,
-        wallet_address_tx_rows,
+        first_height,
+        tip_height,
+        tip_hash,
+        oracle_sequence_digest_hex,
+        total_tx_count: bulk.bulk_stream.prepare_state.total_tx_count,
+        total_checkpoint_count: bulk.bulk_stream.prepare_state.total_checkpoint_count,
+        subtree_root_count: bulk.bulk_stream.subtree_root_count,
+        wallet_utxo_rows: bulk.wallet_projection.utxo_count(),
+        wallet_address_tx_rows: bulk.wallet_projection.address_tx_count(),
     })
+}
+
+fn split_tip_follow_heights(
+    manifest: &FixtureManifest,
+    bulk_count: usize,
+    tip_count: usize,
+) -> Result<TipPhaseHeightRanges, BenchError> {
+    if tip_count == 0 {
+        return Ok((None, None));
+    }
+    let bulk_u32 = u32::try_from(bulk_count)
+        .map_err(|_| BenchError::invalid_argument("bulk_count exceeds u32"))?;
+    let tip_u32 = u32::try_from(tip_count)
+        .map_err(|_| BenchError::invalid_argument("tip_count exceeds u32"))?;
+    let tip_start = manifest.from_height.saturating_add(bulk_u32);
+    let tip_end = tip_start.saturating_add(tip_u32 - 1);
+    if tip_u32 == 1 {
+        return Ok((Some((tip_start, tip_start)), None));
+    }
+    let first_half_len = tip_u32.div_ceil(2);
+    let first_end = tip_start.saturating_add(first_half_len - 1);
+    let second_start = first_end.saturating_add(1);
+    Ok((Some((tip_start, first_end)), Some((second_start, tip_end))))
 }
 
 fn build_validation_expectations(
     config: &PostgresSegmentedConfig,
-    prepared: &PreparedRunInputs,
+    prepared: &PreparedSourceInputs,
     tip_outcome: &TipAndFootprintOutcome,
 ) -> ValidationExpectations {
-    let first_height = prepared
-        .chain
-        .blocks
-        .first()
-        .map_or(BlockHeight::new(0), |b| b.height);
-    let (tip_height, tip_hash) = prepared.chain.blocks.last().map_or(
-        (BlockHeight::new(0), BlockHash::from_bytes([0_u8; 32])),
-        |b| (b.height, b.block_hash),
-    );
     ValidationExpectations {
         schema_name: config.schema_name.clone(),
         network: prepared.network,
         full_blocks: config.full_blocks,
         max_segment_bytes: config.max_segment_bytes,
         live_tail_max_blocks: config.live_tail_max_blocks,
-        expected_first_height: first_height,
-        expected_tip_height: tip_height,
-        expected_tip_hash: tip_hash,
-        expected_sequence_digest_hex: prepared.chain.full_sequence_digest_hex.clone(),
-        expected_transaction_location_rows: prepared.chain.total_tx_count,
-        expected_block_hash_index_rows: u64::try_from(prepared.chain.blocks.len()).unwrap_or(0),
-        expected_tree_state_checkpoint_rows: prepared.chain.total_checkpoint_count,
-        expected_subtree_root_rows: u64::try_from(prepared.chain.subtree_roots.len()).unwrap_or(0),
+        expected_first_height: tip_outcome.first_height,
+        expected_tip_height: tip_outcome.tip_height,
+        expected_tip_hash: tip_outcome.tip_hash,
+        expected_sequence_digest_hex: tip_outcome.oracle_sequence_digest_hex.clone(),
+        expected_transaction_location_rows: tip_outcome.total_tx_count,
+        expected_block_hash_index_rows: u64::from(prepared.manifest.block_count),
+        expected_tree_state_checkpoint_rows: tip_outcome.total_checkpoint_count,
+        expected_subtree_root_rows: tip_outcome.subtree_root_count,
         expected_wallet_utxo_rows: tip_outcome.wallet_utxo_rows,
         expected_wallet_address_tx_rows: tip_outcome.wallet_address_tx_rows,
     }
@@ -509,30 +576,12 @@ fn resolve_tip_follow_block_count(
     }
 }
 
-fn split_tip_follow_phases(
-    tip_blocks: &[PreparedSegmentedBlock],
-) -> (&[PreparedSegmentedBlock], &[PreparedSegmentedBlock]) {
-    if tip_blocks.len() <= 1 {
-        return (tip_blocks, &[]);
-    }
-    tip_blocks.split_at(tip_blocks.len().div_ceil(2))
-}
-
-fn initial_tail_slice(
-    bulk_blocks: &[PreparedSegmentedBlock],
-    live_tail_max_blocks: u32,
-) -> Vec<PreparedSegmentedBlock> {
-    let max_tail = usize::try_from(live_tail_max_blocks).unwrap_or(128);
-    let settled_count = bulk_blocks.len().saturating_sub(max_tail);
-    bulk_blocks[settled_count..].to_vec()
-}
-
 async fn run_contended_phase(
     ctx: ContendedPhaseContext<'_>,
     writer_client: &mut tokio_postgres::Client,
-    contended_tips: &[PreparedSegmentedBlock],
+    contended_range: Option<(u32, u32)>,
 ) -> Result<(LatencyPercentilesMillis, Duration, ConcurrentReaderSummary), BenchError> {
-    if contended_tips.is_empty() && ctx.config.concurrent_readers == 0 {
+    if contended_range.is_none() && ctx.config.concurrent_readers == 0 {
         return Ok((
             LatencyPercentilesMillis::default(),
             Duration::ZERO,
@@ -553,6 +602,7 @@ async fn run_contended_phase(
                 reader_count: ctx.config.concurrent_readers,
                 network: ctx.network,
                 connection_mode: ctx.config.reader_mode,
+                live_tail_max_blocks: ctx.config.live_tail_max_blocks,
             })
             .await?,
         )
@@ -562,7 +612,7 @@ async fn run_contended_phase(
 
     let commit_outcome = ctx
         .tip_state
-        .advance_blocks(writer_client, contended_tips, ctx.wallet_projection)
+        .advance_height_range(writer_client, ctx.advance_target, contended_range)
         .await;
     let reader_outcome = match pool {
         Some(active_pool) => Some(active_pool.stop_and_collect().await),
@@ -596,14 +646,31 @@ async fn run_fresh_reader_validation(
 )]
 fn assemble_run_report(
     config: &PostgresSegmentedConfig,
-    prepared: &PreparedRunInputs,
-    first_height: BlockHeight,
-    last_block: &PreparedSegmentedBlock,
+    prepared: &PreparedSourceInputs,
     server_settings: PostgresServerSettings,
-    timings: PostgresSegmentedBuildTimings,
+    bulk_stream: &BulkStreamOutcome,
+    wall_clock_duration: Duration,
+    fresh_val_duration: Duration,
     tip_outcome: TipAndFootprintOutcome,
     validation: PersistedValidationSummary,
 ) -> PostgresSegmentedRunReport {
+    let total_prepare = (prepared.source_open_duration
+        + bulk_stream.timings.prepare_duration
+        + tip_outcome.extra_prepare_duration)
+        .as_secs_f64();
+    let timings = PostgresSegmentedBuildTimings {
+        wall_clock_seconds: wall_clock_duration.as_secs_f64(),
+        prepare_seconds: total_prepare,
+        schema_create_seconds: bulk_stream.timings.schema_create_duration.as_secs_f64(),
+        wallet_projection_seconds: bulk_stream.timings.wallet_projection_duration.as_secs_f64(),
+        seal_seconds: bulk_stream.timings.seal_duration.as_secs_f64(),
+        bulk_copy_seconds: bulk_stream.timings.copy_duration.as_secs_f64(),
+        finalize_seconds: bulk_stream.timings.finalize_duration.as_secs_f64(),
+        uncontended_tip_follow_seconds: tip_outcome.uncontended_duration.as_secs_f64(),
+        contended_tip_follow_seconds: tip_outcome.contended_duration.as_secs_f64(),
+        fresh_validation_seconds: fresh_val_duration.as_secs_f64(),
+        footprint_measurement_seconds: tip_outcome.footprint_duration.as_secs_f64(),
+    };
     PostgresSegmentedRunReport {
         schema_name: config.schema_name.clone(),
         schema_version: schema::POSTGRES_SEGMENTED_SCHEMA_VERSION,
@@ -617,10 +684,10 @@ fn assemble_run_report(
         mempool_churn_txs_per_block: config.mempool_churn_txs_per_block,
         bulk_block_count: u64::try_from(prepared.bulk_count).unwrap_or(0),
         tip_follow_block_count: u64::try_from(prepared.tip_count).unwrap_or(0),
-        total_block_count: u64::try_from(prepared.chain.blocks.len()).unwrap_or(0),
-        first_height,
-        tip_height: last_block.height,
-        tip_hash: last_block.block_hash,
+        total_block_count: u64::from(prepared.manifest.block_count),
+        first_height: tip_outcome.first_height,
+        tip_height: tip_outcome.tip_height,
+        tip_hash: tip_outcome.tip_hash,
         persisted_sequence_digest_hex: validation.observed_sequence_digest_hex,
         settled_blocks_verified: validation.settled_blocks_verified,
         live_tail_blocks_verified: validation.live_tail_blocks_verified,

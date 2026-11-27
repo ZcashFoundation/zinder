@@ -1359,8 +1359,23 @@ cat >"$segmented_valid_report" <<'JSON'
     "synchronous_commit": "on",
     "wal_level": "replica"
   },
+  "provenance": {
+    "runner": {
+      "cpu_limit_cores": 8.0,
+      "memory_limit_bytes": 17179869184
+    }
+  },
+  "runtime_evidence": {
+    "client_cpu_limit_cores": 1.5,
+    "client_memory_limit_bytes": 8053063680,
+    "database_cpu_limit_cores": 6.0,
+    "database_memory_limit_bytes": 8589934592,
+    "pooler_cpu_limit_cores": 0.5,
+    "pooler_memory_limit_bytes": 536870912
+  },
   "configuration": {
     "schema_version": 2,
+    "reader_mode": "pgbouncer-transaction",
     "max_segment_bytes": 268435456,
     "live_tail_max_blocks": 4,
     "concurrent_readers": 4,
@@ -1377,11 +1392,17 @@ cat >"$segmented_valid_report" <<'JSON'
   },
   "timings": {
     "wall_clock_seconds": 1.5,
+    "prepare_seconds": 0.2,
+    "schema_create_seconds": 0.1,
+    "wallet_projection_seconds": 0.1,
+    "seal_seconds": 0.2,
+    "bulk_copy_seconds": 0.3,
+    "finalize_seconds": 0.2,
     "streaming_blocks_per_second": 42.0
   },
   "tip_follow": {
-    "uncontended_commit_latencies_ms": { "max_ms": 8.0 },
-    "contended_commit_latencies_ms": { "max_ms": 12.0 }
+    "uncontended_commit_latencies_ms": { "sample_count": 2, "max_ms": 8.0 },
+    "contended_commit_latencies_ms": { "sample_count": 2, "max_ms": 12.0 }
   },
   "reader_workload": {
     "completed_transactions": 20,
@@ -1396,6 +1417,7 @@ cat >"$segmented_valid_report" <<'JSON'
     "live_tail_rows": 2
   },
   "adr0004_gate_evaluation": {
+    "tip_commit_latency_under_2s": true,
     "max_segment_bytes_respected": true,
     "live_tail_bounded": true,
     "concurrent_readers_zero_errors": true
@@ -1422,5 +1444,9 @@ expect_segmented_rejected unbounded-live-tail '.footprint.live_tail_rows = 5'
 expect_segmented_rejected wrong-report-version '.report_format_version = 2'
 expect_segmented_rejected zero-reader-throughput '.reader_workload.per_reader_blocks_per_second_mean = 0'
 expect_segmented_rejected storage-mismatch '.footprint.total_storage_bytes = 999'
+expect_segmented_rejected zero-tip-samples-claiming-pass '.tip_follow.contended_commit_latencies_ms.sample_count = 0'
+expect_segmented_rejected missing-pooler-cpu-budget '.runtime_evidence.pooler_cpu_limit_cores = null'
+expect_segmented_rejected pooler-memory-budget-mismatch '.runtime_evidence.pooler_memory_limit_bytes = 1073741824'
+expect_segmented_rejected missing-wallet-projection-timing 'del(.timings.wallet_projection_seconds)'
 
 printf 'storage benchmark campaign validator tests passed\n'

@@ -83,6 +83,7 @@ pub struct StagedWalletBlock {
 pub struct ProvisionalWalletProjection {
     utxos: HashMap<TransparentOutPoint, WalletUtxoRow>,
     address_txs: Vec<WalletAddressTxRow>,
+    address_tx_count: u64,
 }
 
 struct StageBuffers {
@@ -118,6 +119,23 @@ impl ProvisionalWalletProjection {
     #[must_use]
     pub fn address_tx_rows(&self) -> &[WalletAddressTxRow] {
         &self.address_txs
+    }
+
+    /// Drains accumulated pending address-transaction rows after batch `COPY` persistence.
+    pub fn drain_address_tx_rows(&mut self) -> Vec<WalletAddressTxRow> {
+        std::mem::take(&mut self.address_txs)
+    }
+
+    /// Returns total UTXO rows tracked across bulk and tip phases without re-sorting.
+    #[must_use]
+    pub fn utxo_count(&self) -> u64 {
+        u64::try_from(self.utxos.len()).unwrap_or(0)
+    }
+
+    /// Returns total address-transaction rows emitted across bulk and tip phases.
+    #[must_use]
+    pub const fn address_tx_count(&self) -> u64 {
+        self.address_tx_count
     }
 
     /// Purely validates `facts` and produces [`StagedWalletBlock`] without mutating `self`.
@@ -171,6 +189,8 @@ impl ProvisionalWalletProjection {
                 target.spent_at_height = Some(spend.spent_at_height);
             }
         }
+        let added_addr_rows = u64::try_from(delta.address_tx_rows.len()).unwrap_or(0);
+        self.address_tx_count = self.address_tx_count.saturating_add(added_addr_rows);
         self.address_txs.extend(delta.address_tx_rows);
     }
 

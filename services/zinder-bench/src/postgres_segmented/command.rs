@@ -19,8 +19,8 @@ use zinder_bench::{
         },
     },
     report::{
-        BenchmarkReport, FixtureCachePolicy, FixtureSummary, PostgresBenchmarkRuntimeEvidence,
-        PostgresSegmentedBaselineInput, PostgresSegmentedReportInputs,
+        BenchmarkReport, FixtureCachePolicy, FixtureSummary, PostgresSegmentedBaselineInput,
+        PostgresSegmentedReportInputs, PostgresSegmentedRuntimeEvidence,
         build_postgres_segmented_storage_report, is_immutable_image_reference,
         is_valid_benchmark_trial_id,
     },
@@ -89,7 +89,7 @@ pub(super) struct PostgresSegmentedArgs {
     /// Synthetic mempool transactions admitted and evicted per tip block.
     #[arg(long, default_value_t = 8)]
     mempool_churn_txs_per_block: u32,
-    /// Optional `RocksDB` baseline report JSON (`rocksdb-canonical-fixture-replay`, `rocksdb-storage-lifecycle`, or `rocksdb-compact-block-range`) for ADR-0004 Decision 7 comparison.
+    /// Optional `RocksDB` baseline report JSON (`rocksdb-canonical-fixture-replay`, `rocksdb-storage-lifecycle`, or `canonical-replay-storage`) for ADR-0004 Decision 7 build/storage comparison.
     #[arg(long)]
     rocksdb_baseline_report: Option<PathBuf>,
     /// CPU limit applied to the benchmark client container, in logical cores.
@@ -107,6 +107,15 @@ pub(super) struct PostgresSegmentedArgs {
     /// Immutable image reference for the measured database container.
     #[arg(long)]
     database_image_reference: Option<String>,
+    /// CPU limit applied to the connection pooler container (`PgBouncer`), in logical cores.
+    #[arg(long)]
+    pooler_cpu_limit_cores: Option<f64>,
+    /// Memory limit applied to the connection pooler container (`PgBouncer`), in bytes.
+    #[arg(long)]
+    pooler_memory_limit_bytes: Option<u64>,
+    /// Immutable image reference for the measured connection pooler container (`PgBouncer`).
+    #[arg(long)]
+    pooler_image_reference: Option<String>,
     /// Write the JSON report to this path instead of stdout (fails if file already exists).
     #[arg(long)]
     report: Option<PathBuf>,
@@ -188,12 +197,15 @@ pub(super) async fn run_postgres_segmented_cli(
     let inputs = PostgresSegmentedReportInputs {
         run: run_report,
         baseline,
-        runtime_evidence: PostgresBenchmarkRuntimeEvidence {
+        runtime_evidence: PostgresSegmentedRuntimeEvidence {
             database_image_reference: args.database_image_reference,
+            pooler_image_reference: args.pooler_image_reference,
             client_cpu_limit_cores: args.client_cpu_limit_cores,
             client_memory_limit_bytes: args.client_memory_limit_bytes,
             database_cpu_limit_cores: args.database_cpu_limit_cores,
             database_memory_limit_bytes: args.database_memory_limit_bytes,
+            pooler_cpu_limit_cores: args.pooler_cpu_limit_cores,
+            pooler_memory_limit_bytes: args.pooler_memory_limit_bytes,
         },
         benchmark_client_peak_rss: peak_rss(),
         software_revision: args.software_revision,
@@ -223,6 +235,7 @@ fn validate_cli_provenance_and_partitions(
     validate_positive_f64(args.cpu_limit_cores, "--cpu-limit-cores")?;
     validate_positive_f64(args.client_cpu_limit_cores, "--client-cpu-limit-cores")?;
     validate_positive_f64(args.database_cpu_limit_cores, "--database-cpu-limit-cores")?;
+    validate_positive_f64(args.pooler_cpu_limit_cores, "--pooler-cpu-limit-cores")?;
     validate_positive_u64(args.memory_limit_bytes, "--memory-limit-bytes")?;
     validate_positive_u64(
         args.client_memory_limit_bytes,
@@ -231,6 +244,10 @@ fn validate_cli_provenance_and_partitions(
     validate_positive_u64(
         args.database_memory_limit_bytes,
         "--database-memory-limit-bytes",
+    )?;
+    validate_positive_u64(
+        args.pooler_memory_limit_bytes,
+        "--pooler-memory-limit-bytes",
     )?;
 
     match (&args.trial_id, args.fixture_cache_policy) {
@@ -248,65 +265,137 @@ fn validate_cli_provenance_and_partitions(
         }
     }
 
-    if args
-        .image_reference
-        .as_deref()
-        .is_some_and(|r| !is_immutable_image_reference(r))
-    {
-        return Err(BenchError::invalid_argument(
-            "--image-reference must be a sha256 image ID or digest-pinned reference",
-        ));
-    }
-    if args
-        .database_image_reference
-        .as_deref()
-        .is_some_and(|r| !is_immutable_image_reference(r))
-    {
-        return Err(BenchError::invalid_argument(
-            "--database-image-reference must be a sha256 image ID or digest-pinned reference",
-        ));
+    for (flag, img_opt) in [
+        ("--image-reference", args.image_reference.as_deref()),
+        (
+            "--database-image-reference",
+            args.database_image_reference.as_deref(),
+        ),
+        (
+            "--pooler-image-reference",
+            args.pooler_image_reference.as_deref(),
+        ),
+    ] {
+        if img_opt.is_some_and(|r| !is_immutable_image_reference(r)) {
+            return Err(BenchError::invalid_argument(format!(
+                "{flag} must be a sha256 image ID or digest-pinned reference"
+            )));
+        }
     }
 
     validate_resource_partition_totals(args)
 }
 
 fn validate_resource_partition_totals(args: &PostgresSegmentedArgs) -> Result<(), BenchError> {
-    match (
-        args.cpu_limit_cores,
-        args.client_cpu_limit_cores,
-        args.database_cpu_limit_cores,
-    ) {
-        (None, None, None) => {}
-        (Some(agg), Some(cli), Some(db))
-            if (cli + db - agg).abs() <= f64::EPSILON * agg.max(1.0) => {}
-        (Some(_), Some(_), Some(_)) => {
-            return Err(BenchError::invalid_argument(
-                "--client-cpu-limit-cores plus --database-cpu-limit-cores must equal --cpu-limit-cores",
-            ));
-        }
-        _ => {
-            return Err(BenchError::invalid_argument(
-                "CPU resource partition requires --cpu-limit-cores, --client-cpu-limit-cores, and --database-cpu-limit-cores together",
-            ));
-        }
+    if args.reader_mode == CliReaderMode::Direct
+        && (args.pooler_cpu_limit_cores.is_some()
+            || args.pooler_memory_limit_bytes.is_some()
+            || args.pooler_image_reference.is_some())
+    {
+        return Err(BenchError::invalid_argument(
+            "--pooler-* flags are only valid with --reader-mode pgbouncer-transaction",
+        ));
     }
-    match (
-        args.memory_limit_bytes,
-        args.client_memory_limit_bytes,
-        args.database_memory_limit_bytes,
-    ) {
-        (None, None, None) => {}
-        (Some(agg), Some(cli), Some(db)) if cli.checked_add(db) == Some(agg) => {}
-        (Some(_), Some(_), Some(_)) => {
-            return Err(BenchError::invalid_argument(
-                "--client-memory-limit-bytes plus --database-memory-limit-bytes must equal --memory-limit-bytes",
-            ));
-        }
-        _ => {
-            return Err(BenchError::invalid_argument(
-                "Memory resource partition requires --memory-limit-bytes, --client-memory-limit-bytes, and --database-memory-limit-bytes together",
-            ));
-        }
+
+    validate_cpu_budget_partition(args)?;
+    validate_memory_budget_partition(args)
+}
+
+fn validate_cpu_budget_partition(args: &PostgresSegmentedArgs) -> Result<(), BenchError> {
+    let any_cpu = args.cpu_limit_cores.is_some()
+        || args.client_cpu_limit_cores.is_some()
+        || args.database_cpu_limit_cores.is_some()
+        || args.pooler_cpu_limit_cores.is_some();
+    if !any_cpu {
+        return Ok(());
+    }
+    match args.reader_mode {
+        CliReaderMode::Direct => match (
+            args.cpu_limit_cores,
+            args.client_cpu_limit_cores,
+            args.database_cpu_limit_cores,
+        ) {
+            (Some(agg), Some(cli), Some(db))
+                if (cli + db - agg).abs() <= f64::EPSILON * agg.max(1.0) => {}
+            (Some(_), Some(_), Some(_)) => {
+                return Err(BenchError::invalid_argument(
+                    "--client-cpu-limit-cores plus --database-cpu-limit-cores must equal --cpu-limit-cores",
+                ));
+            }
+            _ => {
+                return Err(BenchError::invalid_argument(
+                    "Direct CPU partition requires --cpu-limit-cores, --client-cpu-limit-cores, and --database-cpu-limit-cores together",
+                ));
+            }
+        },
+        CliReaderMode::PgbouncerTransaction => match (
+            args.cpu_limit_cores,
+            args.client_cpu_limit_cores,
+            args.database_cpu_limit_cores,
+            args.pooler_cpu_limit_cores,
+        ) {
+            (Some(agg), Some(cli), Some(db), Some(pool))
+                if (cli + db + pool - agg).abs() <= f64::EPSILON * agg.max(1.0) => {}
+            (Some(_), Some(_), Some(_), Some(_)) => {
+                return Err(BenchError::invalid_argument(
+                    "--client-cpu-limit-cores + --database-cpu-limit-cores + --pooler-cpu-limit-cores must equal --cpu-limit-cores",
+                ));
+            }
+            _ => {
+                return Err(BenchError::invalid_argument(
+                    "Pooled CPU partition requires --cpu-limit-cores, --client-cpu-limit-cores, --database-cpu-limit-cores, and --pooler-cpu-limit-cores together",
+                ));
+            }
+        },
+    }
+    Ok(())
+}
+
+fn validate_memory_budget_partition(args: &PostgresSegmentedArgs) -> Result<(), BenchError> {
+    let any_mem = args.memory_limit_bytes.is_some()
+        || args.client_memory_limit_bytes.is_some()
+        || args.database_memory_limit_bytes.is_some()
+        || args.pooler_memory_limit_bytes.is_some();
+    if !any_mem {
+        return Ok(());
+    }
+    match args.reader_mode {
+        CliReaderMode::Direct => match (
+            args.memory_limit_bytes,
+            args.client_memory_limit_bytes,
+            args.database_memory_limit_bytes,
+        ) {
+            (Some(agg), Some(cli), Some(db)) if cli.checked_add(db) == Some(agg) => {}
+            (Some(_), Some(_), Some(_)) => {
+                return Err(BenchError::invalid_argument(
+                    "--client-memory-limit-bytes plus --database-memory-limit-bytes must equal --memory-limit-bytes",
+                ));
+            }
+            _ => {
+                return Err(BenchError::invalid_argument(
+                    "Direct memory partition requires --memory-limit-bytes, --client-memory-limit-bytes, and --database-memory-limit-bytes together",
+                ));
+            }
+        },
+        CliReaderMode::PgbouncerTransaction => match (
+            args.memory_limit_bytes,
+            args.client_memory_limit_bytes,
+            args.database_memory_limit_bytes,
+            args.pooler_memory_limit_bytes,
+        ) {
+            (Some(agg), Some(cli), Some(db), Some(pool))
+                if cli.checked_add(db).and_then(|s| s.checked_add(pool)) == Some(agg) => {}
+            (Some(_), Some(_), Some(_), Some(_)) => {
+                return Err(BenchError::invalid_argument(
+                    "--client-memory-limit-bytes + --database-memory-limit-bytes + --pooler-memory-limit-bytes must equal --memory-limit-bytes",
+                ));
+            }
+            _ => {
+                return Err(BenchError::invalid_argument(
+                    "Pooled memory partition requires --memory-limit-bytes, --client-memory-limit-bytes, --database-memory-limit-bytes, and --pooler-memory-limit-bytes together",
+                ));
+            }
+        },
     }
     Ok(())
 }
@@ -378,14 +467,9 @@ fn read_rocksdb_baseline_report(path: &Path) -> Result<PostgresSegmentedBaseline
             })
         }
         "rocksdb-canonical-fixture-replay" => Ok(PostgresSegmentedBaselineInput {
-            build_seconds: Some(json_req_f64(&json_doc, "/source_load/wall_clock_seconds")?),
-            storage_bytes: Some(json_req_u64(
-                &json_doc,
-                "/canonical_ready/physical_store_bytes",
-            )?),
-            streaming_blocks_per_second: json_doc
-                .pointer("/source_load/blocks_per_second")
-                .and_then(serde_json::Value::as_f64),
+            build_seconds: Some(json_req_f64(&json_doc, "/total_seconds")?),
+            storage_bytes: Some(json_req_u64(&json_doc, "/physical_store_bytes")?),
+            streaming_blocks_per_second: None,
         }),
         "canonical-replay-storage" => Ok(PostgresSegmentedBaselineInput {
             build_seconds: Some(json_req_f64(&json_doc, "/round_trip/wall_clock_seconds")?),
@@ -393,12 +477,109 @@ fn read_rocksdb_baseline_report(path: &Path) -> Result<PostgresSegmentedBaseline
                 &json_doc,
                 "/round_trip/physical_storage_bytes",
             )?),
-            streaming_blocks_per_second: json_doc
-                .pointer("/round_trip/blocks_per_second")
-                .and_then(serde_json::Value::as_f64),
+            streaming_blocks_per_second: None,
         }),
         other => Err(BenchError::report_format(format!(
             "unsupported baseline report measurement_kind `{other}`"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CliReaderMode, PostgresSegmentedArgs, read_rocksdb_baseline_report,
+        validate_cli_provenance_and_partitions,
+    };
+    use clap::Parser;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: PostgresSegmentedArgs,
+    }
+
+    #[test]
+    fn rocksdb_canonical_fixture_replay_reads_top_level_and_omits_streaming_rate()
+    -> Result<(), crate::BenchError> {
+        let mut file = NamedTempFile::new()
+            .map_err(|err| crate::BenchError::io("baseline-fixture-replay.json", err))?;
+        let doc = serde_json::json!({
+            "measurement_kind": "rocksdb-canonical-fixture-replay",
+            "total_seconds": 12.5,
+            "blocks_per_second": 400.0,
+            "physical_store_bytes": 987_654_u64,
+            "source_load": { "block_count": 5000 },
+            "canonical_ready": { "tip_height": 5000 }
+        });
+        file.write_all(doc.to_string().as_bytes())
+            .map_err(|err| crate::BenchError::io("write baseline json", err))?;
+        let parsed = read_rocksdb_baseline_report(file.path())?;
+        assert_eq!(parsed.build_seconds, Some(12.5));
+        assert_eq!(parsed.storage_bytes, Some(987_654));
+        assert_eq!(parsed.streaming_blocks_per_second, None);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_replay_storage_leaves_streaming_rate_unset() -> Result<(), crate::BenchError> {
+        let mut file = NamedTempFile::new()
+            .map_err(|err| crate::BenchError::io("baseline-canonical-replay.json", err))?;
+        let doc = serde_json::json!({
+            "measurement_kind": "canonical-replay-storage",
+            "round_trip": {
+                "wall_clock_seconds": 4.25,
+                "physical_storage_bytes": 123_456_u64,
+                "blocks_per_second": 999.0
+            }
+        });
+        file.write_all(doc.to_string().as_bytes())
+            .map_err(|err| crate::BenchError::io("write baseline json", err))?;
+        let parsed = read_rocksdb_baseline_report(file.path())?;
+        assert_eq!(parsed.build_seconds, Some(4.25));
+        assert_eq!(parsed.storage_bytes, Some(123_456));
+        assert_eq!(parsed.streaming_blocks_per_second, None);
+        Ok(())
+    }
+
+    #[test]
+    fn pgbouncer_resource_partition_requires_pooler_and_accepts_matched_envelope()
+    -> Result<(), crate::BenchError> {
+        let valid = TestCli::try_parse_from([
+            "test",
+            "--fixture",
+            "/tmp/fx",
+            "--reader-mode",
+            "pgbouncer-transaction",
+            "--cpu-limit-cores",
+            "8.0",
+            "--memory-limit-bytes",
+            "17179869184",
+            "--client-cpu-limit-cores",
+            "1.5",
+            "--client-memory-limit-bytes",
+            "8053063680",
+            "--database-cpu-limit-cores",
+            "6.0",
+            "--database-memory-limit-bytes",
+            "8589934592",
+            "--pooler-cpu-limit-cores",
+            "0.5",
+            "--pooler-memory-limit-bytes",
+            "536870912",
+        ])
+        .map_err(|err| crate::BenchError::invalid_argument(err.to_string()))?;
+        assert_eq!(valid.args.reader_mode, CliReaderMode::PgbouncerTransaction);
+        validate_cli_provenance_and_partitions(&valid.args, 0)?;
+
+        let mut missing_pooler = valid.args;
+        missing_pooler.pooler_cpu_limit_cores = None;
+        assert!(validate_cli_provenance_and_partitions(&missing_pooler, 0).is_err());
+
+        missing_pooler.pooler_cpu_limit_cores = Some(1.0);
+        assert!(validate_cli_provenance_and_partitions(&missing_pooler, 0).is_err());
+        Ok(())
     }
 }

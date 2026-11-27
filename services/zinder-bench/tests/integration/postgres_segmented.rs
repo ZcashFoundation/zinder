@@ -19,16 +19,30 @@ use zinder_bench::{
     },
     capture::measure_fixture_blocks,
     fixture::{
-        FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION, FixtureManifest, SubtreeRootSet,
-        write_segment,
+        FIXTURE_CONTRACT_IDENTITY, FIXTURE_FORMAT_VERSION, FixtureManifest, FixtureNodeSource,
+        SubtreeRootSet, write_segment,
     },
     postgres_segmented::{
-        PostgresSegmentedConfig, reader::ReaderConnectionMode, run_postgres_segmented_benchmark,
-        schema::MAX_SETTLED_SEGMENT_BYTES,
+        PostgresSegmentedConfig,
+        database::{close_postgres, connect_postgres},
+        loader::{
+            BulkStreamConfig, PendingSealTransition, TipCommitPayload, WriterFenceHandle,
+            acquire_post_finalize_writer_term, execute_streaming_bulk_load,
+            persist_sealed_tail_transition, persist_tip_block_in_txn,
+            prepare_block_range_from_source,
+        },
+        reader::{
+            ReaderConnectionMode, ValidationExpectations, validate_persisted_state_read_only,
+        },
+        run_postgres_segmented_benchmark,
+        schema::{BENCHMARK_LEASE_DURATION_MS, MAX_SETTLED_SEGMENT_BYTES},
+        segment_builder::seal_settled_segments,
+        tip_follow::{TipAdvanceTarget, TipFollowParameters, TipFollowState},
+        wallet_projection::ProvisionalWalletProjection,
     },
     report::{
-        FixtureSummary, PostgresBenchmarkRuntimeEvidence, PostgresSegmentedBaselineInput,
-        PostgresSegmentedReportInputs, build_postgres_segmented_storage_report,
+        FixtureSummary, PostgresSegmentedBaselineInput, PostgresSegmentedReportInputs,
+        PostgresSegmentedRuntimeEvidence, build_postgres_segmented_storage_report,
     },
     rss::peak_rss,
 };
@@ -247,6 +261,8 @@ fn assert_compact_segmented_run(
     assert!(seg_run.footprint.wallet_storage_bytes > 0);
     assert!(seg_run.footprint.bulk_wal_bytes > 0);
     assert!(seg_run.footprint.tip_follow_wal_bytes > 0);
+    assert!(seg_run.timings.schema_create_seconds > 0.0);
+    assert!(seg_run.timings.wallet_projection_seconds >= 0.0);
     assert_eq!(
         seg_run.footprint.total_storage_bytes,
         seg_run.footprint.canonical_storage_bytes + seg_run.footprint.wallet_storage_bytes
@@ -265,12 +281,15 @@ async fn verify_compact_report_and_schema_reuse(ctx: CompactVerificationContext<
                 storage_bytes: Some(ctx.rocksdb_bytes),
                 streaming_blocks_per_second: None,
             }),
-            runtime_evidence: PostgresBenchmarkRuntimeEvidence {
+            runtime_evidence: PostgresSegmentedRuntimeEvidence {
                 database_image_reference: None,
+                pooler_image_reference: None,
                 client_cpu_limit_cores: None,
                 client_memory_limit_bytes: None,
                 database_cpu_limit_cores: None,
                 database_memory_limit_bytes: None,
+                pooler_cpu_limit_cores: None,
+                pooler_memory_limit_bytes: None,
             },
             benchmark_client_peak_rss: peak_rss(),
             software_revision: None,
@@ -286,9 +305,21 @@ async fn verify_compact_report_and_schema_reuse(ctx: CompactVerificationContext<
         },
     );
     report.validate()?;
+    let seg_report = report
+        .postgres_segmented_storage()
+        .ok_or_else(|| eyre!("expected segmented report variant"))?;
+    assert_eq!(
+        seg_report
+            .adr0004_gate_evaluation
+            .tip_commit_latency_under_2s,
+        Some(true)
+    );
 
     let database_url = ctx.config.database_url.clone();
     let reader_url = ctx.config.reader_database_url.clone();
+    verify_tampered_live_segment_kind_rejected(&database_url, &ctx.config.schema_name, seg_report)
+        .await?;
+
     let Some(reuse_err) = run_postgres_segmented_benchmark(ctx.config).await.err() else {
         return Err(eyre!("existing schema must reject rerun"));
     };
@@ -298,6 +329,74 @@ async fn verify_compact_report_and_schema_reuse(ctx: CompactVerificationContext<
     if let Some(ref r_url) = reader_url {
         assert!(!reuse_msg.contains(r_url.as_str()));
     }
+    Ok(())
+}
+
+async fn verify_tampered_live_segment_kind_rejected(
+    database_url: &str,
+    schema_name: &str,
+    seg_report: &zinder_bench::report::PostgresSegmentedStorageReport,
+) -> Result<()> {
+    let conn = connect_postgres(
+        database_url,
+        "tampering live transaction_location segment_kind",
+    )
+    .await?;
+    let counts = conn
+        .client
+        .query_one(
+            &format!(
+                "SELECT
+                    (SELECT COUNT(*)::BIGINT FROM {schema_name}.transaction_location),
+                    (SELECT COUNT(*)::BIGINT FROM {schema_name}.block_hash_index),
+                    (SELECT COUNT(*)::BIGINT FROM {schema_name}.tree_state_checkpoint),
+                    (SELECT COUNT(*)::BIGINT FROM {schema_name}.subtree_root),
+                    (SELECT COUNT(*)::BIGINT FROM {schema_name}.wallet_utxo),
+                    (SELECT COUNT(*)::BIGINT FROM {schema_name}.wallet_address_tx)"
+            ),
+            &[],
+        )
+        .await?;
+    let updated = conn
+        .client
+        .execute(
+            &format!(
+                "UPDATE {schema_name}.transaction_location SET segment_kind = 1 WHERE segment_kind = 0"
+            ),
+            &[],
+        )
+        .await?;
+    assert!(updated > 0, "expected live tail transaction_location rows");
+    let tip_hash = zinder_core::wire::decode_internal_block_hash(
+        hex::decode(&seg_report.validation.tip_hash_hex)?.as_slice(),
+    )?;
+    let expectations = ValidationExpectations {
+        schema_name: schema_name.to_owned(),
+        network: zinder_core::Network::ZcashRegtest,
+        full_blocks: seg_report.configuration.full_blocks,
+        max_segment_bytes: seg_report.configuration.max_segment_bytes,
+        live_tail_max_blocks: seg_report.configuration.live_tail_max_blocks,
+        expected_first_height: BlockHeight::new(seg_report.validation.first_height),
+        expected_tip_height: BlockHeight::new(seg_report.validation.tip_height),
+        expected_tip_hash: tip_hash,
+        expected_sequence_digest_hex: seg_report.validation.persisted_sequence_digest_hex.clone(),
+        expected_transaction_location_rows: u64::try_from(counts.get::<_, i64>(0))?,
+        expected_block_hash_index_rows: u64::try_from(counts.get::<_, i64>(1))?,
+        expected_tree_state_checkpoint_rows: u64::try_from(counts.get::<_, i64>(2))?,
+        expected_subtree_root_rows: u64::try_from(counts.get::<_, i64>(3))?,
+        expected_wallet_utxo_rows: u64::try_from(counts.get::<_, i64>(4))?,
+        expected_wallet_address_tx_rows: u64::try_from(counts.get::<_, i64>(5))?,
+    };
+    let err = validate_persisted_state_read_only(&conn.client, &expectations)
+        .await
+        .err();
+    close_postgres(conn).await?;
+    let err = err.ok_or_else(|| eyre!("tampered live segment_kind must be rejected"))?;
+    assert!(
+        err.to_string()
+            .contains("transaction_location segment_kind mismatch"),
+        "unexpected error: {err}"
+    );
     Ok(())
 }
 
@@ -335,12 +434,15 @@ async fn postgres_segmented_full_blocks_verifies_raw_block_segments() -> Result<
         PostgresSegmentedReportInputs {
             run: run_report,
             baseline: None,
-            runtime_evidence: PostgresBenchmarkRuntimeEvidence {
+            runtime_evidence: PostgresSegmentedRuntimeEvidence {
                 database_image_reference: None,
+                pooler_image_reference: None,
                 client_cpu_limit_cores: None,
                 client_memory_limit_bytes: None,
                 database_cpu_limit_cores: None,
                 database_memory_limit_bytes: None,
+                pooler_cpu_limit_cores: None,
+                pooler_memory_limit_bytes: None,
             },
             benchmark_client_peak_rss: peak_rss(),
             software_revision: None,
@@ -356,5 +458,220 @@ async fn postgres_segmented_full_blocks_verifies_raw_block_segments() -> Result<
         },
     );
     report.validate()?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL database"]
+async fn postgres_segmented_renews_lease_after_long_build_and_fences_settlement() -> Result<()> {
+    let database_url = std::env::var(DATABASE_URL_ENV)
+        .map_err(|_| eyre!("set {DATABASE_URL_ENV} to a fresh disposable database"))?;
+    let fixture_dir = write_segmented_regtest_fixture(10)?;
+    let manifest = FixtureManifest::read(fixture_dir.path())?;
+    let manifest_sha256 = manifest.digest_sha256()?;
+    let source = FixtureNodeSource::open(fixture_dir.path(), &manifest)?;
+    let schema = "zinder_bench_seg_fence";
+
+    let mut conn = connect_postgres(&database_url, "connect fence regression test").await?;
+    let mut wallet_projection = ProvisionalWalletProjection::new();
+    let mut bulk = execute_streaming_bulk_load(
+        &mut conn.client,
+        &source,
+        &BulkStreamConfig {
+            manifest: &manifest,
+            manifest_sha256: &manifest_sha256,
+            schema_name: schema,
+            full_blocks: false,
+            max_segment_bytes: MAX_SETTLED_SEGMENT_BYTES,
+            settled_segment_blocks: 3,
+            live_tail_max_blocks: 3,
+            bulk_block_count: 6,
+            seed_lease_duration_ms: 1,
+            post_finalize_lease_duration_ms: BENCHMARK_LEASE_DURATION_MS,
+        },
+        &mut wallet_projection,
+    )
+    .await?;
+    assert_eq!(bulk.writer_epoch, 2);
+
+    assert_initial_segment_kind_classification(&conn.client, schema).await?;
+
+    let fence = WriterFenceHandle {
+        writer_epoch: bulk.writer_epoch,
+        lease_duration_ms: BENCHMARK_LEASE_DURATION_MS,
+    };
+    let tail_for_seal_test = bulk.initial_tail[..2].to_vec();
+    let mut tip_state = TipFollowState::new(
+        TipFollowParameters {
+            network: Network::ZcashRegtest,
+            schema_name: schema.to_owned(),
+            fence,
+            first_height: BlockHeight::new(1),
+            full_blocks: false,
+            max_segment_bytes: MAX_SETTLED_SEGMENT_BYTES,
+            settled_segment_blocks: 3,
+            live_tail_max_blocks: 3,
+            mempool_churn_txs_per_block: 1,
+        },
+        std::mem::take(&mut bulk.initial_tail),
+        bulk.initial_max_segment_bytes,
+    );
+    let mut target = TipAdvanceTarget {
+        source: &source,
+        prepare_state: &mut bulk.prepare_state,
+        wallet_projection: &mut wallet_projection,
+    };
+    let latencies = tip_state
+        .advance_height_range(&mut conn.client, &mut target, Some((7, 8)))
+        .await?;
+    assert_eq!(latencies.sample_count, 2);
+
+    verify_expired_tip_rejection(&mut conn.client, schema, fence, &mut target).await?;
+    verify_settlement_fence_rejections(&mut conn.client, schema, fence, &tail_for_seal_test)
+        .await?;
+    close_postgres(conn).await?;
+    Ok(())
+}
+
+async fn assert_initial_segment_kind_classification(
+    client: &tokio_postgres::Client,
+    schema: &str,
+) -> Result<()> {
+    let settled_cnt: i64 = client
+        .query_one(
+            &format!(
+                "SELECT COUNT(*)::BIGINT FROM {schema}.transaction_location WHERE block_height <= 3 AND segment_kind = 1"
+            ),
+            &[],
+        )
+        .await?
+        .get(0);
+    let live_cnt: i64 = client
+        .query_one(
+            &format!(
+                "SELECT COUNT(*)::BIGINT FROM {schema}.transaction_location WHERE block_height > 3 AND segment_kind = 0"
+            ),
+            &[],
+        )
+        .await?
+        .get(0);
+    let tail_cnt: i64 = client
+        .query_one(
+            &format!("SELECT COUNT(*)::BIGINT FROM {schema}.canonical_live_tail"),
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(settled_cnt >= 3);
+    assert!(live_cnt >= 3);
+    assert_eq!(tail_cnt, 3);
+    Ok(())
+}
+
+async fn verify_expired_tip_rejection(
+    client: &mut tokio_postgres::Client,
+    schema: &str,
+    fence: WriterFenceHandle,
+    target: &mut TipAdvanceTarget<'_>,
+) -> Result<()> {
+    client
+        .execute(
+            &format!(
+                "UPDATE {schema}.canonical_writer_fence SET lease_expires_at = clock_timestamp() - INTERVAL '5 seconds'"
+            ),
+            &[],
+        )
+        .await?;
+
+    let prepared_block_9 =
+        prepare_block_range_from_source(target.source, target.prepare_state, 9, 9).await?;
+    let block_9 = prepared_block_9
+        .first()
+        .ok_or_else(|| eyre!("expected prepared block 9"))?;
+    let staged_wallet = target.wallet_projection.stage_block(&block_9.facts)?;
+    let tip_txn = client.transaction().await?;
+    let expired_tip = persist_tip_block_in_txn(
+        &tip_txn,
+        schema,
+        &TipCommitPayload {
+            fence,
+            full_blocks: false,
+            first_height: BlockHeight::new(1),
+            block: block_9,
+            wallet_delta: &staged_wallet.delta,
+            evicted_mempool_txids: &[],
+            pending_seal: None,
+        },
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("expired writer lease must fail tip commit"))?;
+    assert!(expired_tip.to_string().contains("lease expired"));
+    tip_txn.rollback().await?;
+    Ok(())
+}
+
+async fn verify_settlement_fence_rejections(
+    client: &mut tokio_postgres::Client,
+    schema: &str,
+    fence: WriterFenceHandle,
+    tail_slice: &[zinder_bench::postgres_segmented::segment_builder::PreparedSegmentedBlock],
+) -> Result<()> {
+    let sealed_out = seal_settled_segments(
+        Network::ZcashRegtest,
+        tail_slice.to_vec(),
+        3,
+        false,
+        MAX_SETTLED_SEGMENT_BYTES,
+    )
+    .await?;
+    let last_sealed = tail_slice
+        .last()
+        .ok_or_else(|| eyre!("missing tail slice"))?;
+    let pending_seal = PendingSealTransition {
+        bundles: sealed_out.bundles,
+        settled_height: last_sealed.height,
+        settled_hash: last_sealed.block_hash,
+        settled_prev: last_sealed.previous_block_hash,
+        seal_count: tail_slice.len(),
+        max_segment_bytes_observed: sealed_out.max_segment_bytes_observed,
+    };
+
+    let expired_seal = persist_sealed_tail_transition(client, schema, fence, false, &pending_seal)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("expired writer lease must fail settlement"))?;
+    assert!(expired_seal.to_string().contains("lease expired"));
+
+    client
+        .execute(
+            &format!(
+                "UPDATE {schema}.canonical_writer_fence SET writer_epoch = $1, writer_id = 'competing-writer', lease_expires_at = clock_timestamp() + INTERVAL '30 seconds'",
+            ),
+            &[&(fence.writer_epoch + 1)],
+        )
+        .await?;
+
+    let superseded_seal =
+        persist_sealed_tail_transition(client, schema, fence, false, &pending_seal)
+            .await
+            .err()
+            .ok_or_else(|| eyre!("superseded writer_epoch must fail settlement"))?;
+    assert!(
+        superseded_seal
+            .to_string()
+            .contains("fenced by another epoch")
+    );
+
+    let superseded_term = acquire_post_finalize_writer_term(
+        client,
+        schema,
+        fence.writer_epoch,
+        BENCHMARK_LEASE_DURATION_MS,
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("superseded writer_epoch must fail term acquisition"))?;
+    assert!(superseded_term.to_string().contains("superseded"));
     Ok(())
 }

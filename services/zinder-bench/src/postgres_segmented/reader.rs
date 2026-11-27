@@ -74,6 +74,16 @@ pub struct ConcurrentReaderPoolConfig {
     pub network: Network,
     /// Declared connection mode for observability.
     pub connection_mode: ReaderConnectionMode,
+    /// Maximum allowed rows in `{schema}.canonical_live_tail` checked on each snapshot.
+    pub live_tail_max_blocks: u32,
+}
+
+#[derive(Clone)]
+struct ReaderLoopParams {
+    schema_name: String,
+    network: Network,
+    worker_index: u32,
+    live_tail_max_blocks: u32,
 }
 
 /// Streaming throughput and activity metrics observed by one reader worker.
@@ -258,17 +268,14 @@ pub async fn spawn_concurrent_readers(
         let mut connection =
             connect_postgres(&config.database_url, "connecting concurrent reader").await?;
         let worker_stop = Arc::clone(&stop_signal);
-        let worker_schema = config.schema_name.clone();
-        let network = config.network;
+        let loop_params = ReaderLoopParams {
+            schema_name: config.schema_name.clone(),
+            network: config.network,
+            worker_index,
+            live_tail_max_blocks: config.live_tail_max_blocks,
+        };
         let handle = tokio::spawn(async move {
-            let outcome = run_reader_loop(
-                &mut connection.client,
-                &worker_schema,
-                network,
-                worker_index,
-                &worker_stop,
-            )
-            .await;
+            let outcome = run_reader_loop(&mut connection.client, &loop_params, &worker_stop).await;
             let close_outcome = close_postgres(connection).await;
             let summary = outcome?;
             close_outcome?;
@@ -286,22 +293,19 @@ pub async fn spawn_concurrent_readers(
 
 async fn run_reader_loop(
     client: &mut Client,
-    schema: &str,
-    network: Network,
-    worker_index: u32,
+    params: &ReaderLoopParams,
     stop_signal: &AtomicBool,
 ) -> Result<ReaderWorkerThroughput, BenchError> {
     let worker_started = Instant::now();
     let mut stats = ReaderWorkerThroughput {
-        worker_index,
+        worker_index: params.worker_index,
         ..ReaderWorkerThroughput::default()
     };
     let mut iteration = 0_u64;
 
     loop {
         let iter_started = Instant::now();
-        let iter_stats =
-            execute_reader_iteration(client, schema, network, worker_index, iteration).await?;
+        let iter_stats = execute_reader_iteration(client, params, iteration).await?;
         stats.completed_transactions = stats.completed_transactions.saturating_add(1);
         stats.settled_range_reads = stats
             .settled_range_reads
@@ -335,11 +339,10 @@ struct IterationStats {
 
 async fn execute_reader_iteration(
     client: &mut Client,
-    schema: &str,
-    network: Network,
-    worker_index: u32,
+    params: &ReaderLoopParams,
     iteration: u64,
 ) -> Result<IterationStats, BenchError> {
+    let schema = &params.schema_name;
     let txn = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -385,15 +388,16 @@ async fn execute_reader_iteration(
         .get(0);
     if seg_count > 0 {
         let modulo = u64::try_from(seg_count).unwrap_or(1).max(1);
-        let row_offset = i64::try_from((iteration + u64::from(worker_index)) % modulo).unwrap_or(0);
+        let row_offset =
+            i64::try_from((iteration + u64::from(params.worker_index)) % modulo).unwrap_or(0);
         let (blocks, fetched) =
-            read_one_shielded_range_slice(&txn, schema, network, row_offset).await?;
+            read_one_shielded_range_slice(&txn, schema, params.network, row_offset).await?;
         stats.settled_reads = 1;
         stats.blocks_decoded = stats.blocks_decoded.saturating_add(blocks);
         stats.bytes_fetched = stats.bytes_fetched.saturating_add(fetched);
     }
 
-    read_live_tail_and_index_probes(&txn, schema, &mut stats).await?;
+    read_live_tail_and_index_probes(&txn, schema, params.live_tail_max_blocks, &mut stats).await?;
 
     txn.commit()
         .await
@@ -404,8 +408,25 @@ async fn execute_reader_iteration(
 async fn read_live_tail_and_index_probes(
     txn: &Transaction<'_>,
     schema: &str,
+    live_tail_max_blocks: u32,
     stats: &mut IterationStats,
 ) -> Result<(), BenchError> {
+    let tail_count = i64_to_u64(
+        txn.query_one(
+            &format!("SELECT COUNT(*)::BIGINT FROM {schema}.canonical_live_tail"),
+            &[],
+        )
+        .await
+        .map_err(|err| postgres_error("counting canonical_live_tail in reader", &err))?
+        .get(0),
+        "reader.canonical_live_tail_count",
+    )?;
+    if tail_count > u64::from(live_tail_max_blocks) {
+        return Err(candidate_error(format!(
+            "reader observed canonical_live_tail ({tail_count} rows) exceeding live_tail_max_blocks ({live_tail_max_blocks})"
+        )));
+    }
+
     let tail_rows = txn
         .query(
             &format!(
@@ -679,6 +700,7 @@ pub async fn validate_persisted_state_read_only(
     let schema = validate_schema_name(&expected.schema_name)?;
     let (settled_tip, canonical_tip) = validate_schema_metadata(client, schema, expected).await?;
     validate_secondary_table_counts(client, schema, expected).await?;
+    validate_transaction_location_segments(client, schema, settled_tip).await?;
 
     let mut cursor = ValidationCursor {
         sequence_builder: CanonicalBlockFactsSequenceDigestBuilder::new(
@@ -887,6 +909,50 @@ SELECT
         return Err(candidate_error(format!(
             "canonical_live_tail ({live_tail_count} rows) exceeds live_tail_max_blocks ({})",
             expected.live_tail_max_blocks
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_transaction_location_segments(
+    client: &Client,
+    schema: &str,
+    settled_tip: Option<BlockHeight>,
+) -> Result<(), BenchError> {
+    let settled_tip_pg = settled_tip.map(|h| u32_to_i64(h.value()));
+    let mismatch = client
+        .query_one(
+            &format!(
+                r"
+SELECT
+    (SELECT COUNT(*)::BIGINT
+     FROM {schema}.transaction_location tl
+     LEFT JOIN {schema}.canonical_live_tail lt
+       ON lt.height = tl.block_height AND lt.block_hash = tl.block_hash
+     WHERE tl.segment_kind = 0
+       AND (lt.height IS NULL OR ($1::BIGINT IS NOT NULL AND tl.block_height <= $1))) AS bad_live,
+    (SELECT COUNT(*)::BIGINT
+     FROM {schema}.transaction_location tl
+     LEFT JOIN {schema}.canonical_live_tail lt
+       ON lt.height = tl.block_height AND lt.block_hash = tl.block_hash
+     WHERE tl.segment_kind = 1
+       AND (lt.height IS NOT NULL OR $1::BIGINT IS NULL OR tl.block_height > $1)) AS bad_settled,
+    (SELECT COUNT(*)::BIGINT
+     FROM {schema}.transaction_location
+     WHERE segment_kind NOT IN (0, 1)) AS invalid_kind
+"
+            ),
+            &[&settled_tip_pg],
+        )
+        .await
+        .map_err(|err| postgres_error("validating transaction_location segment_kind", &err))?;
+
+    let bad_live = i64_to_u64(mismatch.get(0), "bad_live")?;
+    let bad_settled = i64_to_u64(mismatch.get(1), "bad_settled")?;
+    let invalid_kind = i64_to_u64(mismatch.get(2), "invalid_kind")?;
+    if bad_live != 0 || bad_settled != 0 || invalid_kind != 0 {
+        return Err(candidate_error(format!(
+            "transaction_location segment_kind mismatch with canonical_live_tail/settled_tip (bad_live={bad_live}, bad_settled={bad_settled}, invalid_kind={invalid_kind})"
         )));
     }
     Ok(())
