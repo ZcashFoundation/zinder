@@ -10,7 +10,7 @@ Zinder serves plaintext gRPC only; keep all gRPC, ops, control, and observabilit
 
 - All `/readyz` endpoints return `200` ([Initial sync](initial-sync.md)) on the host loopback ports in [Processes and canonical ports](deploying.md#what-you-deploy).
 - A public DNS name (`A` and optional `AAAA` records) pointing to the Caddy host, and a certificate/key chain trusted by WebPKI/platform roots for that exact FQDN. (Installing a private CA on a device does not establish that mobile or bundled-root wallets will trust it.)
-- Caddy v2 on the Zinder host, `grpcurl` on an external host, and inbound TCP `443` open (every other Zinder port closed externally).
+- Caddy v2 on the Zinder host and `grpcurl` on an external host. Allow inbound TCP `443` for HTTP/2 and UDP `443` for HTTP/3 through the host firewall and any network firewall, port forward, or container port mapping in front of Caddy. Keep all other Zinder ports closed externally.
 
 ### Configure Caddy
 
@@ -36,7 +36,9 @@ Apply in this exact order so Caddy strips client-supplied headers **before** Zin
 2. Load the config into Caddy (e.g. `caddy reload` or restart the Caddy service).
 3. Verify the isolation requirements in [Keep wallets apart in the receive limit](#keep-wallets-apart-in-the-receive-limit), add `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true` to your Compose env file (or `compat.trust_proxy_client_address = true` outside Compose), and recreate `zinder-serve` (or standalone `zinder-compat-lightwalletd`) using the deployment's full env file and `-f` list.
 
-The template sets `auto_https off` with `alpn h2`, runs `forward_auth` (`HEAD /readyz`, bounded to 16 connections with 5s keepalive) before `reverse_proxy h2c://127.0.0.1:...`, and sets `header_up X-Zinder-Client-Address {http.request.remote}` (replacing any header the client sent). When renewing certificates, replace the files and reload Caddy.
+The template sets `auto_https off` and uses the supplied certificate. When renewing certificates, replace the files and reload Caddy.
+
+Caddy advertises HTTP/3 on responses over HTTP/2 with an `Alt-Svc` header containing `h3=":443"`. A client that supports QUIC connection migration can keep an active HTTP/3 stream open when a mobile device switches between Wi-Fi and cellular, provided the new path can reach the same Caddy instance. Clients that fall back to HTTP/2 can reach the endpoint over TCP `443` when UDP is blocked. Native gRPC clients that use HTTP/2 continue to negotiate `h2`. [HTTP/3 discovery](https://www.rfc-editor.org/rfc/rfc9114#section-3.1), [QUIC connection migration](https://www.rfc-editor.org/rfc/rfc9000#section-9).
 
 ## Keep wallets apart in the receive limit
 
@@ -79,7 +81,9 @@ Before announcing a public endpoint, configure client authentication and per-cli
 
 Set `compat.browser_origins` (`ZINDER_COMPAT__BROWSER_ORIGINS`) to the exact wallet `location.origin` values (e.g. `["https://wallet.example.org"]`, or `http://localhost:5173` for local development) and restart compatibility. Caddy forwards gRPC-Web on the same port as native gRPC. Keep `compat.serving = "wallet"` (default) or `"light-wallet"` for syncing wallets, and keep edge rate limits in the proxy.
 
-Verify in the browser network panel that CORS preflight succeeds and `GetBlockRange` advances scanned height. If preflight fails, check `/readyz` first (Caddy runs `forward_auth` on `OPTIONS` too, which browsers report as CORS failures), then compare the exact `Origin` header including port. See [Configuration](../reference/configuration.md) for the wildcard option.
+Browsers that negotiate `h3` can carry gRPC-Web calls to Caddy over HTTP/3. Caddy forwards the same gRPC-Web requests to Zinder over `h2c`. In the browser network panel, check that CORS preflight succeeds, the Protocol column shows `h3` after the browser discovers HTTP/3, and `GetBlockRange` advances scanned height. With UDP `443` blocked on the test client, repeat the call and confirm it succeeds over `h2`.
+
+If preflight fails, check `/readyz` first (Caddy runs `forward_auth` on `OPTIONS` too, which browsers report as CORS failures), then compare the exact `Origin` header including port. See [Configuration](../reference/configuration.md) for the wildcard option.
 
 ## Expose the native endpoint too
 
@@ -109,7 +113,18 @@ Run from a machine outside the host's network:
      cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
    ```
 
-3. Scan every public IP of the host: confirm only port `443` answers (`grpcurl -plaintext "$name:443" list` must fail, and gRPC, ops, control `9100`/`9101`, Prometheus, and Grafana ports must all be unreachable).
+3. With a curl build that reports `HTTP2` and `HTTP3` in `curl --version`, check that the first command reports `HTTP/2` and an `Alt-Svc` header containing `h3=":443"`. The second must report `HTTP/3`. These probes check the edge transport. Use the RPC and browser checks to verify wallet calls.
+
+   ```bash
+   curl --http2 --max-time 10 -sS -D - -o /dev/null \
+     -w 'HTTP/%{http_version}\n' "https://$name/"
+   curl --http3-only --max-time 10 -sS -o /dev/null \
+     -w 'HTTP/%{http_version}\n' "https://$name/"
+   ```
+
+   If HTTP/3 fails while HTTP/2 succeeds, check UDP `443` on each firewall, forwarder, and port mapping. To test fallback, block UDP `443` on the test client and repeat the second command with `--http3` in place of `--http3-only`. It should report `HTTP/2`.
+
+4. Scan every public IP of the host. Confirm only port `443` answers on TCP and UDP and that `grpcurl -plaintext "$name:443" list` fails. All private gRPC, ops, control, and observability ports must be unreachable.
 
 ## Supported wallets
 

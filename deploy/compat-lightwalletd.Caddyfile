@@ -5,12 +5,13 @@
 # Caddy never obtains or renews a certificate from this template.
 {
 	auto_https off
+	servers {
+		protocols h1 h2 h3
+	}
 }
 
 https://{$ZINDER_COMPAT_PUBLIC_FQDN}:443 {
-	tls {$ZINDER_COMPAT_TLS_CERT_FILE} {$ZINDER_COMPAT_TLS_KEY_FILE} {
-		alpn h2
-	}
+	tls {$ZINDER_COMPAT_TLS_CERT_FILE} {$ZINDER_COMPAT_TLS_KEY_FILE}
 
 	route {
 		# Use the ordinary HTTP ops listener for every new gRPC RPC. A 2xx

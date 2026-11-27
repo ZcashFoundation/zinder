@@ -17,6 +17,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [test-canonical-storage-defaults.py](test-canonical-storage-defaults.py) | Tests canonical storage configuration defaults and `data_dir` path derivation |
 | [test-changelog.sh](test-changelog.sh) | Self-tests changelog fragment validation and release prep scripts |
 | [test-deployment-admission.sh](test-deployment-admission.sh) | Self-tests deployment admission checks against passing and failing deployment fixtures |
+| [test-compat-lightwalletd-caddyfile.sh](test-compat-lightwalletd-caddyfile.sh) | Validates the reference Caddyfile and checks its TLS protocols, readiness gate, and upstream forwarding with Docker |
 | [test-install-ci-tool.sh](test-install-ci-tool.sh) | Self-tests `install-ci-tool.sh` checksum verification and download failures |
 | [test-lthash16-backends.sh](test-lthash16-backends.sh) | Verifies `lthash16` backend equivalence across feature flags |
 | [test-nextest-selectors.sh](test-nextest-selectors.sh) | Verifies `.config/nextest.toml` profile selectors and test tier filters |
