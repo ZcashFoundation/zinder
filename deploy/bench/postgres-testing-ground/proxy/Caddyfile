@@ -1,0 +1,22 @@
+{
+	auto_https off
+	admin off
+	persist_config off
+	servers :9067 {
+		protocols h1 h2c
+	}
+}
+
+:8080 {
+	reverse_proxy {$ZINDER_PROXY_HTTP_UPSTREAMS:probe-reader-a:8081 probe-reader-b:8081} {
+		lb_policy round_robin
+		lb_retries 0
+	}
+}
+
+:9067 {
+	reverse_proxy {$ZINDER_PROXY_GRPC_UPSTREAMS:probe-reader-a:8081 probe-reader-b:8081} {
+		lb_policy round_robin
+		lb_retries 0
+	}
+}

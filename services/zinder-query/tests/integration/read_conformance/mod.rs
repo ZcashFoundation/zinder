@@ -25,6 +25,7 @@ use zinder_testkit::{CanonicalBaseline, ChainFixture};
 pub(crate) mod canonical;
 mod in_memory;
 mod rocksdb;
+pub(crate) mod stateless_serving;
 pub(crate) mod wallet;
 
 /// Stores chains for one storage engine and opens canonical readers over
@@ -136,4 +137,22 @@ macro_rules! conformance_cases {
     };
 }
 
-pub(crate) use {canonical_reader_conformance, conformance_cases, wallet_reader_conformance};
+/// Instantiates every stateless multi-instance reader conformance case as a test
+/// against `$harness`.
+macro_rules! stateless_serving_conformance {
+    ($harness:ty) => {
+        $crate::integration::read_conformance::conformance_cases!(
+            $harness,
+            stateless_serving,
+            cross_instance_transparent_history_and_chain_event_cursors_continue_across_readers,
+            cross_instance_mempool_snapshot_and_events_continue_with_shared_cursor_key,
+            append_and_max_depth_reorg_invalidate_pinned_walks_without_mixing_forks,
+            stale_writer_heartbeat_fails_mempool_immediately_then_closes_gate_with_service_not_ready,
+        );
+    };
+}
+
+pub(crate) use {
+    canonical_reader_conformance, conformance_cases, stateless_serving_conformance,
+    wallet_reader_conformance,
+};
