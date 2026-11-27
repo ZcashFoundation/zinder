@@ -97,7 +97,45 @@ use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
 /// answered for exactly this long after the pair was replaced, however many
 /// blocks arrive meanwhile. A pair no request observed has no pin to answer,
 /// so publication releases it at once.
-const RETAINED_PAIR_WINDOW: Duration = Duration::from_mins(1);
+#[cfg(test)]
+const RETAINED_PAIR_WINDOW: Duration = Duration::from_secs(EpochPinRetention::MIN_SECONDS);
+
+/// Duration for which a replaced serving pair remains available to epoch pins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EpochPinRetention(u64);
+
+impl EpochPinRetention {
+    /// Minimum retention, in seconds.
+    pub const MIN_SECONDS: u64 = 60;
+    /// Maximum retention, in seconds.
+    pub const MAX_SECONDS: u64 = 300;
+
+    /// Accepts an epoch pin window within the supported bounds.
+    #[must_use]
+    pub const fn from_seconds(seconds: u64) -> Option<Self> {
+        if seconds >= Self::MIN_SECONDS && seconds <= Self::MAX_SECONDS {
+            Some(Self(seconds))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the retention window in seconds.
+    #[must_use]
+    pub const fn seconds(self) -> u64 {
+        self.0
+    }
+
+    const fn duration(self) -> Duration {
+        Duration::from_secs(self.0)
+    }
+}
+
+impl Default for EpochPinRetention {
+    fn default() -> Self {
+        Self(Self::MIN_SECONDS)
+    }
+}
 /// Longest a request may keep reading a pair after the publisher released it.
 ///
 /// Past this bound the publisher revokes reads on the pair, so a slow or
@@ -164,6 +202,8 @@ pub struct WalletServingPairConfig {
     /// attestation. Past it the transient warning gives way to the fail-closed
     /// cause the failure would otherwise have raised.
     pub serving_pair_staleness_ceiling: Duration,
+    /// Retention after an observed epoch is replaced.
+    pub epoch_pin_retention: EpochPinRetention,
 }
 
 /// Read-only handle to the currently published wallet-serving pair.
@@ -174,12 +214,13 @@ pub struct WalletServingPairConfig {
 /// lifetime of a composed query.
 ///
 /// Each replaced pair that a request may have exposed to a client keeps
-/// answering reads pinned to its chain epoch for one minute after it was
-/// replaced, however many pairs are published meanwhile. A replaced pair that
+/// answering reads pinned to its chain epoch for the configured retention
+/// window after replacement, however many pairs are published meanwhile. A replaced pair that
 /// no request exposed is released at once, because no pin can name it.
 #[derive(Clone)]
 pub struct WalletServingPairSlot {
     published: Arc<ArcSwap<PublishedPairs>>,
+    epoch_pin_retention: EpochPinRetention,
     signals: Arc<SlotSignals>,
     /// Orders the first observation of a pair against its replacement.
     ///
@@ -212,8 +253,8 @@ struct RetainedPair {
 }
 
 impl RetainedPair {
-    fn is_within_window(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.replaced_at) < RETAINED_PAIR_WINDOW
+    fn is_within_window(&self, now: Instant, retention: EpochPinRetention) -> bool {
+        now.saturating_duration_since(self.replaced_at) < retention.duration()
     }
 }
 
@@ -230,6 +271,7 @@ impl PublishedPairs {
         &self,
         chain_epoch_id: ChainEpochId,
         now: Instant,
+        retention: EpochPinRetention,
     ) -> Arc<WalletServingReadPair> {
         if self.serves(chain_epoch_id) {
             return Arc::clone(&self.current);
@@ -237,7 +279,7 @@ impl PublishedPairs {
         self.retained
             .iter()
             .find(|retained| {
-                retained.is_within_window(now)
+                retained.is_within_window(now, retention)
                     && !retained.pair.has_missing_table_file()
                     && retained.pair.canonical_fence().chain_epoch_id() == chain_epoch_id
             })
@@ -267,7 +309,15 @@ impl WalletServingPairSlot {
     /// [`WalletServingPairPublisher`].
     #[must_use]
     pub fn new(initial_pair: Arc<WalletServingReadPair>) -> Self {
+        Self::with_retention(initial_pair, EpochPinRetention::default())
+    }
+
+    fn with_retention(
+        initial_pair: Arc<WalletServingReadPair>,
+        epoch_pin_retention: EpochPinRetention,
+    ) -> Self {
         Self {
+            epoch_pin_retention,
             published: Arc::new(ArcSwap::from_pointee(PublishedPairs {
                 current: initial_pair,
                 retained: Vec::new(),
@@ -366,14 +416,14 @@ impl WalletServingPairSlot {
         };
         let published = self.published.load();
         if !published.serves(chain_epoch_id) || published.current.is_observed_for_epoch_pin() {
-            return published.pinned_pair(chain_epoch_id, Instant::now());
+            return published.pinned_pair(chain_epoch_id, Instant::now(), self.epoch_pin_retention);
         }
         drop(published);
         // A publication may have replaced the pair before the lock was taken,
         // so the pin is selected again from the pairs published under it.
         let _observation = self.observation.lock();
         let published = self.published.load();
-        let pair = published.pinned_pair(chain_epoch_id, Instant::now());
+        let pair = published.pinned_pair(chain_epoch_id, Instant::now(), self.epoch_pin_retention);
         if Arc::ptr_eq(&pair, &published.current) && published.serves(chain_epoch_id) {
             pair.mark_observed_for_epoch_pin();
         }
@@ -437,13 +487,13 @@ impl WalletServingPairSlot {
         released.into_iter().map(|released| released.pair).collect()
     }
 
-    /// Releases the retained pairs replaced at least [`RETAINED_PAIR_WINDOW`]
-    /// before `now`, and those missing a table file, returning them.
+    /// Releases retained pairs whose window has ended and those missing a table file.
     fn release_expired(&self, now: Instant) -> Vec<Arc<WalletServingReadPair>> {
         let previous = self.published.load_full();
         let (retained, expired): (Vec<_>, Vec<_>) =
             previous.retained.iter().cloned().partition(|retained| {
-                retained.is_within_window(now) && !retained.pair.has_missing_table_file()
+                retained.is_within_window(now, self.epoch_pin_retention)
+                    && !retained.pair.has_missing_table_file()
             });
         if expired.is_empty() {
             return Vec::new();
@@ -2109,7 +2159,10 @@ impl WalletServingPairPublisher {
             self.retire_pairs(released, now);
         } else {
             self.admitted_stored_set = Some(readers.canonical.stored_set());
-            self.serving_pair_slot = Some(WalletServingPairSlot::new(Arc::clone(&pair)));
+            self.serving_pair_slot = Some(WalletServingPairSlot::with_retention(
+                Arc::clone(&pair),
+                self.config.epoch_pin_retention,
+            ));
         }
         self.generations[generation].state = SecondaryGenerationState::Published {
             lease: GenerationLease::new(&pair),
@@ -9025,6 +9078,7 @@ mod tests {
                 .ok_or("wallet-serving pair convergence attempts must be non-zero")?,
             replica_lag_threshold_chain_epochs: 4,
             serving_pair_staleness_ceiling: Duration::from_mins(5),
+            epoch_pin_retention: crate::EpochPinRetention::default(),
         })
     }
 
@@ -9991,6 +10045,33 @@ mod retention_tests {
         assert!(slot.publish(Arc::clone(&pairs[1]), replaced_at).is_empty());
         assert_eq!(slot.retained_pair_count(), 1);
         assert_pin_unavailable(&query, &history, replaced_epoch).await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_retention_extends_the_pin() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 1)?;
+        let replaced_epoch = pairs[0].canonical_fence().chain_epoch_id();
+        let retention =
+            super::EpochPinRetention::from_seconds(180).ok_or("retention must be valid")?;
+        let slot = WalletServingPairSlot::with_retention(Arc::clone(&pairs[0]), retention);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone());
+        drop(slot.capture());
+        let replaced_at = Instant::now();
+        assert!(slot.publish(Arc::clone(&pairs[1]), replaced_at).is_empty());
+
+        tokio::time::advance(Duration::from_secs(179)).await;
+        assert!(slot.release_expired(Instant::now()).is_empty());
+        assert_eq!(
+            unspent_outpoints(&query, &history, Some(replaced_epoch))
+                .await?
+                .0,
+            replaced_epoch,
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_pin_unavailable(&query, &history, replaced_epoch).await?;
+        assert_eq!(slot.release_expired(Instant::now()).len(), 1);
         Ok(())
     }
 

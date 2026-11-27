@@ -1234,6 +1234,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       and wallet secondary pair. Must be in 1..=64; defaults to 12.",
     },
     EnvVarDoc {
+        name: "ZINDER_QUERY__EPOCH_PIN_RETENTION_SECONDS",
+        toml_path: "query.epoch_pin_retention_seconds",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Seconds an exposed epoch can still answer pins after replacement. Must be in 60..=300. Defaults to 60. A longer window can delay publication when all four serving generation slots are occupied.",
+    },
+    EnvVarDoc {
         name: "ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS",
         toml_path: "query.tree_state_replay_wait_ms",
         used_by: &["zinder-query"],
@@ -2470,6 +2478,7 @@ mod tests {
                 "ZINDER_QUERY__LISTEN_ADDR",
                 "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
                 "ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS",
+                "ZINDER_QUERY__EPOCH_PIN_RETENTION_SECONDS",
                 "ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS",
                 "ZINDER_QUERY__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
                 "ZINDER_QUERY__FORWARDED_READ_MAX_CONCURRENT",

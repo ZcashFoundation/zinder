@@ -361,6 +361,7 @@ async fn execute_wallet(
                 replica_lag_threshold_chain_epochs: lightwalletd_config
                     .storage
                     .secondary_replica_lag_threshold_chain_epochs,
+                epoch_pin_retention: zinder_query::EpochPinRetention::default(),
                 serving_pair_staleness_ceiling: lightwalletd_config
                     .storage
                     .serving_pair_staleness_ceiling,

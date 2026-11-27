@@ -16,8 +16,8 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
-    ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
-    MAX_SUBTREE_ROOTS_PER_REQUEST, NetworkUpgradeActivations, RawTransactionBytes,
+    ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact, CompactBlockNullifiers,
+    CompactPool, MAX_SUBTREE_ROOTS_PER_REQUEST, NetworkUpgradeActivations, RawTransactionBytes,
     ShieldedProtocol, StandardFee, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
     TransactionBlobArtifact, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
@@ -35,6 +35,7 @@ use zinder_store::{
 
 mod broadcast_byte_budget;
 mod cold_transaction;
+mod compact_range_stream;
 mod forwarded_read;
 mod grpc;
 mod ingest_control;
@@ -105,7 +106,7 @@ pub use tree_state_replay_limit::{
 };
 pub use wallet_serving_pair::{WalletServingAdmissionError, WalletServingReadPair};
 pub use wallet_serving_pair_publisher::{
-    WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
+    EpochPinRetention, WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
     WalletServingPairPublisher, WalletServingPairSlot, WalletServingPairTeardownError,
     WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
     spawn_wallet_node_readiness_probe,
@@ -282,6 +283,34 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         })
     }
 
+    /// Streams compact blocks in the requested height order at one epoch.
+    async fn ordered_compact_block_stream(
+        &self,
+        block_range: BlockHeightRange,
+        order: HeightOrder,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockStream, QueryError> {
+        if order == HeightOrder::Ascending {
+            return self.compact_block_stream(block_range, at_epoch_id).await;
+        }
+        Err(QueryError::EndpointCapabilityUnavailable {
+            capability: zinder_proto::capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V3,
+        })
+    }
+
+    /// Streams shielded nullifiers in height order at one chain epoch.
+    async fn compact_nullifier_stream(
+        &self,
+        _block_range: BlockHeightRange,
+        _order: HeightOrder,
+        _pools: Vec<CompactPool>,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockStream<CompactBlockNullifiers>, QueryError> {
+        Err(QueryError::EndpointCapabilityUnavailable {
+            capability: zinder_proto::capabilities::WALLET_READ_COMPACT_NULLIFIER_RANGE_V1,
+        })
+    }
+
     /// Reads compact block artifacts from one end of an inclusive height
     /// range, up to a byte budget.
     ///
@@ -443,6 +472,19 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError>;
 
+    /// Streams unspent outputs at one epoch across a bounded list of addresses.
+    async fn transparent_addresses_unspent_outputs(
+        &self,
+        _addresses: Vec<TransparentAddressScriptHash>,
+        _start_height: BlockHeight,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
+        Err(QueryError::EndpointCapabilityUnavailable {
+            capability:
+                zinder_proto::capabilities::WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1,
+        })
+    }
+
     /// Streams the outputs [`Self::transparent_address_unspent_outputs`]
     /// streams, in the same order and at the same pinned epoch, reading
     /// storage only on demand.
@@ -502,9 +544,7 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// addresses at a single pinned chain epoch.
     ///
     /// Folds the complete unspent transparent output set of every requested
-    /// address into one saturating `confirmed_zat` total. The lightwalletd
-    /// compatibility adapter is the only consumer; the native endpoint does
-    /// not serve a balance.
+    /// address into one saturating `confirmed_zat` total.
     ///
     /// Rejects an empty address list and any list above
     /// [`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`] with
@@ -657,7 +697,8 @@ pub const FULL_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 4;
 /// gRPC adapter, one mempool point lookup), so an unbounded list would let one
 /// request issue thousands of reads. `u32` matches the `address_count` field
 /// on the response so the bound check happens in the wire type's native width.
-pub const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 = 256;
+pub const MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES: u32 =
+    zinder_core::MAX_TRANSPARENT_ADDRESSES_PER_BATCH as u32;
 
 /// Metric pair the `WalletQuery` adapter emits per request.
 const QUERY_RPC_METRICS: zinder_runtime::RpcMetricNames =
@@ -928,15 +969,15 @@ pub struct FullBlockStream {
 ///
 /// [`chain_epoch`](Self::chain_epoch) is resolved once and describes every
 /// delivered block. [`blocks`](Self::blocks) yields compact blocks in
-/// ascending, contiguous height order until the range is exhausted; a store
+/// the requested, contiguous height order until the range is exhausted; a store
 /// failure arrives as a terminal `Err` after the blocks already delivered,
 /// and dropping the receiver stops the backing producer.
 #[derive(Debug)]
-pub struct CompactBlockStream {
+pub struct CompactBlockStream<Block = CompactBlockArtifact> {
     /// Chain epoch every delivered block is read under.
     pub chain_epoch: ChainEpoch,
-    /// Ascending compact blocks, then optionally one terminal error.
-    pub blocks: mpsc::Receiver<Result<CompactBlockArtifact, QueryError>>,
+    /// Compact blocks in the requested order, then optionally one terminal error.
+    pub blocks: mpsc::Receiver<Result<Block, QueryError>>,
 }
 
 /// Single mined-transaction response bound to one chain epoch. Used by

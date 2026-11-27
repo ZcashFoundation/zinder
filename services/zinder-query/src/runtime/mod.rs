@@ -306,6 +306,7 @@ async fn serve_query(
             .storage
             .secondary_replica_lag_threshold_chain_epochs,
         serving_pair_staleness_ceiling: query_config.storage.serving_pair_staleness_ceiling,
+        epoch_pin_retention: query_config.epoch_pin_retention,
     };
     let (pair_publisher, pair_slot) = tokio::select! {
         outcome = WalletServingPairPublisher::bootstrap_with_admitted_ingest_control(

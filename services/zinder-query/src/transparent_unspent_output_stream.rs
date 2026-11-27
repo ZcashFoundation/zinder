@@ -85,6 +85,20 @@ enum Pacing {
     OnDemand(mpsc::Receiver<NonZeroU16>),
 }
 
+struct UnspentOutputSelection {
+    addresses: Vec<TransparentAddressScriptHash>,
+    start_height: BlockHeight,
+}
+
+impl From<&TransparentAddressUnspentOutputsRequest> for UnspentOutputSelection {
+    fn from(request: &TransparentAddressUnspentOutputsRequest) -> Self {
+        Self {
+            addresses: vec![request.address_script_hash],
+            start_height: request.start_height,
+        }
+    }
+}
+
 impl TransparentAddressUnspentOutputs {
     /// Starts reading the outputs `request` selects from `pair`, whose visible
     /// epoch is `chain_epoch`, and which `slot` published.
@@ -112,10 +126,38 @@ impl TransparentAddressUnspentOutputs {
         chain_epoch: ChainEpoch,
         page_size: NonZeroU16,
     ) -> Self {
+        Self::spawn_selection(slot, pair, request.into(), chain_epoch, page_size)
+    }
+
+    pub(crate) fn spawn_addresses(
+        slot: WalletServingPairSlot,
+        pair: Arc<WalletServingReadPair>,
+        addresses: Vec<TransparentAddressScriptHash>,
+        start_height: BlockHeight,
+        chain_epoch: ChainEpoch,
+    ) -> Self {
+        Self::spawn_selection(
+            slot,
+            pair,
+            UnspentOutputSelection {
+                addresses,
+                start_height,
+            },
+            chain_epoch,
+            TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE,
+        )
+    }
+
+    fn spawn_selection(
+        slot: WalletServingPairSlot,
+        pair: Arc<WalletServingReadPair>,
+        selection: UnspentOutputSelection,
+        chain_epoch: ChainEpoch,
+        page_size: NonZeroU16,
+    ) -> Self {
         let (pages, receiver) = mpsc::channel(BUFFERED_PAGES);
         tokio::spawn(
-            produce_pages(slot, pair, request.clone(), Pacing::Eager(page_size), pages)
-                .in_current_span(),
+            produce_pages(slot, pair, selection, Pacing::Eager(page_size), pages).in_current_span(),
         );
         Self {
             chain_epoch,
@@ -146,7 +188,7 @@ impl TransparentAddressUnspentOutputs {
             produce_pages(
                 slot,
                 pair,
-                request.clone(),
+                request.into(),
                 Pacing::OnDemand(request_receiver),
                 pages,
             )
@@ -236,15 +278,19 @@ enum PageDelivery {
 async fn produce_pages(
     slot: WalletServingPairSlot,
     mut pair: Arc<WalletServingReadPair>,
-    request: TransparentAddressUnspentOutputsRequest,
+    selection: UnspentOutputSelection,
     mut pacing: Pacing,
     pages: mpsc::Sender<Result<UnspentOutputPage, QueryError>>,
 ) {
     let chain_epoch_id = pair.canonical_fence().chain_epoch_id();
-    let TransparentAddressUnspentOutputsRequest {
-        address_script_hash,
+    let UnspentOutputSelection {
+        addresses,
         start_height,
-    } = request;
+    } = selection;
+    let mut addresses = addresses.into_iter().peekable();
+    let Some(mut address_script_hash) = addresses.next() else {
+        return;
+    };
     let mut after = None;
     loop {
         let page_size = match &mut pacing {
@@ -288,7 +334,7 @@ async fn produce_pages(
                 return;
             }
         };
-        let last = next_page_after.is_none();
+        let last = next_page_after.is_none() && addresses.peek().is_none();
         let delivery = tokio::select! {
             biased;
             () = pair.reads_revoked() => PageDelivery::ReadsRevoked,
@@ -298,7 +344,14 @@ async fn produce_pages(
         };
         match delivery {
             PageDelivery::Sent if last => return,
-            PageDelivery::Sent => after = next_page_after,
+            PageDelivery::Sent => {
+                after = next_page_after;
+                if after.is_none()
+                    && let Some(next_address) = addresses.next()
+                {
+                    address_script_hash = next_address;
+                }
+            }
             PageDelivery::ReceiverDropped => return,
             PageDelivery::ReadsRevoked => return fail(pair, &pages).await,
         }
