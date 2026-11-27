@@ -5,7 +5,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage: build-release-binary-archive.sh \
   --binaries DIR --output DIR --version VERSION --tag TAG --commit SHA \
-  --target RUST_TARGET --source-date-epoch EPOCH [--pasta-asm 0|1]
+  --target RUST_TARGET --source-date-epoch EPOCH [--cpu-baseline ISA] [--pasta-asm 0|1]
 EOF
   exit 2
 }
@@ -19,6 +19,7 @@ commit=""
 rust_target=""
 source_date_epoch=""
 pasta_asm=1
+requested_cpu_baseline=""
 while [[ $# -gt 0 ]]; do
   [[ $# -ge 2 ]] || usage
   case "$1" in
@@ -29,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --commit) commit="$2"; shift 2 ;;
     --target) rust_target="$2"; shift 2 ;;
     --source-date-epoch) source_date_epoch="$2"; shift 2 ;;
+    --cpu-baseline) requested_cpu_baseline="$2"; shift 2 ;;
     --pasta-asm) pasta_asm="$2"; shift 2 ;;
     *) usage ;;
   esac
@@ -46,26 +48,9 @@ case "$pasta_asm" in
     ;;
 esac
 
-case "$rust_target" in
-  x86_64-unknown-linux-gnu)
-    release_platform=x86_64-v3-unknown-linux-gnu
-    cpu_baseline=x86-64-v3
-    if [[ "$pasta_asm" == "1" ]]; then
-      required_cpu_features='["adx","pclmulqdq"]'
-    else
-      required_cpu_features='["pclmulqdq"]'
-    fi
-    ;;
-  aarch64-unknown-linux-gnu)
-    release_platform=aarch64-unknown-linux-gnu
-    cpu_baseline=armv8-a
-    required_cpu_features='[]'
-    ;;
-  *)
-    echo >&2 "unsupported release Rust target: $rust_target"
-    exit 1
-    ;;
-esac
+# shellcheck source=scripts/release-binary-platform.sh
+source "$repository_root/scripts/release-binary-platform.sh"
+resolve_release_binary_platform "$rust_target" "$requested_cpu_baseline" "$pasta_asm"
 
 mapfile -t runtime_binaries < <(jq -r '.[]' "$repository_root/deploy/release-images.json")
 expected_catalog="$(printf '%s\n' "${runtime_binaries[@]}" | LC_ALL=C sort)"
@@ -111,6 +96,7 @@ jq -n \
   --arg rust_target "$rust_target" \
   --arg release_platform "$release_platform" \
   --arg cpu_baseline "$cpu_baseline" \
+  --argjson libc "$libc" \
   --argjson required_cpu_features "$required_cpu_features" \
   --argjson source_date_epoch "$source_date_epoch" \
   --argjson binaries "$binary_inventory" \
@@ -121,12 +107,7 @@ jq -n \
     commit: $commit,
     rust_target: $rust_target,
     release_platform: $release_platform,
-    libc: {
-      family: "glibc",
-      minimum_runtime_version: "2.34",
-      dynamic_libstdcpp: true,
-      minimum_libstdcpp_symbol: "GLIBCXX_3.4.30"
-    },
+    libc: $libc,
     cpu_baseline: $cpu_baseline,
     required_cpu_features: $required_cpu_features,
     source_date_epoch: $source_date_epoch,

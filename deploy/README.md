@@ -14,6 +14,20 @@ Pass `--preset <preset>` (`light-wallet`, `wallet` default, or `explorer`) or se
 
 Single-container deployments run `zinder serve --preset <preset>` (writer + readers supervised together). Two-container Compose deployments split writer lock ownership (`zinder index`) from readers (`zinder serve --readers-only`) over one shared `data` volume.
 
+## Personal-node Compose
+
+[personal/compose.yaml](personal/compose.yaml) runs a bundled archive Zebra node
+alongside `zinder serve --preset light-wallet`. It limits Zinder to 8 GiB by
+default, gives Zinder one persistent volume, and publishes wallet and ops ports
+on host loopback. The signed manifest is available from the release as
+`zinder-personal-compose.yaml`. Follow the
+[personal-node runbook](../docs/runbooks/deploying.md#personal-node-compose)
+to size, start, verify, and stop the stack.
+
+Releases also provide [native archives](../docs/adrs/0022-release-artifacts.md#decision)
+for Apple Silicon, ARM64 Linux, optimized x86-64 Linux, and baseline x86-64 Linux.
+Use the baseline archive for Linux CPUs without AVX2 or ADX.
+
 ## Docker Compose
 
 1. Create the required host control tokens in `${ZINDER_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`).

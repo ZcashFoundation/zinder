@@ -20,6 +20,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [test-compat-lightwalletd-caddyfile.sh](test-compat-lightwalletd-caddyfile.sh) | Validates the reference Caddyfile and checks its TLS protocols, readiness gate, and upstream forwarding with Docker |
 | [test-install-ci-tool.sh](test-install-ci-tool.sh) | Self-tests `install-ci-tool.sh` checksum verification and download failures |
 | [test-lthash16-backends.sh](test-lthash16-backends.sh) | Verifies `lthash16` backend equivalence across feature flags |
+| [test-personal-compose.sh](test-personal-compose.sh) | Starts the personal-node Compose bundle on a disposable Regtest chain and checks readiness |
 | [test-nextest-selectors.sh](test-nextest-selectors.sh) | Verifies `.config/nextest.toml` profile selectors and test tier filters |
 | [test-runbook-lint.sh](test-runbook-lint.sh) | Tests Bash syntax checks for top-level fences and fences inside numbered steps |
 | [test-workflow-action-pins.sh](test-workflow-action-pins.sh) | Verifies every external GitHub Action under `.github/` is pinned to a full commit SHA |
@@ -32,7 +33,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 
 | File | Purpose |
 | --- | --- |
-| [build-release-binary-archive.sh](build-release-binary-archive.sh) | Builds reproducible GNU/Linux binary archives containing `bin/zinder` and checksums |
+| [build-release-binary-archive.sh](build-release-binary-archive.sh) | Builds reproducible Linux and macOS binary archives containing `bin/zinder` and checksums |
 | [check-release-binary-archive.sh](check-release-binary-archive.sh) | Verifies release binary archive layout, checksums, and binary execution checks |
 | [check-release-image-evidence.sh](check-release-image-evidence.sh) | Validates container image manifest, digest, and admission evidence |
 | [check-release-sbom.sh](check-release-sbom.sh) | Validates generated SPDX/CycloneDX SBOM artifacts for releases |
@@ -42,6 +43,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [install-release-gh.sh](install-release-gh.sh) | Installs pinned `gh` CLI tooling for release workflows |
 | [package-release-images.sh](package-release-images.sh) | Packages and manifests `ghcr.io/zcashfoundation/zinder` OCI release images |
 | [prepare-changelog-release.sh](prepare-changelog-release.sh) | Rolls pending `.changes/unreleased/*.yaml` fragments into `CHANGELOG.md` for a release |
+| [release-binary-platform.sh](release-binary-platform.sh) | Resolves release platform names, CPU baselines, and native library metadata for the archive scripts |
 | [resolve-release-image-manifest.sh](resolve-release-image-manifest.sh) | Resolves `deploy/release-images.json` into concrete image build matrix entries |
 | [test-github-release-lookup.sh](test-github-release-lookup.sh) | Unit-tests `find-github-release.sh` |
 | [test-release-binary-archive.sh](test-release-binary-archive.sh) | Unit-tests `build-release-binary-archive.sh` and `check-release-binary-archive.sh` |

@@ -14,7 +14,8 @@ Every first-party crate and service shares one product version, the root
 | Artifact | Contents |
 | --- | --- |
 | Runtime image | The single distroless OCI image in `deploy/release-images.json` (`ghcr.io/zcashfoundation/zinder`), for amd64 and arm64 |
-| Binary archives | One archive per platform (x86-64-v3 with BMI2+ADX Pasta assembly, and AArch64 GNU/Linux) with the unified `bin/zinder` executable, plus an SPDX 2.3 SBOM for each |
+| Binary archives | One archive per [release platform](../adrs/0022-release-artifacts.md#decision) with the unified `bin/zinder` executable, plus an SPDX 2.3 SBOM for each |
+| Personal-node Compose | `zinder-personal-compose.yaml` |
 | Rust SDK | `zinder-core`, `zinder-proto`, and `zinder-client` on crates.io |
 | API artifacts | `zinder.v1.descriptor.bin` and a `zinder-api-docs` archive with the native `.proto` sources and OpenAPI documents |
 | GitHub Release | All of the above files, `SHA256SUMS`, and its signature `SHA256SUMS.sigstore.json` |
@@ -164,8 +165,8 @@ approve the release only after all four jobs pass on the tag's commit.
      expected in that dry run.
    - Per platform, `compile release binaries` and
      `reproduce release binaries` build the archive twice in independent,
-     uncached jobs. The reproduction also packages every image from its
-     archive without pushing, with `scripts/package-release-images.sh
+     uncached jobs. For the two platforms used by the OCI image, the reproduction also packages
+     the image from its archive without pushing, with `scripts/package-release-images.sh
      check`. Each image binary must match its archive binary byte for byte
      and be a root-owned file with mode `0755`. It must run `--version` and
      `--help` as UID 10001, and its `healthcheck` subcommand must exit 1
@@ -177,7 +178,7 @@ approve the release only after all four jobs pass on the tag's commit.
    approve, check that:
 
    - the run belongs to your tag, and its commit is the release commit;
-   - both `compare independent release builds` jobs passed;
+   - all four `compare independent release builds` jobs passed;
    - the `verify public SDK packages` summary shows the plan you expect for
      the three crates; and
    - the four node jobs passed on that commit.
@@ -201,14 +202,15 @@ by hand.
 Check out the tag, so the SDK smoke test compiles against that version's API.
 Then verify the Release, the archives, the crates, and each image:
 
-```console
+```bash
 git switch --detach v0.28.0
 gh release view v0.28.0
 gh release verify v0.28.0
 
 gh release download v0.28.0 \
-  --pattern 'zinder-0.28.0-*-unknown-linux-gnu.tar.gz' \
-  --pattern 'zinder-0.28.0-*-unknown-linux-gnu.spdx.json' \
+  --pattern 'zinder-0.28.0-*.tar.gz' \
+  --pattern 'zinder-0.28.0-*.spdx.json' \
+  --pattern zinder-personal-compose.yaml \
   --pattern SHA256SUMS \
   --pattern SHA256SUMS.sigstore.json
 sha256sum --ignore-missing --check SHA256SUMS

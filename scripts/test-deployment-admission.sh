@@ -81,6 +81,21 @@ if grep -Eq 'zinder[^[:space:]]*:latest' \
   fail "the deployment Compose file or Kubernetes manifest defaults Zinder to :latest"
 fi
 
+personal_compose="$repository_root/deploy/personal/compose.yaml"
+ZINDER_VERSION=v0.27.0 docker compose --env-file /dev/null -f "$personal_compose" config --format json \
+  | jq -e '
+    .services.zinder.command == ["serve", "--preset", "light-wallet"]
+    and (.services.zinder.mem_limit | tonumber) == 8589934592
+    and .services.zinder.environment.ZINDER_NODE__AUTH__METHOD == "cookie"
+    and .services.zebra.environment.ZEBRA_RPC__ENABLE_COOKIE_AUTH == "true"
+    and (.services.zebra.ports // []) == []
+    and (.services.zinder.ports | map([.host_ip, .target]) | sort) == [
+      ["127.0.0.1", 9067], ["127.0.0.1", 9108]
+    ]
+    and ([.services.zinder.volumes[] | select(.read_only != true) | .target] == ["/var/lib/zinder"])
+    and any(.services.zinder.volumes[]; .source == "zebra-auth" and .read_only == true)
+  ' >/dev/null || fail "personal Compose exposed a private port or changed storage or auth defaults"
+
 deployment_env_names=(mainnet testnet regtest zakura-mainnet zakura-testnet)
 
 env_file_value() {

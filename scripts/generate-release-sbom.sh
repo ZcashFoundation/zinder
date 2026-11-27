@@ -97,7 +97,7 @@ fi
 [[ -z "$release_tag" && -z "$architecture" && -z "$digest" ]] || usage
 [[ -s "$archive" && -n "$output" && -n "$version" && "$commit" =~ ^[0-9a-f]{40}$ ]] || usage
 case "$platform" in
-  x86_64-v3-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;;
+  x86_64-v3-unknown-linux-gnu|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin) ;;
   *) usage ;;
 esac
 

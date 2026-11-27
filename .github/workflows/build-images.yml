@@ -18,6 +18,9 @@ on:
       - "deploy/Dockerfile"
       - ".github/actions/buildkit-cargo-cache/**"
       - "deploy/docker-compose.yml"
+      - "deploy/personal/**"
+      - "deploy/zebra/regtest.toml"
+      - "scripts/test-personal-compose.sh"
       - "deploy/release-images.json"
       - "deploy/kubernetes/**"
       - "scripts/validate-deployment-admission.sh"
@@ -38,6 +41,9 @@ on:
       - "deploy/Dockerfile"
       - ".github/actions/buildkit-cargo-cache/**"
       - "deploy/docker-compose.yml"
+      - "deploy/personal/**"
+      - "deploy/zebra/regtest.toml"
+      - "scripts/test-personal-compose.sh"
       - "deploy/release-images.json"
       - "deploy/kubernetes/**"
       - "scripts/validate-deployment-admission.sh"
@@ -163,6 +169,9 @@ jobs:
             docker run --rm "${image_name}:${PR_TAG}" healthcheck --help >/dev/null
             export_image_root "$image_name"
           done <<< "$image_names"
+
+      - name: Start and verify the personal-node bundle
+        run: scripts/test-personal-compose.sh "zinder:${PR_TAG}"
 
       # One export of the build-base stage, from main only. Later stages copy
       # the workspace and change on every commit, so their layers are not

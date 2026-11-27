@@ -261,25 +261,38 @@ When the projector requires a wallet rebuild (for example, an expired event curs
 
 ## Run the release binary without Docker
 
-Releases publish GNU/Linux archives (`x86_64-v3-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`; baseline glibc 2.34+, `GLIBCXX_3.4.30`, Debian 12 tested) containing the unified `bin/zinder` binary. Verify with GitHub CLI 2.94+ and Cosign:
+Choose the [archive for your CPU and OS](../adrs/0022-release-artifacts.md#decision).
+Use `x86_64-unknown-linux-gnu` on x86-64 Linux hosts without AVX2 or ADX.
+The GNU/Linux archives require glibc 2.34 or later and `GLIBCXX_3.4.30`.
+On Apple Silicon, choose `aarch64-apple-darwin`.
+Verify with GitHub CLI 2.94+ and Cosign:
 
 ```bash
 release=vX.Y.Z
-platform=x86_64-v3-unknown-linux-gnu   # or aarch64-unknown-linux-gnu
+platform=x86_64-v3-unknown-linux-gnu
 gh release download "$release" --repo ZcashFoundation/zinder \
   --pattern "zinder-${release#v}-${platform}.tar.gz" \
   --pattern "zinder-${release#v}-${platform}.spdx.json" \
   --pattern SHA256SUMS --pattern SHA256SUMS.sigstore.json
-sha256sum --ignore-missing --check SHA256SUMS
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
   --certificate-identity "https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/${release}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
-tar -xzf "zinder-${release#v}-${platform}.tar.gz"
+archive="zinder-${release#v}-${platform}.tar.gz"
+awk -v archive="$archive" '$2 == archive { print; found = 1 } END { if (!found) exit 1 }' \
+  SHA256SUMS > archive.sha256
+shasum -a 256 -c archive.sha256
+tar -xzf "$archive"
+```
+
+On macOS, run the verified `bin/zinder` from the extracted directory.
+To install it system-wide on Linux, run:
+
+```bash
 sudo install -m 0755 "zinder-${release#v}-${platform}"/bin/zinder /usr/local/bin/zinder
 ```
 
-Run directly with `zinder serve --preset wallet --data-dir /var/lib/zinder` (or split `zinder index` + `zinder serve --readers-only`, or invoke individual roles via `zinder run <role>`) configured through `ZINDER_*` environment variables (or an optional combined `--config` TOML file). When supervising native units under `systemd`:
+Run `zinder serve --preset wallet --data-dir /var/lib/zinder` (or split `zinder index` + `zinder serve --readers-only`, or invoke individual roles via `zinder run <role>`) configured through `ZINDER_*` environment variables (or an optional combined `--config` TOML file). When supervising native units under `systemd`:
 
 - Keep one local filesystem (`--data-dir`) for all stores, and give separate `zinder serve` instances distinct `--data-dir` or per-reader `secondary_path` directories if running multiple readers.
 - Run under an account that can read the node's mode-0600 cookie (or supply `ZINDER_NODE__AUTH__COOKIE` / `basic` auth).

@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -s "$sbom" && -s "$archive" && -n "$version" && "$commit" =~ ^[0-9a-f]{40}$ ]] || usage
 case "$platform" in
-  x86_64-v3-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;;
+  x86_64-v3-unknown-linux-gnu|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin) ;;
   *) usage ;;
 esac
 expected_sbom_name="zinder-${version}-${platform}.spdx.json"
