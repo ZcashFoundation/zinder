@@ -11,13 +11,15 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_runtime::{
-    OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase, SupervisedRuntime,
-    SupervisedTasks, TracingSubscriberError, host_cpu_meets_compiled_baseline,
-    host_cpu_meets_pasta_backend_baseline, install_metrics_recorder_for_service,
-    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
+    OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, RuntimeSupervisionError,
+    StartupPhase, SupervisedRuntime, SupervisedTasks, TracingSubscriberError, guard_serving_bind,
+    host_cpu_meets_compiled_baseline, host_cpu_meets_pasta_backend_baseline,
+    install_metrics_recorder_for_service, install_tracing_subscriber,
+    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, ZebraJsonRpcSource};
 
@@ -151,14 +153,23 @@ async fn dispatch_cli(
 
 /// Supervises the native `WalletQuery` server inside a parent runtime such as `zinder serve`.
 ///
-/// The caller owns the operational HTTP endpoint, metrics recorder, CPU checks,
-/// and terminating-signal handling. `readiness` receives readiness updates and
+/// The caller provides a bound gRPC listener and owns the operational HTTP
+/// endpoint, metrics recorder, CPU checks, and terminating-signal handling. `readiness` receives readiness updates and
 /// `cancel` triggers bounded shutdown.
 pub async fn serve_supervised(
     mut query_config: QueryConfig,
     readiness: Readiness,
     cancel: CancellationToken,
+    listener: TcpListener,
 ) -> Result<(), QueryConfigError> {
+    query_config.listen_addr = listener
+        .local_addr()
+        .map_err(|source| RuntimeSupervisionError::GrpcServer { source })?;
+    guard_serving_bind(
+        "query.listen_addr",
+        query_config.listen_addr,
+        query_config.allow_public_bind,
+    )?;
     query_config.ops_listen_addr = None;
     let runtime = SupervisedRuntime::new(RuntimeService::Query);
     let shutdown = runtime.shutdown_request();
@@ -167,7 +178,7 @@ pub async fn serve_supervised(
         cancel_token.cancelled().await;
         shutdown.request();
     });
-    let outcome = serve_query(query_config, runtime, readiness, cancel).await;
+    let outcome = serve_query(query_config, runtime, readiness, cancel, Some(listener)).await;
     cancel_bridge.abort();
     outcome
 }
@@ -250,7 +261,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     let runtime = SupervisedRuntime::new(RuntimeService::Query);
     let _signal_handle = runtime.request_shutdown_on_terminating_signal();
     let cancel = runtime.stopping();
-    serve_query(query_config, runtime, Readiness::default(), cancel).await
+    serve_query(query_config, runtime, Readiness::default(), cancel, None).await
 }
 
 #[allow(
@@ -262,6 +273,7 @@ async fn serve_query(
     runtime: SupervisedRuntime,
     readiness: Readiness,
     startup_cancel: CancellationToken,
+    listener: Option<TcpListener>,
 ) -> Result<(), QueryConfigError> {
     let serving_readiness = WalletServingReadiness::with_node_and_ingest_control(readiness.clone());
     let admit_ingest_control_phase = StartupPhase::AdmitIngestControl.start();
@@ -413,8 +425,16 @@ async fn serve_query(
     );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let server =
-        router.serve_with_shutdown(query_config.listen_addr, runtime.grpc_server_shutdown());
+    let shutdown = runtime.grpc_server_shutdown();
+    let server = Box::pin(async move {
+        let listener = match listener {
+            Some(listener) => listener,
+            None => TcpListener::bind(query_config.listen_addr).await?,
+        };
+        router
+            .serve_with_incoming_shutdown(listener, shutdown)
+            .await
+    });
     runtime
         .supervise(
             server,

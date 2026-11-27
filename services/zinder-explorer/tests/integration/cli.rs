@@ -66,6 +66,47 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
 }
 
 #[test]
+fn browser_transport_rejects_wildcard_with_inline_or_file_bearer_auth() -> eyre::Result<()> {
+    let storage = tempdir()?;
+    let config_path = storage.path().join("explorer.toml");
+    let token_path = storage.path().join("explorer.token");
+    let token = "fixture-browser-token";
+    fs::write(&token_path, token)?;
+    for origin in ["*", "https://explorer.example"] {
+        fs::write(
+            &config_path,
+            format!("[explorer]\nbrowser_origins = [\"{origin}\"]\n"),
+        )?;
+        for (name, configured_token) in [
+            ("ZINDER_EXPLORER__BEARER_TOKEN", token),
+            ("ZINDER_EXPLORER__BEARER_TOKEN_PATH", path_str(&token_path)?),
+        ] {
+            let output = zinder_explorer_command()
+                .env_clear()
+                .args(["--print-config", "--network", "zcash-regtest", "--config"])
+                .arg(&config_path)
+                .env(name, configured_token)
+                .output()?;
+            let stdout = String::from_utf8(output.stdout)?;
+            let stderr = String::from_utf8(output.stderr)?;
+            assert!(!stdout.contains(token), "{stdout}");
+            assert!(!stderr.contains(token), "{stderr}");
+            if origin == "*" {
+                assert!(!output.status.success(), "{stdout}");
+                assert!(
+                    stderr.contains("explorer.browser_origins requires specific origins"),
+                    "{stderr}"
+                );
+            } else {
+                assert!(output.status.success(), "{stderr}");
+                assert!(stdout.contains(origin), "{stdout}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn wallet_serving_explorer_image_config_resolves() -> eyre::Result<()> {
     let output = zinder_explorer_command()
         .args(["--print-config"])

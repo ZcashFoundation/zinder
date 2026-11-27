@@ -97,11 +97,14 @@ WebZjs requests binary gRPC-Web by default. If your SDK supports binary server s
 Generate a gRPC-Web client from the `WalletQuery` or `ExplorerQuery` protobuf
 definitions. Point it at the same HTTPS URL as native gRPC after the operator
 [enables your site's origin](../runbooks/exposing-over-tls.md#enable-browser-clients).
-Use binary or text gRPC-Web for unary reads. For WalletQuery server streams
-such as `CompactBlocksInRange` and `ChainEvents`, choose an encoding your client
-supports for streaming and read through the terminal gRPC status.
-ExplorerQuery defines unary RPCs. If the operator requires a bearer token,
-send it in the RPC's `authorization` metadata.
+Use binary or text gRPC-Web for unary RPCs. For server streams such as
+WalletQuery's `CompactBlocksInRange` and `ChainEvents` or ExplorerQuery's
+`RecentTransactions`, choose an encoding your client supports for streaming.
+Read through the terminal gRPC status before treating a stream as complete.
+
+On settled `ChainEvents` streams, browsers can read the
+`zinder-chain-event-family` response header. If ExplorerQuery requires a
+bearer token, send it in the RPC's `authorization` metadata.
 
 ## Native gRPC clients
 

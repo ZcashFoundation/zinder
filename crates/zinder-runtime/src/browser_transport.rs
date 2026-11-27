@@ -12,6 +12,7 @@ use tower_http::{
     validate_request::{ValidateRequest, ValidateRequestHeaderLayer},
 };
 use url::Url;
+use zinder_proto::wire::CHAIN_EVENT_FAMILY_HEADER;
 
 use crate::PublicGrpcServer;
 
@@ -90,6 +91,12 @@ impl Serialize for BrowserOrigins {
 }
 
 impl BrowserOrigins {
+    /// Returns whether the listener explicitly permits every browser origin.
+    #[must_use]
+    pub fn allows_any_origin(&self) -> bool {
+        matches!(self.0.as_ref(), [origin] if origin == "*")
+    }
+
     /// Builds the HTTP adapter for the named application RPC service.
     ///
     /// Add this outside middleware that consumes native gRPC bodies.
@@ -199,6 +206,7 @@ fn browser_cors(origins: &[HeaderValue]) -> CorsLayer {
             Status::GRPC_STATUS,
             Status::GRPC_MESSAGE,
             Status::GRPC_STATUS_DETAILS,
+            HeaderName::from_static(CHAIN_EVENT_FAMILY_HEADER),
             HeaderName::from_static("grpc-retry-pushback-ms"),
         ])
 }

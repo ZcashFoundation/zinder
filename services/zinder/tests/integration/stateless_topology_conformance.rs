@@ -91,7 +91,7 @@ struct ReplicaStack {
     tasks: Vec<JoinHandle<eyre::Result<()>>>,
 }
 
-fn build_fixture_chain() -> eyre::Result<ChainFixture> {
+pub(super) fn build_fixture_chain() -> eyre::Result<ChainFixture> {
     let mut chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
     for height in 1_u32..=3_u32 {
         let block = chain
@@ -110,7 +110,9 @@ fn build_fixture_chain() -> eyre::Result<ChainFixture> {
     Ok(chain)
 }
 
-fn prepare_materialized_views(canon_path: &Path) -> eyre::Result<(TempDir, MaterializedViewStore)> {
+pub(super) fn prepare_materialized_views(
+    canon_path: &Path,
+) -> eyre::Result<(TempDir, MaterializedViewStore)> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mv_tail_dir = TempDir::new()?;
     let canon_sec = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(

@@ -352,8 +352,9 @@ scheme, host, and any nondefault port.
 An empty list keeps the listener on native HTTP/2 gRPC. A nonempty list also
 enables HTTP/1.1 and accepts gRPC-Web over either HTTP version. A gRPC-Web
 request with an unlisted `Origin` receives HTTP 403. Use `*` alone to allow
-every origin. No origin list enables credentialed CORS, and ExplorerQuery
-still checks the configured bearer token on each RPC.
+every origin on a listener without Explorer bearer authentication. When you
+configure an inline or file-backed Explorer bearer token, list specific
+origins to enable gRPC-Web. ExplorerQuery checks the token on each RPC.
 
 ## Listener and request limits
 

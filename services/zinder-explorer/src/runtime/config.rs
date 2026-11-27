@@ -280,6 +280,13 @@ fn resolve_explorer_config(
     let listen_addr_text = require_field(raw.explorer.listen_addr, "explorer.listen_addr")?;
     let listen_addr = parse_socket_addr("explorer.listen_addr", &listen_addr_text)?;
     let bearer_token_path = raw.explorer.bearer_token_path;
+    if raw.explorer.browser_origins.allows_any_origin()
+        && (bearer_token_path.is_some() || raw.explorer.bearer_token.is_some())
+    {
+        return Err(ConfigError::invalid(
+            "explorer.browser_origins requires specific origins when an Explorer bearer token is configured",
+        ).into());
+    }
     let bearer_token = resolve_optional_bearer_token(
         bearer_token_path.as_deref(),
         raw.explorer.bearer_token.as_deref(),

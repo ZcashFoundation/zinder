@@ -179,7 +179,7 @@ async fn explorer_health_follows_readyz_and_a_pending_federated_call_ends_at_the
 -> Result<()> {
     const DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
     let wallet = TcpListener::bind("127.0.0.1:0").await?;
-    let grpc_port = PortReservation::bind("127.0.0.1:0")?;
+    let grpc_port = TcpListener::bind("127.0.0.1:0").await?;
     let ops_port = PortReservation::bind("127.0.0.1:0")?;
     let grpc = grpc_port.local_addr()?;
     let ops = ops_port.local_addr()?;
@@ -204,8 +204,9 @@ async fn explorer_health_follows_readyz_and_a_pending_federated_call_ends_at_the
         SupervisedRuntime::new(RuntimeService::Explorer).with_grpc_drain_timeout(DRAIN_TIMEOUT);
     let shutdown = runtime.shutdown_request();
     let readiness = Readiness::default();
-    drop((grpc_port, ops_port));
-    let server = tokio::spawn(serve_explorer(config, runtime, readiness.clone()));
+    drop(ops_port);
+    let serving = serve_explorer(config, runtime, readiness.clone(), Some(grpc_port));
+    let server = tokio::spawn(serving);
     let probe = timeout(PROBE_WAIT_LIMIT, async {
         loop {
             if let Ok(probe) = PublicListenerProbe::connect(grpc, ops).await {

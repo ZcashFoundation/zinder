@@ -18,10 +18,15 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_query::RocksDbCanonicalReader;
 use zinder_runtime::{
-    ClientAddressSource, GrpcRangeAdmission, Readiness, ReadinessState, WalletRpcMetricsLayer,
+    BrowserOrigins, ClientAddressSource, GrpcRangeAdmission, Readiness, ReadinessState,
+    WalletRpcMetricsLayer,
 };
 
-use crate::{CanonicalReaderSlot, CompactBlocksGrpcAdapter, block_range::BlockRangeStreamLimit};
+use crate::{
+    CanonicalReaderSlot, CompactBlocksGrpcAdapter,
+    block_range::BlockRangeStreamLimit,
+    runtime::listener::{BrowserListener, serve_listener},
+};
 
 #[tokio::test]
 async fn a_wallet_over_its_range_quota_does_not_interrupt_independent_wallets() -> eyre::Result<()>
@@ -53,8 +58,8 @@ async fn a_wallet_over_its_range_quota_does_not_interrupt_independent_wallets() 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = Endpoint::from_shared(format!("http://{}", listener.local_addr()?))?
         .timeout(Duration::from_secs(5));
-    let config = super::super::super::browser_transport::BrowserListener {
-        browser_origins: &[],
+    let config = BrowserListener {
+        browser_origins: &BrowserOrigins::default(),
         client_address: ClientAddressSource::Connection,
         proxy_protocol: GrpcProxyProtocol::default(),
         range_admission: GrpcRangeAdmission {
@@ -62,7 +67,7 @@ async fn a_wallet_over_its_range_quota_does_not_interrupt_independent_wallets() 
             ..GrpcRangeAdmission::default()
         },
     };
-    let server = tokio::spawn(super::super::super::browser_transport::serve_listener(
+    let server = tokio::spawn(serve_listener(
         &runtime,
         adapter.into_server(),
         listener,
