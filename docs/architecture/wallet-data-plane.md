@@ -38,7 +38,7 @@ The service advertises a method's capability string only when this deployment ca
 | --- | --- | --- |
 | `VisibleTipBlock`, `SettledTipBlock` | Block identity at the visible or settled tip | Always |
 | `BlockIdBySelector` | Height and hash for a height or hash selector | Always |
-| `BlockHeaderBySelector` | Zinder header read model | Always |
+| `BlockHeaderBySelector` | Zinder header read model | Never |
 | `CompactBlock`, `CompactBlocksInRange` | Compact blocks | Always |
 | `FullBlock`, `FullBlocksInRange` | Consensus-serialized blocks | Ingest retains block blobs (`storage.raw_blob_policy = "all"`) |
 | `TreeStateAtHeight`, `LatestTreeStateCheckpoint` | Sapling, Orchard, and Ironwood tree states | Always |
@@ -85,7 +85,7 @@ Full blocks exist only when ingest writes raw block segments, which requires `st
 
 `BlockIdBySelector` resolves a height or a block hash against the best chain of the answering epoch. A hash that is unknown or belongs to a displaced block returns `NOT_FOUND` with `BLOCK_NOT_IN_BEST_CHAIN`. So does a height above the visible tip. A hash never resolves to the replacement block at the same height.
 
-`BlockHeaderBySelector` resolves the same height or hash selector and returns the header fields for that block. Its `BlockHeader` message omits the Equihash solution. To read the complete header, decode it from a full block.
+`BlockHeaderBySelector` is in the protocol but never advertised. Its `BlockHeader` message omits the Equihash solution, so it is not a complete header. A client that needs the full header reads a full block and decodes it.
 
 ## Tree states and subtree roots
 

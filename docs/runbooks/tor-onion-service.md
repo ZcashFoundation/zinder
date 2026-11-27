@@ -26,15 +26,15 @@ compose=(docker compose --env-file "$env_file" -f deploy/docker-compose.yml
   --ready --addr 127.0.0.1:9108
 ```
 
-Wait for the readiness probe to succeed before serving wallets. The
-[overlay](../../deploy/docker-compose.tor.yml) shares the writer's network
+Wait for the readiness probe to succeed before serving wallets. The overlay
+in `deploy/docker-compose.tor.yml` shares the writer's network
 namespace with the readers and Tor. It binds the listeners there to
 `127.0.0.1`, sets `security.allow_public_bind = false` on both Zinder
 processes, and removes the base file's host port mappings. Leave the
 observability profile off and run operational probes inside the namespace.
 The base Compose host-port overrides do not change onion ports.
 
-The [reference torrc](../../deploy/tor/torrc) uses `HiddenServiceVersion 3`
+The reference config in `deploy/tor/torrc` uses `HiddenServiceVersion 3`
 and maps onion ports `9067` and `9102` to the respective loopback wallet
 listeners. It opens no SOCKS, control, or relay listener. Review the mapping
 and keep ops, ingest and projector control, Explorer, and node ports out of
@@ -92,9 +92,11 @@ Tor runs as `debian-tor`. A fresh `tor-state` named volume inherits the
 image's ownership and directory mode `0700`. Keep the hidden service
 directory at `0700` and its secret key at `0600`, owned by the Tor account.
 Restrict any backup of that volume to the same trust boundary. Deleting the
-volume without a backup loses the onion address. To update Tor, run
-`"${compose[@]}" build --pull --no-cache zinder-tor` and recreate the sidecar
+volume without a backup loses the onion address. To refresh the Tor package,
+run `"${compose[@]}" build --no-cache zinder-tor` and recreate the sidecar
 with `"${compose[@]}" up -d zinder-tor`.
+To refresh the base image, update the Debian image digest in `deploy/tor/Dockerfile`
+before rebuilding.
 
 ## Connect and verify from outside
 
@@ -181,6 +183,7 @@ volume if you plan to reuse the address.
 | Observer | What the observer can learn |
 | --- | --- |
 | Indexer operator | Tor hides the wallet's source IP. The operator still sees RPC methods, parameters, connection reuse, request timing, response sizes, and any identifying application metadata. |
+| Upstream node operator | Sees forwarded transaction IDs and lookup timing, plus transaction bytes and submission timing for broadcasts. |
 | Wallet's local network or ISP | Tor use, packet sizes, and timing are observable. The onion destination and RPC contents are encrypted on the Tor path. |
 | Observer near both ends | Timing and traffic volume can support correlation. Matching distinctive queries or broadcasts can also link sessions without an IP address. |
 
@@ -196,6 +199,19 @@ fetching only interesting full transactions leaks information.
 [ZIP 315](https://zips.z.cash/zip-0315) covers wallet practices for transparent
 addresses.
 
+With the default `wallet` preset, Zinder stores chain history without raw
+transaction bodies. On a cache miss, it forwards transaction IDs to the
+configured upstream node to fetch mined bodies for `GetTransaction`, the
+compatibility transparent history calls, and native `Transaction` when it
+fetches mined bytes. Compatibility history selects matching IDs locally from
+the requested address and range. See [Node-forwarded reads](../reference/lightwalletd-compatibility.md#node-forwarded-reads).
+
+To keep those lookups within your own infrastructure, use upstream nodes you
+operate, including any fallbacks. If you use a third-party node, set
+`ZINDER_STORAGE__FULL_BLOCKS=true` in the Compose env file and build a store
+that retains the transaction bodies. Zinder can then serve those mined reads
+locally. Changing retention requires a new store. See [Configuration](../reference/configuration.md#deployment-profiles).
+
 ### CompactTxStreamer
 
 Availability depends on the [compatibility serving mode](../reference/lightwalletd-compatibility.md).
@@ -207,15 +223,15 @@ Availability depends on the [compatibility serving mode](../reference/lightwalle
 | `GetBlockRange`, `GetBlockRangeNullifiers` | Inclusive height range, direction, and pool selection. Nullifier ranges request shielded data by block, without naming wallet nullifiers. Use contiguous shared scan ranges and match locally. |
 | `GetSubtreeRoots` | Shielded protocol, start index, and entry limit. The starting index can reveal sync progress. |
 | `GetMempoolTx` | Transaction-ID suffix exclusions and pool selection. Exclusions disclose what the client is filtering out and can help link polls. Omit exclusions when feasible and filter locally. |
-| `GetTransaction` | One transaction ID, including during pending checks. Download all transactions in the relevant block where feasible or query your own indexer. |
-| `GetTaddressTxids`, `GetTaddressTransactions` | Transparent address and height range. Both aliases stream raw transactions. Use your own indexer or scan chain data locally. |
+| `GetTransaction` | One transaction ID, including during pending checks. Download all transactions in the relevant block where feasible or use a local indexer with local transaction bodies or an upstream node you operate. |
+| `GetTaddressTxids`, `GetTaddressTransactions` | Transparent address and height range. Both aliases stream raw transactions and can forward matching IDs for the bodies. Scan chain data locally or use a local indexer that keeps body lookups within your infrastructure. |
 | `GetTaddressBalance`, `GetTaddressBalanceStream`, `GetAddressUtxos`, `GetAddressUtxosStream` | Transparent addresses grouped within one request or stream. UTXO requests also reveal a height floor and result limit. Use your own indexer or scan locally. |
 | `SendTransaction` | Full serialized transaction and submission time. Zinder forwards it to the configured node. Broadcast via your own node to avoid disclosing origination to a third-party wallet indexer. Node peers can still correlate propagation. |
 | `Ping` | Requested test delay. Refused by default. Keep it disabled on wallet deployments. |
 
 ### WalletQuery
 
-See the [native method availability](../architecture/wallet-data-plane.md#methods).
+See the [native method availability](../reference/capabilities.md#wallet-capabilities).
 
 | RPC | What the operator learns and how to reduce disclosure |
 | --- | --- |
@@ -226,8 +242,9 @@ See the [native method availability](../architecture/wallet-data-plane.md#method
 | `SubtreeRoots` | Shielded protocol, starting index, entry limit, and any epoch pin. |
 | `MempoolSnapshot`, `MempoolEvents` | A page limit or start position, including cursors that link pages or resumed streams. These methods carry no address or transaction-ID filter. |
 | `ChainEvents` | Stream family and start or resume position. An address filter discloses every selected transparent address and their grouping. Use an unfiltered stream and match locally. |
-| `Transaction` | One transaction ID and any epoch pin, even when requesting status without transaction bytes. Use a local indexer for selective lookups. |
-| `TransparentAddressUnspentOutputs`, `TransparentAddressTxIdsInRange` | One transparent address or script hash, the height selector, and any epoch pin. History requests also reveal pagination. A script hash can be matched against public scripts. Use your own indexer or scan locally. |
+| `Transaction` | One transaction ID and any epoch pin, even when the response carries only status. If you need mined bytes, keep the body lookup within your infrastructure. |
+| `TransparentAddressUnspentOutputs` | One transparent address or script hash, a minimum mined height, and an optional epoch pin (`at_epoch_id`). A script hash can be matched against public scripts. Use your own indexer or scan locally. |
+| `TransparentAddressTxIdsInRange` | One transparent address or script hash, inclusive height bounds, a page limit, and an optional cursor. The cursor can link resumed calls, and the request has no explicit epoch field. Use your own indexer or scan locally. |
 | `TransparentOutpointSpendStatus` | Exact transaction IDs and output indices, co-queried outpoints, and any epoch pin. Use your own indexer or track spends locally. |
 | `BroadcastTransaction` | Full serialized transaction and submission time, as with `SendTransaction`. Use your own node to avoid third-party origination disclosure. |
 | `ChainValuePoolsAtTip` | The release endpoint refuses this method as unavailable. The request carries no wallet-specific selector. |
@@ -237,6 +254,6 @@ can separate client addressing at a relay from request contents at a gateway
 when they do not collude. The gateway still sees selectors. Private
 information retrieval (PIR) can hide a selected record from an indexer if
 the wallet and server implement a compatible PIR protocol. Neither is
-provided by this profile. Self-hosting keeps queries within your own
-operator boundary. It leaves public chain data and network broadcast
-observations visible.
+provided by this profile. Self-hosting gives you control over the indexer.
+Third-party nodes can still see the requests Zinder forwards to them, and
+public chain data and network broadcast observations remain visible.
