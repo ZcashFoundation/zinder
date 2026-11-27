@@ -1,0 +1,6 @@
+kind: added
+body: Support 12-factor data_dir defaults, inline TLS PEM and bearer token values, deployment profiles (light-wallet, wallet, explorer), full_blocks storage toggle, auto-persisted projector owner IDs, and shared multi-role TOML configs.
+time: 2026-11-27T03:42:18Z
+custom:
+  Bump: minor
+  PR: "667"
