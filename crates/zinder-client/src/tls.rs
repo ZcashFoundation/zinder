@@ -12,6 +12,7 @@ use rustls::{
     server::ParsedCertificate,
 };
 use sha2::{Digest as _, Sha256};
+use subtle::ConstantTimeEq as _;
 use tonic::transport::{ClientTlsConfig, Endpoint, Uri};
 
 use crate::IndexerError;
@@ -28,6 +29,7 @@ impl TlsRoots {
         let mut roots = RootCertStore::empty();
         match self {
             Self::Pem(bundle) => {
+                validate_pem_framing(bundle)?;
                 for certificate in CertificateDer::pem_slice_iter(bundle) {
                     roots
                         .add(certificate.map_err(|_| invalid_cert())?)
@@ -47,6 +49,33 @@ impl TlsRoots {
         }
         Ok(roots)
     }
+}
+
+fn validate_pem_framing(bundle: &[u8]) -> Result<(), IndexerError> {
+    let malformed = || IndexerError::invalid_request("invalid TLS CA PEM framing");
+    let mut open_label = None;
+    // Rustls replaces an open label on a second BEGIN. Check framing before decoding.
+    for line in bundle.split(|byte| matches!(byte, b'\r' | b'\n')) {
+        let line = line.trim_ascii_end();
+        if let Some(label) = line.strip_prefix(b"-----BEGIN ") {
+            let label = label
+                .strip_suffix(b"-----")
+                .filter(|label| !label.is_empty())
+                .ok_or_else(malformed)?;
+            if open_label.replace(label).is_some() {
+                return Err(malformed());
+            }
+        } else if let Some(label) = line.strip_prefix(b"-----END ") {
+            let label = label.strip_suffix(b"-----").ok_or_else(malformed)?;
+            if open_label.take() != Some(label) {
+                return Err(malformed());
+            }
+        }
+    }
+    if open_label.is_some() {
+        return Err(malformed());
+    }
+    Ok(())
 }
 
 pub(super) fn configure(
@@ -138,7 +167,7 @@ impl ServerCertVerifier for SpkiPinVerifier {
         )?;
         let spki = ParsedCertificate::try_from(end_entity)?.subject_public_key_info();
         let observed: [u8; 32] = Sha256::digest(spki.as_ref()).into();
-        if observed != self.sha256 {
+        if !bool::from(observed.ct_eq(&self.sha256)) {
             return Err(CertificateError::ApplicationVerificationFailure.into());
         }
         Ok(verified)

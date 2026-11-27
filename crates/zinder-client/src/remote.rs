@@ -47,7 +47,7 @@ use crate::{
     ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted,
     EndpointBackedIndex, EventStreamStart, IndexStream, IndexerError, MempoolEvent,
     MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
-    MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo, ServerInfo,
+    MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo, RetryPolicy, ServerInfo,
     TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
@@ -267,12 +267,31 @@ impl RemoteChainIndex {
         Req: Clone,
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
     {
+        self.read_rpc_with_retry_policy(request, invoke, |status| {
+            Some(IndexerError::from_status(status.clone()).retry_policy())
+        })
+        .await
+    }
+
+    async fn read_rpc_with_retry_policy<Req, Resp, Fut>(
+        &self,
+        request: Req,
+        invoke: impl Fn(WalletQueryClient<Channel>, Req) -> Fut,
+        retry_policy: impl Fn(&tonic::Status) -> Option<RetryPolicy>,
+    ) -> Result<tonic::Response<Resp>, tonic::Status>
+    where
+        Req: Clone,
+        Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+    {
         if self.retry_reads {
             let mut backoff = ReadBackoff::new();
             for _ in 1..MAX_READ_ATTEMPTS {
                 match invoke(self.client(), request.clone()).await {
                     Ok(response) => return Ok(response),
                     Err(status) => {
+                        if retry_policy(&status) != Some(RetryPolicy::RetryWithBackoff) {
+                            return Err(status);
+                        }
                         let Some(delay) = backoff.delay(&status, has_zinder_error_info(&status))
                         else {
                             return Err(status);
@@ -320,8 +339,7 @@ impl RemoteChainIndex {
     /// Maps a failed transaction lookup to [`TxStatus::NotFound`] only for the
     /// typed `TRANSACTION_NOT_FOUND` absence signal.
     fn tx_status_from_lookup_failure(
-        &self,
-        status: tonic::Status,
+        status: &tonic::Status,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError> {
         let details = status.get_error_details();
@@ -334,7 +352,7 @@ impl RemoteChainIndex {
                     message: status.message().to_owned(),
                 })
             }
-            Ok(None) => Err(self.map_status(status)),
+            Ok(None) => Err(IndexerError::from_status(status.clone())),
             Err(metadata_error) => Err(IndexerError::malformed(
                 "error_info.metadata",
                 metadata_error.to_string(),
@@ -870,17 +888,25 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError> {
         let response = match self
-            .read_rpc(
+            .read_rpc_with_retry_policy(
                 wallet::TransactionRequest {
                     transaction_id: encode_rpc_transaction_id_hex(transaction_id),
                     at_epoch_id: at_epoch_id.map(ChainEpochId::value),
                 },
                 async |mut client, request| client.transaction(request).await,
+                |status| {
+                    Self::tx_status_from_lookup_failure(status, at_epoch_id)
+                        .err()
+                        .map(|error| error.retry_policy())
+                },
             )
             .await
         {
             Ok(response) => response.into_inner(),
-            Err(status) => return self.tx_status_from_lookup_failure(status, at_epoch_id),
+            Err(status) => {
+                self.recover_channel(&status);
+                return Self::tx_status_from_lookup_failure(&status, at_epoch_id);
+            }
         };
         tx_status_from_message(self.network, transaction_id, at_epoch_id, response)
     }

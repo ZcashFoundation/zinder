@@ -4,8 +4,6 @@ use std::time::Duration;
 
 use tonic::{Code, Status};
 
-use crate::{ErrorReason, IndexerError, RetryPolicy};
-
 pub(super) const MAX_READ_ATTEMPTS: u8 = 4;
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 2_000;
@@ -23,11 +21,7 @@ impl ReadBackoff {
     }
 
     pub(super) fn delay(&mut self, status: &Status, has_typed_reason: bool) -> Option<Duration> {
-        let failure = IndexerError::from_status(status.clone());
-        // The transaction lookup decodes typed absence as a terminal answer.
-        if failure.retry_policy() != RetryPolicy::RetryWithBackoff
-            || failure.reason() == Some(ErrorReason::TransactionNotFound)
-            || status.code() == Code::Cancelled
+        if status.code() == Code::Cancelled
             || (!has_typed_reason
                 && !matches!(
                     status.code(),

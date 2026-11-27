@@ -6267,6 +6267,7 @@ dependencies = [
  "rustls-native-certs",
  "secrecy",
  "sha2 0.11.1",
+ "subtle",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

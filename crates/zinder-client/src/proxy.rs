@@ -62,11 +62,53 @@ fn socks_target(endpoint: &Uri) -> Result<Uri, IndexerError> {
         Some("https") => 443,
         Some(_) | None => return Err(invalid_target()),
     };
-    let host = endpoint.host().ok_or_else(invalid_target)?;
+    let authority = endpoint.authority().ok_or_else(invalid_target)?;
+    let host = authority.host();
+    let host_and_port = authority
+        .as_str()
+        .rsplit_once('@')
+        .map_or(authority.as_str(), |(_, host_and_port)| host_and_port);
     // Hyper's SOCKS5 connector assumes port 443 when the URI omits the port.
-    let port = endpoint.port_u16().unwrap_or(default_port);
+    let port = if host_and_port == host {
+        default_port
+    } else {
+        authority
+            .port_u16()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| IndexerError::invalid_request("invalid SOCKS5 destination port"))?
+    };
     Uri::builder()
         .authority(format!("{host}:{port}"))
         .build()
         .map_err(|_| invalid_target())
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::transport::Uri;
+
+    use super::socks_target;
+
+    #[test]
+    fn only_an_omitted_destination_port_uses_the_scheme_default() -> eyre::Result<()> {
+        for (endpoint, expected_port) in [
+            ("http://wallet.internal", 80),
+            ("https://wallet.internal", 443),
+            ("http://[::1]", 80),
+            ("https://wallet.internal:9102", 9102),
+        ] {
+            let endpoint: Uri = endpoint.parse()?;
+            assert_eq!(socks_target(&endpoint)?.port_u16(), Some(expected_port));
+        }
+        for endpoint in [
+            "http://wallet.internal:65536",
+            "https://[::1]:99999",
+            "https://wallet.internal:invalid",
+            "https://wallet.internal:0",
+        ] {
+            let endpoint: Uri = endpoint.parse()?;
+            assert!(socks_target(&endpoint).is_err(), "{endpoint}");
+        }
+        Ok(())
+    }
 }

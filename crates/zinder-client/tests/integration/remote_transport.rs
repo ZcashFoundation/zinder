@@ -1,11 +1,16 @@
 //! Loopback tests of the public remote transport settings.
 
-use std::net::SocketAddr;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, PublicKeyData as _,
@@ -14,17 +19,31 @@ use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
 };
+use tokio_stream::{Stream, StreamExt as _, wrappers::TcpListenerStream};
 use tonic::{
-    Request, Status,
-    transport::{Identity, ServerTlsConfig},
+    Request, Response, Status,
+    body::Body as TonicBody,
+    codegen::{BoxFuture, Service, http},
+    server::{NamedService, ServerStreamingService},
+    transport::{Identity, Server, ServerTlsConfig},
 };
 use tonic_types::ErrorDetails;
 use zinder_client::{
-    EndpointBackedIndex as _, IndexerError, Network, RawTransactionBytes, RemoteChainIndex,
-    RemoteClientOptions, RemoteOpenOptions, RetryPolicy,
+    BlockHeightRange, ChainEpochId, ChainIndex as _, EndpointBackedIndex as _, IndexerError,
+    Network, RawTransactionBytes, RemoteChainIndex, RemoteClientOptions, RemoteOpenOptions,
+    RetryPolicy,
 };
-use zinder_proto::{status_with_reason, v1::ops::ErrorReason};
+use zinder_proto::{
+    status_with_reason,
+    v1::{
+        ops::ErrorReason,
+        wallet::{self, compact_blocks_in_range_chunk::Body as RangeChunk},
+    },
+    wire::{chain_epoch_message, compact_block_message},
+};
+use zinder_testkit::ChainFixture;
 
 use super::remote_chain_index::spawn_transport_wallet_query;
 
@@ -232,6 +251,173 @@ async fn read_retries_are_opt_in_and_stop_at_the_limit_or_pushback_refusal() -> 
 }
 
 #[tokio::test]
+async fn retry_enabled_reads_return_terminal_policies_after_one_attempt() -> eyre::Result<()> {
+    for (reason, policy) in [
+        (
+            ErrorReason::ChainEpochPinUnavailable,
+            RetryPolicy::RefreshChainEpoch,
+        ),
+        (ErrorReason::InvalidBlockRange, RetryPolicy::ClientError),
+        (
+            ErrorReason::DependencyNotConfigured,
+            RetryPolicy::OperatorActionRequired,
+        ),
+    ] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (index, server) = scripted_retry_endpoint(
+            RemoteClientOptions::default().with_read_retries(),
+            status_with_reason(
+                reason,
+                "scripted terminal read failure",
+                ErrorDetails::new(),
+            ),
+            Arc::clone(&attempts),
+            usize::MAX,
+        )
+        .await?;
+        let reply = index.server_info().await;
+        assert!(matches!(reply, Err(error) if error.retry_policy() == policy));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1, "{reason:?}");
+        server.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_range_retries_opening_but_surfaces_errors_after_a_block() -> eyre::Result<()> {
+    let network = Network::ZcashRegtest;
+    let epoch_id = ChainEpochId::new(7);
+    let chain = ChainFixture::new(network).extend_blocks(2);
+    let epoch = chain
+        .chain_epoch(epoch_id)
+        .ok_or_else(|| eyre::eyre!("missing fixture epoch"))?;
+    let first_block = chain
+        .compact_block_artifacts()
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre::eyre!("missing fixture block"))?;
+    let (observed, mut attempts) = mpsc::channel(4);
+    let rpc_count = Arc::new(AtomicUsize::new(0));
+    let range_rpc = ScriptedCompactRange {
+        rpc_count: Arc::clone(&rpc_count),
+        observed,
+        opening_failure: transient_failure("350")?,
+        header: wallet::ChainView {
+            chain_epoch: Some(chain_epoch_message(epoch)),
+            ..Default::default()
+        },
+        block: compact_block_message(&first_block),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let index = connect(
+        format!("http://{}", listener.local_addr()?),
+        RemoteClientOptions::default().with_read_retries(),
+    )?;
+    let server = tokio::spawn(
+        Server::builder()
+            .add_service(range_rpc)
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+
+    let range = BlockHeightRange::inclusive(first_block.height(), epoch.visible_tip_height);
+    let mut stream = index.compact_blocks_in_range(range, Some(epoch_id)).await?;
+    let (first_request, first_attempt) = attempts.try_recv()?;
+    let (second_request, second_attempt) = attempts.try_recv()?;
+    assert!(second_attempt.duration_since(first_attempt) >= Duration::from_millis(350));
+    assert_eq!(
+        first_request,
+        wallet::CompactBlocksInRangeRequest {
+            start_height: range.start.value(),
+            end_height: range.end.value(),
+            at_epoch_id: Some(epoch_id.value()),
+        }
+    );
+    assert_eq!(second_request, first_request);
+
+    assert!(
+        matches!(stream.next().await, Some(Ok(block)) if block.height() == first_block.height())
+    );
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(IndexerError::ServiceUnavailable { reason }))
+            if reason.contains("range interrupted after the first block")
+    ));
+    assert!(stream.next().await.is_none());
+    assert_eq!(rpc_count.load(Ordering::Relaxed), 2);
+    server.abort();
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ScriptedCompactRange {
+    rpc_count: Arc<AtomicUsize>,
+    observed: mpsc::Sender<(wallet::CompactBlocksInRangeRequest, Instant)>,
+    opening_failure: Status,
+    header: wallet::ChainView,
+    block: wallet::CompactBlock,
+}
+
+impl NamedService for ScriptedCompactRange {
+    const NAME: &'static str = "zinder.v1.wallet.WalletQuery";
+}
+
+impl Service<http::Request<TonicBody>> for ScriptedCompactRange {
+    type Response = http::Response<TonicBody>;
+    type Error = Infallible;
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<TonicBody>) -> Self::Future {
+        let range_rpc = self.clone();
+        Box::pin(async move {
+            Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                .server_streaming(range_rpc, request)
+                .await)
+        })
+    }
+}
+
+impl ServerStreamingService<wallet::CompactBlocksInRangeRequest> for ScriptedCompactRange {
+    type Response = wallet::CompactBlocksInRangeChunk;
+    type ResponseStream = Pin<Box<dyn Stream<Item = Result<Self::Response, Status>> + Send>>;
+    type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
+
+    fn call(&mut self, request: Request<wallet::CompactBlocksInRangeRequest>) -> Self::Future {
+        let attempt = self.rpc_count.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .observed
+            .try_send((request.into_inner(), Instant::now()));
+        let Self {
+            opening_failure,
+            header,
+            block,
+            ..
+        } = self.clone();
+        Box::pin(async move {
+            if attempt == 0 {
+                return Err(opening_failure);
+            }
+            let chunks = tokio_stream::iter([
+                Ok(wallet::CompactBlocksInRangeChunk {
+                    body: Some(RangeChunk::Header(header)),
+                }),
+                Ok(wallet::CompactBlocksInRangeChunk {
+                    body: Some(RangeChunk::Item(block)),
+                }),
+                Err(Status::unavailable(
+                    "range interrupted after the first block",
+                )),
+            ]);
+            Ok(Response::new(Box::pin(chunks) as Self::ResponseStream))
+        })
+    }
+}
+
+#[tokio::test]
 async fn dropping_a_read_cancels_backoff() -> eyre::Result<()> {
     let attempts = Arc::new(AtomicUsize::new(0));
     let first_attempt = Arc::new(tokio::sync::Notify::new());
@@ -272,8 +458,14 @@ async fn dropping_a_read_cancels_backoff() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn invalid_transport_settings_fail_before_dialing() -> eyre::Result<()> {
+    let mut ca = CertificateParams::default();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let certificate = ca.self_signed(&KeyPair::generate()?)?.pem();
+    let malformed_bundle = format!("-----BEGIN CERTIFICATE-----\n{certificate}");
     for options in [
         RemoteClientOptions::default().with_tls_ca_pem(b"invalid".to_vec()),
+        RemoteClientOptions::default().with_tls_ca_pem(malformed_bundle.into_bytes()),
+        RemoteClientOptions::default().with_tls_ca_der([]),
         RemoteClientOptions::default().with_tls_ca_der([vec![1]]),
         RemoteClientOptions::default().with_tls_domain_name("wallet.internal/path"),
     ] {
