@@ -54,7 +54,7 @@ impl TlsRoots {
 fn validate_pem_framing(bundle: &[u8]) -> Result<(), IndexerError> {
     let malformed = || IndexerError::invalid_request("invalid TLS CA PEM framing");
     let mut open_label = None;
-    // Rustls replaces an open label on a second BEGIN. Check framing before decoding.
+    // Rustls skips text outside blocks and replaces an open label on a second BEGIN.
     for line in bundle.split(|byte| matches!(byte, b'\r' | b'\n')) {
         let line = line.trim_ascii_end();
         if let Some(label) = line.strip_prefix(b"-----BEGIN ") {
@@ -70,6 +70,8 @@ fn validate_pem_framing(bundle: &[u8]) -> Result<(), IndexerError> {
             if open_label.take() != Some(label) {
                 return Err(malformed());
             }
+        } else if open_label.is_none() && !line.is_empty() {
+            return Err(malformed());
         }
     }
     if open_label.is_some() {

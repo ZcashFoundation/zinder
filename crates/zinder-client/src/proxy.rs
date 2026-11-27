@@ -72,8 +72,11 @@ fn socks_target(endpoint: &Uri) -> Result<Uri, IndexerError> {
     let port = if host_and_port == host {
         default_port
     } else {
-        authority
-            .port_u16()
+        host_and_port
+            .strip_prefix(host)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .filter(|port| port.as_bytes().iter().all(u8::is_ascii_digit))
+            .and_then(|port| port.parse::<u16>().ok())
             .filter(|port| *port != 0)
             .ok_or_else(|| IndexerError::invalid_request("invalid SOCKS5 destination port"))?
     };
@@ -102,6 +105,7 @@ mod tests {
         }
         for endpoint in [
             "http://wallet.internal:65536",
+            "http://wallet.internal:+9102",
             "https://[::1]:99999",
             "https://wallet.internal:invalid",
             "https://wallet.internal:0",

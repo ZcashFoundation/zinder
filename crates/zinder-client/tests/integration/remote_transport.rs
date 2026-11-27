@@ -457,14 +457,45 @@ async fn dropping_a_read_cancels_backoff() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn invalid_transport_settings_fail_before_dialing() -> eyre::Result<()> {
+async fn malformed_ca_bundles_fail_before_dialing() -> eyre::Result<()> {
     let mut ca = CertificateParams::default();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let certificate = ca.self_signed(&KeyPair::generate()?)?.pem();
-    let malformed_bundle = format!("-----BEGIN CERTIFICATE-----\n{certificate}");
+    let endpoint = "https://127.0.0.1:443";
+
+    let padded_bundle = format!(" \t\r\n{certificate}\r\n \t");
+    connect(
+        endpoint.to_owned(),
+        RemoteClientOptions::default().with_tls_ca_pem(padded_bundle.into_bytes()),
+    )?;
+
+    for (case, bundle) in [
+        (
+            "nested certificate",
+            format!("-----BEGIN CERTIFICATE-----\n{certificate}"),
+        ),
+        ("trailing text", format!("{certificate}\ntrailing junk\n")),
+        (
+            "truncated certificate",
+            format!("{certificate}\n-----BEGIN CERTIFICATE-----\nAAAA\n"),
+        ),
+    ] {
+        let outcome = connect(
+            endpoint.to_owned(),
+            RemoteClientOptions::default().with_tls_ca_pem(bundle.into_bytes()),
+        );
+        assert!(
+            matches!(outcome, Err(IndexerError::InvalidRequest { reason }) if reason == "invalid TLS CA PEM framing"),
+            "{case}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_transport_settings_fail_before_dialing() -> eyre::Result<()> {
     for options in [
         RemoteClientOptions::default().with_tls_ca_pem(b"invalid".to_vec()),
-        RemoteClientOptions::default().with_tls_ca_pem(malformed_bundle.into_bytes()),
         RemoteClientOptions::default().with_tls_ca_der([]),
         RemoteClientOptions::default().with_tls_ca_der([vec![1]]),
         RemoteClientOptions::default().with_tls_domain_name("wallet.internal/path"),
