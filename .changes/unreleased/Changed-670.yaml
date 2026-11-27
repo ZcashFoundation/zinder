@@ -1,0 +1,6 @@
+kind: changed
+body: Consolidate release packaging onto the single non-root distroless zinder binary and OCI image, replace legacy shell entrypoints and 18 TOMLs with zero-TOML Compose (zinder-index + zinder-serve), and add a Kubernetes RWO StatefulSet manifest.
+time: 2026-11-27T03:42:18Z
+custom:
+  Bump: minor
+  PR: "670"
