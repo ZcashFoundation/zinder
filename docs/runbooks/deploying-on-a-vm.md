@@ -46,6 +46,7 @@ Copy the env file matching your node and network to `/etc/zinder/env`:
 sudo install -d -o root -g root -m 0755 /etc/zinder
 sudo cp /opt/zinder/deploy/.env.mainnet /etc/zinder/env
 echo 'ZINDER_VERSION=vX.Y.Z' | sudo tee -a /etc/zinder/env >/dev/null
+echo 'COMPOSE_PROFILES=history-publisher' | sudo tee -a /etc/zinder/env >/dev/null
 ```
 
 Check these core variables in `/etc/zinder/env`:
@@ -54,6 +55,7 @@ Check these core variables in `/etc/zinder/env`:
 | --- | --- |
 | `ZINDER_DEPLOY_NETWORK` | `mainnet`, `testnet`, or `regtest` (names the Compose project and volumes). |
 | `ZINDER_PRESET` | Deployment preset: `light-wallet`, `wallet` (default), or `explorer`. |
+| `COMPOSE_PROFILES` | `history-publisher` by default so Compose starts `zinder-history-publisher` under both manual commands and `zinder.service` (add `,observability` for Prometheus + Grafana). |
 | `ZINDER_SOURCE_NETWORK_NAME` | Node's external Docker network. |
 | `ZINDER_SOURCE_COOKIE_VOLUME_NAME` | Node's external `.cookie` volume. |
 | `ZINDER_NETWORK__NAME` | `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. |
@@ -91,7 +93,7 @@ sudo systemctl enable --now zinder
 sudo journalctl -u zinder.service -f
 ```
 
-`deploy/systemd/zinder.service` runs `docker compose --env-file /etc/zinder/env -f docker-compose.yml up --no-build` with `Restart=on-failure` and tears down only on explicit `ExecStop` so failed restarts do not discard an active sync or build images unintentionally. Override `ExecStart=` and `ExecStop=` with `sudo systemctl edit zinder` to include `--profile history-publisher`, `--profile observability`, or any custom `-f /etc/zinder/docker-compose.override.yml` overlay you add below.
+`deploy/systemd/zinder.service` runs `docker compose --env-file /etc/zinder/env -f docker-compose.yml up --no-build` with `Restart=on-failure` and tears down only on explicit `ExecStop` so failed restarts do not discard an active sync or build images unintentionally. `zinder.service` reads `COMPOSE_PROFILES` from `/etc/zinder/env` automatically (keeping `history-publisher` and optional `observability` active without modifying the unit); set `COMPOSE_FILE` in `/etc/zinder/env` or override `ExecStart=` and `ExecStop=` with `sudo systemctl edit zinder` when attaching a custom `-f /etc/zinder/docker-compose.override.yml` overlay.
 
 ### 7. Put TLS in front
 
