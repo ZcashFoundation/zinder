@@ -14,8 +14,6 @@ import subprocess
 import sys
 from urllib.request import ProxyHandler, build_opener
 
-import toml
-
 from wallet_fixture import loopback
 
 
@@ -29,6 +27,16 @@ bounded = campaign['run_command']
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def query_service_name(ready):
+    return 'zinder-serve' if 'serve' in ready.get('health', {}) else 'zinder-query'
+
+
+def owned_query_container_id(compose_fn, project, ready):
+    query_id = compose_fn(project, 'ps', '-q', query_service_name(ready))
+    require(re.fullmatch('[a-f0-9]{64}', query_id), 'missing owned query container')
+    return query_id
 
 
 def native_counts(ops_url):
@@ -50,6 +58,8 @@ def delta(before, after):
 
 
 def exercise(args, project, receipt):
+    import toml
+
     private = args.output / 'private'
     ready_path = project / 'ready.initial.json'
     ready = json.loads(ready_path.read_text())
@@ -122,8 +132,7 @@ def exercise(args, project, receipt):
 
                 operator['wait'](published, bool, 60)
                 operator['verify_owner'](ready)
-                query_id = operator['compose'](project, 'ps', '-q', 'zinder-query')
-                require(re.fullmatch('[a-f0-9]{64}', query_id), 'missing owned query container')
+                query_id = owned_query_container_id(operator['compose'], project, ready)
                 def started_at():
                     return subprocess.check_output(['docker', 'inspect', '-f', '{{.State.StartedAt}}', query_id],
                                                    text=True, timeout=5).strip()

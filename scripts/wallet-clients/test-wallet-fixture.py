@@ -369,6 +369,27 @@ class FixtureTests(unittest.TestCase):
         for key in ('--ready', '--candidate'):
             self.assertIn(key, case['steps']['bootstrap']['command'])
 
+    def test_native_expiry_selects_unified_serve_or_legacy_query_container(self):
+        lookup = runpy.run_path(str(SCRIPTS / 'native-expiry.py'))['owned_query_container_id']
+        project = self.root / 'project'
+        container_id = 'a' * 64
+        compose = Mock(return_value=container_id)
+        unified = {'health': {'index': {}, 'serve': {}}}
+        legacy = {'health': {'query': {}}}
+
+        self.assertEqual(lookup(compose, project, unified), container_id)
+        compose.assert_called_once_with(project, 'ps', '-q', 'zinder-serve')
+
+        compose.reset_mock()
+        self.assertEqual(lookup(compose, project, legacy), container_id)
+        compose.assert_called_once_with(project, 'ps', '-q', 'zinder-query')
+
+        for bad_output in ('', 'short', 'g' * 64):
+            with self.subTest(bad_output=bad_output):
+                bad_compose = Mock(return_value=bad_output)
+                with self.assertRaisesRegex(ValueError, 'missing owned query container'):
+                    lookup(bad_compose, project, unified)
+
 
 if __name__ == '__main__':
     unittest.main()

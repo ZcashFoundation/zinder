@@ -9,7 +9,10 @@
 #
 # /etc/zinder/env is a copy of one deploy/.env.* file. Its
 # ZINDER_DEPLOY_NETWORK names the Compose project, so Compose refuses to run
-# when it is unset.
+# when it is unset. Before starting the unit, also set
+# COMPOSE_PROFILES=history-publisher (or history-publisher,observability) in
+# /etc/zinder/env so Compose starts zinder-history-publisher and publishes the
+# initial signed catalog checkpoint required on a fresh catalog.
 
 [Unit]
 Description=Zinder Zcash indexer (Compose topology)
