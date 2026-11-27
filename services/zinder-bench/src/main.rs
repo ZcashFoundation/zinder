@@ -31,6 +31,8 @@ use zinder_store::RocksDbIoMode;
 mod build_provenance;
 #[path = "canonical_replay_storage/command.rs"]
 mod canonical_replay_storage_command;
+#[path = "postgres_segmented/command.rs"]
+mod postgres_segmented_command;
 mod rocksdb_canonical_fixture_replay;
 mod rocksdb_compact_block_range;
 mod rocksdb_raw_blob_retention_comparison;
@@ -142,6 +144,9 @@ enum Command {
     /// Benchmark reader publication across four matched active-writer states.
     #[command(name = "active-writer-publication")]
     ActiveWriterPublication(ActiveWriterPublicationArgs),
+    /// Run the segmented PostgreSQL canonical + wallet build, tip-follow, mempool churn, and pooled-reader benchmark arm.
+    #[command(name = "postgres-segmented")]
+    PostgresSegmented(postgres_segmented_command::PostgresSegmentedArgs),
 }
 
 #[derive(Args)]
@@ -400,6 +405,11 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::RawRangeProbe(args) => run_raw_range_probe_command(args).await,
         Command::ActiveWriterPublication(args) => {
             Box::pin(run_active_writer_publication_command(args)).await
+        }
+        Command::PostgresSegmented(args) => {
+            let output =
+                Box::pin(postgres_segmented_command::run_postgres_segmented_cli(args)).await?;
+            emit_report(&output.report, output.report_path.as_deref())
         }
     }
 }
@@ -1224,6 +1234,35 @@ mod tests {
             .await
             .err()
             .ok_or("existing report path must reject before config validation or execution")?;
+        assert!(err.to_string().contains("already exists"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_segmented_parses_and_rejects_existing_report() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let existing_report = dir.path().join("existing-segmented.json");
+        create_report_file(&existing_report, b"preexisting")?;
+        let parsed = Cli::try_parse_from([
+            "zinder-bench",
+            "postgres-segmented",
+            "--fixture",
+            "/tmp/nonexistent-fixture",
+            "--reader-mode",
+            "pgbouncer-transaction",
+            "--full-blocks",
+            "--report",
+            existing_report
+                .to_str()
+                .ok_or("temp report path must be utf8")?,
+        ])?;
+        let Command::PostgresSegmented(args) = parsed.command else {
+            return Err("unexpected subcommand parsed".into());
+        };
+        let err = super::postgres_segmented_command::run_postgres_segmented_cli(args)
+            .await
+            .err()
+            .ok_or("existing report path must reject before running postgres-segmented")?;
         assert!(err.to_string().contains("already exists"));
         Ok(())
     }

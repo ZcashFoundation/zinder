@@ -148,7 +148,7 @@ services:
 
   postgres-database:
     image: ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
-    profiles: [postgres, comparison]
+    profiles: [postgres, comparison, postgres-segmented]
     restart: "no"
     cgroup: private
     cpus: ${ZINDER_BENCH_POSTGRES_DATABASE_CPUS:-6.0}
@@ -246,6 +246,108 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 30
+
+  postgres-pgbouncer:
+    image: ${ZINDER_BENCH_PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.24.1-p1@sha256:3db3d7223e93af52b4116f642951a1a5fa44702a88c2a59cf7562cac19320c9e}
+    profiles: [postgres-segmented]
+    restart: "no"
+    cpus: ${ZINDER_BENCH_PGBOUNCER_CPUS:-1.0}
+    mem_limit: ${ZINDER_BENCH_PGBOUNCER_MEMORY_LIMIT_BYTES:-536870912}
+    networks: [storage-benchmark]
+    depends_on:
+      postgres-database:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres-database
+      DB_PORT: "5432"
+      DB_USER: ${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}
+      DB_PASSWORD: ${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}
+      DB_NAME: ${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      MAX_PREPARED_STATEMENTS: "200"
+      DEFAULT_POOL_SIZE: ${ZINDER_BENCH_PGBOUNCER_DEFAULT_POOL_SIZE:-32}
+      MAX_CLIENT_CONN: ${ZINDER_BENCH_PGBOUNCER_MAX_CLIENT_CONN:-256}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $${DB_USER} -d $${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      start_period: 5s
+      retries: 15
+
+  postgres-segmented-storage:
+    image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
+    profiles: [postgres-segmented]
+    restart: "no"
+    init: true
+    cgroup: private
+    cpus: ${ZINDER_BENCH_POSTGRES_CLIENT_CPUS:-2.0}
+    mem_limit: ${ZINDER_BENCH_POSTGRES_CLIENT_MEMORY_LIMIT_BYTES:-8589934592}
+    networks: [storage-benchmark]
+    depends_on:
+      postgres-database:
+        condition: service_healthy
+      postgres-pgbouncer:
+        condition: service_healthy
+    environment:
+      ZINDER_BENCH_POSTGRES_DATABASE_URL: "postgresql://${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}:${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}@postgres-database:5432/${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}"
+      ZINDER_BENCH_POSTGRES_READER_DATABASE_URL: "postgresql://${ZINDER_BENCH_POSTGRES_USER:-zinder_bench}:${ZINDER_BENCH_POSTGRES_PASSWORD:-zinder_bench_local_only}@postgres-pgbouncer:5432/${ZINDER_BENCH_POSTGRES_DATABASE:-zinder_bench}"
+    volumes:
+      - type: bind
+        source: ${ZINDER_BENCH_FIXTURE_PATH:-../../fixtures/mainnet-150k-200k}
+        target: /benchmark/fixture
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_BENCH_RESULTS_PATH:-../../benchmark-results}
+        target: /benchmark/results
+        bind:
+          create_host_path: false
+    command:
+      - postgres-segmented
+      - --fixture
+      - /benchmark/fixture
+      - --database-url-env
+      - ZINDER_BENCH_POSTGRES_DATABASE_URL
+      - --reader-database-url-env
+      - ZINDER_BENCH_POSTGRES_READER_DATABASE_URL
+      - --reader-mode
+      - pgbouncer-transaction
+      - --concurrent-readers
+      - ${ZINDER_BENCH_SEGMENTED_CONCURRENT_READERS:-4}
+      - --settled-segment-blocks
+      - ${ZINDER_BENCH_SEGMENTED_SETTLED_BLOCKS:-1000}
+      - --live-tail-max-blocks
+      - ${ZINDER_BENCH_SEGMENTED_LIVE_TAIL_MAX_BLOCKS:-128}
+      - --software-revision
+      - ${ZINDER_BENCH_SOFTWARE_REVISION:?set ZINDER_BENCH_SOFTWARE_REVISION to the exact tested revision}
+      - --trial-id
+      - ${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}
+      - --fixture-cache-policy
+      - ${ZINDER_BENCH_FIXTURE_CACHE_POLICY:?set ZINDER_BENCH_FIXTURE_CACHE_POLICY to warm or cold}
+      - --runner-id
+      - ${ZINDER_BENCH_RUNNER_ID:?set ZINDER_BENCH_RUNNER_ID to the immutable hardware, storage, and resource profile identity}
+      - --cpu-limit-cores
+      - ${ZINDER_BENCH_POSTGRES_TOTAL_CPUS:-8.0}
+      - --memory-limit-bytes
+      - ${ZINDER_BENCH_POSTGRES_TOTAL_MEMORY_LIMIT_BYTES:-17179869184}
+      - --client-cpu-limit-cores
+      - ${ZINDER_BENCH_POSTGRES_CLIENT_CPUS:-2.0}
+      - --client-memory-limit-bytes
+      - ${ZINDER_BENCH_POSTGRES_CLIENT_MEMORY_LIMIT_BYTES:-8589934592}
+      - --database-cpu-limit-cores
+      - ${ZINDER_BENCH_POSTGRES_DATABASE_CPUS:-6.0}
+      - --database-memory-limit-bytes
+      - ${ZINDER_BENCH_POSTGRES_DATABASE_MEMORY_LIMIT_BYTES:-8589934592}
+      - --database-image-reference
+      - ${ZINDER_BENCH_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+      - --storage-class
+      - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
+      - --image-reference
+      - ${ZINDER_BENCH_IMAGE}
+      - --report
+      - /benchmark/results/postgres-segmented-storage-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
 
 networks:
   storage-benchmark:

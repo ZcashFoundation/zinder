@@ -6,8 +6,56 @@ fail() {
   exit 1
 }
 
+validate_segmented_report() {
+  local report_path="$1"
+  [[ -f "$report_path" ]] || fail "segmented report does not exist: $report_path"
+  jq -e '
+    .contract_identity == "benchmark-report"
+    and .measurement_kind == "postgres-segmented-storage"
+    and .report_format_version == 1
+    and .storage_candidate.id == "postgres-segmented-storage"
+    and .storage_candidate.canonical_engine == "postgres"
+    and .storage_candidate.topology == "postgres-segmented"
+    and .fixture.contract_identity == "canonical-fixture"
+    and .fixture.fixture_format_version == 1
+    and .server_settings.fsync == true
+    and .server_settings.full_page_writes == true
+    and .server_settings.synchronous_commit == "on"
+    and (.server_settings.wal_level == "replica" or .server_settings.wal_level == "logical")
+    and .configuration.schema_version == 2
+    and (.configuration.max_segment_bytes > 0 and .configuration.max_segment_bytes <= 268435456)
+    and .configuration.total_block_count == .fixture.block_count
+    and (.configuration.bulk_block_count + .configuration.tip_follow_block_count) == .configuration.total_block_count
+    and .validation.fixture_sequence_digest_match == true
+    and .validation.fresh_reader_validated == true
+    and .validation.first_height == .fixture.from_height
+    and .validation.tip_height == .fixture.to_height
+    and .validation.tip_hash_hex == .fixture.tip_hash_hex
+    and (.footprint.max_segment_byte_len <= .configuration.max_segment_bytes)
+    and (.footprint.live_tail_rows <= .configuration.live_tail_max_blocks)
+    and (.footprint.canonical_storage_bytes + .footprint.wallet_storage_bytes) == .footprint.total_storage_bytes
+    and (.timings.wall_clock_seconds | type == "number" and . >= 0)
+    and (.timings.streaming_blocks_per_second | type == "number" and . >= 0)
+    and (.reader_workload.per_reader_blocks_per_second_mean | type == "number" and . >= 0)
+    and (.reader_workload.per_reader_bytes_per_second_mean | type == "number" and . >= 0)
+    and (.tip_follow.uncontended_commit_latencies_ms.max_ms | type == "number" and . >= 0)
+    and (.tip_follow.contended_commit_latencies_ms.max_ms | type == "number" and . >= 0)
+    and (if .configuration.concurrent_readers > 0 then .reader_workload.completed_transactions > 0 and .reader_workload.per_reader_blocks_per_second_mean > 0 else true end)
+    and .adr0004_gate_evaluation.max_segment_bytes_respected == true
+    and .adr0004_gate_evaluation.live_tail_bounded == true
+    and .adr0004_gate_evaluation.concurrent_readers_zero_errors == true
+  ' "$report_path" >/dev/null || fail "postgres-segmented-storage report contract validation failed: $report_path"
+  cat "$report_path"
+}
+
+if [[ "$#" -eq 2 && "$1" == "--segmented-report" ]]; then
+  command -v jq >/dev/null 2>&1 || fail "jq is required"
+  validate_segmented_report "$2"
+  exit 0
+fi
+
 if [[ "$#" -ne 1 ]]; then
-  echo >&2 "usage: $0 CAMPAIGN_LEDGER.tsv"
+  echo >&2 "usage: $0 CAMPAIGN_LEDGER.tsv | $0 --segmented-report SEGMENTED_REPORT.json"
   exit 2
 fi
 command -v jq >/dev/null 2>&1 || fail "jq is required"

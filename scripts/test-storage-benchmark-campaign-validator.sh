@@ -27,6 +27,14 @@ producer_lifecycle_report_format_version="$(sed -n \
   "$repository_root/services/zinder-bench/src/report.rs")"
 [[ "$producer_lifecycle_report_format_version" == "1" ]] ||
   fail "rocksdb-storage-lifecycle producer report format version must be v1"
+producer_segmented_report_format_version="$(sed -n \
+  's/^pub const POSTGRES_SEGMENTED_REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
+  "$repository_root/services/zinder-bench/src/report.rs")"
+[[ "$producer_segmented_report_format_version" == "1" ]] ||
+  fail "postgres-segmented-storage producer report format version must be v1"
+grep -Fq ".report_format_version == $producer_segmented_report_format_version" \
+  "$validator" ||
+  fail "$(basename "$validator") does not require segmented report format $producer_segmented_report_format_version"
 producer_fixture_format_version="$(sed -n \
   's/^pub const FIXTURE_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
   "$repository_root/services/zinder-bench/src/fixture.rs")"
@@ -1324,5 +1332,95 @@ expect_lifecycle_rejected legacy-sorter-temp-budget '.resource_limits.wallet_max
 for obsolete_version in 4 5 6; do
   expect_lifecycle_rejected "obsolete-version-$obsolete_version" ".report_format_version = $obsolete_version"
 done
+
+segmented_valid_report="$scratch_directory/segmented-valid.json"
+cat >"$segmented_valid_report" <<'JSON'
+{
+  "contract_identity": "benchmark-report",
+  "measurement_kind": "postgres-segmented-storage",
+  "report_format_version": 1,
+  "storage_candidate": {
+    "id": "postgres-segmented-storage",
+    "canonical_engine": "postgres",
+    "canonical_model": "settled-segments-with-bounded-live-tail",
+    "topology": "postgres-segmented"
+  },
+  "fixture": {
+    "contract_identity": "canonical-fixture",
+    "fixture_format_version": 1,
+    "from_height": 1,
+    "to_height": 10,
+    "block_count": 10,
+    "tip_hash_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "server_settings": {
+    "fsync": true,
+    "full_page_writes": true,
+    "synchronous_commit": "on",
+    "wal_level": "replica"
+  },
+  "configuration": {
+    "schema_version": 2,
+    "max_segment_bytes": 268435456,
+    "live_tail_max_blocks": 4,
+    "concurrent_readers": 4,
+    "bulk_block_count": 6,
+    "tip_follow_block_count": 4,
+    "total_block_count": 10
+  },
+  "validation": {
+    "first_height": 1,
+    "tip_height": 10,
+    "tip_hash_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "fixture_sequence_digest_match": true,
+    "fresh_reader_validated": true
+  },
+  "timings": {
+    "wall_clock_seconds": 1.5,
+    "streaming_blocks_per_second": 42.0
+  },
+  "tip_follow": {
+    "uncontended_commit_latencies_ms": { "max_ms": 8.0 },
+    "contended_commit_latencies_ms": { "max_ms": 12.0 }
+  },
+  "reader_workload": {
+    "completed_transactions": 20,
+    "per_reader_blocks_per_second_mean": 42.0,
+    "per_reader_bytes_per_second_mean": 16384.0
+  },
+  "footprint": {
+    "canonical_storage_bytes": 80000,
+    "wallet_storage_bytes": 20000,
+    "total_storage_bytes": 100000,
+    "max_segment_byte_len": 4096,
+    "live_tail_rows": 2
+  },
+  "adr0004_gate_evaluation": {
+    "max_segment_bytes_respected": true,
+    "live_tail_bounded": true,
+    "concurrent_readers_zero_errors": true
+  }
+}
+JSON
+
+"$validator" --segmented-report "$segmented_valid_report" >/dev/null ||
+  fail "valid postgres-segmented-storage report was rejected"
+
+expect_segmented_rejected() {
+  local name="$1" mutation="$2"
+  local mutated="$scratch_directory/segmented-$name.json"
+  jq "$mutation" "$segmented_valid_report" >"$mutated"
+  if "$validator" --segmented-report "$mutated" >/dev/null 2>&1; then
+    fail "segmented report $name was accepted"
+  fi
+}
+
+expect_segmented_rejected corrupt-digest '.validation.fixture_sequence_digest_match = false'
+expect_segmented_rejected non-durable-fsync '.server_settings.fsync = false'
+expect_segmented_rejected oversized-segment '.footprint.max_segment_byte_len = 268435457'
+expect_segmented_rejected unbounded-live-tail '.footprint.live_tail_rows = 5'
+expect_segmented_rejected wrong-report-version '.report_format_version = 2'
+expect_segmented_rejected zero-reader-throughput '.reader_workload.per_reader_blocks_per_second_mean = 0'
+expect_segmented_rejected storage-mismatch '.footprint.total_storage_bytes = 999'
 
 printf 'storage benchmark campaign validator tests passed\n'
