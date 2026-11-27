@@ -1194,6 +1194,13 @@ class NegativeControls(CounterpartyCase):
             with self.assertRaisesRegex(ValueError, "compat-lightwalletd was not ready"):
                 roles.readiness(Path(td) / "receipt.json", pins, "vizor", RELEASE)
 
+            missing_roles = copy.deepcopy(unified)
+            missing_roles["readiness"]["serve"].pop("roles")
+            p.write_text(json.dumps(missing_roles))
+            pins["fixture_ready_sha256"] = digest(p)
+            with self.assertRaisesRegex(ValueError, "invalid serve roles"):
+                roles.readiness(Path(td) / "receipt.json", pins, "vizor", RELEASE)
+
     def test_ledger_and_inclusion_controls(self):
         mutations = (
             lambda r: r["engine_pays"]["payer_fee"].update(debit_zat=1_000_001),

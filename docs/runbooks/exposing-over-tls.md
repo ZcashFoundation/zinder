@@ -22,7 +22,7 @@ Zinder serves plaintext gRPC only; keep all gRPC, ops, control, and observabilit
 | `ZINDER_COMPAT_TLS_CERT_FILE` | Path to certificate chain |
 | `ZINDER_COMPAT_TLS_KEY_FILE` | Path to private key |
 | `ZINDER_COMPAT_HOST_PORT` | Compatibility gRPC host port (`9067` Mainnet) |
-| `ZINDER_COMPAT_OPS_HOST_PORT` | Compatibility ops host port (`9107` Mainnet) |
+| `ZINDER_COMPAT_OPS_HOST_PORT` | Reader ops `/readyz` host port (`9108` under `zinder-serve` / Compose, or `9107` standalone) |
 
 Apply in this exact order so Caddy strips client-supplied headers **before** Zinder trusts `X-Zinder-Client-Address`:
 
@@ -34,7 +34,7 @@ Apply in this exact order so Caddy strips client-supplied headers **before** Zin
    ```
 
 2. Load the config into Caddy (e.g. `caddy reload` or restart the Caddy service).
-3. Verify the isolation requirements in [Keep wallets apart in the receive limit](#keep-wallets-apart-in-the-receive-limit), add `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true` to your Compose env file (or `compat.trust_proxy_client_address = true` outside Compose), and recreate `zinder-compat-lightwalletd` using the deployment's full env file and `-f` list.
+3. Verify the isolation requirements in [Keep wallets apart in the receive limit](#keep-wallets-apart-in-the-receive-limit), add `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true` to your Compose env file (or `compat.trust_proxy_client_address = true` outside Compose), and recreate `zinder-serve` (or standalone `zinder-compat-lightwalletd`) using the deployment's full env file and `-f` list.
 
 The template sets `auto_https off` with `alpn h2`, runs `forward_auth` (`HEAD /readyz`, bounded to 16 connections with 5s keepalive) before `reverse_proxy h2c://127.0.0.1:...`, and sets `header_up X-Zinder-Client-Address {http.request.remote}` (replacing any header the client sent). When renewing certificates, replace the files and reload Caddy.
 
@@ -45,18 +45,17 @@ Zinder admits at most 32 requests whose message is still arriving ([Public gRPC 
 Because Caddy multiplexes wallets onto a few pooled `h2c` connections, Zinder would otherwise treat every wallet behind Caddy as one client. With `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=true` and Caddy setting `X-Zinder-Client-Address` to `{http.request.remote}`, Zinder keys each wallet connection independently:
 
 - Caddy must replace `X-Zinder-Client-Address` on every forwarded call as one `ip:port` or bare IP. Missing, repeated, comma-separated, or malformed values fall back to Caddy's own connection and increment `zinder_grpc_proxy_client_address_fallbacks_total` (headerless supervisor `grpc.health.v1.Health/Check` probes use loopback and do not increment it). A proxy forwarding only a bare IP (such as GCP Global External Application Load Balancer) groups all connections from that IP as one client; ensure its replace semantics are `true` so it never appends.
-- Only Caddy (and equally trusted peers) may reach the listening port directly, because Zinder trusts the header from any caller once enabled. In the Compose deployment, every public listener shares `zinder-ingest`'s network namespace and is directly reachable from:
+- Only Caddy (and equally trusted peers) may reach the listening port directly, because Zinder trusts the header from any caller once enabled. In the Compose deployment, every public listener shares `zinder-index`'s network namespace and is directly reachable from:
   - host processes via loopback or container addresses;
-  - every container on the Compose `node` network (`ZINDER_SOURCE_NETWORK_NAME`, including the node);
-  - every container on the Compose `node-fallback` network (`ZINDER_FALLBACK_SOURCE_NETWORK_NAME`, when merging `deploy/docker-compose.node-fallback.yml`); and
+  - every container on the Compose `node` network (`ZINDER_SOURCE_NETWORK_NAME`, including the node and any external fallback node networks you attach); and
   - every container on the Compose `observability` network (including Prometheus and Grafana).
 
 Before enabling `TRUST_PROXY_CLIENT_ADDRESS`, confirm the host runs no untrusted workloads and inspect every attached container with the exact env file and `-f` files your deployment runs:
 
 ```bash
 env_file=deploy/.env.mainnet
-compose_files=(-f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml)
-ingest="$(docker compose --env-file "$env_file" "${compose_files[@]}" ps -q zinder-ingest)"
+compose_files=(-f deploy/docker-compose.yml)
+ingest="$(docker compose --env-file "$env_file" "${compose_files[@]}" ps -q zinder-index)"
 for network in $(docker inspect "$ingest" \
   --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}'); do
   docker network inspect "$network" \
@@ -84,10 +83,10 @@ Verify in the browser network panel that CORS preflight succeeds and `GetBlockRa
 
 ## Expose the native endpoint too
 
-To expose `WalletQuery` or `ExplorerQuery` (with `deploy/docker-compose.explorer.yml`), add a site block per service to the Caddyfile with its own DNS name, certificate, `forward_auth` ops port, `reverse_proxy h2c://127.0.0.1:<port>`, and `header_up X-Zinder-Client-Address {http.request.remote}`:
+To expose `WalletQuery` or `ExplorerQuery` (with `--preset explorer` / `ZINDER_PRESET=explorer`), add a site block per service to the Caddyfile with its own DNS name, certificate, `forward_auth` ops port, `reverse_proxy h2c://127.0.0.1:<port>`, and `header_up X-Zinder-Client-Address {http.request.remote}`:
 
-- **Native `WalletQuery`:** `ZINDER_QUERY_OPS_HOST_PORT` (`9106` Mainnet) and `ZINDER_QUERY_HOST_PORT` (`9102` Mainnet); once Caddy reloads, set `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true` and verify `zinder.v1.wallet.WalletQuery/ServerInfo`. See [Integration surfaces](../reference/integration-surfaces.md).
-- **`ExplorerQuery`:** `ZINDER_EXPLORER_OPS_HOST_PORT` (`9069` Mainnet) and `ZINDER_EXPLORER_HOST_PORT` (`9068` Mainnet); once Caddy reloads, set `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true` and verify `zinder.v1.explorer.ExplorerQuery/ServerInfo`.
+- **Native `WalletQuery`:** `ZINDER_QUERY_OPS_HOST_PORT` (`9108` under `zinder-serve`, or `9106` standalone) and `ZINDER_QUERY_HOST_PORT` (`9102` Mainnet); once Caddy reloads, set `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=true` and verify `zinder.v1.wallet.WalletQuery/ServerInfo`. See [Integration surfaces](../reference/integration-surfaces.md).
+- **`ExplorerQuery`:** `ZINDER_EXPLORER_OPS_HOST_PORT` (`9108` under `zinder-serve`, or `9069` standalone) and `ZINDER_EXPLORER_HOST_PORT` (`9068` Mainnet); once Caddy reloads, set `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=true` and verify `zinder.v1.explorer.ExplorerQuery/ServerInfo`.
 
 ## Verify from outside
 
@@ -120,13 +119,13 @@ Wallet apps are supported by name after end-to-end certification ([Claim boundar
 
 If a Caddy change or certificate rotation breaks serving, roll back in this order so Zinder stops trusting `X-Zinder-Client-Address` **before** Caddy loads a config that omits `header_up`:
 
-1. Set `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=false` (and `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=false` / `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=false` if enabled) in your env file, then recreate the affected containers using your full env file and `-f` overlay list in order (so overlays like `node-fallback` are preserved):
+1. Set `ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS=false` (and `ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS=false` / `ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS=false` if enabled) in your env file, then recreate the reader service using your full env file and `-f` list:
 
    ```bash
    env_file=deploy/.env.mainnet
-   compose_files=(-f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml)
+   compose_files=(-f deploy/docker-compose.yml)
    docker compose --env-file "$env_file" "${compose_files[@]}" \
-     up -d zinder-compat-lightwalletd # and zinder-query or zinder-explorer, if you changed them
+     up -d zinder-serve
    ```
 
    Outside Compose, set `trust_proxy_client_address = false`, restart each runtime, and confirm with `--print-config`.

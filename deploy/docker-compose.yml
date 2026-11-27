@@ -25,6 +25,7 @@ networks:
 
 x-zinder-image: &zinder-image
   image: ${ZINDER_IMAGE:-ghcr.io/zcashfoundation/zinder:${ZINDER_VERSION:-local}}
+  stop_grace_period: 30s
   build:
     context: ..
     dockerfile: deploy/Dockerfile

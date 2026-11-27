@@ -41,7 +41,7 @@ services:
     volumes:
       - zinder_grafana_data:/var/lib/grafana
       - ../../observability/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ../../observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - ../../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/zinder-overview.json
       GF_SECURITY_ADMIN_PASSWORD: ${ZINDER_GRAFANA_ADMIN_PASSWORD:-admin}

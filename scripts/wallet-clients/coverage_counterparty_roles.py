@@ -372,8 +372,8 @@ def readiness(path, pins, engine, release):
             if target is not None or name == "index":
                 require(type(target) is int and entry["current_height"] >= target,
                         f"{engine}: {name} was not ready")
-            if name == "serve" and "roles" in entry:
-                roles = entry["roles"]
+            if name == "serve":
+                roles = entry.get("roles")
                 require(isinstance(roles, list), f"{engine}: invalid serve roles")
                 for required_role in ("query", "compat-lightwalletd"):
                     require(any(
