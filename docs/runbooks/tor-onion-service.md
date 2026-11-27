@@ -221,7 +221,8 @@ See the [native method availability](../architecture/wallet-data-plane.md#method
 | --- | --- |
 | `ServerInfo`, `NetworkUpgradeActivations` | General reads with no wallet-specific selector. |
 | `VisibleTipBlock`, `SettledTipBlock`, `LatestTreeStateCheckpoint` | General reads, with an optional epoch pin that can link related calls. |
-| `BlockIdBySelector`, `CompactBlock`, `CompactBlocksInRange`, `FullBlock`, `FullBlocksInRange`, `TreeStateAtHeight` | Block selector, height, or range and any epoch pin. Prefer shared checkpoints and contiguous ranges, and match locally. Full blocks require retained block blobs. |
+| `BlockIdBySelector`, `BlockHeaderBySelector` | Selected block height or hash and any epoch pin. A targeted read can reveal a block of interest. |
+| `CompactBlock`, `CompactBlocksInRange`, `FullBlock`, `FullBlocksInRange`, `TreeStateAtHeight` | Block height or range and any epoch pin. Prefer shared checkpoints and contiguous ranges, and match locally. Full blocks require retained block blobs. |
 | `SubtreeRoots` | Shielded protocol, starting index, entry limit, and any epoch pin. |
 | `MempoolSnapshot`, `MempoolEvents` | A page limit or start position, including cursors that link pages or resumed streams. These methods carry no address or transaction-ID filter. |
 | `ChainEvents` | Stream family and start or resume position. An address filter discloses every selected transparent address and their grouping. Use an unfiltered stream and match locally. |
@@ -229,7 +230,7 @@ See the [native method availability](../architecture/wallet-data-plane.md#method
 | `TransparentAddressUnspentOutputs`, `TransparentAddressTxIdsInRange` | One transparent address or script hash, the height selector, and any epoch pin. History requests also reveal pagination. A script hash can be matched against public scripts. Use your own indexer or scan locally. |
 | `TransparentOutpointSpendStatus` | Exact transaction IDs and output indices, co-queried outpoints, and any epoch pin. Use your own indexer or track spends locally. |
 | `BroadcastTransaction` | Full serialized transaction and submission time, as with `SendTransaction`. Use your own node to avoid third-party origination disclosure. |
-| `BlockHeaderBySelector`, `ChainValuePoolsAtTip` | The release endpoint refuses these methods as unavailable. A header request still sends its block selector to the endpoint. |
+| `ChainValuePoolsAtTip` | The release endpoint refuses this method as unavailable. The request carries no wallet-specific selector. |
 
 [Oblivious HTTP (OHTTP)](https://www.rfc-editor.org/rfc/rfc9458.html#section-6)
 can separate client addressing at a relay from request contents at a gateway
