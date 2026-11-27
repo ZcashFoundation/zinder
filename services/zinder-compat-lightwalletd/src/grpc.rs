@@ -128,9 +128,9 @@ pub struct LightwalletdResponseLimits {
     /// Most UTXOs one `GetAddressUtxos` or `GetAddressUtxosStream` response
     /// returns.
     ///
-    /// A positive `maxEntries` caps the page at a complete height.
-    /// Zero requests every matching UTXO. A page that exceeds this bound
-    /// fails with `RESOURCE_EXHAUSTED`.
+    /// With a positive `maxEntries`, a page omits a subsequent height that
+    /// would exceed the bound. If the first height or an unpaginated response
+    /// exceeds the bound, the call fails with `RESOURCE_EXHAUSTED`.
     pub max_address_utxos: NonZeroU32,
 }
 
@@ -1894,7 +1894,7 @@ struct AddressUtxoMerge {
     addresses: Vec<MergedAddress>,
     next_outputs: BinaryHeap<Reverse<NextAddressUtxo>>,
     current_height: std::vec::IntoIter<NextAddressUtxo>,
-    max_entries: Option<usize>,
+    page_entry_limit: Option<usize>,
     budget: AddressUtxoResponseBudget,
     ended: bool,
 }
@@ -1948,7 +1948,7 @@ impl AddressUtxoMerge {
             addresses: Vec::new(),
             next_outputs: BinaryHeap::new(),
             current_height: Vec::new().into_iter(),
-            max_entries,
+            page_entry_limit: max_entries.map(|limit| limit.min(response_limit)),
             budget: AddressUtxoResponseBudget::new(response_limit),
             ended: false,
         }
@@ -1996,15 +1996,25 @@ impl AddressUtxoMerge {
             .filter(|next_output| next_output.0.reply.height == height)
             .map(PeekMut::pop)
         {
-            if !first_height && self.max_entries == Some(self.budget.entries) {
+            if !first_height && self.page_entry_limit == Some(self.budget.entries) {
                 self.ended = true;
                 return Ok(Vec::new());
             }
-            self.budget.record(&next_output.reply)?;
+            if let Err(status) = self.budget.record(&next_output.reply) {
+                if first_height || self.page_entry_limit.is_none() {
+                    return Err(status);
+                }
+                self.ended = true;
+                return Ok(Vec::new());
+            }
             self.read_next_output(next_output.address_position).await?;
             outputs.push(next_output);
         }
-        if first_height && self.max_entries.is_some_and(|limit| outputs.len() > limit) {
+        if first_height
+            && self
+                .page_entry_limit
+                .is_some_and(|limit| outputs.len() > limit)
+        {
             return Err(address_utxo_height_limit_exceeded(height, outputs.len()));
         }
         outputs
@@ -2022,7 +2032,7 @@ impl ResponseSource for AddressUtxoMerge {
         }
         if self.ended
             || self
-                .max_entries
+                .page_entry_limit
                 .is_some_and(|target| self.budget.entries >= target)
         {
             return None;
@@ -2950,6 +2960,39 @@ mod tests {
             confirmed_zat,
             address_count: 1,
             chain_epoch: test_chain_epoch(),
+        }
+    }
+
+    #[tokio::test]
+    async fn address_utxo_byte_cap_omits_a_later_height_on_paginated_reads() {
+        let reply = lightwalletd::GetAddressUtxosReply {
+            height: 2,
+            ..Default::default()
+        };
+        let encoded_bytes = lightwalletd::GetAddressUtxosReplyList {
+            address_utxos: vec![reply.clone()],
+        }
+        .encoded_len();
+        for max_entries in [Some(3), None] {
+            let mut merge = AddressUtxoMerge::new(max_entries, 100_000);
+            merge.budget.entries = 1;
+            merge.budget.bytes = ADDRESS_UTXO_RESPONSE_MAX_BYTES - encoded_bytes;
+            for address_position in [0, 1] {
+                merge.next_outputs.push(Reverse(NextAddressUtxo {
+                    reply: reply.clone(),
+                    address_position,
+                    tx_index: 0,
+                }));
+            }
+            let next = merge.next().await;
+            if max_entries.is_some() {
+                assert!(next.is_none());
+            } else {
+                assert!(matches!(
+                    next,
+                    Some(Err(status)) if status.code() == tonic::Code::ResourceExhausted
+                ));
+            }
         }
     }
 

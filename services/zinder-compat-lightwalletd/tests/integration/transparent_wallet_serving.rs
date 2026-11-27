@@ -27,7 +27,7 @@ use zinder_core::{
     ConsensusBranchId, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
     SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentOutpointSpendStatus,
-    TransparentUnspentOutput, wire::encode_branch_id_hex,
+    TransparentOutputFact, TransparentUnspentOutput, wire::encode_branch_id_hex,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -819,6 +819,76 @@ async fn address_utxos_read_a_busy_address_listed_many_times_once() -> eyre::Res
         );
     }
     Ok(())
+}
+
+/// Checks that both RPCs return the same complete pages in a height walk.
+pub(super) async fn assert_address_utxo_pages(
+    adapter: &impl CompactTxStreamer,
+    mut request: lightwalletd::GetAddressUtxosArg,
+    pages: &[(u64, usize)],
+) -> eyre::Result<()> {
+    for &(height, count) in pages {
+        let page = adapter
+            .get_address_utxos(Request::new(request.clone()))
+            .await?
+            .into_inner()
+            .address_utxos;
+        let stream = adapter
+            .get_address_utxos_stream(Request::new(request.clone()))
+            .await?
+            .into_inner();
+        let streamed = collect_stream(std::pin::pin!(stream)).await?;
+        assert_eq!(streamed, page);
+        assert_eq!(page.len(), count);
+        assert!(page.iter().all(|row| row.height == height));
+        if let Some(last) = page.last() {
+            request.start_height = last.height + 1;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wallet_utxo_pages_continue_past_the_response_row_limit() -> eyre::Result<()> {
+    const OUTPUTS_PER_HEIGHT: u32 = 50_001;
+    let address = transparent_address(0x53);
+    let script = address.script().as_raw_bytes().to_vec();
+    let script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+    let mut chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::All)
+        .extend_blocks(2);
+    for height in 1..=2 {
+        let block = chain
+            .block_at(BlockHeight::new(height))
+            .ok_or_else(|| eyre::eyre!("UTXO fixture must include block {height}"))?
+            .clone();
+        let transaction_id = history_transaction_id(height);
+        let mut transaction = FixtureTransactionRows::from_raw_transaction(
+            transaction_id,
+            block.height,
+            block.hash,
+            0,
+            history_transaction_bytes(height),
+        );
+        transaction.facts.transparent_outputs = (0..OUTPUTS_PER_HEIGHT)
+            .map(|index| TransparentOutputFact::new(index, 1, script.clone(), script_hash))
+            .collect();
+        transaction
+            .facts
+            .public_facts
+            .counts
+            .transparent_output_count = OUTPUTS_PER_HEIGHT;
+        chain = chain.with_transaction_rows(transaction);
+    }
+    let mut fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let adapter = build_wallet_serving_adapter(&mut fixture)?;
+    let request = lightwalletd::GetAddressUtxosArg {
+        addresses: vec![address.to_string()],
+        start_height: 1,
+        max_entries: 100_001,
+    };
+    assert_address_utxo_pages(&adapter, request, &[(1, 50_001), (2, 50_001), (3, 0)]).await
 }
 
 /// Checks the error detail clients use to retry with a larger limit.

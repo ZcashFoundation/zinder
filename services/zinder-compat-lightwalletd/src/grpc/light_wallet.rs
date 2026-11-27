@@ -385,32 +385,19 @@ impl NodeBackedLightWallet {
                     kind: ForwardedReadKind::Utxo,
                     deadline,
                 };
+                let max_entries = request.max_entries.min(response_limit.get());
                 let rows =
-                    height_complete_utxos(&reads, &lookup, height, request.max_entries, view.tip)
-                        .await?;
+                    height_complete_utxos(&reads, &lookup, height, max_entries, view.tip).await?;
                 Ok((rows, response_permit))
             })
             .await?;
-        if rows.is_empty() {
+        let replies = utxo_page_replies(
+            rows,
+            request.max_entries,
+            u32_to_usize(response_limit.get()),
+        )?;
+        if replies.is_empty() {
             return Ok(None);
-        }
-        let mut budget = AddressUtxoResponseBudget::new(u32_to_usize(response_limit.get()));
-        let replies = rows
-            .into_iter()
-            .map(|row| {
-                let reply = utxo_reply(row)?;
-                budget.record(&reply)?;
-                Ok(reply)
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        if let Some(first) = replies.first()
-            && request.max_entries != 0
-            && replies.len() > u32_to_usize(request.max_entries)
-        {
-            return Err(address_utxo_height_limit_exceeded(
-                first.height,
-                replies.len(),
-            ));
         }
         Ok(Some((replies, response_permit)))
     }
@@ -620,6 +607,7 @@ async fn height_complete_utxos(
     max_entries: u32,
     served: BlockId,
 ) -> Result<Vec<SourceTransparentUnspentOutput>, UtxoAttemptError> {
+    let max_entries = max_entries.min(TransparentAddressRowLimit::MAX.get());
     let Some(requested) = TransparentAddressRowLimit::new(max_entries) else {
         return Ok(served_utxo_page(node, lookup, height, None, served)
             .await?
@@ -685,6 +673,42 @@ async fn height_complete_utxos(
     }
     rows.append(&mut verified);
     Ok(rows)
+}
+
+fn utxo_page_replies(
+    rows: Vec<SourceTransparentUnspentOutput>,
+    max_entries: u32,
+    response_limit: usize,
+) -> Result<Vec<lightwalletd::GetAddressUtxosReply>, Status> {
+    let mut budget = AddressUtxoResponseBudget::new(response_limit);
+    let mut replies = Vec::new();
+    let mut height = None;
+    let mut height_start = 0;
+    for row in rows {
+        let reply = utxo_reply(row)?;
+        if height != Some(reply.height) {
+            height = Some(reply.height);
+            height_start = replies.len();
+        }
+        if let Err(status) = budget.record(&reply) {
+            if max_entries == 0 || height_start == 0 {
+                return Err(status);
+            }
+            replies.truncate(height_start);
+            break;
+        }
+        replies.push(reply);
+    }
+    if let Some(first) = replies.first()
+        && max_entries != 0
+        && replies.len() > u32_to_usize(max_entries)
+    {
+        return Err(address_utxo_height_limit_exceeded(
+            first.height,
+            replies.len(),
+        ));
+    }
+    Ok(replies)
 }
 
 fn utxo_reply(

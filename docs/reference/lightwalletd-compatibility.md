@@ -385,16 +385,17 @@ available when it starts. A reorg or a newly mined spend can change the set
 between pages.
 
 Each response is limited to 100,000 outputs and 16 MiB (16,777,216 bytes) of
-encoded protobuf reply-list data, including the per-output field framing. The
-same limits apply to unary and streaming calls. A page that exceeds either
-limit fails with `RESOURCE_EXHAUSTED`. A smaller positive limit can shorten
-the page when it ends at an earlier height. One height that alone exceeds a
-limit cannot be fetched through these methods. Unary gRPC clients may need to
-raise their receive limit or use the streaming method.
+encoded protobuf reply-list data, including the per-output field framing.
+With a positive `maxEntries`, a page ends before a subsequent height that
+would exceed either response limit. If the first matching height alone exceeds
+either limit, both methods fail with `RESOURCE_EXHAUSTED`. With
+`maxEntries = 0`, a response that exceeds either limit also fails with
+`RESOURCE_EXHAUSTED`. Unary gRPC clients may need to raise their receive
+limit or use the streaming method.
 
 In wallet serving, both methods merge on-demand reads for distinct addresses at
 one chain epoch. Each address starts with an even share of 8,192 outputs,
-capped at 1,024 and at a positive target, with a minimum of 16. Subsequent
+capped at 1,024 and at a positive `maxEntries`, with a minimum of 16. Subsequent
 storage pages double up to 1,024 outputs as the merge consumes them. The merge
 stages at most one height within the response budget to order it and checks
 one output ahead per address for the height boundary. The streaming method
@@ -402,8 +403,9 @@ queues up to 64 replies beyond that staging. A refused height sends no rows
 from that height. Treat any stream that ends with an error as incomplete,
 including one that has already sent earlier heights.
 
-In light-wallet serving, both methods read a bounded node prefix for an
-in-range positive target and verify the completeness of its final height.
+In light-wallet serving, both methods read a bounded node prefix for a
+positive `maxEntries`, clamped to 100,000, and verify the completeness of
+its final height.
 The node's reply is also subject to its own row limit and
 `node.max_response_bytes` (64 MiB by default). The call fails with
 `RESOURCE_EXHAUSTED` if those limits prevent the server from verifying a

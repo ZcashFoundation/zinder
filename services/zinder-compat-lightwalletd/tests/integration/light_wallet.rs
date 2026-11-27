@@ -1643,7 +1643,7 @@ async fn later_outputs_can_prevent_proving_a_full_cutoff_height() -> Result<()> 
 }
 
 #[tokio::test]
-async fn an_above_limit_wallet_request_succeeds_only_when_the_complete_set_fits() -> Result<()> {
+async fn an_above_limit_request_refuses_a_single_height_that_exceeds_the_hard_cap() -> Result<()> {
     let small = populated_utxo_fixture(2, 1, UtxoNode::Zebra)?;
     let outputs = small
         .adapter
@@ -1742,27 +1742,12 @@ async fn forwarded_utxos_refuse_first_height_above_max_entries() -> Result<()> {
 #[tokio::test]
 async fn forwarded_utxo_pages_continue_past_the_response_row_limit() -> Result<()> {
     let fixture = populated_utxo_fixture(50_001, 50_001, UtxoNode::Zebra)?;
-    let mut request = utxo_request(50_001).into_inner();
-    for height in [5, 6] {
-        let page = fixture
-            .adapter
-            .get_address_utxos(Request::new(request.clone()))
-            .await?
-            .into_inner()
-            .address_utxos;
-        assert_eq!(page.len(), 50_001);
-        assert!(page.iter().all(|row| row.height == height));
-        request.start_height = height + 1;
-    }
-    assert_eq!(
-        fixture
-            .adapter
-            .get_address_utxos(Request::new(request))
-            .await?
-            .into_inner()
-            .address_utxos,
-        []
-    );
+    super::transparent_wallet_serving::assert_address_utxo_pages(
+        &fixture.adapter,
+        utxo_request(100_001).into_inner(),
+        &[(5, 50_001), (6, 50_001), (7, 0)],
+    )
+    .await?;
     assert!(
         fixture
             .node
@@ -1770,7 +1755,7 @@ async fn forwarded_utxo_pages_continue_past_the_response_row_limit() -> Result<(
             .iter()
             .all(|read| read.params[0]["maxEntries"]
                 .as_u64()
-                .is_some_and(|limit| limit > 0))
+                .is_some_and(|limit| (1..=100_000).contains(&limit)))
     );
     Ok(())
 }
