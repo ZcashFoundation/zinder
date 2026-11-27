@@ -1,0 +1,6 @@
+kind: added
+body: Serve native wallet scan and transparent address batches at one chain epoch. Query operators can keep observed epoch pins readable for 60 to 300 seconds after replacement.
+time: 2026-11-27T23:23:41.850844671Z
+custom:
+    Bump: minor
+    PR: "735"
