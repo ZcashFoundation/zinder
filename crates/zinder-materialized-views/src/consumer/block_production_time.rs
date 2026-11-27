@@ -127,6 +127,16 @@ pub struct BlockProductionTimeRow {
 pub struct BlockProductionTimeCursor(PrimaryKey);
 
 impl BlockProductionTimeCursor {
+    /// Builds a continuation key positioned at `row`'s primary key.
+    #[must_use]
+    pub fn from_row(row: BlockProductionTimeRow) -> Self {
+        Self(encode_primary_key(
+            row.block_time_unix_seconds,
+            row.block_height,
+            row.block_hash,
+        ))
+    }
+
     /// Decodes and validates a persisted continuation key.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlockProductionTimeConsumerError> {
         let key: PrimaryKey = bytes.try_into().map_err(|_| {

@@ -320,17 +320,19 @@ fn read_block_production_in_time_range_sync(
         )
         .into());
     }
-    let snapshot_read = read_time_range_snapshot_and_candidates(&params)?;
-    let mut matched = snapshot_read.matched;
-    let mut budget = FeeHydrationBudget::default();
-    let coinbases = hydrate_coinbase_and_paid_fees_with_budget(
+    let mut snapshot_read = read_time_range_snapshot_and_candidates(&params)?;
+    let mut budget = FeeHydrationBudget::for_time_range();
+    let mut coinbases = hydrate_coinbase_and_paid_fees_with_budget(
         params.canonical_store,
         snapshot_read.epoch,
-        &mut matched,
+        &mut snapshot_read.matched,
         &mut budget,
     )?;
+    if let Some(exhausted_idx) = budget.first_exhausted_index {
+        truncate_time_range_on_fee_budget(&mut snapshot_read, &mut coinbases, exhausted_idx);
+    }
     let (points, covered_block_count, missing_coinbase_count, missing_paid_fee_count) =
-        collect_hydrated_time_range_points(matched, coinbases)?;
+        collect_hydrated_time_range_points(snapshot_read.matched, coinbases)?;
     let (coverage, read_fence) = build_time_range_coverage_and_fence(TimeRangeCoverageInput {
         first_retained: snapshot_read.first_retained,
         epoch: snapshot_read.epoch,
@@ -357,11 +359,53 @@ fn read_block_production_in_time_range_sync(
     })
 }
 
+fn truncate_time_range_on_fee_budget(
+    snapshot_read: &mut TimeRangeSnapshotRead,
+    coinbases: &mut Vec<Option<zinder_proto::v1::explorer::CoinbaseTransactionSummary>>,
+    exhausted_idx: usize,
+) {
+    let truncate_len = if exhausted_idx == 0 {
+        if snapshot_read.matched.len() <= 1 {
+            return;
+        }
+        1
+    } else {
+        exhausted_idx
+    };
+    let Some(stop_row_len) = snapshot_read
+        .candidate_matched_indices
+        .iter()
+        .position(|idx| *idx == Some(truncate_len))
+    else {
+        return;
+    };
+    if stop_row_len == 0 {
+        return;
+    }
+    snapshot_read.matched.truncate(truncate_len);
+    coinbases.truncate(truncate_len);
+    snapshot_read.missing_block_count = u32::try_from(
+        snapshot_read.candidate_matched_indices[..stop_row_len]
+            .iter()
+            .filter(|idx| idx.is_none())
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    snapshot_read.next_cursor = snapshot_read
+        .page_rows
+        .get(stop_row_len - 1)
+        .copied()
+        .map(BlockProductionTimeCursor::from_row);
+    snapshot_read.scan_exhausted = false;
+}
+
 struct TimeRangeSnapshotRead {
     epoch: ChainEpoch,
     first_retained: BlockHeight,
     mv_state: MaterializedViewState,
     mv_coverage: Option<BlockProductionTimeBackfillCoverage>,
+    page_rows: Vec<BlockProductionTimeRow>,
+    candidate_matched_indices: Vec<Option<usize>>,
     matched: Vec<(BlockHeight, BlockHash, u32, BlockSummary)>,
     missing_block_count: u32,
     mv_matches_canonical_epoch: bool,
@@ -401,8 +445,7 @@ fn read_time_range_snapshot_and_candidates(
     .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mv_coverage = BlockProductionTimeConsumer::coverage_snapshot(&snapshot)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let (matched, missing_block_count) =
-        collect_time_range_candidates(&guard, &snapshot, epoch, &page.rows)?;
+    let collected = collect_time_range_candidates(&guard, &snapshot, epoch, &page.rows)?;
     drop(snapshot);
 
     let canonical_tip_hash = guard
@@ -419,8 +462,10 @@ fn read_time_range_snapshot_and_candidates(
         first_retained,
         mv_state,
         mv_coverage,
-        matched,
-        missing_block_count,
+        page_rows: page.rows,
+        candidate_matched_indices: collected.candidate_matched_indices,
+        matched: collected.matched,
+        missing_block_count: collected.missing_block_count,
         mv_matches_canonical_epoch,
         scan_exhausted: page.scan_exhausted,
         next_cursor: page.next_cursor,
@@ -457,12 +502,18 @@ fn collect_hydrated_time_range_points(
     ))
 }
 
+struct CollectedTimeRangeCandidates {
+    matched: Vec<MatchedBlockRow>,
+    candidate_matched_indices: Vec<Option<usize>>,
+    missing_block_count: u32,
+}
+
 fn collect_time_range_candidates(
     secondary: &zinder_store::RocksDbCanonicalSecondary,
     snapshot: &zinder_materialized_views::MaterializedViewStoreReadSnapshot<'_>,
     epoch: ChainEpoch,
     rows: &[BlockProductionTimeRow],
-) -> Result<(Vec<MatchedBlockRow>, u32), Status> {
+) -> Result<CollectedTimeRangeCandidates, Status> {
     let heights: Vec<BlockHeight> = rows.iter().map(|row| row.block_height).collect();
     let headers = secondary
         .block_headers_at(&heights)
@@ -478,6 +529,7 @@ fn collect_time_range_candidates(
 
     let visible_tip = epoch.visible_tip_height.value();
     let mut matched = Vec::with_capacity(rows.len());
+    let mut candidate_matched_indices = Vec::with_capacity(rows.len());
     let mut missing_block_count = 0_u32;
     for ((row, maybe_header), maybe_payload) in rows.iter().zip(headers).zip(summary_payloads) {
         let joined = match (maybe_header, maybe_payload) {
@@ -495,12 +547,18 @@ fn collect_time_range_candidates(
             _ => None,
         };
         if let Some(entry) = joined {
+            candidate_matched_indices.push(Some(matched.len()));
             matched.push(entry);
         } else {
+            candidate_matched_indices.push(None);
             missing_block_count = missing_block_count.saturating_add(1);
         }
     }
-    Ok((matched, missing_block_count))
+    Ok(CollectedTimeRangeCandidates {
+        matched,
+        candidate_matched_indices,
+        missing_block_count,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -749,5 +807,75 @@ mod tests {
             scan_exhausted: true,
         });
         assert!(!exhausted_cov.requested_range_complete);
+    }
+
+    #[test]
+    fn fee_budget_exhaustion_truncates_page_before_unhydrated_row() {
+        let tip_hash = BlockHash::from_bytes([0x22; 32]);
+        let row = |height: u32, tag: u8| BlockProductionTimeRow {
+            block_time_unix_seconds: 1_750_000_000 + i64::from(height),
+            block_height: BlockHeight::new(height),
+            block_hash: BlockHash::from_bytes([tag; 32]),
+        };
+        let rows = vec![row(1, 0x01), row(2, 0x02), row(3, 0x03), row(4, 0x04)];
+        let mut snapshot_read = TimeRangeSnapshotRead {
+            epoch: ChainEpoch {
+                id: ChainEpochId::new(1),
+                network: Network::ZcashRegtest,
+                visible_tip_height: BlockHeight::new(4),
+                visible_tip_hash: tip_hash,
+                settled_tip_height: BlockHeight::new(1),
+                settled_tip_hash: BlockHash::from_bytes([0x01; 32]),
+                artifact_schema_version: ArtifactSchemaVersion::new(1),
+                tip_metadata: ChainTipMetadata::new(0, 0, 0),
+                created_at: UnixTimestampMillis::new(1_750_000_000_000),
+            },
+            first_retained: BlockHeight::new(1),
+            mv_state: MaterializedViewState {
+                chain_epoch_id: ChainEpochId::new(1),
+                tip_height: BlockHeight::new(4),
+                tip_hash,
+                revision: 1,
+                coverage: None,
+            },
+            mv_coverage: None,
+            page_rows: rows.clone(),
+            candidate_matched_indices: vec![Some(0), None, Some(1), Some(2)],
+            matched: vec![
+                (
+                    BlockHeight::new(1),
+                    rows[0].block_hash,
+                    0,
+                    BlockSummary::default(),
+                ),
+                (
+                    BlockHeight::new(3),
+                    rows[2].block_hash,
+                    0,
+                    BlockSummary::default(),
+                ),
+                (
+                    BlockHeight::new(4),
+                    rows[3].block_hash,
+                    0,
+                    BlockSummary::default(),
+                ),
+            ],
+            missing_block_count: 1,
+            mv_matches_canonical_epoch: true,
+            scan_exhausted: true,
+            next_cursor: None,
+        };
+        let mut coinbases = vec![None, None, None];
+        truncate_time_range_on_fee_budget(&mut snapshot_read, &mut coinbases, 1);
+
+        assert_eq!(snapshot_read.matched.len(), 1);
+        assert_eq!(coinbases.len(), 1);
+        assert_eq!(snapshot_read.missing_block_count, 1);
+        assert!(!snapshot_read.scan_exhausted);
+        assert_eq!(
+            snapshot_read.next_cursor,
+            Some(BlockProductionTimeCursor::from_row(rows[1]))
+        );
     }
 }

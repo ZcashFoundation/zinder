@@ -37,7 +37,12 @@ pub(crate) struct FeeHydrationBudget {
     pub(crate) remaining_bytes: usize,
     /// Maximum distinct historical parent block replays across the request.
     pub(crate) remaining_parent_replays: usize,
-    exhausted: bool,
+    /// Stops subsequent sub-batches once the request fee budget is exhausted.
+    pub(crate) stop_on_exhaustion: bool,
+    /// First `matched` index whose paid-fee hydration exhausted a request budget.
+    pub(crate) first_exhausted_index: Option<usize>,
+    inputs_exhausted: bool,
+    parents_exhausted: bool,
 }
 
 impl Default for FeeHydrationBudget {
@@ -47,21 +52,40 @@ impl Default for FeeHydrationBudget {
             remaining_inputs: DEFAULT_FEE_HYDRATION_MAX_INPUTS,
             remaining_bytes: DEFAULT_FEE_HYDRATION_MAX_BYTES,
             remaining_parent_replays: DEFAULT_FEE_HYDRATION_MAX_PARENT_REPLAYS,
-            exhausted: false,
+            stop_on_exhaustion: false,
+            first_exhausted_index: None,
+            inputs_exhausted: false,
+            parents_exhausted: false,
         }
     }
 }
 
 impl FeeHydrationBudget {
-    fn reserve_block_inputs(&mut self, inputs: &BlockFeeInputs) -> bool {
-        if self.exhausted {
+    pub(crate) fn for_time_range() -> Self {
+        Self {
+            stop_on_exhaustion: true,
+            ..Self::default()
+        }
+    }
+
+    fn record_exhaustion(&mut self, block_index: usize) {
+        self.first_exhausted_index = Some(
+            self.first_exhausted_index
+                .map_or(block_index, |prev| prev.min(block_index)),
+        );
+    }
+
+    fn reserve_block_inputs(&mut self, block_index: usize, inputs: &BlockFeeInputs) -> bool {
+        if self.inputs_exhausted || self.parents_exhausted {
+            self.record_exhaustion(block_index);
             return false;
         }
         let estimated = inputs.estimated_total_bytes();
         if inputs.transparent_input_count > self.remaining_inputs
             || estimated > self.remaining_bytes
         {
-            self.exhausted = true;
+            self.inputs_exhausted = true;
+            self.record_exhaustion(block_index);
             return false;
         }
         self.remaining_inputs -= inputs.transparent_input_count;
@@ -69,19 +93,18 @@ impl FeeHydrationBudget {
         true
     }
 
-    fn take_parent_replay_budget(&mut self, requested_parents: usize) -> usize {
-        if self.remaining_parent_replays == 0 {
-            self.exhausted = true;
-            return 0;
+    fn reserve_block_parents(&mut self, block_index: usize, additional_parents: usize) -> bool {
+        if self.parents_exhausted {
+            self.record_exhaustion(block_index);
+            return false;
         }
-        if requested_parents > self.remaining_parent_replays {
-            let allowed = self.remaining_parent_replays;
-            self.remaining_parent_replays = 0;
-            self.exhausted = true;
-            return allowed;
+        if additional_parents > self.remaining_parent_replays {
+            self.parents_exhausted = true;
+            self.record_exhaustion(block_index);
+            return false;
         }
-        self.remaining_parent_replays -= requested_parents;
-        requested_parents
+        self.remaining_parent_replays -= additional_parents;
+        true
     }
 }
 
@@ -262,22 +285,38 @@ pub(crate) fn hydrate_coinbase_and_paid_fees_with_budget(
         hydrate_subbatch(
             canonical_store,
             epoch,
-            &mut matched[offset..end],
-            &mut coinbases[offset..end],
+            HydrateSubbatchTarget {
+                matched: &mut matched[offset..end],
+                coinbases: &mut coinbases[offset..end],
+                offset,
+            },
             budget,
         )?;
+        if budget.stop_on_exhaustion && budget.first_exhausted_index.is_some() {
+            break;
+        }
         offset = end;
     }
     Ok(coinbases)
 }
 
+struct HydrateSubbatchTarget<'a> {
+    matched: &'a mut [(BlockHeight, BlockHash, u32, BlockSummary)],
+    coinbases: &'a mut [Option<CoinbaseTransactionSummary>],
+    offset: usize,
+}
+
 fn hydrate_subbatch(
     canonical_store: &SharedCanonicalSecondary,
     epoch: ChainEpoch,
-    chunk_matched: &mut [(BlockHeight, BlockHash, u32, BlockSummary)],
-    chunk_coinbases: &mut [Option<CoinbaseTransactionSummary>],
+    target: HydrateSubbatchTarget<'_>,
     budget: &mut FeeHydrationBudget,
 ) -> Result<(), Status> {
+    let HydrateSubbatchTarget {
+        matched: chunk_matched,
+        coinbases: chunk_coinbases,
+        offset,
+    } = target;
     let guard = canonical_store.read();
     let verified_epoch = resolve_locked_canonical_epoch(&guard, Some(epoch.id.value()))?;
     let heights: Vec<BlockHeight> = chunk_matched
@@ -286,8 +325,6 @@ fn hydrate_subbatch(
         .collect();
     let mut block_fee_inputs: Vec<Option<BlockFeeInputs>> = Vec::with_capacity(chunk_matched.len());
     block_fee_inputs.resize_with(chunk_matched.len(), || None);
-    let mut needed_external_txids = HashSet::new();
-    let mut needed_external_outpoints = HashSet::new();
 
     guard
         .visit_block_replay_facts_at_heights(&heights, |idx, maybe_facts| {
@@ -307,25 +344,22 @@ fn hydrate_subbatch(
                 .into());
             }
             chunk_coinbases[idx] = encode_coinbase_summary(&facts)?;
-            if !budget.exhausted
+            if !budget.inputs_exhausted
+                && !budget.parents_exhausted
                 && let Some(fee_inputs) = BlockFeeInputs::from_transactions(&facts.transactions)
-                && budget.reserve_block_inputs(&fee_inputs)
+                && budget.reserve_block_inputs(offset + idx, &fee_inputs)
             {
-                for outpoint in &fee_inputs.external_outpoints {
-                    needed_external_txids.insert(outpoint.transaction_id);
-                    needed_external_outpoints.insert(*outpoint);
-                }
                 block_fee_inputs[idx] = Some(fee_inputs);
             }
             Ok::<(), CanonicalReplayVisitError>(())
         })
         .map_err(Status::from)?;
 
-    let external_prevouts = resolve_external_prevout_values_bounded(
+    let external_prevouts = resolve_subbatch_external_prevouts(
         &guard,
         verified_epoch.visible_tip_height,
-        &needed_external_txids,
-        &needed_external_outpoints,
+        offset,
+        &mut block_fee_inputs,
         budget,
     )?;
     drop(guard);
@@ -338,38 +372,96 @@ fn hydrate_subbatch(
     Ok(())
 }
 
-fn resolve_external_prevout_values_bounded(
+type TxLocationMap = HashMap<TransactionId, (BlockHeight, BlockHash)>;
+
+fn resolve_subbatch_external_prevouts(
     secondary: &RocksDbCanonicalSecondary,
     visible_tip_height: BlockHeight,
-    needed_txids: &HashSet<TransactionId>,
-    needed_outpoints: &HashSet<TransparentOutPoint>,
+    offset: usize,
+    block_fee_inputs: &mut [Option<BlockFeeInputs>],
     budget: &mut FeeHydrationBudget,
 ) -> Result<HashMap<TransparentOutPoint, u64>, Status> {
+    let tx_locations =
+        lookup_subbatch_tx_locations(secondary, visible_tip_height, block_fee_inputs)?;
+    let (selected_parents, selected_outpoints) =
+        select_subbatch_parent_replays(offset, block_fee_inputs, &tx_locations, budget);
+    if selected_parents.is_empty() {
+        return Ok(HashMap::new());
+    }
+    replay_selected_parent_blocks(secondary, &selected_parents, &selected_outpoints)
+}
+
+fn lookup_subbatch_tx_locations(
+    secondary: &RocksDbCanonicalSecondary,
+    visible_tip_height: BlockHeight,
+    block_fee_inputs: &[Option<BlockFeeInputs>],
+) -> Result<TxLocationMap, Status> {
+    let mut needed_txids = HashSet::new();
+    for fee_inputs in block_fee_inputs.iter().flatten() {
+        for outpoint in &fee_inputs.external_outpoints {
+            needed_txids.insert(outpoint.transaction_id);
+        }
+    }
     if needed_txids.is_empty() {
         return Ok(HashMap::new());
     }
-    let txids: Vec<TransactionId> = needed_txids.iter().copied().collect();
+    let txids: Vec<TransactionId> = needed_txids.into_iter().collect();
     let locations = secondary
         .transaction_locations(&txids)
         .map_err(internal_canonical_error)?;
     let first_retained = secondary.history_bounds().first_available_height();
-    let mut parent_hashes_by_height = BTreeMap::new();
+    let mut tx_locations = HashMap::with_capacity(txids.len());
     for location in locations.into_iter().flatten() {
         if location.block_height >= first_retained && location.block_height <= visible_tip_height {
-            parent_hashes_by_height.insert(location.block_height, location.block_hash);
+            tx_locations.insert(
+                location.transaction_id,
+                (location.block_height, location.block_hash),
+            );
         }
     }
-    let mut parent_heights: Vec<BlockHeight> = parent_hashes_by_height.keys().copied().collect();
-    if parent_heights.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let allowed_parents = budget.take_parent_replay_budget(parent_heights.len());
-    if allowed_parents == 0 {
-        return Ok(HashMap::new());
-    }
-    parent_heights.truncate(allowed_parents);
+    Ok(tx_locations)
+}
 
-    let mut resolved = HashMap::with_capacity(needed_outpoints.len().min(allowed_parents * 8));
+fn select_subbatch_parent_replays(
+    offset: usize,
+    block_fee_inputs: &mut [Option<BlockFeeInputs>],
+    tx_locations: &TxLocationMap,
+    budget: &mut FeeHydrationBudget,
+) -> (
+    BTreeMap<BlockHeight, BlockHash>,
+    HashSet<TransparentOutPoint>,
+) {
+    let mut selected_parents = BTreeMap::new();
+    let mut selected_outpoints = HashSet::new();
+    for (idx, maybe_inputs) in block_fee_inputs.iter_mut().enumerate() {
+        let Some(fee_inputs) = maybe_inputs.as_ref() else {
+            continue;
+        };
+        let mut newly_needed_parents = BTreeMap::new();
+        for outpoint in &fee_inputs.external_outpoints {
+            if let Some(&(parent_height, parent_hash)) = tx_locations.get(&outpoint.transaction_id)
+                && !selected_parents.contains_key(&parent_height)
+            {
+                newly_needed_parents.insert(parent_height, parent_hash);
+            }
+        }
+        if budget.reserve_block_parents(offset + idx, newly_needed_parents.len()) {
+            selected_parents.extend(newly_needed_parents);
+            selected_outpoints.extend(fee_inputs.external_outpoints.iter().copied());
+        } else {
+            *maybe_inputs = None;
+        }
+    }
+    (selected_parents, selected_outpoints)
+}
+
+fn replay_selected_parent_blocks(
+    secondary: &RocksDbCanonicalSecondary,
+    parent_hashes_by_height: &BTreeMap<BlockHeight, BlockHash>,
+    needed_outpoints: &HashSet<TransparentOutPoint>,
+) -> Result<HashMap<TransparentOutPoint, u64>, Status> {
+    let parent_heights: Vec<BlockHeight> = parent_hashes_by_height.keys().copied().collect();
+    let mut resolved = HashMap::with_capacity(needed_outpoints.len().min(parent_heights.len() * 8));
     secondary
         .visit_block_replay_facts_at_heights(&parent_heights, |idx, maybe_facts| {
             let Some(facts) = maybe_facts else {
@@ -666,6 +758,57 @@ mod tests {
             },
         )?;
         assert_eq!(parent_fees, vec![Some(0), Some(10_000), None, None]);
+        Ok(())
+    }
+
+    #[test]
+    fn stop_on_exhaustion_halts_subbatches_and_prioritizes_matched_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_multi_block_fee_fixture()?;
+
+        let mut matched: Vec<_> = fixture
+            .headers
+            .iter()
+            .map(|&(height, hash, bits)| (height, hash, bits, empty_summary(height)))
+            .collect();
+        let mut stop_budget = FeeHydrationBudget {
+            subbatch_blocks: 1,
+            remaining_parent_replays: 1,
+            stop_on_exhaustion: true,
+            ..FeeHydrationBudget::default()
+        };
+        let coinbases = hydrate_coinbase_and_paid_fees_with_budget(
+            &fixture.canonical_store,
+            fixture.epoch,
+            &mut matched,
+            &mut stop_budget,
+        )?;
+        assert_eq!(stop_budget.first_exhausted_index, Some(2));
+        assert!(coinbases[0].is_some() && coinbases[1].is_some() && coinbases[2].is_some());
+        assert!(coinbases[3].is_none());
+
+        let mut reordered: Vec<_> = [fixture.headers[0], fixture.headers[3], fixture.headers[1]]
+            .into_iter()
+            .map(|(height, hash, bits)| (height, hash, bits, empty_summary(height)))
+            .collect();
+        let mut order_budget = FeeHydrationBudget {
+            subbatch_blocks: 4,
+            remaining_parent_replays: 1,
+            stop_on_exhaustion: true,
+            ..FeeHydrationBudget::default()
+        };
+        hydrate_coinbase_and_paid_fees_with_budget(
+            &fixture.canonical_store,
+            fixture.epoch,
+            &mut reordered,
+            &mut order_budget,
+        )?;
+        let reordered_fees: Vec<_> = reordered
+            .into_iter()
+            .map(|(_, _, _, summary)| summary.paid_fees_collected_zat)
+            .collect();
+        assert_eq!(reordered_fees, vec![Some(0), Some(3_000), None]);
+        assert_eq!(order_budget.first_exhausted_index, Some(2));
         Ok(())
     }
 }

@@ -7554,6 +7554,22 @@ impl NetworkActivityWindow {
         tip_height: u32,
         cutoff_unix_seconds: i64,
     ) -> Result<Self, CipherscanRestError> {
+        if tip_height == 0 {
+            if !entries.is_empty() {
+                return Err(CipherscanRestError::InvalidUpstreamField(
+                    "network_stats.activity_window",
+                ));
+            }
+            let average_block_time_seconds =
+                target_block_spacing_seconds(&zebra_network_for(network)?, 0)?;
+            return Ok(Self {
+                latest_difficulty: 0.0,
+                network_hashrate_raw: 0.0,
+                average_block_time_seconds,
+                block_count: 0,
+                transaction_count: 0,
+            });
+        }
         let latest_difficulty = entries
             .iter()
             .find(|entry| entry.summary.block_height == tip_height)
@@ -17537,6 +17553,41 @@ mod tests {
         assert!((activity.latest_difficulty - 72.0).abs() < f64::EPSILON);
         assert!((activity.network_hashrate_raw - (72.0 / 43_200.0)).abs() < f64::EPSILON);
         assert_eq!(cipherscan_hashrate_string(1.829_992), "1.83 H/s");
+        Ok(())
+    }
+
+    #[test]
+    fn network_activity_window_handles_tip_height_zero_empty_chain()
+    -> Result<(), CipherscanRestError> {
+        let empty =
+            NetworkActivityWindow::from_entries(Network::ZcashRegtest, &[], 0, 1_700_000_000)?;
+
+        assert_eq!(empty.block_count, 0);
+        assert_eq!(empty.transaction_count, 0);
+        assert_eq!(
+            empty.average_block_time_seconds,
+            target_block_spacing_seconds(&zebra_network_for(Network::ZcashRegtest)?, 0)?
+        );
+        assert!((empty.latest_difficulty - 0.0).abs() < f64::EPSILON);
+        assert!((empty.network_hashrate_raw - 0.0).abs() < f64::EPSILON);
+        assert_eq!(
+            cipherscan_hashrate_string(empty.network_hashrate_raw),
+            "0.00 H/s"
+        );
+
+        let unexpected_entry = vec![network_activity_entry(1, 1_700_000_001, 1, 1.0)];
+        let rejected = NetworkActivityWindow::from_entries(
+            Network::ZcashRegtest,
+            &unexpected_entry,
+            0,
+            1_700_000_000,
+        );
+        assert!(matches!(
+            rejected,
+            Err(CipherscanRestError::InvalidUpstreamField(
+                "network_stats.activity_window"
+            ))
+        ));
         Ok(())
     }
 

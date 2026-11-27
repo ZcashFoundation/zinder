@@ -800,9 +800,22 @@ fn seed_baseline_views(
     b1: BlockCommitContext,
     b2: BlockCommitContext,
 ) -> Result<()> {
-    let contexts = vec![b1, b2];
+    seed_backfill_views(mv_primary, &[b1, b2])
+}
+
+fn seed_backfill_views(
+    mv_primary: &MaterializedViewStore,
+    contexts: &[BlockCommitContext],
+) -> Result<()> {
+    let first = contexts
+        .first()
+        .ok_or_else(|| eyre!("cannot seed empty backfill contexts"))?;
+    let last = contexts
+        .last()
+        .ok_or_else(|| eyre!("cannot seed empty backfill contexts"))?;
+    let tail_boundary = BlockHeight::new(last.height.value().saturating_add(1));
     if BlockProductionTimeConsumer::tail_coverage(mv_primary)?.is_none() {
-        BlockProductionTimeConsumer::initialize_tail_boundary(mv_primary, BlockHeight::new(3))
+        BlockProductionTimeConsumer::initialize_tail_boundary(mv_primary, tail_boundary)
             .map_err(|error| eyre!("{error}"))?;
     }
     if BlockProductionTimeConsumer::coverage(mv_primary)?.is_none() {
@@ -818,10 +831,10 @@ fn seed_baseline_views(
             mv_primary,
             &rows,
             BlockProductionTimeBackfillCoverage::new(
-                contexts[0].height,
-                contexts[1].height,
-                contexts[0].block_time_unix_seconds,
-                contexts[1].block_time_unix_seconds,
+                first.height,
+                last.height,
+                first.block_time_unix_seconds,
+                last.block_time_unix_seconds,
             ),
         )
         .map_err(|error| eyre!("{error}"))?;
@@ -830,8 +843,8 @@ fn seed_baseline_views(
         CommitmentRootSearchConsumer::new()
             .write_backfill_batch(
                 mv_primary,
-                &contexts,
-                CommitmentRootBackfillCoverage::new(contexts[0].height, contexts[1].height),
+                contexts,
+                CommitmentRootBackfillCoverage::new(first.height, last.height),
             )
             .map_err(|error| eyre!("{error}"))?;
     }
@@ -839,12 +852,12 @@ fn seed_baseline_views(
         ConventionalFeeDistributionConsumer::new()
             .write_backfill_batch(
                 mv_primary,
-                &contexts,
+                contexts,
                 ConventionalFeeDistributionBackfillCoverage::new(
-                    contexts[0].height,
-                    contexts[1].height,
-                    contexts[0].block_time_unix_seconds,
-                    contexts[1].block_time_unix_seconds,
+                    first.height,
+                    last.height,
+                    first.block_time_unix_seconds,
+                    last.block_time_unix_seconds,
                 ),
             )
             .map_err(|error| eyre!("{error}"))?;
@@ -1570,6 +1583,193 @@ async fn cipherscan_canonical_routes_and_realtime_websocket_succeed() -> Result<
 
     env.cancel.cancel();
     for task in env.tasks {
+        let _ = task.await;
+    }
+    Ok(())
+}
+
+fn synthetic_block_hash(height: u32) -> [u8; 32] {
+    let mut hash = [0_u8; 32];
+    hash[..4].copy_from_slice(&height.to_be_bytes());
+    hash[31] = 1;
+    hash
+}
+
+fn build_long_fee_chain(
+    block_count: u32,
+    activations: &NetworkUpgradeActivations,
+    base_time: i64,
+) -> Result<(Vec<ConstructedBlock>, CommitmentTreeAccumulator)> {
+    let mut acc = CommitmentTreeAccumulator::from_validated_frontiers(
+        BlockHeight::new(0),
+        &CommitmentTreeFrontiers::default(),
+        activations,
+    )?;
+    let mut blocks = Vec::with_capacity(usize::try_from(block_count)?);
+    let mut prev_txid = None;
+    let mut prev_reward = 0_u64;
+    for height in 1..=block_count {
+        let miner_tag = if height.is_multiple_of(2) { 0xAA } else { 0xBB };
+        let reward_zat = if height == 1 {
+            625_000_000
+        } else {
+            625_001_000
+        };
+        let coinbase = make_coinbase_spec(height, reward_zat, [miner_tag; 20])?;
+        let cb_txid = coinbase.facts.public_facts.transaction_id;
+        let mut txs = vec![coinbase];
+        if let Some(parent_txid) = prev_txid {
+            txs.push(make_spend_spec(
+                parent_txid,
+                0,
+                prev_reward - 1_000,
+                [0xCC; 20],
+            )?);
+        }
+        let parent_hash = if height == 1 {
+            Network::ZcashRegtest.genesis_hash().as_bytes()
+        } else {
+            synthetic_block_hash(height - 1)
+        };
+        let constructed = assemble_block(
+            BlockBlueprint {
+                height,
+                block_hash: synthetic_block_hash(height),
+                parent_hash,
+                block_time: base_time + i64::from(height) * 2,
+                raw_block_bytes: vec![miner_tag; 96],
+                txs,
+            },
+            activations,
+            &mut acc,
+        )?;
+        prev_txid = Some(cb_txid);
+        prev_reward = reward_zat;
+        blocks.push(constructed);
+    }
+    Ok((blocks, acc))
+}
+
+fn publish_long_fee_chain_stores(
+    canonical_path: &Path,
+    secondary_dir: &Path,
+    block_count: u32,
+    activations: &NetworkUpgradeActivations,
+    base_time: i64,
+) -> Result<RocksDbCanonicalStore> {
+    let (blocks, _) = build_long_fee_chain(block_count, activations, base_time)?;
+    let tip_cp = blocks
+        .last()
+        .and_then(|blk| blk.build_block.tree_state_checkpoint.clone())
+        .ok_or_else(|| eyre!("missing tip checkpoint"))?;
+    let mv_contexts: Vec<_> = blocks
+        .iter()
+        .map(|blk| clone_commit_context(&blk.commit_context))
+        .collect();
+    let settled_height = block_count - TEST_REORG_WINDOW;
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        activations,
+        u32::try_from(base_time)?,
+        BlockId::new(
+            BlockHeight::new(block_count),
+            BlockHash::from_bytes(synthetic_block_hash(block_count)),
+        ),
+        RawBlobRetention::All,
+        CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
+    )?;
+    let mut builder = RocksDbCanonicalBuilder::create_fresh(
+        canonical_path,
+        CanonicalStoreWorkload::Wallet,
+        build_plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?
+    .with_every_block_tree_state_checkpoints()?;
+    builder.bulk_load_blocks(
+        activations,
+        blocks
+            .into_iter()
+            .map(|blk| Ok::<_, std::convert::Infallible>(blk.build_block)),
+    )?;
+    builder.load_subtree_roots(std::iter::empty())?;
+    builder.confirm_source_tip_checkpoint(&tip_cp)?;
+    let validated = builder.prepare_cold_certified_publication()?;
+    let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+        BlockId::new(
+            BlockHeight::new(settled_height),
+            BlockHash::from_bytes(synthetic_block_hash(settled_height)),
+        ),
+        UnixTimestampMillis::new(u64::try_from(base_time)? * 1_000),
+    ))?;
+    let primary = validated.publish_baseline(publication)?;
+    let mv_primary = open_test_materialized_view_store_for_canonical(canonical_path)?;
+    let tail_canonical = Arc::new(RwLock::new(RocksDbCanonicalSecondary::open_ready(
+        canonical_path,
+        secondary_dir.join("tail-canon"),
+        activations,
+        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
+        CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?));
+    build_tailer(
+        tail_canonical,
+        mv_primary.clone(),
+        Arc::new(activations.clone()),
+    )
+    .catch_up()?;
+    seed_backfill_views(&mv_primary, &mv_contexts)?;
+    Ok(primary)
+}
+
+#[tokio::test]
+async fn pool_distribution_succeeds_across_more_than_256_distinct_parent_blocks() -> Result<()> {
+    let block_count = 270_u32;
+    let now_secs = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+    let base_time = now_secs - 1_200;
+    let activations = sample_regtest_upgrade_activations();
+    let canonical_dir = TempDir::new()?;
+    let canonical_path = canonical_dir.path().join("canonical");
+    let secondary_dir = TempDir::new()?;
+    let canonical_primary = publish_long_fee_chain_stores(
+        &canonical_path,
+        secondary_dir.path(),
+        block_count,
+        &activations,
+        base_time,
+    )?;
+
+    let wallet_fixture = WalletServingStoreFixture::from_published_canonical(
+        TempDir::new()?,
+        &canonical_path,
+        canonical_primary,
+        &activations,
+    )?;
+    let (explorer_canonical, mv_secondary, _) =
+        open_e2e_secondaries(&canonical_path, secondary_dir.path())?;
+
+    let cancel = CancellationToken::new();
+    let (wallet_addr, _, wallet_task) = spawn_wallet_grpc(wallet_fixture, &cancel).await?;
+    let (explorer_addr, explorer_task) =
+        spawn_explorer_grpc(explorer_canonical, mv_secondary, wallet_addr, &cancel).await?;
+    let (http_addr, _, http_task) =
+        spawn_cipherscan_http(explorer_addr, wallet_addr, &cancel).await?;
+
+    let client = reqwest::Client::new();
+    let pool_dist = get_json(
+        &client,
+        &format!("http://{http_addr}/api/mining/pool-distribution?period=24h"),
+    )
+    .await?;
+    assert_eq!(pool_dist["period"], json!("24h"));
+    assert_eq!(pool_dist["totalBlocks"], json!(270));
+    let pools = pool_dist["pools"]
+        .as_array()
+        .ok_or_else(|| eyre!("missing pools array"))?;
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0]["blocks"], json!(270));
+    assert_eq!(pools[0]["totalFeesZat"], json!("269000"));
+
+    cancel.cancel();
+    for task in [wallet_task, explorer_task, http_task] {
         let _ = task.await;
     }
     Ok(())
