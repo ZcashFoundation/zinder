@@ -1,5 +1,11 @@
 # Stateless-Topology Testing Ground (PostgreSQL 17/18 + PgBouncer + Mock R2 + Caddy)
 # Local diagnostic/test harness only; does not change Zinder's supported `rocksdb` production posture.
+#
+# Live multi-replica `zinder serve --readers-only` containers inside this Compose stack await
+# `#676` (PostgreSQL Slice 1), because current `rocksdb` readers require a local canonical
+# store and `IngestControl`. Stateless `read_only: true` replicas in this stack validate
+# PostgreSQL transaction pooling, R2 fault injection + primary fallback, HTTP REST, gRPC-Web,
+# and native HTTP/2 h2c gRPC round-robin routing.
 
 name: ${ZINDER_PG_TESTING_GROUND_PROJECT:-zinder-pg-testing-ground}
 
@@ -85,6 +91,7 @@ services:
     environment:
       REPLICA_ID: probe-reader-a
       PROBE_PORT: "8081"
+      PROBE_GRPC_PORT: "8082"
       PGBOUNCER_HOST: pgbouncer
       PGBOUNCER_PORT: "6432"
       MOCK_R2_BASE: http://mock-r2:9000
@@ -100,7 +107,7 @@ services:
           "CMD",
           "python3",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2)",
+          "import socket, urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2); socket.create_connection(('127.0.0.1', 8082), timeout=2).close()",
         ]
       interval: 2s
       timeout: 5s
@@ -116,6 +123,7 @@ services:
     environment:
       REPLICA_ID: probe-reader-b
       PROBE_PORT: "8081"
+      PROBE_GRPC_PORT: "8082"
       PGBOUNCER_HOST: pgbouncer
       PGBOUNCER_PORT: "6432"
       MOCK_R2_BASE: http://mock-r2:9000
@@ -131,7 +139,7 @@ services:
           "CMD",
           "python3",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2)",
+          "import socket, urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2); socket.create_connection(('127.0.0.1', 8082), timeout=2).close()",
         ]
       interval: 2s
       timeout: 5s
@@ -159,57 +167,3 @@ services:
       interval: 2s
       timeout: 5s
       retries: 15
-
-  zinder-reader-a:
-    profiles: ["readers"]
-    image: ${ZINDER_IMAGE:-zinder:local}
-    depends_on:
-      pgbouncer:
-        condition: service_healthy
-      mock-r2:
-        condition: service_healthy
-    command: ["serve", "--readers-only", "--preset", "${ZINDER_PRESET:-light-wallet}"]
-    read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m
-    environment:
-      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_PRESET:-light-wallet}
-      ZINDER_NETWORK__NAME: zcash-regtest
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://127.0.0.1:18232}
-      ZINDER_NODE__AUTH__METHOD: none
-      ZINDER_STORAGE__DATA_DIR: /tmp/zinder-reader
-      ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS: "120000"
-      ZINDER_INGEST_CONTROL__ADDR: ${ZINDER_INGEST_CONTROL__ADDR:-http://host.docker.internal:9100}
-      ZINDER_OPS__LISTEN_ADDR: 0.0.0.0:9108
-      ZINDER_COMPAT__LISTEN_ADDR: 0.0.0.0:9067
-      ZINDER_QUERY__LISTEN_ADDR: 0.0.0.0:9102
-      ZINDER_EXPLORER__LISTEN_ADDR: 0.0.0.0:9068
-      ZINDER_CIPHERSCAN__LISTEN_ADDR: 0.0.0.0:9070
-      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
-
-  zinder-reader-b:
-    profiles: ["readers"]
-    image: ${ZINDER_IMAGE:-zinder:local}
-    depends_on:
-      pgbouncer:
-        condition: service_healthy
-      mock-r2:
-        condition: service_healthy
-    command: ["serve", "--readers-only", "--preset", "${ZINDER_PRESET:-light-wallet}"]
-    read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m
-    environment:
-      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_PRESET:-light-wallet}
-      ZINDER_NETWORK__NAME: zcash-regtest
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://127.0.0.1:18232}
-      ZINDER_NODE__AUTH__METHOD: none
-      ZINDER_STORAGE__DATA_DIR: /tmp/zinder-reader
-      ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS: "120000"
-      ZINDER_INGEST_CONTROL__ADDR: ${ZINDER_INGEST_CONTROL__ADDR:-http://host.docker.internal:9100}
-      ZINDER_OPS__LISTEN_ADDR: 0.0.0.0:9108
-      ZINDER_COMPAT__LISTEN_ADDR: 0.0.0.0:9067
-      ZINDER_QUERY__LISTEN_ADDR: 0.0.0.0:9102
-      ZINDER_EXPLORER__LISTEN_ADDR: 0.0.0.0:9068
-      ZINDER_CIPHERSCAN__LISTEN_ADDR: 0.0.0.0:9070
-      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"

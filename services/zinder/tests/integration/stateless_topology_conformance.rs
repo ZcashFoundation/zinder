@@ -20,24 +20,33 @@ use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 use tonic::transport::Server;
 use tonic_web::GrpcWebLayer;
-use zinder_compat_cipherscan::{CipherscanMarketPriceEndpoints, CipherscanRestAdapter};
+use zinder_compat_cipherscan::{
+    CipherscanMarketPriceEndpoints, CipherscanRestAdapter,
+    runtime::{CipherscanConfig, serve_supervised},
+};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
-use zinder_core::{BlockHeight, Network, TransactionId};
+use zinder_core::{BlockHeight, Network, TransactionId, wire::encode_zinder_native_chain_name};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_ingest::{MaterializedViewReplayConfig, MaterializedViewTailer, ReplayPrevoutCaches};
 use zinder_materialized_views::{MaterializedViewStore, MaterializedViewStoreOptions};
 use zinder_proto::{
     compat::lightwalletd::{self, compact_tx_streamer_client::CompactTxStreamerClient},
-    v1::explorer::{
-        BlockDetailRequest, BlockSummariesInRangeRequest, ServerInfoRequest, block_detail_request,
-        explorer_query_client::ExplorerQueryClient,
+    v1::{
+        explorer::{
+            BlockDetailRequest, BlockSummariesInRangeRequest, ServerInfoRequest,
+            block_detail_request, explorer_query_client::ExplorerQueryClient,
+        },
+        wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient},
     },
 };
 use zinder_query::{
     AdmittedIngestControl, WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot,
     WalletServingQuery, WalletServingReadPair,
 };
-use zinder_runtime::{ClientAddressSource, HttpListenerLimits, connect_zinder_grpc, serve_http};
+use zinder_runtime::{
+    ClientAddressSource, HttpListenerLimits, OpsEndpointHandle, Readiness, RuntimeService,
+    connect_zinder_grpc, serve_http, spawn_ops_endpoint_for,
+};
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreRequirements, RawBlobRetention, RocksDbCanonicalSecondary,
     RocksDbResourceBudget,
@@ -49,6 +58,9 @@ use zinder_testkit::{
 };
 
 const TEST_REORG_WINDOW: u32 = 100;
+const MAX_WS_HANDSHAKE_BYTES: usize = 8192;
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const READYZ_TIMEOUT: Duration = Duration::from_secs(5);
 const BANNED_CLIENT_DRIVERS: [&str; 14] = [
     "bb8-postgres",
     "deadpool-postgres",
@@ -175,12 +187,42 @@ async fn spawn_wallet_and_compat(
     Ok((wallet_addr, compat_addr, vec![wallet_task, compat_task]))
 }
 
-async fn spawn_explorer_and_cipherscan(
+fn sample_market_price_endpoints() -> eyre::Result<CipherscanMarketPriceEndpoints> {
+    Ok(CipherscanMarketPriceEndpoints::new(
+        reqwest::Url::parse("http://127.0.0.1:9/current")?,
+        "http://127.0.0.1:9/history/{date}".to_owned(),
+    )?)
+}
+
+fn build_cipherscan_config(
+    listen_addr: SocketAddr,
+    explorer_addr: SocketAddr,
+    wallet_addr: SocketAddr,
+) -> eyre::Result<CipherscanConfig> {
+    Ok(CipherscanConfig {
+        network: Network::ZcashRegtest,
+        listen_addr,
+        ops_listen_addr: None,
+        allow_public_bind: false,
+        explorer_query_endpoint: format!("http://{explorer_addr}"),
+        wallet_query_endpoint: format!("http://{wallet_addr}"),
+        market_price_endpoints: sample_market_price_endpoints()?,
+        bearer_token_path: None,
+        bearer_token: None,
+    })
+}
+
+async fn reserve_loopback_addr() -> eyre::Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    Ok(listener.local_addr()?)
+}
+
+async fn spawn_explorer_grpc(
     canon_path: &Path,
     secondary_dir: &Path,
     wallet_addr: SocketAddr,
     cancel: &CancellationToken,
-) -> eyre::Result<(SocketAddr, SocketAddr, Vec<JoinHandle<eyre::Result<()>>>)> {
+) -> eyre::Result<(SocketAddr, JoinHandle<eyre::Result<()>>)> {
     let explorer_canon = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
         canon_path,
         secondary_dir.join("explorer-canon"),
@@ -221,7 +263,17 @@ async fn spawn_explorer_and_cipherscan(
             .await?;
         Ok(())
     });
+    Ok((explorer_addr, explorer_task))
+}
 
+async fn spawn_explorer_and_cipherscan(
+    canon_path: &Path,
+    secondary_dir: &Path,
+    wallet_addr: SocketAddr,
+    cancel: &CancellationToken,
+) -> eyre::Result<(SocketAddr, SocketAddr, Vec<JoinHandle<eyre::Result<()>>>)> {
+    let (explorer_addr, explorer_task) =
+        spawn_explorer_grpc(canon_path, secondary_dir, wallet_addr, cancel).await?;
     let (cipherscan_addr, cs_task) =
         spawn_cipherscan_http(explorer_addr, wallet_addr, cancel).await?;
     Ok((explorer_addr, cipherscan_addr, vec![explorer_task, cs_task]))
@@ -234,15 +286,11 @@ async fn spawn_cipherscan_http(
 ) -> eyre::Result<(SocketAddr, JoinHandle<eyre::Result<()>>)> {
     let explorer_channel = connect_zinder_grpc(&format!("http://{explorer_addr}"), None).await?;
     let wallet_channel = connect_zinder_grpc(&format!("http://{wallet_addr}"), None).await?;
-    let market_prices = CipherscanMarketPriceEndpoints::new(
-        reqwest::Url::parse("http://127.0.0.1:9/current")?,
-        "http://127.0.0.1:9/history/{date}".to_owned(),
-    )?;
     let adapter = CipherscanRestAdapter::new(
         Network::ZcashRegtest,
         explorer_channel,
         wallet_channel,
-        market_prices,
+        sample_market_price_endpoints()?,
         cancel.clone(),
     )?;
     let router = adapter.router();
@@ -481,6 +529,34 @@ async fn query_explorer_and_cipherscan(
     })
 }
 
+async fn read_http_response_head(stream: &TcpStream) -> eyre::Result<String> {
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 512];
+    loop {
+        stream.readable().await?;
+        match stream.try_read(&mut chunk) {
+            Ok(0) => {
+                return Err(eyre!(
+                    "unexpected EOF before WebSocket upgrade headers completed"
+                ));
+            }
+            Ok(bytes_read) => {
+                head.extend_from_slice(&chunk[..bytes_read]);
+                ensure!(
+                    head.len() <= MAX_WS_HANDSHAKE_BYTES,
+                    "WebSocket upgrade response exceeded {MAX_WS_HANDSHAKE_BYTES} bytes"
+                );
+                if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
 async fn verify_cipherscan_websocket(cipherscan_addr: SocketAddr) -> eyre::Result<()> {
     let stream = TcpStream::connect(cipherscan_addr).await?;
     let req = format!(
@@ -496,16 +572,9 @@ async fn verify_cipherscan_websocket(cipherscan_addr: SocketAddr) -> eyre::Resul
             Err(err) => return Err(err.into()),
         }
     }
-    let mut response_buf = vec![0_u8; 1024];
-    let bytes_read = loop {
-        stream.readable().await?;
-        match stream.try_read(&mut response_buf) {
-            Ok(read_count) => break read_count,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(err.into()),
-        }
-    };
-    let headers = String::from_utf8_lossy(&response_buf[..bytes_read]);
+    let headers = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, read_http_response_head(&stream))
+        .await
+        .map_err(|_| eyre!("timed out waiting for WebSocket upgrade response headers"))??;
     ensure!(
         headers.starts_with("HTTP/1.1 101 Switching Protocols"),
         "expected WebSocket 101 Switching Protocols, got: {headers}"
@@ -513,25 +582,166 @@ async fn verify_cipherscan_websocket(cipherscan_addr: SocketAddr) -> eyre::Resul
     Ok(())
 }
 
-async fn verify_cipherscan_requires_both_planes(
+struct SupervisedCipherscan {
+    listen_addr: SocketAddr,
+    ops_addr: SocketAddr,
+    readiness: Readiness,
+    ops_handle: OpsEndpointHandle,
+    cancel: CancellationToken,
+    task: JoinHandle<eyre::Result<()>>,
+}
+
+async fn spawn_cipherscan_ops(
+    readiness: Readiness,
+) -> eyre::Result<(SocketAddr, OpsEndpointHandle)> {
+    let ops_addr = reserve_loopback_addr().await?;
+    let ops_handle = spawn_ops_endpoint_for(
+        RuntimeService::CompatCipherscan,
+        Some(ops_addr),
+        env!("CARGO_PKG_VERSION"),
+        encode_zinder_native_chain_name(Network::ZcashRegtest),
+        readiness,
+        Arc::from([]),
+    )
+    .await?
+    .ok_or_else(|| eyre!("expected ops endpoint handle for Cipherscan conformance test"))?;
+    Ok((ops_addr, ops_handle))
+}
+
+async fn verify_cipherscan_startup_gate_fails_closed(
+    explorer_addr: SocketAddr,
+    wallet_addr: SocketAddr,
+    outage_label: &str,
+) -> eyre::Result<()> {
+    let listen_addr = reserve_loopback_addr().await?;
+    let readiness = Readiness::default();
+    let (ops_addr, ops_handle) = spawn_cipherscan_ops(readiness.clone()).await?;
+    let http = reqwest::Client::new();
+    let pre_start_readyz = http.get(format!("http://{ops_addr}/readyz")).send().await?;
+    ensure!(
+        pre_start_readyz.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "/readyz must start at 503 before Cipherscan connects, got {}",
+        pre_start_readyz.status()
+    );
+
+    let config = build_cipherscan_config(listen_addr, explorer_addr, wallet_addr)?;
+    let startup = serve_supervised(config, readiness.clone(), CancellationToken::new()).await;
+    ensure!(
+        startup.is_err(),
+        "Cipherscan must fail closed during {outage_label}"
+    );
+    ensure!(
+        !readiness.report().is_ready,
+        "Cipherscan readiness must remain not_ready during {outage_label}"
+    );
+    let outage_readyz = http.get(format!("http://{ops_addr}/readyz")).send().await?;
+    ensure!(
+        outage_readyz.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "/readyz must return 503 during {outage_label}, got {}",
+        outage_readyz.status()
+    );
+    ensure!(
+        TcpStream::connect(listen_addr).await.is_err(),
+        "Cipherscan HTTP traffic gate must stay closed during {outage_label}"
+    );
+    ops_handle.shutdown().await?;
+    Ok(())
+}
+
+async fn spawn_supervised_cipherscan(
+    explorer_addr: SocketAddr,
+    wallet_addr: SocketAddr,
+) -> eyre::Result<SupervisedCipherscan> {
+    let listen_addr = reserve_loopback_addr().await?;
+    let readiness = Readiness::default();
+    let (ops_addr, ops_handle) = spawn_cipherscan_ops(readiness.clone()).await?;
+    let config = build_cipherscan_config(listen_addr, explorer_addr, wallet_addr)?;
+    let cancel = CancellationToken::new();
+    let serve_readiness = readiness.clone();
+    let serve_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        serve_supervised(config, serve_readiness, serve_cancel)
+            .await
+            .map_err(eyre::Report::from)
+    });
+
+    let http = reqwest::Client::new();
+    let readyz_url = format!("http://{ops_addr}/readyz");
+    tokio::time::timeout(READYZ_TIMEOUT, async {
+        loop {
+            ensure!(
+                !task.is_finished(),
+                "Cipherscan supervised server exited before becoming ready"
+            );
+            let resp = http.get(&readyz_url).send().await?;
+            if resp.status() == reqwest::StatusCode::OK && readiness.report().is_ready {
+                break Ok::<(), eyre::Report>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("timed out waiting for Cipherscan /readyz to become 200 OK"))??;
+    TcpStream::connect(listen_addr).await?;
+
+    Ok(SupervisedCipherscan {
+        listen_addr,
+        ops_addr,
+        readiness,
+        ops_handle,
+        cancel,
+        task,
+    })
+}
+
+async fn shutdown_supervised_cipherscan(cipherscan: SupervisedCipherscan) -> eyre::Result<()> {
+    cipherscan.cancel.cancel();
+    cipherscan.task.await??;
+    ensure!(
+        !cipherscan.readiness.report().is_ready,
+        "Cipherscan readiness must drain on cancellation"
+    );
+    let drained = reqwest::Client::new()
+        .get(format!("http://{}/readyz", cipherscan.ops_addr))
+        .send()
+        .await?;
+    ensure!(
+        drained.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "/readyz must return 503 after cancellation, got {}",
+        drained.status()
+    );
+    cipherscan.ops_handle.shutdown().await?;
+    Ok(())
+}
+
+async fn verify_cipherscan_runtime_wallet_outage(
     explorer_addr: SocketAddr,
     writer: &mut CanonicalWriterFixture,
     ingest_endpoint: &str,
 ) -> eyre::Result<()> {
-    let ephemeral_cancel = CancellationToken::new();
+    let wallet_cancel = CancellationToken::new();
     let (wallet_addr, _compat_addr, wallet_tasks) =
-        spawn_wallet_and_compat(writer, ingest_endpoint, &ephemeral_cancel).await?;
-    let cs_cancel = CancellationToken::new();
-    let (cs_addr, cs_task) = spawn_cipherscan_http(explorer_addr, wallet_addr, &cs_cancel).await?;
+        spawn_wallet_and_compat(writer, ingest_endpoint, &wallet_cancel).await?;
+    let cs = spawn_supervised_cipherscan(explorer_addr, wallet_addr).await?;
+    let http = reqwest::Client::new();
+    let pre_outage = http
+        .get(format!("http://{}/api/info", cs.listen_addr))
+        .send()
+        .await?;
+    ensure!(
+        pre_outage.status() == reqwest::StatusCode::OK,
+        "expected /api/info 200 OK when both upstreams are healthy, got {}",
+        pre_outage.status()
+    );
 
-    // Shut down ONLY WalletQuery so Cipherscan loses its wallet upstream while Explorer stays up.
-    ephemeral_cancel.cancel();
+    wallet_cancel.cancel();
     for handle in wallet_tasks {
         handle.await??;
     }
 
-    let wallet_dependent_resp = reqwest::Client::new()
-        .get(format!("http://{cs_addr}/api/blockchain-info"))
+    query_explorer_replica(explorer_addr).await?;
+    let wallet_dependent_resp = http
+        .get(format!("http://{}/api/blockchain-info", cs.listen_addr))
         .send()
         .await?;
     ensure!(
@@ -539,9 +749,77 @@ async fn verify_cipherscan_requires_both_planes(
         "Cipherscan must fail closed when WalletQuery is unreachable, got {}",
         wallet_dependent_resp.status()
     );
-    cs_cancel.cancel();
-    cs_task.await??;
-    Ok(())
+    shutdown_supervised_cipherscan(cs).await
+}
+
+async fn verify_cipherscan_runtime_explorer_outage(
+    canon_path: &Path,
+    wallet_healthy_addr: SocketAddr,
+) -> eyre::Result<()> {
+    let secondary_dir = TempDir::new()?;
+    let explorer_cancel = CancellationToken::new();
+    let (explorer_addr, explorer_task) = spawn_explorer_grpc(
+        canon_path,
+        secondary_dir.path(),
+        wallet_healthy_addr,
+        &explorer_cancel,
+    )
+    .await?;
+    let cs = spawn_supervised_cipherscan(explorer_addr, wallet_healthy_addr).await?;
+    let http = reqwest::Client::new();
+    let pre_outage = http
+        .get(format!("http://{}/api/uncles/stats", cs.listen_addr))
+        .send()
+        .await?;
+    ensure!(
+        pre_outage.status() == reqwest::StatusCode::OK,
+        "expected /api/uncles/stats 200 OK when both upstreams are healthy, got {}",
+        pre_outage.status()
+    );
+
+    explorer_cancel.cancel();
+    explorer_task.await??;
+
+    let wallet_channel =
+        connect_zinder_grpc(&format!("http://{wallet_healthy_addr}"), None).await?;
+    let tip_response = WalletQueryClient::new(wallet_channel)
+        .visible_tip_block(VisibleTipBlockRequest { at_epoch_id: None })
+        .await?;
+    ensure!(
+        tip_response.into_inner().visible_tip_block.is_some(),
+        "WalletQuery must stay healthy during ExplorerQuery-only outage"
+    );
+
+    let explorer_dependent_resp = http
+        .get(format!("http://{}/api/uncles/stats", cs.listen_addr))
+        .send()
+        .await?;
+    ensure!(
+        explorer_dependent_resp.status().is_server_error(),
+        "Cipherscan must fail closed when ExplorerQuery is unreachable, got {}",
+        explorer_dependent_resp.status()
+    );
+    shutdown_supervised_cipherscan(cs).await
+}
+
+async fn verify_cipherscan_requires_both_planes(
+    explorer_addr: SocketAddr,
+    canon_path: &Path,
+    wallet_healthy_addr: SocketAddr,
+    writer: &mut CanonicalWriterFixture,
+    ingest_endpoint: &str,
+) -> eyre::Result<()> {
+    let unreachable_addr = reserve_loopback_addr().await?;
+    verify_cipherscan_startup_gate_fails_closed(explorer_addr, unreachable_addr, "wallet outage")
+        .await?;
+    verify_cipherscan_startup_gate_fails_closed(
+        unreachable_addr,
+        wallet_healthy_addr,
+        "explorer outage",
+    )
+    .await?;
+    verify_cipherscan_runtime_wallet_outage(explorer_addr, writer, ingest_endpoint).await?;
+    verify_cipherscan_runtime_explorer_outage(canon_path, wallet_healthy_addr).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -572,6 +850,8 @@ async fn two_stateless_reader_replicas_serve_consistent_grpc_grpc_web_explorer_a
 
     verify_cipherscan_requires_both_planes(
         replica_a.addresses.explorer,
+        &canon_path,
+        replica_a.addresses.wallet,
         &mut writer,
         ingest_fixture.endpoint(),
     )

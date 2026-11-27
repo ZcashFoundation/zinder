@@ -9,13 +9,17 @@ POSTGRES_VERSIONS="18,17"
 ZINDER_IMAGE=""
 REPORT_DIR=""
 
+RUN_STATUS="failed"
+CURRENT_STAGE="initialization"
+FAIL_EXIT_CODE=0
+
 usage() {
   cat <<'EOF'
 Usage: scripts/run-postgres-testing-ground.sh [options]
 
 Options:
   --postgres-versions LIST   Comma-separated PG versions to test (default: 18,17; supported: 18, 17)
-  --zinder-image IMAGE       Optional Zinder OCI image (e.g. zinder:local) to verify --readers-only config & compose profile
+  --zinder-image IMAGE       Optional Zinder OCI image (e.g. zinder:local) for read-only --readers-only config check
   --report-dir DIR           Directory for report.json and report.md (default: .tmp/postgres-testing-ground-<utc>)
   -h, --help                 Show this help message
 EOF
@@ -54,13 +58,109 @@ fi
 mkdir -p "${REPORT_DIR}"
 REPORT_DIR="$(cd "${REPORT_DIR}" && pwd)"
 
+# Clear any prior reports or partial stage files so a failing rerun never leaves stale PASSED output.
+rm -f "${REPORT_DIR}/report.json" "${REPORT_DIR}/report.md" "${REPORT_DIR}/zinder-image.json" "${REPORT_DIR}"/pg-*.json
+
 PROJECT_NAME="zinder-pg-testing-ground-$$"
 export ZINDER_PG_TESTING_GROUND_PROJECT="${PROJECT_NAME}"
 
-cleanup() {
-  docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" --profile readers down -v --remove-orphans >/dev/null 2>&1 || true
+write_final_reports() {
+  local exit_code="$1"
+  python3 - "${REPORT_DIR}" "${TIMESTAMP_UTC}" "${RUN_STATUS}" "${CURRENT_STAGE}" "${exit_code}" <<'PY' || true
+import glob
+import json
+import os
+import sys
+
+report_dir, timestamp_utc, run_status, current_stage, raw_code = sys.argv[1:]
+exit_code = int(raw_code)
+pg_reports = []
+for path in sorted(glob.glob(os.path.join(report_dir, "pg-*.json"))):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            pg_reports.append(json.load(fh))
+    except Exception:
+        pass
+
+zinder_image_path = os.path.join(report_dir, "zinder-image.json")
+zinder_image_report = None
+if os.path.exists(zinder_image_path):
+    try:
+        with open(zinder_image_path, encoding="utf-8") as fh:
+            zinder_image_report = json.load(fh)
+    except Exception:
+        pass
+
+failed_stage = None if run_status == "passed" else current_stage
+summary = {
+    "status": run_status,
+    "failed_stage": failed_stage,
+    "exit_code": exit_code,
+    "generated_at_utc": timestamp_utc,
+    "postgres_runs": pg_reports,
+    "zinder_image_check": zinder_image_report,
 }
-trap cleanup EXIT INT TERM
+with open(os.path.join(report_dir, "report.json"), "w", encoding="utf-8") as fh:
+    json.dump(summary, fh, indent=2, sort_keys=True)
+
+lines = [
+    "# Stateless-Topology Testing Ground Report",
+    "",
+    f"- Status: **{run_status.upper()}**",
+    f"- Generated (UTC): `{timestamp_utc}`",
+    f"- Exit code: `{exit_code}`",
+]
+if failed_stage is not None:
+    lines.append(f"- Failed stage: `{failed_stage}`")
+lines.extend([
+    "",
+    "## PostgreSQL + PgBouncer + Mock R2 + Caddy Results",
+    "",
+    "| PG Version | Pool Mode | Pool Size | Distinct Backend PIDs | HTTP Replicas | gRPC-Web Replicas | Native h2c gRPC Replicas | R2 Fault Fallbacks |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+])
+for item in pg_reports:
+    pool = item["pgbouncer_transaction_pool"]
+    l7 = item["l7_round_robin"]
+    fallbacks = ", ".join(f"{k}->{v}" for k, v in sorted(item["r2_fault_fallbacks"].items()))
+    lines.append(
+        f"| {item['postgres_version']} | `{pool['pool_mode']}` | {pool['default_pool_size']} | "
+        f"{pool['distinct_backend_pids_observed']} | {', '.join(sorted(set(l7['http_replicas'])))} | "
+        f"{', '.join(sorted(set(l7['grpc_web_replicas'])))} | {', '.join(sorted(set(l7.get('grpc_h2c_replicas', []))))} | {fallbacks} |"
+    )
+
+if zinder_image_report is not None:
+    lines.extend([
+        "",
+        "## Stateless Reader Image Config Validation",
+        "",
+        f"- Image: `{zinder_image_report['image']}`",
+        f"- Validated `--readers-only` presets (`read_only: true`): `{', '.join(zinder_image_report['validated_presets'])}`",
+    ])
+
+with open(os.path.join(report_dir, "report.md"), "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+print(f"Wrote reports ({run_status}) to {report_dir}/report.json and {report_dir}/report.md")
+PY
+}
+
+on_exit() {
+  local exit_code="$?"
+  set +e
+  if [[ "${RUN_STATUS}" == "passed" ]]; then
+    exit_code=0
+  elif [[ "${exit_code}" -eq 0 && "${FAIL_EXIT_CODE}" -ne 0 ]]; then
+    exit_code="${FAIL_EXIT_CODE}"
+  elif [[ "${exit_code}" -eq 0 ]]; then
+    exit_code=1
+  fi
+  docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
+  write_final_reports "${exit_code}"
+  exit "${exit_code}"
+}
+trap on_exit EXIT
+trap 'FAIL_EXIT_CODE=130; exit 130' INT
+trap 'FAIL_EXIT_CODE=143; exit 143' TERM
 
 image_for_pg_version() {
   case "$1" in
@@ -95,14 +195,14 @@ PY
 }
 
 verify_compose_definitions() {
+  CURRENT_STAGE="compose_config_validation"
   docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" config --quiet
-  ZINDER_IMAGE="${ZINDER_IMAGE:-zinder:local}" \
-    docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" --profile readers config --quiet
 }
 
 verify_postgres_version() {
   local pg_ver="$1"
   local pg_image
+  CURRENT_STAGE="pg-${pg_ver}_image_resolution"
   pg_image="$(image_for_pg_version "${pg_ver}")"
 
   read -r pg_port pgb_port r2_port http_port grpc_port <<<"$(allocate_free_ports)"
@@ -113,10 +213,12 @@ verify_postgres_version() {
   export ZINDER_PG_TG_HTTP_PORT="${http_port}"
   export ZINDER_PG_TG_GRPC_PORT="${grpc_port}"
 
+  CURRENT_STAGE="pg-${pg_ver}_compose_up"
   echo "[pg-${pg_ver}] Starting stateless-topology testing ground (${pg_image})..."
-  docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" --profile readers down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
   docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" up -d --wait
 
+  CURRENT_STAGE="pg-${pg_ver}_durability_and_roles"
   echo "[pg-${pg_ver}] Checking PostgreSQL durability & least-privilege roles..."
   local pg_settings
   pg_settings="$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD=zinder_pg_superuser_local_only postgres \
@@ -156,6 +258,7 @@ verify_postgres_version() {
     psql -w -h pgbouncer -p 6432 -U zinder_writer -d zinder_testing -Atc \
     "INSERT INTO zinder.topology_probe (id, epoch_label) VALUES (2, 'writer-ok'); DELETE FROM zinder.topology_probe WHERE id = 2;" >/dev/null
 
+  CURRENT_STAGE="pg-${pg_ver}_pgbouncer_pooling"
   echo "[pg-${pg_ver}] Checking PgBouncer transaction pool config & concurrency..."
   local pgb_cfg
   pgb_cfg="$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD=zinder_admin_local_only pgbouncer \
@@ -169,7 +272,6 @@ verify_postgres_version() {
   local max_server_conns distinct_pids
   distinct_pids="$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD=zinder_reader_local_only postgres \
     bash -c '
-      pids=""
       for i in 1 2 3 4 5 6 7 8; do
         psql -w -h pgbouncer -p 6432 -U zinder_reader -d zinder_testing -Atc \
           "SELECT pg_backend_pid(), count(*) FROM zinder.topology_probe; SELECT pg_sleep(0.05); SELECT pg_backend_pid();" &
@@ -187,32 +289,37 @@ verify_postgres_version() {
     return 1
   fi
 
-  echo "[pg-${pg_ver}] Checking read-only probe replicas, Caddy non-sticky L7 routing & Mock R2 faults..."
+  CURRENT_STAGE="pg-${pg_ver}_r2_and_l7_proxy"
+  echo "[pg-${pg_ver}] Checking Mock R2 immutability/HEAD/faults & Caddy REST/gRPC-Web/h2c routing..."
   local version_report="${REPORT_DIR}/pg-${pg_ver}.json"
-  python3 - "${PROJECT_NAME}" "${pg_ver}" "${r2_port}" "${http_port}" "${grpc_port}" "${distinct_pids}" "${max_server_conns:-0}" "${version_report}" <<'PY'
+  python3 - "${PROJECT_NAME}" "${COMPOSE_FILE}" "${pg_ver}" "${r2_port}" "${http_port}" "${grpc_port}" "${distinct_pids}" "${max_server_conns:-0}" "${version_report}" <<'PY'
 import base64
 import hashlib
+import http.client
 import json
 import struct
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
 (
     project_name,
+    compose_file,
     pg_ver,
-    r2_port,
-    http_port,
-    grpc_port,
+    r2_port_str,
+    http_port_str,
+    grpc_port_str,
     distinct_pids,
     max_server_conns,
     out_path,
 ) = sys.argv[1:]
 
+r2_port = int(r2_port_str)
 r2_base = f"http://127.0.0.1:{r2_port}"
-http_base = f"http://127.0.0.1:{http_port}"
-grpc_base = f"http://127.0.0.1:{grpc_port}"
+http_base = f"http://127.0.0.1:{http_port_str}"
+grpc_base = f"http://127.0.0.1:{grpc_port_str}"
 
 def http_json(method: str, url: str, body_obj: dict | None = None) -> tuple[int, dict, dict]:
     data = json.dumps(body_obj).encode("utf-8") if body_obj is not None else None
@@ -225,12 +332,17 @@ def http_json(method: str, url: str, body_obj: dict | None = None) -> tuple[int,
         raw = err.read().decode("utf-8")
         return err.code, dict(err.headers), json.loads(raw)
 
+def assert_head_bodyless_persistent(conn: http.client.HTTPConnection, path: str, expected_status: int, headers: dict | None = None) -> None:
+    conn.request("HEAD", path, headers=headers or {})
+    resp = conn.getresponse()
+    body = resp.read()
+    assert resp.status == expected_status, f"HEAD {path}: expected {expected_status}, got {resp.status}"
+    assert body == b"", f"HEAD {path}: expected empty body, got {len(body)} bytes: {body!r}"
+
 # 1. Inspect probe containers for ReadOnlyRootfs and zero persistent volumes.
 for svc in ("probe-reader-a", "probe-reader-b"):
     cid = subprocess.check_output(
-        ["docker", "compose", "-p", project_name, "-f",
-         f"{sys.path[0] or '.'}/deploy/bench/postgres-testing-ground/docker-compose.yml" if False else "deploy/bench/postgres-testing-ground/docker-compose.yml",
-         "ps", "-q", svc],
+        ["docker", "compose", "-p", project_name, "-f", compose_file, "ps", "-q", svc],
         text=True,
     ).strip()
     inspected = json.loads(subprocess.check_output(["docker", "inspect", cid], text=True))[0]
@@ -243,7 +355,7 @@ for path in ("/healthz", "/readyz"):
     code, _, body = http_json("GET", f"{http_base}{path}")
     assert code == 200 and body["readonly_rootfs"] is True and body["local_db_files"] == [], body
 
-# 3. Mock R2 PUT / GET / Range / fault validation & fallback paths.
+# 3. Mock R2 immutable PUT / GET / Range / HEAD persistence / fault injection.
 payload = b"zinder-settled-segment-0001-" * 8
 expected_sha = hashlib.sha256(payload).hexdigest()
 req = urllib.request.Request(f"{r2_base}/segments/seg-0001.bin", data=payload, method="PUT")
@@ -251,6 +363,26 @@ with urllib.request.urlopen(req, timeout=5.0) as resp:
     assert resp.status == 201
     put_body = json.loads(resp.read().decode("utf-8"))
     assert put_body["sha256"] == expected_sha
+
+# Identical PUT retry is idempotent (200) and does not double-count puts.
+_, _, metrics_after_first_put = http_json("GET", f"{r2_base}/metrics")
+retry_req = urllib.request.Request(f"{r2_base}/segments/seg-0001.bin", data=payload, method="PUT")
+with urllib.request.urlopen(retry_req, timeout=5.0) as resp:
+    assert resp.status == 200
+    retry_body = json.loads(resp.read().decode("utf-8"))
+    assert retry_body["sha256"] == expected_sha and retry_body.get("idempotent") is True
+
+# Conflicting PUT to an existing key fails with 409 Conflict without mutating origin payload or puts.
+conflict_req = urllib.request.Request(f"{r2_base}/segments/seg-0001.bin", data=b"tampered-payload", method="PUT")
+try:
+    urllib.request.urlopen(conflict_req, timeout=5.0)
+    raise AssertionError("conflicting PUT to existing segment key must return 409")
+except urllib.error.HTTPError as err:
+    assert err.code == 409, f"expected 409 Conflict, got {err.code}"
+    conflict_body = json.loads(err.read().decode("utf-8"))
+    assert conflict_body["existing_sha256"] == expected_sha
+_, _, metrics_after_conflict = http_json("GET", f"{r2_base}/metrics")
+assert metrics_after_conflict["puts"] == metrics_after_first_put["puts"], (metrics_after_first_put, metrics_after_conflict)
 
 with urllib.request.urlopen(urllib.request.Request(f"{r2_base}/segments/seg-0001.bin"), timeout=5.0) as resp:
     assert resp.status == 200
@@ -262,6 +394,25 @@ with urllib.request.urlopen(range_req, timeout=5.0) as resp:
     assert resp.status == 206
     assert resp.read() == payload[:16]
     assert resp.headers.get("Content-Range") == f"bytes 0-15/{len(payload)}"
+
+# HEAD requests over one persistent HTTP/1.1 connection must write zero body bytes on errors and success.
+conn = http.client.HTTPConnection("127.0.0.1", r2_port, timeout=5.0)
+try:
+    assert_head_bodyless_persistent(conn, "/segments/seg-0001.bin", 200)
+    assert_head_bodyless_persistent(conn, "/segments/missing-segment.bin", 404)
+    assert_head_bodyless_persistent(conn, "/segments/seg-0001.bin", 416, headers={"Range": "bytes=99999-100000"})
+    http_json("POST", f"{r2_base}/fault", {"mode": "miss_404", "delay_ms": 0})
+    assert_head_bodyless_persistent(conn, "/segments/seg-0001.bin", 404)
+    http_json("POST", f"{r2_base}/fault", {"mode": "outage_503", "delay_ms": 0})
+    assert_head_bodyless_persistent(conn, "/segments/seg-0001.bin", 503)
+    http_json("POST", f"{r2_base}/fault", {"mode": "normal", "delay_ms": 0})
+    # Persistent connection must remain cleanly usable for a subsequent GET after error HEAD responses.
+    conn.request("GET", "/segments/seg-0001.bin")
+    follow_resp = conn.getresponse()
+    follow_body = follow_resp.read()
+    assert follow_resp.status == 200 and follow_body == payload
+finally:
+    conn.close()
 
 # Invalid /fault must fail closed (400) without mutating fault state.
 for bad in ({"mode": "bogus"}, {"mode": "timeout_ms", "delay_ms": -1}):
@@ -289,8 +440,8 @@ for fault_cfg, expected_reason in [
 
 http_json("POST", f"{r2_base}/fault", {"mode": "normal", "delay_ms": 0})
 _, _, r2_metrics = http_json("GET", f"{r2_base}/metrics")
-assert r2_metrics["hits"] >= 2 and r2_metrics["range_hits"] >= 1
-assert r2_metrics["misses"] >= 1 and r2_metrics["outage_503"] >= 1
+assert r2_metrics["hits"] >= 3 and r2_metrics["range_hits"] >= 1
+assert r2_metrics["misses"] >= 2 and r2_metrics["outage_503"] >= 2
 assert r2_metrics["timeout_injections"] >= 1 and r2_metrics["corrupt_injections"] >= 1
 
 # 4. Caddy round-robin over HTTP REST and gRPC-Web (binary + text).
@@ -314,6 +465,7 @@ for ct, raw in [
     )
     with urllib.request.urlopen(req, timeout=5.0) as resp:
         assert resp.status == 200
+        assert ct.split("+", 1)[0] in resp.headers.get("Content-Type", "")
         wire = resp.read()
         decoded = base64.b64decode(wire) if "grpc-web-text" in ct else wire
         assert decoded[0] == 0
@@ -322,6 +474,55 @@ for ct, raw in [
         grpc_web_replicas.append(resp.headers.get("X-Zinder-Replica"))
 
 assert set(grpc_web_replicas) == {"probe-reader-a", "probe-reader-b"}, grpc_web_replicas
+
+# 5. Native HTTP/2 h2c gRPC (application/grpc + HTTP trailers) through Caddy :9067.
+grpc_h2c_replicas = []
+with tempfile.TemporaryDirectory() as tmpd:
+    req_bin = f"{tmpd}/grpc-req.bin"
+    with open(req_bin, "wb") as fh:
+        fh.write(frame)
+    for idx in range(6):
+        hdr_file = f"{tmpd}/hdr-{idx}.txt"
+        body_file = f"{tmpd}/body-{idx}.bin"
+        status_code = subprocess.check_output(
+            [
+                "curl",
+                "-sS",
+                "--http2-prior-knowledge",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/grpc",
+                "-H",
+                "TE: trailers",
+                "--data-binary",
+                f"@{req_bin}",
+                "-D",
+                hdr_file,
+                "-o",
+                body_file,
+                "-w",
+                "%{http_code}",
+                f"{grpc_base}/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+            ],
+            text=True,
+        ).strip()
+        assert status_code == "200", f"h2c gRPC call {idx} returned HTTP {status_code}"
+        raw_hdrs = open(hdr_file, encoding="utf-8", errors="replace").read().lower()
+        assert "content-type: application/grpc" in raw_hdrs, raw_hdrs
+        assert "grpc-status: 0" in raw_hdrs, f"missing trailing grpc-status: 0 in:\n{raw_hdrs}"
+        replica_hdr = None
+        for line in raw_hdrs.splitlines():
+            if line.startswith("x-zinder-replica:"):
+                replica_hdr = line.split(":", 1)[1].strip()
+        assert replica_hdr in {"probe-reader-a", "probe-reader-b"}, raw_hdrs
+        body_bytes = open(body_file, "rb").read()
+        assert len(body_bytes) >= 5 and body_bytes[0] == 0
+        msg_len = struct.unpack(">I", body_bytes[1:5])[0]
+        assert len(body_bytes) == 5 + msg_len and msg_len > 0
+        grpc_h2c_replicas.append(replica_hdr)
+
+assert set(grpc_h2c_replicas) == {"probe-reader-a", "probe-reader-b"}, grpc_h2c_replicas
 
 report = {
     "postgres_version": pg_ver,
@@ -337,41 +538,25 @@ report = {
     "l7_round_robin": {
         "http_replicas": http_replicas,
         "grpc_web_replicas": grpc_web_replicas,
+        "grpc_h2c_replicas": grpc_h2c_replicas,
     },
 }
 with open(out_path, "w", encoding="utf-8") as fh:
     json.dump(report, fh, indent=2, sort_keys=True)
 PY
 
-  docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" --profile readers down -v --remove-orphans >/dev/null
+  docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null
 }
 
 verify_zinder_image_readers_only() {
+  CURRENT_STAGE="zinder_image_readers_only_validation"
   local zinder_out="${REPORT_DIR}/zinder-image.json"
-  python3 - "${ZINDER_IMAGE}" "${PROJECT_NAME}" "${COMPOSE_FILE}" "${zinder_out}" <<'PY'
+  python3 - "${ZINDER_IMAGE}" "${zinder_out}" <<'PY'
 import json
-import os
 import subprocess
 import sys
 
-image, project_name, compose_file, out_path = sys.argv[1:]
-env = dict(os.environ)
-env["ZINDER_IMAGE"] = image
-rendered = subprocess.check_output(
-    ["docker", "compose", "-p", project_name, "-f", compose_file, "--profile", "readers", "config", "--format", "json"],
-    env=env,
-    text=True,
-)
-cfg = json.loads(rendered)
-profile_services = {}
-for svc in ("zinder-reader-a", "zinder-reader-b"):
-    spec = cfg["services"][svc]
-    assert spec.get("read_only") is True, f"{svc} must set read_only: true"
-    assert not spec.get("volumes"), f"{svc} must declare zero persistent volumes"
-    cmd = spec.get("command", [])
-    assert "--readers-only" in cmd, f"{svc} must pass --readers-only"
-    profile_services[svc] = {"read_only": True, "command": cmd}
-
+image, out_path = sys.argv[1:]
 validated_presets = []
 for preset in ("light-wallet", "wallet", "explorer"):
     subprocess.check_call(
@@ -398,7 +583,7 @@ for preset in ("light-wallet", "wallet", "explorer"):
     validated_presets.append(preset)
 
 with open(out_path, "w", encoding="utf-8") as fh:
-    json.dump({"image": image, "profile_services": profile_services, "validated_presets": validated_presets}, fh, indent=2, sort_keys=True)
+    json.dump({"image": image, "validated_presets": validated_presets}, fh, indent=2, sort_keys=True)
 PY
 }
 
@@ -413,68 +598,9 @@ for raw_ver in "${VERSION_ARRAY[@]}"; do
 done
 
 if [[ -n "${ZINDER_IMAGE}" ]]; then
-  echo "[readers] Verifying ${ZINDER_IMAGE} --readers-only compose profile and presets..."
+  echo "[readers] Verifying ${ZINDER_IMAGE} --readers-only presets under --read-only..."
   verify_zinder_image_readers_only
 fi
 
-python3 - "${REPORT_DIR}" "${TIMESTAMP_UTC}" <<'PY'
-import glob
-import json
-import os
-import sys
-
-report_dir, timestamp_utc = sys.argv[1:]
-pg_reports = []
-for path in sorted(glob.glob(os.path.join(report_dir, "pg-*.json"))):
-    with open(path, encoding="utf-8") as fh:
-        pg_reports.append(json.load(fh))
-
-zinder_image_path = os.path.join(report_dir, "zinder-image.json")
-zinder_image_report = None
-if os.path.exists(zinder_image_path):
-    with open(zinder_image_path, encoding="utf-8") as fh:
-        zinder_image_report = json.load(fh)
-
-summary = {
-    "status": "passed",
-    "generated_at_utc": timestamp_utc,
-    "postgres_runs": pg_reports,
-    "zinder_image_check": zinder_image_report,
-}
-with open(os.path.join(report_dir, "report.json"), "w", encoding="utf-8") as fh:
-    json.dump(summary, fh, indent=2, sort_keys=True)
-
-lines = [
-    "# Stateless-Topology Testing Ground Report",
-    "",
-    f"- Status: **PASSED**",
-    f"- Generated (UTC): `{timestamp_utc}`",
-    "",
-    "## PostgreSQL + PgBouncer + Mock R2 + Caddy Results",
-    "",
-    "| PG Version | Pool Mode | Pool Size | Distinct Backend PIDs | HTTP Replicas | gRPC-Web Replicas | R2 Fault Fallbacks |",
-    "| --- | --- | --- | --- | --- | --- | --- |",
-]
-for item in pg_reports:
-    pool = item["pgbouncer_transaction_pool"]
-    l7 = item["l7_round_robin"]
-    fallbacks = ", ".join(f"{k}->{v}" for k, v in sorted(item["r2_fault_fallbacks"].items()))
-    lines.append(
-        f"| {item['postgres_version']} | `{pool['pool_mode']}` | {pool['default_pool_size']} | "
-        f"{pool['distinct_backend_pids_observed']} | {', '.join(sorted(set(l7['http_replicas'])))} | "
-        f"{', '.join(sorted(set(l7['grpc_web_replicas'])))} | {fallbacks} |"
-    )
-
-if zinder_image_report is not None:
-    lines.extend([
-        "",
-        "## Stateless Reader Container Image Check",
-        "",
-        f"- Image: `{zinder_image_report['image']}`",
-        f"- Validated `--readers-only` presets (`read_only: true`): `{', '.join(zinder_image_report['validated_presets'])}`",
-    ])
-
-with open(os.path.join(report_dir, "report.md"), "w", encoding="utf-8") as fh:
-    fh.write("\n".join(lines) + "\n")
-print(f"Wrote reports to {report_dir}/report.json and {report_dir}/report.md")
-PY
+CURRENT_STAGE="complete"
+RUN_STATUS="passed"

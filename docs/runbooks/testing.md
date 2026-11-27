@@ -98,7 +98,7 @@ ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_
 
 #### Containerized stateless-topology testing ground
 
-Run the disposable PostgreSQL 17/18 + `PgBouncer` (`pool_mode = transaction`) + Mock R2 + non-sticky Caddy L7 proxy verification harness (plus optional `zinder:local --readers-only` image check):
+Run the disposable PostgreSQL 17/18 + `PgBouncer` (`pool_mode = transaction`) + Mock R2 + non-sticky Caddy L7 proxy verification harness (plus optional `--zinder-image` `--readers-only` read-only config validation):
 
 ```bash
 scripts/run-postgres-testing-ground.sh --postgres-versions 18,17 --zinder-image zinder:local

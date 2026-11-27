@@ -72,7 +72,8 @@ class MockR2Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
-        self.wfile.write(encoded)
+        if self.command != "HEAD":
+            self.wfile.write(encoded)
 
     def _read_body(self) -> bytes | None:
         raw_len = self.headers.get("Content-Length")
@@ -107,9 +108,36 @@ class MockR2Handler(BaseHTTPRequestHandler):
         if body is None:
             return
         digest = hashlib.sha256(body).hexdigest()
+        existing_digest = None
+        put_outcome = "created"
         with STATE.lock:
-            STATE.objects[key] = (body, digest)
-            STATE.metrics["puts"] += 1
+            existing = STATE.objects.get(key)
+            if existing is not None:
+                existing_body, existing_digest = existing
+                if existing_digest != digest or existing_body != body:
+                    put_outcome = "conflict"
+                else:
+                    put_outcome = "idempotent"
+            else:
+                STATE.objects[key] = (body, digest)
+                STATE.metrics["puts"] += 1
+        if put_outcome == "conflict":
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": "segment key already exists with different payload",
+                    "key": key,
+                    "existing_sha256": existing_digest,
+                    "requested_sha256": digest,
+                },
+            )
+            return
+        if put_outcome == "idempotent":
+            self._send_json(
+                HTTPStatus.OK,
+                {"key": key, "bytes": len(body), "sha256": digest, "idempotent": True},
+            )
+            return
         self._send_json(HTTPStatus.CREATED, {"key": key, "bytes": len(body), "sha256": digest})
 
     def do_POST(self) -> None:
