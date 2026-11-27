@@ -158,11 +158,16 @@ singleflight deduplication. Opening `ZSHRNG02` never touches `ZSTSUP01` or
 
 During cold store admission (`verify_pinned_segments_into_cache`), storage
 admission checks `kernel_verified()` on each pinned `ZSHRNG02`, `ZSTSUP01`, and
-`ZSBLKB01` segment reader. Cold admission stays `O(index)` only when kernel
-`fs-verity` verification confirms the file digest; when kernel `fs-verity` is
-not active on the segment files, cold admission falls back to full-payload
-verification (`verify_full_payload`) across all three segment formats before
-admitting the store.
+`ZSBLKB01` segment reader. `O(index)` describes opening and index
+authentication for an individual segment reader rather than total cold store
+admission: when kernel `fs-verity` verification confirms a file digest,
+per-file `verify_full_payload` scans are skipped, whereas without kernel
+`fs-verity` admission falls back to full-payload verification across all three
+segment formats. Cold admission also verifies cross-stride and cross-module
+linkage across pinned segments (boundary block checks and, when both
+`ZSTSUP01` and `ZSBLKB01` are present, `verify_raw_against_supplement_range`,
+which reads and decodes every `ZSTSUP01` chunk to cross-check raw-block
+digests).
 
 ### Canonical read path
 
