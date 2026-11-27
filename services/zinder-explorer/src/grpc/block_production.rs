@@ -460,6 +460,8 @@ struct TimeRangeReadParams<'a> {
     cursor: Option<&'a DecodedTimeCursor>,
 }
 
+const MAX_TIME_RANGE_SCANNED_CANDIDATES: usize = 4_096;
+
 struct TimeRangePageOutcome {
     epoch: ChainEpoch,
     points: Vec<BlockProductionPoint>,
@@ -510,6 +512,7 @@ fn read_block_production_in_time_range_sync(
             after: params.cursor.map(|cursor| cursor.time_cursor),
             maximum_height: Some(params.epoch.visible_tip_height),
             limit: params.max_entries as usize,
+            max_scanned_rows: Some(MAX_TIME_RANGE_SCANNED_CANDIDATES),
         },
     )
     .map_err(|error| ExplorerError::internal(error.to_string()))?;
@@ -536,6 +539,7 @@ fn read_block_production_in_time_range_sync(
         mv_coverage,
         missing_block_count: evaluated.missing_block_count,
         mv_matches_canonical_epoch,
+        scan_exhausted: page.scan_exhausted,
     });
     let next_cursor = page.next_cursor.map_or_else(Vec::new, |cursor| {
         encode_time_cursor(params.start_time, params.end_time, &read_fence, cursor)
@@ -635,6 +639,7 @@ struct TimeRangeCoverageInput {
     mv_coverage: Option<BlockProductionTimeBackfillCoverage>,
     missing_block_count: u32,
     mv_matches_canonical_epoch: bool,
+    scan_exhausted: bool,
 }
 
 fn build_time_range_coverage_and_fence(
@@ -650,8 +655,10 @@ fn build_time_range_coverage_and_fence(
         mv_coverage,
         missing_block_count,
         mv_matches_canonical_epoch,
+        scan_exhausted,
     } = input;
-    let requested_range_complete = missing_block_count == 0
+    let requested_range_complete = !scan_exhausted
+        && missing_block_count == 0
         && mv_matches_canonical_epoch
         && first_retained == BlockHeight::new(1)
         && mv_coverage.is_some_and(|cov| {
@@ -807,4 +814,68 @@ fn read_cursor_array<const N: usize>(raw: &[u8], offset: usize) -> Result<[u8; N
             ExplorerError::invalid_request("block-production-time continuation cursor truncated")
                 .into()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        missing_docs,
+        reason = "Unit test names describe the behavior under test."
+    )]
+
+    use zinder_core::{
+        ArtifactSchemaVersion, ChainEpochId, ChainTipMetadata, Network, UnixTimestampMillis,
+    };
+
+    use super::*;
+
+    #[test]
+    fn exhausted_scan_budget_forces_incomplete_time_range_coverage() {
+        let tip_hash = BlockHash::from_bytes([0x22; 32]);
+        let epoch = ChainEpoch {
+            id: ChainEpochId::new(1),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(10),
+            visible_tip_hash: tip_hash,
+            settled_tip_height: BlockHeight::new(1),
+            settled_tip_hash: BlockHash::from_bytes([0x11; 32]),
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::new(0, 0, 0),
+            created_at: UnixTimestampMillis::new(1_750_000_000_000),
+        };
+        let mv_state = MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(1),
+            tip_height: BlockHeight::new(10),
+            tip_hash,
+            revision: 1,
+            coverage: None,
+        };
+        let mv_coverage = Some(BlockProductionTimeBackfillCoverage::new(
+            BlockHeight::new(1),
+            BlockHeight::new(10),
+            100,
+            200,
+        ));
+        let (complete_cov, _) = build_time_range_coverage_and_fence(TimeRangeCoverageInput {
+            first_retained: BlockHeight::new(1),
+            epoch,
+            mv_state,
+            mv_coverage,
+            missing_block_count: 0,
+            mv_matches_canonical_epoch: true,
+            scan_exhausted: false,
+        });
+        assert!(complete_cov.requested_range_complete);
+
+        let (exhausted_cov, _) = build_time_range_coverage_and_fence(TimeRangeCoverageInput {
+            first_retained: BlockHeight::new(1),
+            epoch,
+            mv_state,
+            mv_coverage,
+            missing_block_count: 0,
+            mv_matches_canonical_epoch: true,
+            scan_exhausted: true,
+        });
+        assert!(!exhausted_cov.requested_range_complete);
+    }
 }

@@ -19,7 +19,10 @@ use super::{
     },
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     control::encode_ready_store_control_with_revisions,
-    displaced_archive::reindex_test_archive_with_roots,
+    displaced_archive::{
+        backfill_test_root_index_with_batch_limit, reindex_test_archive_with_roots,
+        stage_partial_test_root_backfill_first_block,
+    },
     live_replacement_tests::{
         canonical_block, open_store, open_store_with_retention, published_store,
         published_store_with_retention, replacement_block, replacement_block_with_retention,
@@ -2446,7 +2449,7 @@ fn strip_displaced_root_index_rows(
 }
 
 #[test]
-fn canonical_secondary_fallback_reports_archive_wide_counts_and_primary_reopen_backfills()
+fn canonical_secondary_fallback_bounds_work_and_primary_reopen_backfills()
 -> Result<(), Box<dyn std::error::Error>> {
     use zinder_core::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot};
 
@@ -2499,9 +2502,19 @@ fn canonical_secondary_fallback_reports_archive_wide_counts_and_primary_reopen_b
         BlockHash::from_bytes([4; 32])
     );
     assert!(page.has_more && !page.scan_complete);
-    let cov = page.coverage.ok_or("missing legacy coverage")?;
-    assert_eq!(cov.captured_block_count, 2);
-    assert_eq!(cov.root_artifact_unavailable_count, 1);
+    let partial_cov = page.coverage.ok_or("missing partial legacy coverage")?;
+    assert_eq!(partial_cov.captured_block_count, 2);
+    assert_eq!(partial_cov.root_artifact_unavailable_count, 0);
+
+    let ten = NonZeroU32::new(10).ok_or("nonzero limit")?;
+    let full_legacy =
+        secondary.search_displaced_final_note_commitment_roots_page(matched_root, None, ten)?;
+    assert_eq!(full_legacy.matches.len(), 2);
+    assert_eq!(full_legacy.scanned_work, 2);
+    assert!(!full_legacy.has_more && full_legacy.scan_complete);
+    let full_cov = full_legacy.coverage.ok_or("missing full legacy coverage")?;
+    assert_eq!(full_cov.captured_block_count, 2);
+    assert_eq!(full_cov.root_artifact_unavailable_count, 1);
 
     drop(secondary);
     let _primary = open_store(&store_path, &activations, REORG_WINDOW)?;
@@ -2519,5 +2532,197 @@ fn canonical_secondary_fallback_reports_archive_wide_counts_and_primary_reopen_b
     let indexed_cov = indexed.coverage.ok_or("missing backfilled coverage")?;
     assert_eq!(indexed_cov.captured_block_count, 2);
     assert_eq!(indexed_cov.root_artifact_unavailable_count, 1);
+    Ok(())
+}
+
+struct ReindexedArchiveFixture {
+    store: super::RocksDbCanonicalStore,
+    activations: zinder_core::NetworkUpgradeActivations,
+    first_key: Vec<u8>,
+    first_val: Vec<u8>,
+}
+
+fn open_reindexed_archive_for_mutation(
+    store_path: &std::path::Path,
+) -> Result<ReindexedArchiveFixture, Box<dyn std::error::Error>> {
+    use rust_rocksdb::IteratorMode;
+    use zinder_core::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot};
+
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let root_a = FinalNoteCommitmentRoot::from_bytes([0x61; 32]);
+    let b3 = BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32]));
+    let b4 = BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32]));
+    let staged_roots = [
+        (
+            b3,
+            BlockFinalNoteCommitmentRoots::new(b3.height, b3.hash, Some(root_a), None, None),
+        ),
+        (
+            b4,
+            BlockFinalNoteCommitmentRoots::new(b4.height, b4.hash, Some(root_a), None, None),
+        ),
+    ];
+    let store = published_store(
+        store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let store = replace_heights_3_and_4(
+        store,
+        &activations,
+        RawBlobRetention::Transactions,
+        1_750_000_000_010,
+    )?;
+    reindex_test_archive_with_roots(&store, &staged_roots)?;
+    let archive_cf = column_family(&store.bounded_open.db, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)?;
+    let mut first_index_entry = None;
+    for entry in store
+        .bounded_open
+        .db
+        .iterator_cf(&archive_cf, IteratorMode::Start)
+    {
+        let (key, val) = entry?;
+        if key.first() == Some(&0x04) {
+            first_index_entry = Some((key.to_vec(), val.to_vec()));
+            break;
+        }
+    }
+    let (first_key, first_val) = first_index_entry.ok_or("expected [0x04] row")?;
+    drop(archive_cf);
+    Ok(ReindexedArchiveFixture {
+        store,
+        activations,
+        first_key,
+        first_val,
+    })
+}
+
+#[test]
+fn cold_admission_rejects_missing_extra_or_mismatched_displaced_root_index_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    // (a) Deleting one [0x04] row while retaining [0x05] = 0 must fail cold admission.
+    {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("missing-row");
+        let fixture = open_reindexed_archive_for_mutation(&store_path)?;
+        let archive_cf = column_family(
+            &fixture.store.bounded_open.db,
+            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
+        )?;
+        fixture
+            .store
+            .bounded_open
+            .db
+            .delete_cf(&archive_cf, &fixture.first_key)?;
+        fixture.store.bounded_open.db.flush_wal(true)?;
+        drop(archive_cf);
+        let activations = fixture.activations;
+        drop(fixture.store);
+        assert!(open_store(&store_path, &activations, REORG_WINDOW).is_err());
+    }
+
+    // (b) An extra [0x04] row not backed by any archived block must fail cold admission.
+    {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("extra-row");
+        let mut fixture = open_reindexed_archive_for_mutation(&store_path)?;
+        fixture.first_key[1] ^= 0xff;
+        let archive_cf = column_family(
+            &fixture.store.bounded_open.db,
+            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
+        )?;
+        fixture.store.bounded_open.db.put_cf(
+            &archive_cf,
+            &fixture.first_key,
+            &fixture.first_val,
+        )?;
+        fixture.store.bounded_open.db.flush_wal(true)?;
+        drop(archive_cf);
+        let activations = fixture.activations;
+        drop(fixture.store);
+        assert!(open_store(&store_path, &activations, REORG_WINDOW).is_err());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn interrupted_batched_root_index_backfill_resumes_and_publishes_marker_last()
+-> Result<(), Box<dyn std::error::Error>> {
+    use zinder_core::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot};
+
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let root_a = FinalNoteCommitmentRoot::from_bytes([0x88; 32]);
+    let b4 = BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32]));
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let store = replace_heights_3_and_4(
+        store,
+        &activations,
+        RawBlobRetention::Transactions,
+        1_750_000_000_010,
+    )?;
+    let b4_roots =
+        BlockFinalNoteCommitmentRoots::new(b4.height, b4.hash, Some(root_a), Some(root_a), None);
+    reindex_test_archive_with_roots(&store, &[(b4, b4_roots)])?;
+    strip_displaced_root_index_rows(&store)?;
+
+    // Run 1-block batched backfill on an unindexed store and simulate crash after block 1.
+    stage_partial_test_root_backfill_first_block(&store)?;
+    drop(store);
+
+    let secondary_mid = open_secondary(
+        &store_path,
+        temporary.path().join("secondary-mid"),
+        &activations,
+        RawBlobRetention::Transactions,
+    )??;
+    let one = NonZeroU32::new(1).ok_or("nonzero limit")?;
+    let fallback_page =
+        secondary_mid.search_displaced_final_note_commitment_roots_page(root_a, None, one)?;
+    assert_eq!(fallback_page.matches.len(), 1);
+    assert!(fallback_page.has_more && !fallback_page.scan_complete);
+    drop(secondary_mid);
+
+    let resumed_primary = open_store(&store_path, &activations, REORG_WINDOW)?;
+    let archive_cf = column_family(
+        &resumed_primary.bounded_open.db,
+        DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
+    )?;
+    let has_progress = resumed_primary
+        .bounded_open
+        .db
+        .get_cf(&archive_cf, [0x06])?
+        .is_some();
+    let has_marker = resumed_primary
+        .bounded_open
+        .db
+        .get_cf(&archive_cf, [0x05])?
+        .is_some();
+    assert!(!has_progress && has_marker);
+    drop(archive_cf);
+    drop(resumed_primary);
+
+    // Also verify direct 1-block batched backfill finishes cleanly after stripping again.
+    let reopen_for_batch = open_store(&store_path, &activations, REORG_WINDOW)?;
+    strip_displaced_root_index_rows(&reopen_for_batch)?;
+    backfill_test_root_index_with_batch_limit(&reopen_for_batch, 1)?;
+    let cov = reopen_for_batch
+        .search_displaced_final_note_commitment_roots_page(
+            FinalNoteCommitmentRoot::from_bytes([0x99; 32]),
+            None,
+            one,
+        )?
+        .coverage
+        .ok_or("missing coverage after batched backfill")?;
+    assert_eq!(cov.captured_block_count, 2);
+    assert_eq!(cov.root_artifact_unavailable_count, 1);
     Ok(())
 }

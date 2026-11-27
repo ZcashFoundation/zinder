@@ -25,6 +25,7 @@ const HASH_POINTER_KEY_TAG: u8 = 0x02;
 const EVENT_CONTEXT_KEY_TAG: u8 = 0x03;
 const ROOT_INDEX_KEY_TAG: u8 = 0x04;
 const ROOT_UNAVAILABLE_STATE_KEY: [u8; 1] = [0x05];
+const ROOT_BACKFILL_PROGRESS_KEY: [u8; 1] = [0x06];
 const ORDER_KEY_LENGTH: usize = 45;
 const HASH_POINTER_KEY_LENGTH: usize = 33;
 const HASH_POINTER_VALUE_LENGTH: usize = 13;
@@ -34,6 +35,8 @@ const EVENT_CONTEXT_VALUE_LENGTH: usize = 37;
 const ROOT_INDEX_KEY_LENGTH: usize = 78;
 const ROOT_INDEX_VALUE_LENGTH: usize = 17;
 const ROOT_UNAVAILABLE_STATE_VALUE_LENGTH: usize = 9;
+const ROOT_BACKFILL_PROGRESS_VALUE_LENGTH: usize = 1 + 8 + ORDER_KEY_LENGTH;
+const BACKFILL_BATCH_BLOCKS: usize = 256;
 const MAX_PUBLIC_PAGE_LIMIT: u32 = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -481,11 +484,6 @@ pub struct DisplacedFinalRootPage {
 trait DisplacedArchiveRead {
     fn archive_db(&self) -> &DB;
     fn archive_reorg_window_blocks(&self) -> u32;
-    fn cached_legacy_unavailable_count(
-        &self,
-        latest_event_sequence: u64,
-        compute: &mut dyn FnMut() -> Result<u64, CanonicalStoreError>,
-    ) -> Result<u64, CanonicalStoreError>;
 }
 
 impl DisplacedArchiveRead for RocksDbCanonicalStore {
@@ -496,14 +494,6 @@ impl DisplacedArchiveRead for RocksDbCanonicalStore {
     fn archive_reorg_window_blocks(&self) -> u32 {
         self.reorg_policy().reorg_window_blocks()
     }
-
-    fn cached_legacy_unavailable_count(
-        &self,
-        _latest_event_sequence: u64,
-        compute: &mut dyn FnMut() -> Result<u64, CanonicalStoreError>,
-    ) -> Result<u64, CanonicalStoreError> {
-        compute()
-    }
 }
 
 impl DisplacedArchiveRead for RocksDbCanonicalSecondary {
@@ -513,23 +503,6 @@ impl DisplacedArchiveRead for RocksDbCanonicalSecondary {
 
     fn archive_reorg_window_blocks(&self) -> u32 {
         self.reorg_policy().reorg_window_blocks()
-    }
-
-    fn cached_legacy_unavailable_count(
-        &self,
-        latest_event_sequence: u64,
-        compute: &mut dyn FnMut() -> Result<u64, CanonicalStoreError>,
-    ) -> Result<u64, CanonicalStoreError> {
-        let cached = *self.legacy_root_unavailable_count.lock();
-        if let Some((cached_sequence, unavailable_count)) = cached
-            && cached_sequence == latest_event_sequence
-        {
-            return Ok(unavailable_count);
-        }
-        let unavailable_count = compute()?;
-        *self.legacy_root_unavailable_count.lock() =
-            Some((latest_event_sequence, unavailable_count));
-        Ok(unavailable_count)
     }
 }
 
@@ -1076,8 +1049,6 @@ fn search_displaced_roots_fallback(
     state: ArchiveState,
     query: RootSearchQuery<'_>,
 ) -> Result<DisplacedFinalRootPage, CanonicalStoreError> {
-    let archive_unavailable_count =
-        legacy_archive_unavailable_count(store, state.latest_event_sequence)?;
     let family = archive_family(store)?;
     let mut options = ReadOptions::default();
     options.fill_cache(false);
@@ -1086,12 +1057,12 @@ fn search_displaced_roots_fallback(
     let lookahead = query.limit.saturating_add(1);
     let mut matches = Vec::with_capacity(lookahead.min(64));
     let mut blocks_scanned = 0_usize;
-    let mut unused_unavailable = 0_u64;
+    let mut unavailable_in_scanned = 0_u64;
     let mut last_scanned_position = seek_fallback_initial_position(
         store,
         query,
         (&mut rows, &mut context_cache),
-        (&mut unused_unavailable, &mut matches),
+        (&mut unavailable_in_scanned, &mut matches),
     )?;
 
     while rows.valid()
@@ -1115,7 +1086,7 @@ fn search_displaced_roots_fallback(
             validated.record.displacement_epoch,
             validated.header.block_time,
             (query.root, lookahead, None),
-            (&mut unused_unavailable, &mut matches),
+            (&mut unavailable_in_scanned, &mut matches),
         );
         rows.prev();
     }
@@ -1134,52 +1105,9 @@ fn search_displaced_roots_fallback(
             more_blocks_remain,
             last_scanned_position,
             blocks_scanned,
-            archive_unavailable_count,
+            unavailable_in_scanned,
         ),
     ))
-}
-
-fn legacy_archive_unavailable_count(
-    store: &impl DisplacedArchiveRead,
-    latest_event_sequence: u64,
-) -> Result<u64, CanonicalStoreError> {
-    store.cached_legacy_unavailable_count(latest_event_sequence, &mut || {
-        count_archive_unavailable_roots(store)
-    })
-}
-
-fn count_archive_unavailable_roots(
-    store: &impl DisplacedArchiveRead,
-) -> Result<u64, CanonicalStoreError> {
-    let family = archive_family(store)?;
-    let mut options = ReadOptions::default();
-    options.fill_cache(false);
-    let mut rows = store.archive_db().raw_iterator_cf_opt(&family, options);
-    rows.seek([ORDER_KEY_TAG]);
-    let mut unavailable_count = 0_u64;
-    while rows.valid() {
-        let Some((key, encoded_record)) = rows.item() else {
-            break;
-        };
-        if key.first() != Some(&ORDER_KEY_TAG) {
-            break;
-        }
-        if decode_borrowed_archive_record(encoded_record)?
-            .final_note_commitment_roots
-            .is_none()
-        {
-            unavailable_count = unavailable_count.checked_add(1).ok_or_else(|| {
-                CanonicalStoreError::displaced_archive("archive unavailable-root count exceeds u64")
-            })?;
-        }
-        rows.next();
-    }
-    rows.status()
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "displaced archive unavailable-root scan",
-            source,
-        })?;
-    Ok(unavailable_count)
 }
 
 fn seek_fallback_initial_position(
@@ -1446,15 +1374,221 @@ fn validate_root_index_state(
         &ROOT_UNAVAILABLE_STATE_KEY,
         "reorg archive root-unavailable state read",
     )?;
-    if let Some(encoded) = encoded_unavailable {
-        let unavailable_count = decode_root_unavailable_state(&encoded)?;
-        if unavailable_count > archive_block_count {
+    let encoded_progress = read_exact_db_row(
+        db,
+        &ROOT_BACKFILL_PROGRESS_KEY,
+        "reorg archive root-backfill progress read",
+    )?;
+    match (encoded_unavailable, encoded_progress) {
+        (Some(_), Some(_)) => Err(CanonicalStoreError::displaced_archive(
+            "archive root-backfill progress key exists alongside completed state",
+        )),
+        (Some(encoded), None) => {
+            let unavailable_count = decode_root_unavailable_state(&encoded)?;
+            if unavailable_count > archive_block_count {
+                return Err(CanonicalStoreError::displaced_archive(
+                    "archive unavailable-root count exceeds archived block count",
+                ));
+            }
+            validate_populated_root_index(db, archive_block_count, unavailable_count)
+        }
+        (None, Some(progress_bytes)) => {
+            validate_partial_backfill_progress(db, archive_block_count, &progress_bytes)
+        }
+        (None, None) => validate_absent_root_index(db),
+    }
+}
+
+fn validate_populated_root_index(
+    db: &DB,
+    archive_block_count: u64,
+    recorded_unavailable: u64,
+) -> Result<(), CanonicalStoreError> {
+    let summary = verify_expected_root_index_rows(db, None)?;
+    if summary.observed_blocks != archive_block_count
+        || summary.expected_unavailable != recorded_unavailable
+    {
+        return Err(CanonicalStoreError::displaced_archive(
+            "archive unavailable-root state does not match archived blocks",
+        ));
+    }
+    let actual_index_rows = count_and_validate_root_index_rows(db, None)?;
+    if actual_index_rows != summary.expected_index_rows {
+        return Err(CanonicalStoreError::displaced_archive(
+            "archive root-index contains unexpected extra rows",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_partial_backfill_progress(
+    db: &DB,
+    archive_block_count: u64,
+    progress_bytes: &[u8],
+) -> Result<(), CanonicalStoreError> {
+    let (recorded_unavailable, last_order_key) = decode_backfill_progress(progress_bytes)?;
+    if recorded_unavailable > archive_block_count {
+        return Err(CanonicalStoreError::displaced_archive(
+            "archive backfill unavailable-root count exceeds archived block count",
+        ));
+    }
+    let summary = verify_expected_root_index_rows(db, Some(last_order_key))?;
+    if !summary.saw_limit_key || summary.expected_unavailable != recorded_unavailable {
+        return Err(CanonicalStoreError::displaced_archive(
+            "archive root-backfill progress marker does not match archived blocks",
+        ));
+    }
+    let actual_index_rows = count_and_validate_root_index_rows(db, Some(last_order_key))?;
+    if actual_index_rows != summary.expected_index_rows {
+        return Err(CanonicalStoreError::displaced_archive(
+            "archive root-index contains unexpected extra rows during backfill",
+        ));
+    }
+    Ok(())
+}
+
+struct ExpectedRootIndexSummary {
+    observed_blocks: u64,
+    expected_unavailable: u64,
+    expected_index_rows: u64,
+    saw_limit_key: bool,
+}
+
+fn verify_expected_root_index_rows(
+    db: &DB,
+    up_to_order_key: Option<[u8; ORDER_KEY_LENGTH]>,
+) -> Result<ExpectedRootIndexSummary, CanonicalStoreError> {
+    let family = db
+        .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
+        .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
+    let mut options = ReadOptions::default();
+    options.fill_cache(false);
+    let mut rows = db.raw_iterator_cf_opt(&family, options);
+    rows.seek([ORDER_KEY_TAG]);
+
+    let mut summary = ExpectedRootIndexSummary {
+        observed_blocks: 0,
+        expected_unavailable: 0,
+        expected_index_rows: 0,
+        saw_limit_key: up_to_order_key.is_none(),
+    };
+    while rows.valid() {
+        let Some((key, encoded_record)) = rows.item() else {
+            break;
+        };
+        if key.first() != Some(&ORDER_KEY_TAG) {
+            break;
+        }
+        if let Some(limit_key) = up_to_order_key {
+            if key > limit_key.as_slice() {
+                break;
+            }
+            if key == limit_key.as_slice() {
+                summary.saw_limit_key = true;
+            }
+        }
+        verify_block_expected_root_rows(db, key, encoded_record, &mut summary)?;
+        rows.next();
+    }
+    rows.status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "reorg archive root-index expected scan",
+            source,
+        })?;
+    Ok(summary)
+}
+
+fn verify_block_expected_root_rows(
+    db: &DB,
+    key: &[u8],
+    encoded_record: &[u8],
+    summary: &mut ExpectedRootIndexSummary,
+) -> Result<(), CanonicalStoreError> {
+    summary.observed_blocks = summary.observed_blocks.checked_add(1).ok_or_else(|| {
+        CanonicalStoreError::displaced_archive("archive observed block count exceeds u64")
+    })?;
+    let position = decode_order_key(key)?;
+    let borrowed = decode_borrowed_archive_record(encoded_record)?;
+    let replay = decode_canonical_block_replay(borrowed.replay_bytes).map_err(|source| {
+        CanonicalStoreError::displaced_archive(format!(
+            "archive canonical replay is invalid during root validation: {source}"
+        ))
+    })?;
+    let Some(roots) = borrowed.final_note_commitment_roots else {
+        summary.expected_unavailable =
+            summary.expected_unavailable.checked_add(1).ok_or_else(|| {
+                CanonicalStoreError::displaced_archive("archive unavailable-root count exceeds u64")
+            })?;
+        return Ok(());
+    };
+    let expected_val = encode_root_index_value(
+        borrowed.displacement_epoch,
+        replay.facts().block_header.block_time,
+    );
+    for (protocol, root) in [
+        (ShieldedProtocol::Sapling, roots.sapling),
+        (ShieldedProtocol::Orchard, roots.orchard),
+        (ShieldedProtocol::Ironwood, roots.ironwood),
+    ] {
+        let Some(root) = root else {
+            continue;
+        };
+        summary.expected_index_rows =
+            summary.expected_index_rows.checked_add(1).ok_or_else(|| {
+                CanonicalStoreError::displaced_archive("archive root-index row count exceeds u64")
+            })?;
+        let index_key = encode_root_index_key(root, position, protocol);
+        let observed =
+            read_exact_db_row_uncached(db, &index_key, "reorg archive root-index admission read")?;
+        if observed.as_deref() != Some(expected_val.as_slice()) {
             return Err(CanonicalStoreError::displaced_archive(
-                "archive unavailable-root count exceeds archived block count",
+                "archive root-index row is missing or mismatched",
             ));
         }
-        return Ok(());
     }
+    Ok(())
+}
+
+fn count_and_validate_root_index_rows(
+    db: &DB,
+    up_to_order_key: Option<[u8; ORDER_KEY_LENGTH]>,
+) -> Result<u64, CanonicalStoreError> {
+    let family = db
+        .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
+        .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
+    let mut options = ReadOptions::default();
+    options.fill_cache(false);
+    let mut rows = db.raw_iterator_cf_opt(&family, options);
+    rows.seek([ROOT_INDEX_KEY_TAG]);
+    let mut actual_rows = 0_u64;
+    while rows.valid() {
+        let Some((key, encoded_val)) = rows.item() else {
+            break;
+        };
+        if key.first() != Some(&ROOT_INDEX_KEY_TAG) {
+            break;
+        }
+        let (_, position, _) = decode_root_index_key(key)?;
+        let _ = decode_root_index_value(encoded_val, position.event_sequence)?;
+        if up_to_order_key.is_some_and(|limit_key| encode_order_key(position) > limit_key) {
+            return Err(CanonicalStoreError::displaced_archive(
+                "archive root-index row exists past backfill progress marker",
+            ));
+        }
+        actual_rows = actual_rows.checked_add(1).ok_or_else(|| {
+            CanonicalStoreError::displaced_archive("archive root-index row count exceeds u64")
+        })?;
+        rows.next();
+    }
+    rows.status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "reorg archive root-index count iteration",
+            source,
+        })?;
+    Ok(actual_rows)
+}
+
+fn validate_absent_root_index(db: &DB) -> Result<(), CanonicalStoreError> {
     let family = db
         .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
         .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
@@ -1480,8 +1614,16 @@ fn validate_root_index_state(
     Ok(())
 }
 
-/// Populates missing `[0x04]`/`[0x05]` root-index rows once for upgraded ready primaries.
+/// Populates missing `[0x04]`/`[0x05]` root-index rows in bounded batches for upgraded ready primaries.
 pub(super) fn backfill_displaced_root_index_if_absent(db: &DB) -> Result<(), CanonicalStoreError> {
+    backfill_displaced_root_index_with_batch_limit(db, BACKFILL_BATCH_BLOCKS)
+}
+
+fn backfill_displaced_root_index_with_batch_limit(
+    db: &DB,
+    batch_blocks: usize,
+) -> Result<(), CanonicalStoreError> {
+    let batch_blocks = batch_blocks.max(1);
     let Some(encoded_state) =
         read_exact_db_row(db, &STATE_KEY, "reorg archive backfill state read")?
     else {
@@ -1497,24 +1639,25 @@ pub(super) fn backfill_displaced_root_index_if_absent(db: &DB) -> Result<(), Can
         return Ok(());
     }
     let state = decode_archive_state(&encoded_state)?;
-    let rows = collect_backfill_root_rows(db)?;
-    write_backfill_root_rows_and_verify(db, &rows)?;
-    validate_root_index_state(db, state.block_count)
-}
+    let (mut unavailable_count, resume_after_key) = read_exact_db_row(
+        db,
+        &ROOT_BACKFILL_PROGRESS_KEY,
+        "reorg archive root-backfill progress read",
+    )?
+    .map(|encoded| decode_backfill_progress(&encoded))
+    .transpose()?
+    .map_or((0_u64, None), |(count, key)| (count, Some(key)));
 
-type StagedArchiveRows = Vec<(Vec<u8>, Vec<u8>)>;
-
-fn collect_backfill_root_rows(db: &DB) -> Result<StagedArchiveRows, CanonicalStoreError> {
     let family = db
         .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
         .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
     let mut read_opts = ReadOptions::default();
     read_opts.fill_cache(false);
     let mut rows_iter = db.raw_iterator_cf_opt(&family, read_opts);
-    rows_iter.seek([ORDER_KEY_TAG]);
+    seek_backfill_start(&mut rows_iter, resume_after_key);
 
-    let mut unavailable_count = 0_u64;
-    let mut staged = Vec::new();
+    let mut staged_rows = Vec::with_capacity(batch_blocks.saturating_mul(3));
+    let mut batch_count = 0_usize;
     while rows_iter.valid() {
         let Some((key, encoded_record)) = rows_iter.item() else {
             break;
@@ -1522,24 +1665,28 @@ fn collect_backfill_root_rows(db: &DB) -> Result<StagedArchiveRows, CanonicalSto
         if key.first() != Some(&ORDER_KEY_TAG) {
             break;
         }
-        let position = decode_order_key(key)?;
-        let borrowed = decode_borrowed_archive_record(encoded_record)?;
-        let replay = decode_canonical_block_replay(borrowed.replay_bytes).map_err(|source| {
-            CanonicalStoreError::displaced_archive(format!(
-                "archive canonical replay is invalid during backfill: {source}"
-            ))
-        })?;
-        append_root_index_rows(
-            RootIndexWriteInput {
-                position,
-                displacement_epoch: borrowed.displacement_epoch,
-                block_time: replay.facts().block_header.block_time,
-                roots: borrowed.final_note_commitment_roots,
-            },
+        stage_block_root_backfill(
+            key,
+            encoded_record,
             &mut unavailable_count,
-            &mut staged,
+            &mut staged_rows,
         )?;
+        let progress_key: [u8; ORDER_KEY_LENGTH] = read_array(key, 0)?;
+        batch_count = batch_count.saturating_add(1);
         rows_iter.next();
+
+        let has_more_order_rows = rows_iter.valid()
+            && rows_iter
+                .key()
+                .and_then(|next_key| next_key.first())
+                .is_some_and(|tag| *tag == ORDER_KEY_TAG);
+        if batch_count >= batch_blocks && has_more_order_rows {
+            let progress = encode_backfill_progress(unavailable_count, progress_key);
+            staged_rows.push((ROOT_BACKFILL_PROGRESS_KEY.to_vec(), progress.to_vec()));
+            write_backfill_root_batch_and_verify(db, &staged_rows, false)?;
+            staged_rows.clear();
+            batch_count = 0;
+        }
     }
     rows_iter
         .status()
@@ -1547,16 +1694,57 @@ fn collect_backfill_root_rows(db: &DB) -> Result<StagedArchiveRows, CanonicalSto
             operation: "displaced archive root-index backfill scan",
             source,
         })?;
-    staged.push((
+    staged_rows.push((
         ROOT_UNAVAILABLE_STATE_KEY.to_vec(),
         encode_root_unavailable_state(unavailable_count).to_vec(),
     ));
-    Ok(staged)
+    write_backfill_root_batch_and_verify(db, &staged_rows, true)?;
+    validate_root_index_state(db, state.block_count)
 }
 
-fn write_backfill_root_rows_and_verify(
+fn seek_backfill_start(
+    rows_iter: &mut rust_rocksdb::DBRawIteratorWithThreadMode<'_, DB>,
+    resume_after_key: Option<[u8; ORDER_KEY_LENGTH]>,
+) {
+    let Some(last_key) = resume_after_key else {
+        rows_iter.seek([ORDER_KEY_TAG]);
+        return;
+    };
+    rows_iter.seek(last_key);
+    if rows_iter.valid() && rows_iter.key() == Some(last_key.as_slice()) {
+        rows_iter.next();
+    }
+}
+
+fn stage_block_root_backfill(
+    key: &[u8],
+    encoded_record: &[u8],
+    unavailable_count: &mut u64,
+    staged_rows: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<(), CanonicalStoreError> {
+    let position = decode_order_key(key)?;
+    let borrowed = decode_borrowed_archive_record(encoded_record)?;
+    let replay = decode_canonical_block_replay(borrowed.replay_bytes).map_err(|source| {
+        CanonicalStoreError::displaced_archive(format!(
+            "archive canonical replay is invalid during backfill: {source}"
+        ))
+    })?;
+    append_root_index_rows(
+        RootIndexWriteInput {
+            position,
+            displacement_epoch: borrowed.displacement_epoch,
+            block_time: replay.facts().block_header.block_time,
+            roots: borrowed.final_note_commitment_roots,
+        },
+        unavailable_count,
+        staged_rows,
+    )
+}
+
+fn write_backfill_root_batch_and_verify(
     db: &DB,
     rows: &[(Vec<u8>, Vec<u8>)],
+    clear_progress_marker: bool,
 ) -> Result<(), CanonicalStoreError> {
     let family = db
         .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
@@ -1564,6 +1752,9 @@ fn write_backfill_root_rows_and_verify(
     let mut batch = WriteBatch::default();
     for (key, encoded) in rows {
         batch.put_cf(&family, key, encoded);
+    }
+    if clear_progress_marker {
+        batch.delete_cf(&family, ROOT_BACKFILL_PROGRESS_KEY);
     }
     let mut write_opts = WriteOptions::default();
     write_opts.disable_wal(false);
@@ -1574,12 +1765,24 @@ fn write_backfill_root_rows_and_verify(
             source,
         })?;
     for (key, expected) in rows {
-        let observed = read_exact_db_row(db, key, "displaced archive backfill readback")?;
+        let observed = read_exact_db_row_uncached(db, key, "displaced archive backfill readback")?;
         if observed.as_deref() != Some(expected.as_slice()) {
             return Err(CanonicalStoreError::displaced_archive(
                 "archive root-index backfill row differs after synced write",
             ));
         }
+    }
+    if clear_progress_marker
+        && read_exact_db_row_uncached(
+            db,
+            &ROOT_BACKFILL_PROGRESS_KEY,
+            "displaced archive backfill marker clear readback",
+        )?
+        .is_some()
+    {
+        return Err(CanonicalStoreError::displaced_archive(
+            "archive root-backfill progress key persisted after completion",
+        ));
     }
     Ok(())
 }
@@ -1682,11 +1885,28 @@ fn read_exact_db_row(
     key: &[u8],
     operation: &'static str,
 ) -> Result<Option<Vec<u8>>, CanonicalStoreError> {
+    read_exact_db_row_with_cache(db, key, operation, true)
+}
+
+fn read_exact_db_row_uncached(
+    db: &rust_rocksdb::DB,
+    key: &[u8],
+    operation: &'static str,
+) -> Result<Option<Vec<u8>>, CanonicalStoreError> {
+    read_exact_db_row_with_cache(db, key, operation, false)
+}
+
+fn read_exact_db_row_with_cache(
+    db: &rust_rocksdb::DB,
+    key: &[u8],
+    operation: &'static str,
+    fill_cache: bool,
+) -> Result<Option<Vec<u8>>, CanonicalStoreError> {
     let family = db
         .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
         .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
     let mut options = ReadOptions::default();
-    options.fill_cache(true);
+    options.fill_cache(fill_cache);
     db.get_cf_opt(&family, key, &options)
         .map_err(|source| CanonicalStoreError::RocksDbOperation { operation, source })
 }
@@ -2234,6 +2454,32 @@ fn decode_root_unavailable_state(encoded: &[u8]) -> Result<u64, CanonicalStoreEr
     Ok(u64::from_be_bytes(read_array(encoded, 1)?))
 }
 
+fn encode_backfill_progress(
+    unavailable_so_far: u64,
+    last_order_key: [u8; ORDER_KEY_LENGTH],
+) -> [u8; ROOT_BACKFILL_PROGRESS_VALUE_LENGTH] {
+    let mut encoded = [0; ROOT_BACKFILL_PROGRESS_VALUE_LENGTH];
+    encoded[0] = VERSION_ONE;
+    encoded[1..9].copy_from_slice(&unavailable_so_far.to_be_bytes());
+    encoded[9..].copy_from_slice(&last_order_key);
+    encoded
+}
+
+fn decode_backfill_progress(
+    encoded: &[u8],
+) -> Result<(u64, [u8; ORDER_KEY_LENGTH]), CanonicalStoreError> {
+    if encoded.len() != ROOT_BACKFILL_PROGRESS_VALUE_LENGTH || encoded.first() != Some(&VERSION_ONE)
+    {
+        return Err(CanonicalStoreError::displaced_archive(
+            "archive root-backfill progress state is not exact version-1 bytes",
+        ));
+    }
+    let unavailable_so_far = u64::from_be_bytes(read_array(encoded, 1)?);
+    let last_order_key = read_array(encoded, 9)?;
+    let _ = decode_order_key(&last_order_key)?;
+    Ok((unavailable_so_far, last_order_key))
+}
+
 fn encode_root_index_prefix(root: FinalNoteCommitmentRoot) -> [u8; 33] {
     let mut prefix = [0; 33];
     prefix[0] = ROOT_INDEX_KEY_TAG;
@@ -2270,25 +2516,21 @@ fn encode_root_index_value(
     encoded
 }
 
-fn decode_matching_root_index_row(
+fn decode_root_index_key(
     key: &[u8],
-    encoded_val: &[u8],
-    expected_root: FinalNoteCommitmentRoot,
-) -> Result<Option<DisplacedRootCandidate>, CanonicalStoreError> {
+) -> Result<(FinalNoteCommitmentRoot, ArchivePosition, ShieldedProtocol), CanonicalStoreError> {
     if key.len() != ROOT_INDEX_KEY_LENGTH || key.first() != Some(&ROOT_INDEX_KEY_TAG) {
         return Err(CanonicalStoreError::displaced_archive(
             "archive root-index key is not exact version-1 bytes",
         ));
     }
-    if key.get(1..33) != Some(&expected_root.as_bytes()) {
-        return Ok(None);
-    }
-    if encoded_val.len() != ROOT_INDEX_VALUE_LENGTH || encoded_val.first() != Some(&VERSION_ONE) {
+    let root = FinalNoteCommitmentRoot::from_bytes(read_array(key, 1)?);
+    let event_sequence = !u64::from_be_bytes(read_array(key, 33)?);
+    if event_sequence == 0 {
         return Err(CanonicalStoreError::displaced_archive(
-            "archive root-index value is not exact version-1 bytes",
+            "archive root-index event sequence is invalid",
         ));
     }
-    let event_sequence = !u64::from_be_bytes(read_array(key, 33)?);
     let height = BlockHeight::new(!u32::from_be_bytes(read_array(key, 41)?));
     let mut inverted_hash = read_array::<32>(key, 45)?;
     for byte in &mut inverted_hash {
@@ -2297,18 +2539,52 @@ fn decode_matching_root_index_row(
     let protocol = ShieldedProtocol::from_id(key[77]).ok_or_else(|| {
         CanonicalStoreError::displaced_archive("archive root-index protocol id is invalid")
     })?;
+    Ok((
+        root,
+        ArchivePosition {
+            event_sequence,
+            height,
+            block_hash: BlockHash::from_bytes(inverted_hash),
+        },
+        protocol,
+    ))
+}
+
+fn decode_root_index_value(
+    encoded_val: &[u8],
+    expected_event_sequence: u64,
+) -> Result<(ChainEpochId, i64), CanonicalStoreError> {
+    if encoded_val.len() != ROOT_INDEX_VALUE_LENGTH || encoded_val.first() != Some(&VERSION_ONE) {
+        return Err(CanonicalStoreError::displaced_archive(
+            "archive root-index value is not exact version-1 bytes",
+        ));
+    }
     let displacement_epoch = ChainEpochId::new(u64::from_be_bytes(read_array(encoded_val, 1)?));
-    if event_sequence == 0 || displacement_epoch.value() != event_sequence {
+    if displacement_epoch.value() != expected_event_sequence {
         return Err(CanonicalStoreError::displaced_archive(
             "archive root-index event sequence and epoch are invalid",
         ));
     }
     let block_time_unix_seconds = i64::from_be_bytes(read_array(encoded_val, 9)?);
+    Ok((displacement_epoch, block_time_unix_seconds))
+}
+
+fn decode_matching_root_index_row(
+    key: &[u8],
+    encoded_val: &[u8],
+    expected_root: FinalNoteCommitmentRoot,
+) -> Result<Option<DisplacedRootCandidate>, CanonicalStoreError> {
+    let (row_root, position, protocol) = decode_root_index_key(key)?;
+    if row_root != expected_root {
+        return Ok(None);
+    }
+    let (displacement_epoch, block_time_unix_seconds) =
+        decode_root_index_value(encoded_val, position.event_sequence)?;
     Ok(Some(DisplacedRootCandidate {
-        block_id: BlockId::new(height, BlockHash::from_bytes(inverted_hash)),
+        block_id: BlockId::new(position.height, position.block_hash),
         protocol,
         root: expected_root,
-        displacement_event_sequence: event_sequence,
+        displacement_event_sequence: position.event_sequence,
         displacement_epoch,
         block_time_unix_seconds,
     }))
@@ -2753,6 +3029,42 @@ fn read_existing_test_archive(
         }
     }
     Ok((contexts, records, all_keys))
+}
+
+#[cfg(test)]
+pub(super) fn backfill_test_root_index_with_batch_limit(
+    store: &RocksDbCanonicalStore,
+    batch_blocks: usize,
+) -> Result<(), CanonicalStoreError> {
+    backfill_displaced_root_index_with_batch_limit(&store.bounded_open.db, batch_blocks)
+}
+
+#[cfg(test)]
+pub(super) fn stage_partial_test_root_backfill_first_block(
+    store: &RocksDbCanonicalStore,
+) -> Result<(), CanonicalStoreError> {
+    let db = &store.bounded_open.db;
+    let family = column_family(db, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)?;
+    let mut read_opts = ReadOptions::default();
+    read_opts.fill_cache(false);
+    let mut rows_iter = db.raw_iterator_cf_opt(&family, read_opts);
+    rows_iter.seek([ORDER_KEY_TAG]);
+    let Some((first_key, first_record)) = rows_iter.item() else {
+        return Err(CanonicalStoreError::displaced_archive(
+            "missing first displaced order row for partial backfill staging",
+        ));
+    };
+    let mut unavailable_count = 0_u64;
+    let mut staged_rows = Vec::new();
+    stage_block_root_backfill(
+        first_key,
+        first_record,
+        &mut unavailable_count,
+        &mut staged_rows,
+    )?;
+    let progress = encode_backfill_progress(unavailable_count, read_array(first_key, 0)?);
+    staged_rows.push((ROOT_BACKFILL_PROGRESS_KEY.to_vec(), progress.to_vec()));
+    write_backfill_root_batch_and_verify(db, &staged_rows, false)
 }
 
 #[cfg(test)]

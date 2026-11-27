@@ -4,7 +4,12 @@
 //! filter-aware, bidirectional pages. The physical column-family name is an
 //! internal storage detail, not public vocabulary.
 
-use std::{cmp::Reverse, collections::HashMap, fmt, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use prost::Message as _;
 use thiserror::Error;
@@ -12,7 +17,6 @@ use tonic::{Request, Response, Status};
 use zinder_core::wire::{
     decode_height_key_descending, decode_in_block_position, decode_rpc_block_hash_hex,
     decode_rpc_transaction_id_hex, encode_internal_transaction_id, encode_rpc_block_hash_hex,
-    encode_rpc_transaction_id_hex,
 };
 use zinder_core::{BlockHash, BlockHeight, ChainEpochId, PrivacyShape, TransactionId};
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_HISTORY_V2;
@@ -1108,12 +1112,19 @@ async fn enrich_intrinsic_value_balances(
     epoch_id: ChainEpochId,
     entries: &mut [TransactionHistoryEntry],
 ) -> Result<(), Status> {
-    let mut heights: Vec<BlockHeight> = entries
-        .iter()
-        .filter(|entry| entry.intrinsic_value_balances.is_none())
-        .map(|entry| BlockHeight::new(entry.block_height))
-        .collect();
-    if heights.is_empty() {
+    let mut heights: Vec<BlockHeight> = Vec::new();
+    let mut requested_txs = HashSet::with_capacity(entries.len());
+    for entry in entries.iter() {
+        if entry.intrinsic_value_balances.is_some() {
+            continue;
+        }
+        let Ok(transaction_id) = decode_rpc_transaction_id_hex(&entry.transaction_id) else {
+            continue;
+        };
+        requested_txs.insert((entry.block_height, transaction_id));
+        heights.push(BlockHeight::new(entry.block_height));
+    }
+    if requested_txs.is_empty() {
         return Ok(());
     }
     heights.sort_unstable();
@@ -1121,7 +1132,7 @@ async fn enrich_intrinsic_value_balances(
 
     let store = Arc::clone(canonical_store);
     let balances_by_key = tokio::task::spawn_blocking(move || {
-        read_intrinsic_value_balances_at_heights(&store, epoch_id, &heights)
+        read_intrinsic_value_balances_at_heights(&store, epoch_id, &heights, &requested_txs)
     })
     .await
     .map_err(|error| ExplorerError::internal(format!("canonical read task failed: {error}")))??;
@@ -1130,8 +1141,11 @@ async fn enrich_intrinsic_value_balances(
         if entry.intrinsic_value_balances.is_some() {
             continue;
         }
+        let Ok(transaction_id) = decode_rpc_transaction_id_hex(&entry.transaction_id) else {
+            continue;
+        };
         if let Some((block_hash, balances)) =
-            balances_by_key.get(&(entry.block_height, entry.transaction_id.clone()))
+            balances_by_key.get(&(entry.block_height, transaction_id))
             && entry.block_hash == encode_rpc_block_hash_hex(*block_hash)
         {
             entry.intrinsic_value_balances = Some(*balances);
@@ -1140,12 +1154,13 @@ async fn enrich_intrinsic_value_balances(
     Ok(())
 }
 
-type IntrinsicBalanceMap = HashMap<(u32, String), (BlockHash, WireIntrinsicValueBalances)>;
+type IntrinsicBalanceMap = HashMap<(u32, TransactionId), (BlockHash, WireIntrinsicValueBalances)>;
 
 fn read_intrinsic_value_balances_at_heights(
     store: &SharedCanonicalSecondary,
     epoch_id: ChainEpochId,
     heights: &[BlockHeight],
+    requested_txs: &HashSet<(u32, TransactionId)>,
 ) -> Result<IntrinsicBalanceMap, Status> {
     if store
         .read()
@@ -1180,7 +1195,7 @@ fn read_intrinsic_value_balances_at_heights(
         }
     }
 
-    let mut balances_by_key = HashMap::new();
+    let mut balances_by_key = HashMap::with_capacity(requested_txs.len());
     guard
         .visit_block_replay_facts_at_heights(heights, |idx, maybe_facts| {
             let Some(facts) = maybe_facts else {
@@ -1189,11 +1204,12 @@ fn read_intrinsic_value_balances_at_heights(
             let height = heights[idx].value();
             let block_hash = facts.block_header.block_hash;
             for tx in &facts.transactions {
+                let tx_key = (height, tx.public_facts.transaction_id);
+                if !requested_txs.contains(&tx_key) {
+                    continue;
+                }
                 balances_by_key.insert(
-                    (
-                        height,
-                        encode_rpc_transaction_id_hex(tx.public_facts.transaction_id),
-                    ),
+                    tx_key,
                     (
                         block_hash,
                         encode_intrinsic_value_balances(tx.intrinsic_value_balances),
@@ -1343,6 +1359,66 @@ mod tests {
             ),
             [] as [u8; 0]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn intrinsic_value_balance_read_retains_only_requested_page_transactions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_core::{Network, TransactionIntrinsicValueBalances};
+        use zinder_testkit::{
+            ChainFixture, FixtureTransactionRows, WalletServingStoreFixture,
+            sample_regtest_upgrade_activations,
+        };
+
+        let base = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let block_hash = base.tip_hash().ok_or("missing block hash")?;
+        let height = BlockHeight::new(1);
+        let tx_a = TransactionId::from_bytes([0xaa; 32]);
+        let tx_b = TransactionId::from_bytes([0xbb; 32]);
+        let chain = base
+            .with_transaction_rows(
+                FixtureTransactionRows::coinbase(tx_a, height, block_hash, b"cb".to_vec())
+                    .with_intrinsic_value_balances(TransactionIntrinsicValueBalances {
+                        sprout_zat: 10,
+                        sapling_zat: -5,
+                        orchard_zat: 3,
+                        ironwood_zat: 0,
+                    }),
+            )
+            .with_transaction_rows(
+                FixtureTransactionRows::from_raw_transaction(
+                    tx_b,
+                    height,
+                    block_hash,
+                    1,
+                    b"tx".to_vec(),
+                )
+                .with_intrinsic_value_balances(TransactionIntrinsicValueBalances {
+                    sprout_zat: 99,
+                    sapling_zat: 88,
+                    orchard_zat: 77,
+                    ironwood_zat: 0,
+                }),
+            );
+        let mut fixture =
+            WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+        let (canonical_reader, _wallet_reader) = fixture.take_readers()?;
+        let epoch = canonical_reader.chain_epoch()?;
+        let shared = Arc::new(parking_lot::RwLock::new(canonical_reader));
+
+        let requested_txs = HashSet::from([(height.value(), tx_b)]);
+        let retained =
+            read_intrinsic_value_balances_at_heights(&shared, epoch.id, &[height], &requested_txs)?;
+        assert_eq!(retained.len(), 1);
+        assert!(!retained.contains_key(&(height.value(), tx_a)));
+        let (retained_hash, retained_balances) = retained
+            .get(&(height.value(), tx_b))
+            .ok_or("missing requested tx balances")?;
+        assert_eq!(*retained_hash, block_hash);
+        assert_eq!(retained_balances.sprout_zat, 99);
+        assert_eq!(retained_balances.sapling_zat, 88);
+        assert_eq!(retained_balances.orchard_zat, 77);
         Ok(())
     }
 }

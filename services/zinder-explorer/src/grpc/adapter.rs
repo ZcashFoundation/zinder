@@ -402,7 +402,9 @@ fn transaction_history_matches_canonical_tip(
     let Some(canonical_store) = canonical_store else {
         return false;
     };
-    let guard = canonical_store.read();
+    let Some(guard) = canonical_store.try_read() else {
+        return false;
+    };
     if guard.history_bounds().first_available_height() != BlockHeight::new(1) {
         return false;
     }
@@ -1562,12 +1564,16 @@ impl ExplorerQueryGrpcAdapter {
         canonical_store: &SharedCanonicalSecondary,
         method: &'static str,
     ) -> Result<Option<Arc<NetworkUpgradeActivations>>, Status> {
-        if canonical_store
-            .read()
-            .network_upgrade_activations()
-            .is_some()
-            || self.wallet_channel.is_none()
-        {
+        if self.wallet_channel.is_none() {
+            return Ok(None);
+        }
+        let store = Arc::clone(canonical_store);
+        let has_local_activations = tokio::task::spawn_blocking(move || {
+            store.read().network_upgrade_activations().is_some()
+        })
+        .await
+        .map_err(|error| ExplorerError::internal(format!("canonical read task failed: {error}")))?;
+        if has_local_activations {
             return Ok(None);
         }
         let mut client = self.wallet_client(method).await?;
@@ -2162,6 +2168,45 @@ mod tests {
         for capability in &ranking_capabilities {
             assert!(adapter.advertised_capabilities().contains(capability));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn server_info_history_tip_check_skips_blocking_when_canonical_lock_contended()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zinder_core::Network;
+        use zinder_testkit::{
+            ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+        };
+
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let mut fixture =
+            WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+        let (canonical_reader, _wallet_reader) = fixture.take_readers()?;
+        let epoch = canonical_reader.chain_epoch()?;
+        let readiness_state =
+            TransactionHistoryMaterializedViewReadiness::Available(MaterializedViewState {
+                chain_epoch_id: epoch.id,
+                tip_height: epoch.visible_tip_height,
+                tip_hash: epoch.visible_tip_hash,
+                revision: 1,
+                coverage: Some(MaterializedViewCoverage {
+                    complete_from_height: BlockHeight::new(1),
+                    complete_through_height: epoch.visible_tip_height,
+                    complete_through_hash: epoch.visible_tip_hash,
+                }),
+            });
+        let shared = Arc::new(parking_lot::RwLock::new(canonical_reader));
+        assert!(transaction_history_matches_canonical_tip(
+            readiness_state,
+            Some(&shared),
+        ));
+
+        let _write_guard = shared.write();
+        assert!(!transaction_history_matches_canonical_tip(
+            readiness_state,
+            Some(&shared),
+        ));
         Ok(())
     }
 }

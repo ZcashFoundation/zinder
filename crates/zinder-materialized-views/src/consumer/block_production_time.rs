@@ -156,6 +156,8 @@ pub struct BlockProductionTimePageRequest {
     pub maximum_height: Option<BlockHeight>,
     /// Requested row count, bounded by [`BLOCK_PRODUCTION_TIME_MAX_PAGE_SIZE`].
     pub limit: usize,
+    /// Optional cap on candidate rows scanned before stopping early.
+    pub max_scanned_rows: Option<usize>,
 }
 
 /// One bounded page and its optional continuation cursor.
@@ -163,8 +165,10 @@ pub struct BlockProductionTimePageRequest {
 pub struct BlockProductionTimePage {
     /// Rows in exact primary-key order.
     pub rows: Vec<BlockProductionTimeRow>,
-    /// Cursor to resume after the last returned row when more rows exist.
+    /// Cursor to resume after the last returned or scanned row when more candidates remain.
     pub next_cursor: Option<BlockProductionTimeCursor>,
+    /// True when `max_scanned_rows` stopped scanning before exhausting `[start, end)` or `limit`.
+    pub scan_exhausted: bool,
 }
 
 /// Contiguous canonical history materialized by explicit full-history backfill.
@@ -257,37 +261,25 @@ impl BlockProductionTimeConsumer {
         request: BlockProductionTimePageRequest,
     ) -> Result<BlockProductionTimePage, BlockProductionTimeConsumerError> {
         validate_page_request(request)?;
-        let range_start = encode_primary_key(
-            request.start_time_unix_seconds,
-            BlockHeight::new(0),
-            BlockHash::from_bytes([0; BLOCK_HASH_LEN]),
-        );
-        let end_inclusive = encode_primary_key(
-            request.end_time_unix_seconds.checked_sub(1).ok_or(
-                BlockProductionTimeConsumerError::InvalidTimeRange {
-                    start: request.start_time_unix_seconds,
-                    end: request.end_time_unix_seconds,
-                },
-            )?,
-            BlockHeight::new(u32::MAX),
-            BlockHash::from_bytes([u8::MAX; BLOCK_HASH_LEN]),
-        );
+        let (range_start, end_inclusive, entries_cap) = page_key_bounds(request)?;
         let mut scan_start = request.after.map_or(range_start, |cursor| cursor.0);
-        let lookahead = 2_usize;
-        let entries_cap = request.limit.checked_add(lookahead).ok_or(
-            BlockProductionTimeConsumerError::PageLimitTooLarge {
-                requested: request.limit,
-                maximum: BLOCK_PRODUCTION_TIME_MAX_PAGE_SIZE,
-            },
-        )?;
         let mut decoded = Vec::with_capacity(entries_cap);
         let mut scan_start_is_exclusive = request.after.is_some();
+        let mut scanned_rows = 0_usize;
+        let mut last_scanned_cursor = None;
+        let mut budget_exhausted = false;
         'scan: loop {
+            let fetch_cap = request.max_scanned_rows.map_or(entries_cap, |budget| {
+                budget
+                    .saturating_sub(scanned_rows)
+                    .saturating_add(2)
+                    .min(entries_cap)
+            });
             let entries = store.range_iterate_consumer(
                 BLOCK_PRODUCTION_TIME_COLUMN_FAMILY,
                 &scan_start,
                 &end_inclusive,
-                entries_cap,
+                fetch_cap,
             )?;
             if entries.is_empty() {
                 break;
@@ -298,10 +290,19 @@ impl BlockProductionTimeConsumer {
                 if scan_start_is_exclusive && key == scan_start {
                     continue;
                 }
+                if request
+                    .max_scanned_rows
+                    .is_some_and(|budget| scanned_rows >= budget)
+                {
+                    budget_exhausted = true;
+                    break 'scan;
+                }
                 let cursor = BlockProductionTimeCursor::from_bytes(&key)?;
                 let row = decode_row(&key, &payload)?;
                 scan_start = cursor.0;
                 scan_start_is_exclusive = true;
+                scanned_rows = scanned_rows.saturating_add(1);
+                last_scanned_cursor = Some(cursor);
                 advanced = true;
                 if request
                     .maximum_height
@@ -314,21 +315,16 @@ impl BlockProductionTimeConsumer {
                     break 'scan;
                 }
             }
-            if !advanced || entry_count < entries_cap {
+            if !advanced || entry_count < fetch_cap {
                 break;
             }
         }
-        let has_more = decoded.len() > request.limit;
-        decoded.truncate(request.limit);
-        let next_cursor = if has_more {
-            decoded.last().map(|(cursor, _)| *cursor)
-        } else {
-            None
-        };
-        Ok(BlockProductionTimePage {
-            rows: decoded.into_iter().map(|(_, row)| row).collect(),
-            next_cursor,
-        })
+        Ok(finalize_page(
+            decoded,
+            request.limit,
+            last_scanned_cursor,
+            budget_exhausted,
+        ))
     }
 
     /// Reads explicit full-history backfill coverage.
@@ -768,6 +764,9 @@ fn validate_page_request(
             maximum: BLOCK_PRODUCTION_TIME_MAX_PAGE_SIZE,
         });
     }
+    if request.max_scanned_rows == Some(0) {
+        return Err(BlockProductionTimeConsumerError::InvalidScanBudget);
+    }
     if let Some(cursor) = request.after {
         let (time, _, _) = decode_primary_key(&cursor.0)?;
         if time < request.start_time_unix_seconds || time >= request.end_time_unix_seconds {
@@ -775,6 +774,55 @@ fn validate_page_request(
         }
     }
     Ok(())
+}
+
+fn page_key_bounds(
+    request: BlockProductionTimePageRequest,
+) -> Result<(PrimaryKey, PrimaryKey, usize), BlockProductionTimeConsumerError> {
+    let range_start = encode_primary_key(
+        request.start_time_unix_seconds,
+        BlockHeight::new(0),
+        BlockHash::from_bytes([0; BLOCK_HASH_LEN]),
+    );
+    let end_inclusive = encode_primary_key(
+        request.end_time_unix_seconds.checked_sub(1).ok_or(
+            BlockProductionTimeConsumerError::InvalidTimeRange {
+                start: request.start_time_unix_seconds,
+                end: request.end_time_unix_seconds,
+            },
+        )?,
+        BlockHeight::new(u32::MAX),
+        BlockHash::from_bytes([u8::MAX; BLOCK_HASH_LEN]),
+    );
+    let entries_cap = request.limit.checked_add(2).ok_or(
+        BlockProductionTimeConsumerError::PageLimitTooLarge {
+            requested: request.limit,
+            maximum: BLOCK_PRODUCTION_TIME_MAX_PAGE_SIZE,
+        },
+    )?;
+    Ok((range_start, end_inclusive, entries_cap))
+}
+
+fn finalize_page(
+    mut decoded: Vec<(BlockProductionTimeCursor, BlockProductionTimeRow)>,
+    limit: usize,
+    last_scanned_cursor: Option<BlockProductionTimeCursor>,
+    budget_exhausted: bool,
+) -> BlockProductionTimePage {
+    let has_more = decoded.len() > limit;
+    decoded.truncate(limit);
+    let (next_cursor, scan_exhausted) = if has_more {
+        (decoded.last().map(|(cursor, _)| *cursor), false)
+    } else if budget_exhausted {
+        (last_scanned_cursor, true)
+    } else {
+        (None, false)
+    };
+    BlockProductionTimePage {
+        rows: decoded.into_iter().map(|(_, row)| row).collect(),
+        next_cursor,
+        scan_exhausted,
+    }
 }
 
 fn validate_apply_state(
@@ -1276,6 +1324,9 @@ pub enum BlockProductionTimeConsumerError {
         /// Maximum accepted page size.
         maximum: usize,
     },
+    /// A scanned-candidate budget was explicitly zero.
+    #[error("block-production-time scanned-row budget must be nonzero")]
+    InvalidScanBudget,
     /// A continuation cursor did not belong to the requested time range.
     #[error("block-production-time cursor is outside the requested range")]
     CursorOutsideRange,
@@ -1418,6 +1469,7 @@ mod tests {
                 after: None,
                 maximum_height: None,
                 limit: BLOCK_PRODUCTION_TIME_MAX_PAGE_SIZE,
+                max_scanned_rows: None,
             },
         )?
         .rows)
@@ -1524,6 +1576,7 @@ mod tests {
                 after: None,
                 maximum_height: None,
                 limit: 2,
+                max_scanned_rows: None,
             },
         )?;
         assert_eq!(first.rows.len(), 2);
@@ -1535,6 +1588,7 @@ mod tests {
                 after: first.next_cursor,
                 maximum_height: None,
                 limit: 2,
+                max_scanned_rows: None,
             },
         )?;
         assert_eq!(second.rows.len(), 1);
@@ -1567,6 +1621,7 @@ mod tests {
                 after: None,
                 maximum_height: Some(BlockHeight::new(11)),
                 limit: 10,
+                max_scanned_rows: None,
             },
         )?;
         drop(snapshot);
@@ -1578,6 +1633,73 @@ mod tests {
             vec![10, 11]
         );
         assert!(page.next_cursor.is_none());
+        assert!(!page.scan_exhausted);
+        Ok(())
+    }
+
+    #[test]
+    fn max_scanned_rows_bounds_filtered_tail_and_resumes() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = BlockProductionTimeConsumer::new();
+        mutate_blocks(
+            &store,
+            &mut consumer,
+            &[
+                block(10, 1, 100),
+                block(11, 2, 101),
+                block(12, 3, 102),
+                block(2, 4, 103),
+            ],
+            &[],
+        )?;
+        let snapshot = store.read_snapshot();
+        let truncated = BlockProductionTimeConsumer::read_page_snapshot(
+            &snapshot,
+            BlockProductionTimePageRequest {
+                start_time_unix_seconds: 100,
+                end_time_unix_seconds: 110,
+                after: None,
+                maximum_height: Some(BlockHeight::new(2)),
+                limit: 1,
+                max_scanned_rows: Some(2),
+            },
+        )?;
+        assert_eq!(truncated.rows, []);
+        assert!(truncated.scan_exhausted);
+        assert!(truncated.next_cursor.is_some());
+
+        let resumed = BlockProductionTimeConsumer::read_page_snapshot(
+            &snapshot,
+            BlockProductionTimePageRequest {
+                start_time_unix_seconds: 100,
+                end_time_unix_seconds: 110,
+                after: truncated.next_cursor,
+                maximum_height: Some(BlockHeight::new(2)),
+                limit: 1,
+                max_scanned_rows: Some(2),
+            },
+        )?;
+        assert!(!resumed.scan_exhausted);
+        assert!(resumed.next_cursor.is_none());
+        assert_eq!(resumed.rows.len(), 1);
+        assert_eq!(resumed.rows[0].block_height, BlockHeight::new(2));
+
+        let invalid = BlockProductionTimeConsumer::read_page_snapshot(
+            &snapshot,
+            BlockProductionTimePageRequest {
+                start_time_unix_seconds: 100,
+                end_time_unix_seconds: 110,
+                after: None,
+                maximum_height: None,
+                limit: 1,
+                max_scanned_rows: Some(0),
+            },
+        );
+        drop(snapshot);
+        assert!(matches!(
+            invalid,
+            Err(BlockProductionTimeConsumerError::InvalidScanBudget)
+        ));
         Ok(())
     }
 

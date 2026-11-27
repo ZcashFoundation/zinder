@@ -82,7 +82,6 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
     reorg_policy: super::CanonicalReorgPolicy,
     pub(super) replay_tail: AuthenticatedReplayTail,
-    pub(super) legacy_root_unavailable_count: parking_lot::Mutex<Option<(u64, u64)>>,
 }
 
 impl RocksDbCanonicalSecondary {
@@ -267,7 +266,6 @@ impl RocksDbCanonicalSecondary {
             activation_schedule,
             reorg_policy,
             replay_tail,
-            legacy_root_unavailable_count: parking_lot::Mutex::new(None),
         })
     }
 

@@ -442,18 +442,16 @@ fn catch_up_secondaries(
     materialized_view_store: Option<&MaterializedViewStore>,
     canonical_secondary: Option<&SharedCanonicalSecondary>,
 ) -> Result<(), MaterializedViewStoreError> {
-    if let Some(store) = materialized_view_store {
-        store.try_catch_up()?;
-    }
-    if let Some(store) = canonical_secondary {
-        store.write().try_catch_up().map_err(|source| {
+    let mv_outcome = materialized_view_store.map_or(Ok(()), MaterializedViewStore::try_catch_up);
+    let canonical_outcome = canonical_secondary.map_or(Ok(()), |store| {
+        store.write().try_catch_up().map(|_| ()).map_err(|source| {
             MaterializedViewStoreError::CanonicalSecondary {
                 operation: "catch up canonical secondary",
                 source,
             }
-        })?;
-    }
-    Ok(())
+        })
+    });
+    mv_outcome.and(canonical_outcome)
 }
 
 fn open_materialized_view_store(
@@ -762,6 +760,71 @@ mod tests {
         handle.await?;
 
         assert!(readiness.report().is_ready);
+        Ok(())
+    }
+
+    #[test]
+    fn catch_up_secondaries_advances_canonical_when_materialized_view_catchup_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use parking_lot::RwLock;
+        use tempfile::tempdir;
+        use zinder_core::{BlockHeight, Network};
+        use zinder_explorer::MaterializedViewStoreOptions;
+        use zinder_materialized_views::MaterializedViewStore;
+        use zinder_store::{
+            CanonicalReorgPolicy, CanonicalStoreRequirements, RawBlobRetention,
+            RocksDbCanonicalSecondary, RocksDbResourceBudget,
+        };
+        use zinder_testkit::{
+            CanonicalBaseline, CanonicalWriterFixture, ChainFixture,
+            sample_regtest_upgrade_activations,
+        };
+
+        let temp = tempdir()?;
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+        let activations = sample_regtest_upgrade_activations();
+        let mut writer = CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(&chain).through(BlockHeight::new(1)),
+            &activations,
+        )?;
+        let canonical_secondary = Arc::new(RwLock::new(
+            RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+                writer.canonical_primary_path(),
+                temp.path().join("canonical-secondary"),
+                Network::ZcashRegtest,
+                CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+                CanonicalReorgPolicy::new(100)?,
+                RocksDbResourceBudget::for_local_tests(),
+            )?,
+        ));
+        let mv_primary_path = temp.path().join("mv-primary");
+        let mv_primary = MaterializedViewStore::open_explorer_views(
+            &mv_primary_path,
+            MaterializedViewStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+        let mv_secondary = MaterializedViewStore::open_explorer_views_secondary(
+            &mv_primary_path,
+            temp.path().join("mv-secondary"),
+            MaterializedViewStoreOptions {
+                sync_writes: false,
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+
+        drop(mv_primary);
+        std::fs::remove_dir_all(&mv_primary_path)?;
+        writer.append_live_block(&chain)?;
+
+        let outcome = super::catch_up_secondaries(Some(&mv_secondary), Some(&canonical_secondary));
+        assert!(outcome.is_err());
+        assert_eq!(
+            canonical_secondary.read().chain_epoch()?.visible_tip_height,
+            BlockHeight::new(2)
+        );
         Ok(())
     }
 }
