@@ -233,11 +233,14 @@ where
                     );
                 }
                 command = control.next_command() => {
-                    apply_following_canonical_control_command(
+                    if apply_following_canonical_control_command(
                         store,
                         command,
                         state.tip_confirmation,
-                    );
+                    ) == CanonicalControlScheduling::YieldToCanonical
+                    {
+                        return AtTipWaitOutcome::YieldedToCanonical;
+                    }
                 }
             }
         }
@@ -338,6 +341,7 @@ struct AtTipState {
 
 enum AtTipWaitOutcome {
     PollDue,
+    YieldedToCanonical,
     Cancelled,
 }
 
@@ -569,9 +573,10 @@ where
 ///
 /// The receiver is owned by this loop, not by a storage adapter. While the
 /// follower waits on the node, it answers read-only commands at once and
-/// applies writes in arrival order when the wait ends. `AtTip` waits service
-/// commands and mempool hydration changes until the poll delay expires or
-/// cancellation fires.
+/// applies writes in arrival order when the wait ends. `AtTip` waits yield
+/// immediately to canonical work on [`CanonicalControlScheduling::YieldToCanonical`]
+/// maintenance commands while preserving the poll delay across reads,
+/// non-yielding commands, and mempool hydration changes.
 pub async fn follow_canonical_tip_with_control<Source>(
     store: RocksDbCanonicalStore,
     follower: CanonicalFollower<'_, Source>,
@@ -608,9 +613,12 @@ where
     // while this writer was down. Readers learn that it is confirmed only
     // from a source observation, never from the persisted fence itself.
     let mut tip_confirmation = TipConfirmation::Unconfirmed;
+    let mut yielded_to_canonical = false;
 
     loop {
-        control.drain(&mut store, tip_confirmation);
+        if !std::mem::take(&mut yielded_to_canonical) {
+            control.drain(&mut store, tip_confirmation);
+        }
         if follower.cancel.is_cancelled() {
             return Ok(store);
         }
@@ -727,21 +735,23 @@ where
                 record_fence_metrics(&store, observed_tip);
                 follower
                     .set_follow_readiness(store.event_fence().visible_tip(), Some(observed_tip));
-                if matches!(
-                    follower
-                        .wait_at_tip(
-                            &mut store,
-                            &mut control,
-                            &mut mempool_hydration_changes,
-                            AtTipState {
-                                observed_tip,
-                                tip_confirmation,
-                            },
-                        )
-                        .await,
-                    AtTipWaitOutcome::Cancelled
-                ) {
-                    return Ok(store);
+                match follower
+                    .wait_at_tip(
+                        &mut store,
+                        &mut control,
+                        &mut mempool_hydration_changes,
+                        AtTipState {
+                            observed_tip,
+                            tip_confirmation,
+                        },
+                    )
+                    .await
+                {
+                    AtTipWaitOutcome::PollDue => {}
+                    AtTipWaitOutcome::YieldedToCanonical => {
+                        yielded_to_canonical = true;
+                    }
+                    AtTipWaitOutcome::Cancelled => return Ok(store),
                 }
             }
             FollowIteration::Append {

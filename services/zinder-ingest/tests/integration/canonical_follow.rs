@@ -4386,3 +4386,89 @@ async fn canonical_follower_interleaves_bounded_retention_with_control_reads_and
     let _baseline_epoch = reopened.chain_epoch_at(zinder_core::ChainEpochId::new(1))?;
     Ok(())
 }
+
+async fn wait_for_confirmed_at_tip_status(
+    command_sender: &mpsc::Sender<CanonicalControlCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..10_000 {
+        let (reply, outcome) = oneshot::channel();
+        command_sender
+            .send(CanonicalControlCommand::WriterStatus { reply })
+            .await?;
+        let status = tokio::time::timeout(Duration::from_secs(1), outcome).await???;
+        if !status.tip_unconfirmed {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+    Err("follower did not reach confirmed at-tip wait".into())
+}
+
+#[tokio::test]
+async fn at_tip_wait_yields_to_canonical_between_successive_maintenance_commands()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source, activations, store, _dir) = follower_fixture_at_its_node_tip().await?;
+    for tag in 1_u8..=3 {
+        let _envelope = store.append_mempool_event(
+            MempoolEvent::Invalidated {
+                transaction_id: TransactionId::from_bytes([tag; 32]),
+                reason: MempoolEvictionReason::Unknown,
+            },
+            UnixTimestampMillis::new(1_000),
+        )?;
+    }
+    let retention = MempoolEventRetentionConfig::new(
+        Some(Duration::from_millis(1)),
+        Some(Duration::from_millis(1)),
+    );
+    let budget = MempoolEventRetentionStepBudget::new(
+        NonZeroU32::new(1).ok_or("retention event budget must be nonzero")?,
+        NonZeroU64::new(1_000_000).ok_or("retention byte budget must be nonzero")?,
+    );
+    let (command_sender, control_commands) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+    let follower_source = source.clone();
+    let follower_cancel = cancel.clone();
+    let follower_task = tokio::spawn(async move {
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        let follower = fixed_tip_follower(
+            &follower_source,
+            &activations,
+            Duration::from_secs(60),
+            &readiness,
+            &follower_cancel,
+        );
+        follow_canonical_tip_with_control(store, follower, control_commands).await
+    });
+
+    wait_for_confirmed_at_tip_status(&command_sender).await?;
+    assert_eq!(source.tip_call_count(), 1);
+    let (second_tip_entered, resume_second_tip) = source.pause_tip_call(2);
+    let (first_reply, first_outcome) = oneshot::channel();
+    let (second_reply, mut second_outcome) = oneshot::channel();
+    for reply in [first_reply, second_reply] {
+        command_sender
+            .send(CanonicalControlCommand::PruneMempoolEvents {
+                now: UnixTimestampMillis::new(10_000),
+                retention,
+                budget,
+                reply,
+            })
+            .await?;
+    }
+
+    let first_outcome = tokio::time::timeout(Duration::from_secs(1), first_outcome).await???;
+    assert!(first_outcome.has_immediate_work());
+    tokio::time::timeout(Duration::from_secs(1), second_tip_entered.notified()).await?;
+    assert!(matches!(
+        second_outcome.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    resume_second_tip.notify_one();
+    let second_outcome = tokio::time::timeout(Duration::from_secs(1), second_outcome).await???;
+    assert!(second_outcome.has_immediate_work());
+    cancel.cancel();
+    drop(command_sender);
+    let _store = tokio::time::timeout(Duration::from_secs(1), follower_task).await???;
+    Ok(())
+}
