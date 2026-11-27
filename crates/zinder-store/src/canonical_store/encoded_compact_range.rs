@@ -113,26 +113,24 @@ pub(super) fn encoded_compact_block_at(
     if height < retained.start || height > retained.end {
         return Ok(None);
     }
-    encoded_compact_block_at_for_context(store.serving_context(), height, selection)
+    encoded_compact_block_at_for_context(store.serving_context(), height, selection).map(Some)
 }
 
 fn encoded_compact_block_at_for_context(
     ctx: SegmentStoreContext<'_>,
     height: BlockHeight,
     selection: CompactBlockSpliceSelection,
-) -> Result<Option<EncodedBlock>, CanonicalStoreError> {
+) -> Result<EncodedBlock, CanonicalStoreError> {
     if let Some(entry) = resolve_settled_segment_for_height(ctx.db, ctx.sealed_segments, height)? {
-        return read_settled_unary_compact_block(ctx, &entry, height, selection).map(Some);
+        return read_settled_unary_compact_block(ctx, &entry, height, selection);
     }
-    let Some(raw_row) =
+    let raw_row =
         crate::canonical_store::settled_segments::store_access::read_live_tail_raw_bytes_with_options(
             ctx.db,
             height,
             &verified_read_options(),
         )?
-    else {
-        return Ok(None);
-    };
+        .ok_or_else(|| missing_compact_block_row(height))?;
     let wire = LiveTailBlockRecord::decode_splice_wire_v1(&raw_row, height)
         .map_err(map_settled_segments_read_error)?;
     if wire.has_unrepresentable_wire_fee {
@@ -142,14 +140,13 @@ fn encoded_compact_block_at_for_context(
         });
     }
     if wire.transparent_transactions.is_empty() && !selection.nullifiers_only {
-        return encoded_block_from_payload(wire.shielded_payload).map(Some);
+        return encoded_block_from_payload(wire.shielded_payload);
     }
     splice_compact_block_wire(
         wire.shielded_payload,
         &wire.transparent_transactions,
         selection,
     )
-    .map(Some)
     .map_err(map_supplement_read_error)
 }
 
@@ -2580,8 +2577,7 @@ mod tests {
             CompactBlockSpliceSelection::FULL_BLOCK,
             CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
         ] {
-            let encoded = encoded_compact_block_at_for_context(ctx, height, selection)?
-                .ok_or("expected unary compact block")?;
+            let encoded = encoded_compact_block_at_for_context(ctx, height, selection)?;
             let expected = reference_wire_bytes(
                 artifact,
                 ShieldedProjectionSelection::new(true, true, true, selection.nullifiers_only),
@@ -2613,8 +2609,7 @@ mod tests {
             ctx,
             BlockHeight::new(1),
             CompactBlockSpliceSelection::DEFAULT_SHIELDED,
-        )?
-        .ok_or("expected height 1 DEFAULT_SHIELDED")?;
+        )?;
         assert_eq!(cache.open_count(SettledSegmentKind::Supplement), 0);
 
         for height_val in [1_u32, 16_u32] {
@@ -2633,14 +2628,16 @@ mod tests {
         for (idx, artifact) in artifacts.iter().enumerate() {
             assert_unary_parity_at(ctx, BlockHeight::new(u32::try_from(idx + 1)?), artifact)?;
         }
-        assert!(
-            encoded_compact_block_at_for_context(
-                ctx,
-                BlockHeight::new(25),
-                CompactBlockSpliceSelection::FULL_BLOCK,
-            )?
-            .is_none()
-        );
+        for selection in [
+            CompactBlockSpliceSelection::FULL_BLOCK,
+            CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+        ] {
+            assert!(matches!(
+                encoded_compact_block_at_for_context(ctx, BlockHeight::new(25), selection),
+                Err(CanonicalStoreError::PublicationRefused { ref reason })
+                    if reason.contains("compact block at height 25 is absent")
+            ));
+        }
 
         let wide_dir = TempDir::new()?;
         let wide_db = seed_wide_fee_live_tail_store(wide_dir.path(), 2)?;

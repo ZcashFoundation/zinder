@@ -3608,3 +3608,54 @@ fn assert_unary_lookup_tickers(
     }
     Ok(())
 }
+
+#[test]
+fn unary_encoded_compact_block_reports_missing_retained_live_tail_row_as_storage_damage()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::CompactBlockSpliceSelection;
+
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+
+    for selection in [
+        CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+    ] {
+        for outside in [BlockHeight::new(0), BlockHeight::new(5)] {
+            assert!(
+                store
+                    .encoded_compact_block_at(outside, selection)?
+                    .is_none()
+            );
+        }
+    }
+
+    let live_tail_cf = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    store.bounded_open.db.delete_cf(
+        &live_tail_cf,
+        zinder_core::wire::encode_height_key_ascending(BlockHeight::new(3)),
+    )?;
+
+    for selection in [
+        CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+    ] {
+        assert!(matches!(
+            store.encoded_compact_block_at(BlockHeight::new(3), selection),
+            Err(CanonicalStoreError::PublicationRefused { ref reason })
+                if reason.contains("compact block at height 3 is absent")
+        ));
+        assert!(
+            store
+                .encoded_compact_block_at(BlockHeight::new(2), selection)?
+                .is_some()
+        );
+    }
+    Ok(())
+}
