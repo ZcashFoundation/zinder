@@ -105,10 +105,31 @@ PROJECTION_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 REBUILD_ROLLBACK_RE = re.compile(
-    r"(?<![A-Za-z0-9])(rebuilds?|rebuilding|rebuilt|roll(?:ed)?(?:[-\s])?backs?|restor(?:e|ing|ed))(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9])(rebuilds?|rebuilding|rebuilt|roll(?:ed)?(?:-|\s+)?backs?|restor(?:e|ing|ed))(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 TOP_KEY_RE = re.compile(r'^("[^"]+"|\'[^\']+\'|[A-Za-z0-9_.-]+)\s*:(.*)$')
+BLOCK_SCALAR_RE = re.compile(r"^([|>])([+-]?[1-9]?|[1-9]?[+-]?)(?:\s+#.*)?$")
+YAML_ESCAPES = {
+    "0": "\x00",
+    "a": "\x07",
+    "b": "\x08",
+    "t": "\t",
+    "\t": "\t",
+    "n": "\n",
+    "v": "\x0b",
+    "f": "\x0c",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\u0085",
+    "_": "\u00a0",
+    "L": "\u2028",
+    "P": "\u2029",
+}
 
 
 def unquote_key(token):
@@ -144,15 +165,23 @@ def parse_quoted_scalar(lines, start_idx, first_text, quote_char):
                 if ch == "\\":
                     if pos + 1 < len(segment):
                         nxt = segment[pos + 1]
-                        if nxt == "n":
-                            buf.append("\n")
-                        elif nxt == "t":
-                            buf.append("\t")
-                        elif nxt == "r":
-                            buf.append("\r")
+                        if nxt in YAML_ESCAPES:
+                            buf.append(YAML_ESCAPES[nxt])
+                            pos += 2
+                        elif nxt in ("x", "u", "U"):
+                            hex_len = {"x": 2, "u": 4, "U": 8}[nxt]
+                            hex_part = segment[pos + 2 : pos + 2 + hex_len]
+                            if len(hex_part) == hex_len and all(
+                                c in "0123456789abcdefABCDEF" for c in hex_part
+                            ):
+                                buf.append(chr(int(hex_part, 16)))
+                                pos += 2 + hex_len
+                            else:
+                                buf.append("\\" + nxt)
+                                pos += 2
                         else:
-                            buf.append(nxt)
-                        pos += 2
+                            buf.append("\\" + nxt)
+                            pos += 2
                     else:
                         # line continuation
                         pos += 1
@@ -268,6 +297,7 @@ def parse_flow_mapping(lines, start_idx, first_rest):
     cur = []
     in_quote = None
     escaped = False
+    nested_depth = 0
     pos = 0
     while pos < len(inner):
         ch = inner[pos]
@@ -291,7 +321,14 @@ def parse_flow_mapping(lines, start_idx, first_rest):
             if ch in ("'", '"'):
                 in_quote = ch
                 cur.append(ch)
-            elif ch == ",":
+            elif ch in ("{", "["):
+                nested_depth += 1
+                cur.append(ch)
+            elif ch in ("}", "]"):
+                if nested_depth > 0:
+                    nested_depth -= 1
+                cur.append(ch)
+            elif ch == "," and nested_depth == 0:
                 item_str = "".join(cur).strip()
                 if item_str:
                     entries.append(item_str)
@@ -331,6 +368,104 @@ def parse_flow_mapping(lines, start_idx, first_rest):
     return upgrade_values, idx
 
 
+def consume_block_scalar(lines, start_idx, rest_stripped, parent_indent):
+    block_match = BLOCK_SCALAR_RE.match(rest_stripped)
+    if not block_match:
+        return None
+    style = block_match.group(1)
+    mod = block_match.group(2)
+    explicit_indent = None
+    for ch in mod:
+        if ch.isdigit():
+            explicit_indent = int(ch)
+    j = start_idx + 1
+    block_lines = []
+    while j < len(lines):
+        bl = lines[j]
+        if bl.strip() == "":
+            block_lines.append("")
+            j += 1
+            continue
+        bi = len(bl) - len(bl.lstrip(" "))
+        if bi <= parent_indent:
+            break
+        block_lines.append(bl)
+        j += 1
+    while block_lines and block_lines[-1] == "":
+        block_lines.pop()
+    if explicit_indent is not None:
+        base_indent = parent_indent + explicit_indent if parent_indent > 0 else explicit_indent
+    else:
+        base_indent = None
+        for bl in block_lines:
+            if bl.strip() != "":
+                base_indent = len(bl) - len(bl.lstrip(" "))
+                break
+        if base_indent is None:
+            base_indent = 0
+    cleaned = [
+        bl[base_indent:] if len(bl) >= base_indent and bl.strip() != "" else ""
+        for bl in block_lines
+    ]
+    if style == ">":
+        paragraphs = []
+        current = []
+        for cl in cleaned:
+            if cl == "":
+                if current:
+                    paragraphs.append(" ".join(current))
+                    current = []
+            else:
+                current.append(cl)
+        if current:
+            paragraphs.append(" ".join(current))
+        text = "\n".join(paragraphs)
+    else:
+        text = "\n".join(cleaned)
+    return text, j
+
+
+def consume_flow_value(lines, start_idx, first_rest):
+    idx = start_idx
+    segment = first_rest
+    in_quote = None
+    escaped = False
+    depth = 0
+    while idx < len(lines):
+        pos = 0
+        while pos < len(segment):
+            ch = segment[pos]
+            if in_quote == "'":
+                if ch == "'":
+                    if pos + 1 < len(segment) and segment[pos + 1] == "'":
+                        pos += 2
+                        continue
+                    in_quote = None
+            elif in_quote == '"':
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_quote = None
+            else:
+                if ch == "#" and (pos == 0 or segment[pos - 1].isspace()):
+                    break
+                if ch in ("'", '"'):
+                    in_quote = ch
+                elif ch in ("{", "["):
+                    depth += 1
+                elif ch in ("}", "]"):
+                    depth -= 1
+                    if depth <= 0:
+                        return idx
+            pos += 1
+        idx += 1
+        if idx < len(lines):
+            segment = lines[idx]
+    return len(lines) - 1
+
+
 def parse_fragment(path):
     with open(path, "r", encoding="utf-8") as fh:
         raw = fh.read()
@@ -363,61 +498,9 @@ def parse_fragment(path):
 
         if key == "body":
             rest_stripped = rest.lstrip(" \t")
-            block_match = re.match(
-                r"^([|>])([+-]?[1-9]?|[1-9]?[+-]?)(?:\s+#.*)?$", rest_stripped
-            )
-            if block_match:
-                style = block_match.group(1)
-                mod = block_match.group(2)
-                explicit_indent = None
-                for ch in mod:
-                    if ch.isdigit():
-                        explicit_indent = int(ch)
-                j = i + 1
-                block_lines = []
-                while j < len(lines):
-                    bl = lines[j]
-                    if bl.strip() == "":
-                        block_lines.append("")
-                        j += 1
-                        continue
-                    bi = len(bl) - len(bl.lstrip(" "))
-                    if bi == 0:
-                        break
-                    block_lines.append(bl)
-                    j += 1
-                while block_lines and block_lines[-1] == "":
-                    block_lines.pop()
-                if explicit_indent is not None:
-                    base_indent = explicit_indent
-                else:
-                    base_indent = None
-                    for bl in block_lines:
-                        if bl.strip() != "":
-                            base_indent = len(bl) - len(bl.lstrip(" "))
-                            break
-                    if base_indent is None:
-                        base_indent = 0
-                cleaned = [
-                    bl[base_indent:] if len(bl) >= base_indent and bl.strip() != "" else ""
-                    for bl in block_lines
-                ]
-                if style == ">":
-                    paragraphs = []
-                    current = []
-                    for cl in cleaned:
-                        if cl == "":
-                            if current:
-                                paragraphs.append(" ".join(current))
-                                current = []
-                        else:
-                            current.append(cl)
-                    if current:
-                        paragraphs.append(" ".join(current))
-                    body_text = "\n".join(paragraphs)
-                else:
-                    body_text = "\n".join(cleaned)
-                i = j
+            block = consume_block_scalar(lines, i, rest_stripped, 0)
+            if block is not None:
+                body_text, i = block
                 continue
             elif rest_stripped and rest_stripped[0] in ("'", '"'):
                 body_text, end_idx = parse_quoted_scalar(
@@ -472,20 +555,55 @@ def parse_fragment(path):
                     if ci == child_indent:
                         cm = TOP_KEY_RE.match(cl.lstrip(" "))
                         if cm:
-                            ck = unquote_key(cm.group(1))
+                            raw_ck = cm.group(1)
+                            is_quoted_ck = raw_ck[0] in ("'", '"')
+                            ck = unquote_key(raw_ck)
                             crest = cm.group(2)
-                            if (not crest or crest[0] in (" ", "\t")) and ck == "Upgrade":
+                            if not crest or crest[0] in (" ", "\t") or is_quoted_ck:
+                                crest_stripped = crest.lstrip(" \t")
+                                if crest_stripped.startswith("#"):
+                                    crest_stripped = ""
+                                block = consume_block_scalar(
+                                    lines, j, crest_stripped, child_indent
+                                )
+                                if block is not None:
+                                    val, next_j = block
+                                    if ck == "Upgrade":
+                                        upgrade_entries.append((val.strip(), True))
+                                    j = next_j
+                                    continue
+                                if crest_stripped.startswith(("{", "[")):
+                                    end_idx = consume_flow_value(
+                                        lines, j, crest_stripped
+                                    )
+                                    if ck == "Upgrade":
+                                        upgrade_entries.append(("<non-scalar>", False))
+                                    j = end_idx + 1
+                                    continue
                                 val, end_idx, was_quoted = parse_scalar_value(
                                     lines, j, crest, child_indent
                                 )
-                                upgrade_entries.append((val, was_quoted))
+                                if ck == "Upgrade":
+                                    upgrade_entries.append((val, was_quoted))
                                 j = end_idx + 1
                                 continue
                     j += 1
                 i = j
                 continue
 
-        i += 1
+        rest_stripped = rest.lstrip(" \t")
+        if rest_stripped.startswith("#"):
+            rest_stripped = ""
+        block = consume_block_scalar(lines, i, rest_stripped, 0)
+        if block is not None:
+            _, i = block
+            continue
+        if rest_stripped.startswith(("{", "[")):
+            end_idx = consume_flow_value(lines, i, rest_stripped)
+            i = end_idx + 1
+            continue
+        _val, end_idx, _was_quoted = parse_scalar_value(lines, i, rest, 0)
+        i = end_idx + 1
 
     return body_text, upgrade_entries
 

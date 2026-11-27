@@ -304,6 +304,84 @@ git -C "$fixture_repository" rm -q .changes/unreleased/flow-unseparated-upgrade.
 git -C "$fixture_repository" commit -qm "cleanup flow-unseparated Upgrade"
 clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
 
+# Quoted continuation line inside another custom field must not spoof custom.Upgrade.
+cat > "$fixture_repository/.changes/unreleased/quoted-notes-with-upgrade.yaml" <<'YAML'
+kind: changed
+body: Put Upgrade continuation inside another custom field's quoted scalar.
+time: 2026-07-21T19:14:10Z
+custom:
+  Bump: patch
+  Notes: "Mention
+  Upgrade: compatible"
+  PR: "24"
+YAML
+git -C "$fixture_repository" add .changes/unreleased/quoted-notes-with-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with Upgrade text inside quoted Notes"
+quoted_notes_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with Upgrade text inside quoted custom.Notes (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with Upgrade text inside quoted custom.Notes (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$quoted_notes_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/quoted-notes-with-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup quoted Notes Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
+# Escape sequences in quoted Upgrade must be decoded or preserved verbatim, never stripped.
+cat > "$fixture_repository/.changes/unreleased/bad-escape-block-upgrade.yaml" <<'YAML'
+kind: fixed
+body: Reject YAML escape sequences inside block Upgrade value.
+time: 2026-07-21T19:14:20Z
+custom:
+  Bump: patch
+  PR: "24"
+  Upgrade: "compatibl\e"
+YAML
+git -C "$fixture_repository" add .changes/unreleased/bad-escape-block-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with escaped Upgrade in block mapping"
+bad_escape_block_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with escaped Upgrade in block mapping (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with escaped Upgrade in block mapping (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$bad_escape_block_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/bad-escape-block-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup bad-escape block Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
+cat > "$fixture_repository/.changes/unreleased/bad-escape-flow-upgrade.yaml" <<'YAML'
+kind: fixed
+body: Reject YAML escape sequences inside flow Upgrade value.
+time: 2026-07-21T19:14:30Z
+custom: { Bump: patch, PR: "25", Upgrade: "compati\ble" }
+YAML
+git -C "$fixture_repository" add .changes/unreleased/bad-escape-flow-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with escaped Upgrade in flow mapping"
+bad_escape_flow_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with escaped Upgrade in flow mapping (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with escaped Upgrade in flow mapping (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$bad_escape_flow_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/bad-escape-flow-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup bad-escape flow Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
 # projection-layout missing projection name must fail in both fragments and pr modes.
 cat > "$fixture_repository/.changes/unreleased/proj-no-name.yaml" <<'YAML'
 kind: changed
@@ -377,6 +455,16 @@ body: |-
 time: 2026-07-21T19:26:00Z
 custom: { Bump: patch, PR: "34", Upgrade: projection-layout }
 YAML
+cat > "$fixture_repository/.changes/unreleased/proj-wrapped-rollback.yaml" <<'YAML'
+kind: changed
+body: "Update wallet projection layout; rebuild the wallet projection in a clean path and roll
+  back by restoring a matching backup."
+time: 2026-07-21T19:26:30Z
+custom:
+  Bump: minor
+  PR: "34"
+  Upgrade: projection-layout
+YAML
 cat > "$fixture_repository/.changes/unreleased/canonical-minimal.yaml" <<'YAML'
 kind: changed
 body: Cut serving over to ZSHRNG02 canonical settled segments and remove ZSHRNG01 catalogs.
@@ -390,6 +478,7 @@ run_validator fragments "$fixture_repository"
 rm \
   "$fixture_repository/.changes/unreleased/proj-wallet.yaml" \
   "$fixture_repository/.changes/unreleased/proj-explorer.yaml" \
+  "$fixture_repository/.changes/unreleased/proj-wrapped-rollback.yaml" \
   "$fixture_repository/.changes/unreleased/canonical-minimal.yaml"
 
 # Historical pre-v0.28.0 release sections without Upgrade class remain accepted.
