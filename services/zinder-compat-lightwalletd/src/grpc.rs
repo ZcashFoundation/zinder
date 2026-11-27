@@ -105,6 +105,9 @@ const MAX_MEMPOOL_STREAM_TRANSACTIONS: usize = 100_000;
 /// Outbound `RawTransaction` messages one `GetMempoolStream` task buffers ahead
 /// of its gRPC transport before backpressuring its upstream subscription.
 const MEMPOOL_STREAM_CHANNEL_CAPACITY: usize = 16;
+/// Entries a mempool snapshot walk buffers ahead of its consumer before
+/// backpressuring the next snapshot page read.
+const MEMPOOL_SNAPSHOT_ENTRY_CHANNEL_CAPACITY: usize = 16;
 
 /// Response bounds for [`LightwalletdGrpcAdapter`].
 ///
@@ -426,32 +429,21 @@ impl<QueryApi: Sync> LightwalletdGrpcAdapter<QueryApi> {
             .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
             .await
             .map_err(status_from_mempool_surface_error)?;
-        let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
-        let mut exclusions = (!request.exclude_txid_suffixes.is_empty())
-            .then(|| MempoolExclusions::new(request.exclude_txid_suffixes));
-        let mut compact_messages = Vec::new();
-        while let Some(entry_outcome) = entries.next().await {
-            let entry = entry_outcome?.into_parts();
-            if let Some(exclusions) = &mut exclusions {
-                exclusions.observe(entry.transaction_id);
-            }
-            if let Some(message) = shape.encode_transaction(CompactTransaction {
-                index: 0,
-                transaction_id: entry.transaction_id,
-                data: entry.compact_transaction_data,
-            })? {
-                compact_messages.push(message);
-            }
+        if request.exclude_txid_suffixes.is_empty() {
+            return Ok(Response::new(stream_mempool_compact_transactions(
+                mempool_surface,
+                first_page,
+                shape,
+            )));
         }
-        let messages = compact_messages
-            .into_iter()
-            .filter(move |message| {
-                exclusions
-                    .as_ref()
-                    .is_none_or(|exclusions| !exclusions.uniquely_matches(&message.txid))
-            })
-            .map(Ok);
-        Ok(Response::new(Box::pin(stream::iter(messages))))
+        buffered_mempool_transactions(
+            mempool_surface,
+            first_page,
+            shape,
+            request.exclude_txid_suffixes,
+        )
+        .await
+        .map(Response::new)
     }
 
     async fn mempool_stream(
@@ -2587,6 +2579,135 @@ where
     }
 }
 
+fn stream_mempool_compact_transactions(
+    mempool_surface: SharedMempoolSurface,
+    first_page: MempoolSnapshotPage,
+    shape: CompactBlockShape,
+) -> GrpcStream<lightwalletd::CompactTx> {
+    if first_page.entries.is_empty() && first_page.next_cursor.is_none() {
+        return Box::pin(stream::empty());
+    }
+    if first_page.next_cursor.is_none() {
+        return Box::pin(MempoolCompactTxStream::new(
+            stream::iter(first_page.entries.into_iter().map(Ok)),
+            shape,
+        ));
+    }
+    Box::pin(MempoolCompactTxStream::new(
+        mempool_snapshot_entries(mempool_surface, first_page),
+        shape,
+    ))
+}
+
+async fn buffered_mempool_transactions(
+    mempool_surface: SharedMempoolSurface,
+    first_page: MempoolSnapshotPage,
+    shape: CompactBlockShape,
+    exclude_txid_suffixes: Vec<Vec<u8>>,
+) -> Result<GrpcStream<lightwalletd::CompactTx>, Status> {
+    let mut entries = mempool_snapshot_entries(mempool_surface, first_page);
+    let mut exclusions = MempoolExclusions::new(exclude_txid_suffixes);
+    let mut compact_messages = Vec::new();
+    while let Some(entry_outcome) = entries.next().await {
+        let entry = entry_outcome?;
+        exclusions.observe(entry.transaction_id());
+        if let Some(message) = encode_mempool_transaction(shape, entry)? {
+            compact_messages.push(message);
+        }
+    }
+    let messages = compact_messages
+        .into_iter()
+        .filter(move |message| !exclusions.uniquely_matches(&message.txid))
+        .map(Ok);
+    Ok(Box::pin(stream::iter(messages)))
+}
+
+fn encode_mempool_transaction(
+    shape: CompactBlockShape,
+    entry: zinder_core::MempoolEntry,
+) -> Result<Option<lightwalletd::CompactTx>, Status> {
+    let entry = entry.into_parts();
+    shape.encode_transaction(CompactTransaction {
+        index: 0,
+        transaction_id: entry.transaction_id,
+        data: entry.compact_transaction_data,
+    })
+}
+
+/// Streams `CompactTx` messages encoded lazily from a mempool snapshot walk.
+///
+/// Entries excluded by `shape` are skipped. On the first upstream or encoding
+/// error, the upstream entry stream is dropped before yielding the error so
+/// subsequent polls end the stream without reading further pages.
+struct MempoolCompactTxStream<S> {
+    entries: Option<S>,
+    shape: CompactBlockShape,
+}
+
+impl<S> MempoolCompactTxStream<S> {
+    const fn new(entries: S, shape: CompactBlockShape) -> Self {
+        Self {
+            entries: Some(entries),
+            shape,
+        }
+    }
+}
+
+impl<S> tonic::codegen::tokio_stream::Stream for MempoolCompactTxStream<S>
+where
+    S: tonic::codegen::tokio_stream::Stream<Item = Result<zinder_core::MempoolEntry, Status>>
+        + Unpin,
+{
+    type Item = Result<lightwalletd::CompactTx, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            let Some(entries) = this.entries.as_mut() else {
+                return std::task::Poll::Ready(None);
+            };
+            let outcome = match Pin::new(entries).poll_next(context) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(None) => {
+                    this.entries = None;
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Ready(Some(outcome)) => outcome,
+            };
+            let entry = match outcome {
+                Ok(entry) => entry,
+                Err(status) => {
+                    this.entries = None;
+                    return std::task::Poll::Ready(Some(Err(status)));
+                }
+            };
+            match encode_mempool_transaction(this.shape, entry) {
+                Ok(Some(message)) => return std::task::Poll::Ready(Some(Ok(message))),
+                Ok(None) => {}
+                Err(status) => {
+                    this.entries = None;
+                    return std::task::Poll::Ready(Some(Err(status)));
+                }
+            }
+        }
+    }
+}
+
+async fn take_or_reserve_mempool_entry_slot<'a>(
+    reserved_slot: &mut Option<
+        tokio::sync::mpsc::Permit<'a, Result<zinder_core::MempoolEntry, Status>>,
+    >,
+    entry_sender: &'a tokio::sync::mpsc::Sender<Result<zinder_core::MempoolEntry, Status>>,
+) -> Option<tokio::sync::mpsc::Permit<'a, Result<zinder_core::MempoolEntry, Status>>> {
+    if let Some(slot) = reserved_slot.take() {
+        return Some(slot);
+    }
+    entry_sender.reserve().await.ok()
+}
+
 /// Streams live-mempool entries page by page, starting with the
 /// already-fetched first page and fetching later pages only as the consumer
 /// pulls, so the walk never materializes the whole mempool.
@@ -2594,27 +2715,46 @@ fn mempool_snapshot_entries(
     mempool_surface: SharedMempoolSurface,
     first_page: MempoolSnapshotPage,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<zinder_core::MempoolEntry, Status>> {
-    let (entry_sender, entry_receiver) = tokio::sync::mpsc::channel(16);
+    let (entry_sender, entry_receiver) =
+        tokio::sync::mpsc::channel(MEMPOOL_SNAPSHOT_ENTRY_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let mut page = first_page;
+        let mut reserved_slot = None;
         loop {
             for entry in page.entries {
-                if entry_sender.send(Ok(entry)).await.is_err() {
+                let Some(slot) =
+                    take_or_reserve_mempool_entry_slot(&mut reserved_slot, &entry_sender).await
+                else {
                     return;
-                }
+                };
+                slot.send(Ok(entry));
             }
             let Some(cursor) = page.next_cursor else {
                 return;
             };
-            page = match mempool_surface
-                .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, Some(cursor))
-                .await
-            {
-                Ok(next_page) => next_page,
+            let Some(slot) =
+                take_or_reserve_mempool_entry_slot(&mut reserved_slot, &entry_sender).await
+            else {
+                return;
+            };
+            if entry_sender.is_closed() {
+                return;
+            }
+            let next_page = tokio::select! {
+                biased;
+                () = entry_sender.closed() => return,
+                outcome = mempool_surface.mempool_snapshot_page(
+                    LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE,
+                    Some(cursor),
+                ) => outcome,
+            };
+            page = match next_page {
+                Ok(next_page) => {
+                    reserved_slot = Some(slot);
+                    next_page
+                }
                 Err(error) => {
-                    let _ = entry_sender
-                        .send(Err(status_from_mempool_surface_error(error)))
-                        .await;
+                    slot.send(Err(status_from_mempool_surface_error(error)));
                     return;
                 }
             };
@@ -3047,6 +3187,183 @@ mod tests {
             return Err(Status::internal("expected UNAVAILABLE status after queue"));
         };
         assert_eq!(status.code(), tonic::Code::Unavailable);
+        Ok(())
+    }
+
+    fn unit_mempool_entry(
+        txid_byte: u8,
+        fee_zat: Option<u64>,
+    ) -> Result<zinder_core::MempoolEntry, zinder_core::MempoolEntryBuildError> {
+        let compact_transaction_data = zinder_core::CompactTransactionData {
+            fee_zat,
+            sapling_outputs: vec![zinder_core::CompactSaplingOutput {
+                commitment: [txid_byte; 32],
+                ephemeral_key: [txid_byte; 32],
+                ciphertext: [txid_byte; 52],
+            }],
+            ..zinder_core::CompactTransactionData::default()
+        };
+        zinder_core::MempoolEntry::new(
+            TransactionId::from_bytes([txid_byte; 32]),
+            None,
+            RawTransactionBytes::new(vec![txid_byte; 16]),
+            compact_transaction_data,
+            zinder_core::MempoolObservation {
+                first_seen_unix_millis: UnixTimestampMillis::new(1_700_000_000_000),
+                first_seen_chain_epoch: test_chain_epoch(),
+            },
+        )
+    }
+
+    struct DelayedUnitMempoolSurface {
+        fetched_pages: Arc<AtomicUsize>,
+        page_two_reached: Arc<tokio::sync::Notify>,
+        page_two_dropped: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    struct UnitDropGuard(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for UnitDropGuard {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mempool::MempoolSurface for DelayedUnitMempoolSurface {
+        async fn mempool_snapshot_page(
+            &self,
+            _max_entries: u32,
+            _from_cursor: Option<Vec<u8>>,
+        ) -> Result<MempoolSnapshotPage, MempoolSurfaceError> {
+            self.fetched_pages.fetch_add(1, Ordering::SeqCst);
+            let _drop_guard = UnitDropGuard(self.page_two_dropped.lock().take());
+            self.page_two_reached.notify_waiters();
+            std::future::pending::<()>().await;
+            Err(MempoolSurfaceError::Unavailable {
+                reason: "unreachable".to_owned(),
+            })
+        }
+
+        async fn mempool_events(
+            &self,
+            _from_cursor: Option<zinder_store::StreamCursorTokenV1>,
+        ) -> Result<crate::mempool::MempoolEventEnvelopeStream, MempoolSurfaceError> {
+            Err(MempoolSurfaceError::Unavailable {
+                reason: "unused in unit test".to_owned(),
+            })
+        }
+
+        async fn mempool_transaction(
+            &self,
+            _transaction_id: TransactionId,
+        ) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
+            Err(MempoolSurfaceError::Unavailable {
+                reason: "unused in unit test".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mempool_snapshot_entries_waits_for_channel_capacity_before_fetching_next_page()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fetched_pages = Arc::new(AtomicUsize::new(0));
+        let page_two_reached = Arc::new(tokio::sync::Notify::new());
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let surface: SharedMempoolSurface = Arc::new(DelayedUnitMempoolSurface {
+            fetched_pages: Arc::clone(&fetched_pages),
+            page_two_reached: Arc::clone(&page_two_reached),
+            page_two_dropped: parking_lot::Mutex::new(Some(dropped_tx)),
+        });
+        let first_entries = (0..MEMPOOL_SNAPSHOT_ENTRY_CHANNEL_CAPACITY)
+            .map(|idx| unit_mempool_entry(u8::try_from(idx + 1).unwrap_or(u8::MAX), Some(10)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let first_page = MempoolSnapshotPage {
+            chain_epoch_id: ChainEpochId::new(1),
+            events_resume_cursor: None,
+            entries: first_entries,
+            next_cursor: Some(vec![1]),
+        };
+
+        let mut entry_stream = mempool_snapshot_entries(surface, first_page);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(fetched_pages.load(Ordering::SeqCst), 0);
+
+        let page_two_wait = page_two_reached.notified();
+        let first_entry = entry_stream
+            .next()
+            .await
+            .ok_or_else(|| Status::internal("missing first entry"))??;
+        assert_eq!(
+            first_entry.transaction_id(),
+            TransactionId::from_bytes([1; 32])
+        );
+        tokio::time::timeout(Duration::from_secs(2), page_two_wait).await?;
+        assert_eq!(fetched_pages.load(Ordering::SeqCst), 1);
+
+        drop(entry_stream);
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx).await??;
+        Ok(())
+    }
+
+    struct CountingEntryStream {
+        entries: std::vec::IntoIter<Result<zinder_core::MempoolEntry, Status>>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tonic::codegen::tokio_stream::Stream for CountingEntryStream {
+        type Item = Result<zinder_core::MempoolEntry, Status>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.entries.next())
+        }
+    }
+
+    impl Drop for CountingEntryStream {
+        fn drop(&mut self) {
+            if let Some(sender) = self.dropped.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mempool_compact_tx_stream_drops_upstream_and_terminates_on_encode_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let upstream = CountingEntryStream {
+            entries: vec![
+                Ok(unit_mempool_entry(0x11, Some(10))?),
+                Ok(unit_mempool_entry(0x22, Some(u64::from(u32::MAX) + 1))?),
+                Ok(unit_mempool_entry(0x33, Some(10))?),
+            ]
+            .into_iter(),
+            dropped: Some(dropped_tx),
+        };
+        let shape = CompactBlockShape::for_mempool(&[])?;
+        let mut tx_stream = MempoolCompactTxStream::new(upstream, shape);
+
+        let first = tx_stream
+            .next()
+            .await
+            .ok_or_else(|| Status::internal("missing first compact tx"))??;
+        assert_eq!(first.txid, vec![0x11; 32]);
+
+        let second = tx_stream
+            .next()
+            .await
+            .ok_or_else(|| Status::internal("missing encode error"))?;
+        let Err(status) = second else {
+            return Err("expected DataLoss error on oversized fee".into());
+        };
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx).await??;
+        assert!(tx_stream.next().await.is_none());
         Ok(())
     }
 }
