@@ -1,6 +1,6 @@
 //! `ExplorerQuery.DisplacedBlockHistory` and `DisplacedBlockDetail` handlers.
 
-use std::{num::NonZeroU32, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
 use tonic::{Request, Response, Status};
 use zinder_core::{
@@ -163,14 +163,9 @@ fn read_displaced_history_page(
         .map_err(internal_canonical_error)?
         .map(encode_archive_coverage);
 
-    let mut entries = Vec::with_capacity(page.blocks.len());
-    for displaced in page.blocks {
-        let counterpart = read_canonical_counterpart(&guard, displaced.header.height, &epoch)?;
-        entries.push(DisplacedBlockHistoryEntry {
-            block: Some(encode_displaced_block_summary(&displaced)),
-            current_canonical_block: counterpart,
-        });
-    }
+    let entries = build_displaced_history_entries(page.blocks, |height| {
+        read_canonical_counterpart(&guard, height, &epoch)
+    })?;
     drop(guard);
     let next_cursor = page
         .next_cursor
@@ -184,6 +179,34 @@ fn read_displaced_history_page(
         total_count,
         coverage,
     ))
+}
+
+fn build_displaced_history_entries(
+    blocks: Vec<ArchivedDisplacedBlockSummary>,
+    mut load_counterpart: impl FnMut(
+        BlockHeight,
+    ) -> Result<Option<DisplacedBlockCanonicalCounterpart>, Status>,
+) -> Result<Vec<DisplacedBlockHistoryEntry>, Status> {
+    let mut counterparts_by_height: HashMap<
+        BlockHeight,
+        Option<DisplacedBlockCanonicalCounterpart>,
+    > = HashMap::new();
+    let mut entries = Vec::with_capacity(blocks.len());
+    for displaced in blocks {
+        let height = displaced.header.height;
+        let counterpart = if let Some(cached) = counterparts_by_height.get(&height) {
+            cached.clone()
+        } else {
+            let loaded = load_counterpart(height)?;
+            counterparts_by_height.insert(height, loaded.clone());
+            loaded
+        };
+        entries.push(DisplacedBlockHistoryEntry {
+            block: Some(encode_displaced_block_summary(&displaced)),
+            current_canonical_block: counterpart,
+        });
+    }
+    Ok(entries)
 }
 
 fn read_displaced_detail(
@@ -344,4 +367,84 @@ fn copy_array<const N: usize>(slice: &[u8]) -> Result<[u8; N], Status> {
     slice
         .try_into()
         .map_err(|_| ExplorerError::invalid_request("displaced-block cursor is truncated").into())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        missing_docs,
+        reason = "Unit test names describe the behavior under test."
+    )]
+
+    use std::cell::Cell;
+
+    use zinder_core::{BlockHeaderArtifact, ChainEpochId, TransactionId, UnixTimestampMillis};
+
+    use super::*;
+
+    fn synthetic_displaced_summary(
+        height: u32,
+        hash_byte: u8,
+        seq: u64,
+    ) -> ArchivedDisplacedBlockSummary {
+        let block_hash = BlockHash::from_bytes([hash_byte; 32]);
+        let parent_hash = BlockHash::from_bytes([hash_byte.saturating_sub(1); 32]);
+        ArchivedDisplacedBlockSummary {
+            block_hash,
+            header: BlockHeaderArtifact::new(
+                BlockHeight::new(height),
+                block_hash,
+                parent_hash,
+                [0; 32],
+                [0; 32],
+                1_750_000_000 + i64::from(height),
+                0x200f_0f0f,
+                [0; 32],
+                u32::from(hash_byte),
+                128,
+            ),
+            transaction_ids: vec![TransactionId::from_bytes([hash_byte; 32])],
+            coinbase_outputs: Vec::new(),
+            displacement_event_sequence: seq,
+            displacement_epoch: ChainEpochId::new(seq),
+            displaced_at: UnixTimestampMillis::new(1_750_000_000_000),
+        }
+    }
+
+    #[test]
+    fn displaced_history_page_caches_canonical_counterparts_by_height() -> Result<(), Status> {
+        let blocks = vec![
+            synthetic_displaced_summary(5, 0x11, 10),
+            synthetic_displaced_summary(5, 0x22, 11),
+            synthetic_displaced_summary(6, 0x33, 12),
+            synthetic_displaced_summary(5, 0x44, 13),
+            synthetic_displaced_summary(6, 0x55, 14),
+        ];
+        let calls = Cell::new(0_usize);
+        let entries = build_displaced_history_entries(blocks, |height| {
+            calls.set(calls.get().saturating_add(1));
+            Ok(Some(DisplacedBlockCanonicalCounterpart {
+                block_height: height.value(),
+                block_hash: format!("canon-{}", height.value()),
+                ..Default::default()
+            }))
+        })?;
+        assert_eq!(calls.get(), 2);
+        assert_eq!(entries.len(), 5);
+        for (idx, expected_height) in [5_u32, 5, 6, 5, 6].into_iter().enumerate() {
+            let counterpart = entries[idx].current_canonical_block.as_ref();
+            assert_eq!(
+                counterpart.map(|canon| canon.block_height),
+                Some(expected_height)
+            );
+            assert_eq!(
+                counterpart.map(|canon| canon.block_hash.as_str()),
+                Some(match expected_height {
+                    5 => "canon-5",
+                    _ => "canon-6",
+                })
+            );
+        }
+        Ok(())
+    }
 }
