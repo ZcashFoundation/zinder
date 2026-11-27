@@ -1348,6 +1348,12 @@ cat >"$segmented_valid_report" <<'JSON'
   "fixture": {
     "contract_identity": "canonical-fixture",
     "fixture_format_version": 1,
+    "canonical_block_facts_digest_evidence": {
+      "block_digest_version": 1,
+      "sequence_digest_version": 1,
+      "block_count": 10,
+      "sequence_digest_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
     "from_height": 1,
     "to_height": 10,
     "block_count": 10,
@@ -1387,17 +1393,20 @@ cat >"$segmented_valid_report" <<'JSON'
     "first_height": 1,
     "tip_height": 10,
     "tip_hash_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "persisted_sequence_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222",
     "fixture_sequence_digest_match": true,
     "fresh_reader_validated": true
   },
   "timings": {
     "wall_clock_seconds": 1.5,
     "prepare_seconds": 0.2,
+    "tip_prepare_seconds": 0.05,
     "schema_create_seconds": 0.1,
     "wallet_projection_seconds": 0.1,
     "seal_seconds": 0.2,
     "bulk_copy_seconds": 0.3,
     "finalize_seconds": 0.2,
+    "bulk_build_seconds": 1.1,
     "streaming_blocks_per_second": 42.0
   },
   "tip_follow": {
@@ -1405,6 +1414,8 @@ cat >"$segmented_valid_report" <<'JSON'
     "contended_commit_latencies_ms": { "sample_count": 2, "max_ms": 12.0 }
   },
   "reader_workload": {
+    "ready_workers": 4,
+    "overlapping_workers": 4,
     "completed_transactions": 20,
     "per_reader_blocks_per_second_mean": 42.0,
     "per_reader_bytes_per_second_mean": 16384.0
@@ -1438,6 +1449,15 @@ expect_segmented_rejected() {
 }
 
 expect_segmented_rejected corrupt-digest '.validation.fixture_sequence_digest_match = false'
+expect_segmented_rejected altered-persisted-digest '.validation.persisted_sequence_digest_hex = "9999999999999999999999999999999999999999999999999999999999999999"'
+expect_segmented_rejected missing-persisted-digest 'del(.validation.persisted_sequence_digest_hex)'
+expect_segmented_rejected missing-fixture-digest 'del(.fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256)'
+expect_segmented_rejected malformed-digest '.validation.persisted_sequence_digest_hex = "abcd" | .fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256 = "abcd"'
+expect_segmented_rejected uppercase-digest '.validation.persisted_sequence_digest_hex = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" | .fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"'
+expect_segmented_rejected bulk-build-seconds-mismatch '.timings.bulk_build_seconds = 5.0'
+expect_segmented_rejected build-ratio-with-tip-follow '.adr0004_gate_evaluation.build_time_ratio_vs_rocksdb = 1.5'
+expect_segmented_rejected unready-reader-workers '.reader_workload.ready_workers = 3'
+expect_segmented_rejected non-overlapping-reader-workers '.reader_workload.overlapping_workers = 3'
 expect_segmented_rejected non-durable-fsync '.server_settings.fsync = false'
 expect_segmented_rejected oversized-segment '.footprint.max_segment_byte_len = 268435457'
 expect_segmented_rejected unbounded-live-tail '.footprint.live_tail_rows = 5'

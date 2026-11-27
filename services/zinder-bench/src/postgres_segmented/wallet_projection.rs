@@ -1,7 +1,11 @@
 //! Provisional PostgreSQL wallet UTXO and address-activity projection builder.
 //!
-//! Splits block validation (`stage_block`) from in-memory mutation (`commit_staged`)
-//! so rejected blocks or aborted PostgreSQL transactions never leave partial state behind.
+//! Splits block validation (`stage_block`) from in-memory mutation
+//! (`commit_staged_for_bulk` / `commit_staged_persisted`) so rejected blocks or
+//! aborted PostgreSQL transactions never leave partial state behind. Spent
+//! outputs are evicted from the live lookup map immediately and spilled in
+//! bounded sorted batches during bulk load so client RAM scales only with the
+//! live unspent UTXO set plus the bounded flush batch.
 
 use std::collections::{HashMap, HashSet};
 
@@ -78,11 +82,24 @@ pub struct StagedWalletBlock {
     pub delta: WalletBlockDelta,
 }
 
+/// Minimal unspent transparent output state kept in memory for future spend attribution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveUtxoEntry {
+    /// Transparent script-hash owning the output.
+    pub script_hash: TransparentAddressScriptHash,
+    /// Height of the block that created this output.
+    pub block_height: BlockHeight,
+    /// Output amount in zatoshis.
+    pub zatoshis: i64,
+}
+
 /// Deterministic in-memory provisional transparent wallet projection across canonical blocks.
 #[derive(Clone, Debug, Default)]
 pub struct ProvisionalWalletProjection {
-    utxos: HashMap<TransparentOutPoint, WalletUtxoRow>,
-    address_txs: Vec<WalletAddressTxRow>,
+    live_utxos: HashMap<TransparentOutPoint, LiveUtxoEntry>,
+    pending_spent_utxos: Vec<WalletUtxoRow>,
+    pending_address_txs: Vec<WalletAddressTxRow>,
+    total_utxo_count: u64,
     address_tx_count: u64,
 }
 
@@ -90,7 +107,7 @@ struct StageBuffers {
     created_utxos: Vec<WalletUtxoRow>,
     spent_utxos: Vec<WalletOutpointSpend>,
     address_tx_rows: Vec<WalletAddressTxRow>,
-    staged_outputs: HashMap<TransparentOutPoint, WalletUtxoRow>,
+    staged_outputs: HashMap<TransparentOutPoint, LiveUtxoEntry>,
     staged_spends: HashSet<TransparentOutPoint>,
 }
 
@@ -101,10 +118,25 @@ impl ProvisionalWalletProjection {
         Self::default()
     }
 
-    /// Returns all tracked UTXO rows in deterministic insertion/outpoint order.
+    /// Returns references to currently unspent outputs in deterministic creation order.
     #[must_use]
-    pub fn sorted_utxo_rows(&self) -> Vec<WalletUtxoRow> {
-        let mut rows: Vec<WalletUtxoRow> = self.utxos.values().cloned().collect();
+    pub fn sorted_live_utxo_refs(&self) -> Vec<(&TransparentOutPoint, &LiveUtxoEntry)> {
+        let mut refs: Vec<(&TransparentOutPoint, &LiveUtxoEntry)> =
+            self.live_utxos.iter().collect();
+        refs.sort_by_key(|(outpoint, entry)| {
+            (
+                entry.block_height,
+                encode_internal_transaction_id(outpoint.transaction_id),
+                outpoint.output_index,
+            )
+        });
+        refs
+    }
+
+    /// Drains and sorts pending spent output rows in deterministic creation order.
+    #[must_use]
+    pub fn drain_pending_spent_utxos_sorted(&mut self) -> Vec<WalletUtxoRow> {
+        let mut rows = std::mem::take(&mut self.pending_spent_utxos);
         rows.sort_by_key(|row| {
             (
                 row.block_height,
@@ -115,21 +147,34 @@ impl ProvisionalWalletProjection {
         rows
     }
 
-    /// Returns all accumulated address-transaction rows in block/tx order.
-    #[must_use]
-    pub fn address_tx_rows(&self) -> &[WalletAddressTxRow] {
-        &self.address_txs
-    }
-
     /// Drains accumulated pending address-transaction rows after batch `COPY` persistence.
+    #[must_use]
     pub fn drain_address_tx_rows(&mut self) -> Vec<WalletAddressTxRow> {
-        std::mem::take(&mut self.address_txs)
+        std::mem::take(&mut self.pending_address_txs)
     }
 
-    /// Returns total UTXO rows tracked across bulk and tip phases without re-sorting.
+    /// Returns total historical UTXO rows created across bulk and tip phases.
     #[must_use]
-    pub fn utxo_count(&self) -> u64 {
-        u64::try_from(self.utxos.len()).unwrap_or(0)
+    pub const fn utxo_count(&self) -> u64 {
+        self.total_utxo_count
+    }
+
+    /// Returns the number of currently unspent outputs retained in memory.
+    #[must_use]
+    pub fn live_utxo_count(&self) -> u64 {
+        u64::try_from(self.live_utxos.len()).unwrap_or(0)
+    }
+
+    /// Returns the number of spent output rows queued for the next bulk `COPY` flush.
+    #[must_use]
+    pub fn pending_spent_utxo_count(&self) -> u64 {
+        u64::try_from(self.pending_spent_utxos.len()).unwrap_or(0)
+    }
+
+    /// Returns the number of address-transaction rows queued for the next bulk `COPY` flush.
+    #[must_use]
+    pub fn pending_address_tx_count(&self) -> u64 {
+        u64::try_from(self.pending_address_txs.len()).unwrap_or(0)
     }
 
     /// Returns total address-transaction rows emitted across bulk and tip phases.
@@ -176,33 +221,67 @@ impl ProvisionalWalletProjection {
         })
     }
 
-    /// Commits a previously staged block delta into `self` (infallible once staged).
-    pub fn commit_staged(&mut self, staged: StagedWalletBlock) {
+    /// Commits a staged bulk block, evicting spent outputs into `pending_spent_utxos`
+    /// and queueing address activity for the next bounded `COPY` batch.
+    pub fn commit_staged_for_bulk(&mut self, staged: StagedWalletBlock) {
         let delta = staged.delta;
-        for utxo in delta.created_utxos {
-            self.utxos
-                .insert(TransparentOutPoint::new(utxo.txid, utxo.output_index), utxo);
-        }
+        self.insert_created_and_bump_counts(&delta.created_utxos, delta.address_tx_rows.len());
         for spend in delta.spent_utxos {
-            if let Some(target) = self.utxos.get_mut(&spend.outpoint) {
-                target.spent_by_txid = Some(spend.spent_by_txid);
-                target.spent_at_height = Some(spend.spent_at_height);
+            if let Some(live) = self.live_utxos.remove(&spend.outpoint) {
+                self.pending_spent_utxos.push(WalletUtxoRow {
+                    script_hash: live.script_hash,
+                    txid: spend.outpoint.transaction_id,
+                    output_index: spend.outpoint.output_index,
+                    block_height: live.block_height,
+                    zatoshis: live.zatoshis,
+                    spent_by_txid: Some(spend.spent_by_txid),
+                    spent_at_height: Some(spend.spent_at_height),
+                });
             }
         }
-        let added_addr_rows = u64::try_from(delta.address_tx_rows.len()).unwrap_or(0);
-        self.address_tx_count = self.address_tx_count.saturating_add(added_addr_rows);
-        self.address_txs.extend(delta.address_tx_rows);
+        self.pending_address_txs.extend(delta.address_tx_rows);
     }
 
-    /// Validates `facts`, commits its delta into `self`, and returns the delta.
-    pub fn apply_block(
+    /// Commits a staged tip block after SQL persistence, updating only the live UTXO
+    /// map and cumulative counters without buffering already-persisted rows.
+    pub fn commit_staged_persisted(&mut self, staged: StagedWalletBlock) {
+        let delta = staged.delta;
+        self.insert_created_and_bump_counts(&delta.created_utxos, delta.address_tx_rows.len());
+        for spend in delta.spent_utxos {
+            let _ = self.live_utxos.remove(&spend.outpoint);
+        }
+    }
+
+    /// Validates `facts`, commits its delta for bulk `COPY` flushing, and returns the delta.
+    pub fn apply_block_for_bulk(
         &mut self,
         facts: &CanonicalBlockFacts,
     ) -> Result<WalletBlockDelta, BenchError> {
         let staged = self.stage_block(facts)?;
         let delta = staged.delta.clone();
-        self.commit_staged(staged);
+        self.commit_staged_for_bulk(staged);
         Ok(delta)
+    }
+
+    fn insert_created_and_bump_counts(
+        &mut self,
+        created_utxos: &[WalletUtxoRow],
+        addr_rows_len: usize,
+    ) {
+        let added_utxos = u64::try_from(created_utxos.len()).unwrap_or(0);
+        self.total_utxo_count = self.total_utxo_count.saturating_add(added_utxos);
+        let added_addr_rows = u64::try_from(addr_rows_len).unwrap_or(0);
+        self.address_tx_count = self.address_tx_count.saturating_add(added_addr_rows);
+        for utxo in created_utxos {
+            self.live_utxos.insert(
+                TransparentOutPoint::new(utxo.txid, utxo.output_index),
+                LiveUtxoEntry {
+                    script_hash: utxo.script_hash,
+                    block_height: utxo.block_height,
+                    zatoshis: utxo.zatoshis,
+                },
+            );
+        }
     }
 
     fn collect_tx_spends(
@@ -222,16 +301,10 @@ impl ProvisionalWalletProjection {
                 )));
             }
             if let Some(prev) = self
-                .utxos
+                .live_utxos
                 .get(&outpoint)
                 .or_else(|| buffers.staged_outputs.get(&outpoint))
             {
-                if prev.spent_at_height.is_some() {
-                    return Err(candidate_error(format!(
-                        "double-spend detected for outpoint {:?}:{}",
-                        outpoint.transaction_id, outpoint.output_index
-                    )));
-                }
                 buffers.staged_spends.insert(outpoint);
                 let delta = per_script_delta.entry(prev.script_hash).or_insert(0);
                 *delta -= i128::from(prev.zatoshis);
@@ -257,7 +330,8 @@ impl ProvisionalWalletProjection {
             let zatoshis = i64::try_from(output.value_zat)
                 .map_err(|_| candidate_error("transparent output zatoshis exceed SQL BIGINT"))?;
             let outpoint = TransparentOutPoint::new(txid, output.output_index);
-            if self.utxos.contains_key(&outpoint) || buffers.staged_outputs.contains_key(&outpoint)
+            if self.live_utxos.contains_key(&outpoint)
+                || buffers.staged_outputs.contains_key(&outpoint)
             {
                 return Err(candidate_error(format!(
                     "duplicate transparent outpoint {:?}:{}",
@@ -277,7 +351,14 @@ impl ProvisionalWalletProjection {
                 .entry(output.address_script_hash)
                 .or_insert(0);
             *delta += i128::from(zatoshis);
-            buffers.staged_outputs.insert(outpoint, utxo.clone());
+            buffers.staged_outputs.insert(
+                outpoint,
+                LiveUtxoEntry {
+                    script_hash: utxo.script_hash,
+                    block_height,
+                    zatoshis,
+                },
+            );
             buffers.created_utxos.push(utxo);
         }
         Ok(())
@@ -404,7 +485,7 @@ mod tests {
         let mut projection = ProvisionalWalletProjection::new();
         let tx1 = make_tx(1, vec![], vec![(0, 50_000, 0x11)])?;
         let block1 = make_block(1, vec![tx1]);
-        let delta1 = projection.apply_block(&block1)?;
+        let delta1 = projection.apply_block_for_bulk(&block1)?;
         assert_eq!(delta1.created_utxos.len(), 1);
         assert_eq!(delta1.address_tx_rows[0].net_delta_zatoshis, 50_000);
 
@@ -421,14 +502,71 @@ mod tests {
         let valid_spend = make_tx(2, vec![outpoint], vec![(0, 40_000, 0x22)])?;
         assert!(
             projection
-                .apply_block(&make_block(2, vec![valid_spend, dup_out]))
+                .apply_block_for_bulk(&make_block(2, vec![valid_spend, dup_out]))
                 .is_err()
         );
 
         // Neither rejected attempt mutated projection state.
-        assert_eq!(projection.sorted_utxo_rows().len(), 1);
-        assert_eq!(projection.sorted_utxo_rows()[0].spent_at_height, None);
-        assert_eq!(projection.address_tx_rows().len(), 1);
+        assert_eq!(projection.utxo_count(), 1);
+        assert_eq!(projection.live_utxo_count(), 1);
+        assert_eq!(projection.pending_spent_utxo_count(), 0);
+        assert_eq!(projection.pending_address_tx_count(), 1);
+        assert_eq!(projection.sorted_live_utxo_refs().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn spent_outputs_evict_from_live_map_while_preserving_complete_sorted_history()
+    -> Result<(), BenchError> {
+        let mut projection = ProvisionalWalletProjection::new();
+        let tx1 = make_tx(1, vec![], vec![(0, 50_000, 0x11), (1, 30_000, 0x12)])?;
+        let _ = projection.apply_block_for_bulk(&make_block(1, vec![tx1]))?;
+        assert_eq!(projection.live_utxo_count(), 2);
+        assert_eq!(projection.utxo_count(), 2);
+        assert_eq!(projection.pending_spent_utxo_count(), 0);
+
+        // Block 2 spends tx1:0, creates tx2:0, then spends tx2:0 intra-block in tx3.
+        let out_a = TransparentOutPoint::new(TransactionId::from_bytes([1_u8; 32]), 0);
+        let out_b = TransparentOutPoint::new(TransactionId::from_bytes([1_u8; 32]), 1);
+        let out_c = TransparentOutPoint::new(TransactionId::from_bytes([2_u8; 32]), 0);
+        let tx2 = make_tx(2, vec![out_a], vec![(0, 40_000, 0x21)])?;
+        let tx3 = make_tx(3, vec![out_c], vec![(0, 35_000, 0x31)])?;
+        let _ = projection.apply_block_for_bulk(&make_block(2, vec![tx2, tx3]))?;
+
+        assert_eq!(projection.utxo_count(), 4);
+        assert_eq!(projection.live_utxo_count(), 2);
+        assert_eq!(projection.pending_spent_utxo_count(), 2);
+
+        let spent_batch = projection.drain_pending_spent_utxos_sorted();
+        assert_eq!(projection.pending_spent_utxo_count(), 0);
+        assert_eq!(spent_batch.len(), 2);
+        assert_eq!(spent_batch[0].txid, TransactionId::from_bytes([1_u8; 32]));
+        assert_eq!(
+            spent_batch[0].spent_by_txid,
+            Some(TransactionId::from_bytes([2_u8; 32]))
+        );
+        assert_eq!(spent_batch[0].spent_at_height, Some(BlockHeight::new(2)));
+        assert_eq!(spent_batch[1].txid, TransactionId::from_bytes([2_u8; 32]));
+        assert_eq!(
+            spent_batch[1].spent_by_txid,
+            Some(TransactionId::from_bytes([3_u8; 32]))
+        );
+        assert_eq!(spent_batch[1].spent_at_height, Some(BlockHeight::new(2)));
+
+        let live_refs = projection.sorted_live_utxo_refs();
+        assert_eq!(live_refs.len(), 2);
+        assert_eq!(live_refs[0].0, &out_b);
+        assert_eq!(live_refs[1].1.block_height, BlockHeight::new(2));
+
+        // Tip persistence evicts spent outputs without re-queuing bulk buffers.
+        let _ = projection.drain_address_tx_rows();
+        let tx4 = make_tx(4, vec![out_b], vec![(0, 25_000, 0x41)])?;
+        let staged_tip = projection.stage_block(&make_block(3, vec![tx4]))?;
+        projection.commit_staged_persisted(staged_tip);
+        assert_eq!(projection.utxo_count(), 5);
+        assert_eq!(projection.live_utxo_count(), 2);
+        assert_eq!(projection.pending_spent_utxo_count(), 0);
+        assert_eq!(projection.pending_address_tx_count(), 0);
         Ok(())
     }
 }

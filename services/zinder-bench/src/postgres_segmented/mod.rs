@@ -103,8 +103,10 @@ impl fmt::Debug for PostgresSegmentedConfig {
 pub struct PostgresSegmentedBuildTimings {
     /// End-to-end duration across all phases.
     pub wall_clock_seconds: f64,
-    /// Fixture parse, canonical construction, and replay encoding duration.
+    /// Bulk-prefix fixture parse, canonical construction, and replay encoding duration.
     pub prepare_seconds: f64,
+    /// Tip-follow block fetch, canonical preparation, and replay encoding duration.
+    pub tip_prepare_seconds: f64,
     /// Schema and table creation DDL duration.
     pub schema_create_seconds: f64,
     /// Provisional wallet projection construction and final UTXO sort duration.
@@ -269,6 +271,11 @@ async fn open_streaming_source(
     let total_blocks = usize::try_from(manifest.block_count)
         .map_err(|_| BenchError::fixture_format("manifest.block_count exceeds usize"))?;
     let tip_count = resolve_tip_follow_block_count(total_blocks, config.tip_follow_blocks)?;
+    if tip_count < 2 && config.concurrent_readers > 0 {
+        return Err(BenchError::invalid_argument(
+            "--concurrent-readers must be 0 when fewer than 2 tip-follow blocks are configured (no contended tip-follow phase)",
+        ));
+    }
     let bulk_count = total_blocks - tip_count;
 
     let dir = config.fixture_directory.clone();
@@ -581,7 +588,7 @@ async fn run_contended_phase(
     writer_client: &mut tokio_postgres::Client,
     contended_range: Option<(u32, u32)>,
 ) -> Result<(LatencyPercentilesMillis, Duration, ConcurrentReaderSummary), BenchError> {
-    if contended_range.is_none() && ctx.config.concurrent_readers == 0 {
+    if contended_range.is_none() {
         return Ok((
             LatencyPercentilesMillis::default(),
             Duration::ZERO,
@@ -593,8 +600,7 @@ async fn run_contended_phase(
         .reader_database_url
         .as_deref()
         .unwrap_or(&ctx.config.database_url);
-    let started = Instant::now();
-    let pool = if ctx.config.concurrent_readers > 0 {
+    let mut pool = if ctx.config.concurrent_readers > 0 {
         Some(
             spawn_concurrent_readers(ConcurrentReaderPoolConfig {
                 database_url: reader_url.to_owned(),
@@ -610,10 +616,21 @@ async fn run_contended_phase(
         None
     };
 
+    if let Some(ref mut active_pool) = pool
+        && let Err(err) = active_pool.begin_writer_phase().await
+    {
+        if let Some(failed_pool) = pool {
+            let _ = failed_pool.stop_and_collect().await?;
+        }
+        return Err(err);
+    }
+
+    let started = Instant::now();
     let commit_outcome = ctx
         .tip_state
         .advance_height_range(writer_client, ctx.advance_target, contended_range)
         .await;
+    let contended_elapsed = started.elapsed();
     let reader_outcome = match pool {
         Some(active_pool) => Some(active_pool.stop_and_collect().await),
         None => None,
@@ -624,7 +641,7 @@ async fn run_contended_phase(
         Some(res) => res?,
         None => ConcurrentReaderSummary::default(),
     };
-    Ok((stats, started.elapsed(), summary))
+    Ok((stats, contended_elapsed, summary))
 }
 
 async fn run_fresh_reader_validation(
@@ -654,13 +671,13 @@ fn assemble_run_report(
     tip_outcome: TipAndFootprintOutcome,
     validation: PersistedValidationSummary,
 ) -> PostgresSegmentedRunReport {
-    let total_prepare = (prepared.source_open_duration
-        + bulk_stream.timings.prepare_duration
-        + tip_outcome.extra_prepare_duration)
-        .as_secs_f64();
+    let bulk_prepare =
+        (prepared.source_open_duration + bulk_stream.timings.prepare_duration).as_secs_f64();
+    let tip_prepare = tip_outcome.extra_prepare_duration.as_secs_f64();
     let timings = PostgresSegmentedBuildTimings {
         wall_clock_seconds: wall_clock_duration.as_secs_f64(),
-        prepare_seconds: total_prepare,
+        prepare_seconds: bulk_prepare,
+        tip_prepare_seconds: tip_prepare,
         schema_create_seconds: bulk_stream.timings.schema_create_duration.as_secs_f64(),
         wallet_projection_seconds: bulk_stream.timings.wallet_projection_duration.as_secs_f64(),
         seal_seconds: bulk_stream.timings.seal_duration.as_secs_f64(),

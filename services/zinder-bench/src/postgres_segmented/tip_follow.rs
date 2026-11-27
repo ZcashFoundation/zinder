@@ -240,7 +240,7 @@ impl TipFollowState {
             .await
             .map_err(|err| postgres_error("committing tip-follow transaction", &err))?;
 
-        wallet_projection.commit_staged(staged_wallet);
+        wallet_projection.commit_staged_persisted(staged_wallet);
         for _ in 0..evicted_txids.len() {
             let _ = self.active_mempool_txids.pop_front();
         }

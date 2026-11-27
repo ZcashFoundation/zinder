@@ -41,8 +41,8 @@ use zinder_bench::{
         wallet_projection::ProvisionalWalletProjection,
     },
     report::{
-        FixtureSummary, PostgresSegmentedBaselineInput, PostgresSegmentedReportInputs,
-        PostgresSegmentedRuntimeEvidence, build_postgres_segmented_storage_report,
+        FixtureSummary, PostgresSegmentedReportInputs, PostgresSegmentedRuntimeEvidence,
+        build_postgres_segmented_storage_report,
     },
     rss::peak_rss,
 };
@@ -218,8 +218,6 @@ async fn postgres_segmented_matches_rocksdb_digest_and_rejects_schema_reuse() ->
         fixture_path: fixture_dir.path(),
         config,
         seg_run,
-        rocksdb_seconds: rocksdb_run.timings.wall_clock_seconds,
-        rocksdb_bytes: rocksdb_run.physical_storage_bytes,
         run_started,
         run_completed,
     })
@@ -230,8 +228,6 @@ struct CompactVerificationContext<'a> {
     fixture_path: &'a Path,
     config: PostgresSegmentedConfig,
     seg_run: zinder_bench::postgres_segmented::PostgresSegmentedRunReport,
-    rocksdb_seconds: f64,
-    rocksdb_bytes: u64,
     run_started: u64,
     run_completed: u64,
 }
@@ -251,6 +247,8 @@ fn assert_compact_segmented_run(
     assert!(seg_run.tip_follow.tail_seal_transitions >= 1);
     assert!(seg_run.tip_follow.mempool_admits > 0);
     assert!(seg_run.tip_follow.mempool_evictions > 0);
+    assert_eq!(seg_run.reader_workload.ready_workers, 4);
+    assert_eq!(seg_run.reader_workload.overlapping_workers, 4);
     assert!(seg_run.reader_workload.completed_transactions >= 4);
     assert!(seg_run.reader_workload.per_reader_blocks_per_second_mean > 0.0);
     assert!(seg_run.reader_workload.per_reader_bytes_per_second_mean > 0.0);
@@ -262,6 +260,7 @@ fn assert_compact_segmented_run(
     assert!(seg_run.footprint.bulk_wal_bytes > 0);
     assert!(seg_run.footprint.tip_follow_wal_bytes > 0);
     assert!(seg_run.timings.schema_create_seconds > 0.0);
+    assert!(seg_run.timings.tip_prepare_seconds >= 0.0);
     assert!(seg_run.timings.wallet_projection_seconds >= 0.0);
     assert_eq!(
         seg_run.footprint.total_storage_bytes,
@@ -276,11 +275,7 @@ async fn verify_compact_report_and_schema_reuse(ctx: CompactVerificationContext<
         fixture_summary,
         PostgresSegmentedReportInputs {
             run: ctx.seg_run,
-            baseline: Some(PostgresSegmentedBaselineInput {
-                build_seconds: Some(ctx.rocksdb_seconds),
-                storage_bytes: Some(ctx.rocksdb_bytes),
-                streaming_blocks_per_second: None,
-            }),
+            baseline: None,
             runtime_evidence: PostgresSegmentedRuntimeEvidence {
                 database_image_reference: None,
                 pooler_image_reference: None,
@@ -367,6 +362,7 @@ async fn verify_tampered_live_segment_kind_rejected(
         )
         .await?;
     assert!(updated > 0, "expected live tail transaction_location rows");
+    assert_wallet_utxo_spent_and_live_counts(&conn.client, schema_name).await?;
     let tip_hash = zinder_core::wire::decode_internal_block_hash(
         hex::decode(&seg_report.validation.tip_hash_hex)?.as_slice(),
     )?;
@@ -396,6 +392,37 @@ async fn verify_tampered_live_segment_kind_rejected(
         err.to_string()
             .contains("transaction_location segment_kind mismatch"),
         "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+async fn assert_wallet_utxo_spent_and_live_counts(
+    client: &tokio_postgres::Client,
+    schema_name: &str,
+) -> Result<()> {
+    let wallet_counts = client
+        .query_one(
+            &format!(
+                "SELECT
+                    COUNT(*) FILTER (WHERE spent_at_height = 4)::BIGINT,
+                    COUNT(*) FILTER (WHERE spent_at_height = 9)::BIGINT,
+                    COUNT(*) FILTER (WHERE spent_at_height IS NULL)::BIGINT
+                 FROM {schema_name}.wallet_utxo"
+            ),
+            &[],
+        )
+        .await?;
+    assert!(
+        wallet_counts.get::<_, i64>(0) >= 2,
+        "expected bulk-spilled spent UTXO rows at height 4"
+    );
+    assert!(
+        wallet_counts.get::<_, i64>(1) >= 2,
+        "expected tip-follow spent UTXO rows at height 9"
+    );
+    assert!(
+        wallet_counts.get::<_, i64>(2) > 0,
+        "expected live unspent UTXO rows"
     );
     Ok(())
 }
@@ -493,6 +520,12 @@ async fn postgres_segmented_renews_lease_after_long_build_and_fences_settlement(
     )
     .await?;
     assert_eq!(bulk.writer_epoch, 2);
+    assert!(
+        wallet_projection.live_utxo_count() < wallet_projection.utxo_count(),
+        "bulk load must evict spent height-4 outputs from the in-memory live UTXO map"
+    );
+    assert_eq!(wallet_projection.pending_spent_utxo_count(), 0);
+    assert_eq!(wallet_projection.pending_address_tx_count(), 0);
 
     assert_initial_segment_kind_classification(&conn.client, schema).await?;
 

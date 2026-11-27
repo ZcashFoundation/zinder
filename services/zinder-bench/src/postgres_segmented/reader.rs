@@ -1,12 +1,14 @@
 //! Pooler-safe concurrent PostgreSQL readers and fresh-connection end-to-end
 //! oracle validation using positioned `substring()` reads and Zinder segment codecs.
 
+use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, IsolationLevel, Transaction};
 use zinder_core::wire::{decode_internal_block_hash, decode_zinder_native_chain_name};
@@ -112,7 +114,11 @@ pub struct ReaderWorkerThroughput {
 /// Aggregated concurrent reader execution metrics collected across all workers.
 #[derive(Clone, Debug, Default)]
 pub struct ConcurrentReaderSummary {
-    /// Total read-only transactions completed cleanly.
+    /// Reader workers that completed readiness warm-up before the writer started.
+    pub ready_workers: u32,
+    /// Reader workers that completed at least one iteration overlapping the active writer phase.
+    pub overlapping_workers: u32,
+    /// Total read-only transactions completed cleanly during the active writer phase.
     pub completed_transactions: u64,
     /// Settled shielded range decodes served via positioned `substring()`.
     pub settled_range_reads: u64,
@@ -196,62 +202,251 @@ struct ValidationCursor {
     prior_hash: Option<BlockHash>,
 }
 
-/// Active reader pool handle stopped cooperatively at the end of contended tip-follow.
-pub struct RunningReaderPool {
-    stop_signal: Arc<AtomicBool>,
-    started_at: Instant,
-    workers: Vec<JoinHandle<Result<ReaderWorkerThroughput, BenchError>>>,
+const PHASE_WARMING_UP: u8 = 0;
+const PHASE_WRITER_ACTIVE: u8 = 1;
+const PHASE_STOPPING: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerGateSignal {
+    Standby,
+    Active,
+    Stop,
 }
 
-impl RunningReaderPool {
-    /// Signals all concurrent reader tasks to stop and aggregates throughput + latency metrics.
-    pub async fn stop_and_collect(self) -> Result<ConcurrentReaderSummary, BenchError> {
-        self.stop_signal.store(true, Ordering::Release);
-        let wall_secs = self.started_at.elapsed().as_secs_f64().max(1e-6);
-        let mut combined = ConcurrentReaderSummary::default();
+struct WriterPhaseWindow {
+    epoch: Instant,
+    phase: AtomicU8,
+    writer_started_nanos: AtomicU64,
+    writer_finished_nanos: AtomicU64,
+}
 
-        for worker in self.workers {
-            let stats = worker.await.map_err(|join_err| {
-                candidate_error(format!("concurrent reader worker panicked: {join_err}"))
-            })??;
-            combined.completed_transactions = combined
-                .completed_transactions
-                .saturating_add(stats.completed_transactions);
-            combined.settled_range_reads = combined
-                .settled_range_reads
-                .saturating_add(stats.settled_range_reads);
-            combined.blocks_decoded = combined.blocks_decoded.saturating_add(stats.blocks_decoded);
-            combined.bytes_fetched = combined.bytes_fetched.saturating_add(stats.bytes_fetched);
-            combined
-                .tx_latencies_ms
-                .extend(stats.tx_latencies_ms.iter().copied());
-            combined.per_reader_stats.push(stats);
+impl WriterPhaseWindow {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            phase: AtomicU8::new(PHASE_WARMING_UP),
+            writer_started_nanos: AtomicU64::new(u64::MAX),
+            writer_finished_nanos: AtomicU64::new(u64::MAX),
         }
+    }
 
-        if !combined.per_reader_stats.is_empty() {
-            let count = f64::from(u32::try_from(combined.per_reader_stats.len()).unwrap_or(1));
-            let blocks_rate_sum: f64 = combined
-                .per_reader_stats
-                .iter()
-                .map(|w| w.blocks_per_second)
-                .sum();
-            let bytes_rate_sum: f64 = combined
-                .per_reader_stats
-                .iter()
-                .map(|w| w.bytes_per_second)
-                .sum();
-            combined.per_reader_blocks_per_second_mean = blocks_rate_sum / count;
-            combined.per_reader_bytes_per_second_mean = bytes_rate_sum / count;
+    fn elapsed_nanos(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX - 1)
+    }
+
+    fn begin_writer_phase(&self) {
+        let now_ns = self.elapsed_nanos();
+        let _ = self.writer_started_nanos.compare_exchange(
+            u64::MAX,
+            now_ns,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.phase.store(PHASE_WRITER_ACTIVE, Ordering::Release);
+    }
+
+    fn finish_writer_phase(&self) {
+        let now_ns = self.elapsed_nanos();
+        let _ = self.writer_finished_nanos.compare_exchange(
+            u64::MAX,
+            now_ns,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.phase.store(PHASE_STOPPING, Ordering::Release);
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == PHASE_STOPPING
+    }
+
+    fn window_bounds(&self) -> Option<(u64, u64)> {
+        let start_ns = self.writer_started_nanos.load(Ordering::Acquire);
+        let end_ns = self.writer_finished_nanos.load(Ordering::Acquire);
+        if start_ns == u64::MAX || end_ns == u64::MAX || end_ns < start_ns {
+            None
+        } else {
+            Some((start_ns, end_ns))
         }
-        let total_blocks = u64_to_f64_lossy(combined.blocks_decoded);
-        let total_bytes = u64_to_f64_lossy(combined.bytes_fetched);
-        combined.aggregate_blocks_per_second = total_blocks / wall_secs;
-        combined.aggregate_bytes_per_second = total_bytes / wall_secs;
-        Ok(combined)
     }
 }
 
-/// Spawns `config.reader_count` independent read-only workers targeting `config.database_url`.
+#[derive(Clone, Copy, Debug)]
+struct ObservedReaderIteration {
+    start_ns: u64,
+    end_ns: u64,
+    latency_ms: f64,
+    settled_reads: u64,
+    blocks_decoded: u64,
+    bytes_fetched: u64,
+}
+
+struct RawWorkerOutput {
+    worker_index: u32,
+    iterations: Vec<ObservedReaderIteration>,
+}
+
+struct WorkerHandshake {
+    window: Arc<WriterPhaseWindow>,
+    ready_tx: oneshot::Sender<()>,
+    active_tx: oneshot::Sender<()>,
+    gate_rx: watch::Receiver<WorkerGateSignal>,
+}
+
+/// Active reader pool handle stopped cooperatively at the end of contended tip-follow.
+pub struct RunningReaderPool {
+    window: Arc<WriterPhaseWindow>,
+    gate_tx: watch::Sender<WorkerGateSignal>,
+    active_rxs: Option<Vec<oneshot::Receiver<()>>>,
+    ready_workers: u32,
+    workers: Vec<JoinHandle<Result<RawWorkerOutput, BenchError>>>,
+}
+
+impl RunningReaderPool {
+    /// Releases all warmed-up reader workers into the active contended loop and
+    /// awaits confirmation that every worker has entered its first active iteration.
+    pub async fn begin_writer_phase(&mut self) -> Result<(), BenchError> {
+        self.window.begin_writer_phase();
+        let _ = self.gate_tx.send(WorkerGateSignal::Active);
+        if let Some(receivers) = self.active_rxs.take() {
+            for rx in receivers {
+                if rx.await.is_err() {
+                    self.window.finish_writer_phase();
+                    let _ = self.gate_tx.send(WorkerGateSignal::Stop);
+                    return Err(candidate_error(
+                        "concurrent reader worker terminated before entering contended workload",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Signals all concurrent reader tasks to stop and aggregates only iterations
+    /// overlapping the active writer phase.
+    pub async fn stop_and_collect(self) -> Result<ConcurrentReaderSummary, BenchError> {
+        self.window.finish_writer_phase();
+        let _ = self.gate_tx.send(WorkerGateSignal::Stop);
+        let mut raw_outputs = Vec::with_capacity(self.workers.len());
+        for worker in self.workers {
+            let output = worker.await.map_err(|join_err| {
+                candidate_error(format!("concurrent reader worker panicked: {join_err}"))
+            })??;
+            raw_outputs.push(output);
+        }
+        Ok(aggregate_overlapping_outputs(
+            self.ready_workers,
+            self.window.window_bounds(),
+            raw_outputs,
+        ))
+    }
+}
+
+fn aggregate_overlapping_outputs(
+    ready_workers: u32,
+    window_bounds: Option<(u64, u64)>,
+    raw_outputs: Vec<RawWorkerOutput>,
+) -> ConcurrentReaderSummary {
+    let mut combined = ConcurrentReaderSummary {
+        ready_workers,
+        ..ConcurrentReaderSummary::default()
+    };
+    let Some((writer_start_ns, writer_end_ns)) = window_bounds else {
+        return combined;
+    };
+    let mut global_min_start: Option<u64> = None;
+    let mut global_max_end: Option<u64> = None;
+
+    for raw in raw_outputs {
+        let mut worker_min_start: Option<u64> = None;
+        let mut worker_max_end: Option<u64> = None;
+        let mut stats = ReaderWorkerThroughput {
+            worker_index: raw.worker_index,
+            ..ReaderWorkerThroughput::default()
+        };
+        for iter in raw.iterations {
+            if iter.end_ns < writer_start_ns || iter.start_ns > writer_end_ns {
+                continue;
+            }
+            worker_min_start =
+                Some(worker_min_start.map_or(iter.start_ns, |s| s.min(iter.start_ns)));
+            worker_max_end = Some(worker_max_end.map_or(iter.end_ns, |e| e.max(iter.end_ns)));
+            stats.completed_transactions = stats.completed_transactions.saturating_add(1);
+            stats.settled_range_reads =
+                stats.settled_range_reads.saturating_add(iter.settled_reads);
+            stats.blocks_decoded = stats.blocks_decoded.saturating_add(iter.blocks_decoded);
+            stats.bytes_fetched = stats.bytes_fetched.saturating_add(iter.bytes_fetched);
+            stats.tx_latencies_ms.push(iter.latency_ms);
+        }
+        if stats.completed_transactions > 0 {
+            combined.overlapping_workers = combined.overlapping_workers.saturating_add(1);
+            let eff_start = worker_min_start.map_or(writer_start_ns, |s| s.min(writer_start_ns));
+            let eff_end = worker_max_end.map_or(writer_end_ns, |e| e.max(writer_end_ns));
+            global_min_start = Some(global_min_start.map_or(eff_start, |s| s.min(eff_start)));
+            global_max_end = Some(global_max_end.map_or(eff_end, |e| e.max(eff_end)));
+            let elapsed_secs = nanos_span_seconds(eff_start, eff_end);
+            stats.elapsed_seconds = elapsed_secs;
+            stats.blocks_per_second = u64_to_f64_lossy(stats.blocks_decoded) / elapsed_secs;
+            stats.bytes_per_second = u64_to_f64_lossy(stats.bytes_fetched) / elapsed_secs;
+        }
+        combined.completed_transactions = combined
+            .completed_transactions
+            .saturating_add(stats.completed_transactions);
+        combined.settled_range_reads = combined
+            .settled_range_reads
+            .saturating_add(stats.settled_range_reads);
+        combined.blocks_decoded = combined.blocks_decoded.saturating_add(stats.blocks_decoded);
+        combined.bytes_fetched = combined.bytes_fetched.saturating_add(stats.bytes_fetched);
+        combined
+            .tx_latencies_ms
+            .extend(stats.tx_latencies_ms.iter().copied());
+        combined.per_reader_stats.push(stats);
+    }
+
+    finalize_aggregate_rates(
+        &mut combined,
+        (writer_start_ns, writer_end_ns),
+        global_min_start,
+        global_max_end,
+    );
+    combined
+}
+
+fn finalize_aggregate_rates(
+    combined: &mut ConcurrentReaderSummary,
+    writer_bounds: (u64, u64),
+    global_min_start: Option<u64>,
+    global_max_end: Option<u64>,
+) {
+    if !combined.per_reader_stats.is_empty() {
+        let count = f64::from(u32::try_from(combined.per_reader_stats.len()).unwrap_or(1));
+        let blocks_rate_sum: f64 = combined
+            .per_reader_stats
+            .iter()
+            .map(|w| w.blocks_per_second)
+            .sum();
+        let bytes_rate_sum: f64 = combined
+            .per_reader_stats
+            .iter()
+            .map(|w| w.bytes_per_second)
+            .sum();
+        combined.per_reader_blocks_per_second_mean = blocks_rate_sum / count;
+        combined.per_reader_bytes_per_second_mean = bytes_rate_sum / count;
+    }
+    let agg_start = global_min_start.map_or(writer_bounds.0, |s| s.min(writer_bounds.0));
+    let agg_end = global_max_end.map_or(writer_bounds.1, |e| e.max(writer_bounds.1));
+    let agg_secs = nanos_span_seconds(agg_start, agg_end);
+    combined.aggregate_blocks_per_second = u64_to_f64_lossy(combined.blocks_decoded) / agg_secs;
+    combined.aggregate_bytes_per_second = u64_to_f64_lossy(combined.bytes_fetched) / agg_secs;
+}
+
+fn nanos_span_seconds(start_ns: u64, end_ns: u64) -> f64 {
+    let span_ns = end_ns.saturating_sub(start_ns);
+    (u64_to_f64_lossy(span_ns) / 1_000_000_000.0).max(1e-6)
+}
+
+/// Spawns `config.reader_count` independent read-only workers targeting `config.database_url`,
+/// awaiting warm-up readiness from all workers before returning.
 ///
 /// Readers use transaction-local `REPEATABLE READ READ ONLY` blocks, execute zero
 /// session-pinned SQL commands (`SET`, advisory locks, temp tables, `LISTEN`),
@@ -260,14 +455,30 @@ pub async fn spawn_concurrent_readers(
     config: ConcurrentReaderPoolConfig,
 ) -> Result<RunningReaderPool, BenchError> {
     validate_schema_name(&config.schema_name)?;
-    let stop_signal = Arc::new(AtomicBool::new(false));
-    let started_at = Instant::now();
-    let mut workers = Vec::with_capacity(usize::try_from(config.reader_count).unwrap_or(0));
+    let window = Arc::new(WriterPhaseWindow::new());
+    let (gate_tx, gate_rx) = watch::channel(WorkerGateSignal::Standby);
+    let cap = usize::try_from(config.reader_count).unwrap_or(0);
+    let mut workers = Vec::with_capacity(cap);
+    let mut ready_rxs = Vec::with_capacity(cap);
+    let mut active_rxs = Vec::with_capacity(cap);
 
     for worker_index in 0..config.reader_count {
         let mut connection =
-            connect_postgres(&config.database_url, "connecting concurrent reader").await?;
-        let worker_stop = Arc::clone(&stop_signal);
+            match connect_postgres(&config.database_url, "connecting concurrent reader").await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    shutdown_spawned_workers(&window, &gate_tx, workers).await;
+                    return Err(err);
+                }
+            };
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (active_tx, active_rx) = oneshot::channel();
+        let handshake = WorkerHandshake {
+            window: Arc::clone(&window),
+            ready_tx,
+            active_tx,
+            gate_rx: gate_rx.clone(),
+        };
         let loop_params = ReaderLoopParams {
             schema_name: config.schema_name.clone(),
             network: config.network,
@@ -275,60 +486,161 @@ pub async fn spawn_concurrent_readers(
             live_tail_max_blocks: config.live_tail_max_blocks,
         };
         let handle = tokio::spawn(async move {
-            let outcome = run_reader_loop(&mut connection.client, &loop_params, &worker_stop).await;
+            let outcome = run_handshake_worker_loop(
+                worker_index,
+                handshake,
+                PostgresReaderDriver {
+                    client: &mut connection.client,
+                    params: &loop_params,
+                },
+            )
+            .await;
             let close_outcome = close_postgres(connection).await;
             let summary = outcome?;
             close_outcome?;
             Ok(summary)
         });
         workers.push(handle);
+        ready_rxs.push(ready_rx);
+        active_rxs.push(active_rx);
+    }
+
+    for ready_rx in ready_rxs {
+        if ready_rx.await.is_err() {
+            return Err(collect_early_worker_error(&window, &gate_tx, workers).await);
+        }
     }
 
     Ok(RunningReaderPool {
-        stop_signal,
-        started_at,
+        window,
+        gate_tx,
+        active_rxs: Some(active_rxs),
+        ready_workers: config.reader_count,
         workers,
     })
 }
 
-async fn run_reader_loop(
-    client: &mut Client,
-    params: &ReaderLoopParams,
-    stop_signal: &AtomicBool,
-) -> Result<ReaderWorkerThroughput, BenchError> {
-    let worker_started = Instant::now();
-    let mut stats = ReaderWorkerThroughput {
-        worker_index: params.worker_index,
-        ..ReaderWorkerThroughput::default()
-    };
-    let mut iteration = 0_u64;
+async fn shutdown_spawned_workers(
+    window: &WriterPhaseWindow,
+    gate_tx: &watch::Sender<WorkerGateSignal>,
+    workers: Vec<JoinHandle<Result<RawWorkerOutput, BenchError>>>,
+) {
+    window.finish_writer_phase();
+    let _ = gate_tx.send(WorkerGateSignal::Stop);
+    for worker in workers {
+        let _ = worker.await;
+    }
+}
+
+async fn collect_early_worker_error(
+    window: &WriterPhaseWindow,
+    gate_tx: &watch::Sender<WorkerGateSignal>,
+    workers: Vec<JoinHandle<Result<RawWorkerOutput, BenchError>>>,
+) -> BenchError {
+    window.finish_writer_phase();
+    let _ = gate_tx.send(WorkerGateSignal::Stop);
+    for worker in workers {
+        match worker.await {
+            Ok(Err(err)) => return err,
+            Ok(Ok(_)) => {}
+            Err(join_err) => {
+                return candidate_error(format!("concurrent reader worker panicked: {join_err}"));
+            }
+        }
+    }
+    candidate_error("concurrent reader worker failed readiness handshake")
+}
+
+trait ReaderIterationDriver {
+    fn execute_iteration(
+        &mut self,
+        iteration: u64,
+    ) -> impl Future<Output = Result<IterationStats, BenchError>> + Send;
+}
+
+struct PostgresReaderDriver<'a> {
+    client: &'a mut Client,
+    params: &'a ReaderLoopParams,
+}
+
+impl ReaderIterationDriver for PostgresReaderDriver<'_> {
+    fn execute_iteration(
+        &mut self,
+        iteration: u64,
+    ) -> impl Future<Output = Result<IterationStats, BenchError>> + Send {
+        execute_reader_iteration(self.client, self.params, iteration)
+    }
+}
+
+impl<F, Fut> ReaderIterationDriver for F
+where
+    F: FnMut(u64) -> Fut + Send,
+    Fut: Future<Output = Result<IterationStats, BenchError>> + Send,
+{
+    fn execute_iteration(
+        &mut self,
+        iteration: u64,
+    ) -> impl Future<Output = Result<IterationStats, BenchError>> + Send {
+        self(iteration)
+    }
+}
+
+async fn run_handshake_worker_loop(
+    worker_index: u32,
+    handshake: WorkerHandshake,
+    mut driver: impl ReaderIterationDriver,
+) -> Result<RawWorkerOutput, BenchError> {
+    let _warmup = driver.execute_iteration(0).await?;
+    let _ = handshake.ready_tx.send(());
+
+    let mut gate_rx = handshake.gate_rx;
+    let gate = gate_rx
+        .wait_for(|sig| *sig != WorkerGateSignal::Standby)
+        .await
+        .map_or(WorkerGateSignal::Stop, |guard| *guard);
+    if gate == WorkerGateSignal::Stop || handshake.window.is_stopping() {
+        let _ = handshake.active_tx.send(());
+        return Ok(RawWorkerOutput {
+            worker_index,
+            iterations: Vec::new(),
+        });
+    }
+
+    let mut active_tx = Some(handshake.active_tx);
+    let mut iterations = Vec::new();
+    let mut iteration = 1_u64;
 
     loop {
+        if handshake.window.is_stopping() {
+            drop(active_tx.take());
+            break;
+        }
         let iter_started = Instant::now();
-        let iter_stats = execute_reader_iteration(client, params, iteration).await?;
-        stats.completed_transactions = stats.completed_transactions.saturating_add(1);
-        stats.settled_range_reads = stats
-            .settled_range_reads
-            .saturating_add(iter_stats.settled_reads);
-        stats.blocks_decoded = stats
-            .blocks_decoded
-            .saturating_add(iter_stats.blocks_decoded);
-        stats.bytes_fetched = stats.bytes_fetched.saturating_add(iter_stats.bytes_fetched);
-        stats
-            .tx_latencies_ms
-            .push(iter_started.elapsed().as_secs_f64() * 1000.0);
+        let start_ns = handshake.window.elapsed_nanos();
+        if let Some(tx) = active_tx.take() {
+            let _ = tx.send(());
+        }
+        let iter_stats = driver.execute_iteration(iteration).await?;
+        let end_ns = handshake.window.elapsed_nanos();
+        iterations.push(ObservedReaderIteration {
+            start_ns,
+            end_ns,
+            latency_ms: iter_started.elapsed().as_secs_f64() * 1000.0,
+            settled_reads: iter_stats.settled_reads,
+            blocks_decoded: iter_stats.blocks_decoded,
+            bytes_fetched: iter_stats.bytes_fetched,
+        });
         iteration = iteration.saturating_add(1);
-        if stop_signal.load(Ordering::Acquire) {
+        if handshake.window.is_stopping() {
             break;
         }
         tokio::task::yield_now().await;
     }
 
-    let elapsed_secs = worker_started.elapsed().as_secs_f64().max(1e-6);
-    stats.elapsed_seconds = elapsed_secs;
-    stats.blocks_per_second = u64_to_f64_lossy(stats.blocks_decoded) / elapsed_secs;
-    stats.bytes_per_second = u64_to_f64_lossy(stats.bytes_fetched) / elapsed_secs;
-    Ok(stats)
+    Ok(RawWorkerOutput {
+        worker_index,
+        iterations,
+    })
 }
 
 struct IterationStats {
@@ -1644,7 +1956,17 @@ fn u64_to_f64_lossy(value_in: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::ReaderConnectionMode;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::{oneshot, watch};
+
+    use super::{
+        IterationStats, ObservedReaderIteration, RawWorkerOutput, ReaderConnectionMode,
+        WorkerGateSignal, WorkerHandshake, WriterPhaseWindow, aggregate_overlapping_outputs,
+        collect_early_worker_error, run_handshake_worker_loop,
+    };
 
     #[test]
     fn reader_connection_mode_strings_match_cli_contract() {
@@ -1653,5 +1975,155 @@ mod tests {
             ReaderConnectionMode::PgbouncerTransaction.as_str(),
             "pgbouncer-transaction"
         );
+    }
+
+    #[test]
+    fn overlap_aggregator_excludes_warmup_and_post_writer_iterations() {
+        let summary = aggregate_overlapping_outputs(
+            2,
+            Some((1_000_000, 3_000_000)),
+            vec![
+                RawWorkerOutput {
+                    worker_index: 0,
+                    iterations: vec![
+                        ObservedReaderIteration {
+                            start_ns: 100_000,
+                            end_ns: 900_000,
+                            latency_ms: 0.8,
+                            settled_reads: 1,
+                            blocks_decoded: 16,
+                            bytes_fetched: 1_000,
+                        },
+                        ObservedReaderIteration {
+                            start_ns: 1_100_000,
+                            end_ns: 2_100_000,
+                            latency_ms: 1.0,
+                            settled_reads: 1,
+                            blocks_decoded: 8,
+                            bytes_fetched: 500,
+                        },
+                        ObservedReaderIteration {
+                            start_ns: 3_100_000,
+                            end_ns: 4_000_000,
+                            latency_ms: 0.9,
+                            settled_reads: 1,
+                            blocks_decoded: 32,
+                            bytes_fetched: 2_000,
+                        },
+                    ],
+                },
+                RawWorkerOutput {
+                    worker_index: 1,
+                    iterations: vec![ObservedReaderIteration {
+                        start_ns: 3_500_000,
+                        end_ns: 4_500_000,
+                        latency_ms: 1.0,
+                        settled_reads: 1,
+                        blocks_decoded: 64,
+                        bytes_fetched: 4_000,
+                    }],
+                },
+            ],
+        );
+
+        assert_eq!(summary.ready_workers, 2);
+        assert_eq!(summary.overlapping_workers, 1);
+        assert_eq!(summary.completed_transactions, 1);
+        assert_eq!(summary.blocks_decoded, 8);
+        assert_eq!(summary.bytes_fetched, 500);
+        assert_eq!(summary.per_reader_stats[1].completed_transactions, 0);
+        assert_eq!(summary.per_reader_stats[1].blocks_per_second, 0.0);
+    }
+
+    #[tokio::test]
+    async fn handshake_waits_for_delayed_worker_and_stops_before_post_writer_iteration()
+    -> Result<(), crate::BenchError> {
+        let window = Arc::new(WriterPhaseWindow::new());
+        let (gate_tx, gate_rx) = watch::channel(WorkerGateSignal::Standby);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (active_tx, active_rx) = oneshot::channel();
+        let writer_finished = Arc::new(AtomicBool::new(false));
+        let writer_finished_worker = Arc::clone(&writer_finished);
+
+        let handle = tokio::spawn(run_handshake_worker_loop(
+            0,
+            WorkerHandshake {
+                window: Arc::clone(&window),
+                ready_tx,
+                active_tx,
+                gate_rx,
+            },
+            move |iter| {
+                let finished_flag = Arc::clone(&writer_finished_worker);
+                async move {
+                    if iter == 0 {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        return Ok(IterationStats {
+                            settled_reads: 1,
+                            blocks_decoded: 100,
+                            bytes_fetched: 4_096,
+                        });
+                    }
+                    assert!(!finished_flag.load(Ordering::Acquire));
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    Ok(IterationStats {
+                        settled_reads: 1,
+                        blocks_decoded: 8,
+                        bytes_fetched: 256,
+                    })
+                }
+            },
+        ));
+
+        ready_rx.await.map_err(|_| {
+            crate::postgres_segmented::database::candidate_error("worker dropped ready channel")
+        })?;
+        window.begin_writer_phase();
+        let _ = gate_tx.send(WorkerGateSignal::Active);
+        active_rx.await.map_err(|_| {
+            crate::postgres_segmented::database::candidate_error("worker dropped active channel")
+        })?;
+
+        tokio::time::sleep(Duration::from_millis(12)).await;
+        writer_finished.store(true, Ordering::Release);
+        window.finish_writer_phase();
+        let _ = gate_tx.send(WorkerGateSignal::Stop);
+
+        let output = handle.await.map_err(|err| {
+            crate::postgres_segmented::database::candidate_error(err.to_string())
+        })??;
+        let summary = aggregate_overlapping_outputs(1, window.window_bounds(), vec![output]);
+        assert_eq!(summary.ready_workers, 1);
+        assert_eq!(summary.overlapping_workers, 1);
+        assert!(summary.completed_transactions >= 1);
+        assert!(summary.blocks_decoded < 100);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_failure_surfaces_worker_error_without_deadlock() {
+        let window = Arc::new(WriterPhaseWindow::new());
+        let (gate_tx, gate_rx) = watch::channel(WorkerGateSignal::Standby);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (active_tx, _active_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(run_handshake_worker_loop(
+            0,
+            WorkerHandshake {
+                window: Arc::clone(&window),
+                ready_tx,
+                active_tx,
+                gate_rx,
+            },
+            |_iter| async {
+                Err(crate::postgres_segmented::database::candidate_error(
+                    "boom during warmup",
+                ))
+            },
+        ));
+
+        assert!(ready_rx.await.is_err());
+        let err = collect_early_worker_error(&window, &gate_tx, vec![handle]).await;
+        assert!(err.to_string().contains("boom during warmup"));
     }
 }

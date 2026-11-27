@@ -38,11 +38,12 @@ use super::segment_builder::{
     extract_consensus_tx_slices, seal_settled_segments,
 };
 use super::wallet_projection::{
-    ProvisionalWalletProjection, WalletAddressTxRow, WalletBlockDelta, WalletUtxoRow,
+    LiveUtxoEntry, ProvisionalWalletProjection, WalletAddressTxRow, WalletBlockDelta, WalletUtxoRow,
 };
 
 const STREAM_FETCH_WINDOW_BLOCKS: u32 = 64;
 const STREAM_MAX_BATCH_BLOCKS: usize = 2_048;
+const MAX_PENDING_WALLET_BATCH_ROWS: u64 = 65_536;
 const STREAM_SOURCE_RESPONSE_CAP_BYTES: u64 = 256 * 1024 * 1024;
 const TRANSACTION_LOCATION_KIND_LIVE: i16 = 0;
 const TRANSACTION_LOCATION_KIND_SETTLED: i16 = 1;
@@ -552,9 +553,17 @@ async fn stream_and_copy_settled_prefix(
 
         let wallet_started = Instant::now();
         for prepared in &chunk {
-            let _ = ctx.wallet_projection.apply_block(&prepared.facts)?;
+            let _ = ctx
+                .wallet_projection
+                .apply_block_for_bulk(&prepared.facts)?;
         }
         ctx.timings.wallet_projection_duration += wallet_started.elapsed();
+
+        if ctx.wallet_projection.pending_spent_utxo_count() >= MAX_PENDING_WALLET_BATCH_ROWS
+            || ctx.wallet_projection.pending_address_tx_count() >= MAX_PENDING_WALLET_BATCH_ROWS
+        {
+            flush_pending_wallet_batches(ctx).await?;
+        }
 
         for prepared in chunk {
             batch_est_bytes =
@@ -572,6 +581,22 @@ async fn stream_and_copy_settled_prefix(
             flush_settled_batch(ctx, batch).await?;
         }
     }
+    Ok(())
+}
+
+async fn flush_pending_wallet_batches(
+    ctx: &mut StreamingTxnContext<'_, '_>,
+) -> Result<(), BenchError> {
+    let wallet_started = Instant::now();
+    let spent_utxos = ctx.wallet_projection.drain_pending_spent_utxos_sorted();
+    let addr_rows = ctx.wallet_projection.drain_address_tx_rows();
+    ctx.timings.wallet_projection_duration += wallet_started.elapsed();
+
+    let copy_started = Instant::now();
+    let schema = ctx.cfg.schema_name;
+    copy_wallet_utxos(ctx.txn, schema, &spent_utxos).await?;
+    copy_wallet_address_txs(ctx.txn, schema, &addr_rows).await?;
+    ctx.timings.copy_duration += copy_started.elapsed();
     Ok(())
 }
 
@@ -597,9 +622,9 @@ async fn flush_settled_batch(
         TRANSACTION_LOCATION_KIND_SETTLED,
     )
     .await?;
-    let addr_rows = ctx.wallet_projection.drain_address_tx_rows();
-    copy_wallet_address_txs(ctx.txn, schema, &addr_rows).await?;
     ctx.timings.copy_duration += copy_idx_started.elapsed();
+
+    flush_pending_wallet_batches(ctx).await?;
 
     let seal_started = Instant::now();
     let sealed = seal_settled_segments(
@@ -641,11 +666,17 @@ async fn stream_and_copy_tail_and_finalize_bulk(
 
     let wallet_started = Instant::now();
     for prepared in &initial_tail {
-        let _ = ctx.wallet_projection.apply_block(&prepared.facts)?;
+        let _ = ctx
+            .wallet_projection
+            .apply_block_for_bulk(&prepared.facts)?;
     }
-    let sorted_utxos = ctx.wallet_projection.sorted_utxo_rows();
-    let remaining_addr_rows = ctx.wallet_projection.drain_address_tx_rows();
     ctx.timings.wallet_projection_duration += wallet_started.elapsed();
+
+    flush_pending_wallet_batches(ctx).await?;
+
+    let wallet_sort_started = Instant::now();
+    let live_utxos = ctx.wallet_projection.sorted_live_utxo_refs();
+    ctx.timings.wallet_projection_duration += wallet_sort_started.elapsed();
 
     let schema = ctx.cfg.schema_name;
     let first_height = ctx.prepare_state.first_height;
@@ -660,8 +691,7 @@ async fn stream_and_copy_tail_and_finalize_bulk(
     )
     .await?;
     copy_subtree_roots(ctx.txn, schema, subtree_roots).await?;
-    copy_wallet_utxos(ctx.txn, schema, &sorted_utxos).await?;
-    copy_wallet_address_txs(ctx.txn, schema, &remaining_addr_rows).await?;
+    copy_live_wallet_utxos(ctx.txn, schema, &live_utxos).await?;
     ctx.timings.copy_duration += copy_started.elapsed();
 
     let (first_h, first_hash, first_prev) = ctx
@@ -1304,12 +1334,69 @@ async fn copy_subtree_roots(
     Ok(())
 }
 
+struct WalletUtxoCopyFields {
+    script_hash: zinder_core::TransparentAddressScriptHash,
+    txid: zinder_core::TransactionId,
+    output_index: u32,
+    block_height: BlockHeight,
+    zatoshis: i64,
+    spent_by_txid: Option<zinder_core::TransactionId>,
+    spent_at_height: Option<BlockHeight>,
+}
+
 async fn copy_wallet_utxos(
     txn: &Transaction<'_>,
     schema: &str,
     utxos: &[WalletUtxoRow],
 ) -> Result<(), BenchError> {
-    if utxos.is_empty() {
+    copy_wallet_utxo_rows(
+        txn,
+        schema,
+        utxos.iter().map(|utxo| WalletUtxoCopyFields {
+            script_hash: utxo.script_hash,
+            txid: utxo.txid,
+            output_index: utxo.output_index,
+            block_height: utxo.block_height,
+            zatoshis: utxo.zatoshis,
+            spent_by_txid: utxo.spent_by_txid,
+            spent_at_height: utxo.spent_at_height,
+        }),
+    )
+    .await
+}
+
+async fn copy_live_wallet_utxos(
+    txn: &Transaction<'_>,
+    schema: &str,
+    utxos: &[(&zinder_core::TransparentOutPoint, &LiveUtxoEntry)],
+) -> Result<(), BenchError> {
+    copy_wallet_utxo_rows(
+        txn,
+        schema,
+        utxos.iter().map(|(outpoint, entry)| WalletUtxoCopyFields {
+            script_hash: entry.script_hash,
+            txid: outpoint.transaction_id,
+            output_index: outpoint.output_index,
+            block_height: entry.block_height,
+            zatoshis: entry.zatoshis,
+            spent_by_txid: None,
+            spent_at_height: None,
+        }),
+    )
+    .await
+}
+
+async fn copy_wallet_utxo_rows<I>(
+    txn: &Transaction<'_>,
+    schema: &str,
+    rows: I,
+) -> Result<(), BenchError>
+where
+    I: IntoIterator<Item = WalletUtxoCopyFields>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let iter = rows.into_iter();
+    if iter.len() == 0 {
         return Ok(());
     }
     let sink = txn
@@ -1331,7 +1418,7 @@ async fn copy_wallet_utxos(
         ],
     );
     futures_util::pin_mut!(writer);
-    for utxo in utxos {
+    for utxo in iter {
         let script_wire = encode_address_script_hash(utxo.script_hash);
         let txid_wire = encode_internal_transaction_id(utxo.txid);
         let spent_txid_wire = utxo.spent_by_txid.map(encode_internal_transaction_id);
