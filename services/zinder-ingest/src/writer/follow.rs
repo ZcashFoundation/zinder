@@ -23,9 +23,9 @@ use zinder_runtime::{
 };
 use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{
-    CanonicalAppendAnchor, CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalLiveAppend,
-    CanonicalLiveReplacement, CanonicalReplacementBlock, CanonicalStoreError,
-    RocksDbCanonicalStore,
+    CanonicalAppendAnchor, CanonicalBuildBlock, CanonicalBuildSubtreeRoot,
+    CanonicalEventRetentionStepBudget, CanonicalLiveAppend, CanonicalLiveReplacement,
+    CanonicalReplacementBlock, CanonicalStoreError, RocksDbCanonicalStore,
 };
 
 use crate::{
@@ -91,6 +91,7 @@ pub struct CanonicalFollower<'a, Source> {
     source: &'a Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     config: CanonicalFollowConfig,
+    event_retention_step_budget: CanonicalEventRetentionStepBudget,
     readiness: &'a ComposedReadiness,
     cancel: &'a CancellationToken,
 }
@@ -112,9 +113,20 @@ where
             source,
             network_upgrade_activations,
             config,
+            event_retention_step_budget: CanonicalEventRetentionStepBudget::default(),
             readiness,
             cancel,
         }
+    }
+
+    /// Overrides the per-step canonical event retention work budget.
+    #[must_use]
+    pub const fn with_event_retention_step_budget(
+        mut self,
+        budget: CanonicalEventRetentionStepBudget,
+    ) -> Self {
+        self.event_retention_step_budget = budget;
+        self
     }
 
     async fn recover_source_failure(
@@ -195,6 +207,43 @@ where
             );
         }
         tip_confirmation_after_switch(switch)
+    }
+
+    async fn wait_at_tip(
+        &self,
+        store: &mut RocksDbCanonicalStore,
+        control: &mut ControlInbox,
+        mempool_hydration_changes: &mut Option<MempoolReadyGate>,
+        state: AtTipState,
+    ) -> AtTipWaitOutcome {
+        let poll_sleep = tokio::time::sleep(self.config.poll_interval);
+        tokio::pin!(poll_sleep);
+        loop {
+            tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => return AtTipWaitOutcome::Cancelled,
+                () = &mut poll_sleep => return AtTipWaitOutcome::PollDue,
+                hydration_changed = wait_for_mempool_hydration_change(mempool_hydration_changes) => {
+                    apply_mempool_hydration_change(
+                        hydration_changed,
+                        mempool_hydration_changes,
+                        self.readiness,
+                        store.event_fence().visible_tip(),
+                        Some(state.observed_tip),
+                    );
+                }
+                command = control.next_command() => {
+                    if apply_following_canonical_control_command(
+                        store,
+                        command,
+                        state.tip_confirmation,
+                    ) == CanonicalControlScheduling::YieldToCanonical
+                    {
+                        return AtTipWaitOutcome::YieldedToCanonical;
+                    }
+                }
+            }
+        }
     }
 
     fn set_follow_readiness(&self, canonical_tip: BlockId, observed_tip: Option<BlockId>) {
@@ -282,6 +331,18 @@ enum SourceRecovery {
     Retry,
     /// The node failover switched endpoints; observe the new one now.
     Switched(NodeEndpointSwitch),
+}
+
+#[derive(Clone, Copy)]
+struct AtTipState {
+    observed_tip: BlockId,
+    tip_confirmation: TipConfirmation,
+}
+
+enum AtTipWaitOutcome {
+    PollDue,
+    YieldedToCanonical,
+    Cancelled,
 }
 
 /// Tip confirmation after a switch to `switch`'s target.
@@ -512,8 +573,10 @@ where
 ///
 /// The receiver is owned by this loop, not by a storage adapter. While the
 /// follower waits on the node, it answers read-only commands at once and
-/// applies writes in arrival order when the wait ends. `AtTip` waits select
-/// between a command, cancellation, and the configured poll delay.
+/// applies writes in arrival order when the wait ends. `AtTip` waits yield
+/// immediately to canonical work on `YieldToCanonical`
+/// maintenance commands while preserving the poll delay across reads,
+/// non-yielding commands, and mempool hydration changes.
 pub async fn follow_canonical_tip_with_control<Source>(
     store: RocksDbCanonicalStore,
     follower: CanonicalFollower<'_, Source>,
@@ -543,18 +606,24 @@ where
         .update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
     let mut source_outage: Option<SourceOutage> = None;
     let mut observed_fence_tip = None;
-    let mut next_event_retention_check = std::time::Instant::now();
+    let mut next_event_retention_check = tokio::time::Instant::now();
     let mut mempool_hydration_changes = follower.config.mempool_ready_gate.clone();
     let mut control = ControlInbox::new(control_commands);
     // The opened store's visible tip may sit on a branch the node abandoned
     // while this writer was down. Readers learn that it is confirmed only
     // from a source observation, never from the persisted fence itself.
     let mut tip_confirmation = TipConfirmation::Unconfirmed;
+    let mut skip_top_control_drain = false;
 
     loop {
-        control.drain(&mut store, tip_confirmation);
         if follower.cancel.is_cancelled() {
             return Ok(store);
+        }
+        if !std::mem::take(&mut skip_top_control_drain) {
+            control.drain(&mut store, tip_confirmation, follower.cancel);
+            if follower.cancel.is_cancelled() {
+                return Ok(store);
+            }
         }
         if let Some(node_failover) = follower.config.node_failover.as_ref() {
             observe_fence_for_failover(node_failover, &store, &mut observed_fence_tip)?;
@@ -576,17 +645,12 @@ where
                 continue;
             }
         }
-        if std::time::Instant::now() >= next_event_retention_check {
-            if let Some(window) = follower.config.event_retention_window {
-                let now = UnixTimestampMillis::now();
-                let window_millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
-                let cutoff = UnixTimestampMillis::new(now.value().saturating_sub(window_millis));
-                store.prune_canonical_events_before_created_at(cutoff, now)?;
-            }
-            next_event_retention_check = std::time::Instant::now()
-                .checked_add(follower.config.event_retention_check_interval)
-                .unwrap_or_else(std::time::Instant::now);
-        }
+        maybe_advance_canonical_event_retention(
+            &store,
+            &follower.config,
+            follower.event_retention_step_budget,
+            &mut next_event_retention_check,
+        )?;
         if follower
             .config
             .target_height
@@ -620,7 +684,10 @@ where
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(CanonicalFollowError::Source(source_error)) => {
-                control.drain(&mut store, tip_confirmation);
+                control.drain(&mut store, tip_confirmation, follower.cancel);
+                if follower.cancel.is_cancelled() {
+                    return Ok(store);
+                }
                 let recovery = follower.recover_source_failure(
                     source_error,
                     &mut source_outage,
@@ -664,7 +731,10 @@ where
         if follower.cancel.is_cancelled() {
             return Ok(store);
         }
-        control.drain(&mut store, tip_confirmation);
+        control.drain(&mut store, tip_confirmation, follower.cancel);
+        if follower.cancel.is_cancelled() {
+            return Ok(store);
+        }
 
         match prepared {
             FollowIteration::AtTip { observed_tip } => {
@@ -674,25 +744,22 @@ where
                 record_fence_metrics(&store, observed_tip);
                 follower
                     .set_follow_readiness(store.event_fence().visible_tip(), Some(observed_tip));
-                tokio::select! {
-                    () = follower.cancel.cancelled() => return Ok(store),
-                    hydration_changed = wait_for_mempool_hydration_change(&mut mempool_hydration_changes) => {
-                        apply_mempool_hydration_change(
-                            hydration_changed,
-                            &mut mempool_hydration_changes,
-                            follower.readiness,
-                            store.event_fence().visible_tip(),
-                            Some(observed_tip),
-                        );
-                    }
-                    command = control.next_command() => {
-                        apply_following_canonical_control_command(
-                            &mut store,
-                            command,
+                match follower
+                    .wait_at_tip(
+                        &mut store,
+                        &mut control,
+                        &mut mempool_hydration_changes,
+                        AtTipState {
+                            observed_tip,
                             tip_confirmation,
-                        );
+                        },
+                    )
+                    .await
+                {
+                    AtTipWaitOutcome::PollDue | AtTipWaitOutcome::YieldedToCanonical => {
+                        skip_top_control_drain = true;
                     }
-                    () = tokio::time::sleep(follower.config.poll_interval) => {}
+                    AtTipWaitOutcome::Cancelled => return Ok(store),
                 }
             }
             FollowIteration::Append {
@@ -721,6 +788,47 @@ where
     }
 }
 
+fn maybe_advance_canonical_event_retention(
+    store: &RocksDbCanonicalStore,
+    config: &CanonicalFollowConfig,
+    step_budget: CanonicalEventRetentionStepBudget,
+    next_event_retention_check: &mut tokio::time::Instant,
+) -> Result<(), CanonicalFollowError> {
+    let Some(window) = config.event_retention_window else {
+        return Ok(());
+    };
+    let now_instant = tokio::time::Instant::now();
+    if now_instant < *next_event_retention_check {
+        return Ok(());
+    }
+    let now = UnixTimestampMillis::now();
+    let window_millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+    let cutoff = UnixTimestampMillis::new(now.value().saturating_sub(window_millis));
+    let outcome = store.advance_canonical_event_retention(cutoff, now, step_budget)?;
+    tracing::debug!(
+        target: "zinder::ingest",
+        event = "canonical_event_retention_step",
+        inspected_event_count = outcome.inspected_event_count,
+        pruned_event_count = outcome.report.pruned_event_count,
+        oldest_retained_sequence = outcome.report.oldest_retained_sequence,
+        current_event_sequence = outcome.report.current_event_sequence,
+        lease_protected_sequence = outcome
+            .report
+            .lease_protected_anchor
+            .map(|anchor| anchor.event_cursor().event_sequence()),
+        stop = outcome.stop.label(),
+        "completed bounded canonical event retention pass"
+    );
+    *next_event_retention_check = if outcome.has_immediate_work() {
+        now_instant
+    } else {
+        tokio::time::Instant::now()
+            .checked_add(config.event_retention_check_interval)
+            .unwrap_or_else(tokio::time::Instant::now)
+    };
+    Ok(())
+}
+
 /// The follower's end of the control channel.
 ///
 /// While the follower waits on the node, it answers reads at once and holds
@@ -743,14 +851,30 @@ impl ControlInbox {
         self.receiver.is_some()
     }
 
-    /// Applies held writes, then the commands already in the channel, until a
-    /// mempool retention step yields to canonical work or none is left.
-    fn drain(&mut self, store: &mut RocksDbCanonicalStore, tip_confirmation: TipConfirmation) {
-        while let Some(command) = self.held_writes.pop_front().or_else(|| {
-            self.receiver
-                .as_mut()
-                .and_then(|receiver| receiver.try_recv().ok())
-        }) {
+    /// Applies up to one bounded batch of held writes and queued channel
+    /// commands, returning early on cancellation or when a mempool retention
+    /// step yields to canonical work.
+    fn drain(
+        &mut self,
+        store: &mut RocksDbCanonicalStore,
+        tip_confirmation: TipConfirmation,
+        cancel: &CancellationToken,
+    ) {
+        let max_commands = self
+            .held_writes
+            .len()
+            .saturating_add(CANONICAL_CONTROL_COMMAND_CAPACITY);
+        for _ in 0..max_commands {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let Some(command) = self.held_writes.pop_front().or_else(|| {
+                self.receiver
+                    .as_mut()
+                    .and_then(|receiver| receiver.try_recv().ok())
+            }) else {
+                return;
+            };
             if apply_following_canonical_control_command(store, command, tip_confirmation)
                 == CanonicalControlScheduling::YieldToCanonical
             {
@@ -1830,6 +1954,8 @@ fn record_fence_metrics(store: &RocksDbCanonicalStore, observed_tip: BlockId) {
 mod tests {
     use std::{num::NonZeroU32, time::Duration};
 
+    use tokio_util::sync::CancellationToken;
+
     use zinder_core::{
         BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint,
         CommitmentTreeFrontiers, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootIndex,
@@ -1928,7 +2054,8 @@ mod tests {
         assert!(prune_outcome.try_recv().is_err());
         assert!(second_append.try_recv().is_err());
 
-        control.drain(&mut store, TipConfirmation::Confirmed);
+        let cancel = CancellationToken::new();
+        control.drain(&mut store, TipConfirmation::Confirmed, &cancel);
         assert_eq!(first_append.try_recv()??.event_sequence, 1);
         prune_outcome.try_recv()??;
         assert!(
@@ -1936,7 +2063,7 @@ mod tests {
             "a held retention step yields before the next held write"
         );
 
-        control.drain(&mut store, TipConfirmation::Confirmed);
+        control.drain(&mut store, TipConfirmation::Confirmed, &cancel);
         assert_eq!(second_append.try_recv()??.event_sequence, 2);
         Ok(())
     }
@@ -1982,7 +2109,8 @@ mod tests {
         );
         assert_eq!(replay_page?, [] as [zinder_store::MempoolEventEnvelope; 0]);
 
-        control.drain(&mut store, TipConfirmation::Confirmed);
+        let cancel = CancellationToken::new();
+        control.drain(&mut store, TipConfirmation::Confirmed, &cancel);
         let (durable_page, ()) = tokio::join!(
             canonical.mempool_event_page(None, page_size),
             control.serve_reads_until(

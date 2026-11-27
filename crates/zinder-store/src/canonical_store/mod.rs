@@ -99,7 +99,10 @@ pub use encoded_compact_range::{
 };
 pub use event_lifecycle::{
     CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind,
-    CanonicalEventRetentionReport, CanonicalRetainedEvent, ProjectionBuildAnchor,
+    CanonicalEventRetentionReport, CanonicalEventRetentionStepBudget,
+    CanonicalEventRetentionStepOutcome, CanonicalEventRetentionStepStop, CanonicalRetainedEvent,
+    DEFAULT_CANONICAL_EVENT_RETENTION_MAX_DELETED_EVENTS,
+    DEFAULT_CANONICAL_EVENT_RETENTION_MAX_INSPECTED_EVENTS, ProjectionBuildAnchor,
     ProjectionBuildLease, ProjectionBuildLeaseId,
 };
 pub use live_commit::{CanonicalAppendAnchor, CanonicalEventFence, CanonicalLiveAppend};
