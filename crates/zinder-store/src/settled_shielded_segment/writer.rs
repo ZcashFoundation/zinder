@@ -10,15 +10,17 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use zinder_core::{BlockHash, BlockId, CompactBlockArtifact, wire::encode_internal_block_hash};
 
+use crate::segment_verity;
+
 use super::{
     SettledShieldedSegmentError, SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader,
-    ShieldedSegmentIdentity,
+    ShieldedSegmentHeader, ShieldedSegmentIdentity,
     format::{
         DecodedRowIndexEntry, FRAME_PREFIX_LEN, HEADER_LEN, MAX_SLAB_BYTES,
-        ROW_FLAG_UNREPRESENTABLE_WIRE_FEE, ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader,
+        ROW_FLAG_UNREPRESENTABLE_WIRE_FEE, ROW_INDEX_ENTRY_LEN, STAGING_CHUNK,
         check_contiguous_block, encode_frame_prefix, validate_payload_limit,
     },
-    parent_directory, verity,
+    parent_directory,
     wire_projection::encode_default_shielded_block_with_options,
 };
 
@@ -35,6 +37,11 @@ pub struct SettledShieldedSegmentWriter {
 
 impl SettledShieldedSegmentWriter {
     /// Creates a staged `ZSHRNG02` writer destined for `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError`] if `span` is invalid or writing the
+    /// initial zeroed header fails.
     pub fn create(
         target: &Path,
         staged: NamedTempFile,
@@ -55,6 +62,11 @@ impl SettledShieldedSegmentWriter {
     }
 
     /// Encodes and writes one contiguous canonical compact block to `Slab 0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError`] on height/hash linkage gaps,
+    /// fees exceeding `u32`, payload size overflows, or staged I/O failure.
     pub fn push(
         &mut self,
         block: &CompactBlockArtifact,
@@ -67,6 +79,11 @@ impl SettledShieldedSegmentWriter {
     /// `ZSTSUP01` supplement segment, zeroing shielded wire fees above `u32::MAX`
     /// in `Slab 0` and marking the row flag so direct wire reads fail closed while
     /// canonical reconstruction reads recover full `Option<u64>` fees from `ZSTSUP01`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError`] on height/hash linkage gaps,
+    /// payload size overflows, or staged I/O failure.
     pub fn push_with_supplement(
         &mut self,
         block: &CompactBlockArtifact,
@@ -144,8 +161,13 @@ impl SettledShieldedSegmentWriter {
         Ok(())
     }
 
-    /// Finalizes the segment index, header, SHA-256 trailer, optional
-    /// `fs-verity` protection, and atomic target placement.
+    /// Finalizes the segment index, header, SHA-256 trailer, `index_sha256` pin,
+    /// optional `fs-verity` protection, and atomic target placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError`] if the segment is incomplete,
+    /// hashing or `fs-verity` protection fails, or atomic persistence fails.
     pub fn finish(mut self) -> Result<ShieldedSegmentIdentity, SettledShieldedSegmentError> {
         let block_count = self.identity.block_count()?;
         let first_prev_hash = self.first_prev_hash.ok_or_else(|| {
@@ -168,7 +190,7 @@ impl SettledShieldedSegmentWriter {
             .into_inner()
             .map_err(io::IntoInnerError::into_error)?;
         let index_offset = HEADER_LEN as u64 + u64::from(self.slab_len);
-        let header = SegmentHeader {
+        let header_bytes = ShieldedSegmentHeader {
             network_tag: self.identity.network.id(),
             artifact_schema_version: self.identity.artifact_schema_version,
             segment_flags: 0,
@@ -178,22 +200,29 @@ impl SettledShieldedSegmentWriter {
             last_block_hash_wire: encode_internal_block_hash(self.identity.end_block.hash),
             slab_offset: HEADER_LEN as u64,
             index_offset,
-        };
-        write_all_at(staged_file.as_file(), &header.encode(), 0)?;
+        }
+        .encode();
+        write_all_at(staged_file.as_file(), &header_bytes, 0)?;
         let index_bytes = u64::from(block_count) * ROW_INDEX_ENTRY_LEN as u64;
         let trailer_offset = index_offset + index_bytes;
         let (trailer, verity_digest) = hash_staged(staged_file.as_file(), trailer_offset)?;
         write_all_at(staged_file.as_file(), &trailer, trailer_offset)?;
         staged_file.as_file().sync_all()?;
 
-        let readonly_staged = verity::reopen_staged(&staged_file)?;
+        let index_sha256 = compute_index_sha256(&header_bytes, &self.rows, &trailer);
+        let readonly_staged = segment_verity::reopen_staged(&staged_file, "shielded segment")?;
         let (writable_file, temp_path) = staged_file.into_parts();
         drop(writable_file);
-        verity::protect_new_segment(&readonly_staged, Some(verity_digest))?;
+        segment_verity::protect_new_segment(
+            &readonly_staged,
+            Some(verity_digest),
+            "shielded segment",
+        )?;
         drop(readonly_staged);
 
         let identity = ShieldedSegmentIdentity {
             sha256: trailer,
+            index_sha256,
             fs_verity_sha256: Some(verity_digest),
             ..self.identity
         };
@@ -201,6 +230,20 @@ impl SettledShieldedSegmentWriter {
         File::open(parent_directory(&self.target))?.sync_all()?;
         Ok(identity)
     }
+}
+
+fn compute_index_sha256(
+    header_bytes: &[u8; HEADER_LEN],
+    rows: &[[u8; ROW_INDEX_ENTRY_LEN]],
+    trailer: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(header_bytes);
+    for row in rows {
+        digest.update(row);
+    }
+    digest.update(trailer);
+    digest.finalize().into()
 }
 
 fn persist_segment(

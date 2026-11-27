@@ -1,8 +1,10 @@
-//! Binary framing, header, chunk index, and row index definitions for `ZSTSUP01`.
+//! Binary framing, header, chunk index, and compact row-index definitions for `ZSTSUP01`.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use zinder_core::{BlockHeight, BlockId, Network, wire::encode_internal_block_hash};
+
+use crate::positional_source::ByteRange;
 
 use super::{
     SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS, SETTLED_SUPPLEMENT_SEGMENT_MAGIC,
@@ -16,6 +18,10 @@ pub(super) const ROW_INDEX_ENTRY_LEN: usize = 80;
 pub(super) const TRAILER_LEN: usize = 32;
 pub(super) const STAGING_CHUNK: usize = 256 * 1024;
 pub(super) const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+pub(super) const INDEX_PAGE_ROWS: usize = 64;
+
+/// Default sealed supplement segment byte cap (`256 MiB`) matching `PostgreSQL` `BYTEA` bounds.
+pub const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) const ROW_FLAG_HAS_TRANSPARENT: u8 = 0x01;
 pub(super) const ROW_FLAG_HAS_CANONICAL_METADATA: u8 = 0x02;
@@ -27,6 +33,9 @@ pub(super) const VALIDATION_UNVALIDATED: u8 = 0;
 pub(super) const VALIDATION_VALID: u8 = 1;
 pub(super) const VALIDATION_INVALID: u8 = 2;
 
+const VALIDATION_SHIFT: u8 = 6;
+const VALIDATION_MASK: u8 = 0b11 << VALIDATION_SHIFT;
+
 const MAX_BLOCK_BYTES_U32: u32 = 16 * 1024 * 1024;
 const _: () = assert!(
     (SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS as u64) * (MAX_BLOCK_BYTES_U32 as u64) <= u32::MAX as u64
@@ -37,10 +46,13 @@ const _: () = assert!(
         <= u32::MAX as u64
 );
 const _: () = assert!(MAX_BLOCK_BYTES_U32 as usize == SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES);
+const _: () = assert!(std::mem::size_of::<CompactSupplementRow>() == 1);
+const _: () = assert!(std::mem::size_of::<IndexedChunk>() <= 56);
+const _: () = assert!((ROW_KNOWN_FLAGS & VALIDATION_MASK) == 0);
 
-/// Fixed 128-byte header of one `ZSTSUP01` segment.
+/// Fixed `128`-byte header of one `ZSTSUP01` segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SegmentHeader {
+pub struct SupplementSegmentHeader {
     pub(super) network_tag: u32,
     pub(super) artifact_schema_version: u16,
     pub(super) segment_flags: u16,
@@ -55,7 +67,27 @@ pub(super) struct SegmentHeader {
     pub(super) row_index_offset: u64,
 }
 
-impl SegmentHeader {
+#[cfg(test)]
+pub(super) type SegmentHeader = SupplementSegmentHeader;
+
+impl SupplementSegmentHeader {
+    /// Decodes a `128`-byte `ZSTSUP01` header and verifies it against `expected`
+    /// and `total_len`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError`] if magic, reserved bytes,
+    /// codec, bounds, identity pins, or total byte length fail validation.
+    pub fn decode(
+        bytes: &[u8; HEADER_LEN],
+        expected: &SupplementSegmentIdentity,
+        total_len: u64,
+    ) -> Result<Self, SettledSupplementSegmentError> {
+        let header = Self::decode_unchecked(bytes)?;
+        header.matches_identity(expected, total_len)?;
+        Ok(header)
+    }
+
     pub(super) fn encode(self) -> [u8; HEADER_LEN] {
         let mut header = [0_u8; HEADER_LEN];
         header[..8].copy_from_slice(SETTLED_SUPPLEMENT_SEGMENT_MAGIC);
@@ -74,7 +106,9 @@ impl SegmentHeader {
         header
     }
 
-    pub(super) fn decode(bytes: &[u8; HEADER_LEN]) -> Result<Self, SettledSupplementSegmentError> {
+    pub(super) fn decode_unchecked(
+        bytes: &[u8; HEADER_LEN],
+    ) -> Result<Self, SettledSupplementSegmentError> {
         if &bytes[..8] != SETTLED_SUPPLEMENT_SEGMENT_MAGIC {
             return Err(SettledSupplementSegmentError::InvalidFormat(
                 "supplement segment magic mismatch".to_owned(),
@@ -103,11 +137,21 @@ impl SegmentHeader {
         Ok(header)
     }
 
-    pub(super) fn codec(self) -> Result<SupplementCompressionCodec, SettledSupplementSegmentError> {
+    /// Returns the compression codec configured in the header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError::InvalidCodecId`] if unknown.
+    pub fn codec(self) -> Result<SupplementCompressionCodec, SettledSupplementSegmentError> {
         SupplementCompressionCodec::from_id(self.codec_id)
     }
 
-    pub(super) fn chunk_count(self) -> Result<u32, SettledSupplementSegmentError> {
+    /// Returns the number of compressed chunks expected by the header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError::InvalidFormat`] if `chunk_blocks == 0`.
+    pub fn chunk_count(self) -> Result<u32, SettledSupplementSegmentError> {
         if self.chunk_blocks == 0 {
             return Err(SettledSupplementSegmentError::InvalidFormat(
                 "supplement segment chunk_blocks must be positive".to_owned(),
@@ -116,7 +160,31 @@ impl SegmentHeader {
         Ok(self.block_count.div_ceil(u32::from(self.chunk_blocks)))
     }
 
-    pub(super) fn data_len(self) -> Result<u64, SettledSupplementSegmentError> {
+    /// Returns the first block height covered by the segment.
+    #[must_use]
+    pub const fn start_height(self) -> BlockHeight {
+        BlockHeight::new(self.start_height)
+    }
+
+    /// Returns the number of blocks covered by the segment.
+    #[must_use]
+    pub const fn block_count(self) -> u32 {
+        self.block_count
+    }
+
+    /// Returns the number of blocks grouped into each compressed chunk.
+    #[must_use]
+    pub const fn chunk_blocks(self) -> u16 {
+        self.chunk_blocks
+    }
+
+    /// Returns the byte length of the compressed chunk payload region.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError::InvalidFormat`] if the chunk
+    /// index precedes the data region.
+    pub fn data_len(self) -> Result<u64, SettledSupplementSegmentError> {
         self.chunk_index_offset
             .checked_sub(self.data_offset)
             .ok_or_else(|| {
@@ -124,6 +192,35 @@ impl SegmentHeader {
                     "supplement segment chunk index precedes data region".to_owned(),
                 )
             })
+    }
+
+    /// Returns the exact single [`ByteRange`] spanning the chunk index, row
+    /// index, and trailing `32`-byte SHA-256 trailer (`[chunk_index_offset .. total_len)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError::InvalidFormat`] on arithmetic overflow.
+    pub fn indexes_and_trailer_range(self) -> Result<ByteRange, SettledSupplementSegmentError> {
+        let chunk_count = usize::try_from(self.chunk_count()?).map_err(|_| {
+            SettledSupplementSegmentError::InvalidFormat("chunk count exceeds usize".to_owned())
+        })?;
+        let row_count = usize::try_from(self.block_count).map_err(|_| {
+            SettledSupplementSegmentError::InvalidFormat("block count exceeds usize".to_owned())
+        })?;
+        let total_bytes = chunk_count
+            .checked_mul(CHUNK_INDEX_ENTRY_LEN)
+            .and_then(|chunks_len| {
+                row_count
+                    .checked_mul(ROW_INDEX_ENTRY_LEN)
+                    .and_then(|rows_len| chunks_len.checked_add(rows_len))
+            })
+            .and_then(|idx_len| idx_len.checked_add(TRAILER_LEN))
+            .ok_or_else(|| {
+                SettledSupplementSegmentError::InvalidFormat(
+                    "supplement indexes byte count overflow".to_owned(),
+                )
+            })?;
+        Ok(ByteRange::new(self.chunk_index_offset, total_bytes))
     }
 
     pub(super) fn matches_identity(
@@ -152,7 +249,9 @@ impl SegmentHeader {
     }
 }
 
-fn validate_header_fields(header: &SegmentHeader) -> Result<(), SettledSupplementSegmentError> {
+fn validate_header_fields(
+    header: &SupplementSegmentHeader,
+) -> Result<(), SettledSupplementSegmentError> {
     if Network::from_id(header.network_tag).is_none() {
         return Err(SettledSupplementSegmentError::InvalidFormat(format!(
             "unknown network tag {}",
@@ -254,7 +353,7 @@ pub(super) fn max_compressed_chunk_bytes(
     }
 }
 
-/// Decoded 48-byte on-disk chunk index record.
+/// Decoded `48`-byte on-disk chunk index record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DecodedChunkIndexEntry {
     pub(super) data_rel_offset: u64,
@@ -285,7 +384,7 @@ impl DecodedChunkIndexEntry {
     }
 }
 
-/// Decoded 80-byte on-disk per-block row index record.
+/// Decoded `80`-byte on-disk per-block row index record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DecodedRowIndexEntry {
     pub(super) block_hash_wire: [u8; 32],
@@ -333,7 +432,7 @@ impl DecodedRowIndexEntry {
     }
 }
 
-/// In-memory chunk metadata retained by [`super::SettledSupplementSegmentReader`].
+/// Compact chunk metadata (`56 B/chunk` = `3.5 B/block` at `chunk_blocks = 16`).
 pub(super) struct IndexedChunk {
     pub(super) data_rel_offset: u64,
     pub(super) compressed_len: u32,
@@ -368,50 +467,63 @@ impl IndexedChunk {
     }
 }
 
-/// In-memory per-block row metadata retained by [`super::SettledSupplementSegmentReader`].
-pub(super) struct IndexedSupplementBlock {
-    pub(super) block_hash_wire: [u8; 32],
-    pub(super) payload_sha256: [u8; 32],
-    pub(super) chunk_rel_offset: u32,
-    pub(super) uncompressed_len: u32,
-    pub(super) block_time: u32,
-    pub(super) row_flags: u8,
-    pub(super) validation_state: AtomicU8,
-}
+/// Compact `1`-byte in-memory per-block row descriptor (`row_flags` + sticky
+/// atomic validation bits).
+pub(super) struct CompactSupplementRow(AtomicU8);
 
-impl IndexedSupplementBlock {
-    pub(super) fn from_entry(entry: &DecodedRowIndexEntry) -> Self {
-        Self {
-            block_hash_wire: entry.block_hash_wire,
-            payload_sha256: entry.payload_sha256,
-            chunk_rel_offset: entry.chunk_rel_offset,
-            uncompressed_len: entry.uncompressed_len,
-            block_time: entry.block_time,
-            row_flags: entry.row_flags,
-            validation_state: AtomicU8::new(VALIDATION_UNVALIDATED),
-        }
+impl CompactSupplementRow {
+    pub(super) const fn from_entry(entry: &DecodedRowIndexEntry) -> Self {
+        Self(AtomicU8::new(entry.row_flags & ROW_KNOWN_FLAGS))
     }
 
-    pub(super) const fn has_transparent(&self) -> bool {
-        (self.row_flags & ROW_FLAG_HAS_TRANSPARENT) != 0
+    pub(super) fn row_flags(&self) -> u8 {
+        self.0.load(Ordering::Acquire) & ROW_KNOWN_FLAGS
     }
 
-    pub(super) const fn has_wide_fee(&self) -> bool {
-        (self.row_flags & ROW_FLAG_HAS_WIDE_FEE) != 0
+    pub(super) fn validation_state(&self) -> u8 {
+        (self.0.load(Ordering::Acquire) & VALIDATION_MASK) >> VALIDATION_SHIFT
+    }
+
+    pub(super) fn has_transparent(&self) -> bool {
+        (self.row_flags() & ROW_FLAG_HAS_TRANSPARENT) != 0
+    }
+
+    pub(super) fn has_wide_fee(&self) -> bool {
+        (self.row_flags() & ROW_FLAG_HAS_WIDE_FEE) != 0
     }
 
     pub(super) fn mark_valid(&self) {
-        let _ = self.validation_state.compare_exchange(
-            VALIDATION_UNVALIDATED,
-            VALIDATION_VALID,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            if ((current & VALIDATION_MASK) >> VALIDATION_SHIFT) != VALIDATION_UNVALIDATED {
+                break;
+            }
+            let next = (current & !VALIDATION_MASK) | (VALIDATION_VALID << VALIDATION_SHIFT);
+            match self
+                .0
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub(super) fn mark_invalid(&self) {
-        self.validation_state
-            .store(VALIDATION_INVALID, Ordering::Release);
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            let next = (current & !VALIDATION_MASK) | (VALIDATION_INVALID << VALIDATION_SHIFT);
+            if current == next {
+                break;
+            }
+            match self
+                .0
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 

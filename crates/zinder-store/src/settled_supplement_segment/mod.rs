@@ -1,11 +1,24 @@
 //! Store-owned settled supplement history segment (`ZSTSUP01`).
 //!
 //! Each immutable segment covers one contiguous settled height interval with
-//! chunked Zstd-3 (or uncompressed) per-block tagged sections:
+//! `16`-block Zstd level-3 (or uncompressed) compressed chunks of per-block
+//! tagged sections:
 //! - Tag `1`: compact transparent supplement per block (`tx.index`, `txid`,
 //!   `fee_zat`, `vin`, `vout` covering transparent-only transactions and
 //!   transparent components of mixed transactions).
-//! - Tag `2`: extensible canonical block and transaction supplement metadata.
+//! - Tag `2`: extensible canonical block and transaction supplement metadata
+//!   (ZIP 229/258/248/226/270/272 fields, explicit anchors, `zip317_logical_actions`,
+//!   `paid_fee` / `burn_zat`).
+//!
+//! Cold admission validates `index_sha256 = SHA-256(header || raw_chunk_index ||
+//! raw_row_index || trailer)` in a single positioned read (`O(index)`),
+//! retaining compact `4.5 B/block` in-memory tables (`3.5 B/block` chunks +
+//! `1 B/block` rows; `+ 0.5 B/block` 64-row page digests when not backed by
+//! kernel `fs-verity`). Sans-I/O planning
+//! (`SettledSupplementSegmentIndex::plan_block_range` / `plan_splice_range`)
+//! decouples byte-range planning from [`PositionalByteSource`] I/O so local
+//! files (`File` `pread`), `PostgreSQL` `BYTEA STORAGE EXTERNAL` `substring()`,
+//! and HTTP `Range` fetches share the same verification and splicing core.
 //!
 //! Together with `ZSHRNG02` `Slab 0`, [`splice_compact_block_wire`] produces
 //! byte-identical `CompactBlock` gRPC frames and
@@ -17,7 +30,6 @@ mod reader;
 mod section;
 #[cfg(test)]
 mod tests;
-mod verity;
 mod wire_splice;
 mod writer;
 
@@ -26,7 +38,15 @@ use std::{io, path::Path};
 use thiserror::Error;
 use zinder_core::{BlockHeight, BlockId, Network};
 
-pub use reader::{SettledSupplementSegmentOpenOptions, SettledSupplementSegmentReader};
+pub use format::{
+    DEFAULT_MAX_BYTES as DEFAULT_SETTLED_SUPPLEMENT_SEGMENT_MAX_BYTES, SupplementSegmentHeader,
+};
+pub use reader::{
+    SettledSupplementSegmentIndex, SettledSupplementSegmentOpenOptions,
+    SettledSupplementSegmentReader, SupplementChunkReadStep, SupplementRangePlan,
+    SupplementRowIndexSlice, SupplementSpliceChunkStep, SupplementSplicePlan,
+    VerifiedSupplementRowIndexSlice,
+};
 pub use section::{
     BlockSupplementRecord, CanonicalBlockSupplement, CanonicalTransactionSupplement,
     CompactTransparentSupplementTx, SupplementShieldedAnchors, SupplementTxFeeAndBurn,
@@ -61,6 +81,11 @@ pub enum SupplementCompressionCodec {
 
 impl SupplementCompressionCodec {
     /// Decodes a `ZSTSUP01` header `codec_id`, failing closed on unknown IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError::InvalidCodecId`] if `codec_id`
+    /// is unknown.
     pub const fn from_id(codec_id: u16) -> Result<Self, SettledSupplementSegmentError> {
         match codec_id {
             0 => Ok(Self::None),
@@ -95,7 +120,7 @@ pub enum SettledSupplementSegmentError {
     /// Block heights or parent-hash chain linkage failed verification.
     #[error("settled supplement segment chain linkage error: {0}")]
     ChainLinkage(String),
-    /// Trailer, chunk digest, payload digest, `fs-verity` measurement, or section check failed.
+    /// Trailer, index digest, chunk digest, payload digest, `fs-verity`, or section check failed.
     #[error("settled supplement segment payload integrity error: {0}")]
     PayloadIntegrity(String),
     /// Single block or chunk payload exceeded the configured byte bound.
@@ -131,6 +156,17 @@ pub enum SettledSupplementSegmentError {
     },
 }
 
+impl From<crate::segment_verity::SegmentVerityError> for SettledSupplementSegmentError {
+    fn from(error: crate::segment_verity::SegmentVerityError) -> Self {
+        match error {
+            crate::segment_verity::SegmentVerityError::Io(source) => Self::Io(source),
+            crate::segment_verity::SegmentVerityError::DigestMismatch(reason) => {
+                Self::PayloadIntegrity(reason)
+            }
+        }
+    }
+}
+
 /// Authenticated interval and integrity pins for one settled `ZSTSUP01` segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SupplementSegmentIdentity {
@@ -144,6 +180,8 @@ pub struct SupplementSegmentIdentity {
     pub end_block: BlockId,
     /// Trailing SHA-256 digest over all preceding segment bytes.
     pub sha256: [u8; 32],
+    /// SHA-256 digest over header, raw chunk index, raw row index, and trailer (`O(index)` cold admission pin).
+    pub index_sha256: [u8; 32],
     /// Expected Linux `fs-verity` SHA-256 measurement, when known.
     pub fs_verity_sha256: Option<[u8; 32]>,
 }
@@ -163,11 +201,17 @@ impl SupplementSegmentIdentity {
             start_height,
             end_block,
             sha256: [0; 32],
+            index_sha256: [0; 32],
             fs_verity_sha256: None,
         }
     }
 
     /// Computes the number of contiguous blocks covered by this segment interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError::ChainLinkage`] if the interval
+    /// is reversed or exceeds `u32::MAX` blocks.
     pub fn block_count(&self) -> Result<u32, SettledSupplementSegmentError> {
         let span = self
             .end_block

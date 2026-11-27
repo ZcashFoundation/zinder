@@ -1,11 +1,13 @@
 use std::{
     error::Error,
     fs::{self, File, OpenOptions},
-    io::{Read as _, Seek as _, SeekFrom, Write as _},
+    io::{self, Read as _, Seek as _, SeekFrom, Write as _},
     path::Path,
-    sync::atomic::Ordering,
+    sync::{Arc, atomic::Ordering},
 };
 
+use bytes::Bytes;
+use parking_lot::Mutex;
 use prost::{
     Message as _,
     encoding::{WireType, encode_key, encode_varint},
@@ -28,18 +30,16 @@ use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
 use super::{
     SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS, SETTLED_SUPPLEMENT_SEGMENT_MAGIC,
     SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES, SettledSupplementSegmentError,
-    SettledSupplementSegmentOpenOptions, SettledSupplementSegmentReader,
-    SettledSupplementSegmentWriteOptions, SettledSupplementSegmentWriter,
-    SupplementCompressionCodec, SupplementSegmentIdentity,
+    SettledSupplementSegmentIndex, SettledSupplementSegmentOpenOptions,
+    SettledSupplementSegmentReader, SettledSupplementSegmentWriteOptions,
+    SettledSupplementSegmentWriter, SupplementCompressionCodec, SupplementRowIndexSlice,
+    SupplementSegmentIdentity,
     format::{
-        CHUNK_INDEX_ENTRY_LEN, DecodedChunkIndexEntry, DecodedRowIndexEntry, HEADER_LEN,
-        IndexedChunk, IndexedSupplementBlock, ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN,
+        CHUNK_INDEX_ENTRY_LEN, CompactSupplementRow, DecodedChunkIndexEntry, DecodedRowIndexEntry,
+        HEADER_LEN, INDEX_PAGE_ROWS, IndexedChunk, ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN,
         VALIDATION_INVALID, max_chunk_bytes, max_compressed_chunk_bytes,
     },
-    reader::{
-        AdmittedHeaderAndIndexBytes, PortablePin, SegmentTables, admit_portable, admit_protected,
-        read_indexes_and_trailer, validate_indices,
-    },
+    reader::validate_indices,
     section::{
         BlockEnvelopeIdentity, BlockSupplementRecord, CanonicalBlockSupplement,
         CanonicalTransactionSupplement, CompactTransparentSupplementTx, SupplementShieldedAnchors,
@@ -51,8 +51,9 @@ use super::{
     },
 };
 use crate::{
-    HeightOrder, SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader,
-    SettledShieldedSegmentWriter, ShieldedProjectionSelection, ShieldedSegmentIdentity,
+    HeightOrder, PositionalByteSource, SettledShieldedSegmentOpenOptions,
+    SettledShieldedSegmentReader, SettledShieldedSegmentWriter, ShieldedProjectionSelection,
+    ShieldedSegmentIdentity, positional_source::ByteRange,
 };
 
 type TestOutcome<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -773,6 +774,9 @@ fn assemble_segment_file(
     }
     let sha256: [u8; 32] = Sha256::digest(&file_bytes).into();
     file_bytes.extend_from_slice(&sha256);
+    let mut index_digest = Sha256::new();
+    index_digest.update(&file_bytes[..HEADER_LEN]);
+    index_digest.update(&file_bytes[usize::try_from(chunk_index_offset)?..]);
     let mut identity = SupplementSegmentIdentity::span(
         Network::ZcashMainnet,
         1,
@@ -780,6 +784,7 @@ fn assemble_segment_file(
         BlockId::new(last.height(), last.block_hash()),
     );
     identity.sha256 = sha256;
+    identity.index_sha256 = index_digest.finalize().into();
     Ok((file_bytes, identity))
 }
 
@@ -1032,15 +1037,15 @@ const fn synthetic_header(chunk_blocks: u16, data_len: u64) -> SegmentHeader {
     }
 }
 
-fn synthetic_row(uncompressed_len: u32) -> IndexedSupplementBlock {
-    IndexedSupplementBlock::from_entry(&DecodedRowIndexEntry {
+const fn synthetic_row(uncompressed_len: u32) -> DecodedRowIndexEntry {
+    DecodedRowIndexEntry {
         block_hash_wire: [0x22; 32],
         payload_sha256: [0x33; 32],
         chunk_rel_offset: 0,
         uncompressed_len,
         block_time: 100,
         row_flags: 0,
-    })
+    }
 }
 
 fn synthetic_chunk(compressed_len: u32, uncompressed_len: u32) -> IndexedChunk {
@@ -1158,26 +1163,26 @@ fn validate_indices_enforces_codec_specific_compressed_bounds() -> TestOutcome {
 fn header_flags_codec_reserved_bytes_and_writer_linkage_fail_closed() -> TestOutcome {
     let base = synthetic_header(16, 64).encode();
     assert_eq!(&base[..8], SETTLED_SUPPLEMENT_SEGMENT_MAGIC);
-    assert!(SegmentHeader::decode(&base).is_ok());
+    assert!(SegmentHeader::decode_unchecked(&base).is_ok());
 
     let mut bad_flags = base;
     bad_flags[15] = 0x01;
     assert!(matches!(
-        SegmentHeader::decode(&bad_flags),
+        SegmentHeader::decode_unchecked(&bad_flags),
         Err(SettledSupplementSegmentError::InvalidFormat(_))
     ));
 
     let mut bad_codec = base;
     bad_codec[17] = 9;
     assert!(matches!(
-        SegmentHeader::decode(&bad_codec),
+        SegmentHeader::decode_unchecked(&bad_codec),
         Err(SettledSupplementSegmentError::InvalidCodecId(9))
     ));
 
     let mut non_zero_reserved = base;
     non_zero_reserved[127] = 1;
     assert!(matches!(
-        SegmentHeader::decode(&non_zero_reserved),
+        SegmentHeader::decode_unchecked(&non_zero_reserved),
         Err(SettledSupplementSegmentError::InvalidFormat(_))
     ));
 
@@ -1259,7 +1264,7 @@ fn envelope_and_section_tags_fail_closed_on_mandatory_and_skip_optional() -> Tes
     )?;
 
     let optional_payload = [0xAA, 0xBB];
-    let header = SegmentHeader::decode(bytes[..HEADER_LEN].try_into()?)?;
+    let header = SegmentHeader::decode_unchecked(bytes[..HEADER_LEN].try_into()?)?;
     let base_row = &bytes[HEADER_LEN..usize::try_from(header.chunk_index_offset)?];
 
     let mut opt_row = base_row.to_vec();
@@ -1327,7 +1332,7 @@ fn tag2_extension_tlvs_fail_closed_on_mandatory_and_skip_optional() -> TestOutco
         SupplementCompressionCodec::None,
         16,
     )?;
-    let header = SegmentHeader::decode(bytes[..HEADER_LEN].try_into()?)?;
+    let header = SegmentHeader::decode_unchecked(bytes[..HEADER_LEN].try_into()?)?;
     let row_bytes = bytes[HEADER_LEN..usize::try_from(header.chunk_index_offset)?].to_vec();
 
     let opt_tlv = append_block_tlv(&row_bytes, 0x8001, &[0xDE, 0xAD])?;
@@ -1482,6 +1487,50 @@ fn wire_splice_rejects_mismatched_txid_fee_unexpected_vin_or_wrong_hash() -> Tes
     Ok(())
 }
 
+fn assert_post_admit_chunk_tamper_sticky(
+    seg_path: &Path,
+    dir: &Path,
+    seg_id: &SupplementSegmentIdentity,
+    shielded_reader: &SettledShieldedSegmentReader,
+    target_height: BlockHeight,
+) -> TestOutcome {
+    let post_path = dir.join("post_admit.zstsup01");
+    fs::copy(seg_path, &post_path)?;
+    let post_reader = SettledSupplementSegmentReader::open(
+        &post_path,
+        seg_id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    flip_byte_at(&post_path, u64::try_from(HEADER_LEN + 8)?)?;
+    assert!(matches!(
+        post_reader.read_block(target_height),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+    let shielded_frame = shielded_reader.read_projected_range(
+        BlockHeightRange::inclusive(target_height, target_height),
+        HeightOrder::Ascending,
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+    )?[0]
+        .payload();
+    assert!(matches!(
+        post_reader.has_transparent_at(target_height),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        post_reader.splice_block_wire(
+            target_height,
+            &shielded_frame,
+            CompactBlockSpliceSelection::DEFAULT_SHIELDED,
+        ),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        post_reader.reconstruct_block(target_height, &shielded_frame),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
 #[test]
 fn tamper_header_indexes_chunk_trailer_and_post_admission_sticky_invalid() -> TestOutcome {
     let dir = TempDir::new()?;
@@ -1495,13 +1544,15 @@ fn tamper_header_indexes_chunk_trailer_and_post_admission_sticky_invalid() -> Te
             chunk_blocks: 3,
         },
     )?;
-
+    let raw_bytes = fs::read(&seg_path)?;
+    let raw_header = SegmentHeader::decode_unchecked(raw_bytes[..HEADER_LEN].try_into()?)?;
     for offset in [
         0_u64,
-        160_u64,
-        u64::try_from(fs::read(&seg_path)?.len() - 1)?,
+        raw_header.chunk_index_offset,
+        raw_header.row_index_offset,
+        u64::try_from(raw_bytes.len() - 1)?,
     ] {
-        let tampered_path = dir.path().join(format!("tamper_{offset}.zstsup01"));
+        let tampered_path = dir.path().join(format!("tamper_idx_{offset}.zstsup01"));
         fs::copy(&seg_path, &tampered_path)?;
         flip_byte_at(&tampered_path, offset)?;
         assert!(
@@ -1514,42 +1565,43 @@ fn tamper_header_indexes_chunk_trailer_and_post_admission_sticky_invalid() -> Te
         );
     }
 
-    if !reader.kernel_verified() {
-        let post_path = dir.path().join("post_admit.zstsup01");
-        fs::copy(&seg_path, &post_path)?;
-        let post_reader = SettledSupplementSegmentReader::open(
-            &post_path,
+    let bad_chunk_path = dir.path().join("tamper_chunk_160.zstsup01");
+    fs::copy(&seg_path, &bad_chunk_path)?;
+    flip_byte_at(&bad_chunk_path, 160)?;
+    assert!(
+        SettledSupplementSegmentReader::open(
+            &bad_chunk_path,
             &seg_id,
-            SettledSupplementSegmentOpenOptions::default(),
+            SettledSupplementSegmentOpenOptions {
+                require_fs_verity: false,
+                verify_full_payload: true,
+            },
+        )
+        .is_err()
+    );
+    let target_height = BlockHeight::new(600);
+    let cold_chunk_reader = SettledSupplementSegmentReader::open(
+        &bad_chunk_path,
+        &seg_id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    assert!(matches!(
+        cold_chunk_reader.read_block(target_height),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        cold_chunk_reader.has_transparent_at(target_height),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+
+    if !reader.kernel_verified() {
+        assert_post_admit_chunk_tamper_sticky(
+            &seg_path,
+            dir.path(),
+            &seg_id,
+            &shielded_reader,
+            target_height,
         )?;
-        flip_byte_at(&post_path, u64::try_from(HEADER_LEN + 8)?)?;
-        let target_height = BlockHeight::new(600);
-        assert!(matches!(
-            post_reader.read_block(target_height),
-            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
-        ));
-        let shielded_frame = shielded_reader.read_projected_range(
-            BlockHeightRange::inclusive(target_height, target_height),
-            HeightOrder::Ascending,
-            ShieldedProjectionSelection::DEFAULT_SHIELDED,
-        )?[0]
-            .payload();
-        assert!(matches!(
-            post_reader.has_transparent_at(target_height),
-            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
-        ));
-        assert!(matches!(
-            post_reader.splice_block_wire(
-                target_height,
-                &shielded_frame,
-                CompactBlockSpliceSelection::DEFAULT_SHIELDED,
-            ),
-            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
-        ));
-        assert!(matches!(
-            post_reader.reconstruct_block(target_height, &shielded_frame),
-            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
-        ));
     }
     Ok(())
 }
@@ -1573,7 +1625,7 @@ fn build_forged_interior_segment(
         16,
     )?;
 
-    let header = SegmentHeader::decode(bytes[..HEADER_LEN].try_into()?)?;
+    let header = SegmentHeader::decode_unchecked(bytes[..HEADER_LEN].try_into()?)?;
     let row_off = usize::try_from(header.row_index_offset)?;
     let row0_raw =
         DecodedRowIndexEntry::decode(bytes[row_off..row_off + ROW_INDEX_ENTRY_LEN].try_into()?)?;
@@ -1594,7 +1646,11 @@ fn build_forged_interior_segment(
     let body_end = bytes.len() - TRAILER_LEN;
     let new_trailer: [u8; 32] = Sha256::digest(&bytes[..body_end]).into();
     bytes[body_end..].copy_from_slice(&new_trailer);
+    let mut idx_digest = Sha256::new();
+    idx_digest.update(&bytes[..HEADER_LEN]);
+    idx_digest.update(&bytes[chunk_off..]);
     id.sha256 = new_trailer;
+    id.index_sha256 = idx_digest.finalize().into();
     Ok((bytes, id))
 }
 
@@ -1776,6 +1832,7 @@ fn open_respects_require_fs_verity_flag() -> TestOutcome {
         &id,
         SettledSupplementSegmentOpenOptions {
             require_fs_verity: true,
+            ..SettledSupplementSegmentOpenOptions::default()
         },
     );
     if reader.kernel_verified() {
@@ -1791,42 +1848,57 @@ fn open_respects_require_fs_verity_flag() -> TestOutcome {
 
 #[test]
 fn admit_protected_rejects_mismatched_trailer_pin() -> TestOutcome {
-    let header = synthetic_header(16, 128);
-    let chunks = [synthetic_chunk(128, 128)];
-    let rows = [synthetic_row(128)];
-    let tables = SegmentTables {
-        chunks: &chunks,
-        rows: &rows,
+    let block = empty_block(10);
+    let record = BlockSupplementRecord {
+        transparent_transactions: Vec::new(),
+        canonical_metadata: None,
     };
-    let mut expected = SupplementSegmentIdentity::span(
-        Network::ZcashMainnet,
-        1,
-        BlockHeight::new(10),
-        BlockId::new(BlockHeight::new(10), det_block_hash(10)),
-    );
-    expected.sha256 = [0xAA; 32];
-    admit_protected(
-        &header,
-        tables,
-        PortablePin {
-            expected: &expected,
-            trailer: &[0xAA; 32],
-        },
+    let (bytes, expected) = build_synthetic_segment_bytes(
+        10,
+        &[(block, record)],
+        SupplementCompressionCodec::None,
+        16,
     )?;
+    let header_bytes: &[u8; HEADER_LEN] = bytes[..HEADER_LEN].try_into()?;
+    let header = SegmentHeader::decode_unchecked(header_bytes)?;
+    let idx_start = usize::try_from(header.chunk_index_offset)?;
+    let idx_and_trailer = &bytes[idx_start..];
+    let total_len = u64::try_from(bytes.len())?;
 
-    let mismatch = admit_protected(
-        &header,
-        SegmentTables {
-            chunks: &chunks,
-            rows: &rows,
-        },
-        PortablePin {
-            expected: &expected,
-            trailer: &[0xBB; 32],
-        },
+    assert!(
+        SettledSupplementSegmentIndex::decode_index(
+            header_bytes,
+            idx_and_trailer,
+            &expected,
+            total_len,
+            true,
+        )
+        .is_ok()
     );
+
+    let mut wrong_trailer = expected;
+    wrong_trailer.sha256[0] ^= 0xFF;
     assert!(matches!(
-        mismatch,
+        SettledSupplementSegmentIndex::decode_index(
+            header_bytes,
+            idx_and_trailer,
+            &wrong_trailer,
+            total_len,
+            true,
+        ),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+
+    let mut wrong_idx_pin = expected;
+    wrong_idx_pin.index_sha256[0] ^= 0xFF;
+    assert!(matches!(
+        SettledSupplementSegmentIndex::decode_index(
+            header_bytes,
+            idx_and_trailer,
+            &wrong_idx_pin,
+            total_len,
+            true,
+        ),
         Err(SettledSupplementSegmentError::PayloadIntegrity(_))
     ));
     Ok(())
@@ -1842,13 +1914,17 @@ fn indexed_state_mark_valid_preserves_sticky_invalid() {
         VALIDATION_INVALID
     );
 
-    let row = synthetic_row(64);
-    row.mark_invalid();
-    row.mark_valid();
-    assert_eq!(
-        row.validation_state.load(Ordering::Acquire),
-        VALIDATION_INVALID
-    );
+    let mut row_entry = synthetic_row(64);
+    row_entry.row_flags = 0x05;
+    let valid_row = CompactSupplementRow::from_entry(&row_entry);
+    valid_row.mark_valid();
+    assert_eq!(valid_row.row_flags(), 0x05);
+
+    let invalid_row = CompactSupplementRow::from_entry(&row_entry);
+    invalid_row.mark_invalid();
+    invalid_row.mark_valid();
+    assert_eq!(invalid_row.validation_state(), VALIDATION_INVALID);
+    assert_eq!(invalid_row.row_flags(), 0x05);
 }
 
 fn flip_byte_at(path: &Path, offset: u64) -> TestOutcome {
@@ -2005,37 +2081,18 @@ fn admit_portable_rejects_interleaved_row_flag_mutation_before_hash() -> TestOut
     )?;
 
     let clean_bytes = fs::read(&seg_path)?;
-    let mut header_bytes = [0_u8; HEADER_LEN];
-    header_bytes.copy_from_slice(&clean_bytes[..HEADER_LEN]);
-    let header = SegmentHeader::decode(&header_bytes)?;
-    let row0_flag_off = usize::try_from(header.row_index_offset)? + 76;
-    let mut mutated_bytes = clean_bytes.clone();
-    mutated_bytes[row0_flag_off] ^= 0x01;
-    let staged_path = dir.path().join("toctou.zstsup01");
-    fs::write(&staged_path, &mutated_bytes)?;
-
-    let mutated_file = File::open(&staged_path)?;
-    let decoded = read_indexes_and_trailer(&mutated_file, &header)?;
-    drop(mutated_file);
-
-    fs::write(&staged_path, &clean_bytes)?;
-    let restored_file = File::open(&staged_path)?;
-    let outcome = admit_portable(
-        &restored_file,
-        &header,
-        SegmentTables {
-            chunks: &decoded.chunks,
-            rows: &decoded.rows,
-        },
-        AdmittedHeaderAndIndexBytes {
-            header: &header_bytes,
-            raw_chunks: &decoded.raw_chunks,
-            raw_rows: &decoded.raw_rows,
-        },
-        PortablePin {
-            expected: &seg_id,
-            trailer: &decoded.trailer,
-        },
+    let header_bytes: &[u8; HEADER_LEN] = clean_bytes[..HEADER_LEN].try_into()?;
+    let header = SegmentHeader::decode_unchecked(header_bytes)?;
+    let chunk_off = usize::try_from(header.chunk_index_offset)?;
+    let row0_flag_rel = usize::try_from(header.row_index_offset - header.chunk_index_offset)? + 76;
+    let mut mutated_idx = clean_bytes[chunk_off..].to_vec();
+    mutated_idx[row0_flag_rel] ^= 0x01;
+    let outcome = SettledSupplementSegmentIndex::decode_index(
+        header_bytes,
+        &mutated_idx,
+        &seg_id,
+        u64::try_from(clean_bytes.len())?,
+        false,
     );
     assert!(matches!(
         outcome,
@@ -3178,16 +3235,17 @@ fn near_limit_incompressible_record_roundtrips_with_single_block_zstd_chunk() ->
 
     let file = File::open(&seg_path)?;
     let mut header_bytes = [0_u8; HEADER_LEN];
-    file.take(u64::try_from(HEADER_LEN)?)
-        .read_exact(&mut header_bytes)?;
-    let header = SegmentHeader::decode(&header_bytes)?;
-    let file = File::open(&seg_path)?;
-    let decoded = read_indexes_and_trailer(&file, &header)?;
-    assert_eq!(decoded.chunks.len(), 1);
-    assert_eq!(decoded.chunks[0].uncompressed_len, max_chunk_bytes(1)?);
-    assert!(decoded.chunks[0].compressed_len > max_chunk_bytes(1)?);
+    file.read_exact_at(0, &mut header_bytes)?;
+    let header = SegmentHeader::decode_unchecked(&header_bytes)?;
+    let idx_range = header.indexes_and_trailer_range()?;
+    let idx_bytes = file.read_vec_at(idx_range.offset, idx_range.len)?;
+    let decoded_chunk =
+        DecodedChunkIndexEntry::decode(idx_bytes[..CHUNK_INDEX_ENTRY_LEN].try_into()?)?;
+    assert_eq!(header.chunk_count()?, 1);
+    assert_eq!(decoded_chunk.uncompressed_len, max_chunk_bytes(1)?);
+    assert!(decoded_chunk.compressed_len > max_chunk_bytes(1)?);
     assert!(
-        decoded.chunks[0].compressed_len
+        decoded_chunk.compressed_len
             <= max_compressed_chunk_bytes(1, SupplementCompressionCodec::Zstd)?
     );
 
@@ -3369,5 +3427,323 @@ fn tag2_zip317_logical_actions_uses_serialized_output_sizes_and_omits_unknown_vi
         SettledSupplementSegmentOpenOptions::default(),
     )?;
     assert_eq!(explicit_reader.read_canonical_metadata(height)?, Some(meta));
+    Ok(())
+}
+
+struct CountingByteSource {
+    bytes: Bytes,
+    reads: Mutex<Vec<ByteRange>>,
+}
+
+impl CountingByteSource {
+    fn new(bytes: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: Bytes::from(bytes),
+            reads: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn take_reads(&self) -> Vec<ByteRange> {
+        std::mem::take(&mut *self.reads.lock())
+    }
+}
+
+impl PositionalByteSource for CountingByteSource {
+    fn total_len(&self) -> io::Result<u64> {
+        self.bytes.total_len()
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.reads.lock().push(ByteRange::new(offset, buf.len()));
+        self.bytes.read_exact_at(offset, buf)
+    }
+
+    fn read_vec_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.reads.lock().push(ByteRange::new(offset, len));
+        self.bytes.read_vec_at(offset, len)
+    }
+}
+
+#[test]
+fn cold_open_source_reads_header_and_indexes_only_without_touching_chunks() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = build_rich_corpus(800)?;
+    let (seg_path, _shielded, seg_id, _reader) = write_paired_segments(
+        dir.path(),
+        &blocks,
+        true,
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    let raw = fs::read(&seg_path)?;
+    let portable_id = SupplementSegmentIdentity {
+        fs_verity_sha256: None,
+        ..seg_id
+    };
+    let header_bytes: &[u8; HEADER_LEN] = raw[..HEADER_LEN].try_into()?;
+    let header = SegmentHeader::decode(header_bytes, &portable_id, u64::try_from(raw.len())?)?;
+    let expected_idx_range = header.indexes_and_trailer_range()?;
+
+    let source = CountingByteSource::new(raw.clone());
+    assert!(matches!(
+        SettledSupplementSegmentReader::open_source(
+            Arc::clone(&source),
+            &portable_id,
+            SettledSupplementSegmentOpenOptions {
+                require_fs_verity: true,
+                verify_full_payload: false,
+            },
+        ),
+        Err(SettledSupplementSegmentError::FsVerityRequired)
+    ));
+    assert_eq!(source.take_reads(), Vec::new());
+
+    let reader = SettledSupplementSegmentReader::open_source(
+        Arc::clone(&source),
+        &portable_id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    let reads = source.take_reads();
+    assert_eq!(
+        reads,
+        vec![ByteRange::new(0, HEADER_LEN), expected_idx_range]
+    );
+    assert_eq!(reader.block_count(), blocks.len());
+
+    let full_source = CountingByteSource::new(raw);
+    let _verified = SettledSupplementSegmentReader::open_source(
+        Arc::clone(&full_source),
+        &portable_id,
+        SettledSupplementSegmentOpenOptions {
+            require_fs_verity: false,
+            verify_full_payload: true,
+        },
+    )?;
+    let full_reads = full_source.take_reads();
+    let idx_reads = full_reads
+        .iter()
+        .filter(|span| **span == expected_idx_range)
+        .count();
+    assert_eq!(
+        idx_reads, 1,
+        "verify_full_payload must reuse initial index read"
+    );
+    Ok(())
+}
+
+fn build_mixed_chunk_pair(start_height: u32) -> TestOutcome<Vec<CompactBlockArtifact>> {
+    let mut blocks = Vec::with_capacity(32);
+    for idx in 0..32_u32 {
+        let height = start_height + idx;
+        let block = if idx < 16 {
+            empty_block(height)
+        } else {
+            mixed_interleaved_block(height)?
+        };
+        blocks.push(block);
+    }
+    Ok(blocks)
+}
+
+fn assert_sans_io_block_hashes(
+    index: &SettledSupplementSegmentIndex,
+    raw: &[u8],
+    blocks: &[CompactBlockArtifact],
+) -> TestOutcome {
+    for block in blocks {
+        let hash_range = index.block_hash_byte_range(block.height())?;
+        let start = usize::try_from(hash_range.offset)?;
+        let decoded_hash = index.decode_block_hash_from_slice(
+            block.height(),
+            SupplementRowIndexSlice::new(hash_range.offset, &raw[start..start + hash_range.len]),
+        )?;
+        assert_eq!(decoded_hash, block.block_hash());
+    }
+    Ok(())
+}
+
+#[test]
+fn sans_io_byte_range_roundtrip_and_splice_plan_skips_shielded_only_chunks() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = build_mixed_chunk_pair(2_000)?;
+    let (seg_path, _shielded, seg_id, _reader) = write_paired_segments(
+        dir.path(),
+        &blocks,
+        false,
+        SettledSupplementSegmentWriteOptions {
+            codec: SupplementCompressionCodec::Zstd,
+            chunk_blocks: 16,
+        },
+    )?;
+    let raw = fs::read(&seg_path)?;
+    let header_bytes: &[u8; HEADER_LEN] = raw[..HEADER_LEN].try_into()?;
+    let total_len = u64::try_from(raw.len())?;
+    let header = SegmentHeader::decode(header_bytes, &seg_id, total_len)?;
+    let idx_range = header.indexes_and_trailer_range()?;
+    let idx_start = usize::try_from(idx_range.offset)?;
+    let index = SettledSupplementSegmentIndex::decode_index(
+        header_bytes,
+        &raw[idx_start..idx_start + idx_range.len],
+        &seg_id,
+        total_len,
+        false,
+    )?;
+    assert_sans_io_block_hashes(&index, &raw, &blocks)?;
+
+    let range_plan = index.plan_block_range(BlockHeight::new(2_000), BlockHeight::new(2_031))?;
+    let row_slice_range = range_plan.row_index_range();
+    let row_slice_start = usize::try_from(row_slice_range.offset)?;
+    let verified_rows = index.authenticate_row_index_slice(SupplementRowIndexSlice::new(
+        row_slice_range.offset,
+        &raw[row_slice_start..row_slice_start + row_slice_range.len],
+    ))?;
+    assert_eq!(range_plan.chunks().len(), 2);
+    let mut decoded_records = Vec::new();
+    for step in range_plan.chunks() {
+        let compressed_span = step.compressed_range();
+        let start = usize::try_from(compressed_span.offset)?;
+        decoded_records.extend(index.verify_and_decode_chunk(
+            step,
+            &raw[start..start + compressed_span.len],
+            verified_rows,
+        )?);
+    }
+    assert_eq!(decoded_records.len(), 32);
+    assert!(
+        decoded_records[..16]
+            .iter()
+            .all(|rec| rec.transparent_transactions.is_empty())
+    );
+    assert!(
+        decoded_records[16..]
+            .iter()
+            .all(|rec| !rec.transparent_transactions.is_empty())
+    );
+
+    let full_splice = index.plan_splice_range(
+        BlockHeight::new(2_000),
+        BlockHeight::new(2_031),
+        CompactBlockSpliceSelection::FULL_BLOCK,
+    )?;
+    assert_eq!(full_splice.chunks()[0].compressed_range(), None);
+    assert!(full_splice.chunks()[1].compressed_range().is_some());
+
+    let shielded_splice = index.plan_splice_range(
+        BlockHeight::new(2_000),
+        BlockHeight::new(2_031),
+        CompactBlockSpliceSelection::DEFAULT_SHIELDED,
+    )?;
+    assert!(
+        shielded_splice
+            .chunks()
+            .iter()
+            .all(|step| step.compressed_range().is_none())
+    );
+    Ok(())
+}
+
+#[test]
+fn compact_4096_block_heap_metadata_budget() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("heap-4096.zstsup01");
+    let start = BlockHeight::new(100);
+    let end = BlockId::new(BlockHeight::new(4_195), det_block_hash(4_195));
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &path,
+        SupplementSegmentIdentity::span(Network::ZcashMainnet, 1, start, end),
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    for h in 100..=4_195_u32 {
+        let block = if h % 8 == 0 {
+            mixed_interleaved_block(h)?
+        } else {
+            empty_block(h)
+        };
+        writer.push(&block, None)?;
+    }
+    let identity = writer.finish()?;
+    let raw = fs::read(&path)?;
+    let header_bytes: &[u8; HEADER_LEN] = raw[..HEADER_LEN].try_into()?;
+    let total_len = u64::try_from(raw.len())?;
+    let header = SegmentHeader::decode(header_bytes, &identity, total_len)?;
+    let idx_start = usize::try_from(header.chunk_index_offset)?;
+
+    let kernel_index = SettledSupplementSegmentIndex::decode_index(
+        header_bytes,
+        &raw[idx_start..],
+        &identity,
+        total_len,
+        true,
+    )?;
+    assert_eq!(kernel_index.heap_metadata_bytes(), 4_096 * 9 / 2);
+
+    let portable_index = SettledSupplementSegmentIndex::decode_index(
+        header_bytes,
+        &raw[idx_start..],
+        &identity,
+        total_len,
+        false,
+    )?;
+    let expected_pages = 4_096_usize.div_ceil(INDEX_PAGE_ROWS);
+    assert_eq!(
+        portable_index.heap_metadata_bytes(),
+        4_096 * 9 / 2 + expected_pages * 32
+    );
+    assert!(portable_index.heap_metadata_bytes() <= 4_096 * 5);
+    Ok(())
+}
+
+#[test]
+fn portable_post_admission_row_index_page_tamper_fails_closed_and_latches_invalid() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = build_rich_corpus(850)?;
+    let (seg_path, _shielded, seg_id, _) = write_paired_segments(
+        dir.path(),
+        &blocks,
+        false,
+        SettledSupplementSegmentWriteOptions::default(),
+    )?;
+    let copy_path = dir.path().join("portable-idx-tamper.zstsup01");
+    let original = fs::read(&seg_path)?;
+    fs::write(&copy_path, &original)?;
+    let portable_id = SupplementSegmentIdentity {
+        fs_verity_sha256: None,
+        ..seg_id
+    };
+    let reader = SettledSupplementSegmentReader::open(
+        &copy_path,
+        &portable_id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    let tamper_pos = usize::try_from(reader.index().header().row_index_offset)? + 10;
+    let mut flip_file = OpenOptions::new().write(true).open(&copy_path)?;
+    flip_file.seek(SeekFrom::Start(u64::try_from(tamper_pos)?))?;
+    flip_file.write_all(&[original[tamper_pos] ^ 0x55])?;
+    flip_file.sync_all()?;
+    drop(flip_file);
+
+    let target = BlockHeight::new(850);
+    assert!(matches!(
+        reader.block_hash_at(target),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+
+    let mut restore_file = OpenOptions::new().write(true).open(&copy_path)?;
+    restore_file.seek(SeekFrom::Start(u64::try_from(tamper_pos)?))?;
+    restore_file.write_all(&[original[tamper_pos]])?;
+    restore_file.sync_all()?;
+    drop(restore_file);
+
+    assert!(matches!(
+        reader.block_hash_at(target),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader.has_transparent_at(target),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader.read_block(target),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
     Ok(())
 }

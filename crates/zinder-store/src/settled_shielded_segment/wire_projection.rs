@@ -131,17 +131,15 @@ pub(super) fn encode_default_shielded_block_with_options(
     })
 }
 
-/// Appends one empty nullifier-only gRPC-framed `CompactBlock` straight from
-/// the 48-byte in-memory row index without reading `Slab 0`.
-pub(super) fn synthesize_empty_nullifier_block(
+/// Appends one empty nullifier-only protobuf `CompactBlock` payload (without
+/// gRPC framing) straight from row metadata without reading `Slab 0`.
+pub(super) fn synthesize_empty_nullifier_payload(
     height: BlockHeight,
     block_hash_wire: &[u8; 32],
     prev_hash_wire: &[u8; 32],
     block_time: u32,
     out: &mut Vec<u8>,
-) -> Result<(), SettledShieldedSegmentError> {
-    let frame_start = out.len();
-    out.resize(frame_start + FRAME_PREFIX_LEN, 0);
+) {
     if height.value() != 0 {
         encode_key(COMPACT_BLOCK_TAG_HEIGHT, WireType::Varint, out);
         encode_varint(u64::from(height.value()), out);
@@ -155,6 +153,20 @@ pub(super) fn synthesize_empty_nullifier_block(
         encode_varint(u64::from(block_time), out);
     }
     out.extend_from_slice(&EMPTY_CHAIN_METADATA_WIRE);
+}
+
+/// Appends one empty nullifier-only gRPC-framed `CompactBlock` straight from
+/// row metadata without reading `Slab 0`.
+pub(super) fn synthesize_empty_nullifier_block(
+    height: BlockHeight,
+    block_hash_wire: &[u8; 32],
+    prev_hash_wire: &[u8; 32],
+    block_time: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), SettledShieldedSegmentError> {
+    let frame_start = out.len();
+    out.resize(frame_start + FRAME_PREFIX_LEN, 0);
+    synthesize_empty_nullifier_payload(height, block_hash_wire, prev_hash_wire, block_time, out);
     patch_frame_prefix(out, frame_start)
 }
 

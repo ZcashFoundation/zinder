@@ -13,22 +13,23 @@ use zinder_core::{
 };
 use zstd::bulk::Compressor;
 
+use crate::segment_verity;
+
 use super::{
     SETTLED_SUPPLEMENT_DEFAULT_CHUNK_BLOCKS, SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS,
     SettledSupplementSegmentError, SettledSupplementSegmentOpenOptions,
-    SettledSupplementSegmentReader, SupplementCompressionCodec, SupplementSegmentIdentity,
+    SettledSupplementSegmentReader, SupplementCompressionCodec, SupplementSegmentHeader,
+    SupplementSegmentIdentity,
     format::{
         CHUNK_INDEX_ENTRY_LEN, DecodedChunkIndexEntry, DecodedRowIndexEntry, HEADER_LEN,
-        ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader, ZSTD_COMPRESSION_LEVEL,
-        check_contiguous_block, max_chunk_bytes, max_compressed_chunk_bytes,
-        validate_block_payload_limit,
+        ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, ZSTD_COMPRESSION_LEVEL, check_contiguous_block,
+        max_chunk_bytes, max_compressed_chunk_bytes, validate_block_payload_limit,
     },
     parent_directory,
     section::{
         BlockEnvelopeIdentity, BlockSupplementRecord, CanonicalBlockSupplement,
         encode_block_record, transparent_supplement_from_compact,
     },
-    verity,
 };
 
 /// Tuning options controlling how a new `ZSTSUP01` segment is encoded.
@@ -69,6 +70,11 @@ pub struct SettledSupplementSegmentWriter {
 
 impl SettledSupplementSegmentWriter {
     /// Creates a staged writer targeting `path` for one contiguous settled span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError`] on invalid `expected` intervals,
+    /// unsupported `chunk_blocks`, or temp-file I/O failure.
     pub fn create(
         path: impl AsRef<Path>,
         expected: SupplementSegmentIdentity,
@@ -126,6 +132,11 @@ impl SettledSupplementSegmentWriter {
 
     /// Appends the next contiguous block derived from `block` and optional
     /// [`CanonicalBlockFacts`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError`] if `canonical_facts` disagrees
+    /// with `block`, linkage fails, payload size exceeds `16 MiB`, or writing fails.
     pub fn push(
         &mut self,
         block: &CompactBlockArtifact,
@@ -151,6 +162,11 @@ impl SettledSupplementSegmentWriter {
 
     /// Appends the next contiguous block using an explicit
     /// [`BlockSupplementRecord`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError`] on writer poisoning, linkage
+    /// errors, payload overflow, or I/O/compression failure.
     pub fn push_record(
         &mut self,
         block_id: BlockId,
@@ -219,7 +235,13 @@ impl SettledSupplementSegmentWriter {
         Ok(())
     }
 
-    /// Finalizes indexes, SHA-256 trailer, `fs-verity`, and persists to target.
+    /// Finalizes indexes, SHA-256 trailer, `index_sha256` pin, `fs-verity`,
+    /// and atomic target placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError`] on incomplete spans, hashing,
+    /// `fs-verity`, or atomic file persistence failures.
     pub fn finish(mut self) -> Result<SupplementSegmentIdentity, SettledSupplementSegmentError> {
         if self.staged_file.is_none() {
             return Err(writer_poisoned());
@@ -244,7 +266,7 @@ impl SettledSupplementSegmentWriter {
         }
 
         let mut staged_file = self.staged_file.take().ok_or_else(writer_poisoned)?;
-        let trailer_offset = self.write_indexes_and_header(
+        let (trailer_offset, header_bytes) = self.write_indexes_and_header(
             staged_file.as_file_mut(),
             block_count,
             first_prev_hash_wire,
@@ -253,14 +275,21 @@ impl SettledSupplementSegmentWriter {
         write_all_at(staged_file.as_file(), &trailer, trailer_offset)?;
         staged_file.as_file().sync_all()?;
 
-        let readonly_staged = verity::reopen_staged(&staged_file)?;
+        let index_sha256 =
+            compute_index_sha256(&header_bytes, &self.chunk_index, &self.row_index, &trailer);
+        let readonly_staged = segment_verity::reopen_staged(&staged_file, "supplement segment")?;
         let (writable_file, temp_path) = staged_file.into_parts();
         drop(writable_file);
-        verity::protect_new_segment(&readonly_staged, Some(verity_digest))?;
+        segment_verity::protect_new_segment(
+            &readonly_staged,
+            Some(verity_digest),
+            "supplement segment",
+        )?;
         drop(readonly_staged);
 
         let identity = SupplementSegmentIdentity {
             sha256: trailer,
+            index_sha256,
             fs_verity_sha256: Some(verity_digest),
             ..self.identity
         };
@@ -337,7 +366,7 @@ impl SettledSupplementSegmentWriter {
         file: &mut File,
         block_count: u32,
         first_prev_hash_wire: [u8; 32],
-    ) -> Result<u64, SettledSupplementSegmentError> {
+    ) -> Result<(u64, [u8; HEADER_LEN]), SettledSupplementSegmentError> {
         let data_offset = HEADER_LEN as u64;
         let chunk_index_offset = data_offset.checked_add(self.data_cursor).ok_or_else(|| {
             SettledSupplementSegmentError::InvalidFormat("chunk index offset overflow".to_owned())
@@ -370,7 +399,7 @@ impl SettledSupplementSegmentWriter {
             file.write_all(&entry.encode())?;
         }
 
-        let header = SegmentHeader {
+        let header_bytes = SupplementSegmentHeader {
             network_tag: self.identity.network.id(),
             artifact_schema_version: self.identity.artifact_schema_version,
             segment_flags: 0,
@@ -383,12 +412,31 @@ impl SettledSupplementSegmentWriter {
             data_offset,
             chunk_index_offset,
             row_index_offset,
-        };
+        }
+        .encode();
         file.flush()?;
-        write_all_at(file, &header.encode(), 0)?;
+        write_all_at(file, &header_bytes, 0)?;
         file.sync_all()?;
-        Ok(trailer_offset)
+        Ok((trailer_offset, header_bytes))
     }
+}
+
+fn compute_index_sha256(
+    header_bytes: &[u8; HEADER_LEN],
+    chunk_index: &[DecodedChunkIndexEntry],
+    row_index: &[DecodedRowIndexEntry],
+    trailer: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(header_bytes);
+    for chunk in chunk_index {
+        digest.update(chunk.encode());
+    }
+    for row in row_index {
+        digest.update(row.encode());
+    }
+    digest.update(trailer);
+    digest.finalize().into()
 }
 
 #[cfg(test)]

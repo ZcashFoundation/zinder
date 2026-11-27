@@ -1,10 +1,25 @@
-//! Regular-file opening and Linux `fs-verity` protection helpers for `ZSTSUP01`.
+//! Shared regular-file opening and Linux `fs-verity` protection helpers
+//! for immutable settled segment files.
 
 use std::{fs::File, io, path::Path};
 
-use super::SettledSupplementSegmentError;
+/// Error returned while enabling or verifying `fs-verity` on a settled segment.
+#[derive(Debug)]
+pub(crate) enum SegmentVerityError {
+    /// Underlying filesystem or ioctl I/O error.
+    Io(io::Error),
+    /// Measured `fs-verity` digest was absent or mismatched the pinned digest.
+    DigestMismatch(String),
+}
 
-pub(super) fn open_regular_file(path: &Path) -> io::Result<File> {
+impl From<io::Error> for SegmentVerityError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Opens an existing non-directory file read-only without blocking and verifies it is a regular file.
+pub(crate) fn open_regular_file(path: &Path, label: &'static str) -> io::Result<File> {
     #[cfg(unix)]
     let file = {
         use rustix::fs::{Mode, OFlags, open};
@@ -19,7 +34,7 @@ pub(super) fn open_regular_file(path: &Path) -> io::Result<File> {
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "expected a regular settled supplement segment file",
+            format!("expected a regular settled {label} file"),
         ));
     }
     Ok(file)
@@ -37,31 +52,41 @@ fn native_verity_filesystem(file: &File) -> io::Result<bool> {
     ))
 }
 
+/// Reopens a staged temporary file read-only and verifies its `(dev, ino)` identity matches.
 #[cfg(target_os = "linux")]
-pub(super) fn reopen_staged(staged: &tempfile::NamedTempFile) -> io::Result<File> {
+pub(crate) fn reopen_staged(
+    staged: &tempfile::NamedTempFile,
+    label: &'static str,
+) -> io::Result<File> {
     use std::os::unix::fs::MetadataExt as _;
-    let readonly = open_regular_file(staged.path())?;
+    let readonly = open_regular_file(staged.path(), label)?;
     let written = staged.as_file().metadata()?;
     let reopened = readonly.metadata()?;
     if (written.dev(), written.ino()) != (reopened.dev(), reopened.ino()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "staged supplement segment inode changed before fs-verity protection",
+            format!("staged {label} inode changed before fs-verity protection"),
         ));
     }
     Ok(readonly)
 }
 
+/// Reopens a staged temporary file read-only on non-Linux hosts.
 #[cfg(not(target_os = "linux"))]
-pub(super) fn reopen_staged(staged: &tempfile::NamedTempFile) -> io::Result<File> {
-    open_regular_file(staged.path())
+pub(crate) fn reopen_staged(
+    staged: &tempfile::NamedTempFile,
+    label: &'static str,
+) -> io::Result<File> {
+    open_regular_file(staged.path(), label)
 }
 
+/// Enables kernel `fs-verity` on `file` when supported and checks it against `expected`.
 #[cfg(target_os = "linux")]
-pub(super) fn protect_new_segment(
+pub(crate) fn protect_new_segment(
     file: &File,
     expected: Option<[u8; 32]>,
-) -> Result<(), SettledSupplementSegmentError> {
+    label: &'static str,
+) -> Result<(), SegmentVerityError> {
     use composefs_ioctls::fsverity::{EnableVerityError, fs_ioc_enable_verity};
     use rustix::io::Errno;
 
@@ -73,37 +98,40 @@ pub(super) fn protect_new_segment(
         Err(EnableVerityError::FilesystemNotSupported) => return Ok(()),
         Err(EnableVerityError::Io(source)) => match Errno::from_io_error(&source) {
             Some(Errno::NOPKG | Errno::INVAL) => return Ok(()),
-            Some(_) | None => return Err(SettledSupplementSegmentError::Io(source)),
+            Some(_) | None => return Err(SegmentVerityError::Io(source)),
         },
         Err(EnableVerityError::AlreadyEnabled) => {
-            return Err(SettledSupplementSegmentError::Io(Errno::EXIST.into()));
+            return Err(SegmentVerityError::Io(Errno::EXIST.into()));
         }
         Err(EnableVerityError::FileOpenedForWrite) => {
-            return Err(SettledSupplementSegmentError::Io(Errno::TXTBSY.into()));
+            return Err(SegmentVerityError::Io(Errno::TXTBSY.into()));
         }
         Err(EnableVerityError::SignatureVerificationFailed) => {
-            return Err(SettledSupplementSegmentError::Io(Errno::KEYREJECTED.into()));
+            return Err(SegmentVerityError::Io(Errno::KEYREJECTED.into()));
         }
     }
     if expected.is_none() || measure(file)? != expected {
-        return Err(SettledSupplementSegmentError::PayloadIntegrity(
-            "newly protected supplement segment fs-verity digest mismatch".to_owned(),
-        ));
+        return Err(SegmentVerityError::DigestMismatch(format!(
+            "newly protected {label} fs-verity digest mismatch"
+        )));
     }
     file.sync_all()?;
     Ok(())
 }
 
+/// No-op `fs-verity` enablement on non-Linux hosts.
 #[cfg(not(target_os = "linux"))]
-pub(super) fn protect_new_segment(
+pub(crate) fn protect_new_segment(
     _file: &File,
     _expected: Option<[u8; 32]>,
-) -> Result<(), SettledSupplementSegmentError> {
+    _label: &'static str,
+) -> Result<(), SegmentVerityError> {
     Ok(())
 }
 
+/// Measures the kernel `fs-verity` SHA-256 digest of `file` when active.
 #[cfg(target_os = "linux")]
-pub(super) fn measure(file: &File) -> io::Result<Option<[u8; 32]>> {
+pub(crate) fn measure(file: &File) -> io::Result<Option<[u8; 32]>> {
     use composefs_ioctls::fsverity::{MeasureVerityError, fs_ioc_measure_verity};
     use rustix::fs::{AtFlags, StatxAttributes, StatxFlags, statx};
 
@@ -130,22 +158,25 @@ pub(super) fn measure(file: &File) -> io::Result<Option<[u8; 32]>> {
         })
 }
 
+/// Returns `Ok(None)` for `fs-verity` measurement on non-Linux hosts.
 #[cfg(not(target_os = "linux"))]
-pub(super) fn measure(_file: &File) -> io::Result<Option<[u8; 32]>> {
+pub(crate) fn measure(_file: &File) -> io::Result<Option<[u8; 32]>> {
     Ok(None)
 }
 
-pub(super) fn check_pinned_verity(
+/// Checks an optional `measured` kernel `fs-verity` digest against an optional `expected` pin.
+pub(crate) fn check_pinned_verity(
     expected: Option<[u8; 32]>,
     measured: Option<[u8; 32]>,
-) -> Result<bool, SettledSupplementSegmentError> {
+    label: &'static str,
+) -> Result<bool, SegmentVerityError> {
     let Some(pin) = expected else {
         return Ok(false);
     };
     match measured {
-        Some(actual) if actual != pin => Err(SettledSupplementSegmentError::PayloadIntegrity(
-            "supplement segment fs-verity digest mismatch".to_owned(),
-        )),
+        Some(actual) if actual != pin => Err(SegmentVerityError::DigestMismatch(format!(
+            "{label} fs-verity digest mismatch"
+        ))),
         Some(_) => Ok(true),
         None => Ok(false),
     }

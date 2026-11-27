@@ -1,20 +1,35 @@
 //! Store-owned settled shielded history segment (`ZSHRNG02`).
 //!
-//! Each immutable segment covers one contiguous settled height interval with a
-//! single `Slab 0` of pre-encoded `DEFAULT_RANGE` lightwalletd `CompactBlock`
-//! frames (with 5-byte gRPC length prefixes), an `80`-byte per-block index
-//! carrying `pool_presence_bitmap` and payload SHA-256 digests, and a 32-byte
-//! whole-body SHA-256 trailer compatible with Linux `fs-verity`.
+//! Each immutable segment (default slab cap `256 MiB` for single-object SQL
+//! `BYTEA STORAGE EXTERNAL` and object-storage compatibility) covers one
+//! contiguous settled height interval with:
 //!
-//! Range queries filter and redact `Slab 0` frames via zero-allocation wire
-//! projection rather than storing a duplicate nullifier slab, and skip `Slab 0`
-//! reads entirely for empty or unmatched nullifier-range blocks.
+//! - `[0..128)`: Fixed big-endian `SegmentHeader` (`ZSHRNG02`, network tag,
+//!   `artifact_schema_version`, flags, `start_height`, `block_count`,
+//!   `first_prev_hash_wire`, `last_block_hash_wire`, `slab_offset`,
+//!   `index_offset`).
+//! - `[slab_offset..index_offset)`: `Slab 0` of pre-encoded `DEFAULT_RANGE`
+//!   lightwalletd `CompactBlock` frames prefixed by 5-byte gRPC headers.
+//! - `[index_offset..trailer_offset)`: `80`-byte per-block row index entries
+//!   (`block_hash_wire`, `payload_sha256`, `block_time`, `slab_rel_offset`,
+//!   `native_bytes`, `pool_presence_bitmap`, `row_flags`, `2` reserved zero
+//!   bytes).
+//! - `[trailer_offset..trailer_offset + 32)`: Whole-body SHA-256 trailer
+//!   compatible with Linux `fs-verity`.
+//!
+//! Cold admission validates `index_sha256 = SHA-256(header || raw_index || trailer)`
+//! in a single positioned read (`O(index)`), retaining only compact `12 B/block`
+//! in-memory rows (`+ 0.5 B/block` 64-row page digests when not backed by
+//! kernel `fs-verity`). Range planning separates sans-I/O `ByteRange`
+//! computation (`SettledShieldedSegmentIndex::plan_block_range`) from I/O,
+//! reads short rows (`< 32 KiB`) in `512 KiB` slabs, isolates rows `>= 32 KiB`,
+//! skips `Slab 0` for unmatched/empty `nullifiers_only` rows even when cold, and
+//! coalesces frames into `EncodedBlockBatcher` (`8 KiB` / `32 KiB`).
 
 mod format;
 mod reader;
 #[cfg(test)]
 mod tests;
-mod verity;
 mod wire_projection;
 mod writer;
 
@@ -23,7 +38,16 @@ use std::{io, path::Path};
 use thiserror::Error;
 use zinder_core::{BlockHeight, BlockId, Network};
 
-pub use reader::{SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader};
+pub use format::{
+    DEFAULT_MAX_SLAB_BYTES as DEFAULT_SETTLED_SHIELDED_SEGMENT_MAX_SLAB_BYTES,
+    ShieldedSegmentHeader,
+};
+pub use reader::{
+    BoundedShieldedRangePlan, SettledShieldedSegmentIndex, SettledShieldedSegmentOpenOptions,
+    SettledShieldedSegmentReader, ShieldedBatchReadRequest, ShieldedBoundedBatchReadRequest,
+    ShieldedFetchedSlab, ShieldedIndexSlice, ShieldedRangeByteBudget, ShieldedRangePlan,
+    ShieldedReadScratch, ShieldedReadStep, ShieldedSlabDecodeRequest, VerifiedShieldedIndexSlice,
+};
 pub use wire_projection::{
     is_passthrough_shielded_block_wire, project_shielded_block_wire,
     project_shielded_block_wire_with_scratch,
@@ -52,7 +76,7 @@ pub enum SettledShieldedSegmentError {
     /// Block heights or parent-hash chain linkage failed verification.
     #[error("settled shielded segment chain linkage error: {0}")]
     ChainLinkage(String),
-    /// Trailer, payload digest, `fs-verity` measurement, or wire payload check failed.
+    /// Trailer, index digest, payload digest, `fs-verity`, or wire payload check failed.
     #[error("settled shielded segment payload integrity error: {0}")]
     PayloadIntegrity(String),
     /// Single block payload exceeded [`SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES`].
@@ -86,6 +110,17 @@ pub enum SettledShieldedSegmentError {
         /// Segment last covered height.
         end: BlockHeight,
     },
+}
+
+impl From<crate::segment_verity::SegmentVerityError> for SettledShieldedSegmentError {
+    fn from(error: crate::segment_verity::SegmentVerityError) -> Self {
+        match error {
+            crate::segment_verity::SegmentVerityError::Io(source) => Self::Io(source),
+            crate::segment_verity::SegmentVerityError::DigestMismatch(reason) => {
+                Self::PayloadIntegrity(reason)
+            }
+        }
+    }
 }
 
 /// Per-block presence bits for shielded components recorded in `ZSHRNG02`.
@@ -172,6 +207,8 @@ pub struct ShieldedSegmentIdentity {
     pub end_block: BlockId,
     /// Trailing SHA-256 digest over all preceding segment bytes.
     pub sha256: [u8; 32],
+    /// SHA-256 digest over header bytes, raw row index bytes, and trailer digest (`O(index)` cold admission pin).
+    pub index_sha256: [u8; 32],
     /// Expected Linux `fs-verity` SHA-256 measurement, when known.
     pub fs_verity_sha256: Option<[u8; 32]>,
 }
@@ -191,11 +228,17 @@ impl ShieldedSegmentIdentity {
             start_height,
             end_block,
             sha256: [0; 32],
+            index_sha256: [0; 32],
             fs_verity_sha256: None,
         }
     }
 
     /// Computes the number of contiguous blocks covered by this segment interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError::ChainLinkage`] if the interval is
+    /// reversed or spans more than `u32::MAX` blocks.
     pub fn block_count(&self) -> Result<u32, SettledShieldedSegmentError> {
         let span = self
             .end_block
