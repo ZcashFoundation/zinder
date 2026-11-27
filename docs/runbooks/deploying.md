@@ -29,7 +29,7 @@ If you are carrying forward an existing pre-profile store built with `raw_blob_p
 | **Single-volume container (`ghcr.io/zcashfoundation/zinder`)** | Supported | Your PaaS attaches one persistent volume to one container (`zinder serve`), such as Railway. | [Deploying the single-volume container](deploying-single-volume.md) |
 | **Kubernetes (`StatefulSet`)** | Supported *(Single-host RWO)* | You run single-replica pods on a cluster with a `ReadWriteOnce` `PersistentVolumeClaim` (`deploy/kubernetes/statefulset.yaml`, `fsGroup: 10001`). | [Kubernetes StatefulSet](deploying-single-volume.md#kubernetes-statefulset) |
 | **Standalone `zinder` binary** | Supported | You supervise `zinder serve`, `zinder index`, or `zinder run <role>` natively via systemd without Docker. | [Run the release binary without Docker](deploying-on-a-vm.md#run-the-release-binaries-without-docker) |
-| **Stateless serverless (Cloud Run, AWS Lambda)** | Not supported *(Planned M3)* | You expect stateless scale-to-zero containers without attached RWO disks. | See [Cloud and serverless boundaries](#cloud-and-serverless-boundaries) below |
+| **Stateless serverless (Cloud Run, Cloudflare Containers)** | Not supported *(Planned M3)* | You expect stateless scale-to-zero containers without attached RWO disks. | See [Cloud and serverless boundaries](#cloud-and-serverless-boundaries) below |
 | **Public Foundation endpoints** | Supported | You want to evaluate or integrate a client without operating an indexer. | [Integration surfaces](../reference/integration-surfaces.md#endpoints) |
 
 <a id="cloud-and-serverless-boundaries"></a>
@@ -37,7 +37,7 @@ If you are carrying forward an existing pre-profile store built with `raw_blob_p
 ### Cloud and serverless boundaries
 
 - **Kubernetes (`StatefulSet` vs. horizontal `Deployment`):** The shipped [deploy/kubernetes/statefulset.yaml](../../deploy/kubernetes/statefulset.yaml) runs `replicas: 1` against a single `ReadWriteOnce` PVC mounted at `/var/lib/zinder` with `fsGroup: 10001`, so writer primaries and RocksDB secondaries share one local POSIX filesystem inside the pod. Scaling readers across multiple Kubernetes nodes with a shared `Deployment` is **not** supported on `rocksdb` ([ADR-0004](../adrs/0004-storage-and-deployment-topologies.md)).
-- **Stateless serverless (Google Cloud Run, AWS Lambda):** Neither single-volume RocksDB nor long-lived stateful sync streams fit request-scoped or diskless serverless runtimes today. Horizontal stateless readers (`Deployment`, Cloud Run, Lambda) wait on Milestone M3's PostgreSQL storage backend and externalized segment distribution ([ADR-0004](../adrs/0004-storage-and-deployment-topologies.md)).
+- **Stateless serverless (Google Cloud Run, Cloudflare Containers):** Neither single-volume RocksDB nor long-lived stateful sync streams fit request-scoped or diskless serverless runtimes today. Horizontal stateless readers (`Deployment`, Cloud Run, and Cloudflare Containers + Hyperdrive) wait on Milestone M3's self-contained PostgreSQL storage backend ([ADR-0004](../adrs/0004-storage-and-deployment-topologies.md)).
 
 <a id="what-you-need"></a>
 

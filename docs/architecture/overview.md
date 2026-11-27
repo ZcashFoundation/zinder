@@ -82,7 +82,7 @@ flowchart TD
     Disk --> Compose["Linux VM / Compose: zinder-index + zinder-serve --readers-only"]
     Disk --> PaaS["Single-Volume PaaS (Railway): zinder serve"]
     Disk --> K8s["Kubernetes StatefulSet (replicas: 1, ReadWriteOnce PVC)"]
-    Serverless["Stateless Serverless (Cloud Run / AWS Lambda)"] --> Boundary["Unsupported on RocksDB until M3 PostgreSQL ([ADR-0004])"]
+    Serverless["Stateless Serverless (Cloud Run / Cloudflare Containers)"] --> Boundary["Unsupported on RocksDB until M3 PostgreSQL ([ADR-0004])"]
 ```
 
 For deployment topologies and host sizing, see [service operations](service-operations.md), [deploy/README.md](../../deploy/README.md), and [deploying Zinder](../runbooks/deploying.md).

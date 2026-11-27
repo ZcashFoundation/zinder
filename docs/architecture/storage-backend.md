@@ -9,7 +9,9 @@ Every other process opens it read-only as a RocksDB secondary on the same
 filesystem. Stores never upgrade themselves in place: a store whose identity
 or layout does not match the binary is refused, and you rebuild it.
 [ADR-0004](../adrs/0004-storage-and-deployment-topologies.md) records why
-Zinder deploys on one host.
+Zinder deploys on one host with `rocksdb`, and defines the decided self-contained
+`postgres` canonical (`canonical_settled_segment`), active mempool (`mempool_active_entry`),
+and optional R2 settled-segment cache boundaries ahead of M3.
 [ADR-0003](../adrs/0003-epoch-bound-reads-and-storage-roles.md) records the
 epoch-bound read and secondary model.
 
