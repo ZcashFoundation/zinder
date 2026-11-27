@@ -9,6 +9,8 @@ pub(crate) mod store_access;
 #[cfg(test)]
 mod tests;
 
+pub use sealer::DEFAULT_SETTLED_SEGMENT_BLOCKS;
+
 use std::{
     fs::{self, File},
     io::{self, Read as _, Write as _},

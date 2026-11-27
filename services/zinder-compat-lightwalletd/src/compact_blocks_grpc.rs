@@ -4,7 +4,10 @@
 
 use std::{
     num::NonZeroU32,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -18,11 +21,11 @@ use zinder_query::{
     read_on_blocking_thread, status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
-use zinder_store::{ArtifactFamily, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest};
+use zinder_store::{ArtifactFamily, EncodedCompactBlockRangeRequest};
 
 use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
-    CompactBlockReads, RequestedBlock, view_reaches,
+    CompactBlockReads, EncodedChunkReadOutcome, RequestedBlock, view_reaches,
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::grpc::GrpcStream;
@@ -164,20 +167,32 @@ impl CompactBlockReads for CanonicalReaderSlot {
 
     async fn read_encoded_compact_block_chunk(
         &self,
-        view: &Self::View,
-        _pinned: bool,
+        view: ChunkView<Self::View>,
         request: EncodedCompactBlockRangeRequest,
         cancel: Arc<AtomicBool>,
-    ) -> Result<Option<EncodedCompactBlockRange>, Status> {
-        view.encoded_compact_block_range_up_to(request, Some(cancel))
-            .await
-            .map_err(|error| {
-                if matches!(error, StorageReadError::Cancelled) {
-                    Status::cancelled("block-range stream cancelled")
-                } else {
-                    storage_status(error)
-                }
-            })
+    ) -> EncodedChunkReadOutcome<Self::View> {
+        if cancel.load(Ordering::Acquire) {
+            return EncodedChunkReadOutcome::Failed {
+                read_duration: None,
+                failure: ChunkReadFailure::Failed(Status::cancelled(
+                    "block-range stream cancelled",
+                )),
+            };
+        }
+        let slot = self.clone();
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| read_encoded_chunk_on_this_thread(&slot, view, request, &cancel))
+        })
+        .await
+        .unwrap_or_else(|error| EncodedChunkReadOutcome::Failed {
+            read_duration: None,
+            failure: ChunkReadFailure::Failed(status_from_query_error(
+                &QueryError::BlockingTaskFailed {
+                    reason: error.to_string(),
+                },
+            )),
+        })
     }
 
     async fn read_compact_block_chunk<Output, Convert>(
@@ -255,6 +270,81 @@ fn read_chunk_on_this_thread<Output>(
         converted: blocks
             .map(|blocks| convert(read_at, blocks))
             .map_err(|error| ChunkReadFailure::Failed(storage_status(error))),
+    }
+}
+
+/// Reads one encoded chunk on the calling blocking thread.
+///
+/// Captures the current generation inside the blocking worker for later encoded
+/// chunks so waiting in a saturated blocking pool does not retain a retired
+/// generation, then drops the reader before returning.
+fn read_encoded_chunk_on_this_thread(
+    slot: &CanonicalReaderSlot,
+    view: ChunkView<Arc<RocksDbCanonicalReader>>,
+    request: EncodedCompactBlockRangeRequest,
+    cancel: &Arc<AtomicBool>,
+) -> EncodedChunkReadOutcome<Arc<RocksDbCanonicalReader>> {
+    if cancel.load(Ordering::Acquire) {
+        return EncodedChunkReadOutcome::Failed {
+            read_duration: None,
+            failure: ChunkReadFailure::Failed(Status::cancelled("block-range stream cancelled")),
+        };
+    }
+    let (reader, was_captured) = match view {
+        ChunkView::Captured(reader) => (reader, true),
+        ChunkView::Current => (slot.capture(), false),
+    };
+    let read_at = reader.chain_epoch();
+    if !view_reaches(&read_at, request.range) {
+        drop(reader);
+        return EncodedChunkReadOutcome::Failed {
+            read_duration: None,
+            failure: ChunkReadFailure::TipBelowChunk(read_at),
+        };
+    }
+    let started_at = Instant::now();
+    let outcome = read_on_blocking_thread(
+        reader.encoded_compact_block_range_up_to(request, Some(Arc::clone(cancel))),
+    );
+    let read_duration = started_at.elapsed();
+    match outcome {
+        Ok(Some(range)) => {
+            drop(reader);
+            if cancel.load(Ordering::Acquire) {
+                EncodedChunkReadOutcome::Failed {
+                    read_duration: Some(read_duration),
+                    failure: ChunkReadFailure::Failed(Status::cancelled(
+                        "block-range stream cancelled",
+                    )),
+                }
+            } else {
+                EncodedChunkReadOutcome::Direct {
+                    read_at,
+                    range,
+                    read_duration,
+                }
+            }
+        }
+        Ok(None) => {
+            if was_captured {
+                EncodedChunkReadOutcome::Fallback(ChunkView::Captured(reader))
+            } else {
+                drop(reader);
+                EncodedChunkReadOutcome::Fallback(ChunkView::Current)
+            }
+        }
+        Err(error) => {
+            drop(reader);
+            let status = if matches!(error, StorageReadError::Cancelled) {
+                Status::cancelled("block-range stream cancelled")
+            } else {
+                storage_status(error)
+            };
+            EncodedChunkReadOutcome::Failed {
+                read_duration: Some(read_duration),
+                failure: ChunkReadFailure::Failed(status),
+            }
+        }
     }
 }
 

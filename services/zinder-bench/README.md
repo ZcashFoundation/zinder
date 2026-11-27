@@ -1441,25 +1441,31 @@ roots, and complete report-window coverage for every component.
 ## Active-writer publication benchmark (`active-writer-publication`)
 
 `zinder-bench active-writer-publication` drives three matched writer/serving
-arms against an identical synthetic Regtest chain crossing at least one
-4,096-block settled segment boundary while concurrent lightwalletd
-compatibility readers measure live canonical `ZSHRNG02` and `live_tail_block`
-serving visibility and throughput:
+arms against an identical synthetic Regtest chain while concurrent
+lightwalletd compatibility readers measure live canonical `ZSHRNG02` and
+`live_tail_block` serving visibility and throughput. Canonical settled-segment
+qualification requires crossing the fixed 4,096-block canonical `ZSHRNG02`
+stride (`coverage_scope: "settled_segment_crossing"`,
+`canonical_segment_blocks: 4096`, `crossed_segment_boundary_height: 4096`,
+`probe_anchor_height: 4096`):
 
 ```bash
 zinder-bench active-writer-publication \
   --base-blocks 4092 \
   --live-blocks 16 \
   --reorg-window-blocks 4 \
-  --segment-blocks 4096 \
   --io-mode direct \
   --tail-probe-blocks 24 \
   --dense-orchard-actions-per-tx 2 \
   --report ./reports/active-writer-publication.json
 ```
 
-To exercise sustained multi-hundred-MiB live payloads and RocksDB memtable
-flushes across descending tail reads on real NVMe or scratch storage:
+Smaller workloads whose final settled height remains below 4,096 run as
+`live_tail_only` coverage (`coverage_scope: "live_tail_only"`,
+`canonical_segment_blocks: 4096`, `crossed_segment_boundary_height: null`,
+probes anchored around `base_settled`). To exercise sustained multi-hundred-MiB
+`live_tail_only` payloads and RocksDB memtable flushes across descending tail
+reads on real NVMe or scratch storage (not settled-segment coverage):
 
 ```bash
 zinder-bench active-writer-publication \
@@ -1468,7 +1474,6 @@ zinder-bench active-writer-publication \
   --base-blocks 258 \
   --live-blocks 210 \
   --reorg-window-blocks 4 \
-  --segment-blocks 256 \
   --dense-block-cadence 1 \
   --dense-txs-per-block 2 \
   --dense-orchard-actions-per-tx 900 \
@@ -1486,7 +1491,7 @@ Key command flags:
 - `--io-mode <direct|buffered>`: requests `RocksDbIoMode::Direct` (with buffered fallback if the filesystem rejects direct I/O) or forces `Buffered` (default `direct`).
 - `--tail-probe-blocks <N>`: width in blocks (`>= 2`) of descending live-tail `GetBlockRange(tip, floor)` probes (default `24`).
 - `--dense-orchard-actions-per-tx <N>`: Orchard actions synthesized per dense shielded transaction (default `2`).
-- `--publish-workers <N>`, `--require-tail-eviction`: retained CLI compatibility flags after retiring `history-publisher` and `EncodedTail`; setting `--require-tail-eviction` fails validation because `EncodedTail` is retired.
+- `--segment-blocks <N>`, `--publish-workers <N>`, `--require-tail-eviction`: retained CLI compatibility flags after retiring `history-publisher` and `EncodedTail`; `--segment-blocks` no longer configures canonical sealing (always 4,096 blocks) or qualification boundary claims, and `--require-tail-eviction` fails validation because `EncodedTail` is retired.
 
 The three matched modes are `quiescent_control`, `ingest_active`, and
 `ingest_and_projector`, paired with `canonical_quiescent_control` (2 canonical

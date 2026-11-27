@@ -9,7 +9,8 @@ use eyre::Result;
 use zinder_bench::active_writer_publication::{
     ACTIVE_WRITER_PUBLICATION_CONTRACT, ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION,
     ActiveWriterPublicationConfig, ActiveWriterPublicationReport, ByteParityReport,
-    ModeDifferential, ModeReport, WriterMode, run_active_writer_publication, validate_config,
+    ModeDifferential, ModeReport, WorkloadCoverageScope, WriterMode, run_active_writer_publication,
+    validate_config,
 };
 use zinder_store::RocksDbIoMode;
 
@@ -39,7 +40,13 @@ async fn runs_all_matched_writer_modes_across_a_4096_block_segment_boundary() ->
         report.report_format_version,
         ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION
     );
-    assert_eq!(report.workload.crossed_segment_boundary_height, 4_096);
+    assert_eq!(report.workload.canonical_segment_blocks, 4_096);
+    assert_eq!(
+        report.workload.coverage_scope,
+        WorkloadCoverageScope::SettledSegmentCrossing
+    );
+    assert_eq!(report.workload.crossed_segment_boundary_height, Some(4_096));
+    assert_eq!(report.workload.probe_anchor_height, 4_096);
     assert_eq!(report.workload.final_tip_height, 4_122);
     assert_eq!(report.workload.dense_orchard_actions_per_tx, 2);
     assert!(report.workload.transparent_spend_txs > 0);
@@ -76,7 +83,6 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
         base_blocks: 30,
         live_blocks: 8,
         reorg_window_blocks: 3,
-        segment_blocks: NonZeroU32::new(32).unwrap_or(NonZeroU32::MIN),
         dense_block_cadence: 4,
         dense_txs_per_block: 1,
         dense_orchard_actions_per_tx: 8,
@@ -87,15 +93,20 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
         quiescent_rounds: 3,
         scratch_dir: Some(scratch.path().to_path_buf()),
         io_mode: RocksDbIoMode::Buffered,
-        publish_workers: None,
-        require_tail_eviction: false,
+        ..ActiveWriterPublicationConfig::default()
     };
     validate_config(&config)?;
 
     let report = run_active_writer_publication(&config).await?;
     report.validate(&config)?;
 
-    assert_eq!(report.workload.crossed_segment_boundary_height, 32);
+    assert_eq!(report.workload.canonical_segment_blocks, 4_096);
+    assert_eq!(
+        report.workload.coverage_scope,
+        WorkloadCoverageScope::LiveTailOnly
+    );
+    assert_eq!(report.workload.crossed_segment_boundary_height, None);
+    assert_eq!(report.workload.probe_anchor_height, 27);
     assert_eq!(report.workload.dense_orchard_actions_per_tx, 8);
     assert_eq!(report.workload.requested_io_mode, "buffered");
     assert!(report.workload.transparent_spend_txs > 0);

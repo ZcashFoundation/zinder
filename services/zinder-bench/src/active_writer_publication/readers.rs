@@ -1219,7 +1219,7 @@ mod tests {
             mempool_churn_sizes: vec![10],
             ..ActiveWriterPublicationConfig::default()
         };
-        let trace = WorkloadTrace::build(&config, 16, Vec::new(), Vec::new(), Vec::new());
+        let trace = WorkloadTrace::build(&config, 18, Vec::new(), Vec::new(), Vec::new());
         ReaderFleetContext {
             mode: WriterMode::IngestActive,
             wallet_serving: false,

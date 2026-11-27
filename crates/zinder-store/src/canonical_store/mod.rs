@@ -116,6 +116,7 @@ pub use rocksdb::{
 };
 pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
 pub use served_tree_state::ServedTreeState;
+pub use settled_segments::DEFAULT_SETTLED_SEGMENT_BLOCKS;
 pub use subtree_load::{
     CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
 };

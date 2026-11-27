@@ -2,7 +2,10 @@
 
 pub(crate) mod light_wallet;
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
@@ -42,13 +45,13 @@ use zinder_runtime::RepeatedFieldGuard;
 use zinder_source::{NodeCapability, SourceError};
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
 use zinder_store::{
-    ArtifactFamily, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest, MempoolEvent,
-    RawBlobRetention,
+    ArtifactFamily, EncodedCompactBlockRangeRequest, MempoolEvent, RawBlobRetention,
 };
 
 use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
-    CompactBlockReads, RequestedBlock, TipCapture, requested_block, view_reaches,
+    CompactBlockReads, EncodedChunkReadOutcome, RequestedBlock, TipCapture, requested_block,
+    view_reaches,
 };
 use crate::compact_block_messages::CompactBlockShape;
 use crate::mempool::{
@@ -587,24 +590,77 @@ where
 
     async fn read_encoded_compact_block_chunk(
         &self,
-        view: &Self::View,
-        pinned: bool,
+        view: ChunkView<Self::View>,
         request: EncodedCompactBlockRangeRequest,
         cancel: Arc<AtomicBool>,
-    ) -> Result<Option<EncodedCompactBlockRange>, Status> {
-        let at_epoch_id = pinned.then_some(view.id);
-        self.encoded_compact_block_range_up_to(request, at_epoch_id, Some(cancel))
-            .await
-            .map_err(|error| {
-                if matches!(
+    ) -> EncodedChunkReadOutcome<Self::View> {
+        if cancel.load(Ordering::Acquire) {
+            return EncodedChunkReadOutcome::Failed {
+                read_duration: None,
+                failure: ChunkReadFailure::Failed(Status::cancelled(
+                    "block-range stream cancelled",
+                )),
+            };
+        }
+        let (read_at, at_epoch_id, fallback_view) = match view {
+            ChunkView::Captured(epoch) => (epoch, Some(epoch.id), ChunkView::Captured(epoch)),
+            ChunkView::Current => {
+                let epoch = match self.capture_ephemeral_view().await {
+                    Ok(epoch) => epoch,
+                    Err(status) => {
+                        return EncodedChunkReadOutcome::Failed {
+                            read_duration: None,
+                            failure: ChunkReadFailure::Failed(status),
+                        };
+                    }
+                };
+                if !view_reaches(&epoch, request.range) {
+                    return EncodedChunkReadOutcome::Failed {
+                        read_duration: None,
+                        failure: ChunkReadFailure::TipBelowChunk(epoch),
+                    };
+                }
+                (epoch, None, ChunkView::Current)
+            }
+        };
+        let started_at = Instant::now();
+        let outcome = self
+            .encoded_compact_block_range_up_to(request, at_epoch_id, Some(Arc::clone(&cancel)))
+            .await;
+        let read_duration = started_at.elapsed();
+        match outcome {
+            Ok(Some(range)) => {
+                if cancel.load(Ordering::Acquire) {
+                    EncodedChunkReadOutcome::Failed {
+                        read_duration: Some(read_duration),
+                        failure: ChunkReadFailure::Failed(Status::cancelled(
+                            "block-range stream cancelled",
+                        )),
+                    }
+                } else {
+                    EncodedChunkReadOutcome::Direct {
+                        read_at,
+                        range,
+                        read_duration,
+                    }
+                }
+            }
+            Ok(None) => EncodedChunkReadOutcome::Fallback(fallback_view),
+            Err(error) => {
+                let status = if matches!(
                     error,
                     QueryError::CanonicalStore(StorageReadError::Cancelled)
                 ) {
                     Status::cancelled("block-range stream cancelled")
                 } else {
                     status_from_query_error(&error)
+                };
+                EncodedChunkReadOutcome::Failed {
+                    read_duration: Some(read_duration),
+                    failure: ChunkReadFailure::Failed(status),
                 }
-            })
+            }
+        }
     }
 
     async fn read_compact_block_chunk<Output, Convert>(

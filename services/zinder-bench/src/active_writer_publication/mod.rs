@@ -3,12 +3,14 @@
 //! Exercises identical advancing Zcash Regtest workloads across three matched
 //! writer/serving states (`quiescent_control`, `ingest_active`,
 //! `ingest_and_projector`) plus matched `canonical_quiescent_control` (for
-//! canonical-only `ingest_active`), crossing a configurable settled segment
-//! boundary while concurrent lightwalletd compatibility readers measure
-//! publication visibility, canonical `ZSHRNG02` settled and `live_tail_block`
-//! range latency, descending tail cold/warm reads, slow readers, transparent
-//! wallet RPCs, mempool churn, durability fsyncs, `RocksDB` I/O activity, and
-//! exact reply byte parity.
+//! canonical-only `ingest_active`). Workloads reaching the canonical 4,096-block
+//! settled segment stride (`SettledSegmentCrossing`) cross a live `ZSHRNG02`
+//! segment seal boundary, while shorter workloads (`LiveTailOnly`) anchor
+//! deterministic probes around the settled tip while concurrent lightwalletd
+//! compatibility readers measure publication visibility, canonical `ZSHRNG02`
+//! settled and `live_tail_block` range latency, descending tail cold/warm
+//! reads, slow readers, transparent wallet RPCs, mempool churn, durability
+//! fsyncs, `RocksDB` I/O activity, and exact reply byte parity.
 
 mod chain_fixture;
 mod mempool;
@@ -28,12 +30,51 @@ pub use report::{
     IoModeReport, LatencySummaryMs, MempoolTierMetrics, ModeDifferential, ModeParityDigests,
     ModeReport, NodeRpcCounts, ParityMismatch, ProjectorMetrics, ProtocolErrorCounts,
     RocksDbActivityReport, StoreTickerDelta, StreamLatencyReport, TailRefillMetrics,
-    WalletRpcMetrics, WorkloadGeometryReport, WriterFsyncCounts, WriterMode,
+    WalletRpcMetrics, WorkloadCoverageScope, WorkloadGeometryReport, WriterFsyncCounts, WriterMode,
 };
 pub use runner::run_active_writer_publication;
-use zinder_store::RocksDbIoMode;
+use zinder_store::{DEFAULT_SETTLED_SEGMENT_BLOCKS, RocksDbIoMode};
 
 use crate::BenchError;
+
+/// Canonical settled-segment vs live-tail-only geometry derived for a benchmark run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalWorkloadLayout {
+    pub(crate) canonical_segment_blocks: u32,
+    pub(crate) coverage_scope: WorkloadCoverageScope,
+    pub(crate) crossed_segment_boundary_height: Option<u32>,
+    pub(crate) probe_anchor_height: u32,
+}
+
+/// Derives the canonical 4,096-block settled layout and deterministic probe anchor.
+#[must_use]
+pub(crate) fn canonical_workload_layout(
+    config: &ActiveWriterPublicationConfig,
+) -> CanonicalWorkloadLayout {
+    let canonical_segment_blocks = DEFAULT_SETTLED_SEGMENT_BLOCKS;
+    let base_settled = config
+        .base_blocks
+        .saturating_sub(config.reorg_window_blocks);
+    let final_tip = config.base_blocks.saturating_add(config.live_blocks);
+    let final_settled = final_tip.saturating_sub(config.reorg_window_blocks);
+    let next_canonical_boundary = ((base_settled / canonical_segment_blocks).saturating_add(1))
+        .saturating_mul(canonical_segment_blocks);
+    if final_settled >= next_canonical_boundary {
+        CanonicalWorkloadLayout {
+            canonical_segment_blocks,
+            coverage_scope: WorkloadCoverageScope::SettledSegmentCrossing,
+            crossed_segment_boundary_height: Some(next_canonical_boundary),
+            probe_anchor_height: next_canonical_boundary,
+        }
+    } else {
+        CanonicalWorkloadLayout {
+            canonical_segment_blocks,
+            coverage_scope: WorkloadCoverageScope::LiveTailOnly,
+            crossed_segment_boundary_height: None,
+            probe_anchor_height: base_settled.max(1),
+        }
+    }
+}
 
 /// Configuration parameters for one [`run_active_writer_publication`] run.
 #[derive(Clone, Debug)]
@@ -44,7 +85,8 @@ pub struct ActiveWriterPublicationConfig {
     pub live_blocks: u32,
     /// Canonical settlement reorg window depth in blocks (default `4`).
     pub reorg_window_blocks: u32,
-    /// Settled shielded catalog segment width in blocks (default `4,096`).
+    /// Retained CLI compatibility field; canonical sealing always uses
+    /// [`DEFAULT_SETTLED_SEGMENT_BLOCKS`] (`4,096`).
     pub segment_blocks: NonZeroU32,
     /// Cadence (in blocks) for commitment-dense shielded blocks (default `4`).
     pub dense_block_cadence: u32,
@@ -147,16 +189,19 @@ pub fn validate_config(config: &ActiveWriterPublicationConfig) -> Result<(), Ben
             "require_tail_eviction is no longer supported after retiring EncodedTail",
         ));
     }
+    let canonical_stride = DEFAULT_SETTLED_SEGMENT_BLOCKS;
     let base_settled = config
         .base_blocks
         .saturating_sub(config.reorg_window_blocks);
-    let width = config.segment_blocks.get();
-    let next_boundary = ((base_settled / width).saturating_add(1)).saturating_mul(width);
+    let next_canonical_boundary =
+        ((base_settled / canonical_stride).saturating_add(1)).saturating_mul(canonical_stride);
     let final_tip = config.base_blocks.saturating_add(config.live_blocks);
     let final_settled = final_tip.saturating_sub(config.reorg_window_blocks);
-    if final_settled < next_boundary {
+    if (final_tip >= next_canonical_boundary || base_settled >= canonical_stride)
+        && final_settled < next_canonical_boundary
+    {
         return Err(BenchError::invalid_argument(format!(
-            "final settled height ({final_settled}) must reach next segment boundary ({next_boundary})"
+            "final settled height ({final_settled}) must reach canonical settled segment boundary ({next_canonical_boundary})"
         )));
     }
     Ok(())

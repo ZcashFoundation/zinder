@@ -98,6 +98,23 @@ pub(crate) struct ChunkReadOutcome<Output> {
     pub(crate) converted: Result<Output, ChunkReadFailure>,
 }
 
+/// Outcome of a canonical encoded-range chunk read.
+pub(crate) enum EncodedChunkReadOutcome<View> {
+    /// The canonical reader returned an encoded slice at `read_at` in `read_duration`.
+    Direct {
+        read_at: ChainEpoch,
+        range: EncodedCompactBlockRange,
+        read_duration: Duration,
+    },
+    /// The canonical reader deferred to [`CompactBlockReads::read_compact_block_chunk`].
+    Fallback(ChunkView<View>),
+    /// The read failed or stopped before reading a slice.
+    Failed {
+        read_duration: Option<Duration>,
+        failure: ChunkReadFailure,
+    },
+}
+
 impl<Output> ChunkReadOutcome<Output> {
     /// A read that ended before its storage read ran.
     pub(crate) const fn unread(failure: ChunkReadFailure) -> Self {
@@ -212,17 +229,16 @@ pub(crate) trait CompactBlockReads: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<CompactBlockArtifact, Status>> + Send;
 
     /// Streams encoded compact-block wire payloads directly from `ZSHRNG02`
-    /// settled segments and `live_tail_block`, or returns `Ok(None)` when the
-    /// reader falls back to [`Self::read_compact_block_chunk`].
+    /// settled segments and `live_tail_block`, or defers to
+    /// [`Self::read_compact_block_chunk`] when falling back.
     fn read_encoded_compact_block_chunk(
         &self,
-        view: &Self::View,
-        pinned: bool,
+        view: ChunkView<Self::View>,
         request: EncodedCompactBlockRangeRequest,
         cancel: Arc<AtomicBool>,
-    ) -> impl Future<Output = Result<Option<EncodedCompactBlockRange>, Status>> + Send {
-        let _ = (view, pinned, request, cancel);
-        std::future::ready(Ok(None))
+    ) -> impl Future<Output = EncodedChunkReadOutcome<Self::View>> + Send {
+        let _ = (request, cancel);
+        std::future::ready(EncodedChunkReadOutcome::Fallback(view))
     }
 
     /// Reads the blocks of `read.chunk` that fit `read.max_bytes`, from the

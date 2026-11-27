@@ -17,7 +17,9 @@ use zinder_core::{
     UnixTimestampMillis, encode_canonical_block_replay,
 };
 use zinder_proto::compat::lightwalletd::compact_tx_streamer_client::CompactTxStreamerClient;
-use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
+use zinder_proto::compat::lightwalletd::{
+    self, EncodedBlockRange as _, compact_tx_streamer_server,
+};
 use zinder_proto::v1::ingest::{
     AcquireCanonicalProjectionBuildLeaseRequest, CanonicalEventPageRequest,
     CanonicalEventPageResponse, CanonicalProjectionBuildLeaseResponse, CanonicalWriterFence,
@@ -3709,6 +3711,74 @@ fn a_chunk_read_stage_leaves_out_its_wait_for_a_blocking_thread()
     assert!(
         read_seconds < hold.as_secs_f64(),
         "the read stage counted the {hold:?} its read waited for a blocking thread: {read_seconds}s"
+    );
+    Ok(())
+}
+
+async fn stream_encoded_with_a_queued_later_chunk(
+    hold: Duration,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    const TIP_HEIGHT: u32 = 2_100;
+    let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::None)
+        .extend_blocks(TIP_HEIGHT);
+    let harness = LongRangeHarness::start(&zinder_testkit::CanonicalBaseline::new(&chain)).await?;
+    let entry_generation = Arc::downgrade(&harness.slot.capture());
+
+    let mut stream = harness
+        .adapter
+        .get_encoded_block_range_frames(Request::new(block_range(1, TIP_HEIGHT)))
+        .await?
+        .into_inner();
+    // Taken before the stream's task runs, so its second chunk's read
+    // queues behind the gate.
+    let gate = BlockingGate::hold().await?;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let generation_holders = entry_generation.strong_count();
+    tokio::time::sleep(hold).await;
+    gate.release().await?;
+
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next().await {
+        frames.push(frame?);
+    }
+    assert!(frames.len() >= 3);
+    drop(stream);
+    harness.stop().await?;
+    Ok(generation_holders)
+}
+
+#[test]
+fn an_encoded_later_chunk_waiting_for_a_blocking_thread_holds_no_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let holders = one_blocking_thread_runtime()?
+        .block_on(stream_encoded_with_a_queued_later_chunk(Duration::ZERO))?;
+    assert_eq!(
+        holders, 1,
+        "only the serving slot may hold the generation while a later encoded chunk waits"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_encoded_chunk_read_stage_leaves_out_its_wait_for_a_blocking_thread()
+-> Result<(), Box<dyn std::error::Error>> {
+    let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = metrics_recorder.handle();
+    let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+    let hold = Duration::from_secs(1);
+
+    one_blocking_thread_runtime()?.block_on(stream_encoded_with_a_queued_later_chunk(hold))?;
+
+    let rendered = metrics_handle.render();
+    assert_eq!(block_range_stage_samples(&rendered, "read"), Some(3));
+    let read_seconds =
+        block_range_stage_seconds(&rendered, "read").ok_or("no read stage was recorded")?;
+    assert!(
+        read_seconds < hold.as_secs_f64(),
+        "the encoded read stage counted the {hold:?} its read waited for a blocking thread: {read_seconds}s"
     );
     Ok(())
 }

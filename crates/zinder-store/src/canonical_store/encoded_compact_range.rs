@@ -400,15 +400,15 @@ fn append_live_tail_row(
     request: EncodedCompactBlockRangeRequest,
     acc: &mut RangeAccumulator,
 ) -> Result<bool, CanonicalStoreError> {
+    let output_bytes = wire.shielded_payload.len();
+    if acc.exceeds_output_budget(output_bytes) || acc.exceeds_live_read_budget(stored_row_bytes) {
+        return Ok(false);
+    }
     if request.enforce_wire_fee_limit && wire.has_unrepresentable_wire_fee {
         return Err(CanonicalStoreError::ArtifactCorrupt {
             family: ArtifactFamily::CompactBlock,
             reason: "compact transaction fee exceeds u32".to_owned(),
         });
-    }
-    let output_bytes = wire.shielded_payload.len();
-    if acc.exceeds_output_budget(output_bytes) || acc.exceeds_live_read_budget(stored_row_bytes) {
-        return Ok(false);
     }
     let link = EncodedCompactBlockLink {
         height: wire.block_id.height,
@@ -1530,5 +1530,144 @@ mod tests {
         settled_acc.record_settled_span(link1, link1, 4, 1_024);
         assert_eq!(settled_acc.largest_live_row_bytes, 0);
         assert_eq!(settled_acc.next_live_tail_batch_len(), 1);
+    }
+
+    fn seed_wide_fee_live_tail_store(dir: &std::path::Path, wide_height: u32) -> TestOutcome<DB> {
+        let mut opts = rust_rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let descriptors = CANONICAL_DATA_COLUMN_FAMILIES
+            .into_iter()
+            .map(|name| rust_rocksdb::ColumnFamilyDescriptor::new(name, opts.clone()))
+            .collect::<Vec<_>>();
+        let db = DB::open_cf_descriptors(&opts, dir, descriptors)?;
+        let live_cf = db
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("missing live_tail_block cf")?;
+
+        for h in 1_u32..=3 {
+            let mut tx = build_fixture_transactions(
+                h,
+                FixtureShape {
+                    sapling: false,
+                    orchard: true,
+                    transparent: false,
+                    wide_fee: h == wide_height,
+                },
+            );
+            let seed = u8::try_from(h % 200).unwrap_or(1);
+            for offset in 1_u8..8 {
+                tx[0].data.orchard_actions.push(CompactShieldedAction {
+                    nullifier: [seed.wrapping_add(offset); 32],
+                    commitment: [seed.wrapping_add(offset + 1); 32],
+                    ephemeral_key: [seed.wrapping_add(offset + 2); 32],
+                    ciphertext: [seed.wrapping_add(offset + 3); 52],
+                });
+            }
+            let parent_hash = if h == 1 {
+                Network::ZcashRegtest.genesis_hash()
+            } else {
+                hash_with_tag(h - 1)
+            };
+            let compact = CompactBlockArtifact::new(
+                BlockId::new(BlockHeight::new(h), hash_with_tag(h)),
+                parent_hash,
+                1_700_000_000 + h,
+                tx,
+                CompactChainMetadata {
+                    sapling_commitment_tree_size: h * 2,
+                    orchard_commitment_tree_size: h * 8,
+                    ironwood_commitment_tree_size: 0,
+                },
+            )?;
+            let facts = build_facts_for_compact(&compact);
+            let record = LiveTailBlockRecord::from_compact_block(&compact, true, Some(facts))?;
+            db.put_cf(
+                &live_cf,
+                encode_height_key_ascending(BlockHeight::new(h)),
+                record.encode_v1()?,
+            )?;
+        }
+        drop(live_cf);
+        Ok(db)
+    }
+
+    #[test]
+    fn out_of_budget_wide_fee_live_tail_block_returns_valid_prefix_before_failing() -> TestOutcome {
+        let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
+        for (wide_height, prefix_range, failing_height, order) in [
+            (
+                3_u32,
+                BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
+                BlockHeight::new(3),
+                HeightOrder::Ascending,
+            ),
+            (
+                1_u32,
+                BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(3)),
+                BlockHeight::new(1),
+                HeightOrder::Descending,
+            ),
+        ] {
+            let dir = TempDir::new()?;
+            let db = seed_wide_fee_live_tail_store(dir.path(), wide_height)?;
+            let ctx = SegmentStoreContext {
+                db: &db,
+                segment_cache: None,
+                sealed_segments: Some(&[]),
+            };
+            let prefix = encoded_compact_block_range_for_context(
+                ctx,
+                EncodedCompactBlockRangeRequest {
+                    range: prefix_range,
+                    order,
+                    selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    output: EncodedCompactBlockOutput::Blocks,
+                    max_bytes: usize::MAX,
+                    enforce_wire_fee_limit: true,
+                },
+                None,
+            )?
+            .ok_or("expected valid prefix before wide-fee block")?;
+            let EncodedCompactBlockPayload::Blocks(prefix_blocks) = prefix.payload else {
+                return Err("expected Blocks variant".into());
+            };
+            let prefix_bytes: usize = prefix_blocks.iter().map(|blk| blk.payload().len()).sum();
+
+            // Leave 1 byte of headroom so the loop reads the wide-fee live-tail
+            // block and hits `exceeds_output_budget` rather than `is_budget_spent`.
+            let bounded = encoded_compact_block_range_for_context(
+                ctx,
+                EncodedCompactBlockRangeRequest {
+                    range,
+                    order,
+                    selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    output: EncodedCompactBlockOutput::Blocks,
+                    max_bytes: prefix_bytes + 1,
+                    enforce_wire_fee_limit: true,
+                },
+                None,
+            )?
+            .ok_or("expected bounded prefix stopping before wide-fee block")?;
+            assert_eq!(bounded.block_count, 2);
+            assert_eq!(bounded.covered, prefix_range);
+
+            let wide_req = EncodedCompactBlockRangeRequest {
+                range: BlockHeightRange::inclusive(failing_height, failing_height),
+                order,
+                selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                output: EncodedCompactBlockOutput::Blocks,
+                max_bytes: prefix_bytes + 1,
+                enforce_wire_fee_limit: true,
+            };
+            assert!(matches!(
+                encoded_compact_block_range_for_context(ctx, wide_req, None),
+                Err(CanonicalStoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::CompactBlock,
+                    ..
+                })
+            ));
+        }
+        Ok(())
     }
 }

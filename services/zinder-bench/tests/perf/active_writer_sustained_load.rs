@@ -3,11 +3,12 @@
     reason = "Heavy perf acceptance tests describe behavior by function name."
 )]
 
-use std::{num::NonZeroU32, time::Duration};
+use std::time::Duration;
 
 use eyre::Result;
 use zinder_bench::active_writer_publication::{
-    ActiveWriterPublicationConfig, WriterMode, run_active_writer_publication, validate_config,
+    ActiveWriterPublicationConfig, WorkloadCoverageScope, WriterMode,
+    run_active_writer_publication, validate_config,
 };
 use zinder_store::RocksDbIoMode;
 
@@ -19,7 +20,6 @@ async fn sustained_multi_hundred_mib_load_triggers_rocksdb_flushes_with_byte_par
         base_blocks: 258,
         live_blocks: 210,
         reorg_window_blocks: 4,
-        segment_blocks: NonZeroU32::new(256).unwrap_or(NonZeroU32::MIN),
         dense_block_cadence: 1,
         dense_txs_per_block: 2,
         dense_orchard_actions_per_tx: 900,
@@ -30,13 +30,20 @@ async fn sustained_multi_hundred_mib_load_triggers_rocksdb_flushes_with_byte_par
         quiescent_rounds: 2,
         scratch_dir: None,
         io_mode: RocksDbIoMode::Direct,
-        publish_workers: None,
-        require_tail_eviction: false,
+        ..ActiveWriterPublicationConfig::default()
     };
     validate_config(&config)?;
 
     let report = run_active_writer_publication(&config).await?;
     report.validate(&config)?;
+
+    assert_eq!(report.workload.canonical_segment_blocks, 4_096);
+    assert_eq!(
+        report.workload.coverage_scope,
+        WorkloadCoverageScope::LiveTailOnly
+    );
+    assert!(report.workload.crossed_segment_boundary_height.is_none());
+    assert_eq!(report.workload.probe_anchor_height, 254);
 
     assert!(report.byte_parity.all_matched);
     for arm in std::iter::once(&report.canonical_quiescent_control).chain(report.modes.iter()) {

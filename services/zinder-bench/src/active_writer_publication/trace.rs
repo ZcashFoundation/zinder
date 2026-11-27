@@ -18,7 +18,8 @@ pub(crate) struct WorkloadTrace {
     pub(crate) base_tip_height: u32,
     pub(crate) final_tip_height: u32,
     pub(crate) reorg_window_blocks: u32,
-    pub(crate) segment_boundary_height: u32,
+    /// Settled segment boundary when crossing 4,096 blocks, or base settled tip for live-tail-only runs.
+    pub(crate) probe_anchor_height: u32,
     pub(crate) catalog_span_blocks: u32,
     pub(crate) tail_probe_span_blocks: u32,
     pub(crate) slow_boundary_span_blocks: u32,
@@ -36,7 +37,7 @@ impl WorkloadTrace {
     /// Derives the shared workload trace and computes `digest_hex`.
     pub(crate) fn build(
         config: &ActiveWriterPublicationConfig,
-        segment_boundary_height: u32,
+        probe_anchor_height: u32,
         wallet_addresses: Vec<String>,
         settled_txids: Vec<[u8; 32]>,
         live_txids: Vec<(u32, [u8; 32])>,
@@ -54,7 +55,7 @@ impl WorkloadTrace {
 
         // Both quiescent controls and active modes must sleep across the exact same
         // frame count on slow boundary reads so comparisons isolate contention.
-        let boundary_start = segment_boundary_height.saturating_sub(6).max(1);
+        let boundary_start = probe_anchor_height.saturating_sub(6).max(1);
         let slow_boundary_span_blocks = final_tip_height
             .saturating_sub(boundary_start)
             .min(base_tip_height.saturating_sub(1));
@@ -66,7 +67,7 @@ impl WorkloadTrace {
             base_tip_height,
             final_tip_height,
             reorg_window_blocks: config.reorg_window_blocks,
-            segment_boundary_height,
+            probe_anchor_height,
             catalog_span_blocks,
             tail_probe_span_blocks,
             slow_boundary_span_blocks,
@@ -89,7 +90,7 @@ impl WorkloadTrace {
         (tip, floor)
     }
 
-    /// Ascending `(start, end)` bounds for the slow boundary-crossing range probe.
+    /// Ascending `(start, end)` bounds for the slow boundary/anchor range probe.
     pub(crate) fn slow_boundary_range(&self, tip: u32) -> (u32, u32) {
         let end = tip.max(self.base_tip_height).max(1);
         let start = end.saturating_sub(self.slow_boundary_span_blocks).max(1);
@@ -99,7 +100,7 @@ impl WorkloadTrace {
     /// Ascending `(start, end)` bounds for settled catalog reads at `served_tip`.
     pub(crate) fn catalog_range(&self, served_tip: u32) -> (u32, u32) {
         let settled_tip = served_tip.saturating_sub(self.reorg_window_blocks).max(1);
-        let end = settled_tip.min(self.segment_boundary_height);
+        let end = settled_tip.min(self.probe_anchor_height);
         let start = end.saturating_sub(self.catalog_span_blocks).max(1);
         (start, end)
     }
@@ -150,14 +151,14 @@ mod tests {
         };
         let trace_a = WorkloadTrace::build(
             &config,
-            64,
+            56,
             vec!["tmAddr".to_owned()],
             vec![[1_u8; 32]],
             vec![(65, [2_u8; 32])],
         );
         let trace_b = WorkloadTrace::build(
             &config,
-            64,
+            56,
             vec!["tmAddr".to_owned()],
             vec![[1_u8; 32]],
             vec![(65, [2_u8; 32])],

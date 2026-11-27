@@ -183,6 +183,25 @@ impl ActiveWriterPublicationReport {
                 "require_tail_eviction is no longer supported after retiring EncodedTail",
             ));
         }
+        let expected_layout = super::canonical_workload_layout(config);
+        if self.workload.canonical_segment_blocks != expected_layout.canonical_segment_blocks
+            || self.workload.coverage_scope != expected_layout.coverage_scope
+            || self.workload.crossed_segment_boundary_height
+                != expected_layout.crossed_segment_boundary_height
+            || self.workload.probe_anchor_height != expected_layout.probe_anchor_height
+        {
+            return Err(BenchError::acceptance_completion_mismatch(format!(
+                "workload layout mismatch: expected canonical_segment_blocks={} scope={:?} boundary={:?} anchor={}, got canonical_segment_blocks={} scope={:?} boundary={:?} anchor={}",
+                expected_layout.canonical_segment_blocks,
+                expected_layout.coverage_scope,
+                expected_layout.crossed_segment_boundary_height,
+                expected_layout.probe_anchor_height,
+                self.workload.canonical_segment_blocks,
+                self.workload.coverage_scope,
+                self.workload.crossed_segment_boundary_height,
+                self.workload.probe_anchor_height,
+            )));
+        }
         if !self.byte_parity.all_matched {
             return Err(BenchError::acceptance_completion_mismatch(format!(
                 "byte parity mismatch across modes: {:?}",
@@ -310,6 +329,17 @@ fn validate_mode_pipeline_stages(
     Ok(())
 }
 
+/// Whether an `active-writer-publication` workload crossed a canonical 4,096-block
+/// settled segment boundary or exercised live-tail commits only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadCoverageScope {
+    /// Final settled tip crossed at least one 4,096-block canonical `ZSHRNG02` boundary.
+    SettledSegmentCrossing,
+    /// Workload remained below the first 4,096-block canonical segment boundary.
+    LiveTailOnly,
+}
+
 /// Chain and trace geometry shared identically by all matched modes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkloadGeometryReport {
@@ -323,10 +353,14 @@ pub struct WorkloadGeometryReport {
     pub final_tip_height: u32,
     /// Canonical reorg window (settlement lag in blocks).
     pub reorg_window_blocks: u32,
-    /// Settled catalog segment size in blocks (`4,096` by default).
-    pub segment_blocks: u32,
-    /// Shielded catalog segment boundary crossed during live commits.
-    pub crossed_segment_boundary_height: u32,
+    /// Canonical settled segment stride in blocks (`4,096`).
+    pub canonical_segment_blocks: u32,
+    /// Whether the workload crossed a canonical 4,096-block settled segment boundary.
+    pub coverage_scope: WorkloadCoverageScope,
+    /// Canonical settled segment boundary height crossed during live commits, if any.
+    pub crossed_segment_boundary_height: Option<u32>,
+    /// Boundary or settled-tip anchor height used to shape deterministic reader probes.
+    pub probe_anchor_height: u32,
     /// Sparse blocks present in the generated chain.
     pub sparse_block_count: u32,
     /// Commitment-dense shielded blocks present in the generated chain.
@@ -1132,8 +1166,10 @@ mod tests {
                 live_blocks: 4,
                 final_tip_height: 64,
                 reorg_window_blocks: 4,
-                segment_blocks: 64,
-                crossed_segment_boundary_height: 64,
+                canonical_segment_blocks: zinder_store::DEFAULT_SETTLED_SEGMENT_BLOCKS,
+                coverage_scope: super::WorkloadCoverageScope::LiveTailOnly,
+                crossed_segment_boundary_height: None,
+                probe_anchor_height: 56,
                 sparse_block_count: 50,
                 dense_block_count: 14,
                 dense_orchard_actions_per_tx: 2,

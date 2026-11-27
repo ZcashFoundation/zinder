@@ -15,7 +15,7 @@ use zinder_query::CanonicalReader as _;
 use zinder_runtime::{AuthenticatedChannel, connect_zinder_grpc_with_timeout};
 
 use super::{
-    ActiveWriterPublicationConfig,
+    ActiveWriterPublicationConfig, CanonicalWorkloadLayout, canonical_workload_layout,
     chain_fixture::{
         AdvancingChainSource, ChainSpecConfig, GeneratedChain, TemplateStores, reader_budget,
     },
@@ -62,10 +62,10 @@ pub async fn run_active_writer_publication(
     crate::recorder::install_tracing_subscriber()?;
     let chain = build_generated_chain(config)?;
     let template_stores = TemplateStores::build(&chain, config).await?;
-    let segment_boundary = next_segment_boundary(config, &chain);
+    let layout = canonical_workload_layout(config);
     let trace = WorkloadTrace::build(
         config,
-        segment_boundary,
+        layout.probe_anchor_height,
         chain.tracked_taddresses.clone(),
         chain.settled_txids.clone(),
         chain.live_txids.clone(),
@@ -94,7 +94,7 @@ pub async fn run_active_writer_publication(
         &mode_reports[1..],
     );
     let byte_parity = ByteParityReport::evaluate(std::mem::take(&mut parity_digests));
-    let workload = build_workload_geometry(config, &chain, segment_boundary, &trace.digest_hex);
+    let workload = build_workload_geometry(config, &chain, &layout, &trace.digest_hex);
 
     Ok(ActiveWriterPublicationReport {
         contract_identity: ACTIVE_WRITER_PUBLICATION_CONTRACT.to_owned(),
@@ -181,7 +181,7 @@ fn build_matched_differentials(
 fn build_workload_geometry(
     config: &ActiveWriterPublicationConfig,
     chain: &GeneratedChain,
-    crossed_boundary: u32,
+    layout: &CanonicalWorkloadLayout,
     trace_digest_hex: &str,
 ) -> WorkloadGeometryReport {
     WorkloadGeometryReport {
@@ -190,8 +190,10 @@ fn build_workload_geometry(
         live_blocks: config.live_blocks,
         final_tip_height: chain.final_tip_height.value(),
         reorg_window_blocks: config.reorg_window_blocks,
-        segment_blocks: config.segment_blocks.get(),
-        crossed_segment_boundary_height: crossed_boundary,
+        canonical_segment_blocks: layout.canonical_segment_blocks,
+        coverage_scope: layout.coverage_scope,
+        crossed_segment_boundary_height: layout.crossed_segment_boundary_height,
+        probe_anchor_height: layout.probe_anchor_height,
         sparse_block_count: chain.sparse_block_count,
         dense_block_count: chain.dense_block_count,
         dense_orchard_actions_per_tx: config.dense_orchard_actions_per_tx,
@@ -205,7 +207,7 @@ fn build_workload_geometry(
 
 struct ModeRuntimeBootstrap {
     paths: ModePaths,
-    boundary_height: u32,
+    probe_anchor_height: u32,
     serving: ModeServingHandle,
     initial_epoch: ChainEpoch,
     mempool: Arc<BenchmarkMempoolSurface>,
@@ -222,7 +224,7 @@ async fn bootstrap_mode_runtime(
 ) -> Result<ModeRuntimeBootstrap, BenchError> {
     crate::recorder::install_tracing_subscriber()?;
     let paths = ModePaths::prepare(template, config.scratch_dir.as_deref(), run_spec.label)?;
-    let boundary_height = next_segment_boundary(config, chain);
+    let probe_anchor_height = canonical_workload_layout(config).probe_anchor_height;
 
     if run_spec.mode == WriterMode::QuiescentControl {
         pre_advance_quiescent_stores(
@@ -261,7 +263,7 @@ async fn bootstrap_mode_runtime(
 
     Ok(ModeRuntimeBootstrap {
         paths,
-        boundary_height,
+        probe_anchor_height,
         serving,
         initial_epoch,
         mempool,
@@ -345,7 +347,7 @@ async fn run_single_mode(
             wallet_serving: run_spec.wallet_serving,
             base_tip_height: config.base_blocks,
             final_tip_height: chain.final_tip_height.value(),
-            segment_boundary_height: boot.boundary_height,
+            probe_anchor_height: boot.probe_anchor_height,
             wallet_addresses: &chain.tracked_taddresses,
             probe_txids: &probe_txids,
         },
@@ -545,29 +547,19 @@ fn collect_probe_txids(chain: &GeneratedChain) -> Vec<[u8; 32]> {
     txids
 }
 
-fn next_segment_boundary(config: &ActiveWriterPublicationConfig, chain: &GeneratedChain) -> u32 {
-    let base_settled = chain
-        .base_tip_height
-        .value()
-        .saturating_sub(chain.reorg_window_blocks);
-    let width = config.segment_blocks.get();
-    ((base_settled / width).saturating_add(1))
-        .saturating_mul(width)
-        .min(chain.final_tip_height.value())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{error::Error, num::NonZeroU32, time::Duration};
 
-    use zinder_store::RocksDbIoMode;
+    use zinder_store::{DEFAULT_SETTLED_SEGMENT_BLOCKS, RocksDbIoMode};
 
     use super::{
         ActiveWriterPublicationConfig, AdvancingChainSource, ChainSpecConfig, GeneratedChain,
         ModeRunSpec, TemplateStores, WorkloadTrace, WriterMode, bootstrap_mode_runtime,
-        build_matched_differentials, next_segment_boundary, run_mode_workload_with_source,
+        build_matched_differentials, canonical_workload_layout, run_mode_workload_with_source,
         shutdown_mode_runtime, validate_config,
     };
+    use crate::active_writer_publication::WorkloadCoverageScope;
 
     #[test]
     fn validate_config_rejects_short_live_window_before_segment_seal() {
@@ -660,7 +652,7 @@ mod tests {
             "report_format_version": 3,
             "workload": {
                 "network": "zcash-regtest", "base_blocks": 60, "live_blocks": 4, "final_tip_height": 64,
-                "reorg_window_blocks": 4, "segment_blocks": 64, "crossed_segment_boundary_height": 64,
+                "reorg_window_blocks": 4, "canonical_segment_blocks": 4096, "coverage_scope": "live_tail_only", "crossed_segment_boundary_height": null, "probe_anchor_height": 56,
                 "sparse_block_count": 50, "dense_block_count": 14, "dense_orchard_actions_per_tx": 2,
                 "transparent_spend_txs": 4, "tail_probe_blocks": 24, "requested_io_mode": "buffered",
                 "mempool_churn_sizes": [50], "request_trace_digest": "aa"
@@ -711,6 +703,28 @@ mod tests {
         assert!(validate_config(&config).is_err());
     }
 
+    #[test]
+    fn small_workload_reports_live_tail_only_regardless_of_retained_segment_blocks()
+    -> Result<(), Box<dyn Error>> {
+        let config = ActiveWriterPublicationConfig {
+            base_blocks: 60,
+            live_blocks: 12,
+            reorg_window_blocks: 4,
+            segment_blocks: NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+            ..ActiveWriterPublicationConfig::default()
+        };
+        validate_config(&config)?;
+        let layout = canonical_workload_layout(&config);
+        assert_eq!(
+            layout.canonical_segment_blocks,
+            DEFAULT_SETTLED_SEGMENT_BLOCKS
+        );
+        assert_eq!(layout.coverage_scope, WorkloadCoverageScope::LiveTailOnly);
+        assert_eq!(layout.crossed_segment_boundary_height, None);
+        assert_eq!(layout.probe_anchor_height, 56);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn writer_failure_cancels_and_drains_fleet_projector_and_server()
     -> Result<(), Box<dyn Error>> {
@@ -741,10 +755,10 @@ mod tests {
             dense_orchard_actions_per_tx: config.dense_orchard_actions_per_tx,
         })?;
         let template = TemplateStores::build(&chain, &config).await?;
-        let boundary = next_segment_boundary(&config, &chain);
+        let probe_anchor_height = canonical_workload_layout(&config).probe_anchor_height;
         let trace = WorkloadTrace::build(
             &config,
-            boundary,
+            probe_anchor_height,
             chain.tracked_taddresses.clone(),
             chain.settled_txids.clone(),
             chain.live_txids.clone(),

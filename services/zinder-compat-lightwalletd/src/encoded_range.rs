@@ -8,7 +8,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
 };
 
 use tokio_util::sync::CancellationToken;
@@ -21,8 +20,8 @@ use zinder_store::{
 };
 
 use crate::block_methods::{
-    ChunkMessages, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView, CompactBlockReads,
-    RangeChunk, RangeSource, view_reaches,
+    ChunkMessages, ChunkRead, ChunkReadFailure, ChunkReadOutcome, CompactBlockReads,
+    EncodedChunkReadOutcome, RangeChunk, RangeSource,
 };
 use crate::block_range::BlockRangeStreamLimit;
 use crate::compact_block_messages::CompactBlockShape;
@@ -284,10 +283,13 @@ impl CanonicalEncodedMode {
                 })
                 .await;
         };
-        let (view, pinned) = match resolve_chunk_view(reads, read.chunk, read.view).await {
-            Ok(resolved) => resolved,
-            Err(failure) => return ChunkReadOutcome::unread(failure),
-        };
+        let ChunkRead {
+            chunk,
+            order,
+            max_bytes,
+            view,
+            cancel,
+        } = read;
         let output = if self.batched_frames {
             EncodedCompactBlockOutput::BatchedFrames {
                 opening_frame: self.opening_frame,
@@ -296,49 +298,39 @@ impl CanonicalEncodedMode {
             EncodedCompactBlockOutput::Blocks
         };
         let request = EncodedCompactBlockRangeRequest {
-            range: read.chunk,
-            order: read.order,
+            range: chunk,
+            order,
             selection,
             output,
-            max_bytes: read.max_bytes,
+            max_bytes,
             enforce_wire_fee_limit: true,
         };
-        let cancel_bridge = CancelBridge::new(&read.cancel);
-        let started_at = Instant::now();
-        let direct_outcome = reads
-            .read_encoded_compact_block_chunk(
-                &view,
-                pinned,
-                request,
-                Arc::clone(&cancel_bridge.flag),
-            )
+        let cancel_bridge = CancelBridge::new(&cancel);
+        let outcome = reads
+            .read_encoded_compact_block_chunk(view, request, Arc::clone(&cancel_bridge.flag))
             .await;
         drop(cancel_bridge);
-        let read_duration = Some(started_at.elapsed());
-        match direct_outcome {
-            Ok(Some(range)) => {
-                let read_at = Reads::view_chain_epoch(&view);
-                drop(view);
-                if read.cancel.is_cancelled() {
-                    return cancelled_outcome(read_duration);
+        match outcome {
+            EncodedChunkReadOutcome::Direct {
+                read_at,
+                range,
+                read_duration,
+            } => {
+                if cancel.is_cancelled() {
+                    return cancelled_outcome(Some(read_duration));
                 }
                 ChunkReadOutcome {
-                    read_duration,
+                    read_duration: Some(read_duration),
                     converted: Ok(convert(read_at, EncodedRangeChunk::direct(range))),
                 }
             }
-            Ok(None) => {
+            EncodedChunkReadOutcome::Fallback(fallback_view) => {
                 let fallback_read = ChunkRead {
-                    chunk: read.chunk,
-                    order: read.order,
-                    max_bytes: read.max_bytes,
-                    view: if pinned {
-                        ChunkView::Captured(view)
-                    } else {
-                        drop(view);
-                        ChunkView::Current
-                    },
-                    cancel: read.cancel,
+                    chunk,
+                    order,
+                    max_bytes,
+                    view: fallback_view,
+                    cancel,
                 };
                 reads
                     .read_compact_block_chunk(fallback_read, move |epoch, blocks| {
@@ -346,31 +338,13 @@ impl CanonicalEncodedMode {
                     })
                     .await
             }
-            Err(status) => ChunkReadOutcome {
+            EncodedChunkReadOutcome::Failed {
                 read_duration,
-                converted: Err(ChunkReadFailure::Failed(status)),
+                failure,
+            } => ChunkReadOutcome {
+                read_duration,
+                converted: Err(failure),
             },
-        }
-    }
-}
-
-async fn resolve_chunk_view<Reads: CompactBlockReads>(
-    reads: &Reads,
-    chunk: BlockHeightRange,
-    view: ChunkView<Reads::View>,
-) -> Result<(Reads::View, bool), ChunkReadFailure> {
-    match view {
-        ChunkView::Captured(view) => Ok((view, true)),
-        ChunkView::Current => {
-            let view = reads
-                .capture_ephemeral_view()
-                .await
-                .map_err(ChunkReadFailure::Failed)?;
-            let read_at = Reads::view_chain_epoch(&view);
-            if !view_reaches(&read_at, chunk) {
-                return Err(ChunkReadFailure::TipBelowChunk(read_at));
-            }
-            Ok((view, false))
         }
     }
 }
