@@ -16,7 +16,7 @@ Start with [Deploying Zinder](runbooks/deploying.md) for preset selection, `v0.2
 - [Deploying on a VM](runbooks/deploying-on-a-vm.md): Compose + systemd, Zakura, node failover, and `zinder` binary verification.
 - [Deploying the single-volume container](runbooks/deploying-single-volume.md): single-volume `zinder serve` deployments on PaaS platforms (e.g., Railway) and Kubernetes `StatefulSet`.
 - [Exposing over TLS](runbooks/exposing-over-tls.md): Caddy TLS proxy, client rate limits, and browser-wallet CORS origins.
-- [Serve wallets over Tor](runbooks/tor-onion-service.md): public and private onion services and the wallet RPC privacy boundary.
+- [Serve wallets over Tor](runbooks/tor-onion-service.md) with public or private access and see what wallet RPCs disclose.
 - [Initial sync](runbooks/initial-sync.md): first-sync phases, progress metrics, and recovery.
 - [Bulk-catchup resource tuning](runbooks/bulk-catchup-resource-tuning.md): tuning CPU, memory, and sort budgets during construction.
 - [Upgrading the node](runbooks/upgrading-the-node.md): upgrading Zebra or Zakura without rebuilding stores.
