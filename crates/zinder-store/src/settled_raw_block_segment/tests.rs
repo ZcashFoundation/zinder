@@ -1,24 +1,31 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    fs::{self, OpenOptions},
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::Ordering,
 };
 
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempDir};
-use zinder_core::{BlockHash, BlockHeight, BlockId, Network, wire::encode_internal_block_hash};
+use zinder_core::{
+    BlockHash, BlockHeight, BlockId, Network, SerializedBytesDigest,
+    wire::encode_internal_block_hash,
+};
+
+use crate::positional_source::PositionalByteSource;
 
 use super::{
-    RawBlockCodec, RawBlockSegmentIdentity, RawBlockTransactionSlice,
+    DEFAULT_SETTLED_RAW_BLOCK_SEGMENT_MAX_SLAB_BYTES, RawBlockCodec, RawBlockRowIndexSlice,
+    RawBlockSegmentHeader, RawBlockSegmentIdentity, RawBlockTransactionSlice, RawBlockTxTableSlice,
     SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES, SettledRawBlockSegmentError,
-    SettledRawBlockSegmentOpenOptions, SettledRawBlockSegmentReader, SettledRawBlockSegmentWriter,
+    SettledRawBlockSegmentIndex, SettledRawBlockSegmentOpenOptions, SettledRawBlockSegmentReader,
+    SettledRawBlockSegmentWriter,
     format::{
-        DecodedRowIndexEntry, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock, MAX_TX_ENTRIES_PER_BLOCK,
-        ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN, TX_SLICE_ENTRY_LEN, TxSliceEntry,
-        VALIDATION_INVALID, VALIDATION_UNVALIDATED, VALIDATION_VALID,
+        CompactRawBlockRow, DecodedRowIndexEntry, FRAME_PREFIX_LEN, FRAME_PREFIX_U32, HEADER_LEN,
+        MAX_TX_ENTRIES_PER_BLOCK, ROW_INDEX_ENTRY_LEN, TRAILER_LEN, TX_SLICE_ENTRY_LEN,
+        TxSliceEntry, VALIDATION_INVALID, VALIDATION_UNVALIDATED, VALIDATION_VALID,
     },
-    reader::{PortableFrameDigest, admit_protected, validate_entries},
 };
 
 type TestOutcome<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -111,9 +118,15 @@ fn write_segment(
     Ok((target, identity))
 }
 
-fn recompute_portable_sha256(bytes: &[u8]) -> [u8; 32] {
+fn recompute_portable_pins(bytes: &mut [u8]) -> TestOutcome<([u8; 32], [u8; 32])> {
     let body_end = bytes.len() - TRAILER_LEN;
-    Sha256::digest(&bytes[..body_end]).into()
+    let trailer: [u8; 32] = Sha256::digest(&bytes[..body_end]).into();
+    bytes[body_end..].copy_from_slice(&trailer);
+    let (tx_table_offset, _) = header_offsets(bytes)?;
+    let mut index_hasher = Sha256::new();
+    index_hasher.update(&bytes[..HEADER_LEN]);
+    index_hasher.update(&bytes[tx_table_offset..]);
+    Ok((trailer, index_hasher.finalize().into()))
 }
 
 fn header_offsets(segment: &[u8]) -> TestOutcome<(usize, usize)> {
@@ -122,14 +135,19 @@ fn header_offsets(segment: &[u8]) -> TestOutcome<(usize, usize)> {
     Ok((tx_table_offset, row_index_offset))
 }
 
-fn assert_exact_block_and_tx_recovery(
-    reader: &SettledRawBlockSegmentReader,
+fn assert_exact_block_and_tx_recovery<S: PositionalByteSource>(
+    reader: &SettledRawBlockSegmentReader<S>,
     blocks: &[FixtureBlock],
 ) -> TestOutcome {
     assert_eq!(reader.block_count(), blocks.len());
     for block in blocks {
+        assert_eq!(reader.block_hash_at(block.id.height)?, block.id.hash);
         let recovered_block = reader.read_raw_block(block.id.height)?;
         assert_eq!(recovered_block, block.raw_bytes);
+        assert_eq!(
+            reader.uncompressed_digest_at(block.id.height)?,
+            SerializedBytesDigest::from_serialized_bytes(&block.raw_bytes)
+        );
         for (tx_idx, slice) in block.tx_slices.iter().enumerate() {
             let tx_idx_u32 = u32::try_from(tx_idx)?;
             let recovered_tx = reader.read_raw_transaction(block.id.height, tx_idx_u32)?;
@@ -152,6 +170,10 @@ fn assert_exact_block_and_tx_recovery(
 
 #[test]
 fn zstd_and_uncompressed_round_trips_recover_exact_blocks_and_txs() -> TestOutcome {
+    assert_eq!(
+        DEFAULT_SETTLED_RAW_BLOCK_SEGMENT_MAX_SLAB_BYTES,
+        256 * 1024 * 1024
+    );
     let dir = TempDir::new()?;
     let blocks = fixture_blocks()?;
     for (codec, name) in [
@@ -162,7 +184,10 @@ fn zstd_and_uncompressed_round_trips_recover_exact_blocks_and_txs() -> TestOutco
         let reader = SettledRawBlockSegmentReader::open(
             &path,
             &identity,
-            SettledRawBlockSegmentOpenOptions::default(),
+            SettledRawBlockSegmentOpenOptions {
+                require_fs_verity: false,
+                verify_full_payload: true,
+            },
         )?;
         assert_eq!(reader.identity(), identity);
         assert_exact_block_and_tx_recovery(&reader, &blocks)?;
@@ -179,7 +204,6 @@ fn zstd_and_uncompressed_round_trips_recover_exact_blocks_and_txs() -> TestOutco
             Err(SettledRawBlockSegmentError::HeightOutOfRange { .. })
         ));
     }
-    // Writing the identical segment a second time atomically replaces after verifying existing.
     let (re_path, re_id) = write_segment(dir.path(), "seg-zstd", RawBlockCodec::Zstd, &blocks)?;
     let reopened = SettledRawBlockSegmentReader::open(
         &re_path,
@@ -334,10 +358,44 @@ fn writer_rejects_broken_linkage_incomplete_finish_and_bad_tx_slices() -> TestOu
     Ok(())
 }
 
+fn synthetic_index_identity(
+    header: &RawBlockSegmentHeader,
+    raw_tx_table: &[u8],
+    raw_row_index: &[u8],
+) -> (Vec<u8>, RawBlockSegmentIdentity, u64) {
+    let header_bytes = header.encode();
+    let trailer = [0x44_u8; TRAILER_LEN];
+    let mut index_hasher = Sha256::new();
+    index_hasher.update(header_bytes);
+    index_hasher.update(raw_tx_table);
+    index_hasher.update(raw_row_index);
+    index_hasher.update(trailer);
+    let mut index_and_trailer =
+        Vec::with_capacity(raw_tx_table.len() + raw_row_index.len() + TRAILER_LEN);
+    index_and_trailer.extend_from_slice(raw_tx_table);
+    index_and_trailer.extend_from_slice(raw_row_index);
+    index_and_trailer.extend_from_slice(&trailer);
+    let total_len = header.tx_table_offset + u64::try_from(index_and_trailer.len()).unwrap_or(0);
+    let identity = RawBlockSegmentIdentity {
+        network: TEST_NETWORK,
+        codec: RawBlockCodec::from_id(header.codec_id).unwrap_or(RawBlockCodec::None),
+        start_height: BlockHeight::new(header.start_height),
+        end_block: BlockId::new(
+            BlockHeight::new(header.start_height + header.block_count - 1),
+            block_hash(header.start_height + header.block_count - 1),
+        ),
+        sha256: trailer,
+        index_sha256: index_hasher.finalize().into(),
+        fs_verity_sha256: None,
+    };
+    (index_and_trailer, identity, total_len)
+}
+
 #[test]
 fn protected_index_admission_refuses_oversized_block_and_frame_without_allocating() -> TestOutcome {
     let max_u32 = u32::try_from(SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES)?;
-    let header = SegmentHeader {
+    let slab_len = 100_u64;
+    let header = RawBlockSegmentHeader {
         network_tag: TEST_NETWORK.id(),
         segment_flags: 0,
         codec_id: RawBlockCodec::Zstd.id(),
@@ -346,8 +404,8 @@ fn protected_index_admission_refuses_oversized_block_and_frame_without_allocatin
         first_prev_hash_wire: encode_internal_block_hash(block_hash(0)),
         last_block_hash_wire: encode_internal_block_hash(block_hash(1)),
         slab_offset: HEADER_LEN as u64,
-        tx_table_offset: HEADER_LEN as u64 + 100,
-        row_index_offset: HEADER_LEN as u64 + 100,
+        tx_table_offset: HEADER_LEN as u64 + slab_len,
+        row_index_offset: HEADER_LEN as u64 + slab_len,
     };
     let oversized_uncompressed = DecodedRowIndexEntry {
         block_hash_wire: encode_internal_block_hash(block_hash(1)),
@@ -358,13 +416,15 @@ fn protected_index_admission_refuses_oversized_block_and_frame_without_allocatin
         tx_start_index: 0,
         tx_count: 0,
     };
+    let (raw_idx, expected, total_len) =
+        synthetic_index_identity(&header, &[], &oversized_uncompressed.encode());
     assert!(matches!(
-        validate_entries(
-            &[oversized_uncompressed],
-            &[],
-            100,
-            &header,
-            None::<&[PortableFrameDigest]>,
+        SettledRawBlockSegmentIndex::decode_index(
+            &header.encode(),
+            &raw_idx,
+            &expected,
+            total_len,
+            true,
         ),
         Err(SettledRawBlockSegmentError::InvalidFormat(_))
     ));
@@ -373,14 +433,21 @@ fn protected_index_admission_refuses_oversized_block_and_frame_without_allocatin
         uncompressed_len: 1024,
         ..oversized_uncompressed
     };
-    let near_4gib_slab_len = u32::MAX - 1024;
+    let near_4gib_slab_len = u64::from(u32::MAX - 1024);
+    let oversized_header = RawBlockSegmentHeader {
+        tx_table_offset: HEADER_LEN as u64 + near_4gib_slab_len,
+        row_index_offset: HEADER_LEN as u64 + near_4gib_slab_len,
+        ..header
+    };
+    let (raw_idx_big, expected_big, total_big) =
+        synthetic_index_identity(&oversized_header, &[], &valid_uncompressed.encode());
     assert!(matches!(
-        validate_entries(
-            &[valid_uncompressed],
-            &[],
-            near_4gib_slab_len,
-            &header,
-            None::<&[PortableFrameDigest]>,
+        SettledRawBlockSegmentIndex::decode_index(
+            &oversized_header.encode(),
+            &raw_idx_big,
+            &expected_big,
+            total_big,
+            true,
         ),
         Err(SettledRawBlockSegmentError::InvalidFormat(_))
     ));
@@ -394,19 +461,17 @@ fn open_rejects_oversized_uncompressed_len_and_oob_tx_slice_in_forged_segment() 
     let (path, identity) = write_segment(dir.path(), "bounds", RawBlockCodec::Zstd, &blocks)?;
     let original = fs::read(&path)?;
     let (tx_table_offset, row_index_offset) = header_offsets(&original)?;
-    let body_end = original.len() - TRAILER_LEN;
 
     let mut oversized_buf = original.clone();
     let max_plus_one = u32::try_from(SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES + 1)?;
-    let max_plus_one_bytes = max_plus_one.to_be_bytes();
     oversized_buf[row_index_offset + 100..row_index_offset + 104]
-        .copy_from_slice(&max_plus_one_bytes);
-    let oversized_sha = recompute_portable_sha256(&oversized_buf);
-    oversized_buf[body_end..].copy_from_slice(&oversized_sha);
+        .copy_from_slice(&max_plus_one.to_be_bytes());
+    let (oversized_sha, oversized_idx_sha) = recompute_portable_pins(&mut oversized_buf)?;
     let oversized_path = dir.path().join("forged-oversized");
     fs::write(&oversized_path, &oversized_buf)?;
     let oversized_id = RawBlockSegmentIdentity {
         sha256: oversized_sha,
+        index_sha256: oversized_idx_sha,
         fs_verity_sha256: None,
         ..identity
     };
@@ -422,12 +487,12 @@ fn open_rejects_oversized_uncompressed_len_and_oob_tx_slice_in_forged_segment() 
     let mut oob_tx_buf = original;
     let raw_block_len = u32::try_from(blocks[0].raw_bytes.len())?.to_be_bytes();
     oob_tx_buf[tx_table_offset..tx_table_offset + 4].copy_from_slice(&raw_block_len);
-    let oob_sha = recompute_portable_sha256(&oob_tx_buf);
-    oob_tx_buf[body_end..].copy_from_slice(&oob_sha);
+    let (oob_sha, oob_idx_sha) = recompute_portable_pins(&mut oob_tx_buf)?;
     let oob_path = dir.path().join("forged-oob-tx");
     fs::write(&oob_path, &oob_tx_buf)?;
     let oob_id = RawBlockSegmentIdentity {
         sha256: oob_sha,
+        index_sha256: oob_idx_sha,
         fs_verity_sha256: None,
         ..identity
     };
@@ -442,52 +507,58 @@ fn open_rejects_oversized_uncompressed_len_and_oob_tx_slice_in_forged_segment() 
     Ok(())
 }
 
-fn corrupt_and_open(
-    tampered_path: &Path,
-    original: &[u8],
+#[derive(Clone, Copy)]
+struct TamperBase<'a> {
+    out: &'a Path,
+    original: &'a [u8],
     identity: RawBlockSegmentIdentity,
+}
+
+fn corrupt_and_open(
+    base: TamperBase<'_>,
     mutator: &dyn Fn(&mut Vec<u8>),
-    recompute_trailer: bool,
+    recompute_pins: bool,
+    verify_full_payload: bool,
 ) -> TestOutcome<SettledRawBlockSegmentError> {
-    let mut mutated = original.to_vec();
+    let mut mutated = base.original.to_vec();
     mutator(&mut mutated);
-    let mut expected = identity;
+    let mut expected = base.identity;
     expected.fs_verity_sha256 = None;
-    if recompute_trailer {
-        let forged_sha = recompute_portable_sha256(&mutated);
-        let body_end = mutated.len() - TRAILER_LEN;
-        mutated[body_end..].copy_from_slice(&forged_sha);
+    if recompute_pins {
+        let (forged_sha, forged_idx_sha) = recompute_portable_pins(&mut mutated)?;
         expected.sha256 = forged_sha;
+        expected.index_sha256 = forged_idx_sha;
     }
-    fs::write(tampered_path, &mutated)?;
+    fs::write(base.out, &mutated)?;
     match SettledRawBlockSegmentReader::open(
-        tampered_path,
+        base.out,
         &expected,
-        SettledRawBlockSegmentOpenOptions::default(),
+        SettledRawBlockSegmentOpenOptions {
+            require_fs_verity: false,
+            verify_full_payload,
+        },
     ) {
         Ok(_) => Err("expected tamper refusal on open".into()),
         Err(err) => Ok(err),
     }
 }
 
-fn assert_slab_prefix_tamper_rejected(
-    out: &Path,
-    original: &[u8],
-    identity: RawBlockSegmentIdentity,
-) -> TestOutcome {
+fn assert_slab_prefix_tamper_rejected(base: TamperBase<'_>) -> TestOutcome {
     assert!(matches!(
-        corrupt_and_open(
-            out,
-            original,
-            identity,
-            &|buf| buf[HEADER_LEN] = 0xff,
-            false,
-        )?,
+        corrupt_and_open(base, &|buf| buf[HEADER_LEN] = 0xff, false, true)?,
+        SettledRawBlockSegmentError::InvalidFormat(_)
+    ));
+    assert!(matches!(
+        corrupt_and_open(base, &|buf| buf[HEADER_LEN] = 0xff, true, true)?,
+        SettledRawBlockSegmentError::InvalidFormat(_)
+    ));
+    assert!(matches!(
+        corrupt_and_open(base, &|buf| buf[HEADER_LEN + 3] ^= 0x01, false, true)?,
         SettledRawBlockSegmentError::PayloadIntegrity(_)
     ));
     assert!(matches!(
-        corrupt_and_open(out, original, identity, &|buf| buf[HEADER_LEN] = 0xff, true,)?,
-        SettledRawBlockSegmentError::InvalidFormat(_)
+        corrupt_and_open(base, &|buf| buf[HEADER_LEN + 3] ^= 0x01, true, true)?,
+        SettledRawBlockSegmentError::PayloadIntegrity(_)
     ));
     Ok(())
 }
@@ -500,67 +571,53 @@ fn reader_fails_closed_on_tampered_header_index_slab_and_trailer() -> TestOutcom
     let original = fs::read(&path)?;
     let (_tx_off, row_off) = header_offsets(&original)?;
     let out = dir.path().join("tampered");
+    let base = TamperBase {
+        out: &out,
+        original: &original,
+        identity,
+    };
 
     assert!(matches!(
-        corrupt_and_open(&out, &original, identity, &|buf| buf[0] ^= 0xff, false)?,
+        corrupt_and_open(base, &|buf| buf[0] ^= 0xff, false, true)?,
         SettledRawBlockSegmentError::InvalidFormat(_)
     ));
     assert!(matches!(
-        corrupt_and_open(&out, &original, identity, &|buf| buf[13] = 1, false)?,
+        corrupt_and_open(base, &|buf| buf[13] = 1, false, true)?,
         SettledRawBlockSegmentError::InvalidFormat(_)
     ));
     assert!(matches!(
-        corrupt_and_open(&out, &original, identity, &|buf| buf[15] = 9, false)?,
+        corrupt_and_open(base, &|buf| buf[15] = 9, false, true)?,
         SettledRawBlockSegmentError::InvalidFormat(_)
     ));
     assert!(matches!(
-        corrupt_and_open(&out, &original, identity, &|buf| buf[120] = 1, false)?,
+        corrupt_and_open(base, &|buf| buf[120] = 1, false, true)?,
         SettledRawBlockSegmentError::InvalidFormat(_)
     ));
     assert!(matches!(
-        corrupt_and_open(
-            &out,
-            &original,
-            identity,
-            &|buf| buf[row_off + 115] = 1,
-            true
-        )?,
+        corrupt_and_open(base, &|buf| buf[row_off + 115] = 1, true, true)?,
         SettledRawBlockSegmentError::InvalidFormat(_)
     ));
-    assert_slab_prefix_tamper_rejected(&out, &original, identity)?;
+    assert_slab_prefix_tamper_rejected(base)?;
     let slab_payload_byte = HEADER_LEN + usize::try_from(FRAME_PREFIX_U32)? + 2;
     assert!(matches!(
-        corrupt_and_open(
-            &out,
-            &original,
-            identity,
-            &|buf| buf[slab_payload_byte] ^= 0x01,
-            false,
-        )?,
+        corrupt_and_open(base, &|buf| buf[slab_payload_byte] ^= 0x01, false, true)?,
         SettledRawBlockSegmentError::PayloadIntegrity(_)
     ));
     assert!(matches!(
         corrupt_and_open(
-            &out,
-            &original,
-            identity,
+            base,
             &|buf| {
                 let last = buf.len() - 1;
                 buf[last] ^= 0x01;
             },
+            false,
             false,
         )?,
         SettledRawBlockSegmentError::PayloadIntegrity(_)
     ));
     let last_row = row_off + (blocks.len() - 1) * ROW_INDEX_ENTRY_LEN;
     assert!(matches!(
-        corrupt_and_open(
-            &out,
-            &original,
-            identity,
-            &|buf| buf[last_row] ^= 0x01,
-            true
-        )?,
+        corrupt_and_open(base, &|buf| buf[last_row] ^= 0x01, true, false)?,
         SettledRawBlockSegmentError::ChainLinkage(_)
     ));
     Ok(())
@@ -576,15 +633,14 @@ fn reader_rejects_block_and_tx_hash_tamper_with_sticky_invalid_state() -> TestOu
 
     let mut bad_block_buf = original.clone();
     bad_block_buf[row_off + ROW_INDEX_ENTRY_LEN + 64] ^= 0x01;
-    let bad_block_sha = recompute_portable_sha256(&bad_block_buf);
-    let bad_block_trailer_start = bad_block_buf.len() - TRAILER_LEN;
-    bad_block_buf[bad_block_trailer_start..].copy_from_slice(&bad_block_sha);
+    let (bad_block_sha, bad_block_idx_sha) = recompute_portable_pins(&mut bad_block_buf)?;
     let bad_block_path = dir.path().join("bad-block-sha");
     fs::write(&bad_block_path, &bad_block_buf)?;
     let reader_block = SettledRawBlockSegmentReader::open(
         &bad_block_path,
         &RawBlockSegmentIdentity {
             sha256: bad_block_sha,
+            index_sha256: bad_block_idx_sha,
             fs_verity_sha256: None,
             ..identity
         },
@@ -605,15 +661,14 @@ fn reader_rejects_block_and_tx_hash_tamper_with_sticky_invalid_state() -> TestOu
 
     let mut bad_tx_buf = original;
     bad_tx_buf[tx_off + 2 * TX_SLICE_ENTRY_LEN + 8] ^= 0x01;
-    let bad_tx_sha = recompute_portable_sha256(&bad_tx_buf);
-    let bad_tx_trailer_start = bad_tx_buf.len() - TRAILER_LEN;
-    bad_tx_buf[bad_tx_trailer_start..].copy_from_slice(&bad_tx_sha);
+    let (bad_tx_sha, bad_tx_idx_sha) = recompute_portable_pins(&mut bad_tx_buf)?;
     let bad_tx_path = dir.path().join("bad-tx-sha");
     fs::write(&bad_tx_path, &bad_tx_buf)?;
     let reader_tx = SettledRawBlockSegmentReader::open(
         &bad_tx_path,
         &RawBlockSegmentIdentity {
             sha256: bad_tx_sha,
+            index_sha256: bad_tx_idx_sha,
             fs_verity_sha256: None,
             ..identity
         },
@@ -678,6 +733,7 @@ fn reader_detects_post_admission_tamper_and_enforces_require_fs_verity() -> Test
             &portable_id,
             SettledRawBlockSegmentOpenOptions {
                 require_fs_verity: true,
+                verify_full_payload: false,
             },
         ),
         Err(SettledRawBlockSegmentError::FsVerityRequired)
@@ -694,7 +750,7 @@ fn tx_slice_entry_round_trips_and_overflow_slice_fails_admission() -> TestOutcom
     };
     assert_eq!(TxSliceEntry::decode(&entry.encode())?, entry);
 
-    let header = SegmentHeader {
+    let header = RawBlockSegmentHeader {
         network_tag: TEST_NETWORK.id(),
         segment_flags: 0,
         codec_id: RawBlockCodec::Zstd.id(),
@@ -720,13 +776,15 @@ fn tx_slice_entry_round_trips_and_overflow_slice_fails_admission() -> TestOutcom
         len: 16,
         sha256: [0x33; 32],
     };
+    let (raw_idx, expected, total_len) =
+        synthetic_index_identity(&header, &overflow_tx.encode(), &row.encode());
     assert!(matches!(
-        validate_entries(
-            &[row],
-            &[overflow_tx],
-            64,
-            &header,
-            None::<&[PortableFrameDigest]>,
+        SettledRawBlockSegmentIndex::decode_index(
+            &header.encode(),
+            &raw_idx,
+            &expected,
+            total_len,
+            true,
         ),
         Err(SettledRawBlockSegmentError::InvalidFormat(_))
     ));
@@ -734,8 +792,8 @@ fn tx_slice_entry_round_trips_and_overflow_slice_fails_admission() -> TestOutcom
 }
 
 #[test]
-fn indexed_block_mark_valid_preserves_invalid_state() {
-    let row = IndexedBlock::from_entry(&DecodedRowIndexEntry {
+fn compact_raw_block_row_mark_valid_preserves_invalid_state() {
+    let row = CompactRawBlockRow::from_entry(&DecodedRowIndexEntry {
         block_hash_wire: [0x11; 32],
         payload_sha256: [0x22; 32],
         uncompressed_sha256: [0x33; 32],
@@ -759,7 +817,7 @@ fn indexed_block_mark_valid_preserves_invalid_state() {
         VALIDATION_INVALID
     );
 
-    let valid_row = IndexedBlock::from_entry(&DecodedRowIndexEntry {
+    let valid_row = CompactRawBlockRow::from_entry(&DecodedRowIndexEntry {
         block_hash_wire: [0x44; 32],
         payload_sha256: [0x55; 32],
         uncompressed_sha256: [0x66; 32],
@@ -855,7 +913,7 @@ fn write_forged_sparse_segment(
         BlockHeight::new(spec.block_count),
         block_hash(spec.block_count),
     );
-    let header = SegmentHeader {
+    let header = RawBlockSegmentHeader {
         network_tag: TEST_NETWORK.id(),
         segment_flags: 0,
         codec_id: RawBlockCodec::None.id(),
@@ -992,7 +1050,7 @@ fn open_rejects_forged_sparse_file_with_large_bounded_block_count_and_bad_digest
 }
 
 #[test]
-fn admit_protected_reads_buffered_metadata_across_buffer_refills() -> TestOutcome {
+fn compact_index_drops_in_ram_tx_slice_table_while_reading_across_pages() -> TestOutcome {
     let dir = TempDir::new()?;
     let slices_per_block = 3_500_usize;
     let raw_block = vec![0xab_u8; 8_192];
@@ -1016,25 +1074,35 @@ fn admit_protected_reads_buffered_metadata_across_buffer_refills() -> TestOutcom
         },
     ];
     let (path, identity) = write_segment(dir.path(), "prot-buf", RawBlockCodec::Zstd, &blocks)?;
-
-    let mut file = File::open(&path)?;
-    let mut header_bytes = [0_u8; HEADER_LEN];
-    file.read_exact(&mut header_bytes)?;
-    let header = SegmentHeader::decode(&header_bytes)?;
-    let reader = admit_protected(file, &identity, header)?;
-    assert!(reader.kernel_verified());
+    let raw_file_bytes = fs::read(&path)?;
+    let portable_id = RawBlockSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+    let reader = SettledRawBlockSegmentReader::open_source(
+        Bytes::from(raw_file_bytes.clone()),
+        &portable_id,
+        SettledRawBlockSegmentOpenOptions::default(),
+    )?;
+    // 7,000 txs * 40 B = 280 KiB on disk; in-memory footprint stays tiny (zero Vec<TxSliceEntry>).
+    assert_eq!(reader.tx_entry_count(), 7_000);
+    assert!(reader.heap_metadata_bytes() <= 2 * 20 + 30 * 32);
     assert_eq!(reader.read_raw_block(BlockHeight::new(2))?, raw_block);
     assert_eq!(
         reader.read_raw_transaction(BlockHeight::new(2), 3_499)?,
         vec![0xab_u8]
     );
+    let batch = reader.read_raw_transactions_in_block(BlockHeight::new(2), &[0, 3_499, 1_024])?;
+    assert_eq!(batch, vec![vec![0xab_u8], vec![0xab_u8], vec![0xab_u8]]);
 
-    let mut wrong_identity = identity;
+    let mut wrong_identity = portable_id;
     wrong_identity.sha256[0] ^= 0xff;
-    let mut bad_file = File::open(&path)?;
-    bad_file.read_exact(&mut header_bytes)?;
     assert!(matches!(
-        admit_protected(bad_file, &wrong_identity, header),
+        SettledRawBlockSegmentReader::open_source(
+            Bytes::from(raw_file_bytes),
+            &wrong_identity,
+            SettledRawBlockSegmentOpenOptions::default(),
+        ),
         Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
     ));
     Ok(())
@@ -1068,21 +1136,25 @@ fn writer_rejects_block_exceeding_max_tx_entries_limit() -> TestOutcome {
 }
 
 #[test]
-fn validate_entries_rejects_single_block_exceeding_per_block_tx_limit() -> TestOutcome {
+fn decode_index_rejects_single_block_exceeding_per_block_tx_limit() -> TestOutcome {
     let per_block_overflow = u32::try_from(MAX_TX_ENTRIES_PER_BLOCK)? + 1;
     let tx_count_usize = usize::try_from(per_block_overflow)?;
     let sample_tx = TxSliceEntry {
         offset: 0,
         len: 1,
         sha256: [0x11; 32],
-    };
-    let tx_entries = vec![sample_tx; tx_count_usize];
-    let frame_len = FRAME_PREFIX_U32 + 64;
+    }
+    .encode();
+    let mut raw_tx_table = Vec::with_capacity(tx_count_usize * TX_SLICE_ENTRY_LEN);
+    for _ in 0..tx_count_usize {
+        raw_tx_table.extend_from_slice(&sample_tx);
+    }
+    let frame_len = u64::from(FRAME_PREFIX_U32) + 64;
     let slab_len = 2 * frame_len;
-    let tx_table_offset = HEADER_LEN as u64 + u64::from(slab_len);
+    let tx_table_offset = HEADER_LEN as u64 + slab_len;
     let tx_table_bytes = u64::from(per_block_overflow) * TX_SLICE_ENTRY_LEN as u64;
     let row_index_offset = tx_table_offset + tx_table_bytes;
-    let header = SegmentHeader {
+    let header = RawBlockSegmentHeader {
         network_tag: TEST_NETWORK.id(),
         segment_flags: 0,
         codec_id: RawBlockCodec::None.id(),
@@ -1094,8 +1166,9 @@ fn validate_entries_rejects_single_block_exceeding_per_block_tx_limit() -> TestO
         tx_table_offset,
         row_index_offset,
     };
-    let entries = [
-        DecodedRowIndexEntry {
+    let mut raw_rows = Vec::with_capacity(2 * ROW_INDEX_ENTRY_LEN);
+    raw_rows.extend_from_slice(
+        &DecodedRowIndexEntry {
             block_hash_wire: encode_internal_block_hash(block_hash(1)),
             payload_sha256: [0xaa; 32],
             uncompressed_sha256: [0xaa; 32],
@@ -1103,34 +1176,180 @@ fn validate_entries_rejects_single_block_exceeding_per_block_tx_limit() -> TestO
             uncompressed_len: 64,
             tx_start_index: 0,
             tx_count: per_block_overflow,
-        },
-        DecodedRowIndexEntry {
+        }
+        .encode(),
+    );
+    raw_rows.extend_from_slice(
+        &DecodedRowIndexEntry {
             block_hash_wire: encode_internal_block_hash(block_hash(2)),
             payload_sha256: [0xbb; 32],
             uncompressed_sha256: [0xbb; 32],
-            slab_rel_offset: frame_len,
+            slab_rel_offset: u32::try_from(frame_len)?,
             uncompressed_len: 64,
             tx_start_index: per_block_overflow,
             tx_count: 0,
+        }
+        .encode(),
+    );
+    let (index_and_trailer, expected, total_len) =
+        synthetic_index_identity(&header, &raw_tx_table, &raw_rows);
+    assert!(matches!(
+        SettledRawBlockSegmentIndex::decode_index(
+            &header.encode(),
+            &index_and_trailer,
+            &expected,
+            total_len,
+            true,
+        ),
+        Err(SettledRawBlockSegmentError::InvalidFormat(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn sans_io_planner_and_page_tamper_detection_on_bytes_source() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = fixture_blocks()?;
+    let (path, identity) = write_segment(dir.path(), "sans-io-src", RawBlockCodec::Zstd, &blocks)?;
+    let raw_bytes = fs::read(&path)?;
+    let portable_id = RawBlockSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+    let reader = SettledRawBlockSegmentReader::open_source(
+        Bytes::from(raw_bytes.clone()),
+        &portable_id,
+        SettledRawBlockSegmentOpenOptions::default(),
+    )?;
+    let index = reader.index();
+    let tx_plan = index.plan_tx_read(BlockHeight::new(4), 2)?;
+    let row_start = usize::try_from(tx_plan.row_index_byte_range().offset)?;
+    let raw_rows = &raw_bytes[row_start..row_start + tx_plan.row_index_byte_range().len];
+    let tx_start = usize::try_from(tx_plan.tx_table_byte_range().offset)?;
+    let raw_txs = &raw_bytes[tx_start..tx_start + tx_plan.tx_table_byte_range().len];
+    let slab_start = usize::try_from(tx_plan.slab_byte_range().offset)?;
+    let raw_frame = &raw_bytes[slab_start..slab_start + tx_plan.slab_byte_range().len];
+    let verified_rows = index.authenticate_row_index_slice(RawBlockRowIndexSlice::new(
+        tx_plan.row_index_byte_range().offset,
+        raw_rows,
+    ))?;
+    let verified_txs = index.authenticate_tx_table_slice(RawBlockTxTableSlice::new(
+        tx_plan.tx_table_byte_range().offset,
+        raw_txs,
+    ))?;
+    let recovered_tx =
+        index.verify_and_decode_tx(&tx_plan, verified_rows, verified_txs, raw_frame)?;
+    let slice = blocks[3].tx_slices[2];
+    let expected_slice =
+        &blocks[3].raw_bytes[slice.offset as usize..slice.offset as usize + slice.len as usize];
+    assert_eq!(recovered_tx.as_slice(), expected_slice);
+
+    let (tx_off, row_off) = header_offsets(&raw_bytes)?;
+    let mut tampered_row = raw_rows.to_vec();
+    tampered_row[0] ^= 0xff;
+    assert!(matches!(
+        index.authenticate_row_index_slice(RawBlockRowIndexSlice::new(
+            tx_plan.row_index_byte_range().offset,
+            &tampered_row,
+        )),
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+    let _ = (tx_off, row_off);
+
+    let reader2 = SettledRawBlockSegmentReader::open_source(
+        Bytes::from(raw_bytes),
+        &portable_id,
+        SettledRawBlockSegmentOpenOptions::default(),
+    )?;
+    let mut visited = Vec::new();
+    let count = reader2.visit_indexed_transaction_digests::<SettledRawBlockSegmentError, _>(
+        BlockHeight::new(4),
+        |tx_idx, digest| {
+            visited.push((tx_idx, digest));
+            Ok(())
         },
-    ];
-    let frames = [
-        PortableFrameDigest {
-            rel_offset: 0,
-            frame_len,
-            payload_sha256: [0xaa; 32],
-        },
-        PortableFrameDigest {
-            rel_offset: frame_len,
-            frame_len,
-            payload_sha256: [0xbb; 32],
-        },
-    ];
-    for streamed in [None, Some(frames.as_slice())] {
-        assert!(matches!(
-            validate_entries(&entries, &tx_entries, slab_len, &header, streamed),
-            Err(SettledRawBlockSegmentError::InvalidFormat(_))
-        ));
-    }
+    )?;
+    assert_eq!(count, 4);
+    assert_eq!(visited.len(), 4);
+    let rows_meta = reader2.read_all_row_hashes_and_digests()?;
+    assert_eq!(rows_meta.len(), blocks.len());
+    assert_eq!(
+        rows_meta[3].1,
+        SerializedBytesDigest::from_serialized_bytes(&blocks[3].raw_bytes)
+    );
+    Ok(())
+}
+
+#[test]
+fn portable_post_admission_tamper_of_row_index_and_tx_table_latches_invalid() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = fixture_blocks()?;
+    let (path, identity) =
+        write_segment(dir.path(), "post-admit-meta", RawBlockCodec::None, &blocks)?;
+    let original = fs::read(&path)?;
+    let (tx_off, row_off) = header_offsets(&original)?;
+    let portable_id = RawBlockSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+
+    let row_path = dir.path().join("post-admit-row");
+    fs::write(&row_path, &original)?;
+    let reader_row = SettledRawBlockSegmentReader::open(
+        &row_path,
+        &portable_id,
+        SettledRawBlockSegmentOpenOptions::default(),
+    )?;
+    let mut file_row = OpenOptions::new().write(true).open(&row_path)?;
+    file_row.seek(SeekFrom::Start(u64::try_from(row_off + 12)?))?;
+    file_row.write_all(&[original[row_off + 12] ^ 0x55])?;
+    file_row.sync_all()?;
+    drop(file_row);
+    assert!(matches!(
+        reader_row.read_raw_block(BlockHeight::new(1)),
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader_row.read_raw_block(BlockHeight::new(1)),
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+
+    let tx_path = dir.path().join("post-admit-tx");
+    fs::write(&tx_path, &original)?;
+    let reader_tx = SettledRawBlockSegmentReader::open(
+        &tx_path,
+        &portable_id,
+        SettledRawBlockSegmentOpenOptions::default(),
+    )?;
+    let mut file_tx = OpenOptions::new().write(true).open(&tx_path)?;
+    file_tx.seek(SeekFrom::Start(u64::try_from(tx_off + 12)?))?;
+    file_tx.write_all(&[original[tx_off + 12] ^ 0x55])?;
+    file_tx.sync_all()?;
+    drop(file_tx);
+    assert!(matches!(
+        reader_tx.read_raw_transaction(BlockHeight::new(2), 0),
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader_tx.read_raw_transaction(BlockHeight::new(2), 0),
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
+
+    let frame_tamper_path = dir.path().join("post-admit-full-verify");
+    let mut frame_tamper = original;
+    let payload_byte = HEADER_LEN + FRAME_PREFIX_LEN + 1;
+    frame_tamper[payload_byte] ^= 0x33;
+    fs::write(&frame_tamper_path, &frame_tamper)?;
+    assert!(matches!(
+        SettledRawBlockSegmentReader::open(
+            &frame_tamper_path,
+            &portable_id,
+            SettledRawBlockSegmentOpenOptions {
+                require_fs_verity: false,
+                verify_full_payload: true,
+            },
+        ),
+        Err(SettledRawBlockSegmentError::PayloadIntegrity(_))
+    ));
     Ok(())
 }

@@ -1328,6 +1328,49 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         )
     }
 
+    /// Reads and authenticates every row's block hash in a single coalesced
+    /// index read in ascending block height order.
+    pub(crate) fn read_all_block_hashes(
+        &self,
+    ) -> Result<Vec<BlockHash>, SettledShieldedSegmentError> {
+        let row_count = self.index.rows.len();
+        for row in &self.index.rows {
+            if row.validation_state() == VALIDATION_INVALID {
+                return Err(SettledShieldedSegmentError::PayloadIntegrity(
+                    "shielded segment frame previously failed validation".to_owned(),
+                ));
+            }
+        }
+        let byte_len = row_count.checked_mul(ROW_INDEX_ENTRY_LEN).ok_or_else(|| {
+            SettledShieldedSegmentError::InvalidFormat("shielded index size overflow".to_owned())
+        })?;
+        let raw_index = self
+            .source
+            .read_vec_at(self.index.index_offset, byte_len)
+            .inspect_err(|_| {
+                for row in &self.index.rows {
+                    row.mark_invalid();
+                }
+            })?;
+        let verified = self
+            .index
+            .authenticate_index_slice(ShieldedIndexSlice::new(
+                self.index.index_offset,
+                &raw_index,
+            ))?;
+        let mut hashes = Vec::with_capacity(row_count);
+        for row_idx in 0..row_count {
+            let wire = verified.block_hash_wire(row_idx).inspect_err(|_| {
+                self.index.rows[row_idx].mark_invalid();
+            })?;
+            let hash = decode_wire_hash(&wire, "row.block_hash").inspect_err(|_| {
+                self.index.rows[row_idx].mark_invalid();
+            })?;
+            hashes.push(hash);
+        }
+        Ok(hashes)
+    }
+
     /// Returns the uncompressed canonical byte budget recorded for `height`.
     ///
     /// # Errors

@@ -11,24 +11,62 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use zinder_core::{BlockHash, BlockHeight, BlockId, wire::encode_internal_block_hash};
 
+use crate::segment_verity;
+
 use super::{
-    RawBlockCodec, RawBlockSegmentIdentity, RawBlockTransactionSlice,
+    RawBlockCodec, RawBlockSegmentHeader, RawBlockSegmentIdentity, RawBlockTransactionSlice,
     SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES, SettledRawBlockSegmentError,
     SettledRawBlockSegmentOpenOptions, SettledRawBlockSegmentReader,
     format::{
         DecodedRowIndexEntry, FRAME_PREFIX_LEN, HEADER_LEN, MAX_SEGMENT_TX_ENTRIES, MAX_SLAB_BYTES,
-        MAX_TX_ENTRIES_PER_BLOCK, ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, SegmentHeader,
-        TX_SLICE_ENTRY_LEN, TxSliceEntry, ZSTD_COMPRESSION_LEVEL, check_contiguous_block,
-        encode_frame_prefix,
+        MAX_TX_ENTRIES_PER_BLOCK, ROW_INDEX_ENTRY_LEN, STAGING_CHUNK, TX_SLICE_ENTRY_LEN,
+        TxSliceEntry, ZSTD_COMPRESSION_LEVEL, check_contiguous_block, encode_frame_prefix,
     },
-    parent_directory, verity,
+    parent_directory,
 };
+
+enum StagedTarget {
+    Temp(NamedTempFile),
+    OwnedFile(File),
+}
+
+struct FinalizedStagedBody {
+    target: StagedTarget,
+    trailer: [u8; 32],
+    index_sha256: [u8; 32],
+    verity_digest: [u8; 32],
+}
+
+impl StagedTarget {
+    fn as_file(&self) -> &File {
+        match self {
+            Self::Temp(temp) => temp.as_file(),
+            Self::OwnedFile(file) => file,
+        }
+    }
+}
+
+impl io::Write for StagedTarget {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Temp(temp) => temp.write(buf),
+            Self::OwnedFile(file) => file.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Temp(temp) => temp.flush(),
+            Self::OwnedFile(file) => file.flush(),
+        }
+    }
+}
 
 /// Single-pass staged writer for one immutable `ZSBLKB01` segment.
 pub struct SettledRawBlockSegmentWriter {
     identity: RawBlockSegmentIdentity,
     target: PathBuf,
-    staged: Option<BufWriter<NamedTempFile>>,
+    staged: Option<BufWriter<StagedTarget>>,
     slab_len: u32,
     tx_entries: Vec<[u8; TX_SLICE_ENTRY_LEN]>,
     rows: Vec<[u8; ROW_INDEX_ENTRY_LEN]>,
@@ -38,9 +76,30 @@ pub struct SettledRawBlockSegmentWriter {
 
 impl SettledRawBlockSegmentWriter {
     /// Creates a staged `ZSBLKB01` writer destined for `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError`] if `span` is invalid or writing the
+    /// initial zeroed header fails.
     pub fn create(
         target: &Path,
         staged: NamedTempFile,
+        span: RawBlockSegmentIdentity,
+    ) -> Result<Self, SettledRawBlockSegmentError> {
+        Self::create_target(target.to_owned(), StagedTarget::Temp(staged), span)
+    }
+
+    /// Creates a staged `ZSBLKB01` writer backed directly by a caller-owned `File`.
+    pub(crate) fn create_in_file(
+        staged: File,
+        span: RawBlockSegmentIdentity,
+    ) -> Result<Self, SettledRawBlockSegmentError> {
+        Self::create_target(PathBuf::new(), StagedTarget::OwnedFile(staged), span)
+    }
+
+    fn create_target(
+        target: PathBuf,
+        staged: StagedTarget,
         span: RawBlockSegmentIdentity,
     ) -> Result<Self, SettledRawBlockSegmentError> {
         span.block_count()?;
@@ -48,7 +107,7 @@ impl SettledRawBlockSegmentWriter {
         buffered.write_all(&[0_u8; HEADER_LEN])?;
         Ok(Self {
             identity: span,
-            target: target.to_owned(),
+            target,
             staged: Some(buffered),
             slab_len: 0,
             tx_entries: Vec::new(),
@@ -60,6 +119,12 @@ impl SettledRawBlockSegmentWriter {
 
     /// Validates, optionally compresses, and writes one contiguous canonical raw
     /// block and its transaction slice metadata to `Slab 0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError`] on height/parent linkage gaps,
+    /// block or tx-table limits, slice out-of-bounds errors, compression failures,
+    /// or staged I/O failures.
     pub fn push(
         &mut self,
         block_id: BlockId,
@@ -106,8 +171,75 @@ impl SettledRawBlockSegmentWriter {
     }
 
     /// Finalizes the transaction slice table, row index, header, SHA-256
-    /// trailer, optional `fs-verity` protection, and atomic target placement.
+    /// trailer, `index_sha256` pin, optional `fs-verity` protection, and atomic target placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError`] if the segment is incomplete,
+    /// hashing or `fs-verity` protection fails, or atomic persistence fails.
     pub fn finish(mut self) -> Result<RawBlockSegmentIdentity, SettledRawBlockSegmentError> {
+        let FinalizedStagedBody {
+            target: staged_target,
+            trailer,
+            index_sha256,
+            verity_digest,
+        } = self.finalize_staged_body()?;
+        let StagedTarget::Temp(staged_file) = staged_target else {
+            return Err(SettledRawBlockSegmentError::InvalidFormat(
+                "caller-owned staged raw block writer must use finish_staged_file".to_owned(),
+            ));
+        };
+
+        let readonly_staged = segment_verity::reopen_staged(&staged_file, "raw block segment")?;
+        let (writable_file, temp_path) = staged_file.into_parts();
+        drop(writable_file);
+        segment_verity::protect_new_segment(
+            &readonly_staged,
+            Some(verity_digest),
+            "raw block segment",
+        )?;
+        drop(readonly_staged);
+
+        let identity = RawBlockSegmentIdentity {
+            sha256: trailer,
+            index_sha256,
+            fs_verity_sha256: Some(verity_digest),
+            ..self.identity
+        };
+        persist_segment(temp_path, &self.target, &identity)?;
+        File::open(parent_directory(&self.target))?.sync_all()?;
+        Ok(identity)
+    }
+
+    /// Finalizes headers, indexes, trailer, and sync on a caller-owned staged file,
+    /// returning its Unix `(dev, ino)` and complete identity (including `index_sha256`)
+    /// before dropping the writable descriptor.
+    pub(crate) fn finish_staged_file(
+        mut self,
+    ) -> Result<((u64, u64), RawBlockSegmentIdentity), SettledRawBlockSegmentError> {
+        let FinalizedStagedBody {
+            target: staged_target,
+            trailer,
+            index_sha256,
+            verity_digest,
+        } = self.finalize_staged_body()?;
+        let StagedTarget::OwnedFile(staged_file) = staged_target else {
+            return Err(SettledRawBlockSegmentError::InvalidFormat(
+                "path-backed staged raw block writer must use finish".to_owned(),
+            ));
+        };
+        let dev_ino = staged_file_dev_ino(&staged_file)?;
+        drop(staged_file);
+        let identity = RawBlockSegmentIdentity {
+            sha256: trailer,
+            index_sha256,
+            fs_verity_sha256: Some(verity_digest),
+            ..self.identity
+        };
+        Ok((dev_ino, identity))
+    }
+
+    fn finalize_staged_body(&mut self) -> Result<FinalizedStagedBody, SettledRawBlockSegmentError> {
         let (block_count, first_prev_hash) = self.validate_complete()?;
         let mut staged = self.staged.take().ok_or_else(|| {
             SettledRawBlockSegmentError::Io(io::Error::other("staged segment writer poisoned"))
@@ -122,27 +254,22 @@ impl SettledRawBlockSegmentWriter {
             .into_inner()
             .map_err(io::IntoInnerError::into_error)?;
         let header = self.build_header(block_count, first_prev_hash)?;
-        write_all_at(staged_file.as_file(), &header.encode(), 0)?;
+        let header_bytes = header.encode();
+        write_all_at(staged_file.as_file(), &header_bytes, 0)?;
         let index_bytes = u64::from(block_count) * ROW_INDEX_ENTRY_LEN as u64;
         let trailer_offset = header.row_index_offset + index_bytes;
         let (trailer, verity_digest) = hash_staged(staged_file.as_file(), trailer_offset)?;
         write_all_at(staged_file.as_file(), &trailer, trailer_offset)?;
         staged_file.as_file().sync_all()?;
 
-        let readonly_staged = verity::reopen_staged(&staged_file)?;
-        let (writable_file, temp_path) = staged_file.into_parts();
-        drop(writable_file);
-        verity::protect_new_segment(&readonly_staged, Some(verity_digest))?;
-        drop(readonly_staged);
-
-        let identity = RawBlockSegmentIdentity {
-            sha256: trailer,
-            fs_verity_sha256: Some(verity_digest),
-            ..self.identity
-        };
-        persist_segment(temp_path, &self.target, &identity)?;
-        File::open(parent_directory(&self.target))?.sync_all()?;
-        Ok(identity)
+        let index_sha256 =
+            compute_index_sha256(&header_bytes, &self.tx_entries, &self.rows, &trailer);
+        Ok(FinalizedStagedBody {
+            target: staged_file,
+            trailer,
+            index_sha256,
+            verity_digest,
+        })
     }
 
     fn validate_complete(&self) -> Result<(u32, BlockHash), SettledRawBlockSegmentError> {
@@ -164,7 +291,7 @@ impl SettledRawBlockSegmentWriter {
         &self,
         block_count: u32,
         first_prev_hash: BlockHash,
-    ) -> Result<SegmentHeader, SettledRawBlockSegmentError> {
+    ) -> Result<RawBlockSegmentHeader, SettledRawBlockSegmentError> {
         let tx_table_offset = HEADER_LEN as u64 + u64::from(self.slab_len);
         let tx_count_u64 = u64::try_from(self.tx_entries.len()).map_err(|_| {
             SettledRawBlockSegmentError::InvalidFormat("tx table count exceeds u64".to_owned())
@@ -177,7 +304,7 @@ impl SettledRawBlockSegmentWriter {
         let row_index_offset = tx_table_offset.checked_add(tx_table_bytes).ok_or_else(|| {
             SettledRawBlockSegmentError::InvalidFormat("row index offset overflow".to_owned())
         })?;
-        Ok(SegmentHeader {
+        Ok(RawBlockSegmentHeader {
             network_tag: self.identity.network.id(),
             segment_flags: 0,
             codec_id: self.identity.codec.id(),
@@ -189,6 +316,38 @@ impl SettledRawBlockSegmentWriter {
             tx_table_offset,
             row_index_offset,
         })
+    }
+}
+
+fn compute_index_sha256(
+    header_bytes: &[u8; HEADER_LEN],
+    tx_entries: &[[u8; TX_SLICE_ENTRY_LEN]],
+    rows: &[[u8; ROW_INDEX_ENTRY_LEN]],
+    trailer: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(header_bytes);
+    for tx_entry in tx_entries {
+        digest.update(tx_entry);
+    }
+    for row in rows {
+        digest.update(row);
+    }
+    digest.update(trailer);
+    digest.finalize().into()
+}
+
+fn staged_file_dev_ino(file: &File) -> io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = file.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok((0, 0))
     }
 }
 

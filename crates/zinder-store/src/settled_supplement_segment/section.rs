@@ -171,11 +171,11 @@ pub struct BlockSupplementRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct BlockEnvelopeIdentity {
-    pub(super) height: BlockHeight,
-    pub(super) block_hash_wire: [u8; 32],
-    pub(super) prev_hash_wire: [u8; 32],
-    pub(super) block_time: u32,
+pub(crate) struct BlockEnvelopeIdentity {
+    pub(crate) height: BlockHeight,
+    pub(crate) block_hash_wire: [u8; 32],
+    pub(crate) prev_hash_wire: [u8; 32],
+    pub(crate) block_time: u32,
 }
 
 fn advance_fee_lookup(
@@ -299,7 +299,7 @@ pub(crate) fn transparent_supplement_from_compact(
         .collect()
 }
 
-pub(super) fn encode_block_record(
+pub(crate) fn encode_block_record(
     identity: BlockEnvelopeIdentity,
     record: &BlockSupplementRecord,
 ) -> Result<(Vec<u8>, u8), SettledSupplementSegmentError> {

@@ -24,11 +24,49 @@ use super::{
     wire_projection::encode_default_shielded_block_with_options,
 };
 
+/// Uncommitted or named staged file target for `SettledShieldedSegmentWriter`.
+enum StagedTarget {
+    Temp(NamedTempFile),
+    OwnedFile(File),
+}
+
+struct FinalizedStagedBody {
+    target: StagedTarget,
+    trailer: [u8; 32],
+    index_sha256: [u8; 32],
+    verity_digest: [u8; 32],
+}
+
+impl StagedTarget {
+    fn as_file(&self) -> &File {
+        match self {
+            Self::Temp(temp) => temp.as_file(),
+            Self::OwnedFile(file) => file,
+        }
+    }
+}
+
+impl io::Write for StagedTarget {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Temp(temp) => temp.write(buf),
+            Self::OwnedFile(file) => file.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Temp(temp) => temp.flush(),
+            Self::OwnedFile(file) => file.flush(),
+        }
+    }
+}
+
 /// Single-pass staged writer for one immutable `ZSHRNG02` segment.
 pub struct SettledShieldedSegmentWriter {
     identity: ShieldedSegmentIdentity,
     target: PathBuf,
-    staged: Option<BufWriter<NamedTempFile>>,
+    staged: Option<BufWriter<StagedTarget>>,
     slab_len: u32,
     rows: Vec<[u8; ROW_INDEX_ENTRY_LEN]>,
     prior: Option<BlockId>,
@@ -47,12 +85,28 @@ impl SettledShieldedSegmentWriter {
         staged: NamedTempFile,
         span: ShieldedSegmentIdentity,
     ) -> Result<Self, SettledShieldedSegmentError> {
+        Self::create_target(target.to_owned(), StagedTarget::Temp(staged), span)
+    }
+
+    /// Creates a staged `ZSHRNG02` writer backed directly by a caller-owned `File`.
+    pub(crate) fn create_in_file(
+        staged: File,
+        span: ShieldedSegmentIdentity,
+    ) -> Result<Self, SettledShieldedSegmentError> {
+        Self::create_target(PathBuf::new(), StagedTarget::OwnedFile(staged), span)
+    }
+
+    fn create_target(
+        target: PathBuf,
+        staged: StagedTarget,
+        span: ShieldedSegmentIdentity,
+    ) -> Result<Self, SettledShieldedSegmentError> {
         span.block_count()?;
         let mut buffered = BufWriter::new(staged);
         buffered.write_all(&[0_u8; HEADER_LEN])?;
         Ok(Self {
             identity: span,
-            target: target.to_owned(),
+            target,
             staged: Some(buffered),
             slab_len: 0,
             rows: Vec::new(),
@@ -170,6 +224,68 @@ impl SettledShieldedSegmentWriter {
     /// Returns [`SettledShieldedSegmentError`] if the segment is incomplete,
     /// hashing or `fs-verity` protection fails, or atomic persistence fails.
     pub fn finish(mut self) -> Result<ShieldedSegmentIdentity, SettledShieldedSegmentError> {
+        let FinalizedStagedBody {
+            target: staged_target,
+            trailer,
+            index_sha256,
+            verity_digest,
+        } = self.finalize_staged_body()?;
+        let StagedTarget::Temp(staged_file) = staged_target else {
+            return Err(SettledShieldedSegmentError::InvalidFormat(
+                "caller-owned staged shielded writer must use finish_staged_file".to_owned(),
+            ));
+        };
+
+        let readonly_staged = segment_verity::reopen_staged(&staged_file, "shielded segment")?;
+        let (writable_file, temp_path) = staged_file.into_parts();
+        drop(writable_file);
+        segment_verity::protect_new_segment(
+            &readonly_staged,
+            Some(verity_digest),
+            "shielded segment",
+        )?;
+        drop(readonly_staged);
+
+        let identity = ShieldedSegmentIdentity {
+            sha256: trailer,
+            index_sha256,
+            fs_verity_sha256: Some(verity_digest),
+            ..self.identity
+        };
+        persist_segment(temp_path, &self.target, &identity)?;
+        File::open(parent_directory(&self.target))?.sync_all()?;
+        Ok(identity)
+    }
+
+    /// Finalizes headers, indexes, trailer, and sync on a caller-owned staged file,
+    /// returning its Unix `(dev, ino)` and complete identity (including `index_sha256`)
+    /// before dropping the writable descriptor.
+    pub(crate) fn finish_staged_file(
+        mut self,
+    ) -> Result<((u64, u64), ShieldedSegmentIdentity), SettledShieldedSegmentError> {
+        let FinalizedStagedBody {
+            target: staged_target,
+            trailer,
+            index_sha256,
+            verity_digest,
+        } = self.finalize_staged_body()?;
+        let StagedTarget::OwnedFile(staged_file) = staged_target else {
+            return Err(SettledShieldedSegmentError::InvalidFormat(
+                "path-backed staged shielded writer must use finish".to_owned(),
+            ));
+        };
+        let dev_ino = staged_file_dev_ino(&staged_file)?;
+        drop(staged_file);
+        let identity = ShieldedSegmentIdentity {
+            sha256: trailer,
+            index_sha256,
+            fs_verity_sha256: Some(verity_digest),
+            ..self.identity
+        };
+        Ok((dev_ino, identity))
+    }
+
+    fn finalize_staged_body(&mut self) -> Result<FinalizedStagedBody, SettledShieldedSegmentError> {
         let block_count = self.identity.block_count()?;
         let first_prev_hash = self.first_prev_hash.ok_or_else(|| {
             SettledShieldedSegmentError::ChainLinkage("empty shielded segment".to_owned())
@@ -211,25 +327,26 @@ impl SettledShieldedSegmentWriter {
         staged_file.as_file().sync_all()?;
 
         let index_sha256 = compute_index_sha256(&header_bytes, &self.rows, &trailer);
-        let readonly_staged = segment_verity::reopen_staged(&staged_file, "shielded segment")?;
-        let (writable_file, temp_path) = staged_file.into_parts();
-        drop(writable_file);
-        segment_verity::protect_new_segment(
-            &readonly_staged,
-            Some(verity_digest),
-            "shielded segment",
-        )?;
-        drop(readonly_staged);
-
-        let identity = ShieldedSegmentIdentity {
-            sha256: trailer,
+        Ok(FinalizedStagedBody {
+            target: staged_file,
+            trailer,
             index_sha256,
-            fs_verity_sha256: Some(verity_digest),
-            ..self.identity
-        };
-        persist_segment(temp_path, &self.target, &identity)?;
-        File::open(parent_directory(&self.target))?.sync_all()?;
-        Ok(identity)
+            verity_digest,
+        })
+    }
+}
+
+fn staged_file_dev_ino(file: &File) -> io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = file.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok((0, 0))
     }
 }
 

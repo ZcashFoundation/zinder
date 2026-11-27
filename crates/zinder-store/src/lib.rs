@@ -98,10 +98,13 @@ pub use proto_codec::{
 pub use raw_blob_retention::RawBlobRetention;
 pub use rocksdb_resource_budget::{RocksDbResourceBudget, RocksDbStatisticsLevel};
 pub use settled_raw_block_segment::{
-    RawBlockCodec, RawBlockSegmentIdentity, RawBlockTransactionSlice,
+    DEFAULT_SETTLED_RAW_BLOCK_SEGMENT_MAX_SLAB_BYTES, RawBlockCodec, RawBlockReadPlan,
+    RawBlockRowIndexSlice, RawBlockSegmentHeader, RawBlockSegmentIdentity,
+    RawBlockTransactionSlice, RawBlockTxDigestsPlan, RawBlockTxTableSlice, RawTransactionReadPlan,
     SETTLED_RAW_BLOCK_SEGMENT_MAGIC, SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES,
-    SettledRawBlockSegmentError, SettledRawBlockSegmentOpenOptions, SettledRawBlockSegmentReader,
-    SettledRawBlockSegmentWriter,
+    SettledRawBlockSegmentError, SettledRawBlockSegmentIndex, SettledRawBlockSegmentOpenOptions,
+    SettledRawBlockSegmentReader, SettledRawBlockSegmentWriter, VerifiedRawBlockRowIndexSlice,
+    VerifiedRawBlockTxTableSlice,
 };
 pub use settled_shielded_segment::{
     BoundedShieldedRangePlan, DEFAULT_SETTLED_SHIELDED_SEGMENT_MAX_SLAB_BYTES, PoolPresenceMask,

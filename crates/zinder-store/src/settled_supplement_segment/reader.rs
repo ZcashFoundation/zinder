@@ -1121,6 +1121,47 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         )
     }
 
+    /// Reads and authenticates every row's block hash in a single coalesced
+    /// row-index read in ascending block height order.
+    pub(crate) fn read_all_block_hashes(
+        &self,
+    ) -> Result<Vec<BlockHash>, SettledSupplementSegmentError> {
+        let row_count = self.index.rows.len();
+        for row_idx in 0..row_count {
+            self.index.ensure_row_not_invalid(row_idx)?;
+        }
+        let byte_len = row_count.checked_mul(ROW_INDEX_ENTRY_LEN).ok_or_else(|| {
+            SettledSupplementSegmentError::InvalidFormat(
+                "supplement row index size overflow".to_owned(),
+            )
+        })?;
+        let raw_rows = self
+            .source
+            .read_vec_at(self.index.header.row_index_offset, byte_len)
+            .inspect_err(|_| {
+                if let Some(last_row) = row_count.checked_sub(1) {
+                    mark_row_range_invalid(&self.index, 0, last_row);
+                }
+            })?;
+        let verified = self
+            .index
+            .authenticate_row_index_slice(SupplementRowIndexSlice::new(
+                self.index.header.row_index_offset,
+                &raw_rows,
+            ))?;
+        let mut hashes = Vec::with_capacity(row_count);
+        for row_idx in 0..row_count {
+            let wire = verified.block_hash_wire(row_idx).inspect_err(|_| {
+                self.index.rows[row_idx].mark_invalid();
+            })?;
+            let hash = block_hash_wire_to_domain(&wire).inspect_err(|_| {
+                self.index.rows[row_idx].mark_invalid();
+            })?;
+            hashes.push(hash);
+        }
+        Ok(hashes)
+    }
+
     #[cfg(test)]
     pub(super) fn chunk_validation_state(&self, chunk_idx: usize) -> u8 {
         self.index.chunks[chunk_idx]
