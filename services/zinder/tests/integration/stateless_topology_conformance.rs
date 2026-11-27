@@ -336,7 +336,7 @@ async fn spawn_replica_stack(
     })
 }
 
-fn encode_grpc_web_frame(payload: &[u8]) -> eyre::Result<Vec<u8>> {
+pub(super) fn encode_grpc_web_frame(payload: &[u8]) -> eyre::Result<Vec<u8>> {
     let length = u32::try_from(payload.len())?;
     let mut framed = Vec::with_capacity(5 + payload.len());
     framed.push(0);

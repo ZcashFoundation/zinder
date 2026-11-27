@@ -1,8 +1,8 @@
 //! Reusable runtime entrypoints and CLI parsing for `zinder-compat-lightwalletd`.
 
-mod browser_transport;
 mod compact_block_serving;
 pub mod config;
+mod listener;
 mod supervision;
 
 use std::{
@@ -394,7 +394,7 @@ async fn execute_wallet(
         .with_tree_state_replay_waiters_per_slot(tree_state_replay_waiters_per_slot);
     let grpc_adapter =
         LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query.clone())?;
-    let (incoming, listen_addr) = browser_transport::bind(lightwalletd_config.listen_addr)?;
+    let (incoming, listen_addr) = listener::bind(lightwalletd_config.listen_addr)?;
     let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
         spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
@@ -465,7 +465,7 @@ async fn execute_wallet(
         "lightwalletd-compatible gRPC server started"
     );
 
-    let server = browser_transport::serve(
+    let server = listener::serve(
         &runtime,
         grpc_adapter.into_server(),
         incoming,
@@ -607,7 +607,7 @@ async fn run_canonical(
     .map_err(LightwalletdConfigError::CompactServing)?;
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
-    let (incoming, listen_addr) = browser_transport::bind(lightwalletd_config.listen_addr)?;
+    let (incoming, listen_addr) = listener::bind(lightwalletd_config.listen_addr)?;
     let cancel = runtime.stopping();
     let (node_tip_witness, node_tip_witness_handle) =
         spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
@@ -665,7 +665,7 @@ async fn run_canonical(
                 cancel.clone(),
             );
             (
-                browser_transport::serve(
+                listener::serve(
                     &runtime,
                     adapter.into_server(),
                     incoming,
@@ -688,7 +688,7 @@ async fn run_canonical(
                 .with_node_tip_witness(node_tip_witness)
                 .with_ping(configured_ping(&lightwalletd_config, &cancel));
             (
-                browser_transport::serve(
+                listener::serve(
                     &runtime,
                     grpc_adapter.into_server(),
                     incoming,

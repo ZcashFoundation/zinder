@@ -390,6 +390,10 @@ async fn serve_query(
         |server| {
             server
                 .with_proxy_protocol(query_config.proxy_protocol.clone())
+                .with_browser_transport(
+                    &query_config.browser_origins,
+                    zinder_proto::v1::wallet::wallet_query_server::SERVICE_NAME,
+                )
                 .layer(
                     zinder_runtime::WalletRpcMetricsLayer::WalletQuery.with_range_admission(
                         query_config.range_admission,

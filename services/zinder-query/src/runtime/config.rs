@@ -11,18 +11,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
-    BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
-    ClientAddressSource, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection,
-    DeploymentToml, GrpcProxyProtocol, GrpcRangeAdmission, IngestControlReaderToml,
-    IngestControlSection, NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection,
-    OpsServerError, OpsToml, ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader,
-    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, RuntimeService, SecuritySection,
-    SecurityToml, derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
-    derive_wallet_secondary_path, guard_optional_serving_bind, guard_serving_bind,
-    parse_socket_addr, require_field, resolve_allow_public_bind,
-    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
-    resolve_wallet_projection_reader_rocksdb_budget, section_defaults::DEFAULT_DATA_DIR,
-    validate_optional_data_dir,
+    BearerToken, BearerTokenError, BrowserOrigins, CanonicalSecondaryStorageSection,
+    CanonicalSecondaryStorageToml, ClientAddressSource, ConfigError, ConfigLoader,
+    DeploymentProfile, DeploymentSection, DeploymentToml, GrpcProxyProtocol, GrpcRangeAdmission,
+    IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml, NodeFallbacksToml,
+    NodeToml, OpsSection, OpsServerError, OpsToml, ResolvedCanonicalSecondaryStorage,
+    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
+    RuntimeService, SecuritySection, SecurityToml, derive_canonical_path,
+    derive_canonical_secondary_path, derive_wallet_path, derive_wallet_secondary_path,
+    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
+    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
+    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{
@@ -58,6 +58,8 @@ pub struct QueryConfig {
     pub ingest_control_bearer_token: Option<BearerToken>,
     /// Native `WalletQuery` gRPC listen address.
     pub listen_addr: SocketAddr,
+    /// Browser origins permitted to use gRPC-Web. An empty list disables it.
+    pub browser_origins: BrowserOrigins,
     /// Operational HTTP endpoint listen address, or `None` when disabled.
     pub ops_listen_addr: Option<SocketAddr>,
     /// Optional trace export settings.
@@ -246,6 +248,7 @@ struct QueryRawConfig {
 #[serde(default, deny_unknown_fields)]
 struct QuerySection {
     listen_addr: Option<String>,
+    browser_origins: BrowserOrigins,
     reorg_window_blocks: Option<u32>,
     pair_convergence_attempts: Option<u8>,
     tree_state_replay_wait_ms: Option<u64>,
@@ -327,6 +330,10 @@ fn derive_query_storage_paths(config: &mut QueryRawConfig) -> Result<(), ConfigE
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the field resolution and startup validation order are easier to audit together"
+)]
 fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, QueryConfigError> {
     apply_deployment_profile(&mut config)?;
     derive_query_storage_paths(&mut config)?;
@@ -395,6 +402,7 @@ fn resolve_query_config(mut config: QueryRawConfig) -> Result<QueryConfig, Query
         ingest_control_bearer_token_path,
         ingest_control_bearer_token,
         listen_addr,
+        browser_origins: config.query.browser_origins,
         ops_listen_addr,
         observability: config.observability,
         allow_public_bind,
@@ -572,6 +580,7 @@ impl QueryConfigToml {
             }),
             query: QueryToml {
                 listen_addr: config.listen_addr.to_string(),
+                browser_origins: config.browser_origins.clone(),
                 reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
                 tree_state_replay_wait_ms: u64::try_from(config.tree_state_replay_wait.as_millis())
@@ -597,6 +606,7 @@ impl QueryConfigToml {
 #[derive(Serialize)]
 struct QueryToml {
     listen_addr: String,
+    browser_origins: BrowserOrigins,
     reorg_window_blocks: u32,
     pair_convergence_attempts: u8,
     tree_state_replay_wait_ms: u64,

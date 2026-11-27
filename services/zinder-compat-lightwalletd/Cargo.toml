@@ -34,11 +34,9 @@ toml.workspace = true
 tonic = { workspace = true, features = ["server", "transport"] }
 tonic-reflection.workspace = true
 tonic-types.workspace = true
-tonic-web.workspace = true
 tower.workspace = true
-tower-http = { workspace = true, features = ["cors", "validate-request"] }
+tower-http = { workspace = true, features = ["validate-request"] }
 tracing.workspace = true
-url.workspace = true
 zebra-chain.workspace = true
 zinder-core.workspace = true
 zinder-proto.workspace = true
@@ -49,6 +47,7 @@ zinder-store.workspace = true
 zinder-wallet-rocksdb.workspace = true
 
 [dev-dependencies]
+tonic-web.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 eyre.workspace = true

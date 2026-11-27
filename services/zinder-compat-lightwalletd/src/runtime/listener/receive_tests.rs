@@ -8,23 +8,22 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use eyre::{OptionExt as _, Result, ensure};
-use http::{HeaderValue, Request, Response, header};
+use http::{Request, Response, header};
 use http_body::{Body as _, Frame};
 use http_body_util::{BodyExt as _, StreamBody};
 use prost::{Message, bytes::Bytes};
 use tokio_stream::StreamExt as _;
 use tonic::{Code, Status, body::Body, transport::server::TcpConnectInfo};
 use tonic_types::StatusExt as _;
-use tonic_web::GrpcWebLayer;
-use tower::{Layer as _, Service, ServiceExt as _, service_fn, util::Either};
+use tower::{Layer as _, Service, ServiceExt as _, service_fn};
 use zinder_core::Network;
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_server::CompactTxStreamerServer,
 };
 use zinder_query::RocksDbCanonicalReader;
 use zinder_runtime::{
-    ClientAddressSource, GrpcRangeAdmission, GrpcReceiveLimitLayer, GrpcReceiveLimits,
-    MAX_UNCAPPED_ENUM_LIST_ELEMENTS, RepeatedFieldGuard, WalletRpcMetricsLayer,
+    BrowserOrigins, ClientAddressSource, GrpcRangeAdmission, GrpcReceiveLimitLayer,
+    GrpcReceiveLimits, MAX_UNCAPPED_ENUM_LIST_ELEMENTS, RepeatedFieldGuard, WalletRpcMetricsLayer,
 };
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
@@ -33,7 +32,7 @@ use crate::{
     LightwalletdGrpcAdapter,
 };
 
-use super::{SERVICE_NAME, transport_layers, wallet_layers};
+use super::{SERVICE_NAME, wallet_layers};
 
 const WALLET_ORIGIN: &str = "https://wallet.example";
 const TEXT: &str = "application/grpc-web-text+proto";
@@ -63,16 +62,14 @@ fn service(
         GrpcReceiveLimits::new(NonZeroUsize::MIN, RECEIVE_TIMEOUT),
         ClientAddressSource::Connection,
     );
-    Ok(
-        transport_layers(&[HeaderValue::from_static(WALLET_ORIGIN)]).layer(
-            wallet_layers(
-                true,
-                GrpcRangeAdmission::default(),
-                ClientAddressSource::Connection,
-            )
-            .layer(receive.layer(guard)),
-        ),
-    )
+    let origins: BrowserOrigins = toml::Value::String(WALLET_ORIGIN.to_owned()).try_into()?;
+    Ok(origins.transport_layer(SERVICE_NAME).layer(
+        wallet_layers(
+            GrpcRangeAdmission::default(),
+            ClientAddressSource::Connection,
+        )
+        .layer(receive.layer(guard)),
+    ))
 }
 
 fn request(method: &str, encoding: &'static str, body: Body) -> Result<Request<Body>> {
@@ -349,15 +346,15 @@ async fn browser_range_refusals_preserve_status_pushback_and_rpc_counts() -> Res
                         StreamBody::new(tokio_stream::pending::<Result<Frame<Bytes>, Status>>());
                     Ok::<_, Infallible>(Response::new(Body::new(body)))
                 }));
-            // Only the compatibility listener exposes gRPC-Web in production.
-            let web = match surface {
-                WalletRpcMetricsLayer::Lightwalletd => Either::Left(
-                    transport_layers(&[HeaderValue::from_static(WALLET_ORIGIN)]).layer(admission),
-                ),
+            let origins: BrowserOrigins =
+                toml::Value::String(WALLET_ORIGIN.to_owned()).try_into()?;
+            let service_name = match surface {
+                WalletRpcMetricsLayer::Lightwalletd => SERVICE_NAME,
                 WalletRpcMetricsLayer::WalletQuery => {
-                    Either::Right(GrpcWebLayer::new().layer(admission))
+                    zinder_proto::v1::wallet::wallet_query_server::SERVICE_NAME
                 }
             };
+            let web = origins.transport_layer(service_name).layer(admission);
             let request = || browser_request(path, encoding, Body::empty());
             let held = web.clone().oneshot(request()?).await?;
             assert!(!held.body().is_end_stream());
@@ -437,14 +434,15 @@ async fn wallet_rpc_in_wallet_mode_counts_one_lightwalletd_range_across_query_re
     let query =
         WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)));
     let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?.into_server();
-    let native = transport_layers(&[]).layer(
-        wallet_layers(
-            false,
-            GrpcRangeAdmission::default(),
-            ClientAddressSource::Connection,
-        )
-        .layer(adapter),
-    );
+    let native = BrowserOrigins::default()
+        .transport_layer(SERVICE_NAME)
+        .layer(
+            wallet_layers(
+                GrpcRangeAdmission::default(),
+                ClientAddressSource::Connection,
+            )
+            .layer(adapter),
+        );
     let id = lightwalletd::BlockId {
         height: 1,
         hash: vec![],

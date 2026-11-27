@@ -16,6 +16,7 @@ use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
+use zinder_proto::v1::explorer::explorer_query_server::SERVICE_NAME;
 use zinder_runtime::{
     ComposedReadiness, OpsEndpointHandle, OpsHealthcheckArgs, Readiness, ReadinessCause,
     ReadinessInput, ReadinessState, RuntimeService, StartupPhase, SupervisedRuntime,
@@ -311,11 +312,14 @@ async fn serve_explorer(
         materialized_view_store.clone(),
     );
     let advertised_capabilities = grpc_adapter.advertised_capabilities();
-    let router = runtime.public_grpc_router(
-        grpc_adapter.clone().into_server(),
-        zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+    let router = runtime.public_grpc_router_with_transport(
+        (
+            grpc_adapter.clone().into_server(),
+            zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET,
+        ),
         explorer_config.client_address_source,
         &readiness,
+        |server| server.with_browser_transport(&explorer_config.browser_origins, SERVICE_NAME),
     )?;
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::Explorer,

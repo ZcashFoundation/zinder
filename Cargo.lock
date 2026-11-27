@@ -3743,6 +3743,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -6274,6 +6275,7 @@ dependencies = [
  "zinder-runtime",
  "zinder-store",
  "zinder-testkit",
+ "zinder-wallet-rocksdb",
 ]
 
 [[package]]
@@ -6440,7 +6442,6 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
- "url",
  "zcash_address",
  "zcash_protocol",
  "zebra-chain",
@@ -6744,9 +6745,11 @@ dependencies = [
  "tonic-types",
  "tonic-web",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "x86_64",
  "zinder-core",
  "zinder-proto",

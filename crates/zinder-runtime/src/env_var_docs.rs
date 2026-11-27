@@ -1216,6 +1216,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `127.0.0.1:9102`.",
     },
     EnvVarDoc {
+        name: "ZINDER_QUERY__BROWSER_ORIGINS",
+        toml_path: "query.browser_origins",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Enables gRPC-Web on the WalletQuery listener for the configured origins. \
+                      Defaults to disabled. See [Browser origins](#browser-origins).",
+    },
+    EnvVarDoc {
         name: "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
         toml_path: "query.reorg_window_blocks",
         used_by: &["zinder-query"],
@@ -2236,6 +2245,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Listen address for the ExplorerQuery gRPC endpoint. Defaults to 127.0.0.1:9068.",
     },
     EnvVarDoc {
+        name: "ZINDER_EXPLORER__BROWSER_ORIGINS",
+        toml_path: "explorer.browser_origins",
+        used_by: &["zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Enables gRPC-Web on the ExplorerQuery listener for the configured origins. \
+                      Defaults to disabled. See [Browser origins](#browser-origins).",
+    },
+    EnvVarDoc {
         name: "ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS",
         toml_path: "explorer.trust_proxy_client_address",
         used_by: &["zinder-explorer"],
@@ -2468,6 +2486,7 @@ mod tests {
             query_specific,
             [
                 "ZINDER_QUERY__LISTEN_ADDR",
+                "ZINDER_QUERY__BROWSER_ORIGINS",
                 "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
                 "ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS",
                 "ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS",
