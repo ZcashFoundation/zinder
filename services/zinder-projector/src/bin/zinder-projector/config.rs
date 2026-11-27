@@ -77,6 +77,18 @@ pub(crate) struct ProjectorConfig {
     pub(crate) allow_public_bind: bool,
 }
 
+impl ProjectorConfig {
+    /// Returns canonical store requirements derived from deployment profile and raw-blob policy.
+    #[must_use]
+    pub(crate) fn canonical_requirements(&self) -> zinder_store::CanonicalStoreRequirements {
+        let requirements = self.profile.map_or_else(
+            zinder_store::CanonicalStoreRequirements::default,
+            DeploymentProfile::canonical_requirement,
+        );
+        requirements.with_blob_retention(self.expected_canonical_raw_blob_retention)
+    }
+}
+
 /// Bounded resources for one fixed-tip wallet construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectorBuildConfig {

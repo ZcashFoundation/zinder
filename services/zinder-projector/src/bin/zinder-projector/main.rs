@@ -1847,14 +1847,7 @@ fn open_canonical_secondary(
         &config.canonical_path,
         &config.canonical_secondary_path,
         config.network,
-        config.profile.map_or_else(
-            || {
-                zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                    config.expected_canonical_raw_blob_retention,
-                )
-            },
-            zinder_runtime::DeploymentProfile::canonical_requirement,
-        ),
+        config.canonical_requirements(),
         reorg_policy,
         config.canonical_rocksdb_budget,
     )
@@ -3936,6 +3929,54 @@ mod tests {
             message.contains(&missing_primary.display().to_string()),
             "{message}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn full_blocks_profiles_reject_canonical_store_without_block_blobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let canonical_path = temporary.path().join("canonical");
+        let reorg_policy = CanonicalReorgPolicy::new(3)?;
+        let _canonical = publish_test_canonical_store(&canonical_path, reorg_policy)?;
+
+        for profile in ["wallet", "explorer"] {
+            let secondary_path = temporary.path().join(format!("secondary-{profile}"));
+            let wallet_path = temporary.path().join(format!("wallet-{profile}"));
+            let cfg = super::config::load_projector_config_with_env(
+                None,
+                super::config::ProjectorConfigOverrides {
+                    network: Some("zcash-regtest".to_owned()),
+                    canonical_path: Some(canonical_path.clone()),
+                    canonical_secondary_path: Some(secondary_path),
+                    wallet_path: Some(wallet_path),
+                    reorg_window_blocks: Some(3),
+                    build_owner_hex: Some("00112233445566778899aabbccddeeff".to_owned()),
+                    lease_duration_seconds: Some(14_400),
+                    ..Default::default()
+                },
+                [
+                    ("ZINDER_DEPLOYMENT__PROFILE".to_owned(), profile.to_owned()),
+                    ("ZINDER_STORAGE__FULL_BLOCKS".to_owned(), "true".to_owned()),
+                ],
+            )?;
+            assert_eq!(
+                cfg.expected_canonical_raw_blob_retention,
+                zinder_store::RawBlobRetention::All
+            );
+            let Err(open_err) =
+                super::open_canonical_secondary(&cfg, reorg_policy, &CancellationToken::new())
+            else {
+                return Err(format!(
+                    "profile {profile} with full_blocks = true must reject store without block blobs"
+                )
+                .into());
+            };
+            assert!(matches!(
+                open_err,
+                ProjectorError::CanonicalSecondaryOpen { .. }
+            ));
+        }
         Ok(())
     }
 }

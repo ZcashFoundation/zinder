@@ -40,7 +40,7 @@ Other listeners, such as `ingest_control.listen_addr`, keep their loopback defau
 
 ## Deployment profiles
 
-Set `deployment.profile` on each participating standalone runtime, or select it on Compose or the single-volume `zinder-wallet-serving` image (`light-wallet`, `wallet` default, or `explorer`; add `storage.full_blocks = true` on any preset to retain full raw blocks). Matching explicit settings are accepted; conflicting settings fail configuration resolution. `--print-config` prints the profile and omits the settings it supplies.
+Set `deployment.profile` on each participating standalone runtime (`light-wallet`, `wallet` default, or `explorer`; add `storage.full_blocks = true` on any profile to retain full raw blocks). The existing single-volume `zinder-wallet-serving` image runs `zinder-projector` and `zinder-query` only: it supports `wallet` (plus deprecated `wallet-archive`) without Explorer views and rejects `light-wallet`, `explorer`, and combined profiles with `ingest.explorer_views = true`. Matching explicit settings are accepted; conflicting settings fail configuration resolution. `--print-config` prints the profile and omits the settings it supplies.
 
 | Profile | Canonical workload | Raw blobs | Serving |
 | --- | --- | --- | --- |
