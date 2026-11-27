@@ -20,7 +20,7 @@ Every first-party crate and service shares one product version, the root
 | GitHub Release | All of the above files, `SHA256SUMS`, and its signature `SHA256SUMS.sigstore.json` |
 
 The tag must be `v` followed by the workspace version. A prerelease adds a
-SemVer suffix, such as `v0.18.0-rc.1`. Build metadata (`+...`) is rejected,
+SemVer suffix, such as `v0.28.0-rc.1`. Build metadata (`+...`) is rejected,
 because an OCI image tag cannot carry it.
 
 ## Before you start
@@ -111,8 +111,8 @@ approve the release only after all four jobs pass on the tag's commit.
 1. Create and push an annotated tag at the release commit:
 
    ```console
-   git tag -a v0.18.0 -m "v0.18.0" "$release_commit"
-   git push origin v0.18.0
+   git tag -a v0.28.0 -m "v0.28.0" "$release_commit"
+   git push origin v0.28.0
    ```
 
 2. The `release` workflow starts. Before it asks for approval, it runs these
@@ -165,27 +165,27 @@ Check out the tag, so the SDK smoke test compiles against that version's API.
 Then verify the Release, the archives, the crates, and each image:
 
 ```console
-git switch --detach v0.18.0
-gh release view v0.18.0
-gh release verify v0.18.0
+git switch --detach v0.28.0
+gh release view v0.28.0
+gh release verify v0.28.0
 
-gh release download v0.18.0 \
-  --pattern 'zinder-0.18.0-*-unknown-linux-gnu.tar.gz' \
-  --pattern 'zinder-0.18.0-*-unknown-linux-gnu.spdx.json' \
+gh release download v0.28.0 \
+  --pattern 'zinder-0.28.0-*-unknown-linux-gnu.tar.gz' \
+  --pattern 'zinder-0.28.0-*-unknown-linux-gnu.spdx.json' \
   --pattern SHA256SUMS \
   --pattern SHA256SUMS.sigstore.json
 sha256sum --ignore-missing --check SHA256SUMS
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
   --certificate-identity \
-    'https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/v0.18.0' \
+    'https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/v0.28.0' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 
-scripts/verify-published-sdk.sh 0.18.0
+scripts/verify-published-sdk.sh 0.28.0
 
 for image in $(jq -r '.[]' deploy/release-images.json); do
-  docker buildx imagetools inspect "ghcr.io/zcashfoundation/${image}:v0.18.0"
+  docker buildx imagetools inspect "ghcr.io/zcashfoundation/${image}:v0.28.0"
 done
 ```
 
@@ -205,14 +205,14 @@ The distroless `zinder` image has no shell, so `docker run ... sh` fails. Inspec
 the image from outside, and invoke `zinder` commands directly:
 
 ```console
-image=ghcr.io/zcashfoundation/zinder:v0.18.0
+image=ghcr.io/zcashfoundation/zinder:v0.28.0
 docker pull "$image"
 docker image inspect "$image" --format '{{.Config.User}}'
 docker image inspect "$image" --format '{{json .Config.Labels}}' | jq
 docker run --rm "$image" --version
 ```
 
-The image runs as `10001:10001`, and `--version` prints `zinder 0.18.0`.
+The image runs as `10001:10001`, and `--version` prints `zinder 0.28.0`.
 
 Every image carries these OCI labels:
 

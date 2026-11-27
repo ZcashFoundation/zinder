@@ -112,7 +112,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 See [Restoring the Mainnet benchmark fixture](../docs/runbooks/mainnet-benchmark-fixture.md) for host lifecycle and GCP snapshot procedures.
 
 - **Control & schema:**
-  - [build-stage.sh](mainnet-fixture/build-stage.sh): provisions and stages the Mainnet fixture builder VM
+  - [build-stage.sh](mainnet-fixture/build-stage.sh): packages Zinder role binaries, the pinned Zebra binary, tools (`jq`, `grpcurl`), guest scripts, and protocol files into a stage tarball (and optionally uploads it to GCS)
   - [fixture.schema.json](mainnet-fixture/fixture.schema.json): JSON Schema for signed Mainnet fixture receipts and manifests
   - [restore-fixture.sh](mainnet-fixture/restore-fixture.sh): launches and restores a benchmark guest VM from the frozen Mainnet disk image
 - **Guest scripts & unit configs (`scripts/mainnet-fixture/guest/`):**

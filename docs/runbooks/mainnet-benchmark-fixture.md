@@ -46,15 +46,24 @@ or wallet schema needs a new fixture, built by that release.
   executables matching those recorded SHA-256 digests. Because
   `scripts/mainnet-fixture/build-stage.sh` and the guest runner currently
   require the five named role executables (`zinder-ingest`, `zinder-projector`,
-  `zinder-query`, `zinder-compat-lightwalletd`, `zinder-explorer`) rather than
-  invoking `zinder run <role>`, build them directly from source when staging an
-  unpinned checkout until the staging harness adopts the unified binary:
+  `zinder-query`, `zinder-compat-lightwalletd`, `zinder-explorer`) targeting
+  the Ubuntu 24.04 `linux/amd64` (`x86_64-unknown-linux-gnu`) guest rather than
+  invoking `zinder run <role>`, build `linux/amd64` binaries compatible with
+  Ubuntu 24.04's glibc (on non-amd64 hosts or macOS, compile inside a
+  `linux/amd64` `zinder-build-base` container; on a compatible x86-64 Linux
+  host you can run the inner `cargo build` directly) until the staging harness
+  adopts the unified binary:
 
   ```bash
-  cargo build --release --locked \
+  docker buildx build --platform linux/amd64 -f deploy/Dockerfile \
+    --target zinder-build-base -t zinder-build-base:amd64 --load .
+  docker run --rm --platform linux/amd64 -v "$PWD:/workspace" -w /workspace \
+    zinder-build-base:amd64 cargo build --release --locked \
+    --target x86_64-unknown-linux-gnu \
     -p zinder-ingest -p zinder-projector -p zinder-query \
     -p zinder-compat-lightwalletd -p zinder-explorer
-  scripts/mainnet-fixture/build-stage.sh --binaries target/release \
+  scripts/mainnet-fixture/build-stage.sh \
+    --binaries target/x86_64-unknown-linux-gnu/release \
     --out .tmp/zfx-stage.tar.zst
   ```
 
