@@ -12,7 +12,7 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
-from wallet_fixture import binding
+from wallet_fixture import binding, require_service_ops
 
 
 def require(condition, message):
@@ -55,10 +55,20 @@ def run(args):
     loopback(ops)
     opener = build_opener(ProxyHandler({}))
     revision = service["source_commit" if args.candidate else "zinder_commit"]
-    with opener.open(ops + "/healthz", timeout=5) as response:
-        health = json.load(response)
-    require(health.get("service") == "zinder-compat-lightwalletd" and health.get("network") == service["network"]
-            and health.get("git_commit") == revision, "live service identity differs from the selected fixture")
+
+    def fetch_ops(path):
+        with opener.open(ops + path, timeout=5) as response:
+            return json.load(response)
+
+    require_service_ops(
+        fetch_ops,
+        "zinder-compat-lightwalletd",
+        "compat-lightwalletd",
+        service["network"],
+        revision,
+        require_alive=False,
+        identity_error="live service identity differs from the selected fixture",
+    )
 
     def rpc(method, *params):
         message = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()

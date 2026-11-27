@@ -4,13 +4,7 @@ groups:
     rules:
       - record: zinder:expected_target
         expr: vector(1)
-        labels: {service: zinder-ingest, job: zinder-ingest, instance: "zinder-ingest:9105"}
+        labels: {service: zinder-index, job: zinder-index, instance: "zinder-index:9105"}
       - record: zinder:expected_target
         expr: vector(1)
-        labels: {service: zinder-projector, job: zinder-projector, instance: "zinder-ingest:9110"}
-      - record: zinder:expected_target
-        expr: vector(1)
-        labels: {service: zinder-query, job: zinder-query, instance: "zinder-ingest:9106"}
-      - record: zinder:expected_target
-        expr: vector(1)
-        labels: {service: zinder-compat-lightwalletd, job: zinder-compat-lightwalletd, instance: "zinder-ingest:9107"}
+        labels: {service: zinder-serve, job: zinder-serve, instance: "zinder-index:9108"}

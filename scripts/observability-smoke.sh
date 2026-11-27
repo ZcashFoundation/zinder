@@ -17,7 +17,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${ROOT_DIR}/docker-compose.observability.yml"
+COMPOSE_FILE="${ROOT_DIR}/deploy/bench/docker-compose.observability.yml"
 PROJECT_NAME="${ZINDER_OBSERVABILITY_PROJECT:-zinder-observability}"
 WORK_DIR="${ZINDER_OBSERVABILITY_WORK_DIR:-${ROOT_DIR}/.tmp/observability}"
 CONFIG_DIR="${WORK_DIR}/config"

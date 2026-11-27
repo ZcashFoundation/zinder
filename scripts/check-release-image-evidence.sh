@@ -38,32 +38,17 @@ done
 
 digest_pattern='^sha256:[0-9a-f]{64}$'
 [[ -s "$manifest" && -s "$amd64_sbom" && -s "$arm64_sbom" ]] || usage
-[[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder-[a-z0-9-]+$ ]] || usage
+[[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder(-[a-z0-9-]+)?$ ]] || usage
 [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || usage
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$root_digest" =~ $digest_pattern && "$amd64_digest" =~ $digest_pattern && "$arm64_digest" =~ $digest_pattern ]] || usage
 service_name="${image##*/}"
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
-# The runtime packages an image must report, and the only ones it may report.
-# A single-volume host image is named for its topology, not for a binary, so
-# its set is the executables deploy/Dockerfile copies into that target.
+# The workspace runtime packages the unified release binary carries, and the
+# only internal service crates permitted in its Cargo metadata.
 case "$service_name" in
-  zinder-compat-lightwalletd)
-    grep -Fqx 'zinder-query.workspace = true' \
-      "$repository_root/services/zinder-compat-lightwalletd/Cargo.toml" || {
-        echo >&2 "compatibility image evidence requires the declared zinder-query dependency"
-        exit 1
-      }
-    image_runtime_packages='["zinder-compat-lightwalletd", "zinder-query"]'
-    ;;
-  zinder-canonical-runtime)
-    image_runtime_packages='["zinder-ingest"]'
-    ;;
-  zinder-wallet-serving)
-    image_runtime_packages='["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd"]'
-    ;;
-  zinder-wallet-serving-explorer)
-    image_runtime_packages='["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd", "zinder-explorer"]'
+  zinder)
+    image_runtime_packages='["zinder","zinder-ingest","zinder-projector","zinder-query","zinder-compat-lightwalletd","zinder-explorer","zinder-compat-cipherscan"]'
     ;;
   *)
     image_runtime_packages="$(jq -c -n --arg service "$service_name" '[$service]')"
@@ -152,10 +137,14 @@ check_child_sbom() {
       and all(.packages[]?;
         (.name as $name
           | (
-            ["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd", "zinder-explorer"]
-            - $image_runtime_packages
-          )
-          | index($name)) == null
+            (
+              ["zinder", "zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd", "zinder-explorer", "zinder-compat-cipherscan"]
+              - $image_runtime_packages
+            )
+            | index($name)
+          ) == null
+          and ($name | test("^zinder-(bench|testkit|proto-codegen)$"; "i") | not)
+        )
       )
     ' "$sbom" >/dev/null
   if jq -r '.. | strings' "$sbom" \

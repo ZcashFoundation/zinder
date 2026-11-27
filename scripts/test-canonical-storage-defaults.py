@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the canonical store paths printed by the debug binaries."""
+"""Compare the canonical store paths printed by the unified zinder CLI."""
 
 import os
 from pathlib import Path
@@ -8,11 +8,24 @@ import tomllib
 import unittest
 
 
-def storage_config(binary, *args):
-    executable = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "debug" / binary
+def run_role_storage_config(role, *args):
+    executable = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "debug" / "zinder"
     output = subprocess.check_output(
-        [executable, "--print-config", "--network", "zcash-regtest", *args],
+        [executable, "run", role, "--print-config", "--network", "zcash-regtest", *args],
         env={},
+        text=True,
+    )
+    return tomllib.loads(output)["storage"]
+
+
+def unified_storage_config(subcommand, *args):
+    executable = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "debug" / "zinder"
+    output = subprocess.check_output(
+        [executable, subcommand, "--print-config", *args],
+        env={
+            "ZINDER_NETWORK__NAME": "zcash-regtest",
+            "ZINDER_NODE__JSON_RPC_ADDR": "http://127.0.0.1:18232",
+        },
         text=True,
     )
     return tomllib.loads(output)["storage"]
@@ -20,25 +33,31 @@ def storage_config(binary, *args):
 
 class CanonicalStorageDefaults(unittest.TestCase):
     def test_ingest_explorer_and_projector_share_the_canonical_store(self):
-        ingest = storage_config(
-            "zinder-ingest",
+        ingest = run_role_storage_config(
+            "ingest",
             "--node-source", "zebra-json-rpc",
             "--json-rpc-addr", "http://127.0.0.1:18232",
         )
-        explorer = storage_config("zinder-explorer")
-        projector = storage_config(
-            "zinder-projector",
+        explorer = run_role_storage_config("explorer")
+        projector = run_role_storage_config(
+            "projector",
             "--build-owner-hex", "00112233445566778899aabbccddeeff",
             "--lease-duration-seconds", "14400",
         )
 
         canonical = projector["canonical_path"]
         self.assertEqual(canonical, "/var/lib/zinder/canonical")
-        for binary, path in (
-            ("zinder-ingest", ingest["path"]), ("zinder-explorer", explorer["path"]),
+        for role, path in (
+            ("ingest", ingest["path"]), ("explorer", explorer["path"]),
         ):
-            with self.subTest(binary=binary):
+            with self.subTest(role=role):
                 self.assertEqual(path, canonical)
+
+        for subcommand in ("index", "serve"):
+            with self.subTest(subcommand=subcommand):
+                storage = unified_storage_config(subcommand)
+                self.assertEqual(storage["path"], canonical)
+                self.assertEqual(storage["canonical_path"], canonical)
 
 
 if __name__ == "__main__":

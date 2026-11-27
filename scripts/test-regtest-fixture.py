@@ -61,7 +61,7 @@ def main():
         invoke('status', projects[1])
         assert receipt(projects[1])['current_tip'] == peer['current_tip'] == 150
         assert receipt(projects[1])['current_hash'] == peer['current_hash']
-        capabilities = peer['health']['query']['capabilities']
+        capabilities = peer['health']['serve']['capabilities']
         assert 'wallet.read.full_block_at_v1' in capabilities
         assert 'wallet.read.full_block_range_v1' in capabilities
         invoke('down', projects[0])

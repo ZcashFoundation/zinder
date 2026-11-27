@@ -22,7 +22,7 @@ def check_receipt(receipt, revision):
             and re.fullmatch(r"sha256:[0-9a-f]{64}", recipe["node_image"])
             and type(recipe["starting_height"]) is int and recipe["starting_height"] >= 0,
             "missing pinned inputs or fixture recipe")
-    require(set(recipe["release_binaries"]) == {"compat-lightwalletd", "ingest", "projector", "query"}
+    require(set(recipe["release_binaries"]) in ({"zinder"}, {"compat-lightwalletd", "ingest", "projector", "query"})
             and all(sha_token(v) for v in recipe["release_binaries"].values()), "invalid release binary pins")
     wallet_sources = {"run-wallet-roundtrip.py", "roundtrip_wallets.py", "roundtrip_fixture.py", "wallet_fixture.py"}
     require(receipt["invocation_harnesses"] and wallet_sources <= receipt["harness_sha256"].keys()

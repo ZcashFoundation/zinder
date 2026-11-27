@@ -86,6 +86,90 @@ class CanonicalAuditTests(unittest.TestCase):
                     audit.verify_run(root, ready_path, receipt["inputs"]["revision"])
                 rpc.assert_not_called()
 
+    def test_verify_run_accepts_unified_zinder_binary_receipt(self):
+        from coverage_test import payment_receipt
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = payment_receipt("a")
+            receipt["fixture_recipe"]["release_binaries"] = {"zinder": "d" * 64}
+            recipe = receipt["fixture_recipe"]
+            recipe["genesis"] = audit.GENESIS["regtest"]
+            ready = {k: recipe[k] for k in ("activation_schedule_sha256", "raw_blob_policy", "node_image")}
+            ready.update(
+                owner="owner-a",
+                project="proj-a",
+                network="zcash-regtest",
+                zinder_commit=receipt["inputs"]["revision"],
+                node_rpc="http://127.0.0.1:49032",
+                initial_tip=150,
+                initial_hash="e" * 64,
+                isolation={"peer_count": 0, "default_ipv4_route": False},
+                binaries={"zinder": {"sha256": "d" * 64}},
+            )
+            ready_path = root / "ready.json"
+            ready_path.write_text(json.dumps(ready))
+            receipt["inputs"]["ready_sha256"] = hashlib.sha256(ready_path.read_bytes()).hexdigest()
+            journal = dict(
+                config=receipt["inputs"],
+                wallets=receipt["wallet_identity_sha256"],
+                birthday_anchor=recipe["starting_height"],
+                invocation_harnesses=receipt["invocation_harnesses"],
+                observations={
+                    "outbound": dict(
+                        amount_zat=receipt["legs"]["outbound"]["amount_zat"],
+                        fee_zat=receipt["legs"]["outbound"]["fee_zat"],
+                        payer_after_zat=receipt["legs"]["outbound"]["payer_after_zat"],
+                        payee_after_zat=receipt["legs"]["outbound"]["payee_after_zat"],
+                        spendable_after_zat=receipt["legs"]["outbound"]["spendable_after_zat"],
+                        change_zat=receipt["legs"]["outbound"]["change_zat"],
+                        memo_verified=True,
+                        txid=self.txid,
+                        block={"height": 163, "hash": self.block_hash},
+                    ),
+                    "outbound-before": {"payer": 500, "payee": 0},
+                    "outbound-pending": receipt["legs"]["outbound"]["pending"],
+                    "return": dict(
+                        amount_zat=receipt["legs"]["return"]["amount_zat"],
+                        fee_zat=receipt["legs"]["return"]["fee_zat"],
+                        payer_after_zat=receipt["legs"]["return"]["payer_after_zat"],
+                        payee_after_zat=receipt["legs"]["return"]["payee_after_zat"],
+                        spendable_after_zat=receipt["legs"]["return"]["spendable_after_zat"],
+                        change_zat=receipt["legs"]["return"]["change_zat"],
+                        memo_verified=True,
+                        txid="f" * 64,
+                        block={"height": 164, "hash": "c" * 64},
+                    ),
+                    "return-before": {"payer": 100, "payee": 399},
+                    "return-pending": receipt["legs"]["return"]["pending"],
+                },
+            )
+            (root / "receipt.json").write_text(json.dumps(receipt))
+            (root / "run.json").write_text(json.dumps(journal))
+            block2 = {"hash": "c" * 64, "height": 164, "tx": ["f" * 64]}
+            tx2 = {"txid": "f" * 64, "blockhash": "c" * 64, "height": 164, "confirmations": 2}
+            def rpc(_url, method, *params):
+                if method == "getblockhash":
+                    return {0: audit.GENESIS["regtest"], 150: "e" * 64, 163: self.block_hash, 164: "c" * 64, 200: "c" * 64}[params[0]]
+                if method == "getpeerinfo":
+                    return []
+                if method == "getblockcount":
+                    return 200
+                if method == "getrawtransaction":
+                    return {self.txid: self.tx, "f" * 64: tx2}[params[0]]
+                if method == "getblock":
+                    return {self.block_hash: self.block, "c" * 64: block2}[params[0]]
+                raise AssertionError((method, params))
+            fingerprint2 = hashlib.sha256(bytes.fromhex("f" * 64)).hexdigest()
+            receipt["legs"]["outbound"]["tx_fingerprint"] = hashlib.sha256(bytes.fromhex(self.txid)).hexdigest()
+            receipt["legs"]["outbound"]["mined_height"] = 163
+            receipt["legs"]["return"]["tx_fingerprint"] = fingerprint2
+            receipt["legs"]["return"]["mined_height"] = 164
+            (root / "receipt.json").write_text(json.dumps(receipt))
+            with patch.object(audit, "rpc", rpc):
+                verified, _, summary = audit.verify_run(root, ready_path, receipt["inputs"]["revision"])
+            self.assertEqual(verified["fixture_recipe"]["release_binaries"], {"zinder": "d" * 64})
+            self.assertEqual(summary["end_height"], 200)
+
     def test_independent_canonical_heights_can_differ(self):
         leg = dict(self.leg, memo_verified=True, spendable_after_zat=15, change_zat=None)
         legs = {"outbound": leg, "return": dict(leg, mined_height=173)}

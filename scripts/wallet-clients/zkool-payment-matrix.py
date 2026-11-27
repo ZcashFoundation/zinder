@@ -48,7 +48,7 @@ from roundtrip_fixture import (FULL_BLOCK_CAPS, GENESIS, NodeRpcError, anchor, h
                                rpc)
 
 from roundtrip_wallets import Zallet, pin_directory, require, write_private  # noqa: E402
-from wallet_fixture import loopback  # noqa: E402
+from wallet_fixture import loopback, require_service_ops  # noqa: E402
 
 RELEASE = "v0.22.0"
 NU63_HEIGHT = 250
@@ -67,15 +67,15 @@ TXID = re.compile(r"[0-9a-f]{64}")
 HASH = re.compile(r"[0-9a-f]{64}")
 BRANCHES = ("5ba81b19", "76b809bb", "2bb40e60", "f5b9230b", "e9ff75a6",
             "c2d6d0b4", "c8e71055", "4dec4df0", "5437f330", "37a5165b")
-SERVICES = ("ingest", "projector", "query", "compat-lightwalletd")
-PORT_OFFSETS = (2, 5, 6, 7, 10, 32, 67)
+SERVICES = ("zinder",)
+PORT_OFFSETS = (2, 5, 8, 32, 67)
 WALLET_PORT_OFFSET = 82
 # The readiness receipt names every local port; the offsets are the fixture's
 # own reservation, not a caller-supplied hint.
 ENDPOINT_OFFSETS = {
     "native_wallet_query": 2,
-    "query_ops": 6,
-    "compat_ops": 7,
+    "query_ops": 8,
+    "compat_ops": 8,
     "node_rpc": 32,
     "lightwalletd": 67,
 }
@@ -310,8 +310,11 @@ def verify_endpoints(ready, base=None):
         if type(port) is not int or not 1024 <= port <= 65535:
             raise ValueError(f"fixture {name} port is outside the local service range")
         endpoints[name] = url
-    ports = [urlsplit(url).port for url in endpoints.values()]
-    if len(set(ports)) != len(ports):
+    distinct_ports = {
+        urlsplit(endpoints[name]).port
+        for name in ("native_wallet_query", "node_rpc", "lightwalletd", "compat_ops")
+    }
+    if len(distinct_ports) != 4 or urlsplit(endpoints["query_ops"]).port != urlsplit(endpoints["compat_ops"]).port:
         raise ValueError("fixture endpoints overlap")
     reservation = base if base is not None else ready.get("port_base")
     if base is not None and ready.get("port_base") not in (None, base):
@@ -375,12 +378,17 @@ def verify_fixture(ready, args, base=None):
     require(len(rpc(node, "getpeerinfo")) == 0 and
             ready["isolation"]["default_ipv4_route"] is False,
             "Regtest fixture is not isolated")
-    for key, service in (("compat_ops", "zinder-compat-lightwalletd"),
-                         ("query_ops", "zinder-query")):
-        health = http_json(endpoints[key], "/healthz")
-        require((health.get("service"), health.get("status"), health.get("network"),
-                 health.get("git_commit")) == (service, "alive", "zcash-regtest", revision),
-                f"{service} identity mismatch")
+    for key, service, role in (
+        ("compat_ops", "zinder-compat-lightwalletd", "compat-lightwalletd"),
+        ("query_ops", "zinder-query", "query"),
+    ):
+        require_service_ops(
+            lambda path, base_url=endpoints[key]: http_json(base_url, path),
+            service,
+            role,
+            "zcash-regtest",
+            revision,
+        )
 
     def call(channel, package, method, message, response, streaming=False):
         invoke = channel.unary_stream if streaming else channel.unary_unary

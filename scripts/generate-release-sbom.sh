@@ -36,7 +36,7 @@ done
 
 if [[ -n "$image" ]]; then
   [[ -z "$archive" && -z "$version" && -z "$platform" ]] || usage
-  [[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder-[a-z0-9-]+$ ]] || usage
+  [[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder(-[a-z0-9-]+)?$ ]] || usage
   [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || usage
   [[ "$commit" =~ ^[0-9a-f]{40}$ && "$digest" =~ ^sha256:[0-9a-f]{64}$ && -n "$output" ]] || usage
   case "$architecture" in

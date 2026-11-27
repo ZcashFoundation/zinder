@@ -155,12 +155,26 @@ def wait_served(ready, target, timeout=300):
 
 
 def verify_services(ready, revision):
+    from wallet_fixture import require_service_ops
+
     opener = build_opener(ProxyHandler({}))
-    for name, key in (("compat-lightwalletd", "compat_ops"), ("query", "query_ops")):
-        with opener.open(ready[key] + "/healthz", timeout=10) as response:
-            health = json.load(response)
-        require(health.get("network") == "zcash-regtest", f"{name} network mismatch")
-        require(health.get("git_commit") == revision, f"{name} revision mismatch")
+    for name, service, key in (
+        ("compat-lightwalletd", "zinder-compat-lightwalletd", "compat_ops"),
+        ("query", "zinder-query", "query_ops"),
+    ):
+        def fetch(path, base_url=ready[key]):
+            with opener.open(base_url + path, timeout=10) as response:
+                return json.load(response)
+
+        require_service_ops(
+            fetch,
+            service,
+            name,
+            "zcash-regtest",
+            revision,
+            require_alive=False,
+            identity_error=f"{name} identity or revision mismatch",
+        )
 
 
 def directory_files(path):

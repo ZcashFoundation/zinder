@@ -200,6 +200,33 @@ class FixtureTests(unittest.TestCase):
                         run(args)
                     opener.open.assert_called_once_with(fixture[ops] + '/healthz', timeout=5)
 
+    def test_vizor_accepts_ready_zinder_supervisor_and_rejects_unready_role(self):
+        run = runpy.run_path(str(SCRIPTS / 'vizor-regtest.py'))['run']
+        self.release['compat_ops'] = 'http://127.0.0.1:11108'
+        self.ready.write_text(json.dumps(self.release))
+        revision = self.release['zinder_commit']
+        health = {'service': 'zinder', 'status': 'alive', 'network': 'zcash-regtest',
+                  'git_commit': revision}
+        ready_bad = {'status': 'ready', 'roles': [{'role': 'compat-lightwalletd', 'ready': False, 'state': 'not_ready'}]}
+
+        def opener_for(payloads):
+            opener = Mock()
+            opener.open.side_effect = [io.BytesIO(json.dumps(p).encode()) for p in payloads]
+            return opener
+
+        args = SimpleNamespace(fixture=self.ready, candidate=None, endpoint=self.release['lightwalletd'])
+        with patch.dict(run.__globals__, build_opener=Mock(return_value=opener_for([health, ready_bad]))), \
+             self.assertRaisesRegex(ValueError, 'live service identity'):
+            run(args)
+
+        ready_ok = {'status': 'ready', 'roles': [{'role': 'compat-lightwalletd', 'ready': True, 'state': 'ready'}]}
+        opener_ok = opener_for([health, ready_ok])
+        with patch.dict(run.__globals__, build_opener=Mock(return_value=opener_ok)), \
+             self.assertRaises(StopIteration):
+            run(args)
+        opener_ok.open.assert_any_call(self.release['compat_ops'] + '/healthz', timeout=5)
+        opener_ok.open.assert_any_call(self.release['compat_ops'] + '/readyz', timeout=5)
+
     def test_vizor_rejects_unbound_candidate_before_wallet_or_node_access(self):
         run = runpy.run_path(str(SCRIPTS / 'vizor-regtest.py'))['run']
         digest = hashlib.sha256((SCRIPTS / 'vizor-regtest.rs').read_bytes()).hexdigest()
@@ -341,6 +368,27 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(case['endpoint'], self.overlay['client_endpoint'])
         for key in ('--ready', '--candidate'):
             self.assertIn(key, case['steps']['bootstrap']['command'])
+
+    def test_native_expiry_selects_unified_serve_or_legacy_query_container(self):
+        lookup = runpy.run_path(str(SCRIPTS / 'native-expiry.py'))['owned_query_container_id']
+        project = self.root / 'project'
+        container_id = 'a' * 64
+        compose = Mock(return_value=container_id)
+        unified = {'health': {'index': {}, 'serve': {}}}
+        legacy = {'health': {'query': {}}}
+
+        self.assertEqual(lookup(compose, project, unified), container_id)
+        compose.assert_called_once_with(project, 'ps', '-q', 'zinder-serve')
+
+        compose.reset_mock()
+        self.assertEqual(lookup(compose, project, legacy), container_id)
+        compose.assert_called_once_with(project, 'ps', '-q', 'zinder-query')
+
+        for bad_output in ('', 'short', 'g' * 64):
+            with self.subTest(bad_output=bad_output):
+                bad_compose = Mock(return_value=bad_output)
+                with self.assertRaisesRegex(ValueError, 'missing owned query container'):
+                    lookup(bad_compose, project, unified)
 
 
 if __name__ == '__main__':

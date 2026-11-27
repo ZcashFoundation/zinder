@@ -21,16 +21,20 @@ use crate::common::shielded_catalog_keys;
 
 #[test]
 fn history_publisher_prints_its_effective_configuration() -> Result<()> {
-    let base = zinder_testkit::manifest_dir!().join("../../deploy/config/history-publisher.toml");
-    let shipped: toml::Table = toml::from_str(&fs::read_to_string(&base)?)?;
-    assert_eq!(
-        shipped["storage"]["raw_blob_policy"].as_str(),
-        Some("transactions")
-    );
-    assert_eq!(
-        shipped["compat"]["serving"].as_str(),
-        Some("compact-blocks")
-    );
+    let fixture_dir = tempfile::tempdir()?;
+    let base = fixture_dir.path().join("history-publisher.toml");
+    fs::write(
+        &base,
+        concat!(
+            "[storage]\n",
+            "path = \"/var/lib/zinder/canonical\"\n",
+            "secondary_path = \"/tmp/secondary\"\n",
+            "raw_blob_policy = \"transactions\"\n\n",
+            "[compat]\n",
+            "serving = \"compact-blocks\"\n",
+            "reorg_window_blocks = 1000\n",
+        ),
+    )?;
     let render = |path: &Path, setup: &[(&str, &str)]| {
         super::zinder_compat_command()
             .args(["--print-config", "--config"])
@@ -415,8 +419,6 @@ fn publication_command(primary: &Path, scratch: &Path, catalog: &Path, private: 
     command
         .kill_on_drop(true)
         .env("ZINDER_NETWORK__NAME", "zcash-regtest")
-        .arg("--config")
-        .arg(zinder_testkit::manifest_dir!().join("../../deploy/config/history-publisher.toml"))
         .arg("--canonical-primary-path")
         .arg(primary)
         .arg("--canonical-secondary-root")

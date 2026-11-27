@@ -74,7 +74,7 @@ ZINDER_BENCH_TRIAL_ID=config-validation \
 ZINDER_BENCH_FIXTURE_CACHE_POLICY=warm \
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile comparison \
   config --quiet
 
@@ -86,7 +86,7 @@ ZINDER_BENCH_TRIAL_ID=config-validation \
 ZINDER_BENCH_FIXTURE_CACHE_POLICY=warm \
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   config --profiles
 ```
 
@@ -97,12 +97,12 @@ Start from an empty volume (both existing stores and existing output paths are r
 ```bash
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile comparison down --volumes --remove-orphans
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile rocksdb run --rm --no-deps \
   --user 0:0 --entrypoint /bin/sh rocksdb-canonical-replay-storage -ceu '
     test -z "$(ls -A /var/lib/zinder)"
@@ -111,7 +111,7 @@ docker compose \
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile rocksdb run --rm --no-deps rocksdb-canonical-replay-storage
 ```
 
@@ -129,17 +129,17 @@ The client reads `ZINDER_BENCH_POSTGRES_DATABASE_URL` inside its container using
 ```bash
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile comparison down --volumes --remove-orphans
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile postgres up -d --wait postgres-database
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   exec -T postgres-database sh -ceu '
     pg_isready --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"
     psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
@@ -150,12 +150,12 @@ docker compose \
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile postgres run --rm --no-deps postgres-canonical-replay-storage
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile postgres stop postgres-database
 ```
 
@@ -174,12 +174,12 @@ Tests the Rust driver path against a fresh database (matching CI `ci-postgres`):
 ```bash
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile postgres down --volumes --remove-orphans
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile postgres up -d --wait postgres-database
 
 ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_only@127.0.0.1:55432/zinder_bench' \
@@ -187,7 +187,7 @@ ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile postgres down --volumes --remove-orphans
 ```
 
@@ -261,12 +261,12 @@ Do not publish throughput from `comparison` (shared budgets):
 ```bash
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile comparison up -d --wait postgres-database
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile comparison run --rm --no-deps \
   --user 0:0 --entrypoint /bin/sh rocksdb-canonical-replay-storage -ceu '
     test -z "$(ls -A /var/lib/zinder)"
@@ -275,12 +275,12 @@ docker compose \
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile comparison run --rm --no-deps rocksdb-canonical-replay-storage
 
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile comparison run --rm --no-deps postgres-canonical-replay-storage
 ```
 
@@ -289,6 +289,6 @@ docker compose \
 ```bash
 docker compose \
   --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
+  -f deploy/bench/docker-compose.storage-benchmark.yml \
   --profile comparison down --volumes --remove-orphans
 ```

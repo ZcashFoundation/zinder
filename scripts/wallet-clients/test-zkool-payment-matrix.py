@@ -552,8 +552,8 @@ class MatrixTests(unittest.TestCase):
             "node_rpc": "http://0.0.0.0:50632",
             "lightwalletd": "http://192.0.2.10:50667",
             "native_wallet_query": "https://127.0.0.1:50602",
-            "query_ops": "http://localhost:50606",
-            "compat_ops": "http://127.0.0.1:50607/healthz",
+            "query_ops": "http://localhost:50608",
+            "compat_ops": "http://127.0.0.1:50608/healthz",
         }
         for name, value in invalid.items():
             candidate = dict(ready, **{name: value})
@@ -561,10 +561,13 @@ class MatrixTests(unittest.TestCase):
                 MATRIX.verify_endpoints(candidate, base)
         for name, value in (("node_rpc", "http://127.0.0.1"),
                             ("node_rpc", "http://127.0.0.1:80"),
-                            ("lightwalletd", ready["node_rpc"])):
+                            ("lightwalletd", ready["node_rpc"]),
+                            ("query_ops", "http://127.0.0.1:50606")):
             candidate = dict(ready, **{name: value})
             with self.assertRaises(ValueError, msg=f"{name}={value}"):
                 MATRIX.verify_endpoints(candidate, base)
+        with self.assertRaises(ValueError):
+            MATRIX.verify_endpoints(dict(ready, query_ops="http://127.0.0.1:50606"))
         with self.assertRaises(ValueError):
             MATRIX.verify_endpoints(ready, base + 1)
         with self.assertRaises(ValueError):

@@ -27,7 +27,7 @@ inputs:
     required: false
     default: ""
   images:
-    description: JSON map of the four immutable runtime image shells
+    description: JSON map of the unified zinder runtime image shell
     required: false
     default: scripts/release-wallet-images.json
   baseline-matrix:

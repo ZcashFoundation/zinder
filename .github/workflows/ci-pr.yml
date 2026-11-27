@@ -439,15 +439,6 @@ jobs:
       - name: Test deployment admission
         run: scripts/test-deployment-admission.sh
 
-      - name: Test wallet-serving entrypoint
-        run: scripts/test-wallet-serving-entrypoint.sh
-
-      - name: Test wallet-serving Explorer entrypoint
-        run: scripts/test-wallet-serving-explorer-entrypoint.sh
-
-      - name: Test indexer TLS entrypoints
-        run: scripts/test-indexer-tls-entrypoints.sh
-
       - name: Test release image publication
         run: scripts/test-release-image-publication.sh
 
@@ -496,7 +487,7 @@ jobs:
             ZINDER_BENCH_FIXTURE_CACHE_POLICY=warm \
             docker compose \
               --env-file deploy/.env.storage-benchmark.example \
-              -f deploy/docker-compose.storage-benchmark.yml \
+              -f deploy/bench/docker-compose.storage-benchmark.yml \
               --profile comparison \
               --profile postgres \
               --profile rocksdb \
@@ -507,10 +498,7 @@ jobs:
 
       - name: Test deployment Compose contract
         env:
-          ZINDER_INGEST_IMAGE: zinder-ingest:ci-proof
-          ZINDER_PROJECTOR_IMAGE: zinder-projector:ci-proof
-          ZINDER_QUERY_IMAGE: zinder-query:ci-proof
-          ZINDER_COMPAT_IMAGE: zinder-compat-lightwalletd:ci-proof
+          ZINDER_IMAGE: zinder:ci-proof
           ZINDER_SINGLE_HOST_DATA_VOLUME_NAME: zinder-ci-proof-data
           ZINDER_PROMETHEUS_VOLUME_NAME: zinder-ci-proof-prometheus
           ZINDER_GRAFANA_VOLUME_NAME: zinder-ci-proof-grafana
@@ -522,17 +510,11 @@ jobs:
             --profile observability \
             config --format json \
           | jq -e '
-              .services["zinder-ingest"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-projector"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-query"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-compat-lightwalletd"].command == ["--config", "/etc/zinder/config.toml"]
-              and .services["zinder-ingest"].image == "zinder-ingest:ci-proof"
-              and .services["zinder-projector"].image == "zinder-projector:ci-proof"
-              and .services["zinder-query"].image == "zinder-query:ci-proof"
-              and .services["zinder-compat-lightwalletd"].image == "zinder-compat-lightwalletd:ci-proof"
-              and .services["zinder-projector"].network_mode == "service:zinder-ingest"
-              and .services["zinder-query"].network_mode == "service:zinder-ingest"
-              and .services["zinder-compat-lightwalletd"].network_mode == "service:zinder-ingest"
+              .services["zinder-index"].command[0] == "index"
+              and .services["zinder-serve"].command[0] == "serve"
+              and .services["zinder-index"].image == "zinder:ci-proof"
+              and .services["zinder-serve"].image == "zinder:ci-proof"
+              and .services["zinder-serve"].network_mode == "service:zinder-index"
               and .volumes.data.name == "zinder-ci-proof-data"
               and .volumes.prometheus.name == "zinder-ci-proof-prometheus"
               and .volumes.grafana.name == "zinder-ci-proof-grafana"
@@ -548,7 +530,7 @@ jobs:
           ZINDER_BENCH_TRIAL_ID: ci-compose
           ZINDER_BENCH_FIXTURE_CACHE_POLICY: warm
           ZINDER_BENCH_PROJECT_NAME: zinder-storage-observer-ci
-          ZINDER_BENCH_RESULTS_PATH: ../benchmark-results
+          ZINDER_BENCH_RESULTS_PATH: ../../benchmark-results
           ZINDER_BENCH_POSTGRES_DATABASE_CPUS: "2.0"
         run: |
           set -euo pipefail
@@ -557,7 +539,7 @@ jobs:
           cleanup() {
             docker compose \
               --env-file deploy/.env.storage-benchmark.example \
-              -f deploy/docker-compose.storage-benchmark.yml \
+              -f deploy/bench/docker-compose.storage-benchmark.yml \
               --profile postgres \
               down --volumes --remove-orphans
           }
@@ -565,25 +547,25 @@ jobs:
 
           docker compose \
             --env-file deploy/.env.storage-benchmark.example \
-            -f deploy/docker-compose.storage-benchmark.yml \
+            -f deploy/bench/docker-compose.storage-benchmark.yml \
             --profile postgres \
             up -d --wait postgres-database
           docker compose \
             --env-file deploy/.env.storage-benchmark.example \
-            -f deploy/docker-compose.storage-benchmark.yml \
+            -f deploy/bench/docker-compose.storage-benchmark.yml \
             exec -T postgres-database \
             pg_isready --username zinder_bench --dbname zinder_bench
           published_postgres_endpoint="$(
             docker compose \
               --env-file deploy/.env.storage-benchmark.example \
-              -f deploy/docker-compose.storage-benchmark.yml \
+              -f deploy/bench/docker-compose.storage-benchmark.yml \
               port postgres-database 5432
           )"
           test "${published_postgres_endpoint}" = "127.0.0.1:55432"
           python3 -c 'import socket; connection = socket.create_connection(("127.0.0.1", 55432), timeout=5); connection.close()'
           docker compose \
             --env-file deploy/.env.storage-benchmark.example \
-            -f deploy/docker-compose.storage-benchmark.yml \
+            -f deploy/bench/docker-compose.storage-benchmark.yml \
             --profile postgres \
             stop postgres-database
 

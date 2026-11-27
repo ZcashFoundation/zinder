@@ -19,13 +19,7 @@ on:
       - ".github/actions/buildkit-cargo-cache/**"
       - "deploy/docker-compose.yml"
       - "deploy/release-images.json"
-      - "deploy/release-single-volume-images.json"
-      - "deploy/canonical-runtime-entrypoint"
-      - "deploy/materialize-indexer-tls"
-      - "deploy/wallet-serving-runtime-entrypoint"
-      - "deploy/wallet-serving-explorer-runtime-entrypoint"
-      - "deploy/wallet-serving-healthcheck"
-      - "deploy/config/wallet-serving/**"
+      - "deploy/kubernetes/**"
       - "scripts/validate-deployment-admission.sh"
       - "scripts/test-deployment-admission.sh"
       - "buf.yaml"
@@ -45,13 +39,7 @@ on:
       - ".github/actions/buildkit-cargo-cache/**"
       - "deploy/docker-compose.yml"
       - "deploy/release-images.json"
-      - "deploy/release-single-volume-images.json"
-      - "deploy/canonical-runtime-entrypoint"
-      - "deploy/materialize-indexer-tls"
-      - "deploy/wallet-serving-runtime-entrypoint"
-      - "deploy/wallet-serving-explorer-runtime-entrypoint"
-      - "deploy/wallet-serving-healthcheck"
-      - "deploy/config/wallet-serving/**"
+      - "deploy/kubernetes/**"
       - "scripts/validate-deployment-admission.sh"
       - "scripts/test-deployment-admission.sh"
       - "buf.yaml"
@@ -159,48 +147,22 @@ jobs:
 
             docker image inspect "${image_name}:${PR_TAG}" \
               --format 'image={{.Id}} size_bytes={{.Size}}'
-            docker run --rm --entrypoint="$image_name" "${image_name}:${PR_TAG}" --help
+            docker run --rm "${image_name}:${PR_TAG}" --help >/dev/null
+            docker run --rm "${image_name}:${PR_TAG}" config validate --help >/dev/null
             image_user="$(docker image inspect "${image_name}:${PR_TAG}" --format '{{.Config.User}}')"
             if [ "$image_user" != "10001:10001" ]; then
               echo "::error::${image_name} runs as ${image_user}, not 10001:10001"
               exit 1
             fi
-            # The healthcheck must fail against a closed port and must read the
-            # baked default config the image's CMD names.
-            if docker run --rm --entrypoint="$image_name" "${image_name}:${PR_TAG}" \
-              --config /etc/zinder/config.toml healthcheck --addr 127.0.0.1:1; then
+            # The healthcheck must fail against a closed port (exit 1) rather
+            # than returning a CLI usage error.
+            if docker run --rm "${image_name}:${PR_TAG}" healthcheck --addr 127.0.0.1:1; then
               echo "::error::${image_name} healthcheck passed against a closed port"
               exit 1
             fi
-            docker run --rm --entrypoint="$image_name" "${image_name}:${PR_TAG}" \
-              --config /etc/zinder/config.toml healthcheck --help >/dev/null
+            docker run --rm "${image_name}:${PR_TAG}" healthcheck --help >/dev/null
             export_image_root "$image_name"
           done <<< "$image_names"
-
-          # Single-volume host images wrap the runtime binaries in an
-          # entrypoint script, so the smoke runs the ingest binary they carry
-          # and confirms the configured entrypoint is installed.
-          single_volume_image_names="$(jq -r '.[]' deploy/release-single-volume-images.json)"
-          while IFS= read -r image_name; do
-            docker buildx build \
-              --file deploy/Dockerfile \
-              --target "$image_name" \
-              --platform "$PLATFORM_REF" \
-              --build-arg "ZINDER_BUILD_GIT_COMMIT=${SMOKE_BUILD_GIT_COMMIT}" \
-              --load \
-              --tag "${image_name}:${PR_TAG}" \
-              --cache-from "type=gha,scope=${CACHE_SCOPE}" \
-              .
-
-            docker image inspect "${image_name}:${PR_TAG}" \
-              --format 'image={{.Id}} size_bytes={{.Size}}'
-            docker run --rm --entrypoint=zinder-ingest "${image_name}:${PR_TAG}" --help
-            image_entrypoint="$(docker image inspect "${image_name}:${PR_TAG}" --format '{{index .Config.Entrypoint 0}}')"
-            docker run --rm --entrypoint=sh "${image_name}:${PR_TAG}" -c 'test -x "$(command -v "$1")"' sh "$image_entrypoint"
-            docker run --rm --entrypoint=sh "${image_name}:${PR_TAG}" \
-              -c 'test "$(id -u zinder):$(id -g zinder)" = "10001:10001"'
-            export_image_root "$image_name"
-          done <<< "$single_volume_image_names"
 
       # One export of the build-base stage, from main only. Later stages copy
       # the workspace and change on every commit, so their layers are not

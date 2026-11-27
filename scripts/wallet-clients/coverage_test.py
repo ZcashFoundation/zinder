@@ -242,6 +242,17 @@ class CoverageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             paths = [Path(temp) / f"{s}.json" for s in ("first", "second")]
             a, b = payment_receipt("a"), payment_receipt("b")
+            for r in (a, b):
+                r["fixture_recipe"]["release_binaries"] = {"zinder": "a" * 64}
+            for path, r in zip(paths, (a, b)):
+                path.write_text(json.dumps(r))
+            self.assertEqual(len(list(cov.roundtrip_actions(paths, release))), 4)
+            a["fixture_recipe"]["release_binaries"] = {"zinder": "a" * 64, "query": "a" * 64}
+            paths[0].write_text(json.dumps(a))
+            with self.assertRaisesRegex(ValueError, "release binary"):
+                list(cov.roundtrip_actions(paths, release))
+
+            a, b = payment_receipt("a"), payment_receipt("b")
             def write_pair():
                 for path, r in zip(paths, (a, b)):
                     path.write_text(json.dumps(r))

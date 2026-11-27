@@ -29,8 +29,8 @@ WALLET_CLIENTS = SCRIPTS / "wallet-clients"
 DEFAULT_PORTS = (51500, 51600)
 WALLET_PORT_OFFSET = 82
 CAMPAIGN_ATTEMPTS = 2
-IMAGE_NAMES = ("compat-lightwalletd", "ingest", "projector", "query")
-CANDIDATE_BINARIES = tuple("zinder-" + name for name in IMAGE_NAMES)
+IMAGE_NAMES = ("zinder",)
+CANDIDATE_BINARIES = ("zinder",)
 ROUNDTRIP_ROW_IDS = (
     "roundtrip-outbound-zingo-send",
     "roundtrip-outbound-zallet-receive",
@@ -243,7 +243,7 @@ def load_clients(bundle, bundle_sha256, workspace):
 def load_images(path):
     images = read_json(path)
     require(set(images) == set(IMAGE_NAMES),
-            "--images must map ingest/projector/query/compat-lightwalletd to immutable images")
+            "--images must map zinder to an immutable image")
     for name, reference in images.items():
         require(isinstance(reference, str) and IMMUTABLE_IMAGE.fullmatch(reference),
                 f"{name}: image reference must be an immutable digest")
@@ -363,7 +363,7 @@ def run_campaign(options, candidate, clients):
 
 def bind_campaign_evidence(campaign_state, candidate, clients, commit):
     """Require both receipts to name the candidate archive and both client pins."""
-    receipt_pins = {name: candidate["binaries"]["zinder-" + name]["sha256"] for name in IMAGE_NAMES}
+    receipt_pins = {name: candidate["binaries"][name]["sha256"] for name in CANDIDATE_BINARIES}
     for label in ("first", "second"):
         receipt = read_json(Path(campaign_state) / label / "receipt.json")
         require(receipt["inputs"]["revision"] == commit,

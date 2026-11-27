@@ -1,22 +1,19 @@
-# Single-host wallet-serving topology.
+# Single-host Zinder deployment topology using the unified `zinder` image.
 #
-# The four release runtimes share one host filesystem. zinder-ingest is the
-# only canonical writer, zinder-projector is the only wallet writer,
-# zinder-query serves the native WalletQuery protocol, and
-# zinder-compat-lightwalletd serves the compatibility protocol. A separate
-# publisher signs ranges of settled shielded blocks. Wallet query processes
-# share ingest's network namespace so the authenticated control plane remains
-# loopback-only.
+# `zinder-index` owns write access to the canonical and wallet stores.
+# `zinder-serve` runs reader roles in `zinder-index`'s network namespace so
+# authenticated control stays loopback-only while sharing the node and
+# observability networks.
 #
-# ZINDER_VERSION=vX.Y.Z pulls the signed release images of that tag; use the
-# Compose file from the same tag. Without it, `up -d --build` builds the
-# images from this checkout and tags them `:local`. Each image variable, such
-# as ZINDER_INGEST_IMAGE, replaces one whole reference, for example with a
-# digest-pinned one.
+# Select a deployment preset (`wallet`, `light-wallet`, or `explorer`) with
+# `ZINDER_PRESET` or `ZINDER_DEPLOYMENT__PROFILE` (default: `wallet`).
 #
-# The node is external to this project. Select it with one of the env files in
-# this directory: each names the node's Docker network, its cookie volume, and
-# its JSON-RPC and optional indexer endpoints. No node address has a default.
+# ZINDER_VERSION=vX.Y.Z pulls the signed release image of that tag; use the
+# Compose file from the same tag. Without it, `up -d --build` builds from
+# this checkout and tags `:local`.
+#
+# The Zcash node is external to this project. Select one of the `deploy/.env.*`
+# files for its Docker network, cookie volume, and JSON-RPC/indexer endpoints.
 name: zinder-${ZINDER_DEPLOY_NETWORK:?set ZINDER_DEPLOY_NETWORK to mainnet, testnet, or regtest}
 
 networks:
@@ -26,12 +23,13 @@ networks:
   observability:
     name: ${ZINDER_OBSERVABILITY_NETWORK_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-observability}
 
-x-compat-image: &compat-image
-  image: ${ZINDER_COMPAT_IMAGE:-ghcr.io/zcashfoundation/zinder-compat-lightwalletd:${ZINDER_VERSION:-local}}
+x-zinder-image: &zinder-image
+  image: ${ZINDER_IMAGE:-ghcr.io/zcashfoundation/zinder:${ZINDER_VERSION:-local}}
+  stop_grace_period: 30s
   build:
     context: ..
     dockerfile: deploy/Dockerfile
-    target: zinder-compat-lightwalletd
+    target: zinder
     args:
       ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
 
@@ -45,7 +43,7 @@ services:
       [
         "sh",
         "-c",
-        "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary /var/lib/zinder/explorer/secondary && chown -R 10001:10001 /var/lib/zinder",
+        "mkdir -p /var/lib/zinder/secondary /var/lib/zinder/checkpoints && chown -R 10001:10001 /var/lib/zinder",
       ]
     volumes:
       - type: volume
@@ -59,19 +57,13 @@ services:
         volume:
           nocopy: true
 
-  zinder-ingest:
-    image: ${ZINDER_INGEST_IMAGE:-ghcr.io/zcashfoundation/zinder-ingest:${ZINDER_VERSION:-local}}
-    mem_limit: ${ZINDER_INGEST_MEMORY_LIMIT:-14g}
+  zinder-index:
+    <<: *zinder-image
+    mem_limit: ${ZINDER_INDEX_MEMORY_LIMIT:-20g}
     ulimits:
       nofile:
-        soft: ${ZINDER_INGEST_NOFILE_SOFT_LIMIT:-65536}
-        hard: ${ZINDER_INGEST_NOFILE_HARD_LIMIT:-65536}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: zinder-ingest
-      args:
-        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
+        soft: ${ZINDER_NOFILE_SOFT_LIMIT:-65536}
+        hard: ${ZINDER_NOFILE_HARD_LIMIT:-65536}
     restart: on-failure
     depends_on:
       state-init:
@@ -79,203 +71,68 @@ services:
     networks:
       node:
         aliases:
+          - zinder-${ZINDER_DEPLOY_NETWORK}-index
           - zinder-${ZINDER_DEPLOY_NETWORK}-ingest
-          - zinder-${ZINDER_DEPLOY_NETWORK}-query
-          - zinder-${ZINDER_DEPLOY_NETWORK}-explorer
       observability:
     volumes:
       - data:/var/lib/zinder
       - checkpoint-staging:/var/lib/zinder/checkpoints
-      - ./config/ingest.toml:/etc/zinder/config.toml:ro
       - node-cookie:/var/run/auth:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
-    command: ["--config", "/etc/zinder/config.toml"]
+    command: ["index", "--preset", "${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}"]
     environment:
-      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-wallet}
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}
       ZINDER_INGEST__SOURCE: ${ZINDER_INGEST__SOURCE:-zebra-json-rpc}
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
-      # Empty selects JSON-RPC mempool polling. Env files set the indexer URL
-      # only when the node exposes its indexer gRPC listener to this network.
+      # Empty selects JSON-RPC mempool polling.
       ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR-}
+      ZINDER_NODE__INDEXER_TLS__SERVER_NAME: ${ZINDER_NODE__INDEXER_TLS__SERVER_NAME-}
+      ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM: ${ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM-}
+      ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM: ${ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM-}
+      ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM: ${ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM-}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
+      ZINDER_NODE__AUTH__PATH: /var/run/auth/.cookie
+      ZINDER_STORAGE__DATA_DIR: /var/lib/zinder
+      ZINDER_STORAGE__FULL_BLOCKS: ${ZINDER_STORAGE__FULL_BLOCKS:-false}
+      ZINDER_INGEST_CONTROL__LISTEN_ADDR: "127.0.0.1:9100"
+      ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH: /var/run/zinder-control/ingest.token
+      ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH: /var/run/zinder-checkpoint/checkpoint.token
+      ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR: "127.0.0.1:9101"
+      ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH: /var/run/zinder-checkpoint/checkpoint.token
       # Namespace-wide binds are explicit deployment opt-ins. Host publication
       # below remains loopback-only, while Prometheus reaches ops internally.
       ZINDER_OPS__LISTEN_ADDR: "[::]:9105"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
     ports:
-      - "127.0.0.1:${ZINDER_INGEST_OPS_HOST_PORT:-9105}:9105"
+      - "127.0.0.1:${ZINDER_INDEX_OPS_HOST_PORT:-${ZINDER_INGEST_OPS_HOST_PORT:-9105}}:9105"
       - "127.0.0.1:${ZINDER_COMPAT_HOST_PORT:-9067}:9067"
       - "127.0.0.1:${ZINDER_QUERY_HOST_PORT:-9102}:9102"
-      - "127.0.0.1:${ZINDER_PROJECTOR_OPS_HOST_PORT:-9110}:9110"
-      - "127.0.0.1:${ZINDER_QUERY_OPS_HOST_PORT:-9106}:9106"
-      - "127.0.0.1:${ZINDER_COMPAT_OPS_HOST_PORT:-9107}:9107"
+      - "127.0.0.1:${ZINDER_EXPLORER_HOST_PORT:-9068}:9068"
+      - "127.0.0.1:${ZINDER_CIPHERSCAN_HOST_PORT:-9070}:9070"
+      - "127.0.0.1:${ZINDER_SERVE_OPS_HOST_PORT:-${ZINDER_COMPAT_OPS_HOST_PORT:-9108}}:9108"
     healthcheck:
-      test: ["CMD", "zinder-ingest", "healthcheck"]
+      test: ["CMD", "/usr/local/bin/zinder", "healthcheck", "--addr", "127.0.0.1:9105"]
       interval: 30s
       timeout: 5s
-      # Fresh canonical construction has a three-hour production hard gate.
-      # Keep expected bootstrap failures in Docker's starting state until then.
-      start_period: 3h
+      start_period: 10s
       retries: 3
 
-  zinder-projector:
-    image: ${ZINDER_PROJECTOR_IMAGE:-ghcr.io/zcashfoundation/zinder-projector:${ZINDER_VERSION:-local}}
-    mem_limit: ${ZINDER_PROJECTOR_MEMORY_LIMIT:-10g}
+  zinder-serve:
+    <<: *zinder-image
+    mem_limit: ${ZINDER_SERVE_MEMORY_LIMIT:-8g}
     ulimits:
       nofile:
-        soft: 65536
-        hard: 65536
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: zinder-projector
-      args:
-        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
+        soft: ${ZINDER_NOFILE_SOFT_LIMIT:-65536}
+        hard: ${ZINDER_NOFILE_HARD_LIMIT:-65536}
     restart: on-failure
-    network_mode: "service:zinder-ingest"
+    network_mode: "service:zinder-index"
     depends_on:
-      zinder-ingest:
+      zinder-index:
         condition: service_healthy
     volumes:
       - data:/var/lib/zinder
-      - checkpoint-staging:/var/lib/zinder/checkpoints
-      - ./config/projector.toml:/etc/zinder/config.toml:ro
-      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
-      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
-    command: ["--config", "/etc/zinder/config.toml"]
-    environment:
-      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-wallet}
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
-      ZINDER_PROJECTOR__BUILD_OWNER_HEX: ${ZINDER_PROJECTOR_BUILD_OWNER_HEX:?set a stable 32-character hexadecimal projector owner}
-      ZINDER_OPS__LISTEN_ADDR: "[::]:9110"
-      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
-    healthcheck:
-      test: ["CMD", "zinder-projector", "healthcheck"]
-      interval: 30s
-      timeout: 5s
-      # Wallet construction has a two-hour production hard gate.
-      start_period: 2h
-      retries: 3
-
-  zinder-query:
-    image: ${ZINDER_QUERY_IMAGE:-ghcr.io/zcashfoundation/zinder-query:${ZINDER_VERSION:-local}}
-    mem_limit: ${ZINDER_QUERY_MEMORY_LIMIT:-4g}
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: zinder-query
-      args:
-        ZINDER_PASTA_ASM: ${ZINDER_PASTA_ASM:-1}
-    restart: on-failure
-    network_mode: "service:zinder-ingest"
-    # The shared network namespace needs only a started ingest container.
-    # Query keeps serving through a node outage that leaves ingest unhealthy,
-    # and the first start still waits for the projector, which waits for a
-    # healthy ingest.
-    depends_on:
-      zinder-ingest:
-        condition: service_started
-      zinder-projector:
-        condition: service_healthy
-    volumes:
-      - data:/var/lib/zinder
-      - ./config/query.toml:/etc/zinder/config.toml:ro
-      - node-cookie:/var/run/auth:ro
-      - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
-    command: ["--config", "/etc/zinder/config.toml"]
-    environment:
-      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-wallet}
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
-      ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
-      ZINDER_QUERY__LISTEN_ADDR: "[::]:9102"
-      ZINDER_OPS__LISTEN_ADDR: "[::]:9106"
-      ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
-      # Trusts the proxy's x-zinder-client-address header from every peer.
-      # This namespace joins the node and observability networks, and the
-      # node-fallback network when that overlay is merged, so their
-      # containers and host processes reach the listener without the proxy;
-      # docs/runbooks/exposing-over-tls.md lists what must hold first.
-      ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS:-false}
-    healthcheck:
-      test: ["CMD", "zinder-query", "healthcheck"]
-      interval: 30s
-      timeout: 5s
-      start_period: 5m
-      retries: 3
-
-  zinder-history-publisher:
-    <<: *compat-image
-    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-4g}
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
-    network_mode: none
-    restart: unless-stopped
-    depends_on:
-      zinder-ingest:
-        condition: service_healthy
-    healthcheck:
-      disable: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=512m
-    command:
-      - --config
-      - /etc/zinder/publisher.toml
-      - publish-shielded-history
-      - --directory
-      - /var/lib/zinder-history
-      - --signing-key
-      - /run/zinder-history/publisher.pk8
-      - --workers
-      - "${ZINDER_HISTORY_PUBLISHER_WORKERS:-1}"
-      - --follow-interval-secs
-      - "60"
-    environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
-    volumes:
-      - data:/var/lib/zinder:ro
-      - ./config/history-publisher.toml:/etc/zinder/publisher.toml:ro
-      - type: bind
-        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/publisher.pk8
-        target: /run/zinder-history/publisher.pk8
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/catalog
-        target: /var/lib/zinder-history
-        bind:
-          create_host_path: false
-
-  zinder-compat-lightwalletd:
-    <<: *compat-image
-    # Under cgroup v2, ZSHRNG01 shielded-history page cache counts toward mem_limit;
-    # keep 4g for self-hosted VMs and raise ZINDER_COMPAT_MEMORY_LIMIT (for example 32g+) on
-    # 64+ GiB public Mainnet endpoints (see docs/runbooks/deploying.md).
-    mem_limit: ${ZINDER_COMPAT_MEMORY_LIMIT:-4g}
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
-    restart: on-failure
-    network_mode: "service:zinder-ingest"
-    # Same dependency rule as zinder-query.
-    depends_on:
-      zinder-ingest:
-        condition: service_started
-      zinder-projector:
-        condition: service_healthy
-    volumes:
-      - data:/var/lib/zinder
-      - ./config/compat-lightwalletd.toml:/etc/zinder/config.toml:ro
       - node-cookie:/var/run/auth:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
       - type: bind
@@ -290,30 +147,93 @@ services:
         read_only: true
         bind:
           create_host_path: false
-    command: ["--config", "/etc/zinder/config.toml"]
+    command: ["serve", "--readers-only", "--preset", "${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}"]
     environment:
-      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_DEPLOYMENT__PROFILE:-wallet}
-      ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY: /var/lib/zinder-history
-      ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY: /run/zinder-history/publisher.pub
+      ZINDER_DEPLOYMENT__PROFILE: ${ZINDER_PRESET:-${ZINDER_DEPLOYMENT__PROFILE:-wallet}}
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
       ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
+      ZINDER_NODE__AUTH__PATH: /var/run/auth/.cookie
+      ZINDER_STORAGE__DATA_DIR: /var/lib/zinder
+      ZINDER_STORAGE__FULL_BLOCKS: ${ZINDER_STORAGE__FULL_BLOCKS:-false}
+      ZINDER_INGEST_CONTROL__ADDR: http://127.0.0.1:9100
+      ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH: /var/run/zinder-control/ingest.token
+      ZINDER_OPS__LISTEN_ADDR: "[::]:9108"
       ZINDER_COMPAT__LISTEN_ADDR: "[::]:9067"
-      ZINDER_OPS__LISTEN_ADDR: "[::]:9107"
+      ZINDER_QUERY__LISTEN_ADDR: "[::]:9102"
+      ZINDER_EXPLORER__LISTEN_ADDR: "[::]:9068"
+      ZINDER_CIPHERSCAN__LISTEN_ADDR: "[::]:9070"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
-      # Same trust rule as ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS.
+      ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY: /var/lib/zinder-history
+      ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY: /run/zinder-history/publisher.pub
+      # Proxy trust is an explicit opt-in after verifying the reverse proxy and network isolation.
+      ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS:-false}
       ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS:-false}
+      ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS: ${ZINDER_EXPLORER__TRUST_PROXY_CLIENT_ADDRESS:-false}
     healthcheck:
-      test: ["CMD", "zinder-compat-lightwalletd", "healthcheck"]
+      test: ["CMD", "/usr/local/bin/zinder", "healthcheck", "--addr", "127.0.0.1:9108"]
       interval: 30s
       timeout: 5s
-      start_period: 5m
+      start_period: 30s
       retries: 3
+
+  zinder-history-publisher:
+    <<: *zinder-image
+    profiles: [history-publisher]
+    mem_limit: ${ZINDER_HISTORY_PUBLISHER_MEMORY_LIMIT:-4g}
+    ulimits:
+      nofile:
+        soft: ${ZINDER_NOFILE_SOFT_LIMIT:-65536}
+        hard: ${ZINDER_NOFILE_HARD_LIMIT:-65536}
+    network_mode: none
+    restart: unless-stopped
+    depends_on:
+      zinder-index:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    command:
+      - run
+      - history-publisher
+      - --canonical-primary-path
+      - /var/lib/zinder/canonical
+      - --canonical-secondary-root
+      - /tmp/secondary
+      - --reorg-window-blocks
+      - "${ZINDER_COMPAT__REORG_WINDOW_BLOCKS:-1000}"
+      - --directory
+      - /var/lib/zinder-history
+      - --signing-key
+      - /run/zinder-history/publisher.pk8
+      - --workers
+      - "${ZINDER_HISTORY_PUBLISHER_WORKERS:-1}"
+      - --follow-interval-secs
+      - "60"
+    environment:
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+      ZINDER_COMPAT__SERVING: compact-blocks
+      ZINDER_STORAGE__RAW_BLOB_POLICY: ${ZINDER_STORAGE__RAW_BLOB_POLICY:-none}
+    volumes:
+      - data:/var/lib/zinder:ro
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/publisher.pk8
+        target: /run/zinder-history/publisher.pk8
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}/catalog
+        target: /var/lib/zinder-history
+        bind:
+          create_host_path: false
 
   zinder-prometheus:
     image: prom/prometheus:v3.16.0
     mem_limit: ${ZINDER_PROMETHEUS_MEMORY_LIMIT:-1g}
     restart: unless-stopped
+    profiles: [observability]
     networks:
       observability:
         aliases:

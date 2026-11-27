@@ -67,13 +67,22 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
 
 #[test]
 fn wallet_serving_explorer_image_config_resolves() -> eyre::Result<()> {
-    let config_path =
-        zinder_testkit::manifest_dir!().join("../../deploy/config/wallet-serving/explorer.toml");
-
     let output = zinder_explorer_command()
-        .args(["--config", path_str(&config_path)?, "--print-config"])
+        .args(["--print-config"])
         .env("ZINDER_NETWORK__NAME", "zcash-testnet")
         .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+        .env("ZINDER_STORAGE__PATH", "/var/lib/zinder/canonical")
+        .env(
+            "ZINDER_STORAGE__SECONDARY_PATH",
+            "/var/lib/zinder/explorer/secondary",
+        )
+        .env("ZINDER_EXPLORER__LISTEN_ADDR", "[::]:9068")
+        .env(
+            "ZINDER_EXPLORER__WALLET_QUERY_ENDPOINT",
+            "http://127.0.0.1:9102",
+        )
+        .env("ZINDER_OPS__LISTEN_ADDR", "[::]:9069")
+        .env("ZINDER_SECURITY__ALLOW_PUBLIC_BIND", "true")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");

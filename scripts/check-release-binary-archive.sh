@@ -84,11 +84,7 @@ expected_members="$({
     "$archive_root/README.md" \
     "$archive_root/SHA256SUMS" \
     "$archive_root/bin/" \
-    "$archive_root/bin/zinder-compat-lightwalletd" \
-    "$archive_root/bin/zinder-explorer" \
-    "$archive_root/bin/zinder-ingest" \
-    "$archive_root/bin/zinder-projector" \
-    "$archive_root/bin/zinder-query"
+    "$archive_root/bin/zinder"
 })"
 actual_members="$(LC_ALL=C sort <<< "$member_list")"
 expected_members="$(LC_ALL=C sort <<< "$expected_members")"
@@ -119,11 +115,7 @@ expected_files="$({
     LICENSE \
     README.md \
     SHA256SUMS \
-    bin/zinder-compat-lightwalletd \
-    bin/zinder-explorer \
-    bin/zinder-ingest \
-    bin/zinder-projector \
-    bin/zinder-query
+    bin/zinder
 })"
 actual_files="$(find "$staging_root" -type f -printf '%P\n' | LC_ALL=C sort)"
 [[ "$actual_files" == "$expected_files" ]] || {
@@ -200,11 +192,7 @@ jq -e \
     and .libc.minimum_libstdcpp_symbol == "GLIBCXX_3.4.30"
     and .source_date_epoch == $source_date_epoch
     and ([.binaries[].name] | sort) == [
-      "zinder-compat-lightwalletd",
-      "zinder-explorer",
-      "zinder-ingest",
-      "zinder-projector",
-      "zinder-query"
+      "zinder"
     ]
   ' "$build_info" >/dev/null
 

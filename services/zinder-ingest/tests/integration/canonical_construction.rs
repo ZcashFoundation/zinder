@@ -2579,17 +2579,16 @@ fn assert_compose_legacy_transactions_print_config(
     temporary_root: &std::path::Path,
     store_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let compose_ingest_config =
-        zinder_testkit::manifest_dir!().join("../../deploy/config/ingest.toml");
     let token_path = temporary_root.join("fixture.token");
     std::fs::write(&token_path, "fixture-token\n")?;
     let printed = crate::common::zinder_ingest_command()
-        .args(["--print-config", "--config"])
-        .arg(&compose_ingest_config)
+        .args(["--print-config"])
         .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+        .env("ZINDER_INGEST__RUN_OVERRIDES__COVERAGE", "wallet-serving")
         .env("ZINDER_NETWORK__NAME", "zcash-regtest")
         .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
         .env("ZINDER_STORAGE__PATH", store_path)
+        .env("ZINDER_INGEST_CONTROL__LISTEN_ADDR", "127.0.0.1:9100")
         .env("ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH", &token_path)
         .env(
             "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH",
@@ -2666,9 +2665,8 @@ async fn legacy_transactions_compose_override_reopens_pre_change_store()
         "{rejected}"
     );
 
-    // Using the legacy transactions overlay (`ZINDER_DEPLOYMENT__PROFILE`
-    // unset, `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`) resolves cleanly
-    // against `deploy/config/ingest.toml` and reopens the pre-change store.
+    // Using explicit `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions` without
+    // `ZINDER_DEPLOYMENT__PROFILE` resolves cleanly and reopens the pre-change store.
     assert_compose_legacy_transactions_print_config(temporary.path(), &store_path)?;
 
     let reopened = admit_canonical_store(
