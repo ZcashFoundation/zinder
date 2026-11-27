@@ -1267,6 +1267,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       the cache; defaults to 67108864 (64 MiB).",
     },
     EnvVarDoc {
+        name: "ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS",
+        toml_path: "query.proxy_protocol_trusted_cidrs",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: true,
+        description: "Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted.",
+    },
+    EnvVarDoc {
         name: "ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS",
         toml_path: "query.trust_proxy_client_address",
         used_by: &["zinder-query"],
@@ -1459,6 +1467,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       for as long as the client asks, so enable it only on a server you are \
                       load testing. Defaults to false, which refuses `Ping` with \
                       `FAILED_PRECONDITION`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS",
+        toml_path: "compat.proxy_protocol_trusted_cidrs",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: true,
+        description: "Comma-separated CIDRs for trusted TCP proxies. Requires a PROXY v1 or v2 preface on every connection. Disabled when omitted.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS",
@@ -2382,6 +2398,7 @@ mod tests {
                 "ZINDER_QUERY__FORWARDED_READ_WAIT_MS",
                 "ZINDER_QUERY__FORWARDED_READ_WAITERS_PER_SLOT",
                 "ZINDER_QUERY__FORWARDED_TRANSACTION_CACHE_BYTES",
+                "ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS",
                 "ZINDER_QUERY__TRUST_PROXY_CLIENT_ADDRESS",
             ]
         );
@@ -2410,6 +2427,7 @@ mod tests {
                 "ZINDER_COMPAT__TIP_WAIT_MAX_BLOCKS",
                 "ZINDER_COMPAT__TIP_WAIT_MAX_WAITERS",
                 "ZINDER_COMPAT__PING_VERY_INSECURE",
+                "ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS",
                 "ZINDER_COMPAT__TRUST_PROXY_CLIENT_ADDRESS",
             ]
         );

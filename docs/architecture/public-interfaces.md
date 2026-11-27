@@ -145,6 +145,9 @@ On a public gRPC listener, register application middleware with
 those layers do after readiness and before the response starts. Register
 gRPC-Web and CORS adapters with `PublicGrpcServer::transport_layer` so
 they can format a deadline response for the client.
+On a listener reserved for an allowlisted TCP proxy, pass the resolved
+`GrpcProxyProtocol` to `PublicGrpcServer::with_proxy_protocol` and use
+`ClientAddressSource::Connection` to identify the forwarded client.
 
 - Public operations accept and return domain types, not RocksDB handles,
   column families, or untyped byte maps.

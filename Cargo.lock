@@ -6627,6 +6627,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipnet",
  "metrics",
  "metrics-exporter-prometheus",
  "parking_lot 0.13.0",

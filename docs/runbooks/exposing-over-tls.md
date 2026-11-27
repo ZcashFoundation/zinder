@@ -67,6 +67,12 @@ done
 
 Leave `TRUST_PROXY_CLIENT_ADDRESS` off (`false`) when wallets connect directly without a proxy.
 
+## Forward client addresses from a TCP proxy
+
+Terminate TLS at the edge and configure the TCP proxy to prepend [PROXY v1 or v2](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt) to each plaintext connection to Zinder. Bind each backend on a private address and restrict access to the proxy in your firewall. Set `ZINDER_COMPAT__PROXY_PROTOCOL_TRUSTED_CIDRS` or `ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS` to the **proxy's backend source networks**, for example `192.0.2.10/32,2001:db8::10/128`. Leave HTTP header forwarding disabled on that listener.
+
+Probe `/readyz` on the private ops port for backend readiness, or send a valid PROXY preface before a backend gRPC probe. Verify wallet RPCs through the public endpoint after enabling forwarding. For rollback, remove the allowlist and disable the proxy's preface together before directing traffic to the backend.
+
 ## How readiness reaches wallets
 
 Caddy checks `HEAD /readyz` once per new gRPC call (16 pooled connections, leaving 48 of the 64 ops connections free; 5s idle close before Zinder's 10s idle deadline). A `503` causes Caddy to reject the call (`UNAVAILABLE` to gRPC clients); once admitted, an active block-range stream continues if readiness later changes, while `zinder-compat-lightwalletd` re-checks readiness before starting the RPC handler. Node outages do not drain compatibility ([During a node outage](../reference/readiness.md#during-a-node-outage)).

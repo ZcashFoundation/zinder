@@ -20,15 +20,16 @@ use zinder_query::{
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ClientAddressSource, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection,
-    DeploymentToml, IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml,
-    NodeFallbacksToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    RuntimeService, SecuritySection, SecurityToml, derive_canonical_path,
-    derive_canonical_secondary_path, derive_wallet_path, derive_wallet_secondary_path,
-    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
-    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
-    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
-    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
+    DeploymentToml, GrpcProxyProtocol, IngestControlReaderToml, IngestControlSection,
+    NetworkSection, NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsToml,
+    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
+    RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
+    derive_canonical_path, derive_canonical_secondary_path, derive_wallet_path,
+    derive_wallet_secondary_path, guard_optional_serving_bind, guard_serving_bind,
+    parse_socket_addr, require_field, resolve_allow_public_bind,
+    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
+    resolve_wallet_projection_reader_rocksdb_budget, section_defaults::DEFAULT_DATA_DIR,
+    validate_optional_data_dir,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{
@@ -99,6 +100,8 @@ pub struct LightwalletdConfig {
     pub allow_public_bind: bool,
     /// How the gRPC listener tells clients apart for its receive limit.
     pub client_address_source: ClientAddressSource,
+    /// Trusted TCP proxy peers for a listener requiring PROXY protocol.
+    pub proxy_protocol: GrpcProxyProtocol,
     /// Expected canonical replacement-depth policy.
     pub canonical_reorg_policy: CanonicalReorgPolicy,
     /// Maximum convergence attempts for aligning canonical and wallet secondaries.
@@ -374,6 +377,7 @@ struct CompatSection {
     ping_very_insecure: Option<bool>,
     serving: Option<CompatServing>,
     trust_proxy_client_address: Option<bool>,
+    proxy_protocol_trusted_cidrs: Option<String>,
 }
 
 fn deserialize_browser_origins<'de, D>(deserializer: D) -> Result<Vec<HeaderValue>, D::Error>
@@ -547,6 +551,14 @@ fn resolve_lightwalletd_config(
         .into());
     }
 
+    let client_address_source = ClientAddressSource::from_trust_proxy_client_address(
+        config.compat.trust_proxy_client_address.unwrap_or(false),
+    );
+    let proxy_protocol = GrpcProxyProtocol::resolve(
+        config.compat.proxy_protocol_trusted_cidrs.as_deref(),
+        client_address_source,
+    )?;
+
     Ok(LightwalletdConfig {
         profile: config.deployment.profile,
         network,
@@ -562,9 +574,8 @@ fn resolve_lightwalletd_config(
         browser_origins: config.compat.browser_origins,
         ops_listen_addr,
         allow_public_bind,
-        client_address_source: ClientAddressSource::from_trust_proxy_client_address(
-            config.compat.trust_proxy_client_address.unwrap_or(false),
-        ),
+        client_address_source,
+        proxy_protocol,
         canonical_reorg_policy,
         pair_convergence_attempts,
         max_concurrent_block_range_streams,
@@ -765,6 +776,7 @@ impl LightwalletdConfigToml {
                 trust_proxy_client_address: config
                     .client_address_source
                     .trust_proxy_client_address(),
+                proxy_protocol_trusted_cidrs: config.proxy_protocol.redacted_cidrs(),
             },
             node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
@@ -799,6 +811,8 @@ struct CompatToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     serving: Option<CompatServing>,
     trust_proxy_client_address: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy_protocol_trusted_cidrs: Option<&'static str>,
 }
 
 #[derive(Serialize)]

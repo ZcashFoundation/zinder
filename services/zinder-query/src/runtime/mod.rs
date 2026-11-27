@@ -360,7 +360,11 @@ async fn serve_query(
         ),
         query_config.client_address_source,
         &readiness,
-        |server| server.layer(zinder_runtime::WalletRpcMetricsLayer::WalletQuery),
+        |server| {
+            server
+                .with_proxy_protocol(query_config.proxy_protocol.clone())
+                .layer(zinder_runtime::WalletRpcMetricsLayer::WalletQuery)
+        },
     )?;
 
     tracing::info!(

@@ -47,6 +47,7 @@ where
     let listener = BrowserListener {
         browser_origins: &config.browser_origins,
         client_address: config.client_address_source,
+        proxy_protocol: config.proxy_protocol.clone(),
     };
     serve_listener(runtime, wallet_service, incoming, &listener, readiness)
 }
@@ -55,6 +56,7 @@ where
 pub(super) struct BrowserListener<'a> {
     pub(super) browser_origins: &'a [HeaderValue],
     pub(super) client_address: zinder_runtime::ClientAddressSource,
+    pub(super) proxy_protocol: zinder_runtime::GrpcProxyProtocol,
 }
 
 pub(super) fn serve_listener<S>(
@@ -84,6 +86,7 @@ where
         readiness,
         |server| {
             server
+                .with_proxy_protocol(listener.proxy_protocol.clone())
                 .accept_http1(enabled)
                 .transport_layer(transport)
                 .layer(wallet_layers(enabled))
