@@ -6,7 +6,7 @@ use crate::IndexerError;
 #[cfg(feature = "remote")]
 use crate::ServerInfo;
 use async_trait::async_trait;
-use tokio_stream::Stream;
+use futures_core::Stream;
 use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     ChainEpoch, ChainEpochId, CompactBlockArtifact, NetworkUpgradeActivations, SubtreeRootArtifact,

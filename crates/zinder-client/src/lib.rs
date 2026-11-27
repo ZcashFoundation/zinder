@@ -15,9 +15,15 @@ mod chain_index;
 mod error;
 mod error_reason;
 #[cfg(feature = "remote")]
+mod proxy;
+#[cfg(feature = "remote")]
 mod remote;
 #[cfg(feature = "remote")]
+mod retry;
+#[cfg(feature = "remote")]
 mod server_info;
+#[cfg(feature = "remote")]
+mod tls;
 
 #[cfg(feature = "remote")]
 pub use capability::{Capability, CapabilityDescriptor};
@@ -38,7 +44,9 @@ pub use chain_index::{
 pub use error::{ChainEventCursorRecovery, IndexerError, RetryPolicy};
 pub use error_reason::ErrorReason;
 #[cfg(feature = "remote")]
-pub use remote::{MIN_SUPPORTED_CONTRACT_REVISION, RemoteChainIndex, RemoteOpenOptions};
+pub use remote::{
+    MIN_SUPPORTED_CONTRACT_REVISION, RemoteChainIndex, RemoteClientOptions, RemoteOpenOptions,
+};
 #[cfg(feature = "remote")]
 pub use server_info::{NodeServerInfo, ServerInfo};
 pub use zinder_core::{

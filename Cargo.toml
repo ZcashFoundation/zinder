@@ -48,6 +48,8 @@ config = { version = "0.15.27", default-features = false, features = ["toml"] }
 const-hex = "1.19.3"
 eyre = "0.6.14"
 fs-verity = "0.2.0"
+fastrand = "2.5.0"
+futures-core = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = { version = "0.4.3", features = ["std"] }
 h2 = "0.4.20"

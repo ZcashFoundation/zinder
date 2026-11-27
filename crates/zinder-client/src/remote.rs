@@ -1,6 +1,7 @@
 //! Remote gRPC implementation of the chain-index contract.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,12 +39,15 @@ use zinder_proto::wire::{
 };
 
 use crate::error::ZINDER_ERROR_DOMAIN;
+use crate::proxy::Socks5Proxy;
+use crate::retry::{MAX_READ_ATTEMPTS, ReadBackoff};
+use crate::tls::{self, TlsRoots};
 use crate::{
     BlockId, Capability, CapabilityDescriptor, ChainEpochCommitted, ChainEvent, ChainEventCursor,
     ChainEventEnvelope, ChainEventStream, ChainEventStreamFamily, ChainIndex, ChainRangeReverted,
     EndpointBackedIndex, EventStreamStart, IndexStream, IndexerError, MempoolEvent,
     MempoolEventCursor, MempoolEventEnvelope, MempoolEventStream, MempoolSnapshotCursor,
-    MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo, ServerInfo,
+    MempoolSnapshotRequest, MempoolSnapshotView, NodeServerInfo, RetryPolicy, ServerInfo,
     TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
@@ -57,6 +61,65 @@ pub struct RemoteOpenOptions {
     pub endpoint: String,
     /// Expected network served by the endpoint.
     pub network: Network,
+}
+
+/// Optional transport and read retry settings for [`RemoteChainIndex`].
+///
+/// The default uses system TLS roots, a direct connection, and one attempt
+/// per RPC.
+#[derive(Clone, Default)]
+#[must_use]
+pub struct RemoteClientOptions {
+    tls_roots: Option<TlsRoots>,
+    tls_domain_name: Option<String>,
+    tls_spki_pin: Option<[u8; 32]>,
+    socks5_proxy: Option<String>,
+    retry_reads: bool,
+}
+
+impl RemoteClientOptions {
+    /// Trust the certificates in a PEM bundle in place of system roots.
+    pub fn with_tls_ca_pem(mut self, bundle: impl Into<Vec<u8>>) -> Self {
+        self.tls_roots = Some(TlsRoots::Pem(bundle.into()));
+        self
+    }
+
+    /// Trust a collection of DER-encoded CA certificates in place of system roots.
+    pub fn with_tls_ca_der(mut self, certificates: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        self.tls_roots = Some(TlsRoots::Der(certificates.into_iter().collect()));
+        self
+    }
+
+    /// Override the TLS certificate name and HTTP/2 authority host.
+    pub fn with_tls_domain_name(mut self, domain_name: impl Into<String>) -> Self {
+        self.tls_domain_name = Some(domain_name.into());
+        self
+    }
+
+    /// Require the SHA-256 digest of the leaf certificate's DER-encoded
+    /// `SubjectPublicKeyInfo` in addition to standard TLS certificate verification.
+    pub const fn with_tls_spki_pin(mut self, sha256: [u8; 32]) -> Self {
+        self.tls_spki_pin = Some(sha256);
+        self
+    }
+
+    /// Route every connection through an unauthenticated SOCKS5 proxy.
+    ///
+    /// Both `socks5://host:port` and `socks5h://host:port` send destination
+    /// hostnames to the proxy for resolution.
+    pub fn with_socks5_proxy(mut self, uri: impl Into<String>) -> Self {
+        self.socks5_proxy = Some(uri.into());
+        self
+    }
+
+    /// Allow up to four attempts per read RPC with bounded backoff.
+    ///
+    /// Range and history reads may retry before a stream opens. Broadcasts
+    /// and event subscriptions always use a single attempt.
+    pub const fn with_read_retries(mut self) -> Self {
+        self.retry_reads = true;
+        self
+    }
 }
 
 /// Remote chain index backed by the native wallet gRPC API.
@@ -88,7 +151,9 @@ pub struct RemoteOpenOptions {
 pub struct RemoteChainIndex {
     client: Arc<ArcSwap<WalletQueryClient<Channel>>>,
     endpoint: Endpoint,
+    proxy: Option<Socks5Proxy>,
     network: Network,
+    retry_reads: bool,
 }
 
 /// Cadence at which HTTP/2 PING frames are sent over the channel; with
@@ -100,8 +165,7 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
 /// connection is dead and tearing it down so the next call re-dials.
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Upper bound on the initial TCP+HTTP/2 handshake when the channel
-/// establishes (or re-establishes) the connection lazily.
+/// Timeout for the TCP connection, TLS handshake, and internal metadata probe.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// OS-level TCP keepalive idle interval. Belt-and-braces alongside the
@@ -141,16 +205,9 @@ pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 8;
 /// enable hyper's adaptive window, because in tonic 0.14.9 and hyper 1.12.0
 /// `adaptive_window(true)` resets both initial windows back to the 65,535-byte
 /// spec value, discarding these larger sizes.
-fn build_endpoint(uri: &str) -> Result<Endpoint, IndexerError> {
-    // URI scheme is the TLS signal: `https://` negotiates rustls with system roots.
-    let use_tls = uri.starts_with("https://");
-    let mut endpoint = Channel::from_shared(uri.to_owned())
-        .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
-    if use_tls {
-        endpoint = endpoint
-            .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())
-            .map_err(|error| IndexerError::invalid_request(error.to_string()))?;
-    }
+fn build_endpoint(uri: String) -> Result<Endpoint, IndexerError> {
+    let endpoint = Channel::from_shared(uri)
+        .map_err(|_| IndexerError::invalid_request("invalid wallet endpoint URI"))?;
     Ok(endpoint
         .keep_alive_while_idle(true)
         .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
@@ -165,22 +222,87 @@ fn build_endpoint(uri: &str) -> Result<Endpoint, IndexerError> {
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
     ///
-    /// The channel is constructed lazily: the TCP+HTTP/2 connection is
-    /// established on the first gRPC call, not here. Only URI parsing can
-    /// fail at this stage; transport errors surface at first use.
+    /// The first RPC establishes the connection.
     pub fn connect(options: RemoteOpenOptions) -> Result<Self, IndexerError> {
-        let RemoteOpenOptions {
-            endpoint: uri,
-            network,
-        } = options;
-        let endpoint = build_endpoint(&uri)?;
-        let channel = endpoint.connect_lazy();
+        Self::connect_with_options(options, RemoteClientOptions::default())
+    }
+
+    /// Builds a lazy connection with explicit TLS, proxy, or read retry settings.
+    ///
+    /// Invalid settings fail here. Handshake and certificate verification
+    /// failures surface when an RPC first uses the connection.
+    pub fn connect_with_options(
+        options: RemoteOpenOptions,
+        client_options: RemoteClientOptions,
+    ) -> Result<Self, IndexerError> {
+        let endpoint = tls::configure(
+            build_endpoint(options.endpoint)?,
+            client_options.tls_roots.as_ref(),
+            client_options.tls_domain_name,
+            client_options.tls_spki_pin,
+            CONNECT_TIMEOUT,
+        )?;
+        let proxy = client_options
+            .socks5_proxy
+            .as_deref()
+            .map(|uri| Socks5Proxy::new(uri, &endpoint))
+            .transpose()?;
+        let channel = connect_channel(&endpoint, proxy.as_ref());
 
         Ok(Self {
             client: Arc::new(ArcSwap::new(Arc::new(WalletQueryClient::new(channel)))),
             endpoint,
-            network,
+            proxy,
+            network: options.network,
+            retry_reads: client_options.retry_reads,
         })
+    }
+
+    async fn read_rpc<Req, Resp, Fut>(
+        &self,
+        request: Req,
+        invoke: impl Fn(WalletQueryClient<Channel>, Req) -> Fut,
+    ) -> Result<tonic::Response<Resp>, tonic::Status>
+    where
+        Req: Clone,
+        Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        self.read_rpc_with_retry_policy(request, invoke, |status| {
+            Some(IndexerError::from_status(status.clone()).retry_policy())
+        })
+        .await
+    }
+
+    async fn read_rpc_with_retry_policy<Req, Resp, Fut>(
+        &self,
+        request: Req,
+        invoke: impl Fn(WalletQueryClient<Channel>, Req) -> Fut,
+        retry_policy: impl Fn(&tonic::Status) -> Option<RetryPolicy>,
+    ) -> Result<tonic::Response<Resp>, tonic::Status>
+    where
+        Req: Clone,
+        Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        if self.retry_reads {
+            let mut backoff = ReadBackoff::new();
+            for _ in 1..MAX_READ_ATTEMPTS {
+                match invoke(self.client(), request.clone()).await {
+                    Ok(response) => return Ok(response),
+                    Err(status) => {
+                        if retry_policy(&status) != Some(RetryPolicy::RetryWithBackoff) {
+                            return Err(status);
+                        }
+                        let Some(delay) = backoff.delay(&status, has_zinder_error_info(&status))
+                        else {
+                            return Err(status);
+                        };
+                        self.recover_channel(&status);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        invoke(self.client(), request).await
     }
 
     /// Returns a per-call `WalletQueryClient` clone backed by the current
@@ -200,25 +322,24 @@ impl RemoteChainIndex {
     /// the upstream omitted the trailer, since those are caller bugs that
     /// reconnecting would not fix.
     fn map_status(&self, status: tonic::Status) -> IndexerError {
-        let poisoned_transport = matches!(
+        self.recover_channel(&status);
+        IndexerError::from_status(status)
+    }
+
+    fn recover_channel(&self, status: &tonic::Status) {
+        if matches!(
             status.code(),
             tonic::Code::Unavailable | tonic::Code::Unknown
-        ) && status
-            .get_error_details()
-            .error_info()
-            .is_none_or(|error_info| error_info.domain != ZINDER_ERROR_DOMAIN);
-        let err = IndexerError::from_status(status);
-        if poisoned_transport {
+        ) && !has_zinder_error_info(status)
+        {
             self.rebuild_channel();
         }
-        err
     }
 
     /// Maps a failed transaction lookup to [`TxStatus::NotFound`] only for the
     /// typed `TRANSACTION_NOT_FOUND` absence signal.
     fn tx_status_from_lookup_failure(
-        &self,
-        status: tonic::Status,
+        status: &tonic::Status,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError> {
         let details = status.get_error_details();
@@ -231,7 +352,7 @@ impl RemoteChainIndex {
                     message: status.message().to_owned(),
                 })
             }
-            Ok(None) => Err(self.map_status(status)),
+            Ok(None) => Err(IndexerError::from_status(status.clone())),
             Err(metadata_error) => Err(IndexerError::malformed(
                 "error_info.metadata",
                 metadata_error.to_string(),
@@ -248,6 +369,13 @@ impl RemoteChainIndex {
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
+        self.decode_server_info(response)
+    }
+
+    fn decode_server_info(
+        &self,
+        response: wallet::ServerInfoResponse,
+    ) -> Result<ServerInfo, IndexerError> {
         let wallet_info = response
             .info
             .ok_or_else(|| IndexerError::malformed("info", "field is missing"))?;
@@ -286,13 +414,13 @@ impl RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<(ChainEpoch, Vec<TransparentOutpointSpendStatus>), IndexerError> {
         let response = self
-            .client()
-            .transparent_outpoint_spend_status(Request::new(
+            .read_rpc(
                 wallet::TransparentOutpointSpendStatusRequest {
                     outpoints: outpoints.iter().map(outpoint_message).collect(),
                     at_epoch_id: at_epoch_id.map(ChainEpochId::value),
                 },
-            ))
+                async |mut client, request| client.transparent_outpoint_spend_status(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -329,7 +457,7 @@ impl RemoteChainIndex {
     }
 
     fn rebuild_channel(&self) {
-        let fresh = self.endpoint.connect_lazy();
+        let fresh = connect_channel(&self.endpoint, self.proxy.as_ref());
         self.client.store(Arc::new(WalletQueryClient::new(fresh)));
         warn!(
             target: "zinder_client",
@@ -347,10 +475,10 @@ impl RemoteChainIndex {
 impl ChainIndex for RemoteChainIndex {
     async fn current_epoch(&self) -> Result<ChainEpoch, IndexerError> {
         let response = self
-            .client()
-            .visible_tip_block(Request::new(wallet::VisibleTipBlockRequest {
-                at_epoch_id: None,
-            }))
+            .read_rpc(
+                wallet::VisibleTipBlockRequest { at_epoch_id: None },
+                async |mut client, request| client.visible_tip_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -363,8 +491,10 @@ impl ChainIndex for RemoteChainIndex {
         ensure_advertised_capability(&server_info, Capability::NetworkUpgradeActivations)?;
 
         let response = self
-            .client()
-            .network_upgrade_activations(Request::new(wallet::NetworkUpgradeActivationsRequest {}))
+            .read_rpc(
+                wallet::NetworkUpgradeActivationsRequest {},
+                async |mut client, request| client.network_upgrade_activations(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -377,10 +507,12 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
-            .client()
-            .visible_tip_block(Request::new(wallet::VisibleTipBlockRequest {
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::VisibleTipBlockRequest {
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.visible_tip_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -412,10 +544,12 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
-            .client()
-            .settled_tip_block(Request::new(wallet::SettledTipBlockRequest {
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::SettledTipBlockRequest {
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.settled_tip_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -449,11 +583,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockId, IndexerError> {
         let response = self
-            .client()
-            .block_id_by_selector(Request::new(wallet::BlockSelectorRequest {
-                selector: Some(block_selector_to_message(selector)?),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::BlockSelectorRequest {
+                    selector: Some(block_selector_to_message(selector)?),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.block_id_by_selector(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -466,11 +602,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeader, IndexerError> {
         let response = self
-            .client()
-            .block_header_by_selector(Request::new(wallet::BlockSelectorRequest {
-                selector: Some(block_selector_to_message(selector)?),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::BlockSelectorRequest {
+                    selector: Some(block_selector_to_message(selector)?),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.block_header_by_selector(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -483,11 +621,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockArtifact, IndexerError> {
         let response = self
-            .client()
-            .compact_block(Request::new(wallet::CompactBlockRequest {
-                height: height.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::CompactBlockRequest {
+                    height: height.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.compact_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -513,12 +653,14 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
         let response = self
-            .client()
-            .compact_blocks_in_range(Request::new(wallet::CompactBlocksInRangeRequest {
-                start_height: block_range.start.value(),
-                end_height: block_range.end.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::CompactBlocksInRangeRequest {
+                    start_height: block_range.start.value(),
+                    end_height: block_range.end.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.compact_blocks_in_range(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?;
         let recovery = self.clone();
@@ -538,11 +680,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockBlobArtifact, IndexerError> {
         let response = self
-            .client()
-            .full_block(Request::new(wallet::FullBlockRequest {
-                height: height.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::FullBlockRequest {
+                    height: height.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.full_block(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -568,12 +712,14 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<IndexStream<BlockBlobArtifact>, IndexerError> {
         let response = self
-            .client()
-            .full_blocks_in_range(Request::new(wallet::FullBlocksInRangeRequest {
-                start_height: block_range.start.value(),
-                end_height: block_range.end.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::FullBlocksInRangeRequest {
+                    start_height: block_range.start.value(),
+                    end_height: block_range.end.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.full_blocks_in_range(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?;
         let recovery = self.clone();
@@ -650,11 +796,13 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         let response = self
-            .client()
-            .tree_state_at_height(Request::new(wallet::TreeStateAtHeightRequest {
-                height: height.value(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::TreeStateAtHeightRequest {
+                    height: height.value(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.tree_state_at_height(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -688,10 +836,12 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeStateArtifact, IndexerError> {
         let response = self
-            .client()
-            .latest_tree_state_checkpoint(Request::new(wallet::LatestTreeStateCheckpointRequest {
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::LatestTreeStateCheckpointRequest {
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.latest_tree_state_checkpoint(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -716,14 +866,16 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Vec<SubtreeRootArtifact>, IndexerError> {
         let response = self
-            .client()
-            .subtree_roots(Request::new(wallet::SubtreeRootsRequest {
-                shielded_protocol: shielded_protocol_to_message(subtree_root_range.protocol)?
-                    as i32,
-                start_index: subtree_root_range.start_index.value(),
-                max_entries: subtree_root_range.max_entries.get(),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc(
+                wallet::SubtreeRootsRequest {
+                    shielded_protocol: shielded_protocol_to_message(subtree_root_range.protocol)?
+                        as i32,
+                    start_index: subtree_root_range.start_index.value(),
+                    max_entries: subtree_root_range.max_entries.get(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.subtree_roots(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -736,15 +888,25 @@ impl ChainIndex for RemoteChainIndex {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError> {
         let response = match self
-            .client()
-            .transaction(Request::new(wallet::TransactionRequest {
-                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-                at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-            }))
+            .read_rpc_with_retry_policy(
+                wallet::TransactionRequest {
+                    transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+                async |mut client, request| client.transaction(request).await,
+                |status| {
+                    Self::tx_status_from_lookup_failure(status, at_epoch_id)
+                        .err()
+                        .map(|error| error.retry_policy())
+                },
+            )
             .await
         {
             Ok(response) => response.into_inner(),
-            Err(status) => return self.tx_status_from_lookup_failure(status, at_epoch_id),
+            Err(status) => {
+                self.recover_channel(&status);
+                return Self::tx_status_from_lookup_failure(&status, at_epoch_id);
+            }
         };
         tx_status_from_message(self.network, transaction_id, at_epoch_id, response)
     }
@@ -763,8 +925,9 @@ impl ChainIndex for RemoteChainIndex {
             at_epoch_id: query.at_epoch_id.map(ChainEpochId::value),
         };
         let response = self
-            .client()
-            .transparent_address_unspent_outputs(Request::new(request))
+            .read_rpc(request, async |mut client, request| {
+                client.transparent_address_unspent_outputs(request).await
+            })
             .await
             .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
@@ -822,8 +985,9 @@ impl ChainIndex for RemoteChainIndex {
                 .map_or_default(|cursor| cursor.as_bytes().to_vec()),
         };
         let response = self
-            .client()
-            .transparent_address_tx_ids_in_range(Request::new(request))
+            .read_rpc(request, async |mut client, request| {
+                client.transparent_address_tx_ids_in_range(request).await
+            })
             .await
             .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
@@ -977,13 +1141,22 @@ fn subtree_roots_from_response(
 #[async_trait]
 impl EndpointBackedIndex for RemoteChainIndex {
     async fn server_info(&self) -> Result<ServerInfo, IndexerError> {
-        self.wallet_server_info(&mut self.client()).await
+        let response = self
+            .read_rpc(wallet::ServerInfoRequest {}, async |mut client, request| {
+                client.server_info(request).await
+            })
+            .await
+            .map_err(|status| self.map_status(status))?
+            .into_inner();
+        self.decode_server_info(response)
     }
 
     async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, IndexerError> {
         let response = self
-            .client()
-            .chain_value_pools_at_tip(Request::new(wallet::ChainValuePoolsAtTipRequest {}))
+            .read_rpc(
+                wallet::ChainValuePoolsAtTipRequest {},
+                async |mut client, request| client.chain_value_pools_at_tip(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -1068,11 +1241,13 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .from_cursor
             .map_or_default(|cursor| cursor.as_bytes().to_vec());
         let response = self
-            .client()
-            .mempool_snapshot(Request::new(wallet::MempoolSnapshotRequest {
-                max_entries: request.max_entries,
-                from_cursor,
-            }))
+            .read_rpc(
+                wallet::MempoolSnapshotRequest {
+                    max_entries: request.max_entries,
+                    from_cursor,
+                },
+                async |mut client, request| client.mempool_snapshot(request).await,
+            )
             .await
             .map_err(|status| self.map_status(status))?
             .into_inner();
@@ -1112,6 +1287,20 @@ impl EndpointBackedIndex for RemoteChainIndex {
         let outcome = self.transaction_by_id(transaction_id, None).await?;
         Ok(matches!(outcome, TxStatus::InMempool(_)))
     }
+}
+
+fn connect_channel(endpoint: &Endpoint, proxy: Option<&Socks5Proxy>) -> Channel {
+    proxy.map_or_else(
+        || endpoint.connect_lazy(),
+        |proxy| proxy.connect_lazy(endpoint),
+    )
+}
+
+fn has_zinder_error_info(status: &tonic::Status) -> bool {
+    status
+        .get_error_details()
+        .error_info()
+        .is_some_and(|error_info| error_info.domain == ZINDER_ERROR_DOMAIN)
 }
 
 fn ensure_supported_contract_revision(contract_revision: u32) -> Result<(), IndexerError> {
@@ -1413,7 +1602,7 @@ mod endpoint_transport_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let endpoint = build_endpoint(&format!("http://{address}"))?;
+        let endpoint = build_endpoint(format!("http://{address}"))?;
         let connect = tokio::spawn(async move { endpoint.connect().await });
 
         let (initial_window_size, max_frame_size, connection_window_increment) =

@@ -594,6 +594,11 @@ jobs:
           cache-key: sdk
           save-cache: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Check domain-only SDK for WebAssembly
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --locked -p zinder-core -p zinder-client --no-default-features --target wasm32-unknown-unknown
+
       - name: Verify registry packages and extracted consumer
         run: scripts/verify-sdk-packages.sh
 
