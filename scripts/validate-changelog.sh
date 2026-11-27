@@ -169,17 +169,44 @@ def parse_quoted_scalar(lines, start_idx, first_text, quote_char):
         pos = 0
 
 
-def parse_scalar_value(lines, idx, rest_text):
+def parse_scalar_value(lines, idx, rest_text, key_indent):
     stripped = rest_text.lstrip(" \t")
-    if stripped == "" or stripped.startswith("#"):
-        return "", idx, False
-    if stripped[0] in ("'", '"'):
+    if stripped.startswith(("'", '"')):
         val, end_idx = parse_quoted_scalar(lines, idx, stripped, stripped[0])
         return val, end_idx, True
-    val = strip_inline_comment(stripped)
-    if val in ("null", "Null", "NULL", "~"):
-        return "", idx, False
-    return val, idx, False
+
+    inline_comment = bool(re.search(r"(?:^|\s+)#", stripped))
+    parts = []
+    first_val = strip_inline_comment(stripped)
+    if first_val:
+        parts.append(first_val)
+    last_consumed = idx
+    if not inline_comment:
+        j = idx + 1
+        while j < len(lines):
+            pl = lines[j]
+            ps = pl.strip()
+            if ps == "":
+                j += 1
+                continue
+            if ps.startswith("#"):
+                break
+            pi = len(pl) - len(pl.lstrip(" "))
+            if pi <= key_indent:
+                break
+            if re.search(r"(?:^|\s+)#", ps):
+                part = strip_inline_comment(ps)
+                if part:
+                    parts.append(part)
+                last_consumed = j
+                break
+            parts.append(ps)
+            last_consumed = j
+            j += 1
+    combined = " ".join(parts).strip()
+    if combined in ("", "null", "Null", "NULL", "~"):
+        return "", last_consumed, False
+    return combined, last_consumed, False
 
 
 def parse_flow_mapping(lines, start_idx, first_rest):
@@ -444,7 +471,7 @@ def parse_fragment(path):
                             crest = cm.group(2)
                             if (not crest or crest[0] in (" ", "\t")) and ck == "Upgrade":
                                 val, end_idx, was_quoted = parse_scalar_value(
-                                    lines, j, crest
+                                    lines, j, crest, child_indent
                                 )
                                 upgrade_entries.append((val, was_quoted))
                                 j = end_idx + 1
@@ -548,7 +575,7 @@ CANONICAL_LINES = {
     "projection-layout": "**Upgrade class:** `projection-layout` — Requires a fresh rebuild of the affected projection; see release entries below for affected projections and rollback steps.",
     "canonical-layout": "**Upgrade class:** `canonical-layout` — Requires a fresh rebuild of the canonical store and dependent projections; see release entries below for layout changes and rollback steps.",
 }
-UPGRADE_LINE_RE = re.compile(r"^(?:\*\*)?upgrade class(?:\*\*)?\s*:", re.IGNORECASE)
+UPGRADE_LINE_RE = re.compile(r"^\s*(?:\*\*)?upgrade class(?:\*\*)?\s*:", re.IGNORECASE)
 CANONICAL_SHAPE_RE = re.compile(r"^\*\*Upgrade class:\*\* `([^`]+)` — .+$")
 
 with open(changelog_path, "r", encoding="utf-8") as fh:
@@ -774,7 +801,7 @@ validate_release() {
     local expected_prerelease="$rendered_prerelease"
     if [[ "$requires_upgrade_class" == true ]] \
       || [[ -n "$changelog_upgrade_line" ]] \
-      || grep -Eiq '^(\*\*)?upgrade class(\*\*)?:' "$archived_prerelease"
+      || grep -Eiq '^[[:space:]]*(\*\*)?upgrade class(\*\*)?:' "$archived_prerelease"
     then
       local derived_upgrade_class
       local expected_upgrade_line

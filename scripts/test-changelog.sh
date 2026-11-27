@@ -252,6 +252,34 @@ expect_rejected \
   run_validator fragments "$fixture_repository"
 rm "$fixture_repository/.changes/unreleased/case-upgrade.yaml"
 
+# Multiline plain-scalar continuation on custom.Upgrade must fail.
+cat > "$fixture_repository/.changes/unreleased/multiline-upgrade.yaml" <<'YAML'
+kind: changed
+body: Split an unknown Upgrade enum value across two indented lines.
+time: 2026-07-21T19:13:00Z
+custom:
+  Bump: patch
+  PR: "30"
+  Upgrade: compatible
+    future
+YAML
+git -C "$fixture_repository" add .changes/unreleased/multiline-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with multiline plain Upgrade scalar"
+multiline_upgrade_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with multiline plain Upgrade scalar (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with multiline plain Upgrade scalar (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$multiline_upgrade_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/multiline-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup multiline Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
 # projection-layout missing projection name must fail in both fragments and pr modes.
 cat > "$fixture_repository/.changes/unreleased/proj-no-name.yaml" <<'YAML'
 kind: changed
@@ -487,6 +515,25 @@ cat > "$fixture_repository/CHANGELOG.md" <<'MARKDOWN'
 MARKDOWN
 expect_rejected \
   "v0.28.0 duplicate Upgrade class lines" \
+  run_validator release v0.28.0 "$fixture_repository"
+
+# Indented duplicate Upgrade class lines (1-3 leading spaces) must also fail.
+cat > "$fixture_repository/CHANGELOG.md" <<'MARKDOWN'
+# Changelog
+
+## [Unreleased]
+
+## [0.28.0] - 2026-11-28
+
+**Upgrade class:** `canonical-layout` — Requires a fresh rebuild of the canonical store and dependent projections; see release entries below for layout changes and rollback steps.
+  **Upgrade class:** `compatible` — Reversible by redeploying the previous release against the same store and schema.
+
+### Added
+
+- Serve query endpoints cleanly. ([#40](https://github.com/ZcashFoundation/zinder/pull/40))
+MARKDOWN
+expect_rejected \
+  "v0.28.0 indented duplicate Upgrade class lines" \
   run_validator release v0.28.0 "$fixture_repository"
 
 # Unknown Upgrade class in CHANGELOG.md must fail.
