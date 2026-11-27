@@ -46,7 +46,7 @@ The three stores hold different things:
   spent outputs, address history, and balances. It is derived entirely from the
   canonical store and can be rebuilt from it.
 - The **materialized-view store** holds optional explorer aggregates. It is
-  rebuildable and never blocks wallet serving.
+  rebuildable, isolated from wallet storage, and never blocks wallet data reads when run separately; under `zinder serve --preset explorer`, Explorer and Cipherscan share the supervisor's `/readyz` and fail-fast exit boundary.
 
 ### Logical architecture & presets
 

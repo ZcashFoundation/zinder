@@ -83,7 +83,7 @@ When running under the unified `zinder serve` (default `:9108`) or `zinder index
 
 ## Container healthcheck
 
-The unified distroless image has no shell or HTTP client, so probes invoke `zinder healthcheck` directly (and individual role binaries also accept `healthcheck`):
+The unified distroless image has no shell or HTTP client, so probes invoke `zinder healthcheck` directly:
 
 ```bash
 zinder healthcheck
@@ -93,11 +93,17 @@ zinder healthcheck --addr 127.0.0.1:9105 --path /healthz
 
 The probe sends one HTTP/1.1 `GET` and exits 0 only when the endpoint answers 200. Otherwise it exits 1 and prints the reason to stderr, which Docker records as the failure reason.
 
-| Flag | Default |
+The flags and defaults below apply to `zinder healthcheck`:
+
+| Flag | Default (`zinder healthcheck`) |
 | --- | --- |
 | `--ready` | Probes `/readyz` instead of `/healthz` (unless `--path` is passed). |
-| `--path` | `/healthz`. Override to `/readyz` or pass `--ready`. |
-| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then `[ops] listen_addr` in the `--config` file, then `127.0.0.1:9108` (`zinder serve` ops default; standalone binaries default to their own ops ports). |
+| `--path` | `/healthz`. Override with `--path /readyz` or pass `--ready`. |
+| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then `[ops] listen_addr` in the `--config` file, then `127.0.0.1:9108`. |
+
+Standalone role binaries have two CLI differences:
+- `zinder-ingest`, `zinder-projector`, `zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` accept `healthcheck --addr <ADDR> --path <PATH> --config <PATH>`, default `--path` to `/readyz` (with no `--ready` flag; pass `--path /healthz` for liveness), and default `--addr` to each role's own ops port.
+- `zinder-compat-cipherscan` has no `healthcheck` subcommand.
 
 - The probe reads only `[ops] listen_addr` from the config file. It skips a
   file that is missing, unreadable, or not TOML.

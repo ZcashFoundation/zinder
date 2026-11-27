@@ -155,7 +155,7 @@ Ingest `/readyz` reports `active_node.position`, and failovers log `node_endpoin
 
 When a node requires mutual TLS on its indexer gRPC port (such as Zakura off loopback), configure the node with `ZAKURA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8230`, `ZAKURA_RPC__INDEXER_TLS__CERT_FILE`, `ZAKURA_RPC__INDEXER_TLS__KEY_FILE`, and `ZAKURA_RPC__INDEXER_TLS__CLIENT_CA_FILE` (with the server cert naming `zakura`).
 
-Because `deploy/docker-compose.yml` does not forward `ZINDER_NODE__INDEXER_TLS__*` environment variables automatically, map either inline `*_PEM` variables (12-factor secret injection) or mounted PEM file paths (`*_PATH` readable by UID `10001`) in `/etc/zinder/docker-compose.override.yml` alongside `/etc/zinder/env`:
+`deploy/docker-compose.yml` forwards `ZINDER_NODE__INDEXER_GRPC_ADDR` and the inline PEM/SNI settings (`ZINDER_NODE__INDEXER_TLS__SERVER_NAME`, `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`, `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`, and `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`) from your Compose env file or `/etc/zinder/env` directly into `zinder-index` for 12-factor secret injection. If you prefer file-backed PEM paths (`*_PATH` readable by UID `10001`, reread on every indexer reconnect without restarting), add those variables and the read-only bind mount in `/etc/zinder/docker-compose.override.yml`:
 
 ```yaml
 services:
@@ -169,7 +169,7 @@ services:
       - /etc/zinder/tls:/run/zinder-tls:ro
 ```
 
-Or map `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`, `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`, and `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM` from `/etc/zinder/env` into `services.zinder-index.environment` (plus `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` if the cert names another host). File-backed PEMs are reread on every indexer reconnect without restarting, and recreate with `-f deploy/docker-compose.yml -f /etc/zinder/docker-compose.override.yml` (also in `zinder.service` overrides).
+Recreate with `-f deploy/docker-compose.yml -f /etc/zinder/docker-compose.override.yml` when using an override file (also in `zinder.service` overrides).
 
 ## Publish signed wallet history
 

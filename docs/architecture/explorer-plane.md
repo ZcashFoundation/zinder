@@ -169,7 +169,7 @@ When a method that also reads views runs without a view store, it fails with the
 
 ## Failure isolation and operations
 
-An Explorer crash stops neither `zinder-ingest` nor `zinder-query` when running as separate processes, and its readiness never feeds wallet readiness. Under `zinder serve --preset explorer`, any unexpected role exit triggers fail-fast supervisor shutdown so the container orchestrator restarts cleanly. A damaged view store never changes canonical or wallet state; rebuild it on a fresh path.
+An Explorer crash stops neither `zinder-ingest` nor `zinder-query` when running as separate processes, and standalone Explorer readiness never feeds wallet readiness. Under `zinder serve --preset explorer`, wallet data reads remain independent of Explorer views, but Explorer and Cipherscan share the supervisor's aggregated `/readyz` gate and fail-fast drain boundary on unexpected exit; run wallet readers in a separate `zinder serve` instance when you need an isolated readiness and process failure boundary. A damaged view store never changes canonical or wallet state; rebuild it on a fresh path.
 
 The Explorer serves `/healthz`, `/readyz`, and `/metrics` on its ops listener, `127.0.0.1:9069` by default. `/readyz` fails while the latest secondary catch-up (materialized views or canonical secondary) failed, with `schema_mismatch` or `storage_unavailable`, and recovers on the next successful catch-up. [Readiness](../reference/readiness.md) and [Metrics](../reference/metrics.md) describe the endpoints and the `zinder_explorer_*` metrics.
 

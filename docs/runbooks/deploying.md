@@ -49,7 +49,7 @@ You need an archive Zebra or Zakura node on the same network. Ingest reads every
 
 - **CPU:** 8+ vCPUs (Broadwell+/Zen+ `x86-64` supporting `x86-64-v3` + `ADX`, or `AArch64`). Published release binaries, images, and Compose builds enable the Pasta assembly backend by default (`ZINDER_PASTA_ASM=1`; pass `ZINDER_PASTA_ASM=0` only when building for pre-Broadwell/Haswell x86-64 hosts without `ADX`, checked at startup). Wallet accumulators select AVX-512F/VL at run time when available and AVX2 otherwise; both produce identical store bytes. Hosts with fewer than 8 logical CPUs take longer to sync; see [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus).
 - **RAM:** 32 GiB RAM. Give `zinder-index` enough memory for canonical + wallet construction (`14g`–`24g` on Mainnet), keep `4g`+ on `zinder-serve` for private endpoints (raise for high-concurrency range catalogs), and give single-volume containers (`zinder serve`) at least 8–16 GB.
-- **Disk:** Fast local SSD/NVMe formatted **`ext4 -O verity`** (so `history-publisher` can protect settled segments with Linux fs-verity). Reserve **260+ GB free** for `wallet` (~123 GB steady-state total, which already includes the ~20.9 GB / ~19.5 GiB signed `ZSHRNG01` catalog across 877 segments at Mainnet height 3,593,347 and growing, plus ~130 GB temporary sort spill headroom during initial wallet construction), or **550+ GB free** when adding `--full-blocks` (`raw_blob_policy = "all"`) or retaining raw transaction blobs.
+- **Disk:** Fast local SSD/NVMe formatted **`ext4 -O verity`** (so `history-publisher` can protect settled segments with Linux fs-verity). Reserve **260+ GB free** for `wallet` (~123 GB steady-state total, which already includes the ~20.9 GB / ~19.5 GiB signed `ZSHRNG01` catalog across 877 segments at Mainnet height 3,593,347 and growing, plus ~130 GB temporary sort spill headroom during initial wallet construction), or **550+ GB free** when retaining raw transaction blobs alone (`storage.raw_blob_policy = "transactions"`, ~251.1 GiB transaction payload plus sort spill). Enabling `--full-blocks` (`raw_blob_policy = "all"`) stores complete raw block blobs (another copy of those transaction bytes) separately alongside transaction blobs, so budget additional free NVMe capacity above 550 GB for block blobs as well.
 
 ### Public high-concurrency Mainnet endpoint
 
@@ -82,7 +82,7 @@ In `deploy/docker-compose.yml`, `zinder-index` (`zinder index`) writes the canon
 
 When running individual roles directly via `zinder run <role>`, per-role standalone ops defaults remain `9105` (`ingest`), `9110` (`projector`), `9106` (`query`), `9107` (`compat-lightwalletd`), `9069` (`explorer`), and `9108` (`compat-cipherscan`). The serving gRPC ports also serve `grpc.health.v1.Health` ([gRPC health](../reference/readiness.md#grpc-health)).
 
-These are the **Mainnet** ports. The shipped Compose env files add `+10000` on Testnet (for example, `19102` for `WalletQuery`, `19105` for `zinder-index`, and `19108` for `zinder-serve`) and `+20000` on Regtest, and bind published ports to host loopback (`127.0.0.1`) only.
+These are the **Mainnet** ports. The shipped Compose env files add `+10000` on Testnet (for example, `19067`, `19068`, `19070`, `19102`, `19105`, and `19108`) and `+20000` on Regtest, and bind all six published ports to host loopback (`127.0.0.1`) only.
 
 Compose also exposes these internal/observability ports:
 
@@ -97,7 +97,7 @@ Compose also exposes these internal/observability ports:
 
 ## Testnet Docker Compose quickstart
 
-This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](https://github.com/ZcashFoundation/z3) with zero TOML configuration files, using Docker Engine, the Compose v2 plugin, `git`, `curl`, and `grpcurl`. For Zakura, use `deploy/.env.zakura-testnet` and follow [Attach a Zakura node](deploying-on-a-vm.md#attach-a-zakura-node) for step 1.
+This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](https://github.com/ZcashFoundation/z3) with zero TOML configuration files, using Docker Engine, the Compose v2 plugin, `git`, `openssl` (used by `scripts/prepare-shielded-history.sh`), `curl`, and `grpcurl`. For Zakura, use `deploy/.env.zakura-testnet` and follow [Attach a Zakura node](deploying-on-a-vm.md#attach-a-zakura-node) for step 1.
 
 1. Start a Zebra Testnet node with Z3 and wait until it is synced (this creates the `z3-testnet` Docker network and `z3-testnet-cookie` volume):
 

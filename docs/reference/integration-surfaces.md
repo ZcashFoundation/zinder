@@ -20,10 +20,10 @@ Zinder serves two wallet protocols on separate endpoints. A client speaks one of
 | A new native application or backend | Native `zinder.v1.wallet.WalletQuery` gRPC | `zinder-query` | 9102 |
 | A Rust application | The `zinder-client` crate over `WalletQuery` | `zinder-query` | 9102 |
 | An explorer or analytics backend | `zinder.v1.explorer.ExplorerQuery`, plus `WalletQuery` | `zinder-explorer` (`--preset explorer`) | 9068 |
-| A Cipherscan frontend | Cipherscan-compatible REST and WebSocket | `zinder-compat-cipherscan` (`--preset explorer`) | 9070 *(default listener only; add port mapping + `[::]:9070` override for host access in Compose)* |
+| A Cipherscan frontend | Cipherscan-compatible REST and WebSocket | `zinder-compat-cipherscan` (`--preset explorer`) | 9070 |
 | A server-side wallet | `zinder-client` plus a wallet library such as librustzcash | `zinder-query` | 9102 |
 
-The gRPC ports (`9067`, `9068`, `9102`) are published on host loopback by `deploy/docker-compose.yml` (select `--preset explorer` / `ZINDER_PRESET=explorer` to start Explorer and Cipherscan compat alongside wallet serving). `zinder-compat-cipherscan` defaults to `127.0.0.1:9070` (which standalone `zinder serve --preset explorer` binds on host loopback directly), whereas `deploy/docker-compose.yml` neither publishes port `9070` nor sets `ZINDER_CIPHERSCAN__LISTEN_ADDR` off container loopback by default; to reach Cipherscan REST from the host under Compose, add `ports: ["127.0.0.1:9070:9070"]` on `zinder-index` and `ZINDER_CIPHERSCAN__LISTEN_ADDR: "[::]:9070"` on `zinder-serve` (`ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true` is already enabled in Compose). Your operator may publish different ports.
+All four client ports (`9067`, `9068`, `9070`, `9102`) are published on host loopback by `deploy/docker-compose.yml` (`zinder-serve` listens on `[::]:9070` with `ZINDER_CIPHERSCAN__LISTEN_ADDR` and `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`; select `--preset explorer` / `ZINDER_PRESET=explorer` to start Explorer and Cipherscan compat alongside wallet serving). Your operator may publish different ports.
 
 ### Choose a network
 

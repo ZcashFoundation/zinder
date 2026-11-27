@@ -22,7 +22,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [test-nextest-selectors.sh](test-nextest-selectors.sh) | Verifies `.config/nextest.toml` profile selectors and test tier filters |
 | [test-workflow-action-pins.sh](test-workflow-action-pins.sh) | Verifies every external GitHub Action under `.github/` is pinned to a full commit SHA |
 | [validate-changelog.sh](validate-changelog.sh) | Validates `.changes/unreleased/*.yaml` fragments or the exact PR no-note waiver |
-| [validate-deployment-admission.sh](validate-deployment-admission.sh) | Runs storage, configuration, and readiness admission checks against a running deployment |
+| [validate-deployment-admission.sh](validate-deployment-admission.sh) | Static policy gate validating deployment classes and Compose, Kubernetes, Prometheus, and release-packaging contracts |
 | [verify-published-sdk.sh](verify-published-sdk.sh) | Smoke-tests published `zinder-core`, `zinder-proto`, and `zinder-client` crates |
 | [verify-sdk-packages.sh](verify-sdk-packages.sh) | Packages and offline-verifies workspace SDK crates via `cargo package` |
 
