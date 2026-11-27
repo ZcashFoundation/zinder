@@ -1,5 +1,3 @@
-mod published_range;
-
 use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -299,7 +297,6 @@ struct CompatProcess {
     control: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     storage: tempfile::TempDir,
     writer: CanonicalWriterFixture,
-    writer_control: MutableCanonicalControl,
 }
 
 impl Drop for CompatProcess {
@@ -356,7 +353,6 @@ impl CompatProcess {
         let control_service = MutableCanonicalControl {
             status: Arc::new(Mutex::new(status)),
         };
-        let writer_control = control_service.clone();
         let control = tokio::spawn(async move {
             Server::builder()
                 .add_service(IngestControlServer::new(IngestControlFixtureService::new(
@@ -391,7 +387,6 @@ impl CompatProcess {
             control,
             storage,
             writer,
-            writer_control,
         })
     }
 

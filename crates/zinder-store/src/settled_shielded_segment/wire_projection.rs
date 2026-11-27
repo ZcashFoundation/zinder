@@ -81,15 +81,15 @@ pub(super) fn encode_default_shielded_block_with_options(
             },
             None => Some(0),
         };
+        if wire_fee.is_none() {
+            has_unrepresentable_wire_fee = true;
+        }
         let tx_mask = transaction_pool_mask(scan);
         presence = presence.union(tx_mask);
         if tx_mask.is_empty() {
             continue;
         }
-        let fee = wire_fee.unwrap_or_else(|| {
-            has_unrepresentable_wire_fee = true;
-            0
-        });
+        let fee = wire_fee.unwrap_or(0);
         vtx.push(lightwalletd::CompactTx {
             index: tx.index,
             txid: encode_internal_transaction_id(tx.transaction_id).to_vec(),
@@ -133,7 +133,7 @@ pub(super) fn encode_default_shielded_block_with_options(
 
 /// Appends one empty nullifier-only protobuf `CompactBlock` payload (without
 /// gRPC framing) straight from row metadata without reading `Slab 0`.
-pub(super) fn synthesize_empty_nullifier_payload(
+pub(crate) fn synthesize_empty_nullifier_payload(
     height: BlockHeight,
     block_hash_wire: &[u8; 32],
     prev_hash_wire: &[u8; 32],

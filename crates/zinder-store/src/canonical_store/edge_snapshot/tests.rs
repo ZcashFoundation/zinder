@@ -19,12 +19,9 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
         Ed25519KeyPair::from_pkcs8(signing_key.as_ref()).map_err(|_| "key parsing failed")?;
     let keys = [publisher.public_key().as_ref().try_into()?];
     let bundle = root.path().join("bundle");
-    let sealed = root.path().join("opaque");
-    fs::create_dir_all(sealed.join("part"))?;
-    fs::write(sealed.join("part/segment"), b"opaque history")?;
     let key_file = root.path().join("signer.der");
     fs::write(&key_file, signing_key.as_ref())?;
-    export_edge_snapshot(&mut source, &bundle, &key_file, Some(&sealed))?;
+    export_edge_snapshot(&mut source, &bundle, &key_file)?;
     assert_eq!(old_key, source.cursor_auth_key);
     let history = MempoolEventHistoryRequest::with_default_limit(None);
     assert_eq!(source.mempool_event_history(history)?.len(), 3);
@@ -40,13 +37,12 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
         resource_budget: RocksDbResourceBudget::for_local_tests(),
     };
     let target = root.path().join("target");
-    let sealed_output = root.path().join("sealed");
     let run = || EdgeSnapshotBootstrap {
         source: &bundle,
         trusted_keys: &keys,
         spot_check_blocks: DEFAULT_SPOT_CHECK_BLOCKS,
     };
-    let reserve = || EdgeSnapshotDestination::reserve(&target, Some(&sealed_output), false);
+    let reserve = || EdgeSnapshotDestination::reserve(&target, false);
     assert!(
         prepare_bootstrapped_store(reserve()?, run(), config(), |_| async {
             Err(refused("validator mismatch"))
@@ -82,12 +78,7 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
     assert_ne!(restored.cursor_auth_key, old_key);
     assert_eq!(restored.mempool_event_history(history)?, []);
     assert_eq!(restored.ready_evidence(), source.ready_evidence());
-    assert_eq!(
-        fs::read(sealed_output.join("part/segment"))?,
-        b"opaque history"
-    );
     assert!(reserve().is_err());
-    assert!(!root.path().join("sealed.bootstrap.staging").exists());
     Ok(())
 }
 
@@ -201,7 +192,7 @@ fn signature_and_paths_are_strict() -> TestResult {
     for path in [
         "../evil",
         "/evil",
-        "sealed-history/../evil",
+        "canonical-rocksdb/../evil",
         "canonical-rocksdb/CURRENT",
     ] {
         manifest.files.push(SnapshotFile {
@@ -218,39 +209,7 @@ fn signature_and_paths_are_strict() -> TestResult {
 }
 
 #[test]
-fn export_refuses_signing_key_alias_and_nested_output_before_staging() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let (_source_directory, mut source) = admitted_source()?;
-    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-        .map_err(|_| "key generation failed")?;
-    let history = root.path().join("history");
-    fs::create_dir(&history)?;
-    let key_path = root.path().join("key.der");
-    fs::write(&key_path, key.as_ref())?;
-    let alias = history.join("key-alias");
-    fs::hard_link(&key_path, &alias)?;
-    let bundle = root.path().join("bundle");
-    for path in [&key_path, &alias] {
-        let failure = export_edge_snapshot(&mut source, &bundle, path, Some(&history));
-        assert!(
-            matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("signing key"))
-        );
-        assert!(!bundle.exists());
-        assert!(!root.path().join("bundle.export.staging").exists());
-    }
-    fs::remove_file(alias)?;
-    let nested = history.join("snapshot");
-    let failure = export_edge_snapshot(&mut source, &nested, &key_path, Some(&history));
-    assert!(
-        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("overlap"))
-    );
-    assert!(!nested.exists());
-    assert!(!history.join("snapshot.export.staging").exists());
-    Ok(())
-}
-
-#[test]
-fn reservation_refuses_workspace_overlap_and_occupied_sidecar() -> TestResult {
+fn reservation_refuses_occupied_target_or_staging_workspace() -> TestResult {
     let root = tempfile::tempdir()?;
     let target = root.path().join("canonical");
     let staging = root.path().join("canonical.bootstrap.staging");
@@ -258,53 +217,18 @@ fn reservation_refuses_workspace_overlap_and_occupied_sidecar() -> TestResult {
     let occupied = root.path().join("occupied");
     fs::create_dir(&occupied)?;
     fs::write(occupied.join("segment"), b"preserved")?;
-    fs::create_dir(&staging)?;
-    let alias = root.path().join("alias");
-    std::os::unix::fs::symlink(&staging, &alias)?;
-    for sidecar in [
-        staging.join("sidecar"),
-        alias.join("sidecar"),
-        download.clone(),
-        occupied.clone(),
-    ] {
-        let failure = EdgeSnapshotDestination::reserve(&target, Some(&sidecar), true);
-        let expected = if sidecar == occupied {
-            "occupied"
-        } else {
-            "overlap"
-        };
-        assert!(
-            matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains(expected))
-        );
-        assert!(!target.exists());
-        assert!(!download.exists());
-    }
+    let failure = EdgeSnapshotDestination::reserve(&occupied, true);
+    assert!(
+        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("occupied"))
+    );
     assert_eq!(fs::read(occupied.join("segment"))?, b"preserved");
-    assert_eq!(fs::read_dir(&staging)?.count(), 0);
-    Ok(())
-}
 
-#[test]
-fn canonical_target_cannot_equal_the_sidecar_workspace() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let history = root.path().join("history");
-    let canonical = root.path().join("history.bootstrap.staging");
-    let failure = EdgeSnapshotDestination::reserve(&canonical, Some(&history), false);
-    assert!(
-        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("overlap"))
-    );
-    assert_eq!(fs::read_dir(root.path())?.count(), 0);
-    let alias = root.path().join("alias");
-    std::os::unix::fs::symlink(root.path(), &alias)?;
-    let failure = EdgeSnapshotDestination::reserve(
-        &alias.join("history.bootstrap.staging"),
-        Some(&history),
-        false,
-    );
-    assert!(
-        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("overlap"))
-    );
-    assert_eq!(fs::read_dir(root.path())?.count(), 1);
+    fs::create_dir(&staging)?;
+    let failure = EdgeSnapshotDestination::reserve(&target, true);
+    assert!(failure.is_err());
+    assert!(!target.exists());
+    assert!(!download.exists());
+    assert_eq!(fs::read_dir(&staging)?.count(), 0);
     Ok(())
 }
 
@@ -319,9 +243,9 @@ fn incompatible_local_manifest_refuses_before_any_payload_is_copied() -> TestRes
     let key_path = root.path().join("signer.der");
     fs::write(&key_path, key.as_ref())?;
     let bundle = root.path().join("bundle");
-    export_edge_snapshot(&mut source, &bundle, &key_path, None)?;
+    export_edge_snapshot(&mut source, &bundle, &key_path)?;
     let target = root.path().join("restored");
-    let destination = EdgeSnapshotDestination::reserve(&target, None, false)?;
+    let destination = EdgeSnapshotDestination::reserve(&target, false)?;
     let activations = NetworkUpgradeActivations::new(Network::ZcashRegtest, Vec::new())?;
     let config = EdgeSnapshotStoreConfig {
         activations: &activations,
@@ -446,7 +370,7 @@ fn exported_checkpoint_removes_publisher_keys_leases_and_mempool() -> TestResult
     let key_file = root.path().join("signer.der");
     fs::write(&key_file, signing_key.as_ref())?;
     let bundle = root.path().join("bundle");
-    export_edge_snapshot(&mut source, &bundle, &key_file, None)?;
+    export_edge_snapshot(&mut source, &bundle, &key_file)?;
 
     let trusted = [signer.public_key().as_ref().try_into()?];
     let manifest = EdgeSnapshotManifest::verify(
@@ -631,62 +555,6 @@ fn empty_reservation_failure_allows_immediate_retry() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn export_overlap_checks_subdirectories_exposed_through_an_alias() {
-    let history = PathIdentity {
-        path: Path::new("/history"),
-        deepest: (7, 10),
-        ancestors: vec![(7, 10), (7, 1)],
-        tail: Path::new(""),
-    };
-    let child = (7, 11);
-    let destination = |path, tail| PathIdentity {
-        path: Path::new(path),
-        deepest: child,
-        ancestors: vec![child, (7, 20), (7, 1)],
-        tail: Path::new(tail),
-    };
-    let output = destination("/mnt/alias/snapshot", "snapshot");
-    let stage = destination(
-        "/mnt/alias/snapshot.export.staging",
-        "snapshot.export.staging",
-    );
-    let directories = BTreeSet::from([history.deepest, child]);
-    for alias in [output, stage] {
-        assert!(!history.overlaps(&alias));
-        assert!(reject_history_ancestor_overlap(&directories, &[alias]).is_err());
-    }
-}
-
-#[test]
-fn failed_canonical_commit_rolls_back_the_published_sidecar() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let target = root.path().join("canonical");
-    let output = root.path().join("history");
-    let destination = EdgeSnapshotDestination::reserve(&target, Some(&output), false)?;
-    let sealed = destination.stage.path.join(SEALED);
-    fs::create_dir(&sealed)?;
-    fs::write(sealed.join("segment"), b"staged history")?;
-    let canonical = destination.stage.path.join(CANONICAL);
-    fs::create_dir(&canonical)?;
-    fs::create_dir(&target)?;
-    fs::write(target.join("keep"), b"existing primary")?;
-
-    let staged = PinnedBootstrap::open(&destination, true)?;
-    let inventory = [SnapshotFile {
-        path: format!("{SEALED}/segment"),
-        bytes: 14,
-        sha256: Sha256::digest(b"staged history").into(),
-    }];
-    let failure = commit_bootstrap(&destination, &staged, &inventory);
-    assert!(
-        matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason.contains("occupied"))
-    );
-    assert!(!output.exists());
-    assert_eq!(fs::read(target.join("keep"))?, b"existing primary");
-    Ok(())
-}
-
 #[tokio::test]
 async fn substituted_directories_are_refused_after_attestation() -> TestResult {
     let root = tempfile::tempdir()?;
@@ -699,27 +567,16 @@ async fn substituted_directories_are_refused_after_attestation() -> TestResult {
     let key_file = root.path().join("signer.der");
     fs::write(&key_file, signing.as_ref())?;
     let bundle = root.path().join("bundle");
-    let history = root.path().join("input-history");
-    fs::create_dir(&history)?;
-    fs::write(history.join("segment"), b"history")?;
-    export_edge_snapshot(&mut source, &bundle, &key_file, Some(&history))?;
+    export_edge_snapshot(&mut source, &bundle, &key_file)?;
     let activations = source
         .network_upgrade_activations()
         .ok_or("missing schedule")?;
-    for label in ["stage", CANONICAL, SEALED, "sidecar"] {
+    for label in ["stage", CANONICAL] {
         let target = root.path().join(format!("{label}-target"));
-        let output = root.path().join(format!("{label}-history"));
-        let destination = EdgeSnapshotDestination::reserve(&target, Some(&output), false)?;
+        let destination = EdgeSnapshotDestination::reserve(&target, false)?;
         let stage = destination.stage.path.clone();
         let replaced = match label {
             "stage" => stage.clone(),
-            "sidecar" => destination
-                .sealed
-                .as_ref()
-                .ok_or("missing sidecar")?
-                .1
-                .path
-                .clone(),
             child => stage.join(child),
         };
         let moved = root.path().join(format!("{label}-moved"));
@@ -757,8 +614,7 @@ async fn substituted_directories_are_refused_after_attestation() -> TestResult {
             matches!(failure, Err(EdgeSnapshotError::Refused(reason)) if reason == "snapshot workspace was substituted during attestation")
         );
         assert!(!target.exists());
-        assert!(!output.exists());
-        if matches!(label, "stage" | "sidecar") {
+        if label == "stage" {
             assert_eq!(fs::read(&unadmitted)?, b"unadmitted");
         }
     }

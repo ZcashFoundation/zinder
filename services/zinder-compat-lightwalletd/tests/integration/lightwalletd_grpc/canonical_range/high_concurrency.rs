@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
+use std::{num::NonZeroU32, time::Duration};
 
 use eyre::{Result, ensure, eyre};
 use tokio::net::TcpListener;
@@ -9,7 +9,6 @@ use tonic::{
 };
 use zinder_compat_lightwalletd::{
     CanonicalReaderSlot, CompactBlocksGrpcAdapter, LightwalletdGrpcAdapter,
-    PublishedShieldedHistory, ShieldedCatalogPublisher,
 };
 use zinder_core::{
     BlockHeight, BlockId, CompactBlockArtifact, CompactChainMetadata, CompactSaplingSpend,
@@ -22,11 +21,13 @@ use zinder_testkit::{
     sample_regtest_upgrade_activations,
 };
 
-use super::{Endpoint, NETWORK, ReaderFixture, block_range_request, drain_slowly, fixture_block};
+use super::{
+    Endpoint, EpochPinRecorder, NETWORK, ReaderFixture, block_range_request, drain_slowly,
+    fixture_block,
+};
 
-const TOTAL_MIXED_BLOCKS: u32 = 2_120;
-const SETTLED_MIXED_BLOCKS: u32 = 2_050;
-const SEGMENT_SPAN: u32 = 700;
+const TOTAL_MIXED_BLOCKS: u32 = 4_196;
+const SETTLED_MIXED_BLOCKS: u32 = 4_096;
 
 fn build_chain_with_spends(total: u32, spends_at: fn(u32) -> usize) -> Result<ChainFixture> {
     let mut chain = ChainFixture::new(NETWORK)
@@ -91,37 +92,6 @@ fn slot_cap_spends_for_height(_height: u32) -> usize {
     512
 }
 
-async fn publish_all_segments(
-    store: &ReaderFixture,
-    catalog_dir: &Path,
-    segment_span: u32,
-) -> Result<Arc<PublishedShieldedHistory>> {
-    let root = catalog_dir
-        .parent()
-        .ok_or_else(|| eyre!("missing catalog parent"))?;
-    let (signer, key) = crate::common::shielded_catalog_keys(root)?;
-    let mut publisher = ShieldedCatalogPublisher::open(
-        catalog_dir,
-        &signer,
-        BlockHeight::new(1),
-        NonZeroU32::new(segment_span).ok_or_else(|| eyre!("zero segment span"))?,
-    )?;
-    let mut published_count = 0_usize;
-    while publisher.publish_next(&store.reader)? {
-        published_count += 1;
-    }
-    ensure!(published_count >= 2, "expected multi-segment catalog");
-    Ok(Arc::new(
-        PublishedShieldedHistory::open(
-            &catalog_dir.join("current.json"),
-            &key,
-            false,
-            store.reader.as_ref(),
-        )
-        .await?,
-    ))
-}
-
 #[allow(
     deprecated,
     reason = "Compatibility covers the legacy nullifier RPC used by existing wallets."
@@ -157,34 +127,33 @@ async fn assert_nullifier_parity(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tonic_client_decodes_2000_plus_mixed_blocks_identically_across_segments_and_tail()
 -> Result<()> {
-    let dir = tempfile::tempdir()?;
     let chain = build_chain_with_spends(TOTAL_MIXED_BLOCKS, mixed_spends_for_height)?;
     let writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(SETTLED_MIXED_BLOCKS)),
         &sample_regtest_upgrade_activations(),
     )?;
+    ensure!(
+        writer
+            .canonical_primary_path()
+            .join("segments/shielded/0000000001-0000004096.zshrng02")
+            .exists(),
+        "expected sealed ZSHRNG02 segment covering 1..=4096"
+    );
     let store = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
-    let catalog = publish_all_segments(&store, &dir.path().join("catalog"), SEGMENT_SPAN).await?;
 
     let mut wallet = Endpoint::start(
-        Server::builder().add_service(
-            LightwalletdGrpcAdapter::new(store.query.clone())
-                .with_published_shielded_history(catalog.clone())
-                .into_server(),
-        ),
-    )
-    .await?;
-    let mut blocks_only = Endpoint::start(
-        Server::builder().add_service(
-            CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(store.reader.clone()))
-                .with_published_shielded_history(catalog)
-                .into_server(),
-        ),
-    )
-    .await?;
-    let mut stock = Endpoint::start(
         Server::builder()
             .add_service(LightwalletdGrpcAdapter::new(store.query.clone()).into_server()),
+    )
+    .await?;
+    let mut blocks_only = Endpoint::start(Server::builder().add_service(
+        CompactBlocksGrpcAdapter::new(CanonicalReaderSlot::new(store.reader.clone())).into_server(),
+    ))
+    .await?;
+    let fallback_recorder = EpochPinRecorder::new(store.query.clone());
+    let mut stock = Endpoint::start(
+        Server::builder()
+            .add_service(LightwalletdGrpcAdapter::new(fallback_recorder).into_server()),
     )
     .await?;
 
@@ -255,14 +224,12 @@ async fn drain_concurrent_ranges(
 async fn paused_and_dropped_concurrent_streams_respect_slot_cap_and_release_cleanly() -> Result<()>
 {
     const SLOT_CAP_BLOCKS: u32 = 80;
-    let dir = tempfile::tempdir()?;
     let chain = build_chain_with_spends(SLOT_CAP_BLOCKS, slot_cap_spends_for_height)?;
     let writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(SLOT_CAP_BLOCKS)),
         &sample_regtest_upgrade_activations(),
     )?;
     let store = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
-    let catalog = publish_all_segments(&store, &dir.path().join("catalog"), 40).await?;
     let limit = NonZeroU32::new(100).ok_or_else(|| eyre!("zero limit"))?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
@@ -270,7 +237,6 @@ async fn paused_and_dropped_concurrent_streams_respect_slot_cap_and_release_clea
         Server::builder()
             .add_service(
                 LightwalletdGrpcAdapter::new(store.query)
-                    .with_published_shielded_history(catalog)
                     .with_max_concurrent_block_range_streams(limit)
                     .with_block_range_admission_wait(Duration::ZERO)
                     .into_server(),

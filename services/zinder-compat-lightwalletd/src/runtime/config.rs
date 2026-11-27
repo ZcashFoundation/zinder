@@ -23,13 +23,12 @@ use zinder_runtime::{
     DeploymentToml, IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml,
     NodeFallbacksToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
     ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    RuntimeService, SecuritySection, SecurityToml, StorageRoleToml, derive_canonical_path,
+    RuntimeService, SecuritySection, SecurityToml, derive_canonical_path,
     derive_canonical_secondary_path, derive_wallet_path, derive_wallet_secondary_path,
     guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
-    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
-    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
-    resolve_wallet_projection_reader_rocksdb_budget, section_defaults::DEFAULT_DATA_DIR,
-    validate_optional_data_dir,
+    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
+    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{
@@ -76,8 +75,6 @@ pub struct LightwalletdConfig {
     pub network: Network,
     /// Compatibility serving mode.
     pub serving: CompatServing,
-    /// Optional signed shielded-history catalog configuration.
-    pub shielded_history: Option<ShieldedHistorySection>,
     /// Canonical secondary storage paths and reader tuning.
     pub storage: ResolvedCanonicalSecondaryStorage,
     /// Wallet primary store path when serving full wallet reads.
@@ -172,10 +169,6 @@ pub struct LightwalletdConfigOverrides {
 /// Error returned while resolving lightwalletd compat config or running its gRPC server.
 #[derive(Debug, Error)]
 pub enum LightwalletdConfigError {
-    /// Shielded-history catalog admission or publication I/O failure.
-    #[error("shielded history publication failed: {0}")]
-    ShieldedHistory(#[from] std::io::Error),
-
     /// Layered configuration loading or validation failed.
     #[error(transparent)]
     Config(#[from] ConfigError),
@@ -286,89 +279,6 @@ where
     resolve_lightwalletd_config(load_raw_config(config_path, overrides, environment)?)
 }
 
-/// Resolved configuration for the signed shielded-history catalog publisher.
-#[derive(Clone, Debug)]
-pub struct HistoryPublisherConfig {
-    /// Target Zcash network.
-    pub network: Network,
-    /// Canonical primary store path.
-    pub primary_path: PathBuf,
-    /// Secondary scratch root used by the publisher.
-    pub secondary_path: PathBuf,
-    /// `RocksDB` resource budget for the canonical reader secondary.
-    pub canonical_rocksdb_budget: RocksDbResourceBudget,
-    /// Expected canonical replacement-depth policy.
-    pub canonical_reorg_policy: CanonicalReorgPolicy,
-}
-
-impl HistoryPublisherConfig {
-    /// Renders the resolved history-publisher configuration in TOML format.
-    pub fn to_toml(&self) -> Result<String, LightwalletdConfigError> {
-        let rendered = HistoryPublisherToml {
-            network: NetworkToml::from_network(self.network),
-            storage: HistoryPublisherStorageToml {
-                path: &self.primary_path,
-                secondary_path: &self.secondary_path,
-                canonical: StorageRoleToml::from_resolved(self.canonical_rocksdb_budget),
-            },
-            compat: HistoryPublisherCompatToml {
-                reorg_window_blocks: self.canonical_reorg_policy.reorg_window_blocks(),
-            },
-        };
-        Ok(toml::to_string(&rendered).map_err(|source| ConfigError::Render { source })?)
-    }
-}
-
-#[derive(Serialize)]
-struct HistoryPublisherToml<'a> {
-    network: NetworkToml,
-    storage: HistoryPublisherStorageToml<'a>,
-    compat: HistoryPublisherCompatToml,
-}
-
-#[derive(Serialize)]
-struct HistoryPublisherStorageToml<'a> {
-    path: &'a Path,
-    secondary_path: &'a Path,
-    canonical: StorageRoleToml,
-}
-
-#[derive(Serialize)]
-struct HistoryPublisherCompatToml {
-    reorg_window_blocks: u32,
-}
-
-/// Loads and validates configuration for `publish-shielded-history`.
-pub fn load_history_publisher_config(
-    config_path: Option<PathBuf>,
-    overrides: LightwalletdConfigOverrides,
-) -> Result<HistoryPublisherConfig, LightwalletdConfigError> {
-    load_history_publisher_config_with_env(config_path, overrides, std::env::vars())
-}
-
-/// Loads and validates configuration for `publish-shielded-history` using
-/// explicit `ZINDER_*` environment pairs.
-pub fn load_history_publisher_config_with_env<I>(
-    config_path: Option<PathBuf>,
-    overrides: LightwalletdConfigOverrides,
-    environment: I,
-) -> Result<HistoryPublisherConfig, LightwalletdConfigError>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
-    let mut config = load_raw_config(config_path, overrides, environment)?;
-    derive_storage_paths(CompatServing::CompactBlocks, &mut config.storage, None)?;
-    Ok(HistoryPublisherConfig {
-        network: config.network.resolve()?,
-        primary_path: require_field(config.storage.path, "storage.path")?,
-        secondary_path: require_field(config.storage.secondary_path, "storage.secondary_path")?,
-        canonical_rocksdb_budget: resolve_canonical_reader_rocksdb_budget(
-            config.storage.canonical.rocksdb,
-        )?,
-        canonical_reorg_policy: resolve_reorg_policy(&config.compat)?,
-    })
-}
-
 fn load_raw_config<I>(
     config_path: Option<PathBuf>,
     overrides: LightwalletdConfigOverrides,
@@ -445,7 +355,6 @@ struct LightwalletdRawConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CompatSection {
-    shielded_history: Option<ShieldedHistorySection>,
     listen_addr: Option<String>,
     #[serde(deserialize_with = "deserialize_browser_origins")]
     browser_origins: Vec<HeaderValue>,
@@ -465,66 +374,6 @@ struct CompatSection {
     ping_very_insecure: Option<bool>,
     serving: Option<CompatServing>,
     trust_proxy_client_address: Option<bool>,
-}
-
-/// Signed shielded-history catalog source settings from `[compat.shielded_history]`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(try_from = "ShieldedHistoryConfig")]
-pub struct ShieldedHistorySection {
-    /// Catalog manifest file or managed publisher directory.
-    #[serde(flatten)]
-    pub location: HistoryLocation,
-    /// Path to the raw `Ed25519` publisher verifying public key.
-    pub publisher_key: PathBuf,
-    /// Whether fs-verity verification is required on segment files.
-    #[serde(default)]
-    pub require_fs_verity: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ShieldedHistoryConfig {
-    directory: Option<PathBuf>,
-    manifest: Option<PathBuf>,
-    publisher_key: PathBuf,
-    #[serde(default)]
-    require_fs_verity: bool,
-}
-
-impl TryFrom<ShieldedHistoryConfig> for ShieldedHistorySection {
-    type Error = &'static str;
-
-    fn try_from(config: ShieldedHistoryConfig) -> Result<Self, Self::Error> {
-        let location = match (config.directory, config.manifest) {
-            (Some(path), None) => HistoryLocation::Directory(path),
-            (None, Some(path)) => HistoryLocation::Manifest(path),
-            _ => return Err("shielded history requires exactly one directory or manifest"),
-        };
-        Ok(Self {
-            location,
-            publisher_key: config.publisher_key,
-            require_fs_verity: config.require_fs_verity,
-        })
-    }
-}
-
-/// Location of a signed shielded-history catalog.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HistoryLocation {
-    /// Explicit path to a static `current.json` manifest file.
-    Manifest(PathBuf),
-    /// Directory managed by a live shielded-history publisher.
-    Directory(PathBuf),
-}
-
-impl HistoryLocation {
-    pub(super) fn manifest(&self) -> PathBuf {
-        match self {
-            Self::Manifest(path) => path.clone(),
-            Self::Directory(path) => path.join("current.json"),
-        }
-    }
 }
 
 fn deserialize_browser_origins<'de, D>(deserializer: D) -> Result<Vec<HeaderValue>, D::Error>
@@ -711,7 +560,6 @@ fn resolve_lightwalletd_config(
         ingest_control_bearer_token,
         listen_addr,
         browser_origins: config.compat.browser_origins,
-        shielded_history: config.compat.shielded_history,
         ops_listen_addr,
         allow_public_bind,
         client_address_source: ClientAddressSource::from_trust_proxy_client_address(
@@ -879,7 +727,6 @@ impl LightwalletdConfigToml {
                 bearer_token: config.ingest_control_bearer_token.clone(),
             }),
             compat: CompatToml {
-                shielded_history: config.shielded_history.clone(),
                 listen_addr: config.listen_addr.to_string(),
                 browser_origins: config
                     .browser_origins
@@ -927,8 +774,6 @@ impl LightwalletdConfigToml {
 
 #[derive(Serialize)]
 struct CompatToml {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    shielded_history: Option<ShieldedHistorySection>,
     listen_addr: String,
     browser_origins: Vec<String>,
     reorg_window_blocks: u32,

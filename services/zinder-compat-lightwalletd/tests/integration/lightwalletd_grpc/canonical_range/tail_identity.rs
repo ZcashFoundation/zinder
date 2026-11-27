@@ -9,7 +9,6 @@ use zinder_core::{
     TransactionId,
 };
 use zinder_proto::compat::lightwalletd;
-use zinder_query::{CanonicalReader as _, WalletQueryApi as _};
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
     frontier_of_size, sample_regtest_upgrade_activations,
@@ -77,7 +76,7 @@ async fn served_after_replacement(
 ) -> Result<[Vec<lightwalletd::CompactBlock>; 2]> {
     let mut recorder = EpochPinRecorder::new(original.query.clone())
         .with_later_views(vec![replacement.query.clone()]);
-    recorder.expose_range_fence = true;
+    recorder.expose_encoded_range = true;
     let mut wallet = Endpoint::start(
         Server::builder().add_service(LightwalletdGrpcAdapter::new(recorder.clone()).into_server()),
     )
@@ -92,7 +91,7 @@ async fn served_after_replacement(
         let blocks = endpoint.blocks(block_range_request(first, warmed)).await?;
         assert_eq!(blocks.len(), usize::try_from(warmed - first + 1)?);
     }
-    assert!(!recorder.recorded_rows_with_lengths.lock().is_empty());
+    assert!(!recorder.recorded_encoded_ranges.lock().is_empty());
 
     recorder.advance_view();
     drop(slot.publish(replacement.reader.clone()));
@@ -168,7 +167,7 @@ async fn an_equal_fence_from_another_admitted_generation_is_read_again() -> Resu
     let second = ReaderFixture::new(writer.into_serving_store_fixture()?)?;
     let mut recorder =
         EpochPinRecorder::new(first.query.clone()).with_later_views(vec![second.query.clone()]);
-    recorder.expose_range_fence = true;
+    recorder.expose_encoded_range = true;
     let mut wallet = Endpoint::start(
         Server::builder().add_service(LightwalletdGrpcAdapter::new(recorder.clone()).into_server()),
     )
@@ -186,8 +185,8 @@ async fn an_equal_fence_from_another_admitted_generation_is_read_again() -> Resu
         expected
     );
     assert_eq!(
-        *recorder.recorded_rows_with_lengths.lock(),
-        vec![span(2, TIP)]
+        *recorder.recorded_encoded_ranges.lock(),
+        vec![span(2, TIP), span(2, TIP)]
     );
 
     recorder.advance_view();
@@ -198,8 +197,8 @@ async fn an_equal_fence_from_another_admitted_generation_is_read_again() -> Resu
         expected
     );
     assert_eq!(
-        *recorder.recorded_rows_with_lengths.lock(),
-        vec![span(2, TIP), span(2, TIP)]
+        *recorder.recorded_encoded_ranges.lock(),
+        vec![span(2, TIP), span(2, TIP), span(2, TIP)]
     );
     Ok(())
 }
@@ -274,16 +273,6 @@ async fn a_replacement_store_with_another_lower_payload_of_equal_length_serves_i
     };
     let original = store([1; 32])?;
     let replacement = store([2; 32])?;
-    assert_eq!(
-        original
-            .query
-            .compact_block_fence(original.reader.chain_epoch())
-            .map(|fence| fence.event_fence),
-        replacement
-            .query
-            .compact_block_fence(replacement.reader.chain_epoch())
-            .map(|fence| fence.event_fence),
-    );
 
     let mut reference = Endpoint::start(
         Server::builder()

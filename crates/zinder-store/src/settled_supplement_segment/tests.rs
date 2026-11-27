@@ -3158,9 +3158,14 @@ fn assert_wide_fee_shielded_and_splice_behavior(
             .is_err()
     );
     let range_530 = BlockHeightRange::inclusive(BlockHeight::new(530), BlockHeight::new(530));
+    assert!(
+        shielded_reader
+            .read_default_range(range_530, HeightOrder::Ascending)
+            .is_err()
+    );
     assert_eq!(
         shielded_reader
-            .read_default_range(range_530, HeightOrder::Ascending)?
+            .read_default_range_for_reconstruction(range_530, HeightOrder::Ascending)?
             .len(),
         1
     );

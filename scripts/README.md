@@ -57,7 +57,6 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [generate-live-indexer-tls.sh](generate-live-indexer-tls.sh) | Generates ephemeral local TLS certificates for live node/indexer testing |
 | [mine-live-regtest.sh](mine-live-regtest.sh) | Advances blocks on a live Regtest Zebra or Zakura stack |
 | [observability-smoke.sh](observability-smoke.sh) | Smoke-tests Prometheus scrape targets, Grafana dashboards, and alert rules |
-| [prepare-shielded-history.sh](prepare-shielded-history.sh) | Atomically provisions a signed-history generation directory (`publisher.pk8`, `publisher.pub`, and an empty `catalog/` directory for `history-publisher` to populate) |
 | [prepare-wallet-tls-smoke.py](prepare-wallet-tls-smoke.py) | Prepares local Caddy TLS config and smoke checks for wallet endpoints |
 | [report-publication-delay.py](report-publication-delay.py) | Measures block-tip to served-epoch publication delay across streams and readers |
 | [run-wallet-lifecycle.py](run-wallet-lifecycle.py) | Drives automated wallet sync and spend lifecycle scenarios against Zinder |

@@ -12,6 +12,7 @@ mod construction_manifest;
 mod control;
 mod displaced_archive;
 pub mod edge_snapshot;
+mod encoded_compact_range;
 mod event_lifecycle;
 #[cfg(test)]
 mod event_lifecycle_tests;
@@ -91,6 +92,10 @@ pub use displaced_archive::{
     ArchivedDisplacedBlockSummary, DisplacedBlockCursor, DisplacedBlockPage,
     DisplacedBlockSummaryPage, DisplacedFinalRootPage, DisplacedFinalRootSearch,
     DisplacedRootCursor,
+};
+pub use encoded_compact_range::{
+    EncodedCompactBlockLink, EncodedCompactBlockOutput, EncodedCompactBlockPayload,
+    EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
 };
 pub use event_lifecycle::{
     CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind,
@@ -679,6 +684,15 @@ pub enum CanonicalStoreError {
     /// The caller cancelled a commitment-tree reconstruction.
     #[error("tree-state replay cancelled")]
     ReplayCancelled,
+
+    /// An admitted canonical artifact failed integrity or wire verification on read.
+    #[error("corrupt {family:?} artifact: {reason}")]
+    ArtifactCorrupt {
+        /// Corrupt artifact family.
+        family: crate::ArtifactFamily,
+        /// Exact integrity or wire failure reason.
+        reason: String,
+    },
 
     /// The supplied `RocksDB` resource budget violates a hard bound.
     #[error("invalid canonical store resource budget: {reason}")]

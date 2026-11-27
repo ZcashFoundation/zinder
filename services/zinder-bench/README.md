@@ -1440,10 +1440,11 @@ roots, and complete report-window coverage for every component.
 
 ## Active-writer publication benchmark (`active-writer-publication`)
 
-`zinder-bench active-writer-publication` drives four matched writer/publication
+`zinder-bench active-writer-publication` drives three matched writer/serving
 arms against an identical synthetic Regtest chain crossing at least one
-4,096-block shielded catalog segment boundary while concurrent lightwalletd
-compatibility readers measure live serving visibility and throughput:
+4,096-block settled segment boundary while concurrent lightwalletd
+compatibility readers measure live canonical `ZSHRNG02` and `live_tail_block`
+serving visibility and throughput:
 
 ```bash
 zinder-bench active-writer-publication \
@@ -1457,8 +1458,8 @@ zinder-bench active-writer-publication \
   --report ./reports/active-writer-publication.json
 ```
 
-To exercise `> 64 MiB` `EncodedTail` byte-cap evictions and RocksDB memtable
-flushes across descending tail refills on real NVMe or scratch storage:
+To exercise sustained multi-hundred-MiB live payloads and RocksDB memtable
+flushes across descending tail reads on real NVMe or scratch storage:
 
 ```bash
 zinder-bench active-writer-publication \
@@ -1476,39 +1477,32 @@ zinder-bench active-writer-publication \
   --slow-reader-frame-delay-millis 0 \
   --quiescent-rounds 2 \
   --mempool-churn-size 10,50 \
-  --require-tail-eviction \
-  --report ./.tmp/active-writer-eviction.json
+  --report ./.tmp/active-writer-sustained.json
 ```
 
 Key command flags:
 
 - `--scratch-dir <PATH>`: optional parent directory for per-arm RocksDB stores (defaults to the system temporary directory).
 - `--io-mode <direct|buffered>`: requests `RocksDbIoMode::Direct` (with buffered fallback if the filesystem rejects direct I/O) or forces `Buffered` (default `direct`).
-- `--tail-probe-blocks <N>`: width in blocks (`>= 2`) of descending uncovered-tail `GetBlockRange(tip, floor)` probes (default `24`).
+- `--tail-probe-blocks <N>`: width in blocks (`>= 2`) of descending live-tail `GetBlockRange(tip, floor)` probes (default `24`).
 - `--dense-orchard-actions-per-tx <N>`: Orchard actions synthesized per dense shielded transaction (default `2`).
-- `--publish-workers <N>`: worker count passed to `ShieldedHistoryPublisher::publish_available` (defaults to production clamping `1..=4`).
-- `--require-tail-eviction`: enforces that `report.validate(&config)` rejects any run that does not trigger `EncodedTail` `64 MiB` byte-cap evictions (`--report` is still written before returning failure when validation fails, and existing `--report` paths are rejected up front).
+- `--publish-workers <N>`, `--require-tail-eviction`: retained CLI compatibility flags after retiring `history-publisher` and `EncodedTail`; setting `--require-tail-eviction` fails validation because `EncodedTail` is retired.
 
-The four matched modes are `quiescent_control`, `ingest_active`,
-`ingest_and_projector`, and `ingest_projector_and_publisher`, paired with
-`canonical_quiescent_control` (2 canonical secondary generations, canonical-only
-adapter, no wallet RPC reader — matched baseline for `ingest_active`) and
-`published_quiescent_control` (sealed signed catalog covering the settled boundary
-— matched baseline for `ingest_projector_and_publisher`). Wallet serving arms
-drive 4 bounded canonical/wallet secondary generations with retained epoch-pin
-lookup (`SwappableWalletQuery`, matching `WalletServingPairPublisher`), and
+The three matched modes are `quiescent_control`, `ingest_active`, and
+`ingest_and_projector`, paired with `canonical_quiescent_control` (2 canonical
+secondary generations, canonical-only adapter, no wallet RPC reader — matched
+baseline for `ingest_active`). Wallet serving arms drive 4 bounded
+canonical/wallet secondary generations with retained epoch-pin lookup
+(`SwappableWalletQuery`, matching `WalletServingPairPublisher`), and
 canonical-only `canonical_quiescent_control` and `ingest_active` drive 2
-canonical secondary generations. All
-arms share a deterministic `WorkloadTrace` (`request_trace_digest`) plus unified Prometheus
-scraping (`zinder_compat_encoded_tail_*` fills, hits, fallback_native, bypass,
-byte_capped_fills, byte_cap_evictions, peak retained bytes) and request-scoped
-`encoded_tail_lookup` outcome/generation verification alongside unary
-`GetLatestBlock`, transparent wallet RPCs (`GetTaddressBalance`, `GetAddressUtxos`,
-`GetTransaction` via real coinbase spends), `GetTreeState`, slow boundary-crossing
-streams, descending uncovered-tail cold/warm probes (split across `unpublished_*` and
-span-matched `published_*` coverage), mempool churn (`writer_overlap_verified`),
-ingest prepare/commit histograms, writer WAL fsyncs, `NodeSource` RPC counts,
-single shared-pool deduplicated RocksDB tickers (`canonical_writer`, `reader_canonical_secondaries`,
-`reader_wallet_secondaries`, `wallet_writer`, `projector_secondary`, `publisher_secondary`),
-stage differentials (`ModeDifferential`), and final-tip raw wire-byte SHA-256 parity
-validated by `ActiveWriterPublicationReport::validate(&config)`.
+canonical secondary generations. All arms share a deterministic `WorkloadTrace`
+(`request_trace_digest`) alongside unary `GetLatestBlock`, transparent wallet
+RPCs (`GetTaddressBalance`, `GetAddressUtxos`, `GetTransaction` via real
+coinbase spends), `GetTreeState`, slow boundary-crossing streams, descending
+live-tail cold/warm probes, mempool churn (`writer_overlap_verified`), ingest
+prepare/commit histograms, writer WAL fsyncs, `NodeSource` RPC counts, single
+shared-pool deduplicated RocksDB tickers (`canonical_writer`,
+`reader_canonical_secondaries`, `reader_wallet_secondaries`, `wallet_writer`,
+`projector_secondary`), stage differentials (`ModeDifferential`), and final-tip
+raw wire-byte SHA-256 parity validated by
+`ActiveWriterPublicationReport::validate(&config)`.

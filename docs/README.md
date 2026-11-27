@@ -13,7 +13,7 @@ Pick the section that matches what you are doing. Each page states at the top wh
 
 Start with [Deploying Zinder](runbooks/deploying.md) for preset selection, `v0.26.0` host sizing, ports, cloud options, and the zero-TOML Docker Compose quickstart (or browse [deploy/README.md](../deploy/README.md)).
 
-- [Deploying on a VM](runbooks/deploying-on-a-vm.md): Compose + systemd, Zakura, node failover, signed history operations, and `zinder` binary verification.
+- [Deploying on a VM](runbooks/deploying-on-a-vm.md): Compose + systemd, Zakura, node failover, and `zinder` binary verification.
 - [Deploying the single-volume container](runbooks/deploying-single-volume.md): single-volume `zinder serve` deployments on PaaS platforms (e.g., Railway) and Kubernetes `StatefulSet`.
 - [Exposing over TLS](runbooks/exposing-over-tls.md): Caddy TLS proxy, client rate limits, and browser-wallet CORS origins.
 - [Initial sync](runbooks/initial-sync.md): first-sync phases, progress metrics, and recovery.

@@ -16,11 +16,11 @@ use zinder_core::{
 };
 
 use crate::{
-    HeightOrder, RawBlobRetention,
+    ArtifactFamily, HeightOrder, RawBlobRetention,
     settled_raw_block_segment::{
         RawBlockTransactionSlice, SettledRawBlockSegmentError, SettledRawBlockSegmentReader,
     },
-    settled_shielded_segment::SettledShieldedSegmentReader,
+    settled_shielded_segment::{SettledShieldedSegmentError, SettledShieldedSegmentReader},
     settled_supplement_segment::{
         BlockSupplementRecord, SettledSupplementSegmentReader, reconstruct_canonical_block_facts,
         reconstruct_compact_block_artifact,
@@ -137,7 +137,6 @@ pub(in crate::canonical_store) fn find_settled_segment_for_height(
 }
 
 /// Returns the inclusive `sealed_tip` of the latest sealed segment, or `None`.
-#[cfg(test)]
 pub(in crate::canonical_store) fn read_sealed_tip(
     db: &DB,
 ) -> Result<Option<BlockId>, CanonicalStoreError> {
@@ -411,6 +410,81 @@ pub(in crate::canonical_store) fn read_block_header_from_db(
     decode_block_header_record(height, &encoded).map(Some)
 }
 
+/// Opens ONLY `ZSHRNG02`, never opening `ZSTSUP01` or `ZSBLKB01`.
+pub(in crate::canonical_store) fn open_shielded_segment_reader(
+    ctx: SegmentStoreContext<'_>,
+    entry: &SettledSegmentIndexEntry,
+) -> Result<Arc<SettledShieldedSegmentReader>, CanonicalStoreError> {
+    let opened = if let Some(cache) = ctx.segment_cache {
+        cache.get_or_open_shielded(entry)
+    } else {
+        let temp_cache = SettledSegmentReaderCache::new(ctx.db.path(), 1, false)
+            .map_err(map_settled_segments_read_error)?;
+        temp_cache.get_or_open_shielded(entry)
+    };
+    opened.map_err(map_settled_segments_read_error)
+}
+
+pub(in crate::canonical_store) fn map_shielded_read_error(
+    error: SettledShieldedSegmentError,
+) -> CanonicalStoreError {
+    match error {
+        SettledShieldedSegmentError::Cancelled => CanonicalStoreError::ReplayCancelled,
+        SettledShieldedSegmentError::Io(ref io_err)
+            if rustix::io::Errno::from_io_error(io_err) == Some(rustix::io::Errno::IO) =>
+        {
+            CanonicalStoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                reason: error.to_string(),
+            }
+        }
+        SettledShieldedSegmentError::Io(io_err) => CanonicalStoreError::SettledSegment {
+            reason: io_err.to_string(),
+        },
+        SettledShieldedSegmentError::InvalidFormat(_)
+        | SettledShieldedSegmentError::ChainLinkage(_)
+        | SettledShieldedSegmentError::PayloadIntegrity(_)
+        | SettledShieldedSegmentError::PayloadLimitExceeded { .. }
+        | SettledShieldedSegmentError::FsVerityRequired
+        | SettledShieldedSegmentError::HeightOutOfRange { .. } => {
+            CanonicalStoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                reason: error.to_string(),
+            }
+        }
+    }
+}
+
+pub(in crate::canonical_store) fn map_settled_segments_read_error(
+    error: SettledSegmentsError,
+) -> CanonicalStoreError {
+    match error {
+        SettledSegmentsError::Shielded(inner) => map_shielded_read_error(inner),
+        SettledSegmentsError::Io(ref io_err)
+            if rustix::io::Errno::from_io_error(io_err) == Some(rustix::io::Errno::IO) =>
+        {
+            CanonicalStoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                reason: error.to_string(),
+            }
+        }
+        SettledSegmentsError::Io(io_err) => CanonicalStoreError::SettledSegment {
+            reason: io_err.to_string(),
+        },
+        SettledSegmentsError::InvalidFormat(_)
+        | SettledSegmentsError::Integrity(_)
+        | SettledSegmentsError::ChainLinkage(_)
+        | SettledSegmentsError::InvalidLayout(_)
+        | SettledSegmentsError::Json(_) => CanonicalStoreError::ArtifactCorrupt {
+            family: ArtifactFamily::CompactBlock,
+            reason: error.to_string(),
+        },
+        SettledSegmentsError::Supplement(_) | SettledSegmentsError::RawBlock(_) => {
+            CanonicalStoreError::from(error)
+        }
+    }
+}
+
 /// Opens ONLY `ZSHRNG02` and (when enabled by `entry.modules.supplement`) `ZSTSUP01`,
 /// never opening `ZSBLKB01`.
 pub(in crate::canonical_store) fn open_replay_segment_readers(
@@ -659,7 +733,7 @@ fn read_compact_block_from_segment(
             .shielded
             .read_default_range(range, HeightOrder::Ascending)
     }
-    .map_err(SettledSegmentsError::Shielded)?;
+    .map_err(map_shielded_read_error)?;
     let [encoded_block] =
         <[_; 1]>::try_from(encoded_blocks).map_err(|_| CanonicalStoreError::SettledSegment {
             reason: format!(
@@ -670,20 +744,39 @@ fn read_compact_block_from_segment(
     reconstruct_compact_from_shielded(readers, height, &encoded_block.payload())
 }
 
+fn segment_needs_supplement(
+    sup_reader: &SettledSupplementSegmentReader,
+    height: BlockHeight,
+) -> Result<bool, CanonicalStoreError> {
+    let has_transparent = sup_reader
+        .has_transparent_at(height)
+        .map_err(SettledSegmentsError::Supplement)?;
+    let has_wide_fee = sup_reader
+        .has_wide_fee_at(height)
+        .map_err(SettledSegmentsError::Supplement)?;
+    Ok(has_transparent || has_wide_fee)
+}
+
+fn empty_supplement_record() -> BlockSupplementRecord {
+    BlockSupplementRecord {
+        transparent_transactions: Vec::new(),
+        canonical_metadata: None,
+    }
+}
+
 fn reconstruct_compact_from_shielded(
     readers: &SegmentReplayReaders,
     height: BlockHeight,
     shielded_payload: &[u8],
 ) -> Result<CompactBlockArtifact, CanonicalStoreError> {
-    if let Some(sup_reader) = &readers.supplement {
+    if let Some(sup_reader) = &readers.supplement
+        && segment_needs_supplement(sup_reader, height)?
+    {
         return Ok(sup_reader
             .reconstruct_block(height, shielded_payload)
             .map_err(SettledSegmentsError::Supplement)?);
     }
-    let empty_sup = BlockSupplementRecord {
-        transparent_transactions: Vec::new(),
-        canonical_metadata: None,
-    };
+    let empty_sup = empty_supplement_record();
     reconstruct_compact_block_artifact(shielded_payload, &empty_sup).map_err(|err| {
         CanonicalStoreError::SettledSegment {
             reason: format!(
@@ -712,7 +805,8 @@ fn read_compact_block_split_with_options(
         return Ok(Some(read_compact_block_from_segment(&readers, height)?));
     }
     if let Some(encoded) = read_live_tail_raw_bytes_with_options(ctx.db, height, read_options)? {
-        let (compact, _) = LiveTailBlockRecord::decode_compact_block_v1(&encoded, height)?;
+        let (compact, _) = LiveTailBlockRecord::decode_compact_block_v1(&encoded, height)
+            .map_err(map_settled_segments_read_error)?;
         return Ok(Some(compact));
     }
     Ok(None)
@@ -735,7 +829,7 @@ pub(in crate::canonical_store) fn reconstruct_segment_compact_range(
             .shielded
             .read_default_range(range, HeightOrder::Ascending)
     }
-    .map_err(SettledSegmentsError::Shielded)?;
+    .map_err(map_shielded_read_error)?;
     let expected =
         usize::try_from(u64::from(range.end.value()) - u64::from(range.start.value()) + 1)
             .map_err(|_| CanonicalStoreError::SettledSegment {
@@ -750,23 +844,69 @@ pub(in crate::canonical_store) fn reconstruct_segment_compact_range(
             ),
         });
     }
+    let empty_sup = empty_supplement_record();
     if let Some(sup_reader) = &readers.supplement {
-        let payloads = encoded_blocks
-            .iter()
-            .map(zinder_proto::compat::lightwalletd::EncodedBlock::payload)
-            .collect::<Vec<_>>();
-        return Ok(sup_reader
-            .reconstruct_range(range.start, &payloads)
-            .map_err(SettledSegmentsError::Supplement)?);
+        return reconstruct_range_with_optional_supplement(
+            sup_reader,
+            range,
+            &encoded_blocks,
+            &empty_sup,
+        );
     }
-    let empty_sup = BlockSupplementRecord {
-        transparent_transactions: Vec::new(),
-        canonical_metadata: None,
-    };
     let mut artifacts = Vec::with_capacity(encoded_blocks.len());
     for encoded_block in encoded_blocks {
         artifacts.push(
             reconstruct_compact_block_artifact(&encoded_block.payload(), &empty_sup)
+                .map_err(SettledSegmentsError::Supplement)?,
+        );
+    }
+    Ok(artifacts)
+}
+
+fn reconstruct_range_with_optional_supplement(
+    sup_reader: &SettledSupplementSegmentReader,
+    range: BlockHeightRange,
+    encoded_blocks: &[zinder_proto::compat::lightwalletd::EncodedBlock],
+    empty_sup: &BlockSupplementRecord,
+) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
+    let mut needs = Vec::with_capacity(encoded_blocks.len());
+    for height in range {
+        needs.push(segment_needs_supplement(sup_reader, height)?);
+    }
+    let mut artifacts = Vec::with_capacity(encoded_blocks.len());
+    let mut idx = 0_usize;
+    while idx < encoded_blocks.len() {
+        if !needs[idx] {
+            artifacts.push(
+                reconstruct_compact_block_artifact(&encoded_blocks[idx].payload(), empty_sup)
+                    .map_err(SettledSegmentsError::Supplement)?,
+            );
+            idx += 1;
+            continue;
+        }
+        let run_start = idx;
+        while idx < encoded_blocks.len() && needs[idx] {
+            idx += 1;
+        }
+        let run_offset =
+            u32::try_from(run_start).map_err(|_| CanonicalStoreError::SettledSegment {
+                reason: "segment run index exceeds u32".to_owned(),
+            })?;
+        let run_height = range
+            .start
+            .value()
+            .checked_add(run_offset)
+            .map(BlockHeight::new)
+            .ok_or_else(|| CanonicalStoreError::SettledSegment {
+                reason: "segment run height overflow".to_owned(),
+            })?;
+        let payloads = encoded_blocks[run_start..idx]
+            .iter()
+            .map(zinder_proto::compat::lightwalletd::EncodedBlock::payload)
+            .collect::<Vec<_>>();
+        artifacts.extend(
+            sup_reader
+                .reconstruct_range(run_height, &payloads)
                 .map_err(SettledSegmentsError::Supplement)?,
         );
     }

@@ -311,33 +311,35 @@ impl BlockRangeStage {
 /// full fails at once.
 #[derive(Clone, Debug)]
 pub(crate) struct BlockRangeStreamLimit {
-    published_reads: Arc<Semaphore>,
+    encoded_range_reads: Arc<Semaphore>,
     slots: Arc<Semaphore>,
     waiters: Arc<AtomicUsize>,
     max_streams: NonZeroU32,
     max_wait: Duration,
 }
 
-const PUBLISHED_READERS: usize = 16;
+const ENCODED_RANGE_READERS: usize = 16;
 
 impl BlockRangeStreamLimit {
-    pub(crate) fn published_chunk_budget(&self, offered: usize) -> usize {
+    pub(crate) fn encoded_range_chunk_budget(&self, offered: usize) -> usize {
         let capacity = (self.max_streams.get() as usize).min(Semaphore::MAX_PERMITS);
         let active = capacity.saturating_sub(self.slots.available_permits());
-        offered
-            .min((PUBLISHED_READERS * BLOCK_RANGE_CHUNK_MAX_BYTES) / active.max(PUBLISHED_READERS))
+        offered.min(
+            (ENCODED_RANGE_READERS * BLOCK_RANGE_CHUNK_MAX_BYTES)
+                / active.max(ENCODED_RANGE_READERS),
+        )
     }
 
-    pub(crate) fn try_published_read_permit(&self) -> Option<OwnedSemaphorePermit> {
-        self.published_reads.clone().try_acquire_owned().ok()
+    pub(crate) fn try_encoded_range_read_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.encoded_range_reads.clone().try_acquire_owned().ok()
     }
 
-    pub(crate) async fn published_read_permit(&self) -> Result<OwnedSemaphorePermit, Status> {
-        self.published_reads
+    pub(crate) async fn encoded_range_read_permit(&self) -> Result<OwnedSemaphorePermit, Status> {
+        self.encoded_range_reads
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| Status::unavailable("published range reader closed"))
+            .map_err(|_| Status::unavailable("encoded range reader closed"))
     }
 
     /// Creates a limit that admits at most `max_streams` streams at once and
@@ -351,10 +353,8 @@ impl BlockRangeStreamLimit {
         // zero would discard the slots that other limits in the process hold.
         metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
         register_refusal_counter();
-        crate::sealed_history::register_published_history_metrics();
-        crate::published_range::register_encoded_tail_metrics();
         Self {
-            published_reads: Arc::new(Semaphore::new(PUBLISHED_READERS)),
+            encoded_range_reads: Arc::new(Semaphore::new(ENCODED_RANGE_READERS)),
             slots: Arc::new(Semaphore::new(permits)),
             waiters: Arc::new(AtomicUsize::new(0)),
             max_streams,
@@ -590,7 +590,7 @@ fn maybe_warn_cgroup_memory_pressure() {
         memory_limit_bytes = snapshot.limit_bytes,
         memory_file_cache_bytes = snapshot.file_cache_bytes,
         "block-range admission timed out while cgroup v2 memory usage is near its limit; \
-         signed-history catalog reads charge OS page cache to MemoryMax/mem_limit outside RocksDB"
+         canonical settled-segment reads charge OS page cache to MemoryMax/mem_limit outside RocksDB"
     );
 }
 
@@ -1010,6 +1010,18 @@ impl RangeBlock for CompactBlockArtifact {
     }
     fn previous_block_hash(&self) -> BlockHash {
         self.previous_block_hash()
+    }
+}
+
+impl RangeBlock for zinder_store::EncodedCompactBlockLink {
+    fn height(&self) -> BlockHeight {
+        self.height
+    }
+    fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+    fn previous_block_hash(&self) -> BlockHash {
+        self.previous_block_hash
     }
 }
 
@@ -1900,59 +1912,6 @@ mod tests {
                 ),
                 Some(0.0),
                 "expected 0 sample for reason={reason} in:\n{rendered}"
-            );
-        }
-        assert!(
-            rendered.contains("# HELP zinder_compat_published_history_read_bytes_total "),
-            "missing # HELP for published history read bytes in:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("# TYPE zinder_compat_published_history_read_bytes_total counter"),
-            "missing # TYPE for published history read bytes in:\n{rendered}"
-        );
-        for slab in ["shielded", "nullifier"] {
-            assert_eq!(
-                rendered_sample(
-                    &rendered,
-                    &format!("zinder_compat_published_history_read_bytes_total{{slab=\"{slab}\"}}"),
-                ),
-                Some(0.0),
-                "expected 0 sample for slab={slab} in:\n{rendered}"
-            );
-        }
-        assert!(
-            rendered.contains("# HELP zinder_compat_encoded_tail_lookups_total "),
-            "missing # HELP for encoded tail lookups in:\n{rendered}"
-        );
-        for outcome in ["hit", "rebuild", "prepend", "fallback_native", "bypass"] {
-            assert_eq!(
-                rendered_sample(
-                    &rendered,
-                    &format!("zinder_compat_encoded_tail_lookups_total{{outcome=\"{outcome}\"}}"),
-                ),
-                Some(0.0),
-                "expected 0 sample for outcome={outcome} in:\n{rendered}"
-            );
-        }
-        for kind in ["rebuild", "prepend"] {
-            assert_eq!(
-                rendered_sample(
-                    &rendered,
-                    &format!("zinder_compat_encoded_tail_fills_total{{kind=\"{kind}\"}}"),
-                ),
-                Some(0.0),
-                "expected 0 sample for kind={kind} in:\n{rendered}"
-            );
-        }
-        for series in [
-            "zinder_compat_encoded_tail_byte_capped_fills_total",
-            "zinder_compat_encoded_tail_byte_cap_evictions_total",
-            "zinder_compat_encoded_tail_bytes",
-        ] {
-            assert_eq!(
-                rendered_sample(&rendered, series),
-                Some(0.0),
-                "expected 0 sample for {series} in:\n{rendered}"
             );
         }
     }

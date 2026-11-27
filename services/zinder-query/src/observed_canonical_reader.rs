@@ -19,9 +19,9 @@ use zinder_core::{
 };
 use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, ChainEventEnvelope,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
-    RawBlobRetention, ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay,
-    TreeStateReplayOutcome,
+    ChainEventStreamFamily, ChainEventStreamResume, EncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, RawBlobRetention,
+    ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 
 use crate::{CanonicalReader, IndexedTransaction, RocksDbCanonicalReader, StorageReadError};
@@ -193,13 +193,13 @@ impl CanonicalReader for ObservedCanonicalReader {
             .await
     }
 
-    async fn compact_block_rows_with_lengths(
+    async fn encoded_compact_block_range_up_to(
         &self,
-        range: BlockHeightRange,
-        max_bytes: usize,
-    ) -> Result<Vec<(CompactBlockArtifact, usize)>, StorageReadError> {
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, StorageReadError> {
         self.count()
-            .compact_block_rows_with_lengths(range, max_bytes)
+            .encoded_compact_block_range_up_to(request, cancel)
             .await
     }
 

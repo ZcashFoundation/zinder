@@ -13,7 +13,7 @@ use crate::BenchError;
 /// Stable contract identifier for this benchmark report format.
 pub const ACTIVE_WRITER_PUBLICATION_CONTRACT: &str = "active-writer-publication";
 /// Current schema version for [`ActiveWriterPublicationReport`].
-pub const ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION: u32 = 2;
+pub const ACTIVE_WRITER_PUBLICATION_FORMAT_VERSION: u32 = 3;
 
 /// Tickers collected around each writer, reader, projector, and publisher lifecycle.
 pub(crate) const MONITORED_TICKERS: [Ticker; 10] = [
@@ -117,18 +117,16 @@ impl StoreTickerDelta {
     }
 }
 
-/// Four matched writer/publication states exercised against an identical chain.
+/// Three matched writer/serving states exercised against an identical chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriterMode {
-    /// Closed stores at the final tip with no active writers or publishers.
+    /// Closed stores at the final tip with no active writers.
     QuiescentControl,
     /// Canonical writer following tip commits concurrently with readers.
     IngestActive,
     /// Canonical writer plus concurrent wallet projection transitions.
     IngestAndProjector,
-    /// Canonical writer, wallet projector, and concurrent shielded catalog publisher.
-    IngestProjectorAndPublisher,
 }
 
 impl WriterMode {
@@ -139,17 +137,13 @@ impl WriterMode {
             Self::QuiescentControl => "quiescent_control",
             Self::IngestActive => "ingest_active",
             Self::IngestAndProjector => "ingest_and_projector",
-            Self::IngestProjectorAndPublisher => "ingest_projector_and_publisher",
         }
     }
 
     /// Whether this mode serves a wallet projection alongside canonical state.
     #[must_use]
     pub const fn has_wallet_serving(self) -> bool {
-        matches!(
-            self,
-            Self::QuiescentControl | Self::IngestAndProjector | Self::IngestProjectorAndPublisher
-        )
+        matches!(self, Self::QuiescentControl | Self::IngestAndProjector)
     }
 }
 
@@ -165,22 +159,13 @@ pub struct ActiveWriterPublicationReport {
     /// Baseline canonical-only quiescent arm with 2 secondary generations and no
     /// wallet serving or wallet RPC fleet (matched baseline for `ingest_active`).
     pub canonical_quiescent_control: ModeReport,
-    /// Baseline quiescent arm with signed catalog published through `crossed_segment_boundary_height`
-    /// (matched baseline for `ingest_projector_and_publisher`).
-    pub published_quiescent_control: ModeReport,
     /// Per-mode measurement records in canonical execution order (`quiescent_control`,
-    /// `ingest_active`, `ingest_and_projector`, `ingest_projector_and_publisher`).
+    /// `ingest_active`, `ingest_and_projector`).
     pub modes: Vec<ModeReport>,
     /// Stage differentials comparing each active mode against its matched quiescent control.
     pub differentials_vs_quiescent: Vec<ModeDifferential>,
     /// Byte-level reply parity comparison across all arms at the final tip.
     pub byte_parity: ByteParityReport,
-}
-
-#[derive(Clone, Copy)]
-struct ModeValidationExpectations {
-    published_catalog: bool,
-    wallet_serving: bool,
 }
 
 impl ActiveWriterPublicationReport {
@@ -190,9 +175,14 @@ impl ActiveWriterPublicationReport {
     /// # Errors
     ///
     /// Returns [`BenchError`] if any arm recorded unexpected gRPC errors, missed
-    /// required overlap or publication stages, failed byte parity, or failed a
-    /// requested tail-eviction requirement.
+    /// required overlap or publication stages, failed byte parity, or requested
+    /// retired tail-eviction checks.
     pub fn validate(&self, config: &ActiveWriterPublicationConfig) -> Result<(), BenchError> {
+        if config.require_tail_eviction {
+            return Err(BenchError::invalid_argument(
+                "require_tail_eviction is no longer supported after retiring EncodedTail",
+            ));
+        }
         if !self.byte_parity.all_matched {
             return Err(BenchError::acceptance_completion_mismatch(format!(
                 "byte parity mismatch across modes: {:?}",
@@ -203,7 +193,6 @@ impl ActiveWriterPublicationReport {
             WriterMode::QuiescentControl,
             WriterMode::IngestActive,
             WriterMode::IngestAndProjector,
-            WriterMode::IngestProjectorAndPublisher,
         ];
         if self.modes.len() != expected_modes.len()
             || self
@@ -213,53 +202,13 @@ impl ActiveWriterPublicationReport {
                 .any(|(report, expected)| report.mode != expected)
         {
             return Err(BenchError::acceptance_completion_mismatch(
-                "report modes must match [quiescent_control, ingest_active, ingest_and_projector, ingest_projector_and_publisher]",
+                "report modes must match [quiescent_control, ingest_active, ingest_and_projector]",
             ));
         }
 
-        validate_single_mode(
-            &self.canonical_quiescent_control,
-            ModeValidationExpectations {
-                published_catalog: false,
-                wallet_serving: false,
-            },
-            config,
-        )?;
-        validate_single_mode(
-            &self.published_quiescent_control,
-            ModeValidationExpectations {
-                published_catalog: true,
-                wallet_serving: true,
-            },
-            config,
-        )?;
+        validate_single_mode(&self.canonical_quiescent_control, false, config)?;
         for mode_report in &self.modes {
-            validate_single_mode(
-                mode_report,
-                ModeValidationExpectations {
-                    published_catalog: mode_report.mode == WriterMode::IngestProjectorAndPublisher,
-                    wallet_serving: mode_report.mode.has_wallet_serving(),
-                },
-                config,
-            )?;
-        }
-
-        if config.require_tail_eviction {
-            let evicted = [
-                &self.canonical_quiescent_control,
-                &self.published_quiescent_control,
-            ]
-            .into_iter()
-            .chain(self.modes.iter())
-            .any(|report| {
-                report.tail_refill.encoded_tail_byte_cap_evictions > 0
-                    && report.tail_refill.byte_cap_exceeded
-            });
-            if !evicted {
-                return Err(BenchError::acceptance_hard_limit_missed(
-                    "encoded_tail_64mib_eviction_not_observed",
-                ));
-            }
+            validate_single_mode(mode_report, mode_report.mode.has_wallet_serving(), config)?;
         }
         Ok(())
     }
@@ -267,7 +216,7 @@ impl ActiveWriterPublicationReport {
 
 fn validate_single_mode(
     report: &ModeReport,
-    expectations: ModeValidationExpectations,
+    expect_wallet_serving: bool,
     config: &ActiveWriterPublicationConfig,
 ) -> Result<(), BenchError> {
     if report.errors.unexpected_grpc_errors > 0 {
@@ -284,21 +233,13 @@ fn validate_single_mode(
         || report.tree_state_ms.samples == 0
         || report.tail_refill.cold_after_advance.completion_ms.samples == 0
         || report.tail_refill.warm_repeat.completion_ms.samples == 0
-        || report.tail_refill.encoded_tail_cache_fills == 0
-        || report.tail_refill.encoded_tail_cache_hits == 0
     {
         return Err(BenchError::acceptance_telemetry_missing(format!(
-            "{} missing core reader or EncodedTail Prometheus samples",
+            "{} missing core reader samples",
             report.mode.as_str()
         )));
     }
-    if expectations.published_catalog && report.catalog_range_published.completion_ms.samples == 0 {
-        return Err(BenchError::acceptance_telemetry_missing(format!(
-            "{} missing published catalog samples",
-            report.mode.as_str()
-        )));
-    }
-    if expectations.wallet_serving {
+    if expect_wallet_serving {
         if report.wallet_rpc_ms.taddress_balance_ms.samples == 0
             || report.wallet_rpc_ms.address_utxos_ms.samples == 0
             || report.wallet_rpc_ms.get_transaction_ms.samples == 0
@@ -356,10 +297,8 @@ fn validate_mode_pipeline_stages(
             report.mode.as_str()
         )));
     }
-    if matches!(
-        report.mode,
-        WriterMode::IngestAndProjector | WriterMode::IngestProjectorAndPublisher
-    ) && report.projector.transitions_applied < config.live_blocks
+    if report.mode == WriterMode::IngestAndProjector
+        && report.projector.transitions_applied < config.live_blocks
     {
         return Err(BenchError::acceptance_completion_mismatch(format!(
             "{} projected only {} transitions (< {})",
@@ -367,13 +306,6 @@ fn validate_mode_pipeline_stages(
             report.projector.transitions_applied,
             config.live_blocks
         )));
-    }
-    if report.mode == WriterMode::IngestProjectorAndPublisher
-        && (report.publisher.segments_published == 0 || report.publisher.catalog_refreshes == 0)
-    {
-        return Err(BenchError::acceptance_completion_mismatch(
-            "ingest_projector_and_publisher did not seal and refresh signed catalog",
-        ));
     }
     Ok(())
 }
@@ -407,8 +339,6 @@ pub struct WorkloadGeometryReport {
     pub tail_probe_blocks: u32,
     /// Requested `RocksDB` I/O mode (`"direct"` or `"buffered"`).
     pub requested_io_mode: String,
-    /// Worker count used for signed-catalog publication.
-    pub publish_workers: u32,
     /// Distinct mempool churn transaction counts exercised (e.g. `[50, 500]`).
     pub mempool_churn_sizes: Vec<u32>,
     /// Deterministic SHA-256 hex digest of the shared `WorkloadTrace`.
@@ -505,21 +435,7 @@ pub struct ProjectorMetrics {
     pub transitions_applied: u32,
 }
 
-/// Shielded-history catalog publication timings.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct PublisherMetrics {
-    /// Wall duration across all `publish_available` passes while running.
-    pub total_ms: f64,
-    /// Per-call duration of `publish_available` invocations that sealed a segment.
-    pub segment_publish_ms: LatencySummaryMs,
-    /// Total segments newly published during this mode run.
-    pub segments_published: usize,
-    /// Total catalog refresh swaps completed on the serving listener.
-    pub catalog_refreshes: u64,
-}
-
-/// Encoded tail fill/refill timing and `64 MiB` byte-cap observation from
-/// standard `zinder_compat_encoded_tail_*` Prometheus counters.
+/// Live-tail `GetBlockRange(tip, floor)` cold/warm timing observations.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct TailRefillMetrics {
     /// First tail `GetBlockRange(tip, floor)` after tip advance or generation rotation
@@ -528,36 +444,10 @@ pub struct TailRefillMetrics {
     /// Immediate repeat tail `GetBlockRange(tip, floor)` on the same generation
     /// across all verified pairs.
     pub warm_repeat: StreamLatencyReport,
-    /// Verified cold tail pairs served with no signed catalog boundary (`catalog_end_height == 0`).
-    pub unpublished_cold_after_advance: StreamLatencyReport,
-    /// Verified warm tail repeat pairs served with no signed catalog boundary (`catalog_end_height == 0`).
-    pub unpublished_warm_repeat: StreamLatencyReport,
-    /// Verified cold tail pairs matching `published_quiescent_control` uncovered/catalog span.
-    pub published_cold_after_advance: StreamLatencyReport,
-    /// Verified warm tail repeat pairs matching `published_quiescent_control` uncovered/catalog span.
-    pub published_warm_repeat: StreamLatencyReport,
-    /// Verified published-catalog tail pairs skipped because their uncovered span differed from control.
-    pub published_mismatched_span_pairs: u64,
-    /// Peak payload bytes observed across a single uncovered-tail range response.
+    /// Peak payload bytes observed across a single descending-tail range response.
     pub peak_tail_response_bytes: u64,
-    /// Peak retained bytes observed on `zinder_compat_encoded_tail_bytes`.
-    pub peak_encoded_tail_bytes: u64,
-    /// Delta of `zinder_compat_encoded_tail_byte_cap_evictions_total` during this mode run.
-    pub encoded_tail_byte_cap_evictions: u64,
-    /// Delta of `zinder_compat_encoded_tail_byte_capped_fills_total` during this mode run.
-    pub encoded_tail_byte_capped_fills: u64,
-    /// Delta of `zinder_compat_encoded_tail_fills_total` (`rebuild` + `prepend`).
-    pub encoded_tail_cache_fills: u64,
-    /// Delta of `zinder_compat_encoded_tail_lookups_total{outcome="hit"}`.
-    pub encoded_tail_cache_hits: u64,
-    /// Delta of `zinder_compat_encoded_tail_lookups_total{outcome="fallback_native"}`.
-    pub encoded_tail_fallback_native: u64,
-    /// Delta of `zinder_compat_encoded_tail_lookups_total{outcome="bypass"}`.
-    pub encoded_tail_bypass: u64,
-    /// Tail probe pairs excluded because verification failed or generation/epoch changed mid-pair.
+    /// Tail probe pairs excluded because retries occurred or generation/epoch changed mid-pair.
     pub unpaired_tail_probes: u64,
-    /// Whether `EncodedTail` reported any byte-capped fill or byte-cap eviction.
-    pub byte_cap_exceeded: bool,
 }
 
 /// Mempool churn read timings for a specific pending-transaction batch size.
@@ -588,8 +478,6 @@ pub struct IoModeReport {
     pub wallet_secondaries: Vec<String>,
     /// Projector canonical secondary resolved I/O mode (`None` when projector inactive).
     pub projector_secondary: Option<String>,
-    /// Publisher secondary store resolved I/O mode (`None` when publisher inactive).
-    pub publisher_secondary: Option<String>,
 }
 
 /// Writer durability fsync counters from `RocksDB` `wal.synced`.
@@ -635,8 +523,6 @@ pub struct RocksDbActivityReport {
     pub wallet_writer: StoreTickerDelta,
     /// Projector canonical secondary activity while reading canonical events.
     pub projector_secondary: StoreTickerDelta,
-    /// Publisher canonical secondary activity during catalog sealing.
-    pub publisher_secondary: StoreTickerDelta,
 }
 
 /// Classified reader protocol errors separated from expected tip-change behavior.
@@ -653,8 +539,7 @@ pub struct ProtocolErrorCounts {
 /// Complete telemetry output for a single matched [`WriterMode`] execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModeReport {
-    /// Mode name (`quiescent_control`, `ingest_active`, `ingest_and_projector`,
-    /// `ingest_projector_and_publisher`).
+    /// Mode name (`quiescent_control`, `ingest_active`, `ingest_and_projector`).
     pub mode: WriterMode,
     /// Total wall-clock duration of the measured reader workload window.
     pub workload_duration_ms: f64,
@@ -666,19 +551,13 @@ pub struct ModeReport {
     pub latest_block_rpc_ms: LatencySummaryMs,
     /// Commit-to-served-tip visibility delay across live commits (`0` samples in quiescent controls).
     pub commit_to_served_tip_ms: LatencySummaryMs,
-    /// Ordinary settled catalog `GetBlockRange` timing across all catalog phases.
+    /// Canonical settled segment `GetBlockRange` timing.
     pub catalog_range: StreamLatencyReport,
-    /// Settled catalog samples served strictly before the signed catalog covered the range.
-    pub catalog_range_unpublished: StreamLatencyReport,
-    /// Settled catalog samples served strictly once the signed catalog covered the range.
-    pub catalog_range_published: StreamLatencyReport,
-    /// Settled catalog samples whose call spanned catalog seal/adoption mid-flight.
-    pub catalog_range_during_seal: StreamLatencyReport,
-    /// Uncovered live-tail `GetBlockRange(tip, floor)` timing and `EncodedTail` Prometheus deltas.
+    /// Descending live-tail `GetBlockRange(tip, floor)` cold/warm timing observations.
     pub tail_refill: TailRefillMetrics,
     /// Slow reader `GetBlockRange` crossing the segment boundary into live tail.
     pub slow_boundary_range: StreamLatencyReport,
-    /// `GetTreeState` latency across catalog and tail heights.
+    /// `GetTreeState` latency across settled and tail heights.
     pub tree_state_ms: LatencySummaryMs,
     /// Real wallet-projection unary RPC timings (`0` samples in `ingest_active`).
     pub wallet_rpc_ms: WalletRpcMetrics,
@@ -686,8 +565,6 @@ pub struct ModeReport {
     pub mempool_churn: Vec<MempoolTierMetrics>,
     /// Concurrent wallet projector metrics.
     pub projector: ProjectorMetrics,
-    /// Concurrent shielded history publisher metrics.
-    pub publisher: PublisherMetrics,
     /// Canonical and wallet WAL fsync counts and bytes.
     pub writer_fsyncs: WriterFsyncCounts,
     /// Upstream `NodeSource` RPC call counts.
@@ -698,18 +575,14 @@ pub struct ModeReport {
     pub errors: ProtocolErrorCounts,
 }
 
-/// Matched quiescent baseline pair passed to [`ModeDifferential::between`].
+/// Matched quiescent baseline passed to [`ModeDifferential::between`].
 #[derive(Clone, Copy, Debug)]
 pub struct DifferentialBaselines<'a> {
-    /// Unpublished control report (`"canonical_quiescent_control"` for canonical-only
+    /// Matched control report (`"canonical_quiescent_control"` for canonical-only
     /// `ingest_active`, or `"quiescent_control"` for wallet-serving arms).
-    pub unpublished: &'a ModeReport,
-    /// Published `published_quiescent_control` report (signed catalog baseline).
-    pub published: &'a ModeReport,
-    /// Matched baseline label (`"canonical_quiescent_control"`, `"quiescent_control"`, or `"published_quiescent_control"`).
+    pub baseline: &'a ModeReport,
+    /// Matched baseline label (`"canonical_quiescent_control"` or `"quiescent_control"`).
     pub baseline_label: &'a str,
-    /// Whether the candidate's primary comparison uses the published catalog baseline.
-    pub baseline_catalog_published: bool,
 }
 
 /// Latency and activity deltas for one active mode compared to its matched quiescent baseline.
@@ -717,47 +590,20 @@ pub struct DifferentialBaselines<'a> {
 pub struct ModeDifferential {
     /// Active writer mode being compared.
     pub mode: WriterMode,
-    /// Matched quiescent baseline identifier (`"canonical_quiescent_control"`,
-    /// `"quiescent_control"`, or `"published_quiescent_control"`).
+    /// Matched quiescent baseline identifier (`"canonical_quiescent_control"` or `"quiescent_control"`).
     pub baseline_label: String,
-    /// Whether the matched quiescent baseline held a published signed catalog.
-    pub baseline_catalog_published: bool,
-    /// Change in phase-matched settled catalog `GetBlockRange` completion p50 (ms), if available.
+    /// Change in settled canonical `GetBlockRange` completion p50 (ms), if available.
     pub catalog_completion_p50_delta_ms: Option<f64>,
-    /// Change in phase-matched settled catalog `GetBlockRange` completion p95 (ms), if available.
+    /// Change in settled canonical `GetBlockRange` completion p95 (ms), if available.
     pub catalog_completion_p95_delta_ms: Option<f64>,
-    /// Change in unpublished canonical settled catalog completion p50 vs `quiescent_control` (ms).
-    pub unpublished_catalog_completion_p50_delta_ms: Option<f64>,
-    /// Change in unpublished canonical settled catalog completion p95 vs `quiescent_control` (ms).
-    pub unpublished_catalog_completion_p95_delta_ms: Option<f64>,
-    /// Change in signed-catalog settled completion p50 vs `published_quiescent_control` (ms).
-    pub published_catalog_completion_p50_delta_ms: Option<f64>,
-    /// Change in signed-catalog settled completion p95 vs `published_quiescent_control` (ms).
-    pub published_catalog_completion_p95_delta_ms: Option<f64>,
-    /// Change in cold tail refill completion p50 vs phase-matched baseline (ms), if available.
+    /// Change in cold tail refill completion p50 vs baseline (ms), if available.
     pub cold_tail_completion_p50_delta_ms: Option<f64>,
-    /// Change in cold tail refill completion p95 vs phase-matched baseline (ms), if available.
+    /// Change in cold tail refill completion p95 vs baseline (ms), if available.
     pub cold_tail_completion_p95_delta_ms: Option<f64>,
-    /// Change in warm tail repeat completion p50 vs phase-matched baseline (ms), if available.
+    /// Change in warm tail repeat completion p50 vs baseline (ms), if available.
     pub warm_tail_completion_p50_delta_ms: Option<f64>,
-    /// Change in warm tail repeat completion p95 vs phase-matched baseline (ms), if available.
+    /// Change in warm tail repeat completion p95 vs baseline (ms), if available.
     pub warm_tail_completion_p95_delta_ms: Option<f64>,
-    /// Change in unpublished (`catalog_end_height == 0`) cold tail p50 vs `quiescent_control` (ms).
-    pub unpublished_cold_tail_completion_p50_delta_ms: Option<f64>,
-    /// Change in unpublished (`catalog_end_height == 0`) cold tail p95 vs `quiescent_control` (ms).
-    pub unpublished_cold_tail_completion_p95_delta_ms: Option<f64>,
-    /// Change in unpublished (`catalog_end_height == 0`) warm tail p50 vs `quiescent_control` (ms).
-    pub unpublished_warm_tail_completion_p50_delta_ms: Option<f64>,
-    /// Change in unpublished (`catalog_end_height == 0`) warm tail p95 vs `quiescent_control` (ms).
-    pub unpublished_warm_tail_completion_p95_delta_ms: Option<f64>,
-    /// Change in span-matched published cold tail p50 vs `published_quiescent_control` (ms).
-    pub published_cold_tail_completion_p50_delta_ms: Option<f64>,
-    /// Change in span-matched published cold tail p95 vs `published_quiescent_control` (ms).
-    pub published_cold_tail_completion_p95_delta_ms: Option<f64>,
-    /// Change in span-matched published warm tail p50 vs `published_quiescent_control` (ms).
-    pub published_warm_tail_completion_p50_delta_ms: Option<f64>,
-    /// Change in span-matched published warm tail p95 vs `published_quiescent_control` (ms).
-    pub published_warm_tail_completion_p95_delta_ms: Option<f64>,
     /// Change in slow boundary-crossing completion p50 (ms), if both arms recorded samples.
     pub slow_boundary_completion_p50_delta_ms: Option<f64>,
     /// Change in `GetTreeState` p95 (ms), if both arms recorded samples.
@@ -800,170 +646,65 @@ fn total_reader_bytes_read(report: &ModeReport) -> u64 {
         .saturating_add(report.rocksdb_activity.reader_wallet_secondaries.bytes_read)
 }
 
-struct TailDifferentialDeltas {
-    cold_p50: Option<f64>,
-    cold_p95: Option<f64>,
-    warm_p50: Option<f64>,
-    warm_p95: Option<f64>,
-    unpub_cold_p50: Option<f64>,
-    unpub_cold_p95: Option<f64>,
-    unpub_warm_p50: Option<f64>,
-    unpub_warm_p95: Option<f64>,
-    pub_cold_p50: Option<f64>,
-    pub_cold_p95: Option<f64>,
-    pub_warm_p50: Option<f64>,
-    pub_warm_p95: Option<f64>,
-}
-
-fn compute_tail_deltas(
-    baselines: DifferentialBaselines<'_>,
-    candidate: &ModeReport,
-) -> TailDifferentialDeltas {
-    let (unpub_cold_p50, unpub_cold_p95) = optional_p50_p95(
-        &baselines
-            .unpublished
-            .tail_refill
-            .unpublished_cold_after_advance
-            .completion_ms,
-        &candidate
-            .tail_refill
-            .unpublished_cold_after_advance
-            .completion_ms,
-    );
-    let (unpub_warm_p50, unpub_warm_p95) = optional_p50_p95(
-        &baselines
-            .unpublished
-            .tail_refill
-            .unpublished_warm_repeat
-            .completion_ms,
-        &candidate.tail_refill.unpublished_warm_repeat.completion_ms,
-    );
-    let (pub_cold_p50, pub_cold_p95) = optional_p50_p95(
-        &baselines
-            .published
-            .tail_refill
-            .published_cold_after_advance
-            .completion_ms,
-        &candidate
-            .tail_refill
-            .published_cold_after_advance
-            .completion_ms,
-    );
-    let (pub_warm_p50, pub_warm_p95) = optional_p50_p95(
-        &baselines
-            .published
-            .tail_refill
-            .published_warm_repeat
-            .completion_ms,
-        &candidate.tail_refill.published_warm_repeat.completion_ms,
-    );
-    let (cold_p50, cold_p95, warm_p50, warm_p95) = if baselines.baseline_catalog_published {
-        (pub_cold_p50, pub_cold_p95, pub_warm_p50, pub_warm_p95)
-    } else {
-        (
-            unpub_cold_p50,
-            unpub_cold_p95,
-            unpub_warm_p50,
-            unpub_warm_p95,
-        )
-    };
-    TailDifferentialDeltas {
-        cold_p50,
-        cold_p95,
-        warm_p50,
-        warm_p95,
-        unpub_cold_p50,
-        unpub_cold_p95,
-        unpub_warm_p50,
-        unpub_warm_p95,
-        pub_cold_p50,
-        pub_cold_p95,
-        pub_warm_p50,
-        pub_warm_p95,
-    }
-}
-
 impl ModeDifferential {
     /// Computes stage latency and secondary-read deltas relative to matched `baselines`.
     #[must_use]
     pub fn between(baselines: DifferentialBaselines<'_>, candidate: &ModeReport) -> Self {
-        let primary = if baselines.baseline_catalog_published {
-            baselines.published
-        } else {
-            baselines.unpublished
-        };
-        let (unpublished_p50, unpublished_p95) = optional_p50_p95(
-            &baselines
-                .unpublished
-                .catalog_range_unpublished
-                .completion_ms,
-            &candidate.catalog_range_unpublished.completion_ms,
+        let base = baselines.baseline;
+        let (catalog_p50, catalog_p95) = optional_p50_p95(
+            &base.catalog_range.completion_ms,
+            &candidate.catalog_range.completion_ms,
         );
-        let (published_p50, published_p95) = optional_p50_p95(
-            &baselines.published.catalog_range_published.completion_ms,
-            &candidate.catalog_range_published.completion_ms,
+        let (cold_p50, cold_p95) = optional_p50_p95(
+            &base.tail_refill.cold_after_advance.completion_ms,
+            &candidate.tail_refill.cold_after_advance.completion_ms,
         );
-        let (catalog_p50, catalog_p95) = if baselines.baseline_catalog_published {
-            (published_p50, published_p95)
-        } else {
-            (unpublished_p50, unpublished_p95)
-        };
-        let tail = compute_tail_deltas(baselines, candidate);
+        let (warm_p50, warm_p95) = optional_p50_p95(
+            &base.tail_refill.warm_repeat.completion_ms,
+            &candidate.tail_refill.warm_repeat.completion_ms,
+        );
         Self {
             mode: candidate.mode,
             baseline_label: baselines.baseline_label.to_owned(),
-            baseline_catalog_published: baselines.baseline_catalog_published,
             catalog_completion_p50_delta_ms: catalog_p50,
             catalog_completion_p95_delta_ms: catalog_p95,
-            unpublished_catalog_completion_p50_delta_ms: unpublished_p50,
-            unpublished_catalog_completion_p95_delta_ms: unpublished_p95,
-            published_catalog_completion_p50_delta_ms: published_p50,
-            published_catalog_completion_p95_delta_ms: published_p95,
-            cold_tail_completion_p50_delta_ms: tail.cold_p50,
-            cold_tail_completion_p95_delta_ms: tail.cold_p95,
-            warm_tail_completion_p50_delta_ms: tail.warm_p50,
-            warm_tail_completion_p95_delta_ms: tail.warm_p95,
-            unpublished_cold_tail_completion_p50_delta_ms: tail.unpub_cold_p50,
-            unpublished_cold_tail_completion_p95_delta_ms: tail.unpub_cold_p95,
-            unpublished_warm_tail_completion_p50_delta_ms: tail.unpub_warm_p50,
-            unpublished_warm_tail_completion_p95_delta_ms: tail.unpub_warm_p95,
-            published_cold_tail_completion_p50_delta_ms: tail.pub_cold_p50,
-            published_cold_tail_completion_p95_delta_ms: tail.pub_cold_p95,
-            published_warm_tail_completion_p50_delta_ms: tail.pub_warm_p50,
-            published_warm_tail_completion_p95_delta_ms: tail.pub_warm_p95,
+            cold_tail_completion_p50_delta_ms: cold_p50,
+            cold_tail_completion_p95_delta_ms: cold_p95,
+            warm_tail_completion_p50_delta_ms: warm_p50,
+            warm_tail_completion_p95_delta_ms: warm_p95,
             slow_boundary_completion_p50_delta_ms: optional_delta(
-                primary.slow_boundary_range.completion_ms,
+                base.slow_boundary_range.completion_ms,
                 candidate.slow_boundary_range.completion_ms,
                 |summary| summary.p50,
             ),
             tree_state_p95_delta_ms: optional_delta(
-                primary.tree_state_ms,
+                base.tree_state_ms,
                 candidate.tree_state_ms,
                 |summary| summary.p95,
             ),
             latest_block_rpc_p50_delta_ms: optional_delta(
-                primary.latest_block_rpc_ms,
+                base.latest_block_rpc_ms,
                 candidate.latest_block_rpc_ms,
                 |summary| summary.p50,
             ),
             wallet_taddress_balance_p50_delta_ms: optional_delta(
-                primary.wallet_rpc_ms.taddress_balance_ms,
+                base.wallet_rpc_ms.taddress_balance_ms,
                 candidate.wallet_rpc_ms.taddress_balance_ms,
                 |summary| summary.p50,
             ),
             wallet_address_utxos_p50_delta_ms: optional_delta(
-                primary.wallet_rpc_ms.address_utxos_ms,
+                base.wallet_rpc_ms.address_utxos_ms,
                 candidate.wallet_rpc_ms.address_utxos_ms,
                 |summary| summary.p50,
             ),
             wallet_get_transaction_p50_delta_ms: optional_delta(
-                primary.wallet_rpc_ms.get_transaction_ms,
+                base.wallet_rpc_ms.get_transaction_ms,
                 candidate.wallet_rpc_ms.get_transaction_ms,
                 |summary| summary.p50,
             ),
             reader_bytes_read_delta: saturating_i64_delta(
                 total_reader_bytes_read(candidate),
-                total_reader_bytes_read(primary),
+                total_reader_bytes_read(base),
             ),
         }
     }
@@ -1198,44 +939,23 @@ mod tests {
         serde_json::json!({
             "cold_after_advance": { "first_frame_ms": { "samples": 1, "p50": 2.0, "p95": 2.0, "max": 2.0, "mean": 2.0 }, "completion_ms": { "samples": 1, "p50": 4.0, "p95": 6.0, "max": 6.0, "mean": 4.0 }, "frames_delivered": 10, "payload_bytes_delivered": 100 },
             "warm_repeat": stream_json(1.0, 1.0),
-            "unpublished_cold_after_advance": { "first_frame_ms": { "samples": 1, "p50": 2.0, "p95": 2.0, "max": 2.0, "mean": 2.0 }, "completion_ms": { "samples": 1, "p50": 4.0, "p95": 6.0, "max": 6.0, "mean": 4.0 }, "frames_delivered": 10, "payload_bytes_delivered": 100 },
-            "unpublished_warm_repeat": stream_json(1.0, 1.0),
-            "published_cold_after_advance": { "first_frame_ms": { "samples": 1, "p50": 2.0, "p95": 2.0, "max": 2.0, "mean": 2.0 }, "completion_ms": { "samples": 1, "p50": 3.0, "p95": 5.0, "max": 5.0, "mean": 3.0 }, "frames_delivered": 10, "payload_bytes_delivered": 100 },
-            "published_warm_repeat": stream_json(1.0, 1.0),
-            "published_mismatched_span_pairs": 0,
             "peak_tail_response_bytes": 100,
-            "peak_encoded_tail_bytes": 200,
-            "encoded_tail_byte_cap_evictions": 0,
-            "encoded_tail_byte_capped_fills": 0,
-            "encoded_tail_cache_fills": 1,
-            "encoded_tail_cache_hits": 1,
-            "encoded_tail_fallback_native": 0,
-            "encoded_tail_bypass": 0,
-            "unpaired_tail_probes": 0,
-            "byte_cap_exceeded": false
+            "unpaired_tail_probes": 0
         })
     }
 
     fn blank_mode_report(
         mode: WriterMode,
-        unpub_cat_p50: f64,
-        pub_cat_p50: f64,
+        cat_p50: f64,
         bytes_read: u64,
     ) -> Result<ModeReport, Box<dyn Error>> {
-        blank_mode_report_with_wallet(
-            mode,
-            mode.has_wallet_serving(),
-            unpub_cat_p50,
-            pub_cat_p50,
-            bytes_read,
-        )
+        blank_mode_report_with_wallet(mode, mode.has_wallet_serving(), cat_p50, bytes_read)
     }
 
     fn blank_mode_report_with_wallet(
         mode: WriterMode,
         wallet_serving: bool,
-        unpub_cat_p50: f64,
-        pub_cat_p50: f64,
+        cat_p50: f64,
         bytes_read: u64,
     ) -> Result<ModeReport, Box<dyn Error>> {
         let zero_lat =
@@ -1250,10 +970,7 @@ mod tests {
         };
         let is_active = mode != WriterMode::QuiescentControl;
         let step_lat = if is_active { &sample_lat } else { &zero_lat };
-        let has_projector = matches!(
-            mode,
-            WriterMode::IngestAndProjector | WriterMode::IngestProjectorAndPublisher
-        );
+        let has_projector = mode == WriterMode::IngestAndProjector;
         let can_secondaries = if wallet_serving {
             vec!["buffered", "buffered", "buffered", "buffered"]
         } else {
@@ -1272,8 +989,7 @@ mod tests {
                 "canonical_secondaries": can_secondaries,
                 "wallet_primary": if has_projector { Some("buffered") } else { None::<&str> },
                 "wallet_secondaries": wal_secondaries,
-                "projector_secondary": if has_projector { Some("buffered") } else { None::<&str> },
-                "publisher_secondary": if mode == WriterMode::IngestProjectorAndPublisher { Some("buffered") } else { None::<&str> }
+                "projector_secondary": if has_projector { Some("buffered") } else { None::<&str> }
             },
             "ingest": {
                 "live_prepare_ms": step_lat,
@@ -1282,17 +998,13 @@ mod tests {
             },
             "latest_block_rpc_ms": sample_lat,
             "commit_to_served_tip_ms": step_lat,
-            "catalog_range": stream_json(1.0, unpub_cat_p50),
-            "catalog_range_unpublished": stream_json(1.0, unpub_cat_p50),
-            "catalog_range_published": stream_json(0.5, pub_cat_p50),
-            "catalog_range_during_seal": stream_json(0.0, 0.0),
+            "catalog_range": stream_json(1.0, cat_p50),
             "tail_refill": blank_tail_refill_json(),
             "slow_boundary_range": { "first_frame_ms": { "samples": 1, "p50": 1.0, "p95": 1.0, "max": 1.0, "mean": 1.0 }, "completion_ms": { "samples": 1, "p50": 15.0, "p95": 20.0, "max": 20.0, "mean": 15.0 }, "frames_delivered": 10, "payload_bytes_delivered": 100 },
             "tree_state_ms": { "samples": 1, "p50": 0.5, "p95": 1.0, "max": 1.0, "mean": 0.5 },
             "wallet_rpc_ms": { "taddress_balance_ms": wallet_lat, "address_utxos_ms": wallet_lat, "get_transaction_ms": wallet_lat },
             "mempool_churn": [{ "batch_size": 50, "mempool_tx_stream": stream_json(0.5, 1.0), "mempool_stream_closures": 1, "writer_overlap_verified": is_active, "commits_observed_during_tier": if is_active { 2 } else { 0 } }],
             "projector": { "apply_ms": zero_lat, "transitions_applied": if has_projector { 4 } else { 0 } },
-            "publisher": { "total_ms": 1.0, "segment_publish_ms": zero_lat, "segments_published": usize::from(mode == WriterMode::IngestProjectorAndPublisher), "catalog_refreshes": u64::from(mode == WriterMode::IngestProjectorAndPublisher) },
             "writer_fsyncs": { "canonical_wal_synced": 0, "canonical_wal_bytes": 0, "wallet_wal_synced": 0, "wallet_wal_bytes": 0 },
             "node_rpcs": { "tip_id": 0, "fetch_block_at": 0, "fetch_chain_segment": 0, "fetch_chain_checkpoint": 0, "fetch_subtree_roots": 0, "total": 0 },
             "rocksdb_activity": {
@@ -1300,8 +1012,7 @@ mod tests {
                 "reader_canonical_secondaries": { "wal_synced": 0, "wal_bytes": 0, "flush_write_bytes": 0, "compact_read_bytes": 0, "compact_write_bytes": 0, "bytes_read": bytes_read, "bytes_written": 0, "block_cache_data_hit": 0, "block_cache_data_miss": 0, "stall_micros": 0 },
                 "reader_wallet_secondaries": zero_ticker,
                 "wallet_writer": zero_ticker,
-                "projector_secondary": zero_ticker,
-                "publisher_secondary": zero_ticker
+                "projector_secondary": zero_ticker
             },
             "errors": { "unexpected_grpc_errors": 0, "unexpected_error_samples": [], "transient_retry_count": 0 }
         });
@@ -1321,78 +1032,35 @@ mod tests {
 
     #[test]
     fn differential_marks_all_empty_stage_deltas_unavailable() -> Result<(), Box<dyn Error>> {
-        let mut unpublished = blank_mode_report(WriterMode::QuiescentControl, 5.0, 0.0, 2_000)?;
-        unpublished.catalog_range_published.completion_ms.samples = 0;
-        unpublished.slow_boundary_range.completion_ms.samples = 0;
-        let mut published = blank_mode_report(WriterMode::QuiescentControl, 0.0, 2.0, 1_800)?;
-        published.catalog_range_unpublished.completion_ms.samples = 0;
-        let mut candidate =
-            blank_mode_report(WriterMode::IngestProjectorAndPublisher, 9.0, 3.5, 1_900)?;
+        let mut baseline = blank_mode_report(WriterMode::QuiescentControl, 5.0, 2_000)?;
+        baseline.slow_boundary_range.completion_ms.samples = 0;
+        let mut candidate = blank_mode_report(WriterMode::IngestAndProjector, 9.0, 1_900)?;
         candidate
             .tail_refill
-            .published_cold_after_advance
+            .cold_after_advance
             .completion_ms
             .samples = 0;
         candidate.tree_state_ms.samples = 0;
 
         let diff = ModeDifferential::between(
             super::DifferentialBaselines {
-                unpublished: &unpublished,
-                published: &published,
-                baseline_label: "published_quiescent_control",
-                baseline_catalog_published: true,
+                baseline: &baseline,
+                baseline_label: "quiescent_control",
             },
             &candidate,
         );
         assert!(
-            diff.unpublished_catalog_completion_p50_delta_ms
+            diff.catalog_completion_p50_delta_ms
                 .is_some_and(|delta| (delta - 4.0).abs() < f64::EPSILON)
         );
-        assert!(
-            diff.published_catalog_completion_p50_delta_ms
-                .is_some_and(|delta| (delta - 1.5).abs() < f64::EPSILON)
-        );
         assert!(diff.cold_tail_completion_p50_delta_ms.is_none());
-        assert!(diff.published_cold_tail_completion_p50_delta_ms.is_none());
         assert!(
-            diff.unpublished_cold_tail_completion_p50_delta_ms
+            diff.warm_tail_completion_p50_delta_ms
                 .is_some_and(|delta| delta.abs() < f64::EPSILON)
         );
+        assert!(diff.slow_boundary_completion_p50_delta_ms.is_none());
         assert!(diff.tree_state_p95_delta_ms.is_none());
-        assert_eq!(diff.reader_bytes_read_delta, 100);
-        Ok(())
-    }
-
-    #[test]
-    fn published_differential_never_pools_unpublished_tail_samples() -> Result<(), Box<dyn Error>> {
-        let unpublished = blank_mode_report(WriterMode::QuiescentControl, 5.0, 0.0, 2_000)?;
-        let published = blank_mode_report(WriterMode::QuiescentControl, 0.0, 2.0, 1_800)?;
-        let mut publisher_arm =
-            blank_mode_report(WriterMode::IngestProjectorAndPublisher, 9.0, 3.5, 1_900)?;
-        publisher_arm
-            .tail_refill
-            .published_cold_after_advance
-            .completion_ms
-            .samples = 0;
-        publisher_arm
-            .tail_refill
-            .published_warm_repeat
-            .completion_ms
-            .samples = 0;
-
-        let diff = ModeDifferential::between(
-            super::DifferentialBaselines {
-                unpublished: &unpublished,
-                published: &published,
-                baseline_label: "published_quiescent_control",
-                baseline_catalog_published: true,
-            },
-            &publisher_arm,
-        );
-        assert!(diff.cold_tail_completion_p50_delta_ms.is_none());
-        assert!(diff.warm_tail_completion_p50_delta_ms.is_none());
-        assert!(diff.published_cold_tail_completion_p50_delta_ms.is_none());
-        assert!(diff.unpublished_cold_tail_completion_p50_delta_ms.is_some());
+        assert_eq!(diff.reader_bytes_read_delta, -100);
         Ok(())
     }
 
@@ -1443,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn report_validate_checks_tail_eviction_requirement() -> Result<(), Box<dyn Error>> {
+    fn report_validate_rejects_retired_tail_eviction_requirement() -> Result<(), Box<dyn Error>> {
         let oracle = ModeParityDigests {
             mode: WriterMode::QuiescentControl,
             label: "quiescent_control".to_owned(),
@@ -1472,7 +1140,6 @@ mod tests {
                 transparent_spend_txs: 4,
                 tail_probe_blocks: 24,
                 requested_io_mode: "buffered".to_owned(),
-                publish_workers: 1,
                 mempool_churn_sizes: vec![50],
                 request_trace_digest: "deadbeef".to_owned(),
             },
@@ -1480,20 +1147,12 @@ mod tests {
                 WriterMode::QuiescentControl,
                 false,
                 1.0,
-                0.0,
-                10,
-            )?,
-            published_quiescent_control: blank_mode_report(
-                WriterMode::QuiescentControl,
-                1.0,
-                1.0,
                 10,
             )?,
             modes: vec![
-                blank_mode_report(WriterMode::QuiescentControl, 1.0, 1.0, 10)?,
-                blank_mode_report(WriterMode::IngestActive, 1.0, 1.0, 10)?,
-                blank_mode_report(WriterMode::IngestAndProjector, 1.0, 1.0, 10)?,
-                blank_mode_report(WriterMode::IngestProjectorAndPublisher, 1.0, 1.0, 10)?,
+                blank_mode_report(WriterMode::QuiescentControl, 1.0, 10)?,
+                blank_mode_report(WriterMode::IngestActive, 1.0, 10)?,
+                blank_mode_report(WriterMode::IngestAndProjector, 1.0, 10)?,
             ],
             differentials_vs_quiescent: Vec::new(),
             byte_parity: ByteParityReport::evaluate(vec![oracle]),

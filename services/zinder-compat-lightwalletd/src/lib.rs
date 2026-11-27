@@ -13,16 +13,12 @@ mod block_methods;
 mod block_range;
 mod compact_block_messages;
 mod compact_blocks_grpc;
+mod encoded_range;
 mod grpc;
 mod mempool;
 mod network_tip_estimate;
 mod node_tip_witness;
 mod ping;
-mod published_range;
-mod sealed_history;
-pub use published_range::{
-    PublicationConcurrency, PublishedShieldedHistory, ShieldedCatalogPublisher,
-};
 mod request_limits;
 pub mod runtime;
 mod stale_tip;
@@ -55,6 +51,3 @@ pub use stale_tip::{DEFAULT_STALE_TIP_LIMIT, StaleTipLimit};
 pub use tip_wait::{
     DEFAULT_TIP_WAIT, DEFAULT_TIP_WAIT_MAX_BLOCKS, DEFAULT_TIP_WAIT_MAX_WAITERS, TipWait,
 };
-
-/// The fixed header length, in bytes, of a `ZSHRNG01` sealed segment file.
-pub const SEALED_HEADER_LEN: usize = sealed_history::HEADER_LEN;

@@ -4,7 +4,7 @@
 )]
 
 mod browser_streams;
-mod published_range;
+mod canonical_range;
 mod tip_wait;
 
 use async_trait::async_trait;
@@ -3266,12 +3266,12 @@ async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
 /// is stricter than production retention and needs no clock.
 #[derive(Clone)]
 struct EpochPinRecorder<Inner> {
-    expose_range_fence: bool,
+    expose_encoded_range: bool,
     gated_chunk_reads: Option<tokio::sync::mpsc::UnboundedSender<GatedChunkRead>>,
     inner: Inner,
     recorded_epoch_ids: Arc<Mutex<Vec<Option<ChainEpochId>>>>,
     recorded_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
-    recorded_rows_with_lengths: Arc<Mutex<Vec<BlockHeightRange>>>,
+    recorded_encoded_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
     /// Heights each compact-block range read was offered, which it checks in
     /// full however few blocks its byte budget keeps.
     offered_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
@@ -3331,11 +3331,11 @@ impl<Inner> EpochPinRecorder<Inner> {
     fn new(inner: Inner) -> Self {
         Self {
             inner,
-            expose_range_fence: false,
+            expose_encoded_range: false,
             gated_chunk_reads: None,
             recorded_epoch_ids: Arc::new(Mutex::new(Vec::new())),
             recorded_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
-            recorded_rows_with_lengths: Arc::new(Mutex::new(Vec::new())),
+            recorded_encoded_ranges: Arc::new(Mutex::new(Vec::new())),
             offered_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
             transparent_address_balance: None,
             synthetic_views: None,
@@ -3659,18 +3659,6 @@ impl SyntheticView {
 
 #[async_trait]
 impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
-    fn compact_block_fence(
-        &self,
-        epoch: zinder_core::ChainEpoch,
-    ) -> Option<zinder_query::CompactBlockFence> {
-        if self.expose_range_fence {
-            self.served_inner(self.view_index())
-                .compact_block_fence(epoch)
-        } else {
-            None
-        }
-    }
-
     fn native_endpoint_capabilities(&self) -> &zinder_query::NativeWalletEndpointCapabilities {
         self.inner.native_endpoint_capabilities()
     }
@@ -3849,19 +3837,64 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         compact_block_range
     }
 
-    async fn compact_block_rows_with_lengths(
+    async fn encoded_compact_block_range_up_to(
         &self,
-        block_range: BlockHeightRange,
-        max_bytes: usize,
+        request: zinder_store::EncodedCompactBlockRangeRequest,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
-        if !self.expose_range_fence {
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Option<zinder_store::EncodedCompactBlockRange>, QueryError> {
+        if !self.expose_encoded_range {
             return Ok(None);
         }
-        self.recorded_rows_with_lengths.lock().push(block_range);
-        self.served_inner(self.view_index())
-            .compact_block_rows_with_lengths(block_range, max_bytes, at_epoch_id)
+        if let Some(gates) = self.gated_chunk_reads.clone() {
+            tokio::task::spawn_blocking(move || {
+                let (release, gate) = tokio::sync::oneshot::channel();
+                if gates
+                    .send(GatedChunkRead {
+                        range: request.range,
+                        max_bytes: request.max_bytes,
+                        release,
+                    })
+                    .is_ok()
+                {
+                    let _ = gate.blocking_recv();
+                }
+            })
             .await
+            .map_err(|error| QueryError::BlockingTaskFailed {
+                reason: error.to_string(),
+            })?;
+        }
+        let first_chunk_gate = if at_epoch_id.is_some() {
+            self.first_chunk_gate.lock().take()
+        } else {
+            None
+        };
+        if let Some(gate) = first_chunk_gate {
+            gate.reached.notify_one();
+            let _permit = gate.release.acquire().await;
+        }
+        if at_epoch_id.is_none()
+            && let Some(gate) = &self.later_chunk_gate
+        {
+            self.later_chunk_gate_reached.notify_one();
+            let _permit = gate.acquire().await;
+        }
+        self.record(at_epoch_id);
+        self.offered_compact_block_ranges.lock().push(request.range);
+        let view_index = self.view_index();
+        let served = self
+            .served_inner(view_index)
+            .encoded_compact_block_range_up_to(request, at_epoch_id, cancel)
+            .await;
+        self.advance_view();
+        let recorded_range = served
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or(request.range, |encoded| encoded.covered);
+        self.recorded_encoded_ranges.lock().push(recorded_range);
+        served
     }
 
     async fn full_block_at(

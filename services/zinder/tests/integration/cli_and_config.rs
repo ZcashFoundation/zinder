@@ -63,8 +63,6 @@ fn run_subcommand_accepts_every_role_and_alias() -> eyre::Result<()> {
         "explorer",
         "compat-cipherscan",
         "cipherscan",
-        "history-publisher",
-        "publish-history",
     ] {
         let output = zinder_command(&["run", role, "--help"]).output()?;
         assert!(

@@ -7,8 +7,6 @@ use std::{fs, path::Path, process::Command};
 
 use tempfile::tempdir;
 
-mod publication;
-
 #[test]
 fn version_reports_the_product_version() -> eyre::Result<()> {
     let output = zinder_compat_command().arg("--version").output()?;

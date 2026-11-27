@@ -1184,6 +1184,21 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         Ok(self.index.rows[row_idx].has_transparent())
     }
 
+    /// Returns `true` if `height` records any transaction fee exceeding `u32::MAX`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledSupplementSegmentError`] if `height` is out of bounds or
+    /// that row/chunk previously entered sticky invalid state.
+    pub fn has_wide_fee_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<bool, SettledSupplementSegmentError> {
+        let row_idx = self.index.row_index_for(height)?;
+        self.index.ensure_row_not_invalid(row_idx)?;
+        Ok(self.index.rows[row_idx].has_wide_fee())
+    }
+
     /// Reads and verifies the full decoded supplement record for `height`.
     ///
     /// # Errors

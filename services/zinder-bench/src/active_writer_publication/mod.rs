@@ -1,15 +1,14 @@
-//! Concurrent active-writer, projector, and publisher publication benchmark.
+//! Concurrent active-writer and projector publication benchmark.
 //!
-//! Exercises identical advancing Zcash Regtest workloads across four matched
-//! writer/publication states (`quiescent_control`, `ingest_active`,
-//! `ingest_and_projector`, `ingest_projector_and_publisher`) plus matched
-//! `canonical_quiescent_control` (for canonical-only `ingest_active`) and
-//! `published_quiescent_control` baselines, crossing a configurable shielded segment boundary while
-//! concurrent lightwalletd compatibility readers measure publication
-//! visibility, range first-frame and completion latency, uncovered-tail cold
-//! refills and `64 MiB` byte-cap evictions, slow readers, transparent wallet
-//! RPCs, mempool churn, durability fsyncs, `RocksDB` I/O activity, and exact
-//! reply byte parity.
+//! Exercises identical advancing Zcash Regtest workloads across three matched
+//! writer/serving states (`quiescent_control`, `ingest_active`,
+//! `ingest_and_projector`) plus matched `canonical_quiescent_control` (for
+//! canonical-only `ingest_active`), crossing a configurable settled segment
+//! boundary while concurrent lightwalletd compatibility readers measure
+//! publication visibility, canonical `ZSHRNG02` settled and `live_tail_block`
+//! range latency, descending tail cold/warm reads, slow readers, transparent
+//! wallet RPCs, mempool churn, durability fsyncs, `RocksDB` I/O activity, and
+//! exact reply byte parity.
 
 mod chain_fixture;
 mod mempool;
@@ -28,8 +27,8 @@ pub use report::{
     ActiveWriterPublicationReport, ByteParityReport, DifferentialBaselines, IngestStageMetrics,
     IoModeReport, LatencySummaryMs, MempoolTierMetrics, ModeDifferential, ModeParityDigests,
     ModeReport, NodeRpcCounts, ParityMismatch, ProjectorMetrics, ProtocolErrorCounts,
-    PublisherMetrics, RocksDbActivityReport, StoreTickerDelta, StreamLatencyReport,
-    TailRefillMetrics, WalletRpcMetrics, WorkloadGeometryReport, WriterFsyncCounts, WriterMode,
+    RocksDbActivityReport, StoreTickerDelta, StreamLatencyReport, TailRefillMetrics,
+    WalletRpcMetrics, WorkloadGeometryReport, WriterFsyncCounts, WriterMode,
 };
 pub use runner::run_active_writer_publication;
 use zinder_store::RocksDbIoMode;
@@ -67,9 +66,9 @@ pub struct ActiveWriterPublicationConfig {
     pub scratch_dir: Option<PathBuf>,
     /// Requested `RocksDB` I/O mode (`Direct` tries `O_DIRECT` with buffered fallback).
     pub io_mode: RocksDbIoMode,
-    /// Optional worker count for signed-catalog publication (defaults to production clamping `1..=4`).
+    /// Retained CLI compatibility field; `history-publisher` is retired.
     pub publish_workers: Option<NonZeroU32>,
-    /// When `true`, report validation requires `EncodedTail` `64 MiB` byte-cap evictions.
+    /// Retained CLI compatibility field; rejected by `validate_config` because `EncodedTail` is retired.
     pub require_tail_eviction: bool,
 }
 
@@ -143,11 +142,9 @@ pub fn validate_config(config: &ActiveWriterPublicationConfig) -> Result<(), Ben
             "live_blocks must be at least mempool_churn_sizes.len() so every mempool tier overlaps live commits",
         ));
     }
-    if config.require_tail_eviction
-        && (config.dense_block_cadence == 0 || config.dense_txs_per_block == 0)
-    {
+    if config.require_tail_eviction {
         return Err(BenchError::invalid_argument(
-            "require_tail_eviction needs positive dense_block_cadence and dense_txs_per_block",
+            "require_tail_eviction is no longer supported after retiring EncodedTail",
         ));
     }
     let base_settled = config

@@ -1,23 +1,20 @@
 //! Throughput and speedup benchmark for `[PoolType::Orchard]` `GetBlockRangeNullifiers`
-//! over published `ZSHRNG01` history plus live tail vs canonical `RocksDB` fallback.
+//! directly over canonical `ZSHRNG02` segments plus live tail vs canonical compact-block fallback.
 
 use std::{
-    num::{NonZeroU16, NonZeroU32},
+    num::NonZeroU16,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
 };
 
 use async_trait::async_trait;
-use eyre::eyre;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::transport::{Channel, Server};
-use zinder_compat_lightwalletd::{
-    LightwalletdGrpcAdapter, PublishedShieldedHistory, ShieldedCatalogPublisher,
-};
+use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, BlockSelector, ChainEpoch, ChainEpochId,
     CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput, CompactSaplingSpend,
@@ -30,18 +27,18 @@ use zinder_proto::compat::lightwalletd::{
     self, PoolType, compact_tx_streamer_client::CompactTxStreamerClient,
 };
 use zinder_query::{
-    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockFence,
-    CompactBlockRange, CompactBlockStream, FullBlock, FullBlockStream,
-    NativeWalletEndpointCapabilities, QueryError, RawTransaction, RocksDbCanonicalReader,
-    RocksDbWalletReader, ServedTipSnapshot, SettledTipBlock, SubtreeRoots, Transaction,
-    TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
-    TransparentOutpointSpendStatuses, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
-    WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
+    CompactBlockStream, FullBlock, FullBlockStream, NativeWalletEndpointCapabilities, QueryError,
+    RawTransaction, RocksDbCanonicalReader, RocksDbWalletReader, ServedTipSnapshot,
+    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
+    UpstreamNodeCapabilities, VisibleTipBlock, WalletQueryApi, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
-    StreamCursorTokenV1,
+    ChainEventStreamFamily, ChainEventStreamResume, EncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, StreamCursorTokenV1,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, sample_regtest_upgrade_activations,
@@ -49,15 +46,15 @@ use zinder_testkit::{
 
 const TOTAL_BLOCKS: u32 = 4_000;
 const SETTLED_TIP: u32 = 3_900;
-const SEGMENT_BLOCKS: u32 = 1_000;
 
 #[cfg(debug_assertions)]
-const MAX_PUBLISHED_ORCHARD_SCAN_MS: u128 = 5_000;
+const MAX_CANONICAL_ORCHARD_SCAN_MS: u128 = 5_000;
 #[cfg(not(debug_assertions))]
-const MAX_PUBLISHED_ORCHARD_SCAN_MS: u128 = 500;
+const MAX_CANONICAL_ORCHARD_SCAN_MS: u128 = 500;
 
-/// Delegates to [`WalletServingQuery`] while withholding `compact_block_fence`
-/// so the baseline adapter cannot admit or reuse cached live-tail rows.
+/// Delegates to [`WalletServingQuery`] while withholding
+/// `encoded_compact_block_range_up_to` so the baseline adapter falls back to
+/// `compact_blocks_in_range_up_to`.
 #[derive(Clone)]
 struct CanonicalFallbackQuery {
     inner: WalletServingQuery<()>,
@@ -79,10 +76,6 @@ impl CanonicalFallbackQuery {
 
 #[async_trait]
 impl WalletQueryApi for CanonicalFallbackQuery {
-    fn compact_block_fence(&self, _epoch: ChainEpoch) -> Option<CompactBlockFence> {
-        None
-    }
-
     fn subscribe_publications(&self) -> Option<tokio::sync::watch::Receiver<()>> {
         self.inner.subscribe_publications()
     }
@@ -192,12 +185,12 @@ impl WalletQueryApi for CanonicalFallbackQuery {
         Ok(served)
     }
 
-    async fn compact_block_rows_with_lengths(
+    async fn encoded_compact_block_range_up_to(
         &self,
-        _block_range: BlockHeightRange,
-        _max_bytes: usize,
+        _request: EncodedCompactBlockRangeRequest,
         _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
+        _cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, QueryError> {
         Ok(None)
     }
 
@@ -538,13 +531,13 @@ async fn start_perf_endpoint<QueryApi: WalletQueryApi + Clone>(
 }
 
 struct PerfAdapters {
-    published: LightwalletdGrpcAdapter<WalletServingQuery<()>>,
+    direct: LightwalletdGrpcAdapter<WalletServingQuery<()>>,
     canonical: LightwalletdGrpcAdapter<CanonicalFallbackQuery>,
     canonical_query: CanonicalFallbackQuery,
     _paths: zinder_testkit::WalletServingStoreFixture,
 }
 
-async fn setup_perf_adapters(dir: &std::path::Path) -> eyre::Result<PerfAdapters> {
+fn setup_perf_adapters() -> eyre::Result<PerfAdapters> {
     let chain = build_perf_chain()?;
     let writer = CanonicalWriterFixture::publish(
         &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(SETTLED_TIP)),
@@ -554,31 +547,14 @@ async fn setup_perf_adapters(dir: &std::path::Path) -> eyre::Result<PerfAdapters
     let (mut canonical, wallet) = paths.take_readers()?;
     canonical.try_catch_up()?;
     let reader = Arc::new(RocksDbCanonicalReader::new(canonical)?);
-    let pair =
-        WalletServingReadPair::new(reader.clone(), Arc::new(RocksDbWalletReader::new(wallet)))?;
+    let pair = WalletServingReadPair::new(reader, Arc::new(RocksDbWalletReader::new(wallet)))?;
     let query: WalletServingQuery<()> =
         WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)));
-    let catalog_dir = dir.join("catalog");
-    let (signer, key) = crate::common::shielded_catalog_keys(dir)?;
-    let seg_blocks = NonZeroU32::new(SEGMENT_BLOCKS).ok_or_else(|| eyre!("zero segment size"))?;
-    let mut publisher =
-        ShieldedCatalogPublisher::open(&catalog_dir, &signer, BlockHeight::new(1), seg_blocks)?;
-    while publisher.publish_next(&reader)? {}
-    let history = Arc::new(
-        PublishedShieldedHistory::open(
-            &catalog_dir.join("current.json"),
-            &key,
-            false,
-            reader.as_ref(),
-        )
-        .await?,
-    );
-    let pub_adapter =
-        LightwalletdGrpcAdapter::new(query.clone()).with_published_shielded_history(history);
+    let direct_adapter = LightwalletdGrpcAdapter::new(query.clone());
     let canonical_query = CanonicalFallbackQuery::new(query);
     let canonical_adapter = LightwalletdGrpcAdapter::new(canonical_query.clone());
     Ok(PerfAdapters {
-        published: pub_adapter,
+        direct: direct_adapter,
         canonical: canonical_adapter,
         canonical_query,
         _paths: paths,
@@ -630,7 +606,7 @@ async fn measure_server_scans(
     total_blocks: usize,
     orchard_pools: &[i32],
 ) -> eyre::Result<ServerPerfTimings> {
-    let _ = drain_encoded_nullifier_range(&adapters.published, Vec::new()).await?;
+    let _ = drain_encoded_nullifier_range(&adapters.direct, Vec::new()).await?;
     let _ = drain_encoded_nullifier_range(&adapters.canonical, orchard_pools.to_vec()).await?;
     assert_eq!(
         adapters.canonical_query.take_canonical_blocks_read(),
@@ -648,12 +624,12 @@ async fn measure_server_scans(
 
     let started_def = Instant::now();
     let (def_blocks, def_bytes) =
-        drain_encoded_nullifier_range(&adapters.published, Vec::new()).await?;
+        drain_encoded_nullifier_range(&adapters.direct, Vec::new()).await?;
     let default_us = started_def.elapsed().as_micros();
 
     let started_orc = Instant::now();
     let (orc_blocks, orc_bytes) =
-        drain_encoded_nullifier_range(&adapters.published, orchard_pools.to_vec()).await?;
+        drain_encoded_nullifier_range(&adapters.direct, orchard_pools.to_vec()).await?;
     let orchard_us = started_orc.elapsed().as_micros();
 
     Ok(ServerPerfTimings {
@@ -670,17 +646,16 @@ async fn measure_server_scans(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn orchard_nullifier_range_scan_over_published_history_and_tail_beats_canonical_fallback()
+async fn orchard_nullifier_range_scan_over_canonical_segments_and_tail_beats_canonical_fallback()
 -> eyre::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let adapters = setup_perf_adapters(dir.path()).await?;
+    let adapters = setup_perf_adapters()?;
     let total_blocks = usize::try_from(TOTAL_BLOCKS)?;
     let orchard_pools = vec![PoolType::Orchard as i32];
     let srv = measure_server_scans(&adapters, total_blocks, &orchard_pools).await?;
 
-    let (mut pub_client, pub_server) = start_perf_endpoint(adapters.published).await?;
+    let (mut direct_client, direct_server) = start_perf_endpoint(adapters.direct).await?;
     let (mut can_client, can_server) = start_perf_endpoint(adapters.canonical).await?;
-    let _ = drain_nullifier_range(&mut pub_client, Vec::new()).await?;
+    let _ = drain_nullifier_range(&mut direct_client, Vec::new()).await?;
     let _ = drain_nullifier_range(&mut can_client, orchard_pools.clone()).await?;
     assert_eq!(
         adapters.canonical_query.take_canonical_blocks_read(),
@@ -697,15 +672,15 @@ async fn orchard_nullifier_range_scan_over_published_history_and_tail_beats_cano
     );
 
     let started_default = Instant::now();
-    let (def_blocks, def_txs) = drain_nullifier_range(&mut pub_client, Vec::new()).await?;
+    let (def_blocks, def_txs) = drain_nullifier_range(&mut direct_client, Vec::new()).await?;
     let default_micros = started_default.elapsed().as_micros();
 
     let started_orchard = Instant::now();
-    let (orc_blocks, orc_txs) = drain_nullifier_range(&mut pub_client, orchard_pools).await?;
+    let (orc_blocks, orc_txs) = drain_nullifier_range(&mut direct_client, orchard_pools).await?;
     let orchard_micros = started_orchard.elapsed().as_micros();
     let orchard_millis = orchard_micros / 1_000;
 
-    pub_server.abort();
+    direct_server.abort();
     can_server.abort();
 
     assert_perf_counts(
@@ -732,14 +707,14 @@ async fn orchard_nullifier_range_scan_over_published_history_and_tail_beats_cano
     )]
     {
         eprintln!(
-            "compat_orchard_nullifier_perf blocks={TOTAL_BLOCKS} orchard_txs={orc_txs} default_txs={def_txs} server_canonical_us={} server_published_orchard_us={} server_published_default_us={} grpc_canonical_us={canonical_micros} grpc_published_orchard_us={orchard_micros} grpc_published_default_us={default_micros}",
+            "compat_orchard_nullifier_perf blocks={TOTAL_BLOCKS} orchard_txs={orc_txs} default_txs={def_txs} server_canonical_us={} server_direct_orchard_us={} server_direct_default_us={} grpc_canonical_us={canonical_micros} grpc_direct_orchard_us={orchard_micros} grpc_direct_default_us={default_micros}",
             srv.canonical_us, srv.orchard_us, srv.default_us
         );
     }
 
     assert!(
-        orchard_millis <= MAX_PUBLISHED_ORCHARD_SCAN_MS,
-        "published Orchard nullifier scan took {orchard_millis} ms (budget {MAX_PUBLISHED_ORCHARD_SCAN_MS} ms)"
+        orchard_millis <= MAX_CANONICAL_ORCHARD_SCAN_MS,
+        "direct Orchard nullifier scan took {orchard_millis} ms (budget {MAX_CANONICAL_ORCHARD_SCAN_MS} ms)"
     );
     Ok(())
 }

@@ -5,7 +5,7 @@ Use this runbook for two distinct recovery and bootstrap workflows:
 | Mechanism | Scope | When to use | Trust & cursor behavior |
 | --- | --- | --- | --- |
 | **Coherent private backup** (`zinder backup` / `zinder-projector`) | Canonical + wallet RocksDB stores together, plus `cursor_auth_key` | Private disaster recovery or replacing an existing wallet-serving host without rebuilding | Keeps the deployment's `cursor_auth_key`; requires matching schemas and private archive/pin storage |
-| **Verified edge snapshot** ([ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md); `zinder snapshot` / `zinder-ingest`) | Canonical store at a settled height divisible by 4,096 + optional `sealed-history/` | Initializing a new independent single-host `rocksdb` writer from a publisher checkpoint | Publisher-signed (Ed25519) + validator-attested; generates a fresh `cursor_auth_key` and clears leases/mempool |
+| **Verified edge snapshot** ([ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md); `zinder snapshot` / `zinder-ingest`) | Canonical store at a settled height divisible by 4,096 | Initializing a new independent single-host `rocksdb` writer from a publisher checkpoint | Publisher-signed (Ed25519) + validator-attested; generates a fresh `cursor_auth_key` and clears leases/mempool |
 
 Explorer views rebuild separately from the canonical store in both workflows. Never copy live RocksDB directories with `cp` or `rsync` — copies taken across non-quiesced files or different timestamps are inconsistent.
 
@@ -87,13 +87,11 @@ Prepare a quiesced READY canonical store whose visible and settled tips name the
 ```bash
 zinder snapshot export-edge-snapshot \
   --output-dir /srv/zinder-snapshots/mainnet-3592192 \
-  --signing-key /etc/zinder/snapshot-publisher.pk8 \
-  --include-sealed-history /srv/zinder-history/mainnet/key-1/catalog
+  --signing-key /etc/zinder/snapshot-publisher.pk8
 ```
 
-- `--signing-key` takes a DER-encoded Ed25519 PKCS#8 key and writes `manifest.v1.json`, `manifest.v1.sig`, `canonical-rocksdb/`, and optional `sealed-history/`.
+- `--signing-key` takes a DER-encoded Ed25519 PKCS#8 key and writes `manifest.v1.json`, `manifest.v1.sig`, and `canonical-rocksdb/`.
 - Export clears projection build leases and mempool events and replaces the publisher's `cursor_auth_key` in the copy.
-- `--include-sealed-history` is optional; the source history directory must not overlap `--output-dir` or its staging path and must not contain the signing key.
 
 ### Bootstrap a new writer (receiver)
 
@@ -102,22 +100,11 @@ Point the receiving writer (`ZINDER_*` or `--config`) at an absent or empty `sto
 ```bash
 zinder snapshot bootstrap-from-snapshot \
   --source https://snapshots.example.org/mainnet-3592192 \
-  --public-key "$PUBLISHER_PUBKEY_HEX" \
-  --sealed-history-output /srv/zinder-history/mainnet/key-1/catalog
+  --public-key "$PUBLISHER_PUBKEY_HEX"
 ```
 
 - `--public-key` takes the publisher's 64-character hex raw Ed25519 public key (repeat `--public-key` during a key rotation).
 - `--spot-check-blocks` sets the positive random block sample count compared against your validator (default `32`, plus the snapshot boundary).
-- `--sealed-history-output` is optional and must point to an absent or empty directory separate from `storage.path`.
 - Before writing or downloading payloads, bootstrap verifies the manifest signature, store config (`network`, `raw_blob_policy`, `reorg_window_blocks`, `checkpoint_height`), and file lengths/SHA-256 digests. After cold admission, it attests genesis, network-upgrade schedule, validator tip (at least `reorg_window_blocks` ahead of the snapshot), commitment roots, terminal subtrees, and spot-checked blocks against your validator, generates a fresh `cursor_auth_key`, and atomically publishes `storage.path`.
 
-> [!IMPORTANT]
-> **Re-enable `fs-verity` when `require_fs_verity = true`.** Snapshot bundles copy opaque `sealed-history/` files without filesystem fs-verity metadata. If `zinder-compat-lightwalletd` sets `compat.shielded_history.require_fs_verity = true`, enable fs-verity on every destination segment file on an `ext4 -O verity` filesystem before starting compatibility:
->
-> ```bash
-> for f in /srv/zinder-history/mainnet/key-1/catalog/*.bin; do
->   fsverity enable --hash-alg sha256 --block-size 4096 "$f"
-> done
-> ```
-
-After bootstrap succeeds, start `zinder serve` / `zinder index` (or `zinder-ingest` + `zinder-projector` for `wallet` and `explorer` presets) normally to follow from the snapshot tip. If `bootstrap-from-snapshot` is interrupted, confirm no snapshot process is running and inspect both final destinations (`<storage.path>` and `<sealed_history_output>`) before retrying: if `<storage.path>` was already published, preserve it rather than re-running bootstrap; if `<sealed_history_output>` was published before `<storage.path>` could be renamed into place, move or remove that partial `<sealed_history_output>` directory alongside `<storage.path>.bootstrap.staging`, `<storage.path>.bootstrap.download`, and `<sealed_history_output>.bootstrap.staging` so the retry does not fail with `snapshot destination is occupied`.
+After bootstrap succeeds, start `zinder serve` / `zinder index` (or `zinder-ingest` + `zinder-projector` for `wallet` and `explorer` presets) normally to follow from the snapshot tip. If `bootstrap-from-snapshot` is interrupted, confirm no snapshot process is running and inspect `<storage.path>` before retrying: if `<storage.path>` was already published, preserve it rather than re-running bootstrap; otherwise remove `<storage.path>.bootstrap.staging` and `<storage.path>.bootstrap.download` so the retry does not fail with `snapshot destination is occupied`.

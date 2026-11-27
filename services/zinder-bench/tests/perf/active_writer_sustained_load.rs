@@ -13,7 +13,8 @@ use zinder_store::RocksDbIoMode;
 
 #[ignore = "heavy perf benchmark; run with --profile=ci-perf --run-ignored=only"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn encoded_tail_evicts_at_64mib_and_triggers_rocksdb_flushes() -> Result<()> {
+async fn sustained_multi_hundred_mib_load_triggers_rocksdb_flushes_with_byte_parity() -> Result<()>
+{
     let config = ActiveWriterPublicationConfig {
         base_blocks: 258,
         live_blocks: 210,
@@ -30,7 +31,7 @@ async fn encoded_tail_evicts_at_64mib_and_triggers_rocksdb_flushes() -> Result<(
         scratch_dir: None,
         io_mode: RocksDbIoMode::Direct,
         publish_workers: None,
-        require_tail_eviction: true,
+        require_tail_eviction: false,
     };
     validate_config(&config)?;
 
@@ -38,22 +39,13 @@ async fn encoded_tail_evicts_at_64mib_and_triggers_rocksdb_flushes() -> Result<(
     report.validate(&config)?;
 
     assert!(report.byte_parity.all_matched);
-    let evicted = [
-        &report.canonical_quiescent_control,
-        &report.published_quiescent_control,
-    ]
-    .into_iter()
-    .chain(report.modes.iter())
-    .any(|arm| {
-        arm.tail_refill.encoded_tail_byte_cap_evictions > 0
-            && arm.tail_refill.byte_cap_exceeded
-            && arm.tail_refill.encoded_tail_byte_capped_fills > 0
-            && arm.tail_refill.peak_encoded_tail_bytes > 0
-    });
-    assert!(
-        evicted,
-        "expected >64 MiB EncodedTail eviction in at least one arm"
-    );
+    for arm in std::iter::once(&report.canonical_quiescent_control).chain(report.modes.iter()) {
+        assert!(
+            arm.tail_refill.peak_tail_response_bytes > 0,
+            "{} reported empty tail responses",
+            arm.mode.as_str()
+        );
+    }
 
     for arm in report
         .modes

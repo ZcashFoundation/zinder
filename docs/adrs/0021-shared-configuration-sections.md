@@ -38,8 +38,8 @@ only the writer has.
    catch-up settings, and their resource budgets. `[wallet]` owns the wallet store
    path and its resource budget. `[security]` owns the public-bind policy. `[ops]`
    owns the health and metrics listener. Service sections such as `[ingest]`,
-   `[projector]`, `[query]`, `[compat]`, `[explorer]`, `[cipherscan]`, and
-   `[history_publisher]` own only that runtime's behavior.
+   `[projector]`, `[query]`, `[compat]`, `[explorer]`, and `[cipherscan]` own
+   only that runtime's behavior.
 4. **Ingest groups its own settings by phase.** Construction limits, tip
    following, phase selection, and one-run overrides each have their own
    subsection under `[ingest]`.

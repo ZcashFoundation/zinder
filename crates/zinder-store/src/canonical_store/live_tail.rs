@@ -348,6 +348,18 @@ pub(crate) struct LiveTailBlockRecord {
     pub(crate) canonical_facts: Option<CanonicalBlockFacts>,
 }
 
+/// Authenticated zero-copy shielded wire payload and metadata decoded from a
+/// `live_tail_block` `V1` row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LiveTailShieldedWire<'a> {
+    pub(crate) block_id: BlockId,
+    pub(crate) previous_block_hash: BlockHash,
+    pub(crate) time: u32,
+    pub(crate) shielded_payload: &'a [u8],
+    pub(crate) pool_presence: PoolPresenceMask,
+    pub(crate) has_unrepresentable_wire_fee: bool,
+}
+
 /// Encoding toggles for [`LiveTailBlockRecord::encode_from_compact_block_v1`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LiveTailEncodeOptions {
@@ -476,6 +488,39 @@ impl LiveTailBlockRecord {
             crate::proto_codec::encoded_compact_block_artifact_len(&compact_block)
                 .max(shielded_payload.len());
         Ok((compact_block, compact_wire_budget_len))
+    }
+
+    /// Authenticates a `V1` record and borrows its raw shielded `CompactBlock` protobuf
+    /// payload zero-copy alongside header links and wide-fee detection.
+    pub(crate) fn decode_shielded_wire_v1(
+        bytes: &[u8],
+        expected_height: BlockHeight,
+    ) -> Result<LiveTailShieldedWire<'_>, SettledSegmentsError> {
+        let (header, mut cursor) = parse_authenticated_header_v1(bytes, expected_height)?;
+        let shielded_payload = cursor.read_len_prefixed_slice(
+            SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
+            "live_tail.shielded",
+        )?;
+        let has_unrepresentable_wire_fee = if (header.flags & LIVE_TAIL_FLAG_SUPPLEMENT) != 0 {
+            scan_supplement_for_wide_fee(&mut cursor)?
+        } else {
+            false
+        };
+        if (header.flags & LIVE_TAIL_FLAG_CANONICAL_FACTS) != 0 {
+            let _ = cursor.read_len_prefixed_slice(
+                SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+                "live_tail.facts",
+            )?;
+        }
+        cursor.finish("LiveTailBlockRecord")?;
+        Ok(LiveTailShieldedWire {
+            block_id: header.block_id,
+            previous_block_hash: header.previous_block_hash,
+            time: header.block_time,
+            shielded_payload,
+            pool_presence: header.pool_presence,
+            has_unrepresentable_wire_fee,
+        })
     }
 
     /// Authenticates a `V1` record and extracts only [`CanonicalBlockFacts`] when present,
@@ -1088,7 +1133,20 @@ fn skip_opt(
     Ok(())
 }
 
-fn skip_supplement_record(cursor: &mut ByteReader<'_>) -> Result<(), SettledSegmentsError> {
+fn opt_u64_exceeds_u32(
+    cursor: &mut ByteReader<'_>,
+    field_label: &str,
+) -> Result<bool, SettledSegmentsError> {
+    if cursor.read_bool(field_label)? {
+        let fee_zats = cursor.read_u64_be(field_label)?;
+        Ok(u32::try_from(fee_zats).is_err())
+    } else {
+        Ok(false)
+    }
+}
+
+fn scan_supplement_for_wide_fee(cursor: &mut ByteReader<'_>) -> Result<bool, SettledSegmentsError> {
+    let mut has_wide_fee = false;
     let tx_count = read_bounded_count(
         cursor,
         MAX_LIVE_TAIL_TX_COUNT,
@@ -1096,7 +1154,9 @@ fn skip_supplement_record(cursor: &mut ByteReader<'_>) -> Result<(), SettledSegm
     )?;
     for _ in 0..tx_count {
         let _ = cursor.read_slice(8 + 32, "supplement_tx.head")?;
-        skip_opt(cursor, 8, "supplement_tx.fee_zat")?;
+        if opt_u64_exceeds_u32(cursor, "supplement_tx.fee_zat")? {
+            has_wide_fee = true;
+        }
         let vin_count = read_bounded_count(
             cursor,
             MAX_LIVE_TAIL_TRANSPARENT_IO_COUNT,
@@ -1124,13 +1184,22 @@ fn skip_supplement_record(cursor: &mut ByteReader<'_>) -> Result<(), SettledSegm
         let meta_tx_count =
             read_bounded_count(cursor, MAX_LIVE_TAIL_TX_COUNT, "canonical_sup.tx_count")?;
         for _ in 0..meta_tx_count {
-            skip_canonical_tx_supplement(cursor)?;
+            if scan_canonical_tx_supplement_for_wide_fee(cursor)? {
+                has_wide_fee = true;
+            }
         }
     }
+    Ok(has_wide_fee)
+}
+
+fn skip_supplement_record(cursor: &mut ByteReader<'_>) -> Result<(), SettledSegmentsError> {
+    let _ = scan_supplement_for_wide_fee(cursor)?;
     Ok(())
 }
 
-fn skip_canonical_tx_supplement(cursor: &mut ByteReader<'_>) -> Result<(), SettledSegmentsError> {
+fn scan_canonical_tx_supplement_for_wide_fee(
+    cursor: &mut ByteReader<'_>,
+) -> Result<bool, SettledSegmentsError> {
     let _ = cursor.read_slice(8, "canonical_tx_sup.tx_index")?;
     skip_public_facts(cursor)?;
     let _ = cursor.read_slice(32 + 32, "canonical_tx_sup.digest_and_balances")?;
@@ -1138,9 +1207,10 @@ fn skip_canonical_tx_supplement(cursor: &mut ByteReader<'_>) -> Result<(), Settl
     skip_opt(cursor, 32, "canonical_tx_sup.ironwood_anchor")?;
     skip_opt(cursor, 32, "canonical_tx_sup.sapling_anchor")?;
     skip_opt(cursor, 4, "canonical_tx_sup.zip317")?;
-    skip_opt(cursor, 8, "canonical_tx_sup.fee_zat")?;
+    let wide_fee = opt_u64_exceeds_u32(cursor, "canonical_tx_sup.fee_zat")?;
     skip_opt(cursor, 8, "canonical_tx_sup.burn_zat")?;
-    skip_explicit_transparent_facts(cursor)
+    skip_explicit_transparent_facts(cursor)?;
+    Ok(wide_fee)
 }
 
 fn skip_public_facts(cursor: &mut ByteReader<'_>) -> Result<(), SettledSegmentsError> {

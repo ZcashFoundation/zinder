@@ -50,9 +50,11 @@ pub(crate) use format::{
 pub use reader::{
     BoundedShieldedRangePlan, SettledShieldedSegmentIndex, SettledShieldedSegmentOpenOptions,
     SettledShieldedSegmentReader, ShieldedBatchReadRequest, ShieldedBoundedBatchReadRequest,
-    ShieldedFetchedSlab, ShieldedIndexSlice, ShieldedRangeByteBudget, ShieldedRangePlan,
-    ShieldedReadScratch, ShieldedReadStep, ShieldedSlabDecodeRequest, VerifiedShieldedIndexSlice,
+    ShieldedFetchedSlab, ShieldedIndexSlice, ShieldedPlanExecution, ShieldedRangeByteBudget,
+    ShieldedRangePlan, ShieldedReadScratch, ShieldedReadStep, ShieldedSlabDecodeRequest,
+    VerifiedShieldedIndexSlice,
 };
+pub(crate) use wire_projection::synthesize_empty_nullifier_payload;
 pub use wire_projection::{
     is_passthrough_shielded_block_wire, project_shielded_block_wire,
     project_shielded_block_wire_with_scratch,
@@ -115,6 +117,9 @@ pub enum SettledShieldedSegmentError {
         /// Segment last covered height.
         end: BlockHeight,
     },
+    /// Cooperative cancellation aborted the read before completion.
+    #[error("settled shielded segment read cancelled")]
+    Cancelled,
 }
 
 impl From<crate::segment_verity::SegmentVerityError> for SettledShieldedSegmentError {
@@ -332,6 +337,12 @@ impl ShieldedProjectionSelection {
             mask = mask.union(PoolPresenceMask::IRONWOOD);
         }
         mask
+    }
+
+    /// Returns `true` when `presence` contains at least one pool requested by `self`.
+    #[must_use]
+    pub const fn matches_pool_presence(self, presence: PoolPresenceMask) -> bool {
+        self.requested_pool_mask().intersects(presence)
     }
 }
 

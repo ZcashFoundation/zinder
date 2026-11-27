@@ -2,7 +2,7 @@
 
 pub(crate) mod light_wallet;
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
@@ -33,7 +33,7 @@ use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
     ArtifactKey, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, PendingTransaction, QueryError,
-    SubtreeRoots, TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransactionsInOrder,
+    StorageReadError, SubtreeRoots, TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransactionsInOrder,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
     TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
     address_lookup_to_script_hash, status_from_query_error,
@@ -41,7 +41,10 @@ use zinder_query::{
 use zinder_runtime::RepeatedFieldGuard;
 use zinder_source::{NodeCapability, SourceError};
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
-use zinder_store::{ArtifactFamily, MempoolEvent, RawBlobRetention};
+use zinder_store::{
+    ArtifactFamily, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest, MempoolEvent,
+    RawBlobRetention,
+};
 
 use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
@@ -152,8 +155,6 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     response_limits: LightwalletdResponseLimits,
     block_methods: BlockMethods,
-    published_history: Option<Arc<crate::PublishedShieldedHistory>>,
-    live_tail: crate::published_range::ShieldedTailBuffer,
     transparent_address_support: bool,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
@@ -179,16 +180,6 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
 }
 
 impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
-    /// Serves matching settled shielded ranges from the history admitted for each request.
-    #[must_use]
-    pub fn with_published_shielded_history(
-        mut self,
-        history: Arc<crate::PublishedShieldedHistory>,
-    ) -> Self {
-        self.published_history = Some(history);
-        self
-    }
-
     /// Creates a lightwalletd-compatible gRPC adapter.
     ///
     /// `GetLightdInfo` derives `consensusBranchId`, `upgradeName`,
@@ -218,8 +209,6 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             query_api,
             response_limits,
             block_methods: BlockMethods::default(),
-            published_history: None,
-            live_tail: crate::published_range::ShieldedTailBuffer::default(),
             transparent_address_support: false,
             mempool_surface: None,
             tip_change_watcher: None,
@@ -549,21 +538,6 @@ where
             .map_err(|error| status_from_query_error(&error))
     }
 
-    fn range_fence(
-        &self,
-        view: &Self::View,
-    ) -> Option<(
-        zinder_store::CanonicalEventFence,
-        zinder_core::CanonicalHistoryBounds,
-    )> {
-        self.compact_block_fence(*view)
-            .map(|fence| (fence.event_fence, fence.history_bounds))
-    }
-
-    fn tail_source(&self, view: &Self::View) -> Option<zinder_query::CompactBlockFence> {
-        self.compact_block_fence(*view)
-    }
-
     async fn capture_tip(&self) -> Result<TipCapture<ChainEpoch>, Status> {
         self.served_tip_snapshot()
             .await
@@ -611,26 +585,26 @@ where
             .map_err(|error| status_from_query_error(&error))
     }
 
-    async fn block_hash_at(
+    async fn read_encoded_compact_block_chunk(
         &self,
         view: &Self::View,
-        height: zinder_core::BlockHeight,
-    ) -> Result<zinder_core::BlockHash, Status> {
-        self.block_header_by_selector(BlockSelector::Height(height), Some(view.id))
+        pinned: bool,
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Option<EncodedCompactBlockRange>, Status> {
+        let at_epoch_id = pinned.then_some(view.id);
+        self.encoded_compact_block_range_up_to(request, at_epoch_id, Some(cancel))
             .await
-            .map(|row| row.block_header.block_id.hash)
-            .map_err(|err| status_from_query_error(&err))
-    }
-
-    async fn read_compact_block_rows_with_lengths(
-        &self,
-        view: &Self::View,
-        range: zinder_core::BlockHeightRange,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status> {
-        self.compact_block_rows_with_lengths(range, max_bytes, Some(view.id))
-            .await
-            .map_err(|err| status_from_query_error(&err))
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    QueryError::CanonicalStore(StorageReadError::Cancelled)
+                ) {
+                    Status::cancelled("block-range stream cancelled")
+                } else {
+                    status_from_query_error(&error)
+                }
+            })
     }
 
     async fn read_compact_block_chunk<Output, Convert>(
@@ -982,17 +956,8 @@ where
         self.block_methods
             .await_range_tip(&self.query_api, "get_encoded_block_range", &request)
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range(
-                &self.query_api,
-                &request,
-                range,
-                CompactBlockShape::for_range,
-            )
+            .encoded_block_range(&self.query_api, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }
@@ -1009,17 +974,8 @@ where
         self.block_methods
             .await_range_tip(&self.query_api, "get_encoded_block_range", &request)
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range_frames(
-                &self.query_api,
-                &request,
-                range,
-                CompactBlockShape::for_range,
-            )
+            .encoded_block_range_frames(&self.query_api, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }
@@ -1042,15 +998,10 @@ where
                 &request,
             )
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range(
+            .encoded_block_range(
                 &self.query_api,
                 &request,
-                range,
                 CompactBlockShape::for_nullifier_range,
             )
             .await
@@ -1073,15 +1024,10 @@ where
                 &request,
             )
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range_frames(
+            .encoded_block_range_frames(
                 &self.query_api,
                 &request,
-                range,
                 CompactBlockShape::for_nullifier_range,
             )
             .await

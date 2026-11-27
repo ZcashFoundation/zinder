@@ -16,19 +16,17 @@ Single-container deployments run `zinder serve --preset <preset>` (writer + read
 
 ## Docker Compose
 
-1. Create the required host control tokens in `${ZINDER_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`) and initialize the required host shielded-history directory (`publisher.pub`, `publisher.pk8`, and `catalog/`) with `scripts/prepare-shielded-history.sh`. Because `zinder-serve` bind-mounts `publisher.pub` and `catalog` with `create_host_path: false`, compatibility serving also requires enabling `--profile history-publisher` (using `publisher.pk8`) to publish the first signed checkpoint when the catalog starts empty.
+1. Create the required host control tokens in `${ZINDER_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`).
 2. Start the stack with the env file for your network and upstream node:
 
 ```bash
 ZINDER_PRESET=wallet \
-  docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml \
-  --profile history-publisher up -d
+  docker compose --env-file deploy/.env.mainnet -f deploy/docker-compose.yml up -d
 ```
 
 Optional profiles:
 
 - Observability (`zinder-prometheus` and `zinder-grafana`): add `--profile observability`.
-- Isolated signed shielded history publisher (`zinder-history-publisher`, `network_mode: none`): add `--profile history-publisher`.
 
 Stop or restart the stack with the same `--env-file` and `-f` arguments. Check readiness via `curl -sf http://127.0.0.1:9108/readyz` (or `:19108` on testnet, `:29108` on regtest).
 
@@ -38,7 +36,7 @@ Stop or restart the stack with the same `--env-file` and `-f` arguments. Check r
 
 ## Systemd
 
-[systemd/zinder.service](systemd/zinder.service) wraps the Compose topology cleanly on Linux hosts using `/etc/zinder/env`. Before starting the unit, add `COMPOSE_PROFILES=history-publisher` (or `COMPOSE_PROFILES=history-publisher,observability`) to `/etc/zinder/env` so Docker Compose launches `zinder-history-publisher` and publishes the initial signed catalog checkpoint required by `zinder-serve` on a fresh catalog.
+[systemd/zinder.service](systemd/zinder.service) wraps the Compose topology cleanly on Linux hosts using `/etc/zinder/env`. Optionally add `COMPOSE_PROFILES=observability` to `/etc/zinder/env` to include Prometheus and Grafana.
 
 ## TLS reverse proxy
 

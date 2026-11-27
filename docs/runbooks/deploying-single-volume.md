@@ -6,7 +6,7 @@ Use this runbook when your platform attaches one persistent volume to one contai
 > **Key tradeoffs vs. the two-container VM Compose topology:**
 > - **Shared cgroup memory:** Supervised child processes share one container/pod memory ceiling (minimum 8 GB for `wallet`; size 16+ GB if enabling `explorer` views or serving concurrent range clients).
 > - **All-in-one restarts:** Every redeploy, kernel OOM kill, or fail-fast role exit restarts the container cleanly (which discards an unfinished initial build if interrupted before publication).
-> - **Optional signed history catalog:** Unlike legacy single-volume scripts, `zinder serve` supports `history-publisher` natively when `ZINDER_HISTORY_PUBLISHER__DIRECTORY`, `ZINDER_HISTORY_PUBLISHER__SIGNING_KEY`, and `ZINDER_COMPAT__SHIELDED_HISTORY__*` are configured.
+> Zero-TOML configuration works identically inside `zinder serve` — configure `[node]` and `[network]` via `ZINDER_*` environment variables rather than editing a config file.
 
 ## Get the image
 

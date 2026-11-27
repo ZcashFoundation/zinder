@@ -1,10 +1,8 @@
 //! Reusable runtime entrypoints and CLI parsing for `zinder-compat-lightwalletd`.
 
 mod browser_transport;
-mod catalog_refresh;
 mod compact_block_serving;
 pub mod config;
-pub mod publish_history;
 mod supervision;
 
 use std::{
@@ -37,16 +35,11 @@ use crate::{
     TipWait, spawn_ingest_control_tip_change_publisher, spawn_node_tip_witness,
 };
 
-use catalog_refresh::{CatalogRefresh, CatalogSource};
 pub use compact_block_serving::CompactBlockServingError;
 pub use config::{
-    CompatServing, HistoryLocation, HistoryPublisherConfig, LightwalletdConfig,
-    LightwalletdConfigError, LightwalletdConfigOverrides, ShieldedHistorySection,
-    lightwalletd_config_toml, load_history_publisher_config,
-    load_history_publisher_config_with_env, load_lightwalletd_config,
-    load_lightwalletd_config_with_env,
+    CompatServing, LightwalletdConfig, LightwalletdConfigError, LightwalletdConfigOverrides,
+    lightwalletd_config_toml, load_lightwalletd_config, load_lightwalletd_config_with_env,
 };
-pub use publish_history::PublishHistory;
 use supervision::{CompactBlocksServingTasks, WalletServingTasks};
 
 /// Command-line interface for the `zinder-compat-lightwalletd` gRPC server.
@@ -101,7 +94,7 @@ pub struct Cli {
     /// Answer the `Ping` load-testing RPC, as `lightwalletd --ping-very-insecure` does.
     #[arg(long = "ping-very-insecure")]
     pub ping_very_insecure: bool,
-    /// Optional operational or history-publisher subcommand.
+    /// Optional operational subcommand.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -112,37 +105,6 @@ pub enum Command {
     /// Probe the operational endpoint once and exit 0 only when it answers
     /// HTTP 200. Reads only `[ops] listen_addr` from the `--config` file.
     Healthcheck(OpsHealthcheckArgs),
-    /// Append complete settled segments to a signed wallet history catalog.
-    PublishShieldedHistory(PublishHistory),
-}
-
-/// Standalone CLI for running the shielded-history catalog publisher directly.
-#[derive(Parser)]
-#[command(name = "zinder-history-publisher")]
-#[command(about = "Signed shielded-history catalog publisher for Zinder")]
-#[command(version)]
-pub struct HistoryPublisherCli {
-    /// TOML configuration file loaded before environment variables and CLI overrides.
-    #[arg(long = "config", global = true)]
-    pub config_path: Option<PathBuf>,
-    /// Print the resolved configuration without opening storage or signing.
-    #[arg(long = "print-config", global = true)]
-    pub print_config: bool,
-    /// Network name, such as zcash-regtest.
-    #[arg(long)]
-    pub network: Option<String>,
-    /// Canonical primary path replicated only through an immutable secondary.
-    #[arg(long = "canonical-primary-path")]
-    pub canonical_primary_path: Option<PathBuf>,
-    /// Root for the canonical secondary scratch directory.
-    #[arg(long = "canonical-secondary-root")]
-    pub canonical_secondary_root: Option<PathBuf>,
-    /// Exact canonical replacement-depth identity expected from the writer.
-    #[arg(long = "reorg-window-blocks")]
-    pub reorg_window_blocks: Option<u32>,
-    /// Shielded-history publication options.
-    #[command(flatten)]
-    pub publish: PublishHistory,
 }
 
 /// Runs the standalone `zinder-compat-lightwalletd` CLI from process arguments.
@@ -172,51 +134,6 @@ where
         return run_healthcheck(binary_name, healthcheck, cli.config_path.as_deref());
     }
     run_parsed_cli(cli).await
-}
-
-/// Runs the standalone `history-publisher` role CLI from explicit arguments when
-/// tracing is already initialized by a parent process such as `zinder run`.
-pub async fn run_history_publisher_from_args<I, T>(args: I) -> ExitCode
-where
-    I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
-{
-    let cli = match HistoryPublisherCli::try_parse_from(args) {
-        Ok(cli) => cli,
-        Err(error) => return print_clap_error(&error),
-    };
-    if !cpu_meets_baseline() {
-        return ExitCode::FAILURE;
-    }
-    let config_path = cli.config_path;
-    let print_config = cli.print_config;
-    let publish = cli.publish;
-    let overrides = LightwalletdConfigOverrides {
-        network: cli.network,
-        canonical_primary_path: cli.canonical_primary_path,
-        canonical_secondary_root: cli.canonical_secondary_root,
-        reorg_window_blocks: cli.reorg_window_blocks,
-        ..Default::default()
-    };
-    if print_config {
-        return print_rendered_config(
-            load_history_publisher_config(config_path, overrides).and_then(|cfg| cfg.to_toml()),
-        );
-    }
-    match run_history_publisher_once_or_follow(config_path, overrides, publish).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => emit_runtime_error(&error),
-    }
-}
-
-async fn run_history_publisher_once_or_follow(
-    config_path: Option<PathBuf>,
-    overrides: LightwalletdConfigOverrides,
-    publish: PublishHistory,
-) -> Result<(), LightwalletdConfigError> {
-    let publisher_config =
-        load_runtime_config(|| load_history_publisher_config(config_path, overrides))?;
-    publish.publish(&publisher_config).await
 }
 
 /// Supervises the lightwalletd compatibility adapter inside a parent runtime.
@@ -274,14 +191,9 @@ fn print_rendered_config(render_outcome: Result<String, LightwalletdConfigError>
 
 fn run_print_config(cli: Cli) -> ExitCode {
     let config_path = cli.config_path.clone();
-    let publishing = matches!(cli.command, Some(Command::PublishShieldedHistory(_)));
     let overrides = cli.into();
-    let render_outcome = if publishing {
-        load_history_publisher_config(config_path, overrides).and_then(|cfg| cfg.to_toml())
-    } else {
-        load_lightwalletd_config(config_path, overrides)
-            .and_then(|cfg| lightwalletd_config_toml(&cfg))
-    };
+    let render_outcome = load_lightwalletd_config(config_path, overrides)
+        .and_then(|cfg| lightwalletd_config_toml(&cfg));
     print_rendered_config(render_outcome)
 }
 
@@ -308,13 +220,8 @@ fn load_runtime_config<T>(
     }
 }
 
-async fn run_lightwalletd(mut cli: Cli) -> Result<(), LightwalletdConfigError> {
+async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let config_path = cli.config_path.clone();
-    if let Some(Command::PublishShieldedHistory(args)) = cli.command.take() {
-        let publisher_config =
-            load_runtime_config(|| load_history_publisher_config(config_path, cli.into()))?;
-        return args.publish(&publisher_config).await;
-    }
     let lightwalletd_config =
         load_runtime_config(|| load_lightwalletd_config(config_path, cli.into()))?;
     if lightwalletd_config.ops_listen_addr.is_some() {
@@ -430,12 +337,6 @@ async fn execute_wallet(
             &ingest_control,
         )
         .await?;
-    let catalog_refresh = match &lightwalletd_config.shielded_history {
-        Some(args) => Some(
-            CatalogRefresh::admit(args, CatalogSource::Wallet(serving_pair_slot.clone())).await?,
-        ),
-        None => None,
-    };
     let visible_height = Some(
         serving_pair_slot
             .capture_ephemeral()
@@ -473,10 +374,6 @@ async fn execute_wallet(
         .with_tip_wait(configured_tip_wait(&lightwalletd_config, &cancel))
         .with_node_tip_witness(node_tip_witness)
         .with_ping(configured_ping(&lightwalletd_config, &cancel));
-    let grpc_adapter = match &catalog_refresh {
-        Some(refresh) => grpc_adapter.with_published_shielded_history(refresh.history.clone()),
-        None => grpc_adapter,
-    };
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -556,12 +453,6 @@ async fn execute_wallet(
         operations: ops_handle,
     }
     .supervised();
-    let tasks = CatalogRefresh::supervise(
-        catalog_refresh,
-        lightwalletd_config.storage.secondary_catchup_interval,
-        cancel,
-        tasks,
-    );
     let runtime_outcome = runtime
         .supervise(server, tasks, || serving_readiness.publish_shutting_down())
         .await;
@@ -682,12 +573,6 @@ async fn run_canonical(
     )
     .await
     .map_err(LightwalletdConfigError::CompactServing)?;
-    let catalog_refresh = match &lightwalletd_config.shielded_history {
-        Some(args) => {
-            Some(CatalogRefresh::admit(args, CatalogSource::Compact(slot.clone())).await?)
-        }
-        None => None,
-    };
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
     let (incoming, listen_addr) = browser_transport::bind(lightwalletd_config.listen_addr)?;
@@ -734,10 +619,6 @@ async fn run_canonical(
             .with_tip_wait(configured_tip_wait(&lightwalletd_config, &cancel))
             .with_node_tip_witness(node_tip_witness)
             .with_ping(configured_ping(&lightwalletd_config, &cancel));
-            let adapter = match &catalog_refresh {
-                Some(refresh) => adapter.with_published_shielded_history(refresh.history.clone()),
-                None => adapter,
-            };
             let (adapter, tip_publisher) =
                 with_ingest_mempool(adapter, &lightwalletd_config, &cancel);
             let node_probe = adapter.spawn_node_readiness_probe(
@@ -774,12 +655,6 @@ async fn run_canonical(
                 .with_tip_wait(configured_tip_wait(&lightwalletd_config, &cancel))
                 .with_node_tip_witness(node_tip_witness)
                 .with_ping(configured_ping(&lightwalletd_config, &cancel));
-            let grpc_adapter = match &catalog_refresh {
-                Some(refresh) => {
-                    grpc_adapter.with_published_shielded_history(refresh.history.clone())
-                }
-                None => grpc_adapter,
-            };
             (
                 browser_transport::serve(
                     &runtime,
@@ -811,12 +686,6 @@ async fn run_canonical(
         tip_wait_max_waiters = lightwalletd_config.tip_wait_max_waiters.get(),
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
-    );
-    let tasks = CatalogRefresh::supervise(
-        catalog_refresh,
-        lightwalletd_config.storage.secondary_catchup_interval,
-        cancel,
-        tasks,
     );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();

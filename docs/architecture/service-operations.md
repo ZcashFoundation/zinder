@@ -51,7 +51,7 @@ When step 4 completes, no call handler or response of the gRPC server remains, a
 
 A client that has stopped reading cannot receive its status, so step 5 gives up on its connection after 2 seconds; a client that reads gets its status within milliseconds. These limits bound the gRPC drain. The unified `zinder serve` supervisor gives its child processes 20 seconds to exit.
 
-In `compact-blocks` and `light-wallet` modes, the publisher interrupts pending writer-status reads and retry delays when shutdown begins, including during candidate convergence. It keeps the published reader and skips refresh-failure reporting for the interrupted refresh. RocksDB work already running finishes, and the publisher closes its serving generations after the drain. Slow storage can extend process shutdown beyond the supervisor's 20-second drain window.
+In `compact-blocks` and `light-wallet` modes, the canonical reader publisher interrupts pending writer-status reads and retry delays when shutdown begins, including during candidate convergence. It keeps the published reader and skips refresh-failure reporting for the interrupted refresh. RocksDB work already running finishes, and the publisher closes its serving generations after the drain. Slow storage can extend process shutdown beyond the supervisor's 20-second drain window.
 
 ### Background task failure
 
@@ -126,7 +126,7 @@ Do not copy live canonical and wallet directories directly from the filesystem: 
 
 ### Bootstrap from a verified edge snapshot
 
-An operator can initialize a separate canonical writer from a publisher's signed `zinder-edge-snapshot.v1` bundle (`zinder snapshot export-edge-snapshot` at a quiesced `READY` height divisible by 4,096, plus optional `sealed-history/`). `zinder snapshot bootstrap-from-snapshot` verifies the Ed25519 manifest signature and file digests, attests consensus anchors, subtree roots, and sampled historical blocks against the receiver's own `NodeSource`, and generates a fresh `cursor_auth_key` before admitting the canonical store. See [ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md).
+An operator can initialize a separate canonical writer from a publisher's signed `zinder-edge-snapshot.v1` bundle (`zinder snapshot export-edge-snapshot` at a quiesced `READY` height divisible by 4,096). `zinder snapshot bootstrap-from-snapshot` verifies the Ed25519 manifest signature and file digests, attests consensus anchors, subtree roots, and sampled historical blocks against the receiver's own `NodeSource`, and generates a fresh `cursor_auth_key` before admitting the canonical store. See [ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md).
 
 ## Supported deployments
 

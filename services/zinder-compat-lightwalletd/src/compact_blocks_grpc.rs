@@ -2,7 +2,11 @@
 //! of lightwalletd `CompactTxStreamer` from the canonical reader of each
 //! compact-blocks generation alone.
 
-use std::{num::NonZeroU32, sync::Arc, time::Duration, time::Instant};
+use std::{
+    num::NonZeroU32,
+    sync::{Arc, atomic::AtomicBool},
+    time::{Duration, Instant},
+};
 
 use arc_swap::ArcSwap;
 use tokio::sync::watch;
@@ -14,7 +18,7 @@ use zinder_query::{
     read_on_blocking_thread, status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
-use zinder_store::ArtifactFamily;
+use zinder_store::{ArtifactFamily, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest};
 
 use crate::block_methods::{
     self, BlockMethods, ChunkRead, ChunkReadFailure, ChunkReadOutcome, ChunkView,
@@ -106,24 +110,6 @@ impl CompactBlockReads for CanonicalReaderSlot {
         std::future::ready(Ok(Self::peek_visible_tip_height(self)))
     }
 
-    fn range_fence(
-        &self,
-        view: &Self::View,
-    ) -> Option<(
-        zinder_store::CanonicalEventFence,
-        zinder_core::CanonicalHistoryBounds,
-    )> {
-        Some((view.event_fence(), view.history_bounds()))
-    }
-
-    fn tail_source(&self, view: &Self::View) -> Option<zinder_query::CompactBlockFence> {
-        Some(zinder_query::CompactBlockFence {
-            event_fence: view.event_fence(),
-            history_bounds: view.history_bounds(),
-            source: zinder_query::CompactBlockSource::of(view),
-        })
-    }
-
     fn view_chain_epoch(view: &Arc<RocksDbCanonicalReader>) -> ChainEpoch {
         view.chain_epoch()
     }
@@ -176,28 +162,22 @@ impl CompactBlockReads for CanonicalReaderSlot {
         }
     }
 
-    async fn block_hash_at(
+    async fn read_encoded_compact_block_chunk(
         &self,
         view: &Self::View,
-        height: zinder_core::BlockHeight,
-    ) -> Result<zinder_core::BlockHash, Status> {
-        view.block_header_at(height)
+        _pinned: bool,
+        request: EncodedCompactBlockRangeRequest,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Option<EncodedCompactBlockRange>, Status> {
+        view.encoded_compact_block_range_up_to(request, Some(cancel))
             .await
-            .map_err(storage_status)?
-            .map(|row| row.block_hash)
-            .ok_or_else(|| Status::failed_precondition("missing settled shielded range anchor"))
-    }
-
-    async fn read_compact_block_rows_with_lengths(
-        &self,
-        view: &Self::View,
-        range: zinder_core::BlockHeightRange,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, Status> {
-        view.compact_block_rows_with_lengths(range, max_bytes)
-            .await
-            .map(Some)
-            .map_err(storage_status)
+            .map_err(|error| {
+                if matches!(error, StorageReadError::Cancelled) {
+                    Status::cancelled("block-range stream cancelled")
+                } else {
+                    storage_status(error)
+                }
+            })
     }
 
     async fn read_compact_block_chunk<Output, Convert>(
@@ -293,22 +273,10 @@ fn storage_status(error: StorageReadError) -> Status {
 pub struct CompactBlocksGrpcAdapter {
     slot: CanonicalReaderSlot,
     block_methods: BlockMethods,
-    published_history: Option<Arc<crate::PublishedShieldedHistory>>,
-    live_tail: crate::published_range::ShieldedTailBuffer,
     ping: LightwalletdPing,
 }
 
 impl CompactBlocksGrpcAdapter {
-    /// Serves matching settled shielded ranges from the history admitted for each request.
-    #[must_use]
-    pub fn with_published_shielded_history(
-        mut self,
-        history: Arc<crate::PublishedShieldedHistory>,
-    ) -> Self {
-        self.published_history = Some(history);
-        self
-    }
-
     /// Creates an adapter that serves the reader `slot` serves at each
     /// request.
     #[must_use]
@@ -316,8 +284,6 @@ impl CompactBlocksGrpcAdapter {
         Self {
             slot,
             block_methods: BlockMethods::default(),
-            published_history: None,
-            live_tail: crate::published_range::ShieldedTailBuffer::default(),
             ping: LightwalletdPing::default(),
         }
     }
@@ -418,12 +384,8 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
         self.block_methods
             .await_range_tip(&self.slot, "get_encoded_block_range", &request)
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range(&self.slot, &request, range, CompactBlockShape::for_range)
+            .encoded_block_range(&self.slot, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }
@@ -440,12 +402,8 @@ impl lightwalletd::EncodedBlockRange for CompactBlocksGrpcAdapter {
         self.block_methods
             .await_range_tip(&self.slot, "get_encoded_block_range", &request)
             .await?;
-        let range = self.published_history.as_ref().map_or_else(
-            || (None, self.live_tail.clone()),
-            |history| history.encoded_range(),
-        );
         self.block_methods
-            .published_block_range_frames(&self.slot, &request, range, CompactBlockShape::for_range)
+            .encoded_block_range_frames(&self.slot, &request, CompactBlockShape::for_range)
             .await
             .map(Response::new)
     }

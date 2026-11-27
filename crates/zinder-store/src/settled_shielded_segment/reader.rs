@@ -1,10 +1,18 @@
 //! Admission, sans-I/O range planning, and streaming reader for `ZSHRNG02`.
 
-use std::{fs::File, io, ops::Range, path::Path};
+use std::{
+    fs::File,
+    io,
+    ops::Range,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use zinder_core::{BlockHash, BlockHeight, BlockHeightRange, wire::decode_internal_block_hash};
+use zinder_core::{
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, wire::decode_internal_block_hash,
+};
 use zinder_proto::compat::lightwalletd::{EncodedBlock, EncodedBlockBatcher};
 
 use crate::{
@@ -189,6 +197,17 @@ pub struct BoundedShieldedRangePlan {
     pub kept_native_bytes: usize,
     /// Sans-I/O fetch plan covering `[lowest_height, highest_height]`.
     pub plan: ShieldedRangePlan,
+}
+
+/// Execution options for running an already-planned [`BoundedShieldedRangePlan`].
+#[derive(Clone, Copy, Debug)]
+pub struct ShieldedPlanExecution<'a> {
+    /// Iteration order across the planned range.
+    pub order: HeightOrder,
+    /// Shielded pool and redaction projection.
+    pub selection: ShieldedProjectionSelection,
+    /// Optional cooperative cancellation flag polled between read steps.
+    pub cancel: Option<&'a AtomicBool>,
 }
 
 /// One sans-I/O fetch and decode unit produced by [`SettledShieldedSegmentIndex::plan_block_range`].
@@ -914,6 +933,7 @@ impl SettledShieldedSegmentIndex {
             RangeEmitTarget {
                 order: params.order,
                 selection: params.selection,
+                cancel: None,
             },
             &mut EmitBuffers { scratch, sink },
         )
@@ -1328,6 +1348,25 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         )
     }
 
+    /// Returns the authenticated `(BlockId, previous_block_hash)` pair at `height`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError`] if `height` is outside the segment
+    /// or a required index entry failed validation.
+    pub fn block_link_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<(BlockId, BlockHash), SettledShieldedSegmentError> {
+        let block_hash = self.block_hash_at(height)?;
+        let previous_block_hash = if height == self.index.identity().start_height {
+            self.first_previous_block_hash()?
+        } else {
+            self.block_hash_at(BlockHeight::new(height.value() - 1))?
+        };
+        Ok((BlockId::new(height, block_hash), previous_block_hash))
+    }
+
     /// Reads and authenticates every row's block hash in a single coalesced
     /// index read in ascending block height order.
     pub(crate) fn read_all_block_hashes(
@@ -1451,7 +1490,11 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         };
         self.execute_range_plan(
             &plan,
-            RangeEmitTarget { order, selection },
+            RangeEmitTarget {
+                order,
+                selection,
+                cancel: None,
+            },
             &mut EmitBuffers {
                 scratch: &mut scratch,
                 sink: &mut sink,
@@ -1489,6 +1532,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
             RangeEmitTarget {
                 order: request.order,
                 selection: request.selection,
+                cancel: None,
             },
             &mut EmitBuffers {
                 scratch,
@@ -1525,6 +1569,7 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
             RangeEmitTarget {
                 order: request.order,
                 selection: request.selection,
+                cancel: None,
             },
             &mut EmitBuffers {
                 scratch,
@@ -1534,12 +1579,80 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         Ok(Some(bounded))
     }
 
+    /// Reads encoded wire blocks for a precomputed `plan` with scratch reuse and
+    /// cooperative cancellation polling between read steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError`] on I/O, integrity, or cancellation.
+    pub fn read_bounded_projected_blocks_for_plan(
+        &self,
+        plan: &BoundedShieldedRangePlan,
+        execution: ShieldedPlanExecution<'_>,
+        scratch: &mut ShieldedReadScratch,
+    ) -> Result<Vec<EncodedBlock>, SettledShieldedSegmentError> {
+        let mut out = Vec::with_capacity(plan.kept_blocks);
+        let mut packed_out = Vec::new();
+        let mut sink = StepOutputSink::Blocks {
+            packed_out: &mut packed_out,
+            out: &mut out,
+        };
+        self.execute_range_plan(
+            &plan.plan,
+            RangeEmitTarget {
+                order: execution.order,
+                selection: execution.selection,
+                cancel: execution.cancel,
+            },
+            &mut EmitBuffers {
+                scratch,
+                sink: &mut sink,
+            },
+        )?;
+        flush_packed_blocks(&mut packed_out, &mut out)?;
+        Ok(out)
+    }
+
+    /// Appends projected wire frames for a precomputed `plan` directly into
+    /// `batcher`, polling cooperative cancellation between read steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError`] on I/O, integrity, or cancellation.
+    pub fn append_bounded_projected_frames_for_plan(
+        &self,
+        plan: &BoundedShieldedRangePlan,
+        execution: ShieldedPlanExecution<'_>,
+        scratch: &mut ShieldedReadScratch,
+        batcher: &mut EncodedBlockBatcher,
+    ) -> Result<(), SettledShieldedSegmentError> {
+        let mut sink = StepOutputSink::Batcher(batcher);
+        self.execute_range_plan(
+            &plan.plan,
+            RangeEmitTarget {
+                order: execution.order,
+                selection: execution.selection,
+                cancel: execution.cancel,
+            },
+            &mut EmitBuffers {
+                scratch,
+                sink: &mut sink,
+            },
+        )
+    }
+
     fn execute_range_plan(
         &self,
         plan: &ShieldedRangePlan,
-        target: RangeEmitTarget,
+        target: RangeEmitTarget<'_>,
         buffers: &mut EmitBuffers<'_, '_>,
     ) -> Result<(), SettledShieldedSegmentError> {
+        if target
+            .cancel
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(SettledShieldedSegmentError::Cancelled);
+        }
         let needed_range = plan.needed_index_byte_range();
         let fetched_index = match needed_range {
             Some(byte_range) => Some(
@@ -1587,11 +1700,23 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
         match target.order {
             HeightOrder::Ascending => {
                 for step in plan.steps() {
+                    if target
+                        .cancel
+                        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                    {
+                        return Err(SettledShieldedSegmentError::Cancelled);
+                    }
                     emit_step(step, buffers.scratch, buffers.sink)?;
                 }
             }
             HeightOrder::Descending => {
                 for step in plan.steps().iter().rev() {
+                    if target
+                        .cancel
+                        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                    {
+                        return Err(SettledShieldedSegmentError::Cancelled);
+                    }
                     emit_step(step, buffers.scratch, buffers.sink)?;
                 }
             }
@@ -1601,9 +1726,10 @@ impl<S: PositionalByteSource> SettledShieldedSegmentReader<S> {
 }
 
 #[derive(Clone, Copy)]
-struct RangeEmitTarget {
+struct RangeEmitTarget<'a> {
     order: HeightOrder,
     selection: ShieldedProjectionSelection,
+    cancel: Option<&'a AtomicBool>,
 }
 
 struct EmitBuffers<'s, 'b> {
@@ -1895,7 +2021,7 @@ fn emit_verified_slab_rows(
     index: &SettledShieldedSegmentIndex,
     step: &ShieldedReadStep,
     slab_bytes: Vec<u8>,
-    target: RangeEmitTarget,
+    target: RangeEmitTarget<'_>,
     buffers: &mut EmitBuffers<'_, '_>,
 ) -> Result<(), SettledShieldedSegmentError> {
     if step.isolated_large_row && step.row_range.len() == 1 {

@@ -309,11 +309,6 @@ def provision(args, directory):
             service['environment'].pop('ZINDER_STORAGE__FULL_BLOCKS', None)
             service['environment']['ZINDER_STORAGE__RAW_BLOB_POLICY'] = 'none'
         if name == 'serve':
-            service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY', None)
-            service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY', None)
-            service['volumes'] = [mount for mount in service['volumes']
-                                  if mount['target'] not in ('/var/lib/zinder-history',
-                                                             '/run/zinder-history/publisher.pub')]
             service['environment']['ZINDER_COMPAT__STALE_TIP_LIMIT_MS'] = '0'
         if binary_mount:
             service['volumes'].append(dict(binary_mount))

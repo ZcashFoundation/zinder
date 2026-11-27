@@ -51,9 +51,6 @@ pub struct ExportArgs {
     /// File containing the DER-encoded Ed25519 PKCS#8 signing key.
     #[arg(long)]
     pub signing_key: PathBuf,
-    /// Directory of opaque sealed-history files to include.
-    #[arg(long)]
-    pub include_sealed_history: Option<PathBuf>,
 }
 
 /// CLI arguments for bootstrapping a canonical store from a signed edge snapshot.
@@ -68,9 +65,6 @@ pub struct BootstrapArgs {
     /// Number of random retained blocks to compare, plus the snapshot boundary.
     #[arg(long, default_value_t = DEFAULT_SPOT_CHECK_BLOCKS)]
     pub spot_check_blocks: NonZeroU32,
-    /// Destination directory for verified opaque sealed-history files.
-    #[arg(long)]
-    pub sealed_history_output: Option<PathBuf>,
 }
 
 fn parse_public_key(key: &str) -> Result<[u8; 32], &'static str> {
@@ -146,12 +140,7 @@ pub async fn run(
                 policy,
                 store_config.resource_budget,
             )?;
-            export_edge_snapshot(
-                &mut store,
-                &args.output_dir,
-                &args.signing_key,
-                args.include_sealed_history.as_deref(),
-            )?;
+            export_edge_snapshot(&mut store, &args.output_dir, &args.signing_key)?;
         }
         SnapshotCommand::BootstrapFromSnapshot(args) => {
             bootstrap(
@@ -325,8 +314,7 @@ async fn prepare_source(
     config: &EdgeSnapshotStoreConfig<'_>,
 ) -> Result<(EdgeSnapshotDestination, PathBuf), SnapshotCommandError> {
     let remote = args.source.starts_with("http://") || args.source.starts_with("https://");
-    let destination =
-        EdgeSnapshotDestination::reserve(target, args.sealed_history_output.as_deref(), remote)?;
+    let destination = EdgeSnapshotDestination::reserve(target, remote)?;
     let source = if let Some(directory) = destination.download_path() {
         let bundle = directory.join("bundle");
         fs::create_dir(&bundle)?;

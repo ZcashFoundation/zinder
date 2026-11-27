@@ -6,30 +6,32 @@
 //! one, and reports each publication as the slot does, so the wallet adapter
 //! runs its real tip wait against it.
 
-use std::{num::NonZeroU16, sync::Arc};
+use std::{
+    num::NonZeroU16,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::watch;
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip,
-    CompactBlockArtifact, NetworkUpgradeActivations, RawTransactionBytes, StandardFee,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressBalance,
+    NetworkUpgradeActivations, RawTransactionBytes, StandardFee, SubtreeRootRange,
+    TransactionBroadcastOutcome, TransactionId, TransparentAddressBalance,
     TransparentAddressScriptHash, TransparentOutPoint,
 };
 use zinder_query::{
-    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockFence,
-    CompactBlockRange, CompactBlockStream, FullBlock, FullBlockStream,
-    NativeWalletEndpointCapabilities, QueryError, RawTransaction, ServedTipSnapshot,
-    ServedTreeStateHex, SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus,
-    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
+    CompactBlockStream, FullBlock, FullBlockStream, NativeWalletEndpointCapabilities, QueryError,
+    RawTransaction, ServedTipSnapshot, ServedTreeStateHex, SettledTipBlock, SubtreeRoots,
+    Transaction, TransactionStatus, TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
     TransparentOutpointSpendStatuses, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
     WalletQueryApi, WalletServingQuery,
 };
 use zinder_store::{
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
-    StreamCursorTokenV1,
+    ChainEventStreamFamily, ChainEventStreamResume, EncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, StreamCursorTokenV1,
 };
 
 type UnpinnedTreeStateStep = Box<dyn FnOnce() + Send>;
@@ -91,10 +93,6 @@ impl PublishedQuery {
 
 #[async_trait]
 impl WalletQueryApi for PublishedQuery {
-    fn compact_block_fence(&self, epoch: ChainEpoch) -> Option<CompactBlockFence> {
-        self.now().compact_block_fence(epoch)
-    }
-
     fn subscribe_publications(&self) -> Option<watch::Receiver<()>> {
         Some(self.publications.subscribe())
     }
@@ -203,14 +201,14 @@ impl WalletQueryApi for PublishedQuery {
             .await
     }
 
-    async fn compact_block_rows_with_lengths(
+    async fn encoded_compact_block_range_up_to(
         &self,
-        block_range: BlockHeightRange,
-        max_bytes: usize,
+        request: EncodedCompactBlockRangeRequest,
         at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<Option<Vec<(CompactBlockArtifact, usize)>>, QueryError> {
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, QueryError> {
         self.now()
-            .compact_block_rows_with_lengths(block_range, max_bytes, at_epoch_id)
+            .encoded_compact_block_range_up_to(request, at_epoch_id, cancel)
             .await
     }
 

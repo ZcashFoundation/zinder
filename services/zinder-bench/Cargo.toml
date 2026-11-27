@@ -21,7 +21,6 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
-ring.workspace = true
 rust-rocksdb.workspace = true
 rustix = { workspace = true, features = ["param", "time"] }
 rustls.workspace = true

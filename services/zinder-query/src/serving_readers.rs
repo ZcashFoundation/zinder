@@ -17,7 +17,12 @@
 //! only once it does, drives a read on that thread with
 //! [`read_on_blocking_thread`].
 
-use std::{cell::Cell, error::Error as StdError, num::NonZeroU16, num::NonZeroU32};
+use std::{
+    cell::Cell,
+    error::Error as StdError,
+    num::{NonZeroU16, NonZeroU32},
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -29,9 +34,9 @@ use zinder_core::{
 };
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence,
-    ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition,
-    HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
-    TreeStateReplay, TreeStateReplayOutcome,
+    ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume, EncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, RawBlobRetention,
+    ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
@@ -144,17 +149,18 @@ pub trait CanonicalReader: Send + Sync + 'static {
         max_bytes: usize,
     ) -> Result<Vec<CompactBlockArtifact>, StorageReadError>;
 
-    /// Reads ascending compact blocks with their original stored lengths, within the
-    /// same byte budget as a wallet range. Readers that cannot supply exact lengths
-    /// leave the optional encoded tail to canonical range serving.
-    async fn compact_block_rows_with_lengths(
+    /// Reads encoded compact-block wire payloads or pre-batched frames directly from canonical
+    /// `ZSHRNG02` settled segments and `live_tail_block` up to `request.max_bytes`, keeping at
+    /// least one block.
+    ///
+    /// Readers without segment wire framing return `Ok(None)` so adapters can fall back to
+    /// [`Self::compact_blocks_in_range_up_to`].
+    async fn encoded_compact_block_range_up_to(
         &self,
-        _range: BlockHeightRange,
-        _max_bytes: usize,
-    ) -> Result<Vec<(CompactBlockArtifact, usize)>, StorageReadError> {
-        Err(StorageReadError::Unavailable {
-            source: "canonical row lengths are unavailable".into(),
-        })
+        _request: EncodedCompactBlockRangeRequest,
+        _cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<EncodedCompactBlockRange>, StorageReadError> {
+        Ok(None)
     }
 
     /// Reads the retained raw block at `height`, or `None` when the store
@@ -479,6 +485,19 @@ pub enum StorageReadError {
         /// Operator-facing failure reason.
         reason: String,
     },
+
+    /// An admitted stored artifact failed wire or integrity verification on read.
+    #[error("corrupt {family:?} artifact: {reason}")]
+    ArtifactCorrupt {
+        /// Corrupt artifact family.
+        family: ArtifactFamily,
+        /// Exact verification or decoding failure reason.
+        reason: String,
+    },
+
+    /// Cooperative cancellation stopped the storage read before completion.
+    #[error("canonical storage read cancelled")]
+    Cancelled,
 
     /// Storage failed to answer.
     #[error(transparent)]

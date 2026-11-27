@@ -733,7 +733,7 @@ mod tests {
             "lightwalletd.compat.v1".to_owned(),
         ];
 
-        let mut helper = RoleOpsSnapshot::starting(ServiceRole::HistoryPublisher, false, None);
+        let mut helper = RoleOpsSnapshot::starting(ServiceRole::Explorer, false, None);
         helper.current_height = Some(10);
         helper.target_height = Some(999);
 

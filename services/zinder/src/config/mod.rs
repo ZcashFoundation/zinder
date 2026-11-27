@@ -3,12 +3,7 @@
 mod filter;
 mod validate;
 
-use std::{
-    collections::BTreeMap,
-    net::SocketAddr,
-    num::{NonZeroU32, NonZeroUsize},
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
 
 use thiserror::Error;
 use zinder_core::Network;
@@ -81,23 +76,6 @@ impl ConfigScope {
     }
 }
 
-/// Periodic catalog publication arguments passed to `zinder run history-publisher`.
-#[derive(Clone, Debug)]
-pub struct HistoryPublisherPlan {
-    /// Target directory containing `current.json` and segments.
-    pub directory: PathBuf,
-    /// File containing the DER-encoded Ed25519 PKCS#8 private key.
-    pub signing_key: PathBuf,
-    /// Optional starting height.
-    pub first_height: Option<u32>,
-    /// Optional segment size in blocks.
-    pub segment_blocks: Option<NonZeroU32>,
-    /// Optional concurrent builder worker count.
-    pub workers: Option<NonZeroUsize>,
-    /// Poll interval in seconds when running continuously.
-    pub follow_interval_secs: NonZeroU32,
-}
-
 /// Filtered per-role configuration material ready for validation or child launch.
 #[derive(Clone, Debug)]
 pub struct RoleLaunchSpec {
@@ -134,8 +112,6 @@ pub struct SupervisionPlan {
     pub query_listen_addr: Option<SocketAddr>,
     /// `ExplorerQuery` socket address when cipherscan depends on it.
     pub explorer_listen_addr: Option<SocketAddr>,
-    /// Optional periodic shielded-history publication flags.
-    pub history_publisher: Option<HistoryPublisherPlan>,
     /// Ordered per-role filtered configurations matching active startup sequence.
     pub roles: Vec<RoleLaunchSpec>,
     pub(crate) redacted_sections: validate::ValidatedRoleRenderings,

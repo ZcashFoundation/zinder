@@ -14,7 +14,7 @@ use zinder_bench::active_writer_publication::{
 use zinder_store::RocksDbIoMode;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn runs_all_four_matched_writer_modes_across_a_4096_block_segment_boundary() -> Result<()> {
+async fn runs_all_matched_writer_modes_across_a_4096_block_segment_boundary() -> Result<()> {
     let config = ActiveWriterPublicationConfig {
         base_blocks: 4_098,
         live_blocks: 24,
@@ -56,49 +56,7 @@ fn assert_4096_boundary_baselines_and_modes(
     config: &ActiveWriterPublicationConfig,
 ) -> Result<()> {
     assert_mode_report_invariants(&report.canonical_quiescent_control, config, None, false)?;
-    assert!(
-        report
-            .canonical_quiescent_control
-            .io_modes
-            .publisher_secondary
-            .is_none()
-    );
-    assert!(
-        report
-            .canonical_quiescent_control
-            .tail_refill
-            .unpublished_cold_after_advance
-            .completion_ms
-            .samples
-            > 0
-    );
-
-    assert_mode_report_invariants(&report.published_quiescent_control, config, None, true)?;
-    assert!(
-        report
-            .published_quiescent_control
-            .io_modes
-            .publisher_secondary
-            .is_none()
-    );
-    assert!(
-        report
-            .published_quiescent_control
-            .catalog_range_published
-            .completion_ms
-            .samples
-            > 0
-    );
-    assert!(
-        report
-            .published_quiescent_control
-            .tail_refill
-            .published_cold_after_advance
-            .completion_ms
-            .samples
-            > 0
-    );
-    assert_eq!(report.modes.len(), 4);
+    assert_eq!(report.modes.len(), 3);
     for mode_report in &report.modes {
         assert_mode_report_invariants(
             mode_report,
@@ -106,16 +64,6 @@ fn assert_4096_boundary_baselines_and_modes(
             None,
             mode_report.mode.has_wallet_serving(),
         )?;
-        if mode_report.mode == WriterMode::QuiescentControl {
-            assert!(
-                mode_report
-                    .tail_refill
-                    .unpublished_cold_after_advance
-                    .completion_ms
-                    .samples
-                    > 0
-            );
-        }
     }
     Ok(())
 }
@@ -139,7 +87,7 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
         quiescent_rounds: 3,
         scratch_dir: Some(scratch.path().to_path_buf()),
         io_mode: RocksDbIoMode::Buffered,
-        publish_workers: Some(NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN)),
+        publish_workers: None,
         require_tail_eviction: false,
     };
     validate_config(&config)?;
@@ -150,7 +98,6 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
     assert_eq!(report.workload.crossed_segment_boundary_height, 32);
     assert_eq!(report.workload.dense_orchard_actions_per_tx, 8);
     assert_eq!(report.workload.requested_io_mode, "buffered");
-    assert_eq!(report.workload.publish_workers, 2);
     assert!(report.workload.transparent_spend_txs > 0);
     assert_wallet_enabled_parity(&report.byte_parity);
     assert_differential_baselines(&report.differentials_vs_quiescent);
@@ -161,30 +108,6 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
         Some("buffered"),
         false,
     )?;
-    assert!(
-        report
-            .canonical_quiescent_control
-            .tail_refill
-            .unpublished_cold_after_advance
-            .completion_ms
-            .samples
-            > 0
-    );
-    assert_mode_report_invariants(
-        &report.published_quiescent_control,
-        &config,
-        Some("buffered"),
-        true,
-    )?;
-    assert!(
-        report
-            .published_quiescent_control
-            .tail_refill
-            .published_cold_after_advance
-            .completion_ms
-            .samples
-            > 0
-    );
     for mode_report in &report.modes {
         assert_mode_report_invariants(
             mode_report,
@@ -192,16 +115,6 @@ async fn handles_buffered_scratch_dir_and_scaled_orchard_actions_without_parity_
             Some("buffered"),
             mode_report.mode.has_wallet_serving(),
         )?;
-        if mode_report.mode == WriterMode::QuiescentControl {
-            assert!(
-                mode_report
-                    .tail_refill
-                    .unpublished_cold_after_advance
-                    .completion_ms
-                    .samples
-                    > 0
-            );
-        }
     }
     Ok(())
 }
@@ -216,14 +129,14 @@ fn assert_wallet_enabled_parity(byte_parity: &ByteParityReport) {
         byte_parity.mismatches,
         [] as [zinder_bench::active_writer_publication::ParityMismatch; 0]
     );
-    assert_eq!(byte_parity.digests.len(), 6);
+    assert_eq!(byte_parity.digests.len(), 4);
 
     let wallet_armed_count = byte_parity
         .digests
         .iter()
         .filter(|digest| digest.wallet_taddress_balance_sha256.is_some())
         .count();
-    assert_eq!(wallet_armed_count, 4);
+    assert_eq!(wallet_armed_count, 2);
 
     for digest in &byte_parity.digests {
         let expect_wallet =
@@ -241,7 +154,7 @@ fn assert_wallet_enabled_parity(byte_parity: &ByteParityReport) {
 }
 
 fn assert_differential_baselines(differentials: &[ModeDifferential]) {
-    assert_eq!(differentials.len(), 3);
+    assert_eq!(differentials.len(), 2);
     for diff in differentials {
         assert!(diff.latest_block_rpc_p50_delta_ms.is_some());
         assert!(diff.slow_boundary_completion_p50_delta_ms.is_some());
@@ -258,15 +171,9 @@ fn assert_differential_baselines(differentials: &[ModeDifferential]) {
         match diff.mode {
             WriterMode::IngestActive => {
                 assert_eq!(diff.baseline_label, "canonical_quiescent_control");
-                assert!(!diff.baseline_catalog_published);
             }
             WriterMode::IngestAndProjector => {
                 assert_eq!(diff.baseline_label, "quiescent_control");
-                assert!(!diff.baseline_catalog_published);
-            }
-            WriterMode::IngestProjectorAndPublisher => {
-                assert_eq!(diff.baseline_label, "published_quiescent_control");
-                assert!(diff.baseline_catalog_published);
             }
             WriterMode::QuiescentControl => {}
         }
@@ -294,9 +201,6 @@ fn assert_mode_io_and_wallet_invariants(
         }
         if let Some(projector_sec) = mode_report.io_modes.projector_secondary.as_deref() {
             assert_eq!(projector_sec, expected);
-        }
-        if let Some(publisher_sec) = mode_report.io_modes.publisher_secondary.as_deref() {
-            assert_eq!(publisher_sec, expected);
         }
     }
     if expect_wallet_serving {
@@ -333,8 +237,7 @@ fn assert_mode_report_invariants(
             > 0
     );
     assert!(mode_report.tail_refill.warm_repeat.completion_ms.samples > 0);
-    assert!(mode_report.tail_refill.encoded_tail_cache_fills > 0);
-    assert!(mode_report.tail_refill.encoded_tail_cache_hits > 0);
+    assert!(mode_report.tail_refill.peak_tail_response_bytes > 0);
     assert_mode_io_and_wallet_invariants(mode_report, expected_io_mode, expect_wallet_serving);
 
     assert_eq!(
@@ -353,37 +256,11 @@ fn assert_mode_report_invariants(
             assert!(tier.commits_observed_during_tier > 0);
         }
     }
-    if matches!(
-        mode_report.mode,
-        WriterMode::IngestAndProjector | WriterMode::IngestProjectorAndPublisher
-    ) {
+    if mode_report.mode == WriterMode::IngestAndProjector {
         assert!(mode_report.io_modes.wallet_primary.is_some());
         assert!(mode_report.io_modes.projector_secondary.is_some());
         assert!(mode_report.projector.transitions_applied >= config.live_blocks);
         assert!(mode_report.rocksdb_activity.projector_secondary.bytes_read > 0);
-    }
-    if mode_report.mode == WriterMode::IngestProjectorAndPublisher {
-        assert!(mode_report.io_modes.publisher_secondary.is_some());
-        assert!(mode_report.publisher.segments_published >= 1);
-        assert!(mode_report.publisher.catalog_refreshes >= 1);
-        assert!(mode_report.catalog_range_published.completion_ms.samples > 0);
-    } else if mode_report.mode != WriterMode::QuiescentControl {
-        assert!(
-            mode_report
-                .tail_refill
-                .unpublished_cold_after_advance
-                .completion_ms
-                .samples
-                > 0
-        );
-        assert!(
-            mode_report
-                .tail_refill
-                .unpublished_warm_repeat
-                .completion_ms
-                .samples
-                > 0
-        );
     }
     Ok(())
 }
