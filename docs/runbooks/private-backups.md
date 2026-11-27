@@ -21,7 +21,7 @@ archive=/srv/zinder-backups/wallet-20261120
 receipt=$(zinder backup create --archive "$archive")
 ```
 
-Inside Compose (`zinder-index`) or a single-volume container (`zinder-serve`), configure both the running projector and the `backup create` process with matching shared `ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR` (`127.0.0.1:9101`), `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH`, and `ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT` (`/var/lib/zinder/checkpoints`) settings (rather than relying on an auto-generated internal token that an external `exec` invocation cannot read), mount `/srv/zinder-backups` writable by UID `10001` onto `zinder-index`, and pass the deployment's full Compose `--env-file` and `-f` arguments:
+Inside Compose (`deploy/docker-compose.yml`), `zinder-index` already sets `ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR=127.0.0.1:9101`, `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH=/var/run/zinder-checkpoint/checkpoint.token` (matching ingest's checkpoint capability), and `ZINDER_STORAGE__DATA_DIR=/var/lib/zinder` (which derives `/var/lib/zinder/checkpoints`); mount `/srv/zinder-backups` writable by UID `10001` onto `zinder-index` and pass the deployment's full Compose `--env-file` and `-f` arguments. In a single-volume container (`zinder serve`), configure matching `ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR`, `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH` (matching `ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH`), and `ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT` (`/var/lib/zinder/checkpoints`) at container startup rather than relying on an auto-generated internal token that an external `exec` invocation cannot read:
 
 ```bash
 set -euo pipefail
@@ -29,9 +29,6 @@ archive=/srv/zinder-backups/wallet-20261120
 receipt=$(docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml -f /etc/zinder/docker-compose.override.yml \
   exec -T -u 10001:10001 \
-  -e ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR=127.0.0.1:9101 \
-  -e ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH=/var/run/zinder-control/projector.token \
-  -e ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT=/var/lib/zinder/checkpoints \
   zinder-index zinder backup create --archive "$archive")
 ```
 

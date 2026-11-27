@@ -113,9 +113,12 @@ restart. Under `zinder serve`, an unexpected exit of any child role fails fast
 and drains sibling processes so the orchestrator restarts cleanly. A changed
 process start time confirms an observed new process. Planned construction
 completion and forwarded shutdown have a different meaning. Keep brief
-readiness drains even when they never qualify as recurrence episodes. Record
-elapsed time per drain and the supervisor's cumulative completed seconds
-separately. Treat a missing termination cause as unknown.
+readiness drains even when they never qualify as recurrence episodes. The
+unified supervisor exposes current readiness gauges
+(`zinder_supervisor_ready` and `zinder_supervisor_role_ready`) rather than
+a cumulative drain-duration counter, so compute per-drain elapsed time and
+cumulative drain seconds in the collector from retained readiness and
+lifecycle observations. Treat a missing termination cause as unknown.
 
 Count fatal events, warnings, storage errors, failed epoch pins, and source
 outages at their owners. `canonical_source_recovery` records onset or a
