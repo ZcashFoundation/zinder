@@ -35,8 +35,9 @@ use zinder_testkit::{
     WalletServingStoreFixture, sample_regtest_upgrade_activations,
 };
 
-const TOTAL_BLOCKS: u32 = 4_050;
-const SETTLED_BLOCKS: u32 = 4_000;
+const SEALED_SEGMENT_BLOCKS: u32 = 4_096;
+const SETTLED_BLOCKS: u32 = 4_150;
+const TOTAL_BLOCKS: u32 = 4_250;
 
 #[cfg(debug_assertions)]
 const MAX_BURST_MS: u128 = 30_000;
@@ -134,6 +135,16 @@ fn build_bench_fixture() -> Result<BenchFixture> {
         &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(SETTLED_BLOCKS)),
         &sample_regtest_upgrade_activations(),
     )?;
+    let sealed_segment = writer
+        .canonical_primary_path()
+        .join("segments")
+        .join("shielded")
+        .join(format!("0000000001-{SEALED_SEGMENT_BLOCKS:010}.zshrng02"));
+    ensure!(
+        sealed_segment.is_file(),
+        "expected sealed canonical ZSHRNG02 segment at {}",
+        sealed_segment.display()
+    );
     let mut store = writer.into_serving_store_fixture()?;
     let (mut canonical, wallet) = store.take_readers()?;
     canonical.try_catch_up()?;
@@ -331,9 +342,9 @@ async fn two_worker_canonical_block_ranges_scale_under_high_concurrency() -> Res
     let server = TwoWorkerServer::start(fixture.query)?;
     let clients = connect_clients(server.addr, 32).await?;
 
-    // Warm up segment validation verdicts and blocking threads once.
-    let warmed = run_concurrent_ranges(&clients, 1, (1, u64::from(SETTLED_BLOCKS))).await?;
-    assert_eq!(warmed, usize::try_from(SETTLED_BLOCKS)?);
+    // Warm up segment validation verdicts and blocking threads once across sealed + live tail.
+    let warmed = run_concurrent_ranges(&clients, 1, (1, u64::from(TOTAL_BLOCKS))).await?;
+    assert_eq!(warmed, usize::try_from(TOTAL_BLOCKS)?);
 
     let io_before_burst = server.io_snapshot();
     let started_burst = Instant::now();
@@ -343,10 +354,10 @@ async fn two_worker_canonical_block_ranges_scale_under_high_concurrency() -> Res
     assert_eq!(burst_blocks, 200_000);
 
     let started_wide = Instant::now();
-    let wide_blocks = run_concurrent_ranges(&clients, 100, (1, u64::from(SETTLED_BLOCKS))).await?;
+    let wide_blocks = run_concurrent_ranges(&clients, 100, (1, u64::from(TOTAL_BLOCKS))).await?;
     let wide_elapsed = started_wide.elapsed();
     let io_after_wide = server.io_snapshot();
-    assert_eq!(wide_blocks, 100 * usize::try_from(SETTLED_BLOCKS)?);
+    assert_eq!(wide_blocks, 100 * usize::try_from(TOTAL_BLOCKS)?);
 
     let burst_secs = burst_elapsed.as_secs_f64();
     let wide_secs = wide_elapsed.as_secs_f64();

@@ -257,7 +257,7 @@ fn read_settled_segment_step(
 ) -> Result<bool, CanonicalStoreError> {
     let reader = open_shielded_segment_reader(ctx, entry)?;
     let budget = ShieldedRangeByteBudget {
-        max_bytes: params.request.max_bytes.saturating_sub(acc.kept_bytes),
+        max_bytes: acc.remaining_output_bytes(),
         allow_oversized_first: acc.block_count == 0,
         enforce_wire_fee_limit: params.request.enforce_wire_fee_limit,
     };
@@ -301,7 +301,12 @@ fn read_settled_segment_step(
                 .map_err(map_shielded_read_error)?;
         }
     }
-    acc.record_settled_span(step_first, step_last, &bounded);
+    acc.record_settled_span(
+        step_first,
+        step_last,
+        bounded.kept_blocks,
+        bounded.kept_native_bytes,
+    );
     let completed_sub_range = match params.request.order {
         HeightOrder::Ascending => bounded.highest_height == params.sub_range.end,
         HeightOrder::Descending => bounded.lowest_height == params.sub_range.start,
@@ -359,10 +364,7 @@ fn read_live_tail_span(
     };
     while !acc.is_budget_spent() {
         check_cancelled(cancel)?;
-        let batch_len = bounded_batch_len(
-            request.max_bytes.saturating_sub(acc.kept_bytes),
-            acc.largest_row_bytes,
-        );
+        let batch_len = acc.next_live_tail_batch_len();
         let heights = std::iter::from_fn(&mut next_height)
             .take(batch_len)
             .collect::<Vec<_>>();
@@ -373,15 +375,18 @@ fn read_live_tail_span(
         for (height, maybe_row) in heights.iter().zip(rows) {
             check_cancelled(cancel)?;
             let raw_row = maybe_row?.ok_or_else(|| missing_compact_block_row(*height))?;
-            let raw_exceeds_budget = acc.block_count > 0
-                && acc.kept_bytes.saturating_add(raw_row.as_ref().len()) > request.max_bytes;
+            let stored_row_bytes = raw_row.as_ref().len();
+            if acc.exceeds_live_read_budget(stored_row_bytes) {
+                return Ok(false);
+            }
+            let raw_exceeds_output_budget = acc.exceeds_output_budget(stored_row_bytes);
             let wire = match LiveTailBlockRecord::decode_shielded_wire_v1(raw_row.as_ref(), *height)
             {
                 Ok(decoded) => decoded,
-                Err(_) if raw_exceeds_budget => return Ok(false),
+                Err(_) if raw_exceeds_output_budget => return Ok(false),
                 Err(error) => return Err(map_settled_segments_read_error(error)),
             };
-            if !append_live_tail_row(&wire, request, acc)? {
+            if !append_live_tail_row(&wire, stored_row_bytes, request, acc)? {
                 return Ok(false);
             }
         }
@@ -391,6 +396,7 @@ fn read_live_tail_span(
 
 fn append_live_tail_row(
     wire: &LiveTailShieldedWire<'_>,
+    stored_row_bytes: usize,
     request: EncodedCompactBlockRangeRequest,
     acc: &mut RangeAccumulator,
 ) -> Result<bool, CanonicalStoreError> {
@@ -400,8 +406,8 @@ fn append_live_tail_row(
             reason: "compact transaction fee exceeds u32".to_owned(),
         });
     }
-    let row_bytes = wire.shielded_payload.len();
-    if acc.block_count > 0 && acc.kept_bytes.saturating_add(row_bytes) > request.max_bytes {
+    let output_bytes = wire.shielded_payload.len();
+    if acc.exceeds_output_budget(output_bytes) || acc.exceeds_live_read_budget(stored_row_bytes) {
         return Ok(false);
     }
     let link = EncodedCompactBlockLink {
@@ -414,7 +420,7 @@ fn append_live_tail_row(
     }
     let encoded_payload = project_live_wire(wire, request.selection, acc)?;
     acc.push_encoded_payload(encoded_payload)?;
-    acc.record_single_row(link, row_bytes);
+    acc.record_live_tail_row(link, output_bytes, stored_row_bytes);
     Ok(!acc.is_budget_spent())
 }
 
@@ -493,6 +499,14 @@ fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<(), CanonicalStoreErro
     }
 }
 
+/// Full stored `live_tail_block` row-read cap as a multiple of `request.max_bytes`.
+///
+/// Empty/coinbase `ZSLVTL01` rows include envelope framing and canonical facts (~500–950 B)
+/// even when their shielded `CompactBlock` payload is ~74 B, so a 4× multiplier keeps 1,000
+/// small live-tail blocks inside a 256 KiB opening chunk (1 MiB live-read cap) while capping
+/// transparent-heavy supplements separately from shielded output bytes.
+const LIVE_TAIL_READ_BUDGET_MULTIPLIER: usize = 4;
+
 enum AccumulatorOutput {
     Blocks(Vec<EncodedBlock>),
     Batcher(EncodedBlockBatcher),
@@ -501,8 +515,11 @@ enum AccumulatorOutput {
 struct RangeAccumulator {
     order: HeightOrder,
     max_bytes: usize,
+    max_live_read_bytes: usize,
     kept_bytes: usize,
-    largest_row_bytes: usize,
+    live_tail_read_bytes: usize,
+    largest_live_row_bytes: usize,
+    largest_live_output_bytes: usize,
     first_link: Option<EncodedCompactBlockLink>,
     last_link: Option<EncodedCompactBlockLink>,
     block_count: usize,
@@ -523,8 +540,13 @@ impl RangeAccumulator {
         Self {
             order: request.order,
             max_bytes: request.max_bytes,
+            max_live_read_bytes: request
+                .max_bytes
+                .saturating_mul(LIVE_TAIL_READ_BUDGET_MULTIPLIER),
             kept_bytes: 0,
-            largest_row_bytes: 0,
+            live_tail_read_bytes: 0,
+            largest_live_row_bytes: 0,
+            largest_live_output_bytes: 0,
             first_link: None,
             last_link: None,
             block_count: 0,
@@ -535,37 +557,75 @@ impl RangeAccumulator {
         }
     }
 
+    const fn remaining_output_bytes(&self) -> usize {
+        self.max_bytes.saturating_sub(self.kept_bytes)
+    }
+
+    const fn remaining_live_read_bytes(&self) -> usize {
+        self.max_live_read_bytes
+            .saturating_sub(self.live_tail_read_bytes)
+    }
+
     const fn is_budget_spent(&self) -> bool {
-        self.block_count > 0 && self.kept_bytes >= self.max_bytes
+        self.block_count > 0
+            && (self.kept_bytes >= self.max_bytes
+                || self.live_tail_read_bytes >= self.max_live_read_bytes)
+    }
+
+    const fn exceeds_live_read_budget(&self, stored_row_bytes: usize) -> bool {
+        self.block_count > 0
+            && (self.live_tail_read_bytes >= self.max_live_read_bytes
+                || self.live_tail_read_bytes.saturating_add(stored_row_bytes)
+                    > self.max_live_read_bytes)
+    }
+
+    const fn exceeds_output_budget(&self, output_bytes: usize) -> bool {
+        self.block_count > 0
+            && (self.kept_bytes >= self.max_bytes
+                || self.kept_bytes.saturating_add(output_bytes) > self.max_bytes)
+    }
+
+    fn next_live_tail_batch_len(&self) -> usize {
+        bounded_batch_len(
+            self.remaining_live_read_bytes(),
+            self.largest_live_row_bytes,
+        )
+        .min(bounded_batch_len(
+            self.remaining_output_bytes(),
+            self.largest_live_output_bytes,
+        ))
     }
 
     fn record_settled_span(
         &mut self,
         first: EncodedCompactBlockLink,
         last: EncodedCompactBlockLink,
-        bounded: &crate::BoundedShieldedRangePlan,
+        kept_blocks: usize,
+        kept_native_bytes: usize,
     ) {
         if self.first_link.is_none() {
             self.first_link = Some(first);
         }
         self.last_link = Some(last);
-        self.block_count = self.block_count.saturating_add(bounded.kept_blocks);
-        self.kept_bytes = self.kept_bytes.saturating_add(bounded.kept_native_bytes);
-        let avg_row = bounded
-            .kept_native_bytes
-            .checked_div(bounded.kept_blocks)
-            .unwrap_or(0);
-        self.largest_row_bytes = self.largest_row_bytes.max(avg_row);
+        self.block_count = self.block_count.saturating_add(kept_blocks);
+        self.kept_bytes = self.kept_bytes.saturating_add(kept_native_bytes);
     }
 
-    fn record_single_row(&mut self, link: EncodedCompactBlockLink, row_bytes: usize) {
+    fn record_live_tail_row(
+        &mut self,
+        link: EncodedCompactBlockLink,
+        output_bytes: usize,
+        stored_row_bytes: usize,
+    ) {
         if self.first_link.is_none() {
             self.first_link = Some(link);
         }
         self.last_link = Some(link);
         self.block_count = self.block_count.saturating_add(1);
-        self.kept_bytes = self.kept_bytes.saturating_add(row_bytes);
-        self.largest_row_bytes = self.largest_row_bytes.max(row_bytes);
+        self.kept_bytes = self.kept_bytes.saturating_add(output_bytes);
+        self.live_tail_read_bytes = self.live_tail_read_bytes.saturating_add(stored_row_bytes);
+        self.largest_live_row_bytes = self.largest_live_row_bytes.max(stored_row_bytes);
+        self.largest_live_output_bytes = self.largest_live_output_bytes.max(output_bytes);
     }
 
     fn push_encoded_payload(&mut self, wire: ProjectedWire<'_>) -> Result<(), CanonicalStoreError> {
@@ -674,6 +734,7 @@ mod tests {
         RocksDbResourceBudget,
         canonical_store::{
             live_replacement_tests::published_store,
+            live_tail::LiveTailEncodeOptions,
             rocksdb::{LIVE_TAIL_BLOCK_COLUMN_FAMILY, SETTLED_SEGMENT_INDEX_COLUMN_FAMILY},
             settled_segments::{
                 cache::SettledSegmentReaderCache,
@@ -1232,5 +1293,242 @@ mod tests {
         )?;
         assert_eq!(reconstructed_mixed, blocks[0..2]);
         Ok(())
+    }
+
+    #[test]
+    fn default_range_serving_rejects_live_tail_mismatched_shielded_payload_with_valid_checksum()
+    -> TestOutcome {
+        let dir = TempDir::new()?;
+        let (db, entries, cache, _) = seed_multi_segment_store(dir.path(), 5, 2, &[])?;
+        let (compact_live, facts_live) = shielded_block_fixture(
+            5,
+            FixtureShape {
+                sapling: true,
+                orchard: false,
+                transparent: false,
+                wide_fee: false,
+            },
+        )?;
+        let record =
+            LiveTailBlockRecord::from_compact_block(&compact_live, true, Some(facts_live))?;
+        let mut altered_proto =
+            lightwalletd::CompactBlock::decode(record.shielded_payload.as_slice())?;
+        altered_proto.hash = vec![0xab; 32];
+        let tampered_row = super::super::live_tail::build_raw_v1_record_with_outer_checksum(
+            &record,
+            record.pool_presence,
+            &altered_proto.encode_to_vec(),
+        )?;
+        let live_cf = db
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("missing live_tail_block cf")?;
+        db.put_cf(
+            &live_cf,
+            encode_height_key_ascending(BlockHeight::new(5)),
+            tampered_row,
+        )?;
+        drop(live_cf);
+
+        let ctx = SegmentStoreContext {
+            db: &db,
+            segment_cache: Some(&cache),
+            sealed_segments: Some(&entries),
+        };
+        let req = EncodedCompactBlockRangeRequest {
+            range: BlockHeightRange::inclusive(BlockHeight::new(4), BlockHeight::new(5)),
+            order: HeightOrder::Ascending,
+            selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            output: EncodedCompactBlockOutput::Blocks,
+            max_bytes: usize::MAX,
+            enforce_wire_fee_limit: true,
+        };
+        assert!(matches!(
+            encoded_compact_block_range_for_context(ctx, req, None),
+            Err(CanonicalStoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    fn seed_transparent_heavy_live_tail_store(
+        dir: &std::path::Path,
+        block_count: u32,
+        script_len: usize,
+    ) -> TestOutcome<(DB, Vec<usize>, Vec<usize>)> {
+        let mut opts = rust_rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let descriptors = CANONICAL_DATA_COLUMN_FAMILIES
+            .into_iter()
+            .map(|name| rust_rocksdb::ColumnFamilyDescriptor::new(name, opts.clone()))
+            .collect::<Vec<_>>();
+        let db = DB::open_cf_descriptors(&opts, dir, descriptors)?;
+        let live_cf = db
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("missing live_tail_block cf")?;
+
+        let mut stored_row_lens = Vec::new();
+        let mut shielded_lens = Vec::new();
+        let padding_script = vec![0x6a_u8; script_len];
+
+        for h in 1_u32..=block_count {
+            let height = BlockHeight::new(h);
+            let block_hash = hash_with_tag(h);
+            let prev_hash = if h == 1 {
+                Network::ZcashRegtest.genesis_hash()
+            } else {
+                hash_with_tag(h - 1)
+            };
+            let seed = u8::try_from(h)?;
+            let compact = CompactBlockArtifact::new(
+                BlockId::new(height, block_hash),
+                prev_hash,
+                1_700_000_000 + h,
+                vec![
+                    CompactTransaction {
+                        index: 0,
+                        transaction_id: TransactionId::from_bytes([seed; 32]),
+                        data: CompactTransactionData {
+                            fee_zat: Some(500),
+                            sapling_spends: vec![CompactSaplingSpend {
+                                nullifier: [seed; 32],
+                            }],
+                            ..Default::default()
+                        },
+                    },
+                    CompactTransaction {
+                        index: 1,
+                        transaction_id: TransactionId::from_bytes([seed.wrapping_add(10); 32]),
+                        data: CompactTransactionData {
+                            fee_zat: Some(1_000),
+                            transparent_outputs: vec![CompactTransparentOutput {
+                                value_zat: 10_000,
+                                script_pub_key: padding_script.clone(),
+                            }],
+                            ..Default::default()
+                        },
+                    },
+                ],
+                CompactChainMetadata {
+                    sapling_commitment_tree_size: h,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            )?;
+            let facts = build_facts_for_compact(&compact);
+            let (encoded, shielded_len) = LiveTailBlockRecord::encode_from_compact_block_v1(
+                &compact,
+                Some(facts),
+                LiveTailEncodeOptions {
+                    include_supplement: true,
+                    retain_canonical_facts: true,
+                },
+            )?;
+            stored_row_lens.push(encoded.len());
+            shielded_lens.push(shielded_len);
+            db.put_cf(&live_cf, encode_height_key_ascending(height), encoded)?;
+        }
+        drop(live_cf);
+        Ok((db, stored_row_lens, shielded_lens))
+    }
+
+    #[test]
+    fn transparent_heavy_live_tail_bounds_full_row_reads() -> TestOutcome {
+        let dir = TempDir::new()?;
+        let (db, stored_row_lens, shielded_lens) =
+            seed_transparent_heavy_live_tail_store(dir.path(), 6, 16 * 1024)?;
+
+        let min_stored = stored_row_lens.iter().copied().min().unwrap_or(0);
+        let max_shielded = shielded_lens.iter().copied().max().unwrap_or(0);
+        assert!(min_stored > max_shielded * 50);
+
+        let ctx = SegmentStoreContext {
+            db: &db,
+            segment_cache: None,
+            sealed_segments: Some(&[]),
+        };
+        let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6));
+
+        for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+            let one_row_budget = min_stored / 3;
+            assert!(one_row_budget * LIVE_TAIL_READ_BUDGET_MULTIPLIER < min_stored * 2);
+            assert!(one_row_budget > max_shielded * 10);
+            let single = encoded_compact_block_range_for_context(
+                ctx,
+                EncodedCompactBlockRangeRequest {
+                    range,
+                    order,
+                    selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    output: EncodedCompactBlockOutput::Blocks,
+                    max_bytes: one_row_budget,
+                    enforce_wire_fee_limit: true,
+                },
+                None,
+            )?
+            .ok_or("expected 1 block")?;
+            assert_eq!(single.block_count, 1);
+
+            let two_rows = match order {
+                HeightOrder::Ascending => stored_row_lens[0] + stored_row_lens[1],
+                HeightOrder::Descending => stored_row_lens[5] + stored_row_lens[4],
+            };
+            let two_row_budget = two_rows.div_ceil(LIVE_TAIL_READ_BUDGET_MULTIPLIER);
+            assert!(two_row_budget * LIVE_TAIL_READ_BUDGET_MULTIPLIER < two_rows + min_stored);
+            assert!(two_row_budget > max_shielded * 20);
+            let two_blocks = encoded_compact_block_range_for_context(
+                ctx,
+                EncodedCompactBlockRangeRequest {
+                    range,
+                    order,
+                    selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    output: EncodedCompactBlockOutput::Blocks,
+                    max_bytes: two_row_budget,
+                    enforce_wire_fee_limit: true,
+                },
+                None,
+            )?
+            .ok_or("expected 2 blocks")?;
+            assert_eq!(two_blocks.block_count, 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn range_accumulator_sizes_live_tail_batches_by_stored_row_size() {
+        let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6));
+        let link1 = EncodedCompactBlockLink {
+            height: BlockHeight::new(1),
+            block_hash: hash_with_tag(1),
+            previous_block_hash: Network::ZcashRegtest.genesis_hash(),
+        };
+
+        let transparent_req = EncodedCompactBlockRangeRequest {
+            range,
+            order: HeightOrder::Ascending,
+            selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            output: EncodedCompactBlockOutput::Blocks,
+            max_bytes: 16 * 1024,
+            enforce_wire_fee_limit: true,
+        };
+        let mut live_acc = RangeAccumulator::new(transparent_req);
+        live_acc.record_live_tail_row(link1, 80, 16 * 1024);
+        assert_eq!(live_acc.remaining_live_read_bytes(), 48 * 1024);
+        assert_eq!(live_acc.largest_live_row_bytes, 16 * 1024);
+        assert_eq!(live_acc.next_live_tail_batch_len(), 3);
+
+        let shielded_req = EncodedCompactBlockRangeRequest {
+            max_bytes: 64 * 1024,
+            ..transparent_req
+        };
+        let mut shielded_acc = RangeAccumulator::new(shielded_req);
+        shielded_acc.record_live_tail_row(link1, 40 * 1024, 41 * 1024);
+        assert_eq!(shielded_acc.next_live_tail_batch_len(), 1);
+
+        let mut settled_acc = RangeAccumulator::new(shielded_req);
+        settled_acc.record_settled_span(link1, link1, 4, 1_024);
+        assert_eq!(settled_acc.largest_live_row_bytes, 0);
+        assert_eq!(settled_acc.next_live_tail_batch_len(), 1);
     }
 }

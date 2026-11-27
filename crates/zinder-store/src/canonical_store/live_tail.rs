@@ -513,6 +513,13 @@ impl LiveTailBlockRecord {
             )?;
         }
         cursor.finish("LiveTailBlockRecord")?;
+        let _ = decode_and_validate_shielded_payload(
+            shielded_payload,
+            header.block_id,
+            header.previous_block_hash,
+            header.block_time,
+            header.pool_presence,
+        )?;
         Ok(LiveTailShieldedWire {
             block_id: header.block_id,
             previous_block_hash: header.previous_block_hash,
@@ -2539,6 +2546,28 @@ fn decode_opt_fixed<const N: usize>(
 }
 
 #[cfg(test)]
+pub(super) fn build_raw_v1_record_with_outer_checksum(
+    record: &LiveTailBlockRecord,
+    pool_presence: PoolPresenceMask,
+    shielded_payload: &[u8],
+) -> Result<Vec<u8>, SettledSegmentsError> {
+    let mut out = Vec::with_capacity(128 + shielded_payload.len());
+    out.extend_from_slice(LIVE_TAIL_MAGIC);
+    out.extend_from_slice(&LIVE_TAIL_RECORD_VERSION_V1.to_be_bytes());
+    out.push(0); // flags: no supplement or embedded canonical_facts
+    out.push(0); // reserved
+    out.extend_from_slice(&record.block_id.height.value().to_be_bytes());
+    out.extend_from_slice(&encode_internal_block_hash(record.block_id.hash));
+    out.extend_from_slice(&encode_internal_block_hash(record.previous_block_hash));
+    out.extend_from_slice(&record.block_time.to_be_bytes());
+    out.push(pool_presence.bits());
+    push_len_prefixed_bytes(&mut out, shielded_payload, "live_tail.shielded")?;
+    let digest: [u8; 32] = Sha256::digest(&out).into();
+    out.extend_from_slice(&digest);
+    Ok(out)
+}
+
+#[cfg(test)]
 mod tests {
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
@@ -2710,6 +2739,97 @@ mod tests {
         assert_eq!(
             LiveTailBlockRecord::decode_canonical_facts_v1(&encoded_min, height)?,
             None
+        );
+        Ok(())
+    }
+
+    fn sample_shielded_live_tail_record() -> Result<LiveTailBlockRecord, Box<dyn std::error::Error>>
+    {
+        use zinder_core::{CompactSaplingOutput, CompactSaplingSpend};
+
+        let height = BlockHeight::new(42);
+        let block_hash = BlockHash::from_bytes([0x11; 32]);
+        let prev_hash = BlockHash::from_bytes([0x00; 32]);
+        let compact = CompactBlockArtifact::new(
+            BlockId::new(height, block_hash),
+            prev_hash,
+            1_700_000_042,
+            vec![CompactTransaction {
+                index: 0,
+                transaction_id: TransactionId::from_bytes([0x22; 32]),
+                data: CompactTransactionData {
+                    fee_zat: Some(1_000),
+                    sapling_spends: vec![CompactSaplingSpend {
+                        nullifier: [0x33; 32],
+                    }],
+                    sapling_outputs: vec![CompactSaplingOutput {
+                        commitment: [0x44; 32],
+                        ephemeral_key: [0x55; 32],
+                        ciphertext: [0x66; 52],
+                    }],
+                    ..Default::default()
+                },
+            }],
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 1,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        )?;
+        Ok(LiveTailBlockRecord::from_compact_block(
+            &compact, false, None,
+        )?)
+    }
+
+    #[test]
+    fn decode_shielded_wire_v1_rejects_malformed_or_mismatched_payload_despite_valid_checksum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::build_raw_v1_record_with_outer_checksum;
+        use prost::Message as _;
+        use zinder_proto::compat::lightwalletd;
+
+        use crate::settled_shielded_segment::PoolPresenceMask;
+
+        let record = sample_shielded_live_tail_record()?;
+        let height = record.block_id.height;
+        let valid_encoded = record.encode_v1()?;
+        let valid_wire = LiveTailBlockRecord::decode_shielded_wire_v1(&valid_encoded, height)?;
+        assert_eq!(valid_wire.block_id.height, height);
+
+        let base_proto = lightwalletd::CompactBlock::decode(valid_wire.shielded_payload)?;
+
+        let mut wrong_hash_proto = base_proto.clone();
+        wrong_hash_proto.hash = vec![0x99; 32];
+        let wrong_hash_row = build_raw_v1_record_with_outer_checksum(
+            &record,
+            valid_wire.pool_presence,
+            &wrong_hash_proto.encode_to_vec(),
+        )?;
+        assert!(LiveTailBlockRecord::decode_shielded_wire_v1(&wrong_hash_row, height).is_err());
+
+        let mut wrong_time_proto = base_proto;
+        wrong_time_proto.time = record.block_time + 1;
+        let wrong_time_row = build_raw_v1_record_with_outer_checksum(
+            &record,
+            valid_wire.pool_presence,
+            &wrong_time_proto.encode_to_vec(),
+        )?;
+        assert!(LiveTailBlockRecord::decode_shielded_wire_v1(&wrong_time_row, height).is_err());
+
+        let wrong_presence_row = build_raw_v1_record_with_outer_checksum(
+            &record,
+            PoolPresenceMask::ORCHARD,
+            valid_wire.shielded_payload,
+        )?;
+        assert!(LiveTailBlockRecord::decode_shielded_wire_v1(&wrong_presence_row, height).is_err());
+
+        let malformed_proto_row = build_raw_v1_record_with_outer_checksum(
+            &record,
+            valid_wire.pool_presence,
+            &[0xff, 0xff, 0xff],
+        )?;
+        assert!(
+            LiveTailBlockRecord::decode_shielded_wire_v1(&malformed_proto_row, height).is_err()
         );
         Ok(())
     }
