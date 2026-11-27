@@ -95,8 +95,10 @@ synced), and one RocksDB `WriteBatch` then inserts `settled_segment_index`,
 deletes the newly sealed `live_tail_block` and `live_tail_raw_block` rows, and
 advances indexes, chain epoch, chain event, and sequence digest together before
 updating `segments-manifest.json` (`CANONICAL_SEGMENTS_MANIFEST_SCHEMA_VERSION = 2`).
-Because `live_tail_block` only holds heights above `sealed_tip` (`<= sealed_tip + 4,095`
-alongside the live reorg suffix, up to `reorg_window_blocks + 4,095` physical rows),
+Because `live_tail_block` holds only unsealed heights above `sealed_tip` — at most
+`4,095` settled-but-unsealed blocks (up to `settled_tip`) plus the live reorg
+suffix through the visible tip (at most `reorg_window_blocks + 4,095` physical rows
+in total),
 bounded compaction keeps unsealed tail storage small while reorg eligibility
 remains strictly bounded by `settled_tip` / `reorg_window_blocks`. On primary
 reopen, crash recovery cleans stale `segments/.staging` files and any
@@ -117,8 +119,9 @@ presplit deterministically):
   128-byte fixed big-endian header, `Slab 0` containing 5-byte gRPC-framed
   pre-encoded `DEFAULT_RANGE` lightwalletd `CompactBlock` payloads, an `80`-byte
   per-block row index (block hash, `payload_sha256`, `block_time`, slab offset,
-  length, `PoolPresenceMask` distinguishing Sapling spends from Sapling outputs
-  plus Orchard and Ironwood), and a 32-byte whole-body SHA-256 trailer. Cold
+  `native_bytes` budget, `PoolPresenceMask` distinguishing Sapling spends from Sapling
+  outputs plus Orchard and Ironwood, and row flags — with wire frame lengths derived
+  by `frame_span` from adjacent slab offsets or the slab end), and a 32-byte whole-body SHA-256 trailer. Cold
   admission validates `index_sha256` in one positioned read (`O(index)`),
   retaining `12 B/block` compact rows (`+ 0.5 B/block` 64-row page digests when
   not backed by kernel `fs-verity`). Sans-I/O `ByteRange` planning groups short
@@ -184,11 +187,13 @@ unsealed heights `> sealed_tip`):
     from `1` to `16` within the remaining byte budget.
 
 Reads verify block height linkage across every decoded row and fail on missing
-rows inside retained history as store damage. Canonical reads never construct
-RocksDB iterators over range data families (preventing L0 SST open amplification
-and keeping secondary invalidation strictly limited to `MultiGet` lookups that
-hit compacted-away SSTs, handled by reader-pair replacement as recorded in
-[ADR-0015](../adrs/0015-wallet-runtime-composition.md)).
+rows inside retained history as store damage. Compact-block payload range reads
+never construct RocksDB iterators over range data families (preventing L0 SST open
+amplification during range sweeps and limiting secondary invalidation on those
+reads to `MultiGet` lookups into compacted-away SSTs); checkpoint-at-or-before
+lookups on `tree_state_checkpoint` still use a reverse RocksDB `iterator_cf` and
+can therefore also trigger secondary invalidation, which reader-pair replacement
+handles cleanly as recorded in [ADR-0015](../adrs/0015-wallet-runtime-composition.md).
 
 A transaction byte lookup by ID reads the `72`-byte `transaction_location` row
 once through the active handle (seeing one immutable chain view). When
