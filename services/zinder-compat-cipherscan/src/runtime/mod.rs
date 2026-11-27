@@ -62,20 +62,40 @@ pub struct Cli {
 
 /// Runs the standalone `zinder-compat-cipherscan` CLI from process arguments.
 pub async fn main_from_env(binary_name: &str) -> ExitCode {
-    let cli = Cli::parse();
-
-    run_cli(binary_name, cli).await
+    dispatch_cli(binary_name, Cli::try_parse(), true).await
 }
 
-/// Runs the `zinder-compat-cipherscan` CLI from explicit arguments.
+/// Runs this role as the process entry point, owning its tracing subscriber.
+pub async fn run_process_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    dispatch_cli(binary_name, Cli::try_parse_from(args), true).await
+}
+
+/// Runs this role from explicit arguments using the caller's tracing subscriber.
 pub async fn run_from_args<I, T>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    match Cli::try_parse_from(args) {
-        Ok(cli) => run_cli("zinder-compat-cipherscan", cli).await,
-        Err(error) => print_clap_error(&error),
+    dispatch_cli("zinder-compat-cipherscan", Cli::try_parse_from(args), false).await
+}
+
+async fn dispatch_cli(
+    binary_name: &str,
+    parsed: Result<Cli, clap::Error>,
+    owns_process_tracing: bool,
+) -> ExitCode {
+    let cli = match parsed {
+        Ok(cli) => cli,
+        Err(error) => return print_clap_error(&error),
+    };
+    if owns_process_tracing {
+        run_with_process_tracing(binary_name, cli).await
+    } else {
+        run_parsed_cli(cli).await
     }
 }
 
@@ -93,7 +113,7 @@ pub async fn serve_supervised(
     serve_adapter_with_ops(config, None, readiness, cancel).await
 }
 
-async fn run_cli(binary_name: &str, cli: Cli) -> ExitCode {
+async fn run_with_process_tracing(binary_name: &str, cli: Cli) -> ExitCode {
     if cli.print_config {
         if let Err(error) = install_tracing_subscriber() {
             return emit_tracing_subscriber_error(binary_name, &error);

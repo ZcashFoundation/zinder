@@ -57,7 +57,12 @@ pub enum TracingSubscriberError {
     /// `RUST_LOG` is set but is not valid Unicode.
     #[error("RUST_LOG is set but is not valid Unicode")]
     NonUnicodeLogFilter,
-    /// The observability section could not be loaded.
+    /// The configuration sources could not be read or parsed.
+    #[error(
+        "failed to load configuration sources. Check that the configuration file exists, is readable, and contains valid TOML"
+    )]
+    ConfigLoad,
+    /// The merged observability settings failed validation.
     #[error(
         "invalid observability configuration. Check observability.otlp_endpoint and observability.sampling_rate"
     )]
@@ -99,10 +104,13 @@ pub fn install_runtime_tracing_subscriber(
     config_path: Option<&Path>,
 ) -> Result<RuntimeTracing, TracingSubscriberError> {
     let env_filter = log_filter()?;
-    let config: ProcessObservability = ConfigLoader::new()
+    let (merged, _) = ConfigLoader::new()
         .with_file(config_path.map(Path::to_path_buf))
         .with_zinder_env()
-        .and_then(ConfigLoader::load)
+        .and_then(ConfigLoader::merge_sources)
+        .map_err(|_| TracingSubscriberError::ConfigLoad)?;
+    let config: ProcessObservability = merged
+        .try_deserialize()
         .map_err(|_| TracingSubscriberError::ObservabilityConfig)?;
     let provider = trace_provider(service.binary_name(), &config.observability)?;
     if let Some(provider) = provider.as_ref() {
@@ -410,18 +418,31 @@ mod tests {
 
 #[cfg(test)]
 mod export_tests {
-    use opentelemetry_proto::tonic::collector::trace::v1::{
-        ExportTraceServiceRequest, ExportTraceServiceResponse,
-        trace_service_server::{TraceService, TraceServiceServer},
+    use std::collections::BTreeMap;
+
+    use axum::{Router, routing::post};
+    use opentelemetry_proto::tonic::{
+        collector::trace::v1::{
+            ExportTraceServiceRequest, ExportTraceServiceResponse,
+            trace_service_server::{TraceService, TraceServiceServer},
+        },
+        common::v1::any_value::Value as AttributeValue,
+        trace::v1::{Span as ExportedSpan, span::SpanKind},
     };
     use tokio::{net::TcpListener, sync::mpsc};
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_util::sync::CancellationToken;
     use tonic::{Request, Response, Status, transport::Server};
     use zinder_core::Network;
-    use zinder_proto::v1::ingest::{
-        WriterStatusRequest, ingest_control_client::IngestControlClient,
-        ingest_control_server::IngestControlServer,
+    use zinder_proto::v1::{
+        ingest::{
+            WriterStatusRequest, ingest_control_client::IngestControlClient,
+            ingest_control_server::IngestControlServer,
+        },
+        wallet::{
+            ServerInfoRequest, ServerInfoResponse, wallet_query_client::WalletQueryClient,
+            wallet_query_server,
+        },
     };
     use zinder_testkit::IngestControlFixtureService;
 
@@ -480,6 +501,86 @@ mod export_tests {
         Ok(())
     }
 
+    fn wallet_server_info_route(
+        control: IngestControlClient<crate::AuthenticatedChannel>,
+    ) -> tonic::service::Routes {
+        let path = format!("/{}/ServerInfo", wallet_query_server::SERVICE_NAME);
+        Router::new()
+            .route(
+                &path,
+                post(move |request: axum::extract::Request| async move {
+                    let call = tower::service_fn(move |_: Request<ServerInfoRequest>| {
+                        let mut control = control.clone();
+                        async move {
+                            control.writer_status(WriterStatusRequest {}).await?;
+                            Ok(Response::new(ServerInfoResponse::default()))
+                        }
+                    });
+                    tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                        .unary(call, request)
+                        .await
+                }),
+            )
+            .into()
+    }
+
+    fn assert_exported_rpc_span(span: &ExportedSpan, rpc_attributes: &[(&str, &str)]) {
+        let mut expected = BTreeMap::from([("target", TRACE_TARGET)]);
+        expected.extend(rpc_attributes.iter().copied());
+        assert_eq!(span.kind, SpanKind::Server as i32);
+        assert_eq!(span.events.len(), 0);
+        assert_eq!(span.attributes.len(), expected.len() + 2);
+        for attribute in &span.attributes {
+            let name = attribute.key.as_str();
+            let attribute_content = attribute
+                .value
+                .as_ref()
+                .and_then(|attribute| attribute.value.as_ref());
+            match name {
+                "busy_ns" | "idle_ns" => assert!(
+                    matches!(attribute_content, Some(AttributeValue::IntValue(_))),
+                    "{attribute:?}"
+                ),
+                _ => {
+                    let expected_content = expected
+                        .remove(name)
+                        .map(|text| AttributeValue::StringValue(text.to_owned()));
+                    assert!(
+                        expected_content.is_some(),
+                        "unexpected exported attribute {name}"
+                    );
+                    assert_eq!(attribute_content, expected_content.as_ref(), "{name}");
+                }
+            }
+        }
+        assert_eq!(expected, BTreeMap::new());
+    }
+
+    fn assert_exported_wallet_trace(spans: &[ExportedSpan]) -> eyre::Result<()> {
+        assert_eq!(spans.len(), 2);
+        let wallet_span = spans
+            .iter()
+            .find(|span| span.name == "wallet.request")
+            .ok_or_else(|| eyre::eyre!("wallet span did not reach the collector"))?;
+        let control_span = spans
+            .iter()
+            .find(|span| span.name == "ingest_control.request")
+            .ok_or_else(|| eyre::eyre!("control span did not reach the collector"))?;
+        assert_eq!(wallet_span.trace_id, control_span.trace_id);
+        assert_eq!(wallet_span.span_id, control_span.parent_span_id);
+        assert_eq!(wallet_span.parent_span_id, Vec::<u8>::new());
+        assert_exported_rpc_span(
+            wallet_span,
+            &[
+                ("rpc.system", "grpc"),
+                ("rpc.service", "wallet_query"),
+                ("rpc.method", "ServerInfo"),
+            ],
+        );
+        assert_exported_rpc_span(control_span, &[]);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn otlp_flush_exports_correlated_wallet_and_ingest_control_spans() -> eyre::Result<()> {
         let shutdown = CancellationToken::new();
@@ -518,16 +619,23 @@ mod export_tests {
         );
 
         let channel = crate::connect_zinder_grpc(&format!("http://{control_addr}"), None).await?;
-        let mut client = IngestControlClient::new(channel);
-        async {
-            let _ = client.writer_status(WriterStatusRequest {}).await?;
-            Ok::<(), Status>(())
-        }
-        .instrument(
-            wallet_rpc_span("wallet_query", "ChainView")
-                .ok_or_else(|| eyre::eyre!("trace export is disabled"))?,
-        )
-        .await?;
+        let wallet_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let wallet_addr = wallet_listener.local_addr()?;
+        let wallet = tokio::spawn(
+            Server::builder()
+                .layer(crate::WalletRpcMetricsLayer::WalletQuery)
+                .add_routes(wallet_server_info_route(IngestControlClient::new(channel)))
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(wallet_listener),
+                    shutdown.clone().cancelled_owned(),
+                ),
+        );
+        let mut client = WalletQueryClient::connect(format!("http://{wallet_addr}")).await?;
+        let mut request = Request::new(ServerInfoRequest {});
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer private-wallet-token".parse()?);
+        client.server_info(request).await?;
         drop(client);
         tracing.shutdown().await;
 
@@ -536,19 +644,10 @@ mod export_tests {
             .flat_map(|resource| resource.scope_spans)
             .flat_map(|scope| scope.spans)
             .collect();
-        let wallet_span = spans
-            .iter()
-            .find(|span| span.name == "wallet.request")
-            .ok_or_else(|| eyre::eyre!("wallet span did not reach the collector"))?;
-        let control_span = spans
-            .iter()
-            .find(|span| span.name == "ingest_control.request")
-            .ok_or_else(|| eyre::eyre!("control span did not reach the collector"))?;
-        assert_eq!(wallet_span.trace_id, control_span.trace_id);
-        assert_eq!(wallet_span.span_id, control_span.parent_span_id);
-        assert_eq!(wallet_span.parent_span_id, Vec::<u8>::new());
+        assert_exported_wallet_trace(&spans)?;
 
         shutdown.cancel();
+        wallet.await??;
         control.await??;
         collector.await??;
         Ok(())

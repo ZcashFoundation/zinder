@@ -174,24 +174,33 @@ impl From<Cli> for ProjectorConfigOverrides {
 
 /// Runs the standalone `zinder-projector` CLI from process arguments.
 pub async fn main_from_env(binary_name: &str) -> ExitCode {
-    let mut cli = Cli::parse();
-    let recovery = match cli.command.take() {
-        Some(Command::Healthcheck(healthcheck)) => {
-            return run_healthcheck(binary_name, &healthcheck, cli.config_path.as_deref());
-        }
-        Some(Command::Recovery(command)) => Some(command),
-        None => None,
-    };
-    run_cli(binary_name, cli, recovery).await
+    dispatch_cli(binary_name, Cli::try_parse(), true).await
 }
 
-/// Runs `zinder-projector` from explicit CLI arguments.
+/// Runs this role as the process entry point, owning its tracing subscriber.
+pub async fn run_process_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    dispatch_cli(binary_name, Cli::try_parse_from(args), true).await
+}
+
+/// Runs this role from explicit arguments using the caller's tracing subscriber.
 pub async fn run_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let mut cli = match Cli::try_parse_from(args) {
+    dispatch_cli(binary_name, Cli::try_parse_from(args), false).await
+}
+
+async fn dispatch_cli(
+    binary_name: &str,
+    parsed: Result<Cli, clap::Error>,
+    owns_process_tracing: bool,
+) -> ExitCode {
+    let mut cli = match parsed {
         Ok(cli) => cli,
         Err(error) => return print_clap_error(&error),
     };
@@ -202,10 +211,14 @@ where
         Some(Command::Recovery(command)) => Some(command),
         None => None,
     };
-    run_cli(binary_name, cli, recovery).await
+    if owns_process_tracing {
+        run_with_process_tracing(binary_name, cli, recovery).await
+    } else {
+        run_parsed_cli(binary_name, cli, recovery).await
+    }
 }
 
-async fn run_cli(
+async fn run_with_process_tracing(
     binary_name: &str,
     cli: Cli,
     recovery: Option<recovery::RecoveryCommand>,

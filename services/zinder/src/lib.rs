@@ -84,23 +84,32 @@ async fn run_single_role(args: cli::RunArgs) -> ExitCode {
         .collect();
     match args.role {
         ServiceRole::Ingest => {
-            zinder_ingest::runtime::run_from_args(args.role.binary_name(), forwarded).await
+            zinder_ingest::runtime::run_process_from_args(args.role.binary_name(), forwarded).await
         }
         ServiceRole::Projector => {
-            zinder_projector::runtime::run_from_args(args.role.binary_name(), forwarded).await
-        }
-        ServiceRole::Query => {
-            zinder_query::runtime::run_from_args(args.role.binary_name(), forwarded).await
-        }
-        ServiceRole::CompatLightwalletd => {
-            zinder_compat_lightwalletd::runtime::run_from_args(args.role.binary_name(), forwarded)
+            zinder_projector::runtime::run_process_from_args(args.role.binary_name(), forwarded)
                 .await
         }
+        ServiceRole::Query => {
+            zinder_query::runtime::run_process_from_args(args.role.binary_name(), forwarded).await
+        }
+        ServiceRole::CompatLightwalletd => {
+            zinder_compat_lightwalletd::runtime::run_process_from_args(
+                args.role.binary_name(),
+                forwarded,
+            )
+            .await
+        }
         ServiceRole::Explorer => {
-            zinder_explorer::runtime::run_from_args(args.role.binary_name(), forwarded).await
+            zinder_explorer::runtime::run_process_from_args(args.role.binary_name(), forwarded)
+                .await
         }
         ServiceRole::CompatCipherscan => {
-            zinder_compat_cipherscan::runtime::run_from_args(forwarded).await
+            zinder_compat_cipherscan::runtime::run_process_from_args(
+                args.role.binary_name(),
+                forwarded,
+            )
+            .await
         }
     }
 }

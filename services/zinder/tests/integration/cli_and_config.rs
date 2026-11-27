@@ -75,6 +75,58 @@ fn run_subcommand_accepts_every_role_and_alias() -> eyre::Result<()> {
 }
 
 #[test]
+fn role_startup_distinguishes_config_sources_from_observability_settings() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let missing = sandbox.path().join("private-missing-config.toml");
+    let missing_path = missing
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("non-UTF-8 config path"))?;
+    for role in [
+        "ingest",
+        "projector",
+        "query",
+        "compat-lightwalletd",
+        "explorer",
+        "compat-cipherscan",
+    ] {
+        let output = zinder_command(&["run", role, "--config", missing_path]).output()?;
+        assert!(!output.status.success(), "{role}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("failed to load configuration sources"),
+            "{role}: {stderr}"
+        );
+        assert!(!stderr.contains("observability"), "{role}: {stderr}");
+        assert!(
+            !stderr.contains("private-missing-config"),
+            "{role}: {stderr}"
+        );
+    }
+
+    for (contents, diagnostic) in [
+        (
+            "[node]\npassword = \"private-config-token",
+            "failed to load configuration sources",
+        ),
+        (
+            "[observability]\notlp_endpoint = \"http://collector.internal?token=private-config-token\"\n",
+            "invalid observability configuration",
+        ),
+    ] {
+        let config = write_test_config(sandbox.path(), contents)?;
+        let path = config
+            .to_str()
+            .ok_or_else(|| eyre::eyre!("non-UTF-8 config path"))?;
+        let output = zinder_command(&["run", "query", "--config", path]).output()?;
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains(diagnostic), "{stderr}");
+        assert!(!stderr.contains("private-config-token"), "{stderr}");
+    }
+    Ok(())
+}
+
+#[test]
 fn config_validate_and_print_cover_all_presets_with_redaction() -> eyre::Result<()> {
     let sandbox = TempDir::new()?;
     let storage_root = sandbox.path().join("store-root");
