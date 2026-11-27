@@ -19,6 +19,7 @@ mod live_commit;
 mod live_replacement;
 #[cfg(test)]
 mod live_replacement_tests;
+pub(crate) mod live_tail;
 mod mempool_lifecycle;
 #[cfg(test)]
 mod mempool_lifecycle_tests;
@@ -32,6 +33,7 @@ mod secondary;
 #[cfg(test)]
 mod secondary_tests;
 mod served_tree_state;
+pub(crate) mod settled_segments;
 mod stored_set;
 #[cfg(test)]
 mod stored_set_tests;

@@ -1,21 +1,35 @@
 //! Store-owned settled raw block body segment (`ZSBLKB01`).
 //!
-//! Each immutable segment covers one contiguous settled height interval with a
-//! single `Slab 0` storing each consensus raw block once (either uncompressed or
-//! `Zstd`-3 compressed), a flat per-transaction slice table
-//! `(tx_offset, tx_len, tx_sha256)`, a `128`-byte per-block row index carrying
-//! uncompressed length and SHA-256 integrity digests, and a `32`-byte
-//! whole-body SHA-256 trailer compatible with Linux `fs-verity`.
+//! Each immutable segment (default slab cap `256 MiB` for single-object SQL
+//! `BYTEA STORAGE EXTERNAL` and object-storage compatibility) covers one
+//! contiguous settled height interval with:
 //!
-//! Single-transaction reads decompress and verify the containing block once and
-//! slice the exact consensus transaction bytes without storing duplicate raw
-//! transaction blobs.
+//! - `[0..128)`: Fixed big-endian [`RawBlockSegmentHeader`] (`ZSBLKB01`,
+//!   network tag, flags, codec, `start_height`, `block_count`,
+//!   `first_prev_hash_wire`, `last_block_hash_wire`, `slab_offset`,
+//!   `tx_table_offset`, `row_index_offset`).
+//! - `[slab_offset..tx_table_offset)`: `Slab 0` storing each consensus raw
+//!   block once (uncompressed or `Zstd`-3 compressed).
+//! - `[tx_table_offset..row_index_offset)`: Flat `40`-byte per-transaction
+//!   slice table `(tx_offset, tx_len, tx_sha256)`, read on demand via
+//!   positioned reads without retaining a full `Vec<TxSliceEntry>` in memory.
+//! - `[row_index_offset..trailer_offset)`: `128`-byte per-block row index
+//!   entries carrying block hash, payload/uncompressed SHA-256 integrity
+//!   digests, slab offset, uncompressed length, and transaction slice bounds.
+//! - `[trailer_offset..trailer_offset + 32)`: Whole-body SHA-256 trailer
+//!   compatible with Linux `fs-verity`.
+//!
+//! Cold admission validates `index_sha256 = SHA-256(header || raw_tx_table ||
+//! raw_row_index || trailer)` in a single positioned read (`O(index)`),
+//! retaining compact `20 B/block` in-memory rows (plus optional `64`-row and
+//! `256`-tx portable page digests when not backed by kernel `fs-verity`).
+//! [`SettledRawBlockSegmentIndex`] exposes pure sans-I/O [`ByteRange`] planning
+//! decoupled from [`PositionalByteSource`] I/O.
 
 mod format;
 mod reader;
 #[cfg(test)]
 mod tests;
-mod verity;
 mod writer;
 
 use std::{io, path::Path};
@@ -23,7 +37,22 @@ use std::{io, path::Path};
 use thiserror::Error;
 use zinder_core::{BlockHeight, BlockId, Network};
 
-pub use reader::{SettledRawBlockSegmentOpenOptions, SettledRawBlockSegmentReader};
+pub use format::{
+    DEFAULT_MAX_SLAB_BYTES as DEFAULT_SETTLED_RAW_BLOCK_SEGMENT_MAX_SLAB_BYTES,
+    RawBlockSegmentHeader,
+};
+pub(crate) use format::{
+    FRAME_PREFIX_LEN as RAW_FRAME_PREFIX_LEN, HEADER_LEN as RAW_HEADER_LEN,
+    MAX_COMPRESSED_PAYLOAD_BYTES as MAX_RAW_COMPRESSED_PAYLOAD_BYTES,
+    MAX_SEGMENT_TX_ENTRIES as MAX_RAW_SEGMENT_TX_ENTRIES, MAX_SLAB_BYTES as MAX_RAW_SLAB_BYTES,
+    ROW_INDEX_ENTRY_LEN as RAW_ROW_INDEX_ENTRY_LEN, TRAILER_LEN as RAW_TRAILER_LEN,
+    TX_SLICE_ENTRY_LEN as RAW_TX_SLICE_ENTRY_LEN,
+};
+pub use reader::{
+    RawBlockReadPlan, RawBlockRowIndexSlice, RawBlockTxDigestsPlan, RawBlockTxTableSlice,
+    RawTransactionReadPlan, SettledRawBlockSegmentIndex, SettledRawBlockSegmentOpenOptions,
+    SettledRawBlockSegmentReader, VerifiedRawBlockRowIndexSlice, VerifiedRawBlockTxTableSlice,
+};
 pub use writer::SettledRawBlockSegmentWriter;
 
 /// Magic header identifying the `ZSBLKB01` settled raw block segment format.
@@ -45,8 +74,8 @@ pub enum SettledRawBlockSegmentError {
     /// Block heights or parent-hash chain linkage failed verification.
     #[error("settled raw block segment chain linkage error: {0}")]
     ChainLinkage(String),
-    /// Trailer, payload digest, uncompressed digest, transaction digest, codec
-    /// decode, or `fs-verity` measurement failed.
+    /// Trailer, index digest, payload digest, uncompressed digest, transaction
+    /// digest, codec decode, or `fs-verity` measurement failed.
     #[error("settled raw block segment payload integrity error: {0}")]
     PayloadIntegrity(String),
     /// Single block raw payload exceeded [`SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES`].
@@ -95,6 +124,17 @@ pub enum SettledRawBlockSegmentError {
     },
 }
 
+impl From<crate::segment_verity::SegmentVerityError> for SettledRawBlockSegmentError {
+    fn from(error: crate::segment_verity::SegmentVerityError) -> Self {
+        match error {
+            crate::segment_verity::SegmentVerityError::Io(source) => Self::Io(source),
+            crate::segment_verity::SegmentVerityError::DigestMismatch(reason) => {
+                Self::PayloadIntegrity(reason)
+            }
+        }
+    }
+}
+
 /// Payload compression codec applied to each block stored in `Slab 0`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -140,6 +180,9 @@ pub struct RawBlockSegmentIdentity {
     pub end_block: BlockId,
     /// Trailing SHA-256 digest over all preceding segment bytes.
     pub sha256: [u8; 32],
+    /// SHA-256 digest over header, raw tx slice table, raw row index, and
+    /// trailer (`O(index)` cold admission pin).
+    pub index_sha256: [u8; 32],
     /// Expected Linux `fs-verity` SHA-256 measurement, when known.
     pub fs_verity_sha256: Option<[u8; 32]>,
 }
@@ -159,11 +202,18 @@ impl RawBlockSegmentIdentity {
             start_height,
             end_block,
             sha256: [0; 32],
+            index_sha256: [0; 32],
             fs_verity_sha256: None,
         }
     }
 
     /// Computes the number of contiguous blocks covered by this segment interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError::ChainLinkage`] on reversed intervals
+    /// or [`SettledRawBlockSegmentError::InvalidFormat`] when exceeding the maximum
+    /// segment block bound.
     pub fn block_count(&self) -> Result<u32, SettledRawBlockSegmentError> {
         let span = self
             .end_block

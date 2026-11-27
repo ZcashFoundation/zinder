@@ -1,34 +1,41 @@
-//! Binary framing, header, transaction slice table, and row index definitions for `ZSBLKB01`.
+//! Binary framing, header, transaction slice table, and compact row-index definitions for `ZSBLKB01`.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use zinder_core::{BlockId, wire::encode_internal_block_hash};
+use zinder_core::{BlockHeight, BlockId, wire::encode_internal_block_hash};
+
+use crate::positional_source::ByteRange;
 
 use super::{
     RawBlockCodec, RawBlockSegmentIdentity, SETTLED_RAW_BLOCK_SEGMENT_MAGIC,
     SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES, SettledRawBlockSegmentError,
 };
 
-pub(super) const HEADER_LEN: usize = 128;
-pub(super) const FRAME_PREFIX_LEN: usize = 4;
+pub(crate) const HEADER_LEN: usize = 128;
+pub(crate) const FRAME_PREFIX_LEN: usize = 4;
 pub(super) const FRAME_PREFIX_U32: u32 = 4;
-pub(super) const TX_SLICE_ENTRY_LEN: usize = 40;
-pub(super) const ROW_INDEX_ENTRY_LEN: usize = 128;
-pub(super) const TRAILER_LEN: usize = 32;
-pub(super) const MAX_SLAB_BYTES: u64 = u32::MAX as u64;
+pub(crate) const TX_SLICE_ENTRY_LEN: usize = 40;
+pub(crate) const ROW_INDEX_ENTRY_LEN: usize = 128;
+pub(crate) const TRAILER_LEN: usize = 32;
+pub(crate) const MAX_SLAB_BYTES: u64 = u32::MAX as u64;
+/// Default sealed raw-block segment `Slab 0` byte cap (`256 MiB`) matching `PostgreSQL` `BYTEA` bounds.
+pub const DEFAULT_MAX_SLAB_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const MAX_SEGMENT_BLOCKS: u32 = 1_048_576;
 pub(super) const MIN_FRAME_BYTES: u64 = FRAME_PREFIX_LEN as u64 + 1;
 pub(super) const MAX_TX_ENTRIES_PER_BLOCK: u64 = 262_144;
-pub(super) const MAX_SEGMENT_TX_ENTRIES: usize = 8_388_608;
+pub(crate) const MAX_SEGMENT_TX_ENTRIES: usize = 8_388_608;
+pub(super) const ROW_INDEX_PAGE_ROWS: usize = 64;
+pub(super) const TX_TABLE_PAGE_ENTRIES: usize = 256;
 pub(super) const STAGING_CHUNK: usize = 256 * 1024;
 pub(super) const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 /// Worst-case `Zstd` compressed frame payload upper bound for one `16 MiB` block.
-pub(super) const MAX_COMPRESSED_PAYLOAD_BYTES: usize =
+pub(crate) const MAX_COMPRESSED_PAYLOAD_BYTES: usize =
     SETTLED_RAW_BLOCK_SEGMENT_MAX_BLOCK_BYTES + 128 * 1024;
 
 const _: () = assert!(FRAME_PREFIX_LEN == FRAME_PREFIX_U32 as usize);
 const _: () = assert!(TX_SLICE_ENTRY_LEN == 40);
 const _: () = assert!(ROW_INDEX_ENTRY_LEN == 128);
+const _: () = assert!(std::mem::size_of::<CompactRawBlockRow>() == 20);
 
 pub(super) const VALIDATION_UNVALIDATED: u8 = 0;
 pub(super) const VALIDATION_VALID: u8 = 1;
@@ -36,7 +43,7 @@ pub(super) const VALIDATION_INVALID: u8 = 2;
 
 /// Fixed 128-byte header of one `ZSBLKB01` segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SegmentHeader {
+pub struct RawBlockSegmentHeader {
     pub(super) network_tag: u32,
     pub(super) segment_flags: u16,
     pub(super) codec_id: u16,
@@ -49,7 +56,24 @@ pub(super) struct SegmentHeader {
     pub(super) row_index_offset: u64,
 }
 
-impl SegmentHeader {
+impl RawBlockSegmentHeader {
+    /// Decodes a `128`-byte `ZSBLKB01` header and validates it against
+    /// `expected` and `total_len`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError`] if magic, flags, reserved bytes,
+    /// codec, bounds, identity pins, or total length disagree.
+    pub fn decode(
+        bytes: &[u8; HEADER_LEN],
+        expected: &RawBlockSegmentIdentity,
+        total_len: u64,
+    ) -> Result<Self, SettledRawBlockSegmentError> {
+        let header = Self::decode_unchecked(bytes)?;
+        header.matches_identity(expected, total_len)?;
+        Ok(header)
+    }
+
     pub(super) fn encode(self) -> [u8; HEADER_LEN] {
         let mut header = [0_u8; HEADER_LEN];
         header[..8].copy_from_slice(SETTLED_RAW_BLOCK_SEGMENT_MAGIC);
@@ -66,7 +90,9 @@ impl SegmentHeader {
         header
     }
 
-    pub(super) fn decode(bytes: &[u8; HEADER_LEN]) -> Result<Self, SettledRawBlockSegmentError> {
+    pub(super) fn decode_unchecked(
+        bytes: &[u8; HEADER_LEN],
+    ) -> Result<Self, SettledRawBlockSegmentError> {
         if &bytes[..8] != SETTLED_RAW_BLOCK_SEGMENT_MAGIC {
             return Err(SettledRawBlockSegmentError::InvalidFormat(
                 "raw block segment magic mismatch".to_owned(),
@@ -93,7 +119,12 @@ impl SegmentHeader {
         Ok(header)
     }
 
-    pub(super) fn codec(self) -> Result<RawBlockCodec, SettledRawBlockSegmentError> {
+    /// Returns the compression codec declared in this segment header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError::InvalidFormat`] if `codec_id` is unsupported.
+    pub fn codec(self) -> Result<RawBlockCodec, SettledRawBlockSegmentError> {
         RawBlockCodec::from_id(self.codec_id).ok_or_else(|| {
             SettledRawBlockSegmentError::InvalidFormat(format!(
                 "unsupported raw block segment codec_id {}",
@@ -102,7 +133,43 @@ impl SegmentHeader {
         })
     }
 
-    pub(super) fn slab_len(self) -> Result<u32, SettledRawBlockSegmentError> {
+    /// Returns the first block height covered by this segment.
+    #[must_use]
+    pub const fn start_height(self) -> BlockHeight {
+        BlockHeight::new(self.start_height)
+    }
+
+    /// Returns the number of contiguous blocks stored in this segment.
+    #[must_use]
+    pub const fn block_count(self) -> u32 {
+        self.block_count
+    }
+
+    /// Returns the starting byte offset of `Slab 0`.
+    #[must_use]
+    pub const fn slab_offset(self) -> u64 {
+        self.slab_offset
+    }
+
+    /// Returns the starting byte offset of the flat `40`-byte transaction slice table.
+    #[must_use]
+    pub const fn tx_table_offset(self) -> u64 {
+        self.tx_table_offset
+    }
+
+    /// Returns the starting byte offset of the `128`-byte per-block row index.
+    #[must_use]
+    pub const fn row_index_offset(self) -> u64 {
+        self.row_index_offset
+    }
+
+    /// Returns the byte length of `Slab 0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError::InvalidFormat`] if offsets precede
+    /// or exceed the 32-bit slab offset space.
+    pub fn slab_len(self) -> Result<u32, SettledRawBlockSegmentError> {
         let len = self
             .tx_table_offset
             .checked_sub(self.slab_offset)
@@ -118,7 +185,13 @@ impl SegmentHeader {
         })
     }
 
-    pub(super) fn tx_entry_count(self) -> Result<usize, SettledRawBlockSegmentError> {
+    /// Returns the total transaction slice count recorded in the tx table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError::InvalidFormat`] on misaligned or
+    /// oversized transaction slice tables.
+    pub fn tx_entry_count(self) -> Result<usize, SettledRawBlockSegmentError> {
         let byte_len = self
             .row_index_offset
             .checked_sub(self.tx_table_offset)
@@ -152,6 +225,43 @@ impl SegmentHeader {
         })
     }
 
+    /// Returns the single contiguous [`ByteRange`] spanning the tx slice table,
+    /// row index, and trailing SHA-256 digest for `O(index)` cold admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError::InvalidFormat`] if index or
+    /// trailer byte spans overflow.
+    pub fn index_and_trailer_range(self) -> Result<ByteRange, SettledRawBlockSegmentError> {
+        let total_len = expected_total_file_len(self.row_index_offset, self.block_count)?;
+        let span = total_len.checked_sub(self.tx_table_offset).ok_or_else(|| {
+            SettledRawBlockSegmentError::InvalidFormat(
+                "raw block segment total length precedes tx_table_offset".to_owned(),
+            )
+        })?;
+        let span_usize = usize::try_from(span).map_err(|_| {
+            SettledRawBlockSegmentError::InvalidFormat(
+                "raw block segment index and trailer range exceeds usize".to_owned(),
+            )
+        })?;
+        Ok(ByteRange::new(self.tx_table_offset, span_usize))
+    }
+
+    /// Returns the trailing `32`-byte SHA-256 trailer [`ByteRange`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledRawBlockSegmentError::InvalidFormat`] on size overflow.
+    pub(super) fn trailer_range(self) -> Result<ByteRange, SettledRawBlockSegmentError> {
+        let total_len = expected_total_file_len(self.row_index_offset, self.block_count)?;
+        let trailer_offset = total_len.checked_sub(TRAILER_LEN as u64).ok_or_else(|| {
+            SettledRawBlockSegmentError::InvalidFormat(
+                "raw block segment total length precedes trailer".to_owned(),
+            )
+        })?;
+        Ok(ByteRange::new(trailer_offset, TRAILER_LEN))
+    }
+
     pub(super) fn matches_identity(
         self,
         expected: &RawBlockSegmentIdentity,
@@ -178,7 +288,9 @@ impl SegmentHeader {
     }
 }
 
-fn validate_header_fields(header: &SegmentHeader) -> Result<(), SettledRawBlockSegmentError> {
+fn validate_header_fields(
+    header: &RawBlockSegmentHeader,
+) -> Result<(), SettledRawBlockSegmentError> {
     if header.segment_flags != 0 {
         return Err(SettledRawBlockSegmentError::InvalidFormat(format!(
             "unsupported raw block segment flags {:#06x}",
@@ -306,10 +418,10 @@ impl DecodedRowIndexEntry {
     }
 }
 
-/// In-memory per-block index entry retained by [`super::SettledRawBlockSegmentReader`].
-pub(super) struct IndexedBlock {
-    pub(super) payload_sha256: [u8; 32],
-    pub(super) uncompressed_sha256: [u8; 32],
+/// Compact `20`-byte in-memory per-block descriptor retained by
+/// [`super::SettledRawBlockSegmentIndex`], avoiding full digest and `Vec<TxSliceEntry>` RAM residency.
+#[derive(Debug)]
+pub(super) struct CompactRawBlockRow {
     pub(super) slab_rel_offset: u32,
     pub(super) uncompressed_len: u32,
     pub(super) tx_start_index: u32,
@@ -317,17 +429,19 @@ pub(super) struct IndexedBlock {
     pub(super) validation_state: AtomicU8,
 }
 
-impl IndexedBlock {
-    pub(super) fn from_entry(entry: &DecodedRowIndexEntry) -> Self {
+impl CompactRawBlockRow {
+    pub(super) const fn from_entry(entry: &DecodedRowIndexEntry) -> Self {
         Self {
-            payload_sha256: entry.payload_sha256,
-            uncompressed_sha256: entry.uncompressed_sha256,
             slab_rel_offset: entry.slab_rel_offset,
             uncompressed_len: entry.uncompressed_len,
             tx_start_index: entry.tx_start_index,
             tx_count: entry.tx_count,
             validation_state: AtomicU8::new(VALIDATION_UNVALIDATED),
         }
+    }
+
+    pub(super) fn validation_state(&self) -> u8 {
+        self.validation_state.load(Ordering::Acquire)
     }
 
     pub(super) fn mark_valid(&self) {
@@ -415,8 +529,8 @@ pub(super) fn check_contiguous_block(
     Ok(())
 }
 
-pub(super) fn frame_span(
-    rows: &[IndexedBlock],
+pub(super) fn compact_frame_span(
+    rows: &[CompactRawBlockRow],
     slab_len: u32,
     row_idx: usize,
 ) -> Result<(u32, u32), SettledRawBlockSegmentError> {
@@ -440,28 +554,28 @@ pub(super) fn frame_span(
     Ok((start, len))
 }
 
-fn read_u16_be(slice: &[u8]) -> Result<u16, SettledRawBlockSegmentError> {
+pub(super) fn read_u16_be(slice: &[u8]) -> Result<u16, SettledRawBlockSegmentError> {
     let bytes: [u8; 2] = slice.try_into().map_err(|_| {
         SettledRawBlockSegmentError::InvalidFormat("truncated u16 field".to_owned())
     })?;
     Ok(u16::from_be_bytes(bytes))
 }
 
-fn read_u32_be(slice: &[u8]) -> Result<u32, SettledRawBlockSegmentError> {
+pub(super) fn read_u32_be(slice: &[u8]) -> Result<u32, SettledRawBlockSegmentError> {
     let bytes: [u8; 4] = slice.try_into().map_err(|_| {
         SettledRawBlockSegmentError::InvalidFormat("truncated u32 field".to_owned())
     })?;
     Ok(u32::from_be_bytes(bytes))
 }
 
-fn read_u64_be(slice: &[u8]) -> Result<u64, SettledRawBlockSegmentError> {
+pub(super) fn read_u64_be(slice: &[u8]) -> Result<u64, SettledRawBlockSegmentError> {
     let bytes: [u8; 8] = slice.try_into().map_err(|_| {
         SettledRawBlockSegmentError::InvalidFormat("truncated u64 field".to_owned())
     })?;
     Ok(u64::from_be_bytes(bytes))
 }
 
-fn read_hash32(slice: &[u8]) -> Result<[u8; 32], SettledRawBlockSegmentError> {
+pub(super) fn read_hash32(slice: &[u8]) -> Result<[u8; 32], SettledRawBlockSegmentError> {
     slice.try_into().map_err(|_| {
         SettledRawBlockSegmentError::InvalidFormat("truncated 32-byte hash field".to_owned())
     })

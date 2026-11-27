@@ -12,12 +12,12 @@ use super::{
     SettledShieldedSegmentError, ShieldedSegmentIdentity,
 };
 
-pub(super) const HEADER_LEN: usize = 128;
+pub(crate) const HEADER_LEN: usize = 128;
 pub(crate) const FRAME_PREFIX_LEN: usize = EncodedBlock::PREFIX_LEN;
 pub(super) const FRAME_PREFIX_U32: u32 = 5;
-pub(super) const ROW_INDEX_ENTRY_LEN: usize = 80;
-pub(super) const TRAILER_LEN: usize = 32;
-pub(super) const MAX_SLAB_BYTES: u64 = u32::MAX as u64;
+pub(crate) const ROW_INDEX_ENTRY_LEN: usize = 80;
+pub(crate) const TRAILER_LEN: usize = 32;
+pub(crate) const MAX_SLAB_BYTES: u64 = u32::MAX as u64;
 /// Default sealed shielded segment `Slab 0` byte cap (`256 MiB`) matching `PostgreSQL` `BYTEA` bounds.
 pub const DEFAULT_MAX_SLAB_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const SLAB_TARGET_BYTES: usize = BoundedChunkRetention::MAX_ALLOCATION_BYTES;

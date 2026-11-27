@@ -38,6 +38,10 @@ use std::{io, path::Path};
 use thiserror::Error;
 use zinder_core::{BlockHeight, BlockId, Network};
 
+pub(crate) use format::{
+    CHUNK_INDEX_ENTRY_LEN as SUPPLEMENT_CHUNK_INDEX_ENTRY_LEN, HEADER_LEN as SUPPLEMENT_HEADER_LEN,
+    ROW_INDEX_ENTRY_LEN as SUPPLEMENT_ROW_INDEX_ENTRY_LEN, TRAILER_LEN as SUPPLEMENT_TRAILER_LEN,
+};
 pub use format::{
     DEFAULT_MAX_BYTES as DEFAULT_SETTLED_SUPPLEMENT_SEGMENT_MAX_BYTES, SupplementSegmentHeader,
 };
@@ -46,6 +50,10 @@ pub use reader::{
     SettledSupplementSegmentReader, SupplementChunkReadStep, SupplementRangePlan,
     SupplementRowIndexSlice, SupplementSpliceChunkStep, SupplementSplicePlan,
     VerifiedSupplementRowIndexSlice,
+};
+pub(crate) use section::{
+    BlockEnvelopeIdentity, encode_block_record, exact_zip317_logical_actions_from_outputs,
+    transparent_supplement_from_compact,
 };
 pub use section::{
     BlockSupplementRecord, CanonicalBlockSupplement, CanonicalTransactionSupplement,

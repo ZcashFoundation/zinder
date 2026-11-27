@@ -50,12 +50,40 @@ impl Default for SettledSupplementSegmentWriteOptions {
     }
 }
 
+enum StagedTarget {
+    Temp(NamedTempFile),
+    OwnedFile(File),
+}
+
+struct FinalizedStagedBody {
+    target: StagedTarget,
+    trailer: [u8; 32],
+    index_sha256: [u8; 32],
+    verity_digest: [u8; 32],
+}
+
+impl StagedTarget {
+    fn as_file(&self) -> &File {
+        match self {
+            Self::Temp(temp) => temp.as_file(),
+            Self::OwnedFile(file) => file,
+        }
+    }
+
+    fn as_file_mut(&mut self) -> &mut File {
+        match self {
+            Self::Temp(temp) => temp.as_file_mut(),
+            Self::OwnedFile(file) => file,
+        }
+    }
+}
+
 /// Streaming writer that constructs one immutable `ZSTSUP01` segment.
 pub struct SettledSupplementSegmentWriter {
     target: PathBuf,
     identity: SupplementSegmentIdentity,
     options: SettledSupplementSegmentWriteOptions,
-    staged_file: Option<NamedTempFile>,
+    staged_file: Option<StagedTarget>,
     compressor: Option<Compressor<'static>>,
     first_prev_hash_wire: Option<[u8; 32]>,
     last_block: Option<BlockId>,
@@ -80,6 +108,31 @@ impl SettledSupplementSegmentWriter {
         expected: SupplementSegmentIdentity,
         options: SettledSupplementSegmentWriteOptions,
     ) -> Result<Self, SettledSupplementSegmentError> {
+        let target = path.as_ref().to_path_buf();
+        let staged_file = NamedTempFile::new_in(parent_directory(&target))?;
+        Self::create_target(target, StagedTarget::Temp(staged_file), expected, options)
+    }
+
+    /// Creates a staged `ZSTSUP01` writer backed directly by a caller-owned `File`.
+    pub(crate) fn create_in_file(
+        staged_file: File,
+        expected: SupplementSegmentIdentity,
+        options: SettledSupplementSegmentWriteOptions,
+    ) -> Result<Self, SettledSupplementSegmentError> {
+        Self::create_target(
+            PathBuf::new(),
+            StagedTarget::OwnedFile(staged_file),
+            expected,
+            options,
+        )
+    }
+
+    fn create_target(
+        target: PathBuf,
+        mut staged_file: StagedTarget,
+        expected: SupplementSegmentIdentity,
+        options: SettledSupplementSegmentWriteOptions,
+    ) -> Result<Self, SettledSupplementSegmentError> {
         let block_count = expected.block_count()?;
         if options.chunk_blocks == 0 || options.chunk_blocks > SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS {
             return Err(SettledSupplementSegmentError::InvalidFormat(format!(
@@ -87,8 +140,6 @@ impl SettledSupplementSegmentWriter {
                 options.chunk_blocks
             )));
         }
-        let target = path.as_ref().to_path_buf();
-        let mut staged_file = NamedTempFile::new_in(parent_directory(&target))?;
         staged_file.as_file_mut().write_all(&[0_u8; HEADER_LEN])?;
 
         let compressor = match options.codec {
@@ -240,6 +291,70 @@ impl SettledSupplementSegmentWriter {
     /// Returns [`SettledSupplementSegmentError`] on incomplete spans, hashing,
     /// `fs-verity`, or atomic file persistence failures.
     pub fn finish(mut self) -> Result<SupplementSegmentIdentity, SettledSupplementSegmentError> {
+        let FinalizedStagedBody {
+            target: staged_target,
+            trailer,
+            index_sha256,
+            verity_digest,
+        } = self.finalize_staged_body()?;
+        let StagedTarget::Temp(staged_file) = staged_target else {
+            return Err(SettledSupplementSegmentError::InvalidFormat(
+                "caller-owned staged supplement writer must use finish_staged_file".to_owned(),
+            ));
+        };
+
+        let readonly_staged = segment_verity::reopen_staged(&staged_file, "supplement segment")?;
+        let (writable_file, temp_path) = staged_file.into_parts();
+        drop(writable_file);
+        segment_verity::protect_new_segment(
+            &readonly_staged,
+            Some(verity_digest),
+            "supplement segment",
+        )?;
+        drop(readonly_staged);
+
+        let identity = SupplementSegmentIdentity {
+            sha256: trailer,
+            index_sha256,
+            fs_verity_sha256: Some(verity_digest),
+            ..self.identity
+        };
+        persist_segment(temp_path, &self.target, &identity)?;
+        File::open(parent_directory(&self.target))?.sync_all()?;
+        Ok(identity)
+    }
+
+    /// Finalizes indexes, trailer, and sync on a caller-owned staged file,
+    /// returning its Unix `(dev, ino)` and complete identity (including `index_sha256`)
+    /// before dropping the writable descriptor.
+    pub(crate) fn finish_staged_file(
+        mut self,
+    ) -> Result<((u64, u64), SupplementSegmentIdentity), SettledSupplementSegmentError> {
+        let FinalizedStagedBody {
+            target: staged_target,
+            trailer,
+            index_sha256,
+            verity_digest,
+        } = self.finalize_staged_body()?;
+        let StagedTarget::OwnedFile(staged_file) = staged_target else {
+            return Err(SettledSupplementSegmentError::InvalidFormat(
+                "path-backed staged supplement writer must use finish".to_owned(),
+            ));
+        };
+        let dev_ino = staged_file_dev_ino(&staged_file)?;
+        drop(staged_file);
+        let identity = SupplementSegmentIdentity {
+            sha256: trailer,
+            index_sha256,
+            fs_verity_sha256: Some(verity_digest),
+            ..self.identity
+        };
+        Ok((dev_ino, identity))
+    }
+
+    fn finalize_staged_body(
+        &mut self,
+    ) -> Result<FinalizedStagedBody, SettledSupplementSegmentError> {
         if self.staged_file.is_none() {
             return Err(writer_poisoned());
         }
@@ -274,25 +389,12 @@ impl SettledSupplementSegmentWriter {
 
         let index_sha256 =
             compute_index_sha256(&header_bytes, &self.chunk_index, &self.row_index, &trailer);
-        let readonly_staged = segment_verity::reopen_staged(&staged_file, "supplement segment")?;
-        let (writable_file, temp_path) = staged_file.into_parts();
-        drop(writable_file);
-        segment_verity::protect_new_segment(
-            &readonly_staged,
-            Some(verity_digest),
-            "supplement segment",
-        )?;
-        drop(readonly_staged);
-
-        let identity = SupplementSegmentIdentity {
-            sha256: trailer,
+        Ok(FinalizedStagedBody {
+            target: staged_file,
+            trailer,
             index_sha256,
-            fs_verity_sha256: Some(verity_digest),
-            ..self.identity
-        };
-        persist_segment(temp_path, &self.target, &identity)?;
-        File::open(parent_directory(&self.target))?.sync_all()?;
-        Ok(identity)
+            verity_digest,
+        })
     }
 
     fn flush_pending_chunk(&mut self) -> Result<(), SettledSupplementSegmentError> {
@@ -461,6 +563,20 @@ fn write_chunk_frame(
 fn write_chunk_frame(file: &mut File, frame: &[u8]) -> Result<(), SettledSupplementSegmentError> {
     file.write_all(frame)?;
     Ok(())
+}
+
+fn staged_file_dev_ino(file: &File) -> io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = file.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok((0, 0))
+    }
 }
 
 fn writer_poisoned() -> SettledSupplementSegmentError {

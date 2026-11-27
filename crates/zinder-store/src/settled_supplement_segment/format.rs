@@ -12,10 +12,10 @@ use super::{
     SupplementCompressionCodec, SupplementSegmentIdentity,
 };
 
-pub(super) const HEADER_LEN: usize = 128;
-pub(super) const CHUNK_INDEX_ENTRY_LEN: usize = 48;
-pub(super) const ROW_INDEX_ENTRY_LEN: usize = 80;
-pub(super) const TRAILER_LEN: usize = 32;
+pub(crate) const HEADER_LEN: usize = 128;
+pub(crate) const CHUNK_INDEX_ENTRY_LEN: usize = 48;
+pub(crate) const ROW_INDEX_ENTRY_LEN: usize = 80;
+pub(crate) const TRAILER_LEN: usize = 32;
 pub(super) const STAGING_CHUNK: usize = 256 * 1024;
 pub(super) const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 pub(super) const INDEX_PAGE_ROWS: usize = 64;

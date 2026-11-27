@@ -42,6 +42,11 @@ pub use format::{
     DEFAULT_MAX_SLAB_BYTES as DEFAULT_SETTLED_SHIELDED_SEGMENT_MAX_SLAB_BYTES,
     ShieldedSegmentHeader,
 };
+pub(crate) use format::{
+    FRAME_PREFIX_LEN as SHIELDED_FRAME_PREFIX_LEN, HEADER_LEN as SHIELDED_HEADER_LEN,
+    MAX_SLAB_BYTES as MAX_SHIELDED_SLAB_BYTES, ROW_INDEX_ENTRY_LEN as SHIELDED_ROW_INDEX_ENTRY_LEN,
+    TRAILER_LEN as SHIELDED_TRAILER_LEN,
+};
 pub use reader::{
     BoundedShieldedRangePlan, SettledShieldedSegmentIndex, SettledShieldedSegmentOpenOptions,
     SettledShieldedSegmentReader, ShieldedBatchReadRequest, ShieldedBoundedBatchReadRequest,
