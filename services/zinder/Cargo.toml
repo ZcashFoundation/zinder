@@ -1,0 +1,59 @@
+[package]
+name = "zinder"
+version.workspace = true
+description = "Unified Zinder CLI, runtime supervisor, and operational control binary"
+edition.workspace = true
+readme = "../../README.md"
+keywords = ["zcash", "indexer", "wallet"]
+categories = ["command-line-utilities"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+clap = { workspace = true, features = ["derive"] }
+getrandom.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+metrics.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+zinder-compat-cipherscan.workspace = true
+zinder-compat-lightwalletd.workspace = true
+zinder-core.workspace = true
+zinder-explorer.workspace = true
+zinder-ingest.workspace = true
+zinder-projector.workspace = true
+zinder-query.workspace = true
+zinder-runtime.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
+
+[[bin]]
+name = "zinder"
+path = "src/main.rs"
+
+[dev-dependencies]
+eyre.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+zinder-proto.workspace = true
+zinder-testkit.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["process"] }
+
+[lints]
+workspace = true

@@ -1,3 +1,1 @@
-//! Binary-only CLI helpers shared between `main.rs` and `config.rs`.
-
-pub(crate) mod parse;
+//! Empty stub kept until the obsolete file is removed by the coordinator.

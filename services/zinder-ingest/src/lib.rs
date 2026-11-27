@@ -15,6 +15,7 @@ mod memory_pressure;
 mod mempool;
 mod node_failover;
 mod phase;
+pub mod runtime;
 mod runtime_config;
 mod source_recovery;
 mod subtree_verification;

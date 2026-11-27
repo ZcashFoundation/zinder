@@ -11,6 +11,7 @@ members = [
     "crates/zinder-testkit",
     "crates/zinder-wallet-projection",
     "crates/zinder-wallet-rocksdb",
+    "services/zinder",
     "services/zinder-bench",
     "services/zinder-compat-lightwalletd",
     "services/zinder-compat-cipherscan",
@@ -129,9 +130,12 @@ zstd = "0.13"
 zinder-core = { version = "0.27.0", path = "crates/zinder-core" }
 zinder-rocksdb-bulk-load = { path = "crates/zinder-rocksdb-bulk-load" }
 zinder-client = { version = "0.27.0", path = "crates/zinder-client" }
+zinder-compat-cipherscan = { path = "services/zinder-compat-cipherscan" }
 zinder-compat-lightwalletd = { path = "services/zinder-compat-lightwalletd" }
+zinder-explorer = { path = "services/zinder-explorer" }
 zinder-materialized-views = { path = "crates/zinder-materialized-views" }
 zinder-ingest = { path = "services/zinder-ingest" }
+zinder-projector = { path = "services/zinder-projector" }
 zinder-proto = { version = "0.27.0", path = "crates/zinder-proto" }
 zinder-query = { path = "services/zinder-query" }
 zinder-runtime = { path = "crates/zinder-runtime" }

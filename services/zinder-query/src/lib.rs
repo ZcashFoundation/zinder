@@ -44,6 +44,7 @@ mod observed_canonical_reader;
 mod ordered_transactions;
 pub use light_wallet::{LightWalletNodeQuery, VerifiedNodeTarget};
 mod rocksdb_serving_readers;
+pub mod runtime;
 mod serving_read;
 mod serving_readers;
 mod transparent_unspent_output_stream;
