@@ -683,6 +683,7 @@ fn wallet_ready_summary(
             transparent_address_transaction_count: row_counts.transparent_address_transaction_count,
             transparent_address_balance_count: row_counts.transparent_address_balance_count,
             reorg_undo_count: row_counts.reorg_undo_count,
+            block_hash_by_height_count: row_counts.block_hash_by_height_count,
         },
         utxo_summary: WalletStorageUtxoSummary {
             utxo_count: utxo_summary.utxo_count,

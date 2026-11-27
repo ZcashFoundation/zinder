@@ -280,6 +280,7 @@ struct RowCountSummary {
     transparent_address_transaction_count: u64,
     transparent_address_balance_count: u64,
     reorg_undo_count: u64,
+    block_hash_by_height_count: u64,
 }
 
 struct PreparedFixture {
@@ -743,6 +744,7 @@ fn expected_row_counts(stratum: Stratum, blocks: u64) -> WalletProjectionFamilyR
         transparent_address_transaction_count: history + 1 + baseline + replay_address_transactions,
         transparent_address_balance_count: 1 + stratum_balances,
         reorg_undo_count: u64::from(SUPPORTED_REORG_DEPTH),
+        block_hash_by_height_count: 1 + blocks,
     }
 }
 
@@ -1197,6 +1199,7 @@ const fn row_count_summary(counts: WalletProjectionFamilyRowCounts) -> RowCountS
         transparent_address_transaction_count: counts.transparent_address_transaction_count,
         transparent_address_balance_count: counts.transparent_address_balance_count,
         reorg_undo_count: counts.reorg_undo_count,
+        block_hash_by_height_count: counts.block_hash_by_height_count,
     }
 }
 

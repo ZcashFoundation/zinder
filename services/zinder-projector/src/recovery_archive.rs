@@ -1637,12 +1637,13 @@ mod tests {
         Ok(())
     }
 
-    /// Writes an authentic backup of wallet schema 2 whose payload is unreadable.
+    /// Writes an authentic backup of an unsupported wallet schema whose payload is unreadable.
     ///
-    /// The inner state-bundle manifest records wallet schema 2, and the payload
+    /// The inner state-bundle manifest records `unsupported_schema`, and the payload
     /// lists a file the backup does not hold. Returns the trusted outer SHA-256.
-    fn schema_2_backup_with_unreadable_payload(
+    fn unsupported_schema_backup_with_unreadable_payload(
         archive: &Path,
+        unsupported_schema: u16,
     ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         fs::create_dir(archive)?;
         fs::create_dir(archive.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME))?;
@@ -1651,7 +1652,8 @@ mod tests {
         let mut inner = serde_json::to_value(&state_bundle)?;
         *inner
             .pointer_mut("/wallet_checkpoint/schema_version")
-            .ok_or("inner manifest has a wallet schema")? = serde_json::Value::from(2);
+            .ok_or("inner manifest has a wallet schema")? =
+            serde_json::Value::from(unsupported_schema);
         let inner = serde_json::to_vec(&inner)?;
         fs::write(archive.join(STATE_BUNDLE_MANIFEST_FILE_NAME), &inner)?;
         let missing = RecoveryArchiveFile {
@@ -1669,7 +1671,7 @@ mod tests {
         Ok(Sha256::digest(&outer).into())
     }
 
-    fn require_schema_2_refusal(error: &RecoveryArchiveError) {
+    fn require_unsupported_schema_refusal(error: &RecoveryArchiveError, unsupported_schema: u16) {
         let message = error.to_string();
         assert!(
             matches!(
@@ -1680,55 +1682,64 @@ mod tests {
             ),
             "{message}"
         );
-        assert!(message.contains("wallet schema version 2"), "{message}");
+        assert!(
+            message.contains(&format!("wallet schema version {unsupported_schema}")),
+            "{message}"
+        );
         assert!(message.contains("rebuild the wallet store"), "{message}");
     }
 
     #[test]
-    fn restore_refuses_a_schema_2_backup_before_copying_its_payload()
+    fn restore_refuses_an_unsupported_schema_backup_before_copying_its_payload()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
-        let archive = temporary.path().join("backup");
-        let expected = schema_2_backup_with_unreadable_payload(&archive)?;
-        let destination = temporary.path().join("restored");
+        for unsupported_schema in [1_u16, 3_u16] {
+            let temporary = TempDir::new()?;
+            let archive = temporary.path().join("backup");
+            let expected =
+                unsupported_schema_backup_with_unreadable_payload(&archive, unsupported_schema)?;
+            let destination = temporary.path().join("restored");
 
-        let error = restore_private_backup(
-            &archive,
-            &destination,
-            Network::ZcashRegtest,
-            &expected,
-            RecoveryValidationBudget::default(),
-        )
-        .err()
-        .ok_or("a schema-2 backup was restored")?;
+            let error = restore_private_backup(
+                &archive,
+                &destination,
+                Network::ZcashRegtest,
+                &expected,
+                RecoveryValidationBudget::default(),
+            )
+            .err()
+            .ok_or("an unsupported-schema backup was restored")?;
 
-        require_schema_2_refusal(&error);
-        assert!(!destination.exists());
-        let mut entries = fs::read_dir(temporary.path())?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<Result<Vec<_>, _>>()?;
-        entries.sort();
-        assert_eq!(entries, ["backup"], "restore left a workspace behind");
+            require_unsupported_schema_refusal(&error, unsupported_schema);
+            assert!(!destination.exists());
+            let mut entries = fs::read_dir(temporary.path())?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<Vec<_>, _>>()?;
+            entries.sort();
+            assert_eq!(entries, ["backup"], "restore left a workspace behind");
+        }
         Ok(())
     }
 
     #[test]
-    fn verification_refuses_a_schema_2_backup_before_walking_its_payload()
+    fn verification_refuses_an_unsupported_schema_backup_before_walking_its_payload()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
-        let archive = temporary.path().join("backup");
-        let expected = schema_2_backup_with_unreadable_payload(&archive)?;
+        for unsupported_schema in [1_u16, 3_u16] {
+            let temporary = TempDir::new()?;
+            let archive = temporary.path().join("backup");
+            let expected =
+                unsupported_schema_backup_with_unreadable_payload(&archive, unsupported_schema)?;
 
-        let error = verify_private_backup(
-            &archive,
-            Network::ZcashRegtest,
-            &expected,
-            RecoveryValidationBudget::default(),
-        )
-        .err()
-        .ok_or("a schema-2 backup was verified")?;
+            let error = verify_private_backup(
+                &archive,
+                Network::ZcashRegtest,
+                &expected,
+                RecoveryValidationBudget::default(),
+            )
+            .err()
+            .ok_or("an unsupported-schema backup was verified")?;
 
-        require_schema_2_refusal(&error);
+            require_unsupported_schema_refusal(&error, unsupported_schema);
+        }
         Ok(())
     }
 

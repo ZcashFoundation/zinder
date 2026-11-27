@@ -604,6 +604,7 @@ fn bulk_built_hash_keyed_families_carry_partitioned_filters_and_the_rest_do_not(
         ("transparent_address_transaction", true),
         ("transparent_address_balance", false),
         ("reorg_undo", false),
+        ("block_hash_by_height", false),
     ] {
         let property = |field| aggregated_table_property(&wallet, name, field);
         assert!(property("# entries")? > Some(0), "{name} has no SST rows");
@@ -1831,6 +1832,7 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
             transparent_address_transaction_count: 6,
             transparent_address_balance_count: 2,
             reorg_undo_count: 0,
+            block_hash_by_height_count: 3,
         }
     );
     assert_eq!(
@@ -1842,9 +1844,9 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
     assert_eq!(
         outcome.report.projection_digest.as_bytes(),
         [
-            0xcf, 0xf7, 0xde, 0xc4, 0x25, 0x53, 0x6d, 0x6a, 0x7f, 0xc9, 0x74, 0xa6, 0x6b, 0x12,
-            0xcd, 0x3b, 0xed, 0xf6, 0x17, 0x59, 0x35, 0xc4, 0x05, 0xaa, 0x7f, 0x3b, 0x67, 0x87,
-            0x55, 0xab, 0xb9, 0xf4,
+            0x25, 0xfd, 0xcb, 0x0b, 0x49, 0x39, 0x64, 0x7d, 0xc8, 0x30, 0x29, 0xe9, 0xd5, 0xa1,
+            0x1e, 0x8f, 0xf7, 0x41, 0xf5, 0x42, 0x75, 0xb9, 0x99, 0xb1, 0xd3, 0x67, 0x4e, 0xde,
+            0xcb, 0x6a, 0x93, 0x8a,
         ]
     );
     assert_eq!(outcome.report.scanned_block_count, 3);

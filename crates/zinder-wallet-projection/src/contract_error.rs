@@ -175,6 +175,9 @@ pub enum WalletProjectionContractError {
     /// The ready undo family must cover the unsettled canonical suffix exactly.
     #[error("wallet reorg-undo count does not match the unsettled canonical suffix")]
     ReadyReorgUndoCountMismatch,
+    /// The ready block-hash table must cover every retained canonical block exactly.
+    #[error("wallet block-hash row count does not match the retained canonical sequence")]
+    ReadyBlockHashCountMismatch,
     /// The canonical settled tip is not an ancestor of the ready visible tip.
     #[error("wallet settled tip lies outside the ready canonical source range")]
     ReadySettledTipOutsideSourceRange,

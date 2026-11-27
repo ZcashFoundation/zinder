@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
+    io::{BufReader, BufWriter, Read, Write},
     mem::size_of,
     num::NonZeroU32,
     path::{Path, PathBuf},
@@ -29,11 +30,11 @@ use zinder_store::{
     CanonicalReplaySliceSource, CanonicalStoreError, ObservedCanonicalReplaySequence,
 };
 use zinder_wallet_projection::{
-    WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
-    WalletAddressUnspentOutputKey, WalletOutpointKey, WalletProjectionAccumulator,
-    WalletProjectionContractError, WalletProjectionDigest, WalletProjectionFamilyRowCounts,
-    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletTransactionPosition,
-    WalletUnspentOutput, WalletUtxoSetSummary,
+    StoredWalletSpentOutput, StoredWalletUnspentOutput, WalletAddressBalance,
+    WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
+    WalletBlockHash, WalletOutpointKey, WalletProjectionAccumulator, WalletProjectionContractError,
+    WalletProjectionDigest, WalletProjectionFamilyRowCounts, WalletProjectionRowFamily,
+    WalletReorgUndo, WalletStoredTransactionPosition, WalletUtxoSetSummary,
 };
 
 use crate::{
@@ -41,8 +42,9 @@ use crate::{
     WalletSstWriteDurations,
     accumulator_hashing::ConstructionAccumulators,
     store::{
-        REORG_UNDO_COLUMN_FAMILY, TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
-        TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
+        BLOCK_HASH_BY_HEIGHT_COLUMN_FAMILY, REORG_UNDO_COLUMN_FAMILY,
+        TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY, TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
+        TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
         TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
         TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, WalletColumnFamilyOptions,
     },
@@ -51,7 +53,8 @@ use crate::{
 const OUTPOINT_EVENT_KEY_BYTES: usize = 37;
 const ADDRESS_UNSPENT_KEY_BYTES: usize = 72;
 const ADDRESS_TRANSACTION_KEY_BYTES: usize = 40;
-const SPEND_TRAILER_BYTES: usize = 76;
+const SPEND_TRAILER_BYTES: usize = 44;
+const BLOCK_HASH_CHUNK_RECORD_BYTES: usize = 36;
 const OUTPUT_EVENT_TAG: u8 = 0;
 const SPEND_EVENT_TAG: u8 = 1;
 
@@ -414,7 +417,7 @@ pub(crate) struct PreparedWalletProjectionLoad {
 
 #[derive(Clone, Copy)]
 struct StagedSpend {
-    spent_at: WalletTransactionPosition,
+    spent_at: WalletStoredTransactionPosition,
     input_index: u32,
 }
 
@@ -789,6 +792,114 @@ impl OutpointEventSink for ShardedKeyPrefixWriter<'_, OUTPOINT_EVENT_KEY_BYTES> 
     }
 }
 
+struct BlockHashStageSink<'options> {
+    writer: TimedSstWriter<'options>,
+    accumulators: ConstructionAccumulators,
+    evidence: WalletProjectionSstEvidence,
+}
+
+impl<'options> BlockHashStageSink<'options> {
+    fn new(config: WalletProjectionLoadConfig<'options>) -> Result<Self, RocksDbWalletError> {
+        Ok(Self {
+            writer: ordered_writer(
+                config,
+                WalletProjectionRowFamily::BlockHashByHeight,
+                "wallet-block-hash",
+            )?,
+            accumulators: ConstructionAccumulators::start_optional_branch(config.network, None),
+            evidence: WalletProjectionSstEvidence::default(),
+        })
+    }
+
+    fn append_block(&mut self, block: BlockId) -> Result<(), RocksDbWalletError> {
+        let row = WalletBlockHash::new(block);
+        append_row(
+            &mut self.writer,
+            &mut self.accumulators,
+            &mut self.evidence,
+            WalletProjectionRowFamily::BlockHashByHeight,
+            &row.encode_key(),
+            &row.encode_value(),
+        )
+    }
+
+    fn finish(
+        self,
+    ) -> Result<
+        (
+            SstFileSet,
+            crate::accumulator_hashing::FinishedBranchAccumulators,
+            WalletProjectionSstEvidence,
+        ),
+        RocksDbWalletError,
+    > {
+        let (files, _write_duration) = self.writer.finish()?;
+        let accumulators = self.accumulators.finish_branch()?;
+        Ok((files, accumulators, self.evidence))
+    }
+}
+
+struct TempChunkBlockHashesFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempChunkBlockHashesFile {
+    fn new_armed(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn delete(mut self) -> Result<(), RocksDbWalletError> {
+        let path = std::mem::take(&mut self.path);
+        self.armed = false;
+        fs::remove_file(&path)
+            .map_err(|source| RocksDbWalletError::PathUnavailable { path, source })
+    }
+}
+
+impl Drop for TempChunkBlockHashesFile {
+    fn drop(&mut self) {
+        if self.armed && !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn stream_chunk_block_hashes(
+    path: &Path,
+    block_count: usize,
+    sink: &mut BlockHashStageSink<'_>,
+) -> Result<(), RocksDbWalletError> {
+    let file = fs::File::open(path).map_err(|source| RocksDbWalletError::PathUnavailable {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut record = [0_u8; BLOCK_HASH_CHUNK_RECORD_BYTES];
+    for _ in 0..block_count {
+        reader
+            .read_exact(&mut record)
+            .map_err(|source| RocksDbWalletError::PathUnavailable {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mut height_bytes = [0_u8; 4];
+        height_bytes.copy_from_slice(&record[..4]);
+        let mut hash_bytes = [0_u8; 32];
+        hash_bytes.copy_from_slice(&record[4..]);
+        let block = BlockId::new(
+            BlockHeight::new(u32::from_be_bytes(height_bytes)),
+            BlockHash::from_bytes(hash_bytes),
+        );
+        sink.append_block(block)?;
+    }
+    Ok(())
+}
+
 struct CompletedCanonicalScan {
     first_block: BlockId,
     tip: BlockId,
@@ -803,6 +914,9 @@ struct CompletedCanonicalScan {
     sorted_outpoints: ShardedSortedVariableValues<OUTPOINT_EVENT_KEY_BYTES>,
     outpoint_sort_evidence: VariableValueSortEvidence,
     outpoint_sort_durations: VariableValueSortDurations,
+    block_hash_files: SstFileSet,
+    block_hash_accumulators: crate::accumulator_hashing::FinishedBranchAccumulators,
+    block_hash_evidence: WalletProjectionSstEvidence,
 }
 
 #[derive(Default)]
@@ -830,6 +944,7 @@ struct CompletedReplayChunk {
     last_block: BlockId,
     counters: ScanCounters,
     digests: Vec<CanonicalBlockFactsDigest>,
+    block_hashes_file: TempChunkBlockHashesFile,
 }
 
 struct ChunkWindowState {
@@ -1093,6 +1208,48 @@ fn write_projection_ssts_with_plan(
     finish_projection_ssts_with_plan(config, scanned, shard_plan)
 }
 
+struct CanonicalScanOutcome {
+    first_block: BlockId,
+    tip: BlockId,
+    source_sequence_digest: CanonicalBlockFactsSequenceDigest,
+    retained_undo: RetainedUndo,
+    counters: ScanCounters,
+    canonical_scan: Duration,
+}
+
+fn finish_canonical_scan(
+    outcome: CanonicalScanOutcome,
+    outpoint_sorter: ShardedKeyPrefixSorter<OUTPOINT_EVENT_KEY_BYTES>,
+    block_hash_sink: BlockHashStageSink<'_>,
+) -> Result<CompletedCanonicalScan, RocksDbWalletError> {
+    let (block_hash_files, block_hash_accumulators, block_hash_evidence) =
+        block_hash_sink.finish()?;
+    let phase_started = Instant::now();
+    let sorted_outpoints = outpoint_sorter.finish()?;
+    let outpoint_sort_evidence = sorted_outpoints.evidence();
+    let outpoint_sort_durations = sorted_outpoints.durations();
+    let outpoint_sort = phase_started.elapsed();
+
+    Ok(CompletedCanonicalScan {
+        first_block: outcome.first_block,
+        tip: outcome.tip,
+        source_sequence_digest: outcome.source_sequence_digest,
+        retained_undo: outcome.retained_undo,
+        scanned_block_count: outcome.counters.blocks,
+        scanned_transaction_count: outcome.counters.transactions,
+        staged_output_count: outcome.counters.staged_outputs,
+        staged_spend_count: outcome.counters.staged_spends,
+        canonical_scan: outcome.canonical_scan,
+        outpoint_sort,
+        sorted_outpoints,
+        outpoint_sort_evidence,
+        outpoint_sort_durations,
+        block_hash_files,
+        block_hash_accumulators,
+        block_hash_evidence,
+    })
+}
+
 fn scan_canonical_replay_serial(
     config: WalletProjectionLoadConfig<'_>,
     blocks: impl IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
@@ -1113,6 +1270,7 @@ fn scan_canonical_replay_serial(
     );
     let mut sequence_digest =
         CanonicalBlockFactsSequenceDigestBuilder::new(CanonicalBlockFactsSequenceDigestVersion::V1);
+    let mut block_hash_sink = BlockHashStageSink::new(config)?;
     let mut first_block = None;
     let mut previous_block = None;
     let mut counters = ScanCounters::default();
@@ -1127,6 +1285,7 @@ fn scan_canonical_replay_serial(
             previous_block,
             &mut sequence_digest,
             &mut retained_undo,
+            &mut block_hash_sink,
             &mut outpoint_writer,
             &mut counters,
         )?;
@@ -1135,29 +1294,18 @@ fn scan_canonical_replay_serial(
     outpoint_writer.flush()?;
     let first_block = first_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
     let tip = previous_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
-    let canonical_scan = scan_started.elapsed();
-
-    let phase_started = Instant::now();
-    let sorted_outpoints = outpoint_sorter.finish()?;
-    let outpoint_sort_evidence = sorted_outpoints.evidence();
-    let outpoint_sort_durations = sorted_outpoints.durations();
-    let outpoint_sort = phase_started.elapsed();
-
-    Ok(CompletedCanonicalScan {
-        first_block,
-        tip,
-        source_sequence_digest: sequence_digest.finish(),
-        retained_undo,
-        scanned_block_count: counters.blocks,
-        scanned_transaction_count: counters.transactions,
-        staged_output_count: counters.staged_outputs,
-        staged_spend_count: counters.staged_spends,
-        canonical_scan,
-        outpoint_sort,
-        sorted_outpoints,
-        outpoint_sort_evidence,
-        outpoint_sort_durations,
-    })
+    finish_canonical_scan(
+        CanonicalScanOutcome {
+            first_block,
+            tip,
+            source_sequence_digest: sequence_digest.finish(),
+            retained_undo,
+            counters,
+            canonical_scan: scan_started.elapsed(),
+        },
+        outpoint_sorter,
+        block_hash_sink,
+    )
 }
 
 struct ParallelSettledScan {
@@ -1188,13 +1336,16 @@ fn scan_canonical_replay_parallel(
     );
     let mut sequence_digest =
         CanonicalBlockFactsSequenceDigestBuilder::new(CanonicalBlockFactsSequenceDigestVersion::V1);
+    let mut block_hash_sink = BlockHashStageSink::new(config)?;
     let mut settled = run_parallel_settled_chunks(
         &outpoint_sorter,
+        config.staging_path,
         slice_source,
         chunks,
         worker_count,
         config.first_retained_block,
         &mut sequence_digest,
+        &mut block_hash_sink,
     )?;
     if settled.previous_block != Some(config.settled_tip) {
         return Err(RocksDbWalletError::CanonicalSourceFenceMismatch {
@@ -1205,9 +1356,13 @@ fn scan_canonical_replay_parallel(
         config,
         slice_source,
         &outpoint_sorter,
-        (&mut settled, &mut sequence_digest, &mut retained_undo),
+        (
+            &mut settled,
+            &mut sequence_digest,
+            &mut retained_undo,
+            &mut block_hash_sink,
+        ),
     )?;
-
     let ParallelSettledScan {
         first_block,
         previous_block,
@@ -1224,29 +1379,18 @@ fn scan_canonical_replay_parallel(
             sequence_digest: final_sequence_digest,
         })
         .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
-    let canonical_scan = scan_started.elapsed();
-
-    let phase_started = Instant::now();
-    let sorted_outpoints = outpoint_sorter.finish()?;
-    let outpoint_sort_evidence = sorted_outpoints.evidence();
-    let outpoint_sort_durations = sorted_outpoints.durations();
-    let outpoint_sort = phase_started.elapsed();
-
-    Ok(CompletedCanonicalScan {
-        first_block,
-        tip,
-        source_sequence_digest: final_sequence_digest,
-        retained_undo,
-        scanned_block_count: counters.blocks,
-        scanned_transaction_count: counters.transactions,
-        staged_output_count: counters.staged_outputs,
-        staged_spend_count: counters.staged_spends,
-        canonical_scan,
-        outpoint_sort,
-        sorted_outpoints,
-        outpoint_sort_evidence,
-        outpoint_sort_durations,
-    })
+    finish_canonical_scan(
+        CanonicalScanOutcome {
+            first_block,
+            tip,
+            source_sequence_digest: final_sequence_digest,
+            retained_undo,
+            counters,
+            canonical_scan: scan_started.elapsed(),
+        },
+        outpoint_sorter,
+        block_hash_sink,
+    )
 }
 
 fn scan_unsettled_suffix(
@@ -1257,9 +1401,10 @@ fn scan_unsettled_suffix(
         &mut ParallelSettledScan,
         &mut CanonicalBlockFactsSequenceDigestBuilder,
         &mut RetainedUndo,
+        &mut BlockHashStageSink<'_>,
     ),
 ) -> Result<(), RocksDbWalletError> {
-    let (settled, sequence_digest, retained_undo) = suffix_state;
+    let (settled, sequence_digest, retained_undo, block_hash_sink) = suffix_state;
     let visible_tip = slice_source.ready_evidence().visible_tip;
     let Some(suffix_start) = config.settled_tip.height.next() else {
         return Ok(());
@@ -1283,6 +1428,7 @@ fn scan_unsettled_suffix(
             settled.previous_block,
             sequence_digest,
             retained_undo,
+            block_hash_sink,
             &mut suffix_writer,
             &mut settled.counters,
         )?;
@@ -1298,11 +1444,13 @@ fn scan_unsettled_suffix(
 )]
 fn run_parallel_settled_chunks(
     outpoint_sorter: &ShardedKeyPrefixSorter<OUTPOINT_EVENT_KEY_BYTES>,
+    staging_path: &Path,
     slice_source: &CanonicalReplaySliceSource<'_>,
     chunks: Vec<BlockHeightRange>,
     worker_count: NonZeroU32,
     first_retained_block: BlockId,
     sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
+    block_hash_sink: &mut BlockHashStageSink<'_>,
 ) -> Result<ParallelSettledScan, RocksDbWalletError> {
     let total_chunks = chunks.len();
     let worker_threads = usize::try_from(worker_count.get()).unwrap_or(1);
@@ -1321,7 +1469,7 @@ fn run_parallel_settled_chunks(
             let sender = completed_tx.clone();
             match spawn_canonical_scan_worker(scope, worker_index, move || {
                 let writer = outpoint_sorter.writer(worker_count);
-                scan_worker_chunks(slice_source, window_ref, writer, &sender)
+                scan_worker_chunks(slice_source, window_ref, staging_path, writer, &sender)
             }) {
                 Ok(worker) => workers.push(worker),
                 Err(error) => {
@@ -1337,9 +1485,9 @@ fn run_parallel_settled_chunks(
             verify_completed_chunks(
                 &window,
                 &completed_rx,
-                first_retained_block,
-                total_chunks,
+                (first_retained_block, total_chunks),
                 sequence_digest,
+                block_hash_sink,
             )
         } else {
             Ok((None, None, ScanCounters::default()))
@@ -1382,6 +1530,7 @@ fn run_parallel_settled_chunks(
 fn scan_worker_chunks(
     slice_source: &CanonicalReplaySliceSource<'_>,
     window: &ChunkWindow,
+    staging_path: &Path,
     mut writer: ShardedKeyPrefixWriter<'_, OUTPOINT_EVENT_KEY_BYTES>,
     completed_tx: &SyncSender<Result<CompletedReplayChunk, RocksDbWalletError>>,
 ) -> Result<(), RocksDbWalletError> {
@@ -1389,7 +1538,13 @@ fn scan_worker_chunks(
     while let Some((chunk_index, range)) = window.claim_next() {
         #[cfg(test)]
         window.maybe_inject_worker_unwind(chunk_index);
-        let outcome = scan_one_settled_chunk(slice_source, window, chunk_index, range, &mut writer);
+        let outcome = scan_one_settled_chunk(
+            slice_source,
+            window,
+            staging_path,
+            (chunk_index, range),
+            &mut writer,
+        );
         let failed = outcome.is_err();
         if failed {
             window.stop();
@@ -1404,10 +1559,11 @@ fn scan_worker_chunks(
 fn scan_one_settled_chunk(
     slice_source: &CanonicalReplaySliceSource<'_>,
     window: &ChunkWindow,
-    chunk_index: usize,
-    range: BlockHeightRange,
+    staging_path: &Path,
+    chunk: (usize, BlockHeightRange),
     sink: &mut impl OutpointEventSink,
 ) -> Result<CompletedReplayChunk, RocksDbWalletError> {
+    let (chunk_index, range) = chunk;
     let expected_blocks =
         usize::try_from(u64::from(range.end.value() - range.start.value()) + 1).unwrap_or(0);
     let mut digests = Vec::with_capacity(expected_blocks);
@@ -1415,6 +1571,16 @@ fn scan_one_settled_chunk(
     let mut first_parent_hash = None;
     let mut last_block = None;
     let mut counters = ScanCounters::default();
+    let chunk_hashes_path =
+        staging_path.join(format!("wallet-block-hash-chunk-{chunk_index:08}.bin"));
+    let hashes_file = fs::File::create(&chunk_hashes_path).map_err(|source| {
+        RocksDbWalletError::PathUnavailable {
+            path: chunk_hashes_path.clone(),
+            source,
+        }
+    })?;
+    let block_hashes_file = TempChunkBlockHashesFile::new_armed(chunk_hashes_path);
+    let mut hashes_writer = BufWriter::new(hashes_file);
     let scan = slice_source
         .scan_slice(range)
         .map_err(|source| RocksDbWalletError::CanonicalReplay { source })?;
@@ -1431,10 +1597,26 @@ fn scan_one_settled_chunk(
             first_parent_hash = Some(facts.block_header.parent_hash);
         }
         last_block = Some(block);
+        let mut hash_record = [0_u8; BLOCK_HASH_CHUNK_RECORD_BYTES];
+        hash_record[..4].copy_from_slice(&block.height.value().to_be_bytes());
+        hash_record[4..].copy_from_slice(&block.hash.as_bytes());
+        hashes_writer.write_all(&hash_record).map_err(|source| {
+            RocksDbWalletError::PathUnavailable {
+                path: block_hashes_file.path().to_path_buf(),
+                source,
+            }
+        })?;
         digests.push(reference_digest);
         counters.blocks = increment(counters.blocks)?;
         stage_settled_block_transactions(&facts, block, sink, &mut counters)?;
     }
+    hashes_writer
+        .flush()
+        .map_err(|source| RocksDbWalletError::PathUnavailable {
+            path: block_hashes_file.path().to_path_buf(),
+            source,
+        })?;
+    drop(hashes_writer);
     let first_block = first_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
     let first_parent_hash = first_parent_hash.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
     let last_block = last_block.ok_or(RocksDbWalletError::EmptyCanonicalHistory)?;
@@ -1445,16 +1627,18 @@ fn scan_one_settled_chunk(
         last_block,
         counters,
         digests,
+        block_hashes_file,
     })
 }
 
 fn verify_completed_chunks(
     window: &ChunkWindow,
     completed_rx: &Receiver<Result<CompletedReplayChunk, RocksDbWalletError>>,
-    first_retained_block: BlockId,
-    total_chunks: usize,
+    bounds: (BlockId, usize),
     sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
+    block_hash_sink: &mut BlockHashStageSink<'_>,
 ) -> Result<(Option<BlockId>, Option<BlockId>, ScanCounters), RocksDbWalletError> {
+    let (first_retained_block, total_chunks) = bounds;
     let mut reorder = BTreeMap::new();
     let mut next_to_verify = 0_usize;
     let mut first_block = None;
@@ -1473,9 +1657,16 @@ fn verify_completed_chunks(
                 ready.first_parent_hash,
             )?;
             first_block.get_or_insert(ready.first_block);
+            let block_count = ready.digests.len();
             for digest in ready.digests {
                 sequence_digest.try_append(digest)?;
             }
+            stream_chunk_block_hashes(
+                ready.block_hashes_file.path(),
+                block_count,
+                block_hash_sink,
+            )?;
+            ready.block_hashes_file.delete()?;
             counters.combine(&ready.counters)?;
             previous_block = Some(ready.last_block);
             next_to_verify = next_to_verify.saturating_add(1);
@@ -1495,10 +1686,10 @@ fn stage_settled_block_transactions(
         let tx_index_in_block = u32::try_from(transaction_index)
             .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
         counters.transactions = increment(counters.transactions)?;
-        let transaction_position = WalletTransactionPosition::new(
+        let transaction_position = WalletStoredTransactionPosition::new(
             transaction.public_facts.transaction_id,
             tx_index_in_block,
-            block,
+            block.height,
         );
         for (input_position, input) in transaction.transparent_inputs.iter().enumerate() {
             let expected_input_index = u32::try_from(input_position)
@@ -1530,7 +1721,7 @@ fn stage_settled_block_transactions(
                 output.output_index,
             );
             let outpoint_key = WalletOutpointKey::new(outpoint);
-            let wallet_output = WalletUnspentOutput::new(
+            let wallet_output = StoredWalletUnspentOutput::new(
                 outpoint,
                 output.address_script_hash,
                 output.value_zat,
@@ -1549,7 +1740,7 @@ fn stage_settled_block_transactions(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "serial block staging updates sequence digest, retained undo, outpoint sink, and counters together"
+    reason = "serial block staging updates sequence digest, retained undo, block hashes, outpoint sink, and counters together"
 )]
 #[allow(
     clippy::too_many_lines,
@@ -1562,6 +1753,7 @@ fn stage_serial_block(
     previous_block: Option<BlockId>,
     sequence_digest: &mut CanonicalBlockFactsSequenceDigestBuilder,
     retained_undo: &mut RetainedUndo,
+    block_hash_sink: &mut BlockHashStageSink<'_>,
     sink: &mut impl OutpointEventSink,
     counters: &mut ScanCounters,
 ) -> Result<BlockId, RocksDbWalletError> {
@@ -1575,6 +1767,7 @@ fn stage_serial_block(
         facts.block_header.parent_hash,
     )?;
     first_block.get_or_insert(block);
+    block_hash_sink.append_block(block)?;
     let source_sequence_digest_before = sequence_digest.clone().finish();
     sequence_digest.try_append(reference_digest)?;
     let source_sequence_digest_after = sequence_digest.clone().finish();
@@ -1591,10 +1784,10 @@ fn stage_serial_block(
         let tx_index_in_block = u32::try_from(transaction_index)
             .map_err(|_| WalletProjectionContractError::FactIndexOverflow)?;
         counters.transactions = increment(counters.transactions)?;
-        let transaction_position = WalletTransactionPosition::new(
+        let transaction_position = WalletStoredTransactionPosition::new(
             transaction.public_facts.transaction_id,
             tx_index_in_block,
-            block,
+            block.height,
         );
         for (input_position, input) in transaction.transparent_inputs.iter().enumerate() {
             let expected_input_index = u32::try_from(input_position)
@@ -1629,7 +1822,7 @@ fn stage_serial_block(
                 output.output_index,
             );
             let outpoint_key = WalletOutpointKey::new(outpoint);
-            let wallet_output = WalletUnspentOutput::new(
+            let wallet_output = StoredWalletUnspentOutput::new(
                 outpoint,
                 output.address_script_hash,
                 output.value_zat,
@@ -1762,6 +1955,9 @@ fn finish_projection_ssts_with_plan(
         sorted_outpoints,
         outpoint_sort_evidence,
         outpoint_sort_durations,
+        block_hash_files,
+        block_hash_accumulators,
+        block_hash_evidence,
     } = scanned;
 
     let phase_started = Instant::now();
@@ -1795,6 +1991,7 @@ fn finish_projection_ssts_with_plan(
         )?;
     let mut accumulators =
         ConstructionAccumulators::start(config.network, config.accumulator_hashing_workers)?;
+    accumulators.combine_branch(&block_hash_accumulators)?;
     let branch_pool = accumulators.take_branch_hashing_pool()?;
     let outpoint_summary = drain_outpoint_shards(
         config,
@@ -1804,6 +2001,7 @@ fn finish_projection_ssts_with_plan(
         &mut accumulators,
     )?;
     let mut sst_evidence = outpoint_summary.sst_evidence;
+    sst_evidence.merge(&block_hash_evidence)?;
     let outpoint_merge = phase_started.elapsed();
 
     let phase_started = Instant::now();
@@ -1877,6 +2075,10 @@ fn finish_projection_ssts_with_plan(
         (
             REORG_UNDO_COLUMN_FAMILY,
             PreparedFamilyFiles::from(reorg_undo_files),
+        ),
+        (
+            BLOCK_HASH_BY_HEIGHT_COLUMN_FAMILY,
+            PreparedFamilyFiles::from(block_hash_files),
         ),
     ];
     let (families, sst_file_bytes, sst_file_count) = prepare_families(artifacts)?;
@@ -2985,7 +3187,7 @@ fn drain_outpoint_events(
         }
         let output = output.ok_or(WalletProjectionContractError::MissingTransparentPredecessor)?;
         stage_address_transaction(
-            &output,
+            output.address_script_hash,
             output.created_at,
             targets.address_transaction_writer,
         )?;
@@ -2993,9 +3195,10 @@ fn drain_outpoint_events(
             if !precedes(output.created_at, spend.spent_at) {
                 return Err(WalletProjectionContractError::MissingTransparentPredecessor.into());
             }
-            let spent_output = WalletSpentOutput::new(output, spend.spent_at, spend.input_index);
+            let spent_output =
+                StoredWalletSpentOutput::new(output, spend.spent_at, spend.input_index);
             stage_address_transaction(
-                &spent_output.output,
+                spent_output.output.address_script_hash,
                 spent_output.spent_at,
                 targets.address_transaction_writer,
             )?;
@@ -3009,7 +3212,11 @@ fn drain_outpoint_events(
                 &encoded_value,
             )?;
         } else {
-            let address_key = WalletAddressUnspentOutputKey::new(&output);
+            let address_key = WalletAddressUnspentOutputKey::from_parts(
+                output.address_script_hash,
+                output.created_at.block_height,
+                output.outpoint,
+            );
             targets
                 .address_index_writer
                 .push(*address_key.as_bytes(), &output.value_zat.to_be_bytes())?;
@@ -3018,7 +3225,7 @@ fn drain_outpoint_events(
                 .total_value_zat
                 .checked_add(output.value_zat)
                 .ok_or(WalletProjectionContractError::UtxoValueOverflow)?;
-            targets.accumulators.insert_unspent_output(&output)?;
+            targets.accumulators.insert_stored_unspent_output(&output)?;
             let encoded_value = output.encode_value()?;
             append_row(
                 targets.unspent_writer,
@@ -3036,7 +3243,7 @@ fn drain_outpoint_events(
 fn accept_outpoint_event(
     key: &[u8; OUTPOINT_EVENT_KEY_BYTES],
     encoded_value: &[u8],
-    output: &mut Option<WalletUnspentOutput>,
+    output: &mut Option<StoredWalletUnspentOutput>,
     spend: &mut Option<StagedSpend>,
 ) -> Result<(), RocksDbWalletError> {
     let outpoint_key = WalletOutpointKey::decode(&key[..36])?;
@@ -3045,7 +3252,7 @@ fn accept_outpoint_event(
             if output.is_some() {
                 return Err(WalletProjectionContractError::DuplicateOutput.into());
             }
-            *output = Some(WalletUnspentOutput::decode_value(
+            *output = Some(StoredWalletUnspentOutput::decode_value(
                 outpoint_key,
                 encoded_value,
             )?);
@@ -3171,9 +3378,9 @@ fn drain_address_transactions(
         if targets.aborted.load(Ordering::Acquire) {
             return Ok(false);
         }
-        if first.encoded_value.len() != 64 {
+        if first.encoded_value.len() != 32 {
             return Err(RocksDbWalletError::AdmissionChanged {
-                reason: "address-transaction staging value is not exact64",
+                reason: "address-transaction staging value is not exact32",
             });
         }
         let mut canonical_value = first.encoded_value;
@@ -3193,7 +3400,7 @@ fn drain_address_transactions(
             canonical_value = next_record.encoded_value;
         }
         let key = WalletAddressTransactionKey::decode(&first.key)?;
-        WalletAddressTransaction::decode_value(key, &canonical_value)?;
+        WalletAddressTransaction::decode_stored_value(key, &canonical_value)?;
         targets.undo_collector.try_collect(key)?;
         append_row(
             targets.writer,
@@ -3208,18 +3415,16 @@ fn drain_address_transactions(
 }
 
 fn stage_address_transaction(
-    output: &WalletUnspentOutput,
-    position: WalletTransactionPosition,
+    address_script_hash: zinder_core::TransparentAddressScriptHash,
+    position: WalletStoredTransactionPosition,
     tx_writer: &mut ShardedKeyPrefixWriter<'_, ADDRESS_TRANSACTION_KEY_BYTES>,
 ) -> Result<(), RocksDbWalletError> {
     let key = WalletAddressTransactionKey::new(
-        output.address_script_hash,
-        position.block.height,
+        address_script_hash,
+        position.block_height,
         position.tx_index_in_block,
     );
-    let transaction =
-        WalletAddressTransaction::new(key, position.transaction_id, position.block.hash);
-    tx_writer.push(*key.as_bytes(), &transaction.encode_value())?;
+    tx_writer.push(*key.as_bytes(), &position.transaction_id.as_bytes())?;
     Ok(())
 }
 
@@ -3255,7 +3460,7 @@ fn shard_projection_writer<'options>(
         OrderedSstWriter::new_pipelined(
             staging_path,
             artifact_label,
-            config.options.for_family(family),
+            config.options.for_bulk_sst(family),
             config.sst_target_logical_bytes,
             queue_budget,
         )?
@@ -3263,7 +3468,7 @@ fn shard_projection_writer<'options>(
         OrderedSstWriter::new(
             staging_path,
             artifact_label,
-            config.options.for_family(family),
+            config.options.for_bulk_sst(family),
             config.sst_target_logical_bytes,
         )?
     };
@@ -3282,7 +3487,7 @@ fn ordered_writer<'options>(
         writer: OrderedSstWriter::new(
             config.staging_path,
             artifact_label,
-            config.options.for_family(family),
+            config.options.for_bulk_sst(family),
             config.sst_target_logical_bytes,
         )?,
         write_duration: Duration::ZERO,
@@ -3314,7 +3519,7 @@ impl TimedSstWriter<'_> {
 }
 
 fn prepare_families(
-    artifacts: [(&'static str, PreparedFamilyFiles); 6],
+    artifacts: [(&'static str, PreparedFamilyFiles); 7],
 ) -> Result<(Vec<PreparedWalletColumnFamily>, u64, u64), RocksDbWalletError> {
     let mut families = Vec::with_capacity(artifacts.len());
     let mut sst_file_bytes = 0_u64;
@@ -3354,12 +3559,14 @@ fn validate_next_block(
     }
 }
 
-fn precedes(created_at: WalletTransactionPosition, spent_at: WalletTransactionPosition) -> bool {
-    if created_at.block.height < spent_at.block.height {
+fn precedes(
+    created_at: WalletStoredTransactionPosition,
+    spent_at: WalletStoredTransactionPosition,
+) -> bool {
+    if created_at.block_height < spent_at.block_height {
         return true;
     }
-    created_at.block.height == spent_at.block.height
-        && created_at.block.hash == spent_at.block.hash
+    created_at.block_height == spent_at.block_height
         && created_at.tx_index_in_block < spent_at.tx_index_in_block
 }
 
@@ -3375,8 +3582,7 @@ fn encode_spend_trailer(spend: StagedSpend) -> [u8; SPEND_TRAILER_BYTES] {
     encoded[..32].copy_from_slice(&spend.spent_at.transaction_id.as_bytes());
     encoded[32..36].copy_from_slice(&spend.input_index.to_be_bytes());
     encoded[36..40].copy_from_slice(&spend.spent_at.tx_index_in_block.to_be_bytes());
-    encoded[40..44].copy_from_slice(&spend.spent_at.block.height.value().to_be_bytes());
-    encoded[44..].copy_from_slice(&spend.spent_at.block.hash.as_bytes());
+    encoded[40..44].copy_from_slice(&spend.spent_at.block_height.value().to_be_bytes());
     encoded
 }
 
@@ -3385,7 +3591,7 @@ fn decode_spend_trailer(encoded: &[u8]) -> Result<StagedSpend, RocksDbWalletErro
         encoded
             .try_into()
             .map_err(|_| RocksDbWalletError::AdmissionChanged {
-                reason: "spend staging value is not the exact version-1 76-byte trailer",
+                reason: "spend staging value is not the exact version-2 44-byte trailer",
             })?;
     let mut transaction_id = [0; 32];
     transaction_id.copy_from_slice(&encoded[..32]);
@@ -3395,16 +3601,11 @@ fn decode_spend_trailer(encoded: &[u8]) -> Result<StagedSpend, RocksDbWalletErro
     tx_index.copy_from_slice(&encoded[36..40]);
     let mut height = [0; 4];
     height.copy_from_slice(&encoded[40..44]);
-    let mut block_hash = [0; 32];
-    block_hash.copy_from_slice(&encoded[44..]);
     Ok(StagedSpend {
-        spent_at: WalletTransactionPosition::new(
+        spent_at: WalletStoredTransactionPosition::new(
             TransactionId::from_bytes(transaction_id),
             u32::from_be_bytes(tx_index),
-            BlockId::new(
-                BlockHeight::new(u32::from_be_bytes(height)),
-                BlockHash::from_bytes(block_hash),
-            ),
+            BlockHeight::new(u32::from_be_bytes(height)),
         ),
         input_index: u32::from_be_bytes(input_index),
     })
