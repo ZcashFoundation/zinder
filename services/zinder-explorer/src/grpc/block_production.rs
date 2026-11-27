@@ -520,13 +520,23 @@ fn read_block_production_in_time_range_sync(
         evaluate_time_range_candidates(params.secondary, &snapshot, params.epoch, &page.rows)?;
     drop(snapshot);
 
-    let (coverage, read_fence) = build_time_range_coverage_and_fence(
-        params.secondary,
-        params.epoch,
+    let canonical_tip_hash = params
+        .secondary
+        .block_header_at(params.epoch.visible_tip_height)
+        .map_err(internal_canonical_error)?
+        .map(|header| header.block_hash);
+    let mv_matches_canonical_epoch = mv_state.chain_epoch_id == params.epoch.id
+        && mv_state.tip_height == params.epoch.visible_tip_height
+        && canonical_tip_hash == Some(mv_state.tip_hash);
+
+    let (coverage, read_fence) = build_time_range_coverage_and_fence(TimeRangeCoverageInput {
+        first_retained: params.secondary.history_bounds().first_available_height(),
+        epoch: params.epoch,
         mv_state,
         mv_coverage,
-        evaluated.missing_block_count,
-    );
+        missing_block_count: evaluated.missing_block_count,
+        mv_matches_canonical_epoch,
+    });
     let next_cursor = page.next_cursor.map_or_else(Vec::new, |cursor| {
         encode_time_cursor(params.start_time, params.end_time, &read_fence, cursor)
     });
@@ -617,18 +627,32 @@ fn evaluate_time_range_candidates(
     })
 }
 
-fn build_time_range_coverage_and_fence(
-    secondary: &RocksDbCanonicalSecondary,
+#[derive(Clone, Copy)]
+struct TimeRangeCoverageInput {
+    first_retained: BlockHeight,
     epoch: ChainEpoch,
     mv_state: MaterializedViewState,
     mv_coverage: Option<BlockProductionTimeBackfillCoverage>,
     missing_block_count: u32,
+    mv_matches_canonical_epoch: bool,
+}
+
+fn build_time_range_coverage_and_fence(
+    input: TimeRangeCoverageInput,
 ) -> (
     BlockProductionTimeRangeCoverage,
     BlockProductionTimeRangeReadFence,
 ) {
-    let first_retained = secondary.history_bounds().first_available_height();
+    let TimeRangeCoverageInput {
+        first_retained,
+        epoch,
+        mv_state,
+        mv_coverage,
+        missing_block_count,
+        mv_matches_canonical_epoch,
+    } = input;
     let requested_range_complete = missing_block_count == 0
+        && mv_matches_canonical_epoch
         && first_retained == BlockHeight::new(1)
         && mv_coverage.is_some_and(|cov| {
             cov.complete_from_height == BlockHeight::new(1)

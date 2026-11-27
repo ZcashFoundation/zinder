@@ -20,7 +20,10 @@ use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
     MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
 };
-use crate::{MaterializedViewStore, MaterializedViewStoreColumnFamily, MaterializedViewStoreError};
+use crate::{
+    MaterializedViewStore, MaterializedViewStoreColumnFamily, MaterializedViewStoreError,
+    MaterializedViewStoreReadSnapshot,
+};
 
 /// Root-keyed canonical block matches.
 pub const COMMITMENT_ROOT_SEARCH_COLUMN_FAMILY: &str = "commitment_root_search";
@@ -118,31 +121,77 @@ impl CommitmentRootSearchConsumer {
         root: FinalNoteCommitmentRoot,
         max_matches: usize,
     ) -> Result<Vec<CommitmentRootIndexEntry>, MaterializedViewStoreError> {
-        if max_matches == 0 {
+        let snapshot = store.read_snapshot();
+        Self::search_snapshot_page(&snapshot, root, None, max_matches)
+    }
+
+    /// Reads one bounded newest-first page of candidates for `root` from a
+    /// consistent read snapshot, strictly after `after` when provided.
+    pub fn search_snapshot_page(
+        snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+        root: FinalNoteCommitmentRoot,
+        after: Option<&CommitmentRootIndexEntry>,
+        page_limit: usize,
+    ) -> Result<Vec<CommitmentRootIndexEntry>, MaterializedViewStoreError> {
+        if page_limit == 0 {
             return Ok(Vec::new());
         }
-        let mut start_key = [0_u8; ROOT_KEY_LEN];
-        start_key[..ROOT_PREFIX_LEN].copy_from_slice(&root.as_bytes());
+        let cursor_key = after.map(|cursor| {
+            encode_root_key(
+                root,
+                cursor.protocol,
+                cursor.block_height,
+                cursor.block_hash,
+            )
+        });
+        let start_key = cursor_key.unwrap_or_else(|| {
+            let mut key = [0_u8; ROOT_KEY_LEN];
+            key[..ROOT_PREFIX_LEN].copy_from_slice(&root.as_bytes());
+            key
+        });
         let mut end_key = [0xff_u8; ROOT_KEY_LEN];
         end_key[..ROOT_PREFIX_LEN].copy_from_slice(&root.as_bytes());
-        let entries = store.range_iterate_consumer(
+        let fetch_cap = if cursor_key.is_some() {
+            page_limit.saturating_add(1)
+        } else {
+            page_limit
+        };
+        let raw_entries = snapshot.range_iterate_consumer(
             COMMITMENT_ROOT_SEARCH_COLUMN_FAMILY,
             &start_key,
             &end_key,
-            max_matches,
+            fetch_cap,
         )?;
-        entries
-            .into_iter()
-            .map(|(key, payload)| decode_index_entry(&key, &payload))
-            .collect()
+        let mut out = Vec::with_capacity(raw_entries.len().min(page_limit));
+        for (key, payload) in raw_entries {
+            if cursor_key
+                .as_ref()
+                .is_some_and(|cursor| key.as_slice() == cursor.as_slice())
+            {
+                continue;
+            }
+            out.push(decode_index_entry(&key, &payload)?);
+            if out.len() >= page_limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Reads the contiguous historical range completed by backfill.
     pub fn backfill_coverage(
         store: &MaterializedViewStore,
     ) -> Result<Option<CommitmentRootBackfillCoverage>, MaterializedViewStoreError> {
+        let snapshot = store.read_snapshot();
+        Self::backfill_coverage_snapshot(&snapshot)
+    }
+
+    /// Reads the contiguous historical backfill range from one read snapshot.
+    pub fn backfill_coverage_snapshot(
+        snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+    ) -> Result<Option<CommitmentRootBackfillCoverage>, MaterializedViewStoreError> {
         let Some(payload) =
-            store.get_consumer(COMMITMENT_ROOT_SEARCH_COVERAGE_COLUMN_FAMILY, COVERAGE_KEY)?
+            snapshot.get_consumer(COMMITMENT_ROOT_SEARCH_COVERAGE_COLUMN_FAMILY, COVERAGE_KEY)?
         else {
             return Ok(None);
         };
@@ -616,6 +665,51 @@ mod tests {
             CommitmentRootBackfillCoverage::new(BlockHeight::new(100), BlockHeight::new(103)),
         );
         assert!(discontinuous.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_paging_walks_repeated_roots_without_gaps_or_duplicates() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let mut consumer = CommitmentRootSearchConsumer::new();
+        for height in 100..=104 {
+            apply_block(
+                &store,
+                &mut consumer,
+                &block(height, [Some(root(7)), Some(root(7)), None]),
+            )?;
+        }
+
+        let snapshot = store.read_snapshot();
+        let page1 =
+            CommitmentRootSearchConsumer::search_snapshot_page(&snapshot, root(7), None, 4)?;
+        let page2 = CommitmentRootSearchConsumer::search_snapshot_page(
+            &snapshot,
+            root(7),
+            page1.last(),
+            4,
+        )?;
+        let page3 = CommitmentRootSearchConsumer::search_snapshot_page(
+            &snapshot,
+            root(7),
+            page2.last(),
+            4,
+        )?;
+        drop(snapshot);
+
+        assert_eq!(page1.len(), 4);
+        assert_eq!(page2.len(), 4);
+        assert_eq!(page3.len(), 2);
+        let heights: Vec<u32> = page1
+            .into_iter()
+            .chain(page2)
+            .chain(page3)
+            .map(|entry| entry.block_height.value())
+            .collect();
+        assert_eq!(
+            heights,
+            vec![104, 104, 103, 103, 102, 102, 101, 101, 100, 100]
+        );
         Ok(())
     }
 }

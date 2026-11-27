@@ -1478,3 +1478,292 @@ async fn explorer_without_canonical_secondary_degrades_gracefully() -> Result<()
     wallet_server.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn lagging_mv_after_same_height_reorg_reports_incomplete_coverage() -> Result<()> {
+    let activations = sample_regtest_upgrade_activations();
+    let canonical_dir = TempDir::new()?;
+    let canonical_path = canonical_dir.path().join("canonical");
+    let secondary_dir = TempDir::new()?;
+
+    let (canonical_primary, mut baseline) =
+        publish_baseline_store(&canonical_path, secondary_dir.path(), &activations)?;
+    let (canonical_primary, b2_new_roots, _, _) =
+        commit_reorg_block2(&mut baseline, &activations, canonical_primary)?;
+    // Leave mv_primary at baseline epoch 1 / height 2 without running MaterializedViewTailer catch-up.
+    let (canonical_secondary, mv_secondary) =
+        open_explorer_secondaries(&canonical_path, secondary_dir.path())?;
+    let wallet_dir = TempDir::new()?;
+    let wallet_fixture = WalletServingStoreFixture::from_published_canonical(
+        wallet_dir,
+        &canonical_path,
+        canonical_primary,
+        &activations,
+    )?;
+    let (wallet_server, _wallet_fixtures) = spawn_wallet_server(wallet_fixture).await?;
+    let explorer_adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
+        network: Network::ZcashRegtest,
+    })
+    .with_canonical_store(Arc::new(RwLock::new(canonical_secondary)))
+    .with_materialized_view_store(mv_secondary)
+    .with_wallet_query_endpoint(format!("http://{}", wallet_server.addr));
+    let (explorer_server, mut client) = spawn_explorer_server(explorer_adapter).await?;
+
+    let time_range = client
+        .block_production_in_time_range(BlockProductionInTimeRangeRequest {
+            start_time_unix_seconds: BLOCK2_NEW_TIME,
+            end_time_unix_seconds: BLOCK2_NEW_TIME + 10,
+            max_entries: 10,
+            from_cursor: Vec::new(),
+            at_epoch_id: None,
+        })
+        .await?
+        .into_inner();
+    assert!(
+        !time_range
+            .coverage
+            .ok_or_else(|| eyre!("missing time range coverage"))?
+            .requested_range_complete
+    );
+
+    let root = first_present_root(b2_new_roots).ok_or_else(|| eyre!("missing b2_new root"))?;
+    let root_search = client
+        .commitment_root_search(CommitmentRootSearchRequest {
+            root,
+            max_matches: 10,
+        })
+        .await?
+        .into_inner();
+    assert!(
+        !root_search
+            .coverage
+            .ok_or_else(|| eyre!("missing root search coverage"))?
+            .canonical_history_complete
+    );
+
+    explorer_server.shutdown().await?;
+    wallet_server.shutdown().await?;
+    Ok(())
+}
+
+struct SharedRootDisplacementBundle {
+    canonical_dir: TempDir,
+    secondary_dir: TempDir,
+    primary_store: RocksDbCanonicalStore,
+    stale_h2_canonical: RocksDbCanonicalSecondary,
+    mv_secondary: MaterializedViewStore,
+    shared_root: Vec<u8>,
+    b2_alt2_hash: BlockHash,
+}
+
+fn build_block2_with_hash(
+    activations: &NetworkUpgradeActivations,
+    base_acc: &CommitmentTreeAccumulator,
+    hash_fill: u8,
+    block_time: i64,
+) -> Result<ConstructedBlock> {
+    let mut acc = base_acc.clone();
+    let coinbase = make_coinbase_spec(2, 625_000_000, [hash_fill; 20])?;
+    assemble_block(
+        BlockBlueprint {
+            height: 2,
+            block_hash: [hash_fill; 32],
+            parent_hash: [0x11; 32],
+            block_time,
+            raw_block_bytes: vec![hash_fill; 96],
+            txs: vec![coinbase],
+        },
+        activations,
+        &mut acc,
+    )
+}
+
+fn replace_block2_sequence(
+    mut primary: RocksDbCanonicalStore,
+    activations: &NetworkUpgradeActivations,
+    steps: Vec<(CanonicalBuildBlock, u64)>,
+) -> Result<RocksDbCanonicalStore> {
+    for (block, ts) in steps {
+        let fence = primary.event_fence();
+        let (next, _) = primary.commit_live_replacement(
+            CanonicalLiveReplacement::new(
+                fence,
+                vec![CanonicalReplacementBlock::new(block, Vec::new())],
+                UnixTimestampMillis::new(ts),
+            ),
+            activations,
+        )?;
+        primary = next;
+    }
+    Ok(primary)
+}
+
+fn append_block3_with_shared_root(
+    primary: RocksDbCanonicalStore,
+    baseline: &BaselineOutput,
+    activations: &NetworkUpgradeActivations,
+    shared_sapling: [u8; 32],
+) -> Result<RocksDbCanonicalStore> {
+    let mut b3_acc = baseline.base_acc.clone();
+    let _ = assemble_block(
+        BlockBlueprint {
+            height: 2,
+            block_hash: [0x23; 32],
+            parent_hash: [0x11; 32],
+            block_time: BLOCK2_NEW_TIME + 5,
+            raw_block_bytes: vec![0x23; 96],
+            txs: vec![make_coinbase_spec(2, 625_000_000, [0x23; 20])?],
+        },
+        activations,
+        &mut b3_acc,
+    )?;
+    let mut b3 = assemble_block(
+        BlockBlueprint {
+            height: 3,
+            block_hash: [0x33; 32],
+            parent_hash: [0x23; 32],
+            block_time: BLOCK3_TIME,
+            raw_block_bytes: vec![0x33; 96],
+            txs: vec![make_coinbase_spec(3, 625_000_000, [0x33; 20])?],
+        },
+        activations,
+        &mut b3_acc,
+    )?;
+    let forced_b3 = BlockFinalNoteCommitmentRoots::new(
+        BlockHeight::new(3),
+        BlockHash::from_bytes([0x33; 32]),
+        Some(zinder_core::FinalNoteCommitmentRoot::from_bytes(
+            shared_sapling,
+        )),
+        b3.final_roots.orchard,
+        b3.final_roots.ironwood,
+    );
+    b3.commit_context.final_note_commitment_roots = Some(forced_b3);
+    let append_fence = primary.event_fence();
+    let (next_primary, _) = primary.commit_live_append(
+        CanonicalLiveAppend::new(
+            append_fence,
+            b3.build_block,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0x11; 32])),
+            UnixTimestampMillis::new(1_750_000_000_500),
+        ),
+        activations,
+    )?;
+    baseline.tail_canonical.write().try_catch_up()?;
+    build_tailer(
+        Arc::clone(&baseline.tail_canonical),
+        baseline.mv_primary.clone(),
+        Arc::new(activations.clone()),
+    )
+    .catch_up()?;
+    CommitmentRootSearchConsumer::new()
+        .write_backfill_batch(
+            &baseline.mv_primary,
+            &[b3.commit_context],
+            CommitmentRootBackfillCoverage::new(BlockHeight::new(1), BlockHeight::new(3)),
+        )
+        .map_err(|error| eyre!("{error}"))?;
+    Ok(next_primary)
+}
+
+fn setup_shared_root_displacement_bundle() -> Result<SharedRootDisplacementBundle> {
+    let activations = sample_regtest_upgrade_activations();
+    let canonical_dir = TempDir::new()?;
+    let canonical_path = canonical_dir.path().join("canonical");
+    let secondary_dir = TempDir::new()?;
+    let (primary, baseline) =
+        publish_baseline_store(&canonical_path, secondary_dir.path(), &activations)?;
+    let alt1 = build_block2_with_hash(&activations, &baseline.base_acc, 0x21, BLOCK2_NEW_TIME)?;
+    let alt2_first =
+        build_block2_with_hash(&activations, &baseline.base_acc, 0x23, BLOCK2_NEW_TIME + 5)?;
+    let alt2_second =
+        build_block2_with_hash(&activations, &baseline.base_acc, 0x23, BLOCK2_NEW_TIME + 5)?;
+    let alt3 = build_block2_with_hash(&activations, &baseline.base_acc, 0x25, BLOCK2_NEW_TIME + 8)?;
+    let shared_sapling = alt2_second
+        .final_roots
+        .sapling
+        .ok_or_else(|| eyre!("missing alt2 sapling final root"))?
+        .as_bytes();
+
+    // Event 2 displaces b2_old, Event 3 displaces alt1, Event 4 displaces alt2,
+    // Event 5 displaces alt3 and re-adopts alt2 as canonical at height 2.
+    let primary = replace_block2_sequence(
+        primary,
+        &activations,
+        vec![
+            (alt1.build_block, 1_750_000_000_100),
+            (alt2_first.build_block, 1_750_000_000_200),
+            (alt3.build_block, 1_750_000_000_300),
+            (alt2_second.build_block, 1_750_000_000_400),
+        ],
+    )?;
+
+    // Freeze Explorer canonical secondary at height 2 (alt2) before appending block 3 for MV.
+    let stale_h2_canonical = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &canonical_path,
+        secondary_dir.path().join("stale-h2"),
+        Network::ZcashRegtest,
+        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
+        CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let primary = append_block3_with_shared_root(primary, &baseline, &activations, shared_sapling)?;
+    let (_latest_canonical, mv_secondary) =
+        open_explorer_secondaries(&canonical_path, secondary_dir.path())?;
+    Ok(SharedRootDisplacementBundle {
+        canonical_dir,
+        secondary_dir,
+        primary_store: primary,
+        stale_h2_canonical,
+        mv_secondary,
+        shared_root: shared_sapling.to_vec(),
+        b2_alt2_hash: BlockHash::from_bytes([0x23; 32]),
+    })
+}
+
+#[tokio::test]
+async fn commitment_root_search_pages_past_ahead_mv_candidates_and_reports_displaced_coverage()
+-> Result<()> {
+    let bundle = setup_shared_root_displacement_bundle()?;
+    let _keep_alive = (
+        bundle.canonical_dir,
+        bundle.secondary_dir,
+        bundle.primary_store,
+    );
+    let explorer_adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
+        network: Network::ZcashRegtest,
+    })
+    .with_canonical_store(Arc::new(RwLock::new(bundle.stale_h2_canonical)))
+    .with_materialized_view_store(bundle.mv_secondary);
+    let (explorer_server, mut client) = spawn_explorer_server(explorer_adapter).await?;
+
+    let response = client
+        .commitment_root_search(CommitmentRootSearchRequest {
+            root: bundle.shared_root,
+            max_matches: 1,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(response.matches.len(), 1);
+    assert_eq!(response.matches[0].block_height, 2);
+    assert_eq!(
+        response.matches[0].block_hash,
+        encode_rpc_block_hash_hex(bundle.b2_alt2_hash)
+    );
+    let canonical_coverage = response
+        .coverage
+        .as_ref()
+        .ok_or_else(|| eyre!("missing canonical coverage"))?;
+    assert!(!canonical_coverage.canonical_history_complete);
+    let displaced_coverage = response
+        .displaced_coverage
+        .as_ref()
+        .ok_or_else(|| eyre!("missing displaced coverage"))?;
+    assert_eq!(displaced_coverage.captured_block_count, 4);
+    assert_eq!(displaced_coverage.root_artifact_unavailable_count, 4);
+    assert!(!displaced_coverage.captured_range_complete);
+    explorer_server.shutdown().await?;
+    Ok(())
+}

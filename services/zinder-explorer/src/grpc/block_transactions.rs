@@ -1,6 +1,6 @@
 //! `ExplorerQuery.BlockTransactions` handler.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use tonic::{Request, Response, Status};
 use zinder_core::{
@@ -237,67 +237,49 @@ fn resolve_block_prevouts(
     let locations = secondary
         .transaction_locations(&parent_txids)
         .map_err(internal_canonical_error)?;
+    let location_by_txid: HashMap<TransactionId, _> = parent_txids
+        .into_iter()
+        .zip(locations)
+        .filter_map(|(txid, maybe_loc)| maybe_loc.map(|loc| (txid, loc)))
+        .collect();
 
-    let mut needed_outpoints: Vec<(BlockHeight, BlockHash, TransactionId, u32, u32)> = Vec::new();
     let current_height = block_facts.block_header.height;
     let first_retained = secondary.history_bounds().first_available_height();
-    for tx in &block_facts.transactions {
-        for input in &tx.transparent_inputs {
-            if input.spent_outpoint.is_coinbase_sentinel() {
-                continue;
-            }
-            let Some(pos) = parent_txids
-                .iter()
-                .position(|txid| *txid == input.spent_outpoint.transaction_id)
-            else {
-                continue;
-            };
-            let Some(Some(loc)) = locations.get(pos) else {
-                continue;
-            };
-            if loc.block_height <= epoch.visible_tip_height && loc.block_height >= first_retained {
-                needed_outpoints.push((
-                    loc.block_height,
-                    loc.block_hash,
-                    loc.transaction_id,
-                    loc.tx_index_in_block,
-                    input.spent_outpoint.output_index,
-                ));
-            }
-        }
-    }
+    let (intra_block_needed, external_by_height) = partition_needed_prevouts(
+        &block_facts.transactions,
+        &location_by_txid,
+        current_height,
+        epoch.visible_tip_height,
+        first_retained,
+    );
 
-    let mut resolved = HashMap::with_capacity(needed_outpoints.len());
-    let mut external_heights: Vec<BlockHeight> = needed_outpoints
-        .iter()
-        .filter_map(|(height, _, _, _, _)| (*height != current_height).then_some(*height))
-        .collect();
-    external_heights.sort_unstable();
-    external_heights.dedup();
-
-    for &(height, block_hash, txid, tx_idx, out_idx) in &needed_outpoints {
-        if height == current_height && block_facts.block_header.block_hash == block_hash {
+    let mut resolved = HashMap::with_capacity(
+        intra_block_needed.len() + external_by_height.values().map(Vec::len).sum::<usize>(),
+    );
+    for (block_hash, txid, tx_idx, out_idx) in intra_block_needed {
+        if block_facts.block_header.block_hash == block_hash {
             insert_prevout_from_facts(block_facts, txid, tx_idx, out_idx, &mut resolved);
         }
     }
 
-    if !external_heights.is_empty() {
+    if !external_by_height.is_empty() {
+        let external_heights: Vec<BlockHeight> = external_by_height.keys().copied().collect();
         secondary
             .visit_block_replay_facts_at_heights(&external_heights, |idx, maybe_parent_facts| {
                 let Some(parent_facts) = maybe_parent_facts else {
                     return Ok(());
                 };
-                let target_height = external_heights[idx];
-                for &(height, block_hash, txid, tx_idx, out_idx) in &needed_outpoints {
-                    if height == target_height && parent_facts.block_header.block_hash == block_hash
-                    {
-                        insert_prevout_from_facts(
-                            &parent_facts,
-                            txid,
-                            tx_idx,
-                            out_idx,
-                            &mut resolved,
-                        );
+                if let Some(height_outpoints) = external_by_height.get(&external_heights[idx]) {
+                    for &(block_hash, txid, tx_idx, out_idx) in height_outpoints {
+                        if parent_facts.block_header.block_hash == block_hash {
+                            insert_prevout_from_facts(
+                                &parent_facts,
+                                txid,
+                                tx_idx,
+                                out_idx,
+                                &mut resolved,
+                            );
+                        }
                     }
                 }
                 Ok::<(), CanonicalReplayVisitError>(())
@@ -306,6 +288,48 @@ fn resolve_block_prevouts(
     }
 
     Ok(resolved)
+}
+
+type NeededOutpoint = (BlockHash, TransactionId, u32, u32);
+type ExternalOutpointsByHeight = BTreeMap<BlockHeight, Vec<NeededOutpoint>>;
+
+fn partition_needed_prevouts(
+    transactions: &[CanonicalTransactionFacts],
+    location_by_txid: &HashMap<TransactionId, zinder_core::TransactionLocation>,
+    current_height: BlockHeight,
+    visible_tip_height: BlockHeight,
+    first_retained: BlockHeight,
+) -> (Vec<NeededOutpoint>, ExternalOutpointsByHeight) {
+    let mut intra_block_needed = Vec::new();
+    let mut external_by_height: ExternalOutpointsByHeight = BTreeMap::new();
+    for tx in transactions {
+        for input in &tx.transparent_inputs {
+            if input.spent_outpoint.is_coinbase_sentinel() {
+                continue;
+            }
+            let Some(loc) = location_by_txid.get(&input.spent_outpoint.transaction_id) else {
+                continue;
+            };
+            if loc.block_height > visible_tip_height || loc.block_height < first_retained {
+                continue;
+            }
+            let entry = (
+                loc.block_hash,
+                loc.transaction_id,
+                loc.tx_index_in_block,
+                input.spent_outpoint.output_index,
+            );
+            if loc.block_height == current_height {
+                intra_block_needed.push(entry);
+            } else {
+                external_by_height
+                    .entry(loc.block_height)
+                    .or_default()
+                    .push(entry);
+            }
+        }
+    }
+    (intra_block_needed, external_by_height)
 }
 
 fn collect_unique_parent_txids(transactions: &[CanonicalTransactionFacts]) -> Vec<TransactionId> {

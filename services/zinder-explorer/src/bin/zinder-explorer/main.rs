@@ -531,16 +531,18 @@ fn spawn_materialized_view_catchup_task<CatchUp>(
     cancel: CancellationToken,
 ) -> JoinHandle<()>
 where
-    CatchUp: Fn() -> Result<(), MaterializedViewStoreError> + Send + 'static,
+    CatchUp: Fn() -> Result<(), MaterializedViewStoreError> + Send + Sync + 'static,
 {
+    let catch_up = Arc::new(catch_up);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let cause = match catch_up() {
-                        Ok(()) => ReadinessCause::Ready,
-                        Err(error) => {
+                    let catch_up_fn = Arc::clone(&catch_up);
+                    let cause = match tokio::task::spawn_blocking(move || catch_up_fn()).await {
+                        Ok(Ok(())) => ReadinessCause::Ready,
+                        Ok(Err(error)) => {
                             tracing::warn!(
                                 target: "zinder::explorer",
                                 event = "materialized_view_secondary_catchup_failed",
@@ -548,6 +550,15 @@ where
                                 "materialized-view store secondary catchup failed"
                             );
                             materialized_view_catchup_failure_cause(&error)
+                        }
+                        Err(join_error) => {
+                            tracing::warn!(
+                                target: "zinder::explorer",
+                                event = "materialized_view_secondary_catchup_panicked",
+                                error = %join_error,
+                                "materialized-view store secondary catchup task failed"
+                            );
+                            ReadinessCause::StorageUnavailable
                         }
                     };
                     readiness.publish_input(ReadinessInput::MaterializedViewCatchup, cause);

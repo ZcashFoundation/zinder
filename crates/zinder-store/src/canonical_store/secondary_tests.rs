@@ -2155,3 +2155,55 @@ fn canonical_secondary_reads_and_catches_up_displaced_archive_rows()
     drop(store);
     Ok(())
 }
+
+#[test]
+fn canonical_secondary_pages_displaced_root_index_without_scanning_full_archive()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let requirements =
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions);
+    let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW)?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &store_path,
+        temporary.path().join("secondary"),
+        Network::ZcashTestnet,
+        requirements,
+        reorg_policy,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let fence = store.event_fence();
+    let (store, _) = store.commit_live_replacement(
+        crate::CanonicalLiveReplacement::new(
+            fence,
+            vec![crate::CanonicalReplacementBlock::new(
+                replacement_block(BlockHeight::new(4), [0x44; 32], [3; 32], 144)?,
+                Vec::new(),
+            )],
+            UnixTimestampMillis::new(1_750_000_000_010),
+        ),
+        &activations,
+    )?;
+    assert!(secondary.try_catch_up()?.advanced());
+
+    let root_page = secondary.search_displaced_final_note_commitment_roots_page(
+        zinder_core::FinalNoteCommitmentRoot::from_bytes([0; 32]),
+        None,
+        std::num::NonZeroU32::new(16).ok_or("nonzero limit")?,
+    )?;
+    assert!(!root_page.has_more);
+    assert!(root_page.scan_complete);
+    let coverage = root_page.coverage.ok_or("expected root page coverage")?;
+    assert_eq!(coverage.captured_block_count, 1);
+    assert_eq!(coverage.root_artifact_unavailable_count, 1);
+    drop(store);
+    Ok(())
+}

@@ -56,7 +56,7 @@ Plan disk, build time, and memory for the Explorer. [Deploying Zinder](../runboo
 - `WalletQuery` on `zinder-query`, for transaction status, tips, the mempool, value pools, and the network-upgrade table. Each wallet read is pinned to one chain epoch, the consistent chain snapshot the wallet reader serves ([Wallet data plane](wallet-data-plane.md)).
 - Optionally, the node in `[node]`, polled in the background for the upstream tip. It never supplies a chain fact.
 
-When the canonical or view store is absent, the Explorer starts with those capability groups unadvertised. When the view store was built by a release with a different set of views, the Explorer exits at startup with `ConsumerNotDeclared` or `ExplorerViewManifestRequiresFreshStore`. Rebuild the views on a fresh path as [Add the Explorer](../runbooks/deploying-on-a-vm.md#add-the-explorer) describes.
+When the canonical or view store is absent (or not yet `READY` when the Explorer starts), the Explorer opens only what is available at startup and starts with the missing capability groups unadvertised. Because secondary handles are opened only at startup and the catch-up task advances already-opened handles, an Explorer started while the canonical primary is still constructing must be restarted after the primary reaches `READY` to advertise canonical-backed capabilities. When the view store was built by a release with a different set of views, the Explorer exits at startup with `ConsumerNotDeclared` or `ExplorerViewManifestRequiresFreshStore`. Rebuild the views on a fresh path as [Add the Explorer](../runbooks/deploying-on-a-vm.md#add-the-explorer) describes.
 
 ## Query families
 
@@ -167,7 +167,7 @@ The proto defines a `CursorExpiredError` message, but no method returns it.
 `PaidFeeDistribution`, `MempoolEventCounts`, and `ValuePoolBalanceHistory` remain unadvertised in `zinder-explorer` in this release because no materialized view supplies paid-fee distribution or daily value-pool balance history, and no runtime indexes mempool event counts:
 
 - `PaidFeeDistribution` fails with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`.
-- `BlockProductionSeries`, `BlockProductionInTimeRange`, `BlockTransactions`, `CommitmentRootSearch`, `DisplacedBlockHistory`, and `DisplacedBlockDetail` also fail with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED` when the canonical secondary store is absent, and become advertised and served once `storage.path` has a READY canonical primary.
+- `BlockProductionSeries`, `BlockProductionInTimeRange`, `BlockTransactions`, `CommitmentRootSearch`, `DisplacedBlockHistory`, and `DisplacedBlockDetail` also fail with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED` when a required canonical secondary store or materialized-view store is absent (or was not yet `READY` when the Explorer started); start or restart `zinder-explorer` once `storage.path` has a `READY` canonical primary and the required view/wallet dependencies in the [Query families](#query-families) table are satisfied to advertise and serve them.
 
 When a method that also reads views runs without a view store, it fails with the same reason first. With a store that lacks the exact view manifest, it fails with `UNIMPLEMENTED` and `EXPLORER_METHOD_DISABLED`. [Error vocabulary](../reference/error-vocabulary.md) lists every reason.
 
