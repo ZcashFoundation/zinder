@@ -17,7 +17,7 @@ use zinder_runtime::{
     resolve_ops_listen_addr, resolve_optional_bearer_token, resolve_secondary_storage,
     section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
 };
-use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
+use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget, redact_endpoint_url};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 
@@ -236,7 +236,10 @@ impl ExplorerConfigToml {
                     .map(|path| path.display().to_string()),
                 bearer_token: (config.bearer_token.is_some() && config.bearer_token_path.is_none())
                     .then_some("[REDACTED]"),
-                wallet_query_endpoint: config.wallet_query_endpoint.clone().unwrap_or_default(),
+                wallet_query_endpoint: config
+                    .wallet_query_endpoint
+                    .as_deref()
+                    .map_or_default(|endpoint| redact_endpoint_url(endpoint).into_owned()),
                 trust_proxy_client_address: config
                     .client_address_source
                     .trust_proxy_client_address(),

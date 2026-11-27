@@ -1,6 +1,12 @@
 //! T=0 operational HTTP server (`/healthz`, `/readyz`, `/metrics`) for `zinder`.
 
-use std::{collections::HashSet, fmt::Write as _, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fmt::Write as _,
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{Json, Router, body::Bytes, extract::State, http::StatusCode, routing::get};
 use http_body_util::{BodyExt, Empty};
@@ -91,6 +97,10 @@ pub struct RoleOpsSnapshot {
     pub(crate) ops_addr: Option<SocketAddr>,
     #[serde(skip)]
     pub(crate) role_kind: ServiceRole,
+    #[serde(skip)]
+    pub(crate) capabilities: Vec<String>,
+    #[serde(skip)]
+    pub(crate) capabilities_loaded: bool,
 }
 
 impl RoleOpsSnapshot {
@@ -109,6 +119,8 @@ impl RoleOpsSnapshot {
             detail: None,
             ops_addr,
             role_kind: role,
+            capabilities: Vec::new(),
+            capabilities_loaded: false,
         }
     }
 }
@@ -187,6 +199,18 @@ impl SharedOpsState {
         self.inner.read().preset
     }
 
+    fn capabilities_snapshot(&self) -> Vec<String> {
+        let guard = self.inner.read();
+        let mut unique = BTreeSet::new();
+        for snapshot in &guard.roles {
+            for capability in &snapshot.capabilities {
+                unique.insert(capability.clone());
+            }
+        }
+        drop(guard);
+        unique.into_iter().collect()
+    }
+
     fn ready_summary(&self) -> ReadyzResponseBody {
         let guard = self.inner.read();
         let ready = guard.stage == StartupStage::Ready
@@ -195,12 +219,26 @@ impl SharedOpsState {
                 .roles
                 .iter()
                 .all(|snapshot| !snapshot.required || snapshot.ready);
+        let current_height = guard
+            .roles
+            .iter()
+            .filter(|snapshot| snapshot.required)
+            .filter_map(|snapshot| snapshot.current_height)
+            .min();
+        let target_height = guard
+            .roles
+            .iter()
+            .filter(|snapshot| snapshot.required)
+            .filter_map(|snapshot| snapshot.target_height)
+            .max();
         ReadyzResponseBody {
             status: if ready { "ready" } else { "not_ready" },
             mode: guard.mode,
             preset: guard.preset,
             network: guard.network_name,
             phase: guard.stage,
+            current_height,
+            target_height,
             roles: guard.roles.clone(),
         }
     }
@@ -264,6 +302,7 @@ struct HealthzBody {
     version: &'static str,
     git_commit: &'static str,
     network: &'static str,
+    capabilities: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -273,6 +312,10 @@ struct ReadyzResponseBody {
     preset: &'static str,
     network: &'static str,
     phase: StartupStage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_height: Option<u32>,
     roles: Vec<RoleOpsSnapshot>,
 }
 
@@ -326,6 +369,7 @@ pub async fn spawn_supervisor_ops(
         version: env!("CARGO_PKG_VERSION"),
         git_commit: BUILD_GIT_COMMIT,
         network: shared.network_name(),
+        capabilities: Vec::new(),
     };
     let state = SupervisorHttpState {
         healthz,
@@ -374,7 +418,9 @@ async fn serve_loop(
 async fn handle_healthz(
     State(state): State<SupervisorHttpState>,
 ) -> (StatusCode, Json<HealthzBody>) {
-    (StatusCode::OK, Json(state.healthz))
+    let mut body = state.healthz;
+    body.capabilities = state.shared.capabilities_snapshot();
+    (StatusCode::OK, Json(body))
 }
 
 async fn handle_readyz(
@@ -428,12 +474,12 @@ async fn aggregate_prometheus_metrics(
 ) -> String {
     let mut output = String::with_capacity(local_metrics.len() + targets.len() * 2048);
     let mut seen_headers = HashSet::new();
-    append_prometheus_section(&mut output, local_metrics, &mut seen_headers);
+    append_prometheus_section(&mut output, local_metrics, "zinder", &mut seen_headers);
 
     for &(role, addr) in targets {
         if let Ok((StatusCode::OK, body)) = http_get_localhost(addr, "/metrics").await {
             let _ = writeln!(output, "# child_role: {}", role.label());
-            append_prometheus_section(&mut output, &body, &mut seen_headers);
+            append_prometheus_section(&mut output, &body, role.binary_name(), &mut seen_headers);
         }
     }
     output
@@ -442,6 +488,7 @@ async fn aggregate_prometheus_metrics(
 fn append_prometheus_section(
     output: &mut String,
     rendered: &str,
+    service_label: &str,
     seen_headers: &mut HashSet<String>,
 ) {
     for line in rendered.lines() {
@@ -450,9 +497,107 @@ fn append_prometheus_section(
         {
             continue;
         }
-        output.push_str(line);
+        inject_service_label(output, line, service_label);
         output.push('\n');
     }
+}
+
+fn inject_service_label(output: &mut String, line: &str, service_label: &str) {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        output.push_str(line);
+        return;
+    }
+    if let Some((brace_open, brace_close)) = find_metric_label_braces(line) {
+        let inside = &line[brace_open + 1..brace_close];
+        if labels_contain_service(inside) {
+            output.push_str(line);
+            return;
+        }
+        output.push_str(&line[..=brace_open]);
+        output.push_str("service=\"");
+        output.push_str(service_label);
+        output.push('"');
+        if !inside.trim().is_empty() {
+            output.push(',');
+        }
+        output.push_str(&line[brace_open + 1..]);
+        return;
+    }
+    if let Some(ws_idx) = line.find(char::is_whitespace) {
+        output.push_str(&line[..ws_idx]);
+        output.push_str("{service=\"");
+        output.push_str(service_label);
+        output.push_str("\"}");
+        output.push_str(&line[ws_idx..]);
+    } else {
+        output.push_str(line);
+    }
+}
+
+fn find_metric_label_braces(line: &str) -> Option<(usize, usize)> {
+    let mut brace_open = None;
+    for (idx, ch) in line.char_indices() {
+        if ch == '{' {
+            brace_open = Some(idx);
+            break;
+        }
+        if ch.is_whitespace() {
+            return None;
+        }
+    }
+    let open = brace_open?;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (rel_idx, ch) in line[open + 1..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '}' if !in_quotes => return Some((open, open + 1 + rel_idx)),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn labels_contain_service(labels: &str) -> bool {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut key_start = 0usize;
+    for (idx, ch) in labels.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                if segment_has_service_key(&labels[key_start..idx]) {
+                    return true;
+                }
+                key_start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    segment_has_service_key(&labels[key_start..])
+}
+
+fn segment_has_service_key(segment: &str) -> bool {
+    segment
+        .split_once('=')
+        .is_some_and(|(key, _)| key.trim() == "service")
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChildHealthzPayload {
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 /// Fetches a child operational `/readyz` endpoint over loopback HTTP/1.1.
@@ -460,6 +605,16 @@ pub async fn fetch_child_readyz(addr: SocketAddr) -> Option<(bool, ChildReadyzPa
     let (status, body) = http_get_localhost(addr, "/readyz").await.ok()?;
     let payload = serde_json::from_str::<ChildReadyzPayload>(&body).ok()?;
     Some((status == StatusCode::OK, payload))
+}
+
+/// Fetches a child operational `/healthz` capability list over loopback HTTP/1.1.
+pub async fn fetch_child_capabilities(addr: SocketAddr) -> Option<Vec<String>> {
+    let (status, body) = http_get_localhost(addr, "/healthz").await.ok()?;
+    if status != StatusCode::OK {
+        return None;
+    }
+    let payload = serde_json::from_str::<ChildHealthzPayload>(&body).ok()?;
+    Some(payload.capabilities)
 }
 
 async fn http_get_localhost(
@@ -508,4 +663,99 @@ async fn http_get_inner(
     conn_task.abort();
     let text = String::from_utf8_lossy(&collected).into_owned();
     Ok((status, text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zinder_proto::capabilities::WALLET_READ_FULL_BLOCK_AT_V1;
+
+    #[test]
+    fn aggregated_metrics_inject_service_labels_without_clobbering_existing_ones() {
+        let query_metrics = concat!(
+            "# HELP zinder_rocksdb_property Sample RocksDB property.\n",
+            "# TYPE zinder_rocksdb_property gauge\n",
+            "zinder_rocksdb_property{cf=\"default\",store_role=\"canonical_secondary\"} 123\n",
+            "zinder_child_ready{service=\"custom-query\",other=\"a,b\"} 1\n",
+            "zinder_bare_counter 42\n",
+            "zinder_empty_braces{} 7\n",
+        );
+        let compat_metrics = concat!(
+            "# HELP zinder_rocksdb_property Sample RocksDB property.\n",
+            "# TYPE zinder_rocksdb_property gauge\n",
+            "zinder_rocksdb_property{cf=\"default\",store_role=\"canonical_secondary\"} 456\n",
+        );
+
+        let mut output = String::new();
+        let mut seen = HashSet::new();
+        append_prometheus_section(&mut output, query_metrics, "zinder-query", &mut seen);
+        append_prometheus_section(
+            &mut output,
+            compat_metrics,
+            "zinder-compat-lightwalletd",
+            &mut seen,
+        );
+
+        assert!(output.contains(
+            "zinder_rocksdb_property{service=\"zinder-query\",cf=\"default\",store_role=\"canonical_secondary\"} 123"
+        ));
+        assert!(output.contains(
+            "zinder_rocksdb_property{service=\"zinder-compat-lightwalletd\",cf=\"default\",store_role=\"canonical_secondary\"} 456"
+        ));
+        assert!(output.contains("zinder_child_ready{service=\"custom-query\",other=\"a,b\"} 1"));
+        assert!(output.contains("zinder_bare_counter{service=\"zinder-query\"} 42"));
+        assert!(output.contains("zinder_empty_braces{service=\"zinder-query\"} 7"));
+        assert_eq!(
+            output
+                .matches("# HELP zinder_rocksdb_property Sample RocksDB property.")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn shared_ops_state_aggregates_capabilities_and_required_heights() {
+        let mut query = RoleOpsSnapshot::starting(ServiceRole::Query, true, None);
+        query.ready = true;
+        query.current_height = Some(150);
+        query.target_height = Some(151);
+        query.capabilities = vec![
+            WALLET_READ_FULL_BLOCK_AT_V1.to_owned(),
+            "wallet.read.address_txids_v1".to_owned(),
+        ];
+
+        let mut compat = RoleOpsSnapshot::starting(ServiceRole::CompatLightwalletd, true, None);
+        compat.ready = true;
+        compat.current_height = Some(148);
+        compat.target_height = Some(150);
+        compat.capabilities = vec![
+            WALLET_READ_FULL_BLOCK_AT_V1.to_owned(),
+            "lightwalletd.compat.v1".to_owned(),
+        ];
+
+        let mut helper = RoleOpsSnapshot::starting(ServiceRole::HistoryPublisher, false, None);
+        helper.current_height = Some(10);
+        helper.target_height = Some(999);
+
+        let shared = SharedOpsState::new(
+            "serve",
+            "wallet",
+            "zcash-regtest",
+            vec![query, compat, helper],
+        );
+        shared.set_stage(StartupStage::Ready);
+
+        let summary = shared.ready_summary();
+        assert_eq!(summary.status, "ready");
+        assert_eq!(summary.current_height, Some(148));
+        assert_eq!(summary.target_height, Some(151));
+        assert_eq!(
+            shared.capabilities_snapshot(),
+            vec![
+                "lightwalletd.compat.v1".to_owned(),
+                "wallet.read.address_txids_v1".to_owned(),
+                WALLET_READ_FULL_BLOCK_AT_V1.to_owned(),
+            ]
+        );
+    }
 }

@@ -12,6 +12,7 @@ use zinder_runtime::{
     parse_socket_addr, require_field, resolve_allow_public_bind, resolve_ops_listen_addr,
     resolve_optional_bearer_token, validate_zinder_grpc_endpoint,
 };
+use zinder_source::redact_endpoint_url;
 
 use crate::CipherscanMarketPriceEndpoints;
 
@@ -258,13 +259,18 @@ impl CipherscanConfigToml {
             security: SecurityToml::from_resolved(config.allow_public_bind),
             cipherscan: CipherscanToml {
                 listen_addr: config.listen_addr.to_string(),
-                explorer_query_endpoint: config.explorer_query_endpoint.clone(),
-                wallet_query_endpoint: config.wallet_query_endpoint.clone(),
-                current_price_endpoint: config.market_price_endpoints.current.to_string(),
-                historical_price_endpoint_template: config
-                    .market_price_endpoints
-                    .historical_template
-                    .clone(),
+                explorer_query_endpoint: redact_endpoint_url(&config.explorer_query_endpoint)
+                    .into_owned(),
+                wallet_query_endpoint: redact_endpoint_url(&config.wallet_query_endpoint)
+                    .into_owned(),
+                current_price_endpoint: redact_endpoint_url(
+                    config.market_price_endpoints.current.as_str(),
+                )
+                .into_owned(),
+                historical_price_endpoint_template: redact_endpoint_url(
+                    &config.market_price_endpoints.historical_template,
+                )
+                .into_owned(),
                 bearer_token_path: config
                     .bearer_token_path
                     .as_ref()

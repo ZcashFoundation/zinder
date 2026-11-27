@@ -261,3 +261,102 @@ fn invalid_sections_and_conflicting_explorer_views_are_rejected() -> eyre::Resul
     assert!(!conflict_out.status.success());
     Ok(())
 }
+
+#[test]
+fn explorer_print_config_redacts_cipherscan_and_wallet_query_urls() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let storage_root = sandbox.path().join("explorer-root");
+    let config_body = format!(
+        concat!(
+            "[network]\nname = \"zcash-regtest\"\n\n",
+            "[storage]\ndata_dir = \"{}\"\n\n",
+            "[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n\n",
+            "[explorer]\nwallet_query_endpoint = \"http://exp-user:exp-secret@127.0.0.1:9102/?tok=wq-secret#frag\"\n\n",
+            "[cipherscan]\n",
+            "explorer_query_endpoint = \"http://cs-exp:cs-exp-secret@127.0.0.1:9068/?k=1\"\n",
+            "wallet_query_endpoint = \"http://cs-wal:cs-wal-secret@127.0.0.1:9102/?k=2\"\n",
+            "current_price_endpoint = \"https://price-user:price-pass@prices.example/v1/spot?api_key=spot-secret\"\n",
+            "historical_price_endpoint_template = \"https://hist-user:hist-pass@prices.example/v1/hist/{{date}}?api_key=hist-secret\"\n",
+        ),
+        storage_root.display()
+    );
+    let cfg_path = write_test_config(sandbox.path(), &config_body)?;
+    let cfg_str = cfg_path.to_str().ok_or_else(|| eyre::eyre!("path"))?;
+
+    for args in [
+        vec![
+            "config", "print", "--preset", "explorer", "--config", cfg_str,
+        ],
+        vec![
+            "serve",
+            "--preset",
+            "explorer",
+            "--config",
+            cfg_str,
+            "--print-config",
+        ],
+    ] {
+        let output = zinder_command(&args).output()?;
+        assert!(
+            output.status.success(),
+            "`{}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for leaked in [
+            "exp-secret",
+            "wq-secret",
+            "cs-exp-secret",
+            "cs-wal-secret",
+            "price-pass",
+            "spot-secret",
+            "hist-pass",
+            "hist-secret",
+        ] {
+            assert!(
+                !stdout.contains(leaked),
+                "command `{}` leaked `{leaked}`:\n{stdout}",
+                args.join(" ")
+            );
+        }
+        assert!(stdout.contains("[REDACTED]"), "{stdout}");
+    }
+    Ok(())
+}
+
+#[test]
+fn unprofiled_transactions_policy_omits_injected_wallet_profile() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let storage_root = sandbox.path().join("legacy-root");
+    let config_body = format!(
+        concat!(
+            "[network]\nname = \"zcash-regtest\"\n\n",
+            "[storage]\ndata_dir = \"{}\"\nraw_blob_policy = \"transactions\"\n\n",
+            "[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n",
+        ),
+        storage_root.display()
+    );
+    let cfg_path = write_test_config(sandbox.path(), &config_body)?;
+    let cfg_str = cfg_path.to_str().ok_or_else(|| eyre::eyre!("path"))?;
+
+    let validate = zinder_command(&["config", "validate", "--config", cfg_str]).output()?;
+    assert!(
+        validate.status.success(),
+        "unprofiled raw_blob_policy = transactions should validate: {}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+
+    let printed = zinder_command(&["config", "print", "--config", cfg_str]).output()?;
+    assert!(printed.status.success());
+    let stdout = String::from_utf8_lossy(&printed.stdout);
+    assert!(
+        !stdout.contains("profile = \"wallet\""),
+        "must not inject profile = wallet into unprofiled transactions store:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("raw_blob_policy = \"transactions\""),
+        "{stdout}"
+    );
+    Ok(())
+}

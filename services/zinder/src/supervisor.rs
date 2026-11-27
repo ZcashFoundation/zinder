@@ -21,7 +21,7 @@ use crate::{
     config::{HistoryPublisherPlan, RoleLaunchSpec, SupervisionPlan},
     ops::{
         RoleOpsSnapshot, SharedOpsState, StartupStage, SupervisorOpsError, SupervisorOpsHandle,
-        fetch_child_readyz, spawn_supervisor_ops,
+        fetch_child_capabilities, fetch_child_readyz, spawn_supervisor_ops,
     },
 };
 
@@ -399,6 +399,12 @@ async fn refresh_child_snapshot(entry: &mut ManagedChild) {
         return;
     }
     if let Some((is_ready, payload)) = fetch_child_readyz(entry.ops_addr).await {
+        if !entry.snapshot.capabilities_loaded
+            && let Some(capabilities) = fetch_child_capabilities(entry.ops_addr).await
+        {
+            entry.snapshot.capabilities = capabilities;
+            entry.snapshot.capabilities_loaded = true;
+        }
         entry.snapshot.ready = is_ready;
         entry.snapshot.state = if is_ready {
             "ready".to_owned()

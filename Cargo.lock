@@ -6189,6 +6189,7 @@ dependencies = [
  "zinder-explorer",
  "zinder-ingest",
  "zinder-projector",
+ "zinder-proto",
  "zinder-query",
  "zinder-runtime",
  "zinder-testkit",

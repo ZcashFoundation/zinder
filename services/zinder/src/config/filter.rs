@@ -11,8 +11,8 @@ use zinder_core::Network;
 use zinder_runtime::{
     ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection, IngestControlSection,
     NetworkSection, OpsSection, ProjectorControlSection, SecuritySection, derive_canonical_path,
-    derive_canonical_secondary_path, derive_explorer_secondary_path, derive_wallet_path,
-    guard_optional_serving_bind, parse_socket_addr, resolve_allow_public_bind,
+    derive_canonical_secondary_path, derive_checkpoints_path, derive_explorer_secondary_path,
+    derive_wallet_path, guard_optional_serving_bind, parse_socket_addr, resolve_allow_public_bind,
     resolve_ops_listen_addr, section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
 };
 
@@ -135,6 +135,7 @@ struct HistoryPublisherSection {
 
 struct DerivedWiring {
     profile: DeploymentProfile,
+    inject_deployment_profile: bool,
     network: Network,
     ops_listen_addr: Option<SocketAddr>,
     full_blocks: bool,
@@ -163,13 +164,23 @@ pub(super) fn build_supervision_plan(
     let cli_data_dir = validate_optional_data_dir(scope.data_dir.clone())?;
     let meta_data_dir = validate_optional_data_dir(meta.storage.data_dir.clone())?;
     let effective_data_dir = cli_data_dir.or(meta_data_dir);
-    let profile = scope
+    let explicit_profile = scope
         .preset
         .map(Preset::deployment_profile)
-        .or(meta.deployment.profile)
-        .unwrap_or(DeploymentProfile::Wallet);
+        .or(meta.deployment.profile);
+    let unprofiled_transactions = explicit_profile.is_none()
+        && !scope.full_blocks
+        && meta.storage.full_blocks != Some(true)
+        && meta.storage.raw_blob_policy.as_deref() == Some("transactions");
+    let profile = explicit_profile.unwrap_or(DeploymentProfile::Wallet);
     let active_roles = active_roles_for(scope.mode, profile, scope.readers_only, &meta)?;
-    let wiring = derive_wiring(scope, &meta, profile, effective_data_dir, &active_roles)?;
+    let wiring = derive_wiring(
+        scope,
+        &meta,
+        (profile, !unprofiled_transactions),
+        effective_data_dir,
+        &active_roles,
+    )?;
 
     let mut roles = Vec::with_capacity(active_roles.len());
     for role in active_roles {
@@ -266,9 +277,9 @@ fn active_roles_for(
     if mode == SupervisorMode::Index {
         return match profile {
             DeploymentProfile::LightWallet => Ok(vec![ServiceRole::Ingest]),
-            DeploymentProfile::Wallet | DeploymentProfile::Explorer => {
-                Ok(vec![ServiceRole::Ingest, ServiceRole::Projector])
-            }
+            DeploymentProfile::Wallet
+            | DeploymentProfile::WalletArchive
+            | DeploymentProfile::Explorer => Ok(vec![ServiceRole::Ingest, ServiceRole::Projector]),
             _ => Err(UnifiedConfigError::Invalid(format!(
                 "unsupported deployment profile `{}`",
                 profile.as_str()
@@ -287,7 +298,7 @@ fn active_roles_for(
                 roles.push(ServiceRole::HistoryPublisher);
             }
         }
-        DeploymentProfile::Wallet => {
+        DeploymentProfile::Wallet | DeploymentProfile::WalletArchive => {
             if !readers_only {
                 roles.push(ServiceRole::Ingest);
                 roles.push(ServiceRole::Projector);
@@ -339,15 +350,18 @@ fn is_history_publisher_enabled(meta: &CombinedMetaRaw) -> Result<bool, UnifiedC
 fn derive_wiring(
     scope: &ConfigScope,
     meta: &CombinedMetaRaw,
-    profile: DeploymentProfile,
+    profile_mode: (DeploymentProfile, bool),
     effective_data_dir: Option<PathBuf>,
     active_roles: &[ServiceRole],
 ) -> Result<DerivedWiring, UnifiedConfigError> {
+    let (profile, inject_deployment_profile) = profile_mode;
     let network = meta.network.clone().resolve()?;
     let ops_listen_addr = resolve_ops_listen_addr(meta.ops.clone())?;
     let allow_public_bind = resolve_allow_public_bind(meta.security)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let full_blocks = scope.full_blocks || meta.storage.full_blocks == Some(true);
+    let full_blocks = scope.full_blocks
+        || meta.storage.full_blocks == Some(true)
+        || profile == DeploymentProfile::WalletArchive;
     let has_ingest = active_roles.contains(&ServiceRole::Ingest);
     let has_consumers = active_roles.iter().any(|role| {
         matches!(
@@ -375,6 +389,7 @@ fn derive_wiring(
 
     Ok(DerivedWiring {
         profile,
+        inject_deployment_profile,
         network,
         ops_listen_addr,
         full_blocks,
@@ -443,7 +458,7 @@ fn resolve_checkpoint_staging_root(
     {
         return None;
     }
-    effective_data_dir.map(|dir| dir.join("checkpoints"))
+    effective_data_dir.map(derive_checkpoints_path)
 }
 
 fn resolve_ingest_control_wiring(
@@ -867,19 +882,23 @@ fn apply_role_overrides(
     table: &mut toml::Table,
     wiring: &DerivedWiring,
 ) -> Result<(), UnifiedConfigError> {
-    if matches!(
-        role,
-        ServiceRole::Ingest
-            | ServiceRole::Projector
-            | ServiceRole::Query
-            | ServiceRole::CompatLightwalletd
-    ) {
+    if wiring.inject_deployment_profile
+        && matches!(
+            role,
+            ServiceRole::Ingest
+                | ServiceRole::Projector
+                | ServiceRole::Query
+                | ServiceRole::CompatLightwalletd
+        )
+    {
         with_subtable(table, "deployment", |deploy| {
             deploy.insert(
                 "profile".to_owned(),
                 TomlValue::String(wiring.profile.as_str().to_owned()),
             );
         });
+    } else if !wiring.inject_deployment_profile {
+        apply_unprofiled_transaction_defaults(role, table);
     }
     if role == ServiceRole::Ingest && wiring.profile == DeploymentProfile::Explorer {
         let mut rejected_explorer_views = false;
@@ -1091,6 +1110,28 @@ fn apply_control_and_endpoint_overrides(
     }
 }
 
+fn apply_unprofiled_transaction_defaults(role: ServiceRole, table: &mut toml::Table) {
+    match role {
+        ServiceRole::Ingest => with_subtable(table, "ingest", |ingest_tbl| {
+            with_subtable(ingest_tbl, "run_overrides", |run_overrides| {
+                run_overrides
+                    .entry("coverage".to_owned())
+                    .or_insert_with(|| TomlValue::String("wallet-serving".to_owned()));
+            });
+        }),
+        ServiceRole::CompatLightwalletd => with_subtable(table, "compat", |compat_tbl| {
+            compat_tbl
+                .entry("serving".to_owned())
+                .or_insert_with(|| TomlValue::String("wallet".to_owned()));
+        }),
+        ServiceRole::Projector
+        | ServiceRole::Query
+        | ServiceRole::Explorer
+        | ServiceRole::CompatCipherscan
+        | ServiceRole::HistoryPublisher => {}
+    }
+}
+
 fn with_subtable(table: &mut toml::Table, key: &str, update: impl FnOnce(&mut toml::Table)) {
     let mut sub = match table.remove(key) {
         Some(TomlValue::Table(existing)) => existing,
@@ -1235,13 +1276,15 @@ fn apply_role_env_overrides(
     env: &mut BTreeMap<String, String>,
     wiring: &DerivedWiring,
 ) {
-    if matches!(
-        role,
-        ServiceRole::Ingest
-            | ServiceRole::Projector
-            | ServiceRole::Query
-            | ServiceRole::CompatLightwalletd
-    ) {
+    if wiring.inject_deployment_profile
+        && matches!(
+            role,
+            ServiceRole::Ingest
+                | ServiceRole::Projector
+                | ServiceRole::Query
+                | ServiceRole::CompatLightwalletd
+        )
+    {
         env.insert(
             "ZINDER_DEPLOYMENT__PROFILE".to_owned(),
             wiring.profile.as_str().to_owned(),
