@@ -1,0 +1,6 @@
+kind: added
+body: Paginate GetAddressUtxos and GetAddressUtxosStream at complete block heights. Resume at the last returned height plus one and stop on an empty page.
+time: 2026-11-27T23:30:44.883973847Z
+custom:
+    Bump: minor
+    PR: "738"
