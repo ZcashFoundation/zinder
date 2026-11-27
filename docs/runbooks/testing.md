@@ -1321,8 +1321,10 @@ and + 5 and + 8 are the `zinder-index` and `zinder-serve` ops listeners. Each pr
 peer listener binds container loopback; it has no published peer port. An owned
 Python TCP relay exposes only the selected loopback ports. On native Linux the
 relay connects to bridge addresses. On Docker Desktop it uses `docker exec` to
-connect from inside the fixture's internal network. Readiness verifies
-internal network isolation, absence of a default route, and an empty peer list.
+connect from inside the fixture's internal network. Both modes accept up to 64
+active forwards. The shutdown listener has its own connection limit.
+Readiness verifies internal network isolation, absence of a default route, and
+an empty peer list.
 Two unused /28 subnets are selected from `10.253.0.0/16`, excluding existing
 Docker networks and, for direct bridge access, Linux host routes. Set `--subnet-pool` if that range conflicts
 with your host. This avoids consuming Docker's large default address pools.
@@ -1350,8 +1352,9 @@ must equal `--revision`, including this mode.
 This check establishes executable identity, not release signature provenance.
 Verify downloaded archives or images through the release workflow separately.
 
-The fixture waits for `zinder-index` to build its stores before starting the
-readers. The command prints the absolute `ready.json` path only after both `zinder-index`
+The fixture verifies the node reached the requested tip before starting Zinder.
+It waits for `zinder-index` to build its stores before starting the readers.
+The command prints the absolute `ready.json` path only after both `zinder-index`
 and `zinder-serve` `/readyz` responses reach the node tip. The receipt includes the actual node activation
 map, complete health capabilities and versions, candidate commit, image IDs,
 optional binary hashes, endpoints, retention, chain hash, and observation time.

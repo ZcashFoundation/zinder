@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Test fixture routing and cleanup, with optional Docker smoke checks."""
 import argparse
+import asyncio
 import concurrent.futures
 import json
+import os
 from pathlib import Path
 import runpy
+import shutil
 import socket
 import subprocess
 import sys
@@ -12,14 +15,108 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / 'scripts/regtest-fixture.py'
+RELAY = ROOT / 'scripts/regtest-fixture-relay.py'
 operator = runpy.run_path(str(FIXTURE))['start_relay'].__globals__
+relay = runpy.run_path(str(RELAY))['main'].__globals__
 
 
 class FixtureTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash') and shutil.which('jq'), 'requires Bash and jq')
+    def test_mining_with_crlf_height_and_tree_size_output(self):
+        shell = r'''
+set -euo pipefail
+jq() {
+  command jq "$@" | while IFS= read -r line; do printf '%s\r\n' "$line"; done
+}
+curl() {
+  case "${@: -2:1}" in
+    *'"method":"getblockcount"'*)
+      printf '{"result":%s}\n' "$(<"$MINED_TIP")"
+      ;;
+    *'"method":"generatetoaddress"'*)
+      printf '10\n' > "$MINED_TIP"
+      printf '{"result":[]}\n'
+      ;;
+    *'"method":"getblock"'*)
+      printf '{"result":{"trees":{"sapling":{"size":2},"orchard":{"size":3},"ironwood":{"size":4}}}}\n'
+      ;;
+    *'"method":"generate","params":[2]'*)
+      printf '12\n' > "$MINED_TIP"
+      printf '{"result":[]}\n'
+      ;;
+    *) return 1 ;;
+  esac
+}
+source "$1" http://127.0.0.1:1 12
+'''
+        with tempfile.TemporaryDirectory() as scratch:
+            tip_path = Path(scratch) / 'tip'
+            tip_path.write_text('0')
+            output = operator['run'](
+                shutil.which('bash'), '-c', shell, 'test-mining', (ROOT / 'scripts/mine-live-regtest.sh').as_posix(),
+                env=dict(os.environ, MINED_TIP=tip_path.as_posix()), timeout=10)
+            self.assertEqual(tip_path.read_text().strip(), '12')
+        self.assertEqual(output.splitlines(), [
+            'shielded prefix: Sapling 2, Orchard 3, Ironwood 4 notes at height 10',
+            'regtest tip: 12',
+        ])
+
+    def test_successful_miner_below_requested_tip_does_not_start_indexer(self):
+        model = {'services': {
+            'state-init': {},
+            'zinder-index': {'environment': {}, 'healthcheck': {'test': ['CMD']}},
+            'zinder-serve': {'environment': {}, 'healthcheck': {}},
+        }}
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch) / 'fixture'
+            images = Path(scratch) / 'images.json'
+            images.write_text('{"zinder":"test-image"}')
+            args = SimpleNamespace(node_config=ROOT / 'deploy/zebra/regtest.toml', port_base=34100,
+                                   project=directory.name, images=images, subnet_pool='10.253.0.0/16',
+                                   bin_dir=None, raw_blob_policy='none', revision='0' * 40, tip=12, timeout=1)
+            compose = Mock(side_effect=['', 'node-id'])
+            cleanup = Mock()
+            with (patch.object(socket, 'socket'), patch.object(shutil, 'which', return_value='test-command'),
+                  patch.dict(operator, compose=compose, tear_down_fixture=cleanup, image_id=Mock(return_value='image'),
+                             direct_bridge_access=Mock(return_value=True), fixture_subnets=Mock(return_value=[]),
+                             run=Mock(side_effect=['', '', '', json.dumps(model), 'regtest tip: 0']),
+                             start_relay=Mock(), wait=Mock(), rpc=Mock(return_value=0))):
+                with self.assertRaisesRegex(RuntimeError, 'node reached height 0. Expected height 12'):
+                    operator['provision'](args, directory)
+            self.assertEqual(compose.call_args_list, [call(directory, 'up', '-d', 'node'),
+                                                     call(directory, 'ps', '-q', 'node')])
+            cleanup.assert_called_once()
+
+    def test_cleanup_stops_relay_when_docker_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch)
+            (directory / 'ready.json').touch()
+            state = {'owner': 'test-owner'}
+            cleanup = Mock()
+            cleanup.verify.side_effect = OSError('cannot contact Docker')
+            with patch.dict(operator, verify_owner=cleanup.verify, compose=cleanup.compose, stop_relay=cleanup.stop):
+                with self.assertRaisesRegex(OSError, 'cannot contact Docker'):
+                    operator['tear_down_fixture'](directory, state, collect_logs=True)
+            self.assertFalse((directory / 'ready.json').exists())
+            self.assertEqual(cleanup.mock_calls, [call.verify(state), call.stop(directory, state)])
+
+    def test_failed_log_collection_still_stops_relay_and_removes_owned_project(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch)
+            state = {'owner': 'test-owner'}
+            cleanup = Mock()
+            cleanup.compose.side_effect = [OSError('cannot collect logs'), '']
+            with patch.dict(operator, verify_owner=cleanup.verify, compose=cleanup.compose, stop_relay=cleanup.stop):
+                operator['tear_down_fixture'](directory, state, collect_logs=True)
+            self.assertEqual(cleanup.mock_calls, [
+                call.verify(state), call.compose(directory, 'logs', '--no-color', '--tail', '80'),
+                call.stop(directory, state), call.compose(directory, 'down', '-v', '--remove-orphans'),
+            ])
+
     def test_subprocess_preserves_lf_on_binary_stdin(self):
         script = b'first line\nsecond line\n'
         received = operator['run'](sys.executable, '-c', 'import sys; print(sys.stdin.buffer.read().hex())',
@@ -93,15 +190,11 @@ class FixtureTests(unittest.TestCase):
             directory = Path(scratch)
             routes = directory / 'relay.json'
             control_path = directory / 'relay-control.json'
-            with socket.socket() as listener:
-                listener.bind(('127.0.0.1', 0))
-                port = listener.getsockname()[1]
-            routes.write_text(json.dumps(dict(targets=[[port, '127.0.0.1', 1]], exec_container=None)))
-            relay = subprocess.Popen([sys.executable, str(ROOT / 'scripts/regtest-fixture-relay.py'),
-                                      str(routes), 'test-owner'])
+            routes.write_text(json.dumps(dict(targets=[], exec_container=None)))
+            process = subprocess.Popen([sys.executable, str(RELAY), str(routes), 'test-owner'])
             try:
                 operator['wait'](control_path.exists, bool, 5)
-                state = dict(relay_pid=relay.pid, owner='test-owner')
+                state = dict(relay_pid=process.pid, owner='test-owner')
                 control = json.loads(control_path.read_text())
                 with socket.create_connection(('127.0.0.1', control['port']), timeout=2) as peer:
                     peer.sendall(b'0' * len(control['token']))
@@ -109,14 +202,74 @@ class FixtureTests(unittest.TestCase):
                 with patch.dict(operator, os=SimpleNamespace()):
                     operator['stop_relay'](directory, state)
                     operator['stop_relay'](directory, state)
-                self.assertEqual(relay.wait(timeout=5), 0)
+                self.assertEqual(process.wait(timeout=5), 0)
                 self.assertFalse(control_path.exists())
-                with socket.socket() as listener:
-                    listener.bind(('127.0.0.1', port))
             finally:
-                if relay.poll() is None:
-                    relay.kill()
-                relay.wait(timeout=5)
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+
+
+class RelayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forward_and_control_connections_have_separate_limits(self):
+        for exec_container in (None, 'node-id'):
+            with self.subTest(exec_container=exec_container), tempfile.TemporaryDirectory() as scratch:
+                routes = Path(scratch) / 'relay.json'
+                control_path = routes.with_name('relay-control.json')
+                routes.write_text(json.dumps(dict(targets=[[0, '127.0.0.1', 1]], exec_container=exec_container)))
+                listeners_ready = asyncio.Event()
+                accept_connections = []
+                server = Mock(wait_closed=AsyncMock())
+                server.sockets = [Mock(getsockname=Mock(return_value=('127.0.0.1', 12345)))]
+
+                async def listen(accept, _host, _port):
+                    accept_connections.append(accept)
+                    if len(accept_connections) == 2:
+                        listeners_ready.set()
+                    return server
+
+                forwarding_started = asyncio.Event()
+
+                async def hold_stream(*_args):
+                    forwarding_started.set()
+                    await asyncio.Future()
+
+                forward = AsyncMock(side_effect=hold_stream)
+                with (patch.dict(relay, MAX_FORWARD_STREAMS=1, MAX_CONTROL_CONNECTIONS=2, forward=forward),
+                      patch.object(asyncio, 'start_server', side_effect=listen),
+                      patch.object(sys, 'argv', [str(RELAY), str(routes), 'test-owner'])):
+                    running = asyncio.create_task(relay['main']())
+                    try:
+                        await asyncio.wait_for(listeners_ready.wait(), timeout=5)
+                        accept_forward, accept_control = accept_connections
+                        client = Mock()
+                        accept_forward(asyncio.StreamReader(), client)
+                        await asyncio.wait_for(forwarding_started.wait(), timeout=5)
+
+                        rejected_forward = Mock()
+                        accept_forward(asyncio.StreamReader(), rejected_forward)
+                        rejected_forward.close.assert_called_once()
+                        self.assertEqual(forward.await_count, 1)
+
+                        idle = asyncio.StreamReader()
+                        accept_control(idle, Mock(wait_closed=AsyncMock()))
+                        owner = asyncio.StreamReader()
+                        token = json.loads(control_path.read_text())['token']
+                        owner.feed_data(token.encode('ascii'))
+                        shutdown = Mock(drain=AsyncMock(), wait_closed=AsyncMock())
+                        accept_control(owner, shutdown)
+
+                        rejected_control = Mock()
+                        accept_control(asyncio.StreamReader(), rejected_control)
+                        rejected_control.close.assert_called_once()
+                        idle.feed_eof()
+
+                        await asyncio.wait_for(running, timeout=5)
+                        shutdown.write.assert_called_once_with(b'stopped\n')
+                        client.close.assert_called_once()
+                    finally:
+                        running.cancel()
+                        await asyncio.gather(running, return_exceptions=True)
 
 
 def main():

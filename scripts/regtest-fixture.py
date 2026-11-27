@@ -90,6 +90,24 @@ def verify_owner(state):
                 raise RuntimeError('project name is owned by a different fixture instance')
 
 
+def tear_down_fixture(directory, state, *, collect_logs=False):
+    owns_compose_project = False
+    try:
+        (directory / 'ready.json').unlink(missing_ok=True)
+        verify_owner(state)
+        owns_compose_project = True
+        if collect_logs:
+            with suppress(OSError, subprocess.SubprocessError):
+                logs = compose(directory, 'logs', '--no-color', '--tail', '80')
+                (directory / 'failure.log').write_text(logs)
+    finally:
+        try:
+            stop_relay(directory, state)
+        finally:
+            if owns_compose_project:
+                compose(directory, 'down', '-v', '--remove-orphans')
+
+
 def stop_relay_by_pidfd(directory, state, pid):
     """Return whether Linux process identity was available for this relay."""
     if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
@@ -434,22 +452,18 @@ def provision(args, directory):
             run(bash, '-s', '--', state['node_rpc'], str(args.tip), stdin_bytes=mining_script)
         else:
             rpc(state, 'generate', [args.tip])
+        mined_tip = rpc(state, 'getblockcount', [])
+        if type(mined_tip) is not int:
+            raise RuntimeError('node returned an invalid block height')
+        if mined_tip != args.tip:
+            raise RuntimeError(f'node reached height {mined_tip}. Expected height {args.tip} before starting Zinder.')
         compose(directory, 'up', '-d', '--wait', '--wait-timeout', str(args.timeout),
                 *['zinder-' + n for n in SERVICES])
         start_relay(directory, state, serving=True, direct_bridge=direct_bridge)
         snapshot(directory, state, args.timeout)
         shutil.copyfile(directory / 'ready.json', directory / 'ready.initial.json')
     except BaseException:
-        try:
-            (directory / 'failure.log').write_text(compose(directory, 'logs', '--no-color', '--tail', '80'))
-        except subprocess.CalledProcessError:
-            pass
-        (directory / 'ready.json').unlink(missing_ok=True)
-        verify_owner(state)
-        try:
-            stop_relay(directory, state)
-        finally:
-            compose(directory, 'down', '-v', '--remove-orphans')
+        tear_down_fixture(directory, state, collect_logs=True)
         raise
 
 
@@ -486,14 +500,10 @@ def main():
         state = json.loads((directory / 'state.json').read_text())
         if state['project'] != args.project:
             raise ValueError('project ownership mismatch')
-        verify_owner(state)
         if args.action == 'down':
-            (directory / 'ready.json').unlink(missing_ok=True)
-            try:
-                stop_relay(directory, state)
-            finally:
-                compose(directory, 'down', '-v', '--remove-orphans')
+            tear_down_fixture(directory, state)
         else:
+            verify_owner(state)
             (directory / 'ready.json').unlink(missing_ok=True)
             running = compose(directory, 'ps', '--status', 'running', '-q', 'node')
             if not running or running != state['node_container']:
