@@ -26,9 +26,10 @@ use zinder_core::{
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence,
     CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily,
-    ChainEventStreamResume, EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
-    EventStreamStartPosition, HeightOrder, RawBlobRetention, RocksDbCanonicalSecondary,
-    ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
+    ChainEventStreamResume, CompactBlockSpliceSelection, EncodedCompactBlockRange,
+    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, RawBlobRetention,
+    RocksDbCanonicalSecondary, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
+    TreeStateReplay, TreeStateReplayOutcome,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionHistoryPage, WalletAddressTransactionKey,
@@ -37,8 +38,9 @@ use zinder_wallet_projection::{
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
 
 use crate::{
-    ArtifactKey, CanonicalReader, IndexedTransaction, SpendStatusReadEnd, StorageReadError,
-    WalletProjectionReader, serving_readers::drives_blocking_read,
+    ArtifactKey, CanonicalReader, EncodedCompactBlockLookup, IndexedTransaction,
+    SpendStatusReadEnd, StorageReadError, WalletProjectionReader,
+    serving_readers::drives_blocking_read,
 };
 
 /// A [`CanonicalReader`] over one admitted `RocksDB` canonical secondary.
@@ -278,6 +280,44 @@ impl CanonicalReader for RocksDbCanonicalReader {
     ) -> Result<Option<CompactBlockArtifact>, StorageReadError> {
         self.read(move |secondary| secondary.compact_block_at(height))
             .await
+    }
+
+    async fn encoded_compact_block_at(
+        &self,
+        height: BlockHeight,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        self.read(move |secondary| {
+            Ok(secondary
+                .encoded_compact_block_at(height, selection)?
+                .map_or(
+                    EncodedCompactBlockLookup::NotFound,
+                    EncodedCompactBlockLookup::Block,
+                ))
+        })
+        .await
+    }
+
+    async fn encoded_compact_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        self.read(
+            move |secondary| match secondary.block_hash_lookup(block_hash)? {
+                BlockHashLookup::Resolved(block_id) => secondary
+                    .encoded_compact_block_at(block_id.height, selection)?
+                    .map(EncodedCompactBlockLookup::Block)
+                    .ok_or(CanonicalStoreError::ArtifactUnavailable {
+                        family: ArtifactFamily::CompactBlock,
+                        height: block_id.height,
+                    }),
+                BlockHashLookup::NotInBestChain | BlockHashLookup::NotIndexed => {
+                    Ok(EncodedCompactBlockLookup::NotFound)
+                }
+            },
+        )
+        .await
     }
 
     async fn compact_blocks_in_range(

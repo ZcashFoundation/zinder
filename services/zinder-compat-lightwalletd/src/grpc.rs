@@ -32,7 +32,7 @@ use zinder_core::{
         encode_rpc_transaction_id_hex,
     },
 };
-use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
+use zinder_proto::compat::lightwalletd::{self, EncodedBlock, compact_tx_streamer_server};
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
     ArtifactKey, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, PendingTransaction, QueryError,
@@ -45,7 +45,8 @@ use zinder_runtime::RepeatedFieldGuard;
 use zinder_source::{NodeCapability, SourceError};
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
 use zinder_store::{
-    ArtifactFamily, EncodedCompactBlockRangeRequest, MempoolEvent, RawBlobRetention,
+    ArtifactFamily, CompactBlockSpliceSelection, EncodedCompactBlockRangeRequest, MempoolEvent,
+    RawBlobRetention,
 };
 
 use crate::block_methods::{
@@ -585,6 +586,21 @@ where
         self.compact_block_at(height, Some(view.id))
             .await
             .map(|compact_block| compact_block.compact_block)
+            .map_err(|error| status_from_query_error(&error))
+    }
+
+    async fn read_encoded_compact_block(
+        &self,
+        view: &ChainEpoch,
+        block: RequestedBlock,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<Option<EncodedBlock>, Status> {
+        let height = resolve_block_height(self, view, block)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        self.encoded_compact_block_at(height, selection, Some(view.id))
+            .await
+            .map(|encoded| encoded.map(|response| response.compact_block))
             .map_err(|error| status_from_query_error(&error))
     }
 

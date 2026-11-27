@@ -12,6 +12,7 @@ use zinder_core::{
     TransactionId, TransactionLocation, UnixTimestampMillis,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
+use zinder_proto::compat::lightwalletd::EncodedBlock;
 
 use super::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, CanonicalStoreError, RocksDbCanonicalSecondary,
@@ -23,7 +24,7 @@ use super::{
     },
     block_replay::validate_incremental_replay_range_bound,
     encoded_compact_range::{
-        EncodedCompactBlockRange, EncodedCompactBlockRangeRequest,
+        EncodedCompactBlockRange, EncodedCompactBlockRangeRequest, encoded_compact_block_at,
         encoded_compact_block_range_up_to,
     },
     live_tail::LiveTailBlockRecord,
@@ -292,6 +293,17 @@ macro_rules! impl_canonical_typed_reads {
                 cancel: Option<&AtomicBool>,
             ) -> Result<Option<EncodedCompactBlockRange>, CanonicalStoreError> {
                 encoded_compact_block_range_up_to(self, request, cancel)
+            }
+
+            /// Reads one encoded lightwalletd `CompactBlock` wire message at `height`
+            /// directly from `ZSHRNG02` + `ZSTSUP01` or `live_tail_block`, skipping
+            /// `ZSTSUP01` chunk decompression when no Tag-1 supplement is needed.
+            pub fn encoded_compact_block_at(
+                &self,
+                height: BlockHeight,
+                selection: crate::CompactBlockSpliceSelection,
+            ) -> Result<Option<EncodedBlock>, CanonicalStoreError> {
+                encoded_compact_block_at(self, height, selection)
             }
 
             /// Reads the canonical location of one transaction.
@@ -1023,7 +1035,7 @@ pub(super) fn require_retained_compact_blocks(
 }
 
 /// Heights from the first retained block through the visible tip.
-fn retained_compact_block_span(store: &impl CanonicalServingRead) -> BlockHeightRange {
+pub(super) fn retained_compact_block_span(store: &impl CanonicalServingRead) -> BlockHeightRange {
     let ready_evidence = store.serving_ready_evidence();
     BlockHeightRange::inclusive(
         ready_evidence.first_retained_block.height,

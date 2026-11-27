@@ -2901,3 +2901,710 @@ fn secondary_catch_up_rejects_non_trailing_segment_mutation_and_beyond_checkpoin
     assert!(merged_err.to_string().contains("prefix mutated"));
     Ok(())
 }
+
+fn boundary_det_hash(height: u32) -> [u8; 32] {
+    let mut out = [0_u8; 32];
+    out[..4].copy_from_slice(&height.to_be_bytes());
+    out[4] = 0xa7;
+    out
+}
+
+fn boundary_public_facts(
+    tx_id: zinder_core::TransactionId,
+    height_num: u32,
+    counts: zinder_core::TransactionComponentCounts,
+    privacy_shape: zinder_core::PrivacyShape,
+    size_bytes: u32,
+) -> zinder_core::TransactionPublicFacts {
+    use zinder_core::{LockTime, TransactionPublicFacts, TransactionVersion};
+
+    TransactionPublicFacts {
+        transaction_id: tx_id,
+        auth_digest: None,
+        wtxid: None,
+        version: TransactionVersion::V5,
+        consensus_branch_id: None,
+        lock_time: LockTime::Height(BlockHeight::new(height_num)),
+        expiry_height: Some(BlockHeight::new(height_num + 20)),
+        size_bytes,
+        counts,
+        orchard_value_balance_zat: None,
+        orchard_anchor: None,
+        ironwood_value_balance_zat: None,
+        privacy_shape,
+        is_coinbase: true,
+        unsupported_sections: Vec::new(),
+    }
+}
+
+fn boundary_tx_variant(
+    height_num: u32,
+) -> (
+    zinder_core::CompactTransactionData,
+    zinder_core::TransactionComponentCounts,
+    zinder_core::PrivacyShape,
+    Vec<zinder_core::TransparentOutputFact>,
+) {
+    use zinder_core::{
+        CompactSaplingSpend, CompactTransactionData, CompactTransparentOutput, PrivacyShape,
+        TransactionComponentCounts, TransparentAddressScriptHash, TransparentOutputFact,
+    };
+
+    match height_num % 3 {
+        0 => (
+            CompactTransactionData {
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: boundary_det_hash(height_num.wrapping_add(200_000)),
+                }],
+                ..Default::default()
+            },
+            TransactionComponentCounts {
+                sapling_spend_count: 1,
+                ..TransactionComponentCounts::EMPTY
+            },
+            PrivacyShape::ShieldedOnly,
+            Vec::new(),
+        ),
+        1 => (
+            CompactTransactionData {
+                fee_zat: Some(250),
+                transparent_outputs: vec![CompactTransparentOutput {
+                    value_zat: 10_000,
+                    script_pub_key: vec![0x76, 0xa9, 0x14, 0x88, 0xac],
+                }],
+                ..Default::default()
+            },
+            TransactionComponentCounts {
+                transparent_output_count: 1,
+                ..TransactionComponentCounts::EMPTY
+            },
+            PrivacyShape::TransparentOnly,
+            vec![TransparentOutputFact::new(
+                0,
+                10_000,
+                vec![0x76, 0xa9, 0x14, 0x88, 0xac],
+                TransparentAddressScriptHash::from_bytes([0x11; 32]),
+            )],
+        ),
+        _ => (
+            CompactTransactionData {
+                fee_zat: Some(500),
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: boundary_det_hash(height_num.wrapping_add(300_000)),
+                }],
+                transparent_outputs: vec![CompactTransparentOutput {
+                    value_zat: 20_000,
+                    script_pub_key: vec![0x00, 0x14, 0x22],
+                }],
+                ..Default::default()
+            },
+            TransactionComponentCounts {
+                transparent_output_count: 1,
+                sapling_spend_count: 1,
+                ..TransactionComponentCounts::EMPTY
+            },
+            PrivacyShape::Mixed,
+            vec![TransparentOutputFact::new(
+                0,
+                20_000,
+                vec![0x00, 0x14, 0x22],
+                TransparentAddressScriptHash::from_bytes([0x22; 32]),
+            )],
+        ),
+    }
+}
+
+fn boundary_tx_and_facts(
+    height_num: u32,
+) -> (
+    zinder_core::CompactTransaction,
+    zinder_core::CanonicalTransactionFacts,
+) {
+    use zinder_core::{
+        CanonicalTransactionFacts, CompactTransaction, SerializedBytesDigest, TransactionId,
+        TransactionIntrinsicValueBalances,
+    };
+
+    let tx_id = TransactionId::from_bytes(boundary_det_hash(height_num.wrapping_add(100_000)));
+    let (tx_data, counts, shape, outputs) = boundary_tx_variant(height_num);
+    (
+        CompactTransaction {
+            index: 0,
+            transaction_id: tx_id,
+            data: tx_data,
+        },
+        CanonicalTransactionFacts {
+            public_facts: boundary_public_facts(tx_id, height_num, counts, shape, 256),
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
+                &height_num.to_be_bytes(),
+            ),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: Vec::new(),
+            transparent_outputs: outputs,
+        },
+    )
+}
+
+fn boundary_build_block(
+    height_num: u32,
+    parent_hash: [u8; 32],
+    activations: &NetworkUpgradeActivations,
+    with_checkpoint: bool,
+) -> Result<crate::CanonicalBuildBlock, Box<dyn std::error::Error>> {
+    use zinder_core::{
+        BlockHeaderArtifact, CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
+        CanonicalBlockReplayFormatVersion, CompactChainMetadata, SerializedBytesDigest,
+        encode_canonical_block_replay,
+    };
+
+    let height = BlockHeight::new(height_num);
+    let block_hash = boundary_det_hash(height_num);
+    let (compact_tx, tx_facts) = boundary_tx_and_facts(height_num);
+    let facts = CanonicalBlockFacts {
+        block_header: BlockHeaderArtifact::new(
+            height,
+            BlockHash::from_bytes(block_hash),
+            BlockHash::from_bytes(parent_hash),
+            [3; 32],
+            [4; 32],
+            1_750_000_000 + i64::from(height_num),
+            0x1d00_ffff,
+            [5; 32],
+            4,
+            128,
+        ),
+        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
+            &height_num.to_be_bytes(),
+        ),
+        transactions: vec![tx_facts],
+    };
+    let replay_envelope = encode_canonical_block_replay(
+        &facts,
+        CanonicalBlockReplayFormatVersion::V1,
+        CanonicalBlockFactsDigestVersion::V1,
+    );
+    let checkpoint = with_checkpoint
+        .then(|| {
+            super::test_checkpoint_frontiers(activations, height).map(|frontiers| {
+                zinder_core::CommitmentTreeCheckpoint::new(
+                    BlockId::new(height, BlockHash::from_bytes(block_hash)),
+                    1_750_000_000 + height_num,
+                    frontiers,
+                )
+            })
+        })
+        .transpose()?;
+    Ok(crate::CanonicalBuildBlock {
+        compact_block: zinder_core::CompactBlockArtifact::new(
+            BlockId::new(height, BlockHash::from_bytes(block_hash)),
+            BlockHash::from_bytes(parent_hash),
+            1_750_000_000 + height_num,
+            vec![compact_tx],
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        )?,
+        replay_envelope,
+        tip_metadata: zinder_core::ChainTipMetadata::new(0, 0, 0),
+        tree_state_checkpoint: checkpoint,
+        transaction_blobs: Vec::new(),
+        block_blob: None,
+        facts,
+    })
+}
+
+fn published_4096_boundary_store(
+    store_path: &std::path::Path,
+) -> Result<(RocksDbCanonicalStore, NetworkUpgradeActivations), Box<dyn std::error::Error>> {
+    use crate::{
+        CanonicalBaselinePublication, CanonicalStoreBuildPlan, RocksDbCanonicalBuilder,
+        TREE_STATE_CHECKPOINT_STRIDE,
+    };
+
+    const BOUNDARY_TIP: u32 = 4_104;
+    const BOUNDARY_SETTLED: u32 = crate::DEFAULT_SETTLED_SEGMENT_BLOCKS;
+    const BOUNDARY_REORG: u32 = BOUNDARY_TIP - BOUNDARY_SETTLED;
+
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let tip = BlockId::new(
+        BlockHeight::new(BOUNDARY_TIP),
+        BlockHash::from_bytes(boundary_det_hash(BOUNDARY_TIP)),
+    );
+    let plan = CanonicalStoreBuildPlan::complete(
+        &activations,
+        0,
+        tip,
+        RawBlobRetention::None,
+        CanonicalReorgPolicy::new(BOUNDARY_REORG)?,
+    )?;
+    let mut builder = RocksDbCanonicalBuilder::create_fresh(
+        store_path,
+        plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let mut blocks: Vec<Result<crate::CanonicalBuildBlock, std::io::Error>> =
+        Vec::with_capacity(usize::try_from(BOUNDARY_TIP)?);
+    let mut parent = Network::ZcashTestnet.genesis_hash().as_bytes();
+    for h in 1_u32..=BOUNDARY_TIP {
+        let with_ckpt = h == BOUNDARY_TIP || h.is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
+        let blk = boundary_build_block(h, parent, &activations, with_ckpt)?;
+        parent = blk.facts.block_header.block_hash.as_bytes();
+        blocks.push(Ok(blk));
+    }
+    builder.bulk_load_blocks(&activations, blocks)?;
+    builder.load_subtree_roots(std::iter::empty())?;
+    builder.confirm_source_tip_checkpoint(&zinder_core::CommitmentTreeCheckpoint::new(
+        tip,
+        1_750_000_000 + BOUNDARY_TIP,
+        super::test_checkpoint_frontiers(&activations, BlockHeight::new(BOUNDARY_TIP))?,
+    ))?;
+    let validated = builder.prepare_cold_certified_publication()?;
+    let settled = BlockId::new(
+        BlockHeight::new(BOUNDARY_SETTLED),
+        BlockHash::from_bytes(boundary_det_hash(BOUNDARY_SETTLED)),
+    );
+    let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+        settled,
+        UnixTimestampMillis::new(1_750_000_000_000),
+    ))?;
+    let store = validated.publish_baseline(publication)?;
+    Ok((store, activations))
+}
+
+/// Consumes `RocksDB`'s `min(16, table_cache_capacity / 4)` open-time
+/// `table_reader_handle` pins on `default` (`CF 0`) so later column families
+/// (including `live_tail_block`) receive none at secondary open.
+fn saturate_initial_open_pins(db: &rust_rocksdb::DB) -> Result<(), Box<dyn std::error::Error>> {
+    let default_cf = db
+        .cf_handle(DEFAULT_COLUMN_FAMILY_NAME)
+        .ok_or("default family must exist")?;
+    db.set_options_cf(&default_cf, &[("disable_auto_compactions", "true")])?;
+    let (control_key, control_row) = db
+        .iterator_cf(&default_cf, rust_rocksdb::IteratorMode::Start)
+        .next()
+        .ok_or("default family must hold store control")??;
+    for _ in 0..16 {
+        db.put_cf(&default_cf, &control_key, &control_row)?;
+        db.flush_cf(&default_cf)?;
+    }
+    Ok(())
+}
+
+/// Splits the first `limit` rows of `family` into individual L0 table files
+/// while keeping auto-compactions disabled.
+fn split_first_rows_into_table_files(
+    db: &rust_rocksdb::DB,
+    family: &str,
+    limit: usize,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let handle = db.cf_handle(family).ok_or("the family must exist")?;
+    db.set_options_cf(&handle, &[("disable_auto_compactions", "true")])?;
+    let rows = db
+        .iterator_cf(&handle, rust_rocksdb::IteratorMode::Start)
+        .take(limit)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut heights = Vec::with_capacity(rows.len());
+    for (key, row) in rows {
+        if key.len() == 4 {
+            let raw: [u8; 4] = key.as_ref().try_into()?;
+            heights.push(u32::from_be_bytes(raw));
+        }
+        db.put_cf(&handle, key, row)?;
+        db.flush_cf(&handle)?;
+    }
+    Ok(heights)
+}
+
+/// Evicts unpinned table-cache handles across all shards by point-reading `heights`
+/// from `block_header`, each backed by its own L0 SST.
+fn evict_table_cache_via_block_headers(
+    secondary: &RocksDbCanonicalSecondary,
+    heights: &[u32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for &height in heights {
+        let _ = secondary.block_header_at(BlockHeight::new(height))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn encoded_range_and_unary_reads_across_4096_boundary_invalidate_on_missing_table_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let (store, activations) = published_4096_boundary_store(&store_path)?;
+    saturate_initial_open_pins(&store.bounded_open.db)?;
+    let header_heights =
+        split_first_rows_into_table_files(&store.bounded_open.db, BLOCK_HEADER_COLUMN_FAMILY, 80)?;
+    split_rows_into_bottom_level_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+
+    let mut tight_budget = RocksDbResourceBudget::for_local_tests();
+    tight_budget.max_open_files = RocksDbResourceBudget::MIN_MAX_OPEN_FILES;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &store_path,
+        temporary.path().join("secondary"),
+        Network::ZcashTestnet,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+        CanonicalReorgPolicy::new(8)?,
+        tight_budget,
+    )?;
+    assert_eq!(secondary.sealed_segments.len(), 1);
+    assert_eq!(
+        secondary.sealed_segments[0].end_block.height,
+        BlockHeight::new(4_096)
+    );
+    evict_table_cache_via_block_headers(&secondary, &header_heights)?;
+
+    compact_away_rows_in(
+        &store.bounded_open.db,
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+        BlockHeightRange::inclusive(BlockHeight::new(4_097), BlockHeight::new(4_104)),
+    )?;
+    assert_compacted_boundary_behavior(&secondary, &store)?;
+
+    secondary.try_catch_up()?;
+    assert_post_catch_up_boundary_reads(&secondary)?;
+    let _ = activations;
+    Ok(())
+}
+
+fn assert_compacted_boundary_behavior(
+    secondary: &RocksDbCanonicalSecondary,
+    store: &RocksDbCanonicalStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        EncodedCompactBlockOutput, EncodedCompactBlockRangeRequest, ShieldedProjectionSelection,
+    };
+
+    for include_transparent in [false, true] {
+        let two_settled = secondary
+            .encoded_compact_block_range_up_to(
+                EncodedCompactBlockRangeRequest {
+                    range: BlockHeightRange::inclusive(
+                        BlockHeight::new(4_095),
+                        BlockHeight::new(4_100),
+                    ),
+                    order: HeightOrder::Ascending,
+                    selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    include_transparent,
+                    output: EncodedCompactBlockOutput::Blocks,
+                    max_bytes: 160,
+                    enforce_wire_fee_limit: true,
+                },
+                None,
+            )?
+            .ok_or("expected settled prefix")?;
+        assert!(two_settled.covered.end <= BlockHeight::new(4_096));
+    }
+    for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+        for include_transparent in [false, true] {
+            let err = secondary
+                .encoded_compact_block_range_up_to(
+                    EncodedCompactBlockRangeRequest {
+                        range: BlockHeightRange::inclusive(
+                            BlockHeight::new(4_095),
+                            BlockHeight::new(4_100),
+                        ),
+                        order,
+                        selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                        include_transparent,
+                        output: EncodedCompactBlockOutput::Blocks,
+                        max_bytes: usize::MAX,
+                        enforce_wire_fee_limit: true,
+                    },
+                    None,
+                )
+                .err()
+                .ok_or("compacted boundary must fail with MissingTableFile")?;
+            assert!(err.is_missing_table_file(), "unexpected error: {err:?}");
+        }
+    }
+    assert_compacted_unary_tail_behavior(secondary, store)
+}
+
+fn assert_compacted_unary_tail_behavior(
+    secondary: &RocksDbCanonicalSecondary,
+    store: &RocksDbCanonicalStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::CompactBlockSpliceSelection;
+
+    for selection in [
+        CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+    ] {
+        let mut missing_failures = 0_usize;
+        for h in 4_097_u32..=4_104 {
+            let height = BlockHeight::new(h);
+            match secondary.encoded_compact_block_at(height, selection) {
+                Ok(Some(actual)) => {
+                    let expected = store
+                        .encoded_compact_block_at(height, selection)?
+                        .ok_or("primary must hold live-tail block")?;
+                    assert_eq!(actual.payload().as_ref(), expected.payload().as_ref());
+                }
+                Ok(None) => return Err("live-tail block must not silently return None".into()),
+                Err(err) => {
+                    assert!(err.is_missing_table_file(), "unexpected error: {err:?}");
+                    missing_failures += 1;
+                }
+            }
+        }
+        assert!(missing_failures > 0, "expected MissingTableFile on tail");
+    }
+    let settled_actual = secondary
+        .encoded_compact_block_at(
+            BlockHeight::new(4_096),
+            CompactBlockSpliceSelection::FULL_BLOCK,
+        )?
+        .ok_or("settled height 4,096 must stay readable")?;
+    let settled_expected = store
+        .encoded_compact_block_at(
+            BlockHeight::new(4_096),
+            CompactBlockSpliceSelection::FULL_BLOCK,
+        )?
+        .ok_or("primary must hold height 4,096")?;
+    assert_eq!(
+        settled_actual.payload().as_ref(),
+        settled_expected.payload().as_ref()
+    );
+    assert!(
+        secondary
+            .encoded_compact_block_at(
+                BlockHeight::new(5_000),
+                CompactBlockSpliceSelection::FULL_BLOCK,
+            )?
+            .is_none()
+    );
+    Ok(())
+}
+
+fn assert_post_catch_up_boundary_reads(
+    secondary: &RocksDbCanonicalSecondary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        EncodedCompactBlockOutput, EncodedCompactBlockPayload, EncodedCompactBlockRangeRequest,
+        ShieldedProjectionSelection,
+    };
+
+    for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+        for include_transparent in [false, true] {
+            let full = secondary
+                .encoded_compact_block_range_up_to(
+                    EncodedCompactBlockRangeRequest {
+                        range: BlockHeightRange::inclusive(
+                            BlockHeight::new(4_095),
+                            BlockHeight::new(4_104),
+                        ),
+                        order,
+                        selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                        include_transparent,
+                        output: EncodedCompactBlockOutput::Blocks,
+                        max_bytes: usize::MAX,
+                        enforce_wire_fee_limit: true,
+                    },
+                    None,
+                )?
+                .ok_or("expected full cross-boundary range after catch-up")?;
+            assert_eq!(full.block_count, 10);
+            let EncodedCompactBlockPayload::Blocks(blocks) = full.payload else {
+                return Err("expected Blocks variant".into());
+            };
+            assert_eq!(blocks.len(), 10);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct DbScanTicker {
+    next_calls: u64,
+    prev_calls: u64,
+}
+
+fn capture_db_scan_ticker(secondary: &RocksDbCanonicalSecondary) -> DbScanTicker {
+    DbScanTicker {
+        next_calls: secondary
+            .bounded_open
+            .statistics
+            .get_ticker_count(Ticker::NumberDbNext),
+        prev_calls: secondary
+            .bounded_open
+            .statistics
+            .get_ticker_count(Ticker::NumberDbPrev),
+    }
+}
+
+fn assert_zero_table_scans(
+    secondary: &RocksDbCanonicalSecondary,
+    before_range: RangeReadTickers,
+    before_scan: DbScanTicker,
+) {
+    let delta = range_read_tickers(secondary).since(before_range);
+    let after_scan = capture_db_scan_ticker(secondary);
+    assert_eq!(delta.iterator_seeks, 0);
+    assert_eq!(after_scan.next_calls - before_scan.next_calls, 0);
+    assert_eq!(after_scan.prev_calls - before_scan.prev_calls, 0);
+}
+
+#[test]
+fn encoded_range_and_unary_reads_have_bounded_lookups_and_zero_table_scans()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::settled_segments::layout::SettledSegmentKind;
+    use crate::{
+        EncodedCompactBlockOutput, EncodedCompactBlockRangeRequest, ShieldedProjectionSelection,
+    };
+
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let (store, _) = published_4096_boundary_store(&store_path)?;
+    let secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &store_path,
+        temporary.path().join("secondary"),
+        Network::ZcashTestnet,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+        CanonicalReorgPolicy::new(8)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    // 1. Settled-only shielded range (1..=4,096): zero RocksDB MultiGet/seek/next/prev, zero ZSTSUP01 opens.
+    secondary.segment_cache.clear();
+    let before = range_read_tickers(&secondary);
+    let scan_before = capture_db_scan_ticker(&secondary);
+    let settled_shielded = secondary
+        .encoded_compact_block_range_up_to(
+            EncodedCompactBlockRangeRequest {
+                range: BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(4_096)),
+                order: HeightOrder::Ascending,
+                selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                include_transparent: false,
+                output: EncodedCompactBlockOutput::Blocks,
+                max_bytes: usize::MAX,
+                enforce_wire_fee_limit: true,
+            },
+            None,
+        )?
+        .ok_or("expected settled shielded range")?;
+    assert_eq!(settled_shielded.block_count, 4_096);
+    assert_zero_table_scans(&secondary, before, scan_before);
+    let delta = range_read_tickers(&secondary).since(before);
+    assert_eq!(delta.multi_get_calls, 0);
+    assert_eq!(delta.multi_get_keys, 0);
+    assert_eq!(
+        secondary
+            .segment_cache
+            .open_count(SettledSegmentKind::Shielded),
+        1
+    );
+    assert_eq!(
+        secondary
+            .segment_cache
+            .open_count(SettledSegmentKind::Supplement),
+        0
+    );
+
+    assert_boundary_range_tickers(&secondary)?;
+    assert_unary_lookup_tickers(&secondary)?;
+    drop(store);
+    Ok(())
+}
+
+fn assert_boundary_range_tickers(
+    secondary: &RocksDbCanonicalSecondary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        EncodedCompactBlockOutput, EncodedCompactBlockRangeRequest, ShieldedProjectionSelection,
+    };
+
+    for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+        let before = range_read_tickers(secondary);
+        let scan_before = capture_db_scan_ticker(secondary);
+        let boundary = secondary
+            .encoded_compact_block_range_up_to(
+                EncodedCompactBlockRangeRequest {
+                    range: BlockHeightRange::inclusive(
+                        BlockHeight::new(4_095),
+                        BlockHeight::new(4_104),
+                    ),
+                    order,
+                    selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    include_transparent: true,
+                    output: EncodedCompactBlockOutput::Blocks,
+                    max_bytes: usize::MAX,
+                    enforce_wire_fee_limit: true,
+                },
+                None,
+            )?
+            .ok_or("expected cross-boundary range")?;
+        assert_eq!(boundary.block_count, 10);
+        assert_zero_table_scans(secondary, before, scan_before);
+        let delta = range_read_tickers(secondary).since(before);
+        // Probe batch (1 key) learns largest_live_row_bytes; second MultiGet fetches the remaining 7 keys.
+        assert_eq!(delta.multi_get_calls, 2);
+        assert_eq!(delta.multi_get_keys, 8);
+    }
+
+    let before_t = range_read_tickers(secondary);
+    let scan_t = capture_db_scan_ticker(secondary);
+    let settled_transparent = secondary
+        .encoded_compact_block_range_up_to(
+            EncodedCompactBlockRangeRequest {
+                range: BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(4_096)),
+                order: HeightOrder::Descending,
+                selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                include_transparent: true,
+                output: EncodedCompactBlockOutput::Blocks,
+                max_bytes: usize::MAX,
+                enforce_wire_fee_limit: true,
+            },
+            None,
+        )?
+        .ok_or("expected settled transparent range")?;
+    assert_eq!(settled_transparent.block_count, 4_096);
+    assert_zero_table_scans(secondary, before_t, scan_t);
+    let delta_t = range_read_tickers(secondary).since(before_t);
+    assert_eq!(delta_t.multi_get_calls, 0);
+    assert_eq!(delta_t.multi_get_keys, 0);
+    Ok(())
+}
+
+fn assert_unary_lookup_tickers(
+    secondary: &RocksDbCanonicalSecondary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::CompactBlockSpliceSelection;
+
+    let before_settled = range_read_tickers(secondary);
+    let scan_settled = capture_db_scan_ticker(secondary);
+    assert!(
+        secondary
+            .encoded_compact_block_at(
+                BlockHeight::new(2_048),
+                CompactBlockSpliceSelection::FULL_BLOCK,
+            )?
+            .is_some()
+    );
+    assert_zero_table_scans(secondary, before_settled, scan_settled);
+    assert_eq!(
+        range_read_tickers(secondary)
+            .since(before_settled)
+            .multi_get_calls,
+        0
+    );
+
+    for selection in [
+        CompactBlockSpliceSelection::FULL_BLOCK,
+        CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+    ] {
+        let before_tail = range_read_tickers(secondary);
+        let scan_tail = capture_db_scan_ticker(secondary);
+        assert!(
+            secondary
+                .encoded_compact_block_at(BlockHeight::new(4_100), selection)?
+                .is_some()
+        );
+        assert_zero_table_scans(secondary, before_tail, scan_tail);
+    }
+    Ok(())
+}

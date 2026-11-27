@@ -315,6 +315,17 @@ impl WalletQueryApi for SwappableWalletQuery {
             .await
     }
 
+    async fn encoded_compact_block_at(
+        &self,
+        height: BlockHeight,
+        selection: zinder_store::CompactBlockSpliceSelection,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<zinder_query::EncodedCompactBlock>, QueryError> {
+        self.for_epoch(at_epoch_id)
+            .encoded_compact_block_at(height, selection, at_epoch_id)
+            .await
+    }
+
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
@@ -1587,6 +1598,7 @@ mod tests {
                         range,
                         order: HeightOrder::Ascending,
                         selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                        include_transparent: false,
                         output: EncodedCompactBlockOutput::Blocks,
                         max_bytes: 1024 * 1024,
                         enforce_wire_fee_limit: true,

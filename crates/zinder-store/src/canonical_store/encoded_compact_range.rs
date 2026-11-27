@@ -14,21 +14,25 @@ use crate::{
         ShieldedReadScratch, project_shielded_block_wire_with_scratch,
         synthesize_empty_nullifier_payload,
     },
+    settled_supplement_segment::{
+        CompactBlockSpliceSelection, SupplementSpliceRequest, splice_compact_block_wire,
+    },
 };
 
 use super::{
     CanonicalStoreError,
-    live_tail::{LiveTailBlockRecord, LiveTailShieldedWire},
+    live_tail::{LiveTailBlockRecord, LiveTailShieldedWire, LiveTailSpliceWire},
     reader::{
         CanonicalServingRead, bounded_batch_len, missing_compact_block_row,
-        require_retained_compact_blocks,
+        require_retained_compact_blocks, retained_compact_block_span,
     },
     settled_segments::{
         layout::SettledSegmentIndexEntry,
         store_access::{
             SegmentStoreContext, fetch_live_tail_batch_pinned, map_settled_segments_read_error,
-            map_shielded_read_error, open_shielded_segment_reader, read_sealed_tip,
-            resolve_settled_segment_for_height, verified_read_options,
+            map_shielded_read_error, map_supplement_read_error, open_shielded_segment_reader,
+            open_supplement_segment_reader, read_sealed_tip, resolve_settled_segment_for_height,
+            verified_read_options,
         },
     },
 };
@@ -81,7 +85,7 @@ pub struct EncodedCompactBlockRange {
 }
 
 /// Parameters for reading bounded canonical compact-block wire frames directly from
-/// `ZSHRNG02` settled segments and `live_tail_block`.
+/// `ZSHRNG02` settled segments and `live_tail_block` (with optional `ZSTSUP01` splicing).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EncodedCompactBlockRangeRequest {
     /// Inclusive canonical height range to read.
@@ -90,12 +94,121 @@ pub struct EncodedCompactBlockRangeRequest {
     pub order: HeightOrder,
     /// Shielded pool selection and redaction mode.
     pub selection: ShieldedProjectionSelection,
+    /// Merge Tag-1 transparent inputs, outputs, and transparent-only transactions via `ZSTSUP01`.
+    pub include_transparent: bool,
     /// Output representation (individual messages or batched wire frames).
     pub output: EncodedCompactBlockOutput,
     /// Soft stored-byte budget per call (always keeps at least one block).
     pub max_bytes: usize,
     /// Reject blocks carrying an omitted transaction fee exceeding `u32::MAX`.
     pub enforce_wire_fee_limit: bool,
+}
+
+pub(super) fn encoded_compact_block_at(
+    store: &impl CanonicalServingRead,
+    height: BlockHeight,
+    selection: CompactBlockSpliceSelection,
+) -> Result<Option<EncodedBlock>, CanonicalStoreError> {
+    let retained = retained_compact_block_span(store);
+    if height < retained.start || height > retained.end {
+        return Ok(None);
+    }
+    encoded_compact_block_at_for_context(store.serving_context(), height, selection)
+}
+
+fn encoded_compact_block_at_for_context(
+    ctx: SegmentStoreContext<'_>,
+    height: BlockHeight,
+    selection: CompactBlockSpliceSelection,
+) -> Result<Option<EncodedBlock>, CanonicalStoreError> {
+    if let Some(entry) = resolve_settled_segment_for_height(ctx.db, ctx.sealed_segments, height)? {
+        return read_settled_unary_compact_block(ctx, &entry, height, selection).map(Some);
+    }
+    let Some(raw_row) =
+        crate::canonical_store::settled_segments::store_access::read_live_tail_raw_bytes_with_options(
+            ctx.db,
+            height,
+            &verified_read_options(),
+        )?
+    else {
+        return Ok(None);
+    };
+    let wire = LiveTailBlockRecord::decode_splice_wire_v1(&raw_row, height)
+        .map_err(map_settled_segments_read_error)?;
+    if wire.has_unrepresentable_wire_fee {
+        return Err(CanonicalStoreError::ArtifactCorrupt {
+            family: ArtifactFamily::CompactBlock,
+            reason: "compact transaction fee exceeds u32".to_owned(),
+        });
+    }
+    if wire.transparent_transactions.is_empty() && !selection.nullifiers_only {
+        return encoded_block_from_payload(wire.shielded_payload).map(Some);
+    }
+    splice_compact_block_wire(
+        wire.shielded_payload,
+        &wire.transparent_transactions,
+        selection,
+    )
+    .map(Some)
+    .map_err(map_supplement_read_error)
+}
+
+fn read_settled_unary_compact_block(
+    ctx: SegmentStoreContext<'_>,
+    entry: &SettledSegmentIndexEntry,
+    height: BlockHeight,
+    selection: CompactBlockSpliceSelection,
+) -> Result<EncodedBlock, CanonicalStoreError> {
+    let shielded = open_shielded_segment_reader(ctx, entry)?;
+    let may_need_supplement = selection.include_transparent || selection.retain_all_transactions;
+    let sup_reader = if may_need_supplement {
+        open_supplement_segment_reader(ctx, entry)?
+    } else {
+        None
+    };
+    let has_tag1 = if let Some(sup) = &sup_reader {
+        if sup
+            .has_wide_fee_at(height)
+            .map_err(map_supplement_read_error)?
+        {
+            return Err(CanonicalStoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                reason: "supplement compact transaction fee exceeds u32".to_owned(),
+            });
+        }
+        sup.has_transparent_at(height)
+            .map_err(map_supplement_read_error)?
+    } else {
+        false
+    };
+    let single_range = BlockHeightRange::inclusive(height, height);
+    if !(has_tag1 && may_need_supplement) {
+        let proj = if selection.nullifiers_only {
+            ShieldedProjectionSelection::DEFAULT_NULLIFIERS
+        } else {
+            ShieldedProjectionSelection::DEFAULT_SHIELDED
+        };
+        let mut blocks = shielded
+            .read_projected_range(single_range, HeightOrder::Ascending, proj)
+            .map_err(map_shielded_read_error)?;
+        return blocks
+            .pop()
+            .ok_or_else(|| missing_compact_block_row(height));
+    }
+    let sup = sup_reader.ok_or_else(|| CanonicalStoreError::SettledSegment {
+        reason: format!(
+            "settled supplement reader missing for block {}",
+            height.value()
+        ),
+    })?;
+    let mut blocks = shielded
+        .read_default_range(single_range, HeightOrder::Ascending)
+        .map_err(map_shielded_read_error)?;
+    let shielded_block = blocks
+        .pop()
+        .ok_or_else(|| missing_compact_block_row(height))?;
+    sup.splice_block_wire(height, &shielded_block.payload(), selection)
+        .map_err(map_supplement_read_error)
 }
 
 pub(super) fn encoded_compact_block_range_up_to(
@@ -278,28 +391,16 @@ fn read_settled_segment_step(
     if let Some(prev) = acc.last_link {
         verify_step_linkage(params.request.order, prev, step_first)?;
     }
-    let execution = ShieldedPlanExecution {
-        order: params.request.order,
-        selection: params.request.selection,
-        cancel: params.cancel,
-    };
-    match &mut acc.output {
-        AccumulatorOutput::Blocks(out) => {
-            let blocks = reader
-                .read_bounded_projected_blocks_for_plan(&bounded, execution, &mut acc.scratch)
-                .map_err(map_shielded_read_error)?;
-            out.extend(blocks);
-        }
-        AccumulatorOutput::Batcher(batcher) => {
-            reader
-                .append_bounded_projected_frames_for_plan(
-                    &bounded,
-                    execution,
-                    &mut acc.scratch,
-                    batcher,
-                )
-                .map_err(map_shielded_read_error)?;
-        }
+    let sup_reader =
+        if params.request.include_transparent && !params.request.selection.nullifiers_only {
+            open_needed_supplement_for_span(ctx, entry, &bounded)?
+        } else {
+            None
+        };
+    if let Some(sup) = sup_reader {
+        emit_settled_spliced_step(&reader, &sup, &bounded, params, acc)?;
+    } else {
+        emit_settled_shielded_step(&reader, &bounded, params, acc)?;
     }
     acc.record_settled_span(
         step_first,
@@ -312,6 +413,93 @@ fn read_settled_segment_step(
         HeightOrder::Descending => bounded.lowest_height == params.sub_range.start,
     };
     Ok(completed_sub_range)
+}
+
+fn open_needed_supplement_for_span(
+    ctx: SegmentStoreContext<'_>,
+    entry: &SettledSegmentIndexEntry,
+    bounded: &crate::BoundedShieldedRangePlan,
+) -> Result<Option<std::sync::Arc<crate::SettledSupplementSegmentReader>>, CanonicalStoreError> {
+    let Some(sup) = open_supplement_segment_reader(ctx, entry)? else {
+        return Ok(None);
+    };
+    let splice_plan = sup
+        .index()
+        .plan_splice_range(
+            bounded.lowest_height,
+            bounded.highest_height,
+            CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
+        )
+        .map_err(map_supplement_read_error)?;
+    Ok(splice_plan.needs_any_chunk().then_some(sup))
+}
+
+fn emit_settled_shielded_step(
+    reader: &crate::SettledShieldedSegmentReader,
+    bounded: &crate::BoundedShieldedRangePlan,
+    params: SegmentStepParams<'_>,
+    acc: &mut RangeAccumulator,
+) -> Result<(), CanonicalStoreError> {
+    let execution = ShieldedPlanExecution {
+        order: params.request.order,
+        selection: params.request.selection,
+        cancel: params.cancel,
+    };
+    match &mut acc.output {
+        AccumulatorOutput::Blocks(out) => {
+            let blocks = reader
+                .read_bounded_projected_blocks_for_plan(bounded, execution, &mut acc.scratch)
+                .map_err(map_shielded_read_error)?;
+            out.extend(blocks);
+        }
+        AccumulatorOutput::Batcher(batcher) => {
+            reader
+                .append_bounded_projected_frames_for_plan(
+                    bounded,
+                    execution,
+                    &mut acc.scratch,
+                    batcher,
+                )
+                .map_err(map_shielded_read_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_settled_spliced_step(
+    reader: &crate::SettledShieldedSegmentReader,
+    sup: &crate::SettledSupplementSegmentReader,
+    bounded: &crate::BoundedShieldedRangePlan,
+    params: SegmentStepParams<'_>,
+    acc: &mut RangeAccumulator,
+) -> Result<(), CanonicalStoreError> {
+    let asc_execution = ShieldedPlanExecution {
+        order: HeightOrder::Ascending,
+        selection: params.request.selection,
+        cancel: params.cancel,
+    };
+    let shielded_blocks = reader
+        .read_bounded_projected_blocks_for_plan(bounded, asc_execution, &mut acc.scratch)
+        .map_err(map_shielded_read_error)?;
+    let completed = sup
+        .splice_encoded_range_into(
+            SupplementSpliceRequest {
+                start_height: bounded.lowest_height,
+                selection: CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
+                order: params.request.order,
+                cancel: params.cancel,
+            },
+            &shielded_blocks,
+            |spliced| {
+                acc.push_encoded_block(spliced);
+                Ok(())
+            },
+        )
+        .map_err(map_supplement_read_error)?;
+    if !completed {
+        return Err(CanonicalStoreError::ReplayCancelled);
+    }
+    Ok(())
 }
 
 fn read_segment_boundary_links(
@@ -362,6 +550,7 @@ fn read_live_tail_span(
         }
         .map(BlockHeight::new)
     };
+    let splice_transparent = request.include_transparent && !request.selection.nullifiers_only;
     while !acc.is_budget_spent() {
         check_cancelled(cancel)?;
         let batch_len = acc.next_live_tail_batch_len();
@@ -380,18 +569,112 @@ fn read_live_tail_span(
                 return Ok(false);
             }
             let raw_exceeds_output_budget = acc.exceeds_output_budget(stored_row_bytes);
-            let wire = match LiveTailBlockRecord::decode_shielded_wire_v1(raw_row.as_ref(), *height)
-            {
-                Ok(decoded) => decoded,
-                Err(_) if raw_exceeds_output_budget => return Ok(false),
-                Err(error) => return Err(map_settled_segments_read_error(error)),
-            };
-            if !append_live_tail_row(&wire, stored_row_bytes, request, acc)? {
-                return Ok(false);
+            if splice_transparent {
+                let wire =
+                    match LiveTailBlockRecord::decode_splice_wire_v1(raw_row.as_ref(), *height) {
+                        Ok(decoded) => decoded,
+                        Err(_) if raw_exceeds_output_budget => return Ok(false),
+                        Err(error) => return Err(map_settled_segments_read_error(error)),
+                    };
+                if !append_live_tail_spliced_row(&wire, stored_row_bytes, request, acc)? {
+                    return Ok(false);
+                }
+            } else {
+                let wire =
+                    match LiveTailBlockRecord::decode_shielded_wire_v1(raw_row.as_ref(), *height) {
+                        Ok(decoded) => decoded,
+                        Err(_) if raw_exceeds_output_budget => return Ok(false),
+                        Err(error) => return Err(map_settled_segments_read_error(error)),
+                    };
+                if !append_live_tail_row(&wire, stored_row_bytes, request, acc)? {
+                    return Ok(false);
+                }
             }
         }
     }
     Ok(false)
+}
+
+fn append_live_tail_spliced_row(
+    wire: &LiveTailSpliceWire<'_>,
+    stored_row_bytes: usize,
+    request: EncodedCompactBlockRangeRequest,
+    acc: &mut RangeAccumulator,
+) -> Result<bool, CanonicalStoreError> {
+    if wire.transparent_transactions.is_empty() {
+        let shielded = LiveTailShieldedWire {
+            block_id: wire.block_id,
+            previous_block_hash: wire.previous_block_hash,
+            time: wire.time,
+            shielded_payload: wire.shielded_payload,
+            pool_presence: wire.pool_presence,
+            has_unrepresentable_wire_fee: wire.has_unrepresentable_wire_fee,
+        };
+        return append_live_tail_row(&shielded, stored_row_bytes, request, acc);
+    }
+    if acc.exceeds_output_budget(wire.shielded_payload.len())
+        || acc.exceeds_live_read_budget(stored_row_bytes)
+    {
+        return Ok(false);
+    }
+    if request.enforce_wire_fee_limit && wire.has_unrepresentable_wire_fee {
+        return Err(CanonicalStoreError::ArtifactCorrupt {
+            family: ArtifactFamily::CompactBlock,
+            reason: "compact transaction fee exceeds u32".to_owned(),
+        });
+    }
+    let link = EncodedCompactBlockLink {
+        height: wire.block_id.height,
+        block_hash: wire.block_id.hash,
+        previous_block_hash: wire.previous_block_hash,
+    };
+    if let Some(prev) = acc.last_link {
+        verify_step_linkage(request.order, prev, link)?;
+    }
+    let projected = project_live_wire_bytes(wire.shielded_payload, wire, request.selection, acc)?;
+    let shielded_slice =
+        match projected {
+            ProjectedWire::Borrowed(bytes) => bytes,
+            ProjectedWire::Scratch { start } => acc.wire_scratch.get(start..).ok_or_else(|| {
+                CanonicalStoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::CompactBlock,
+                    reason: "projected scratch payload too short".to_owned(),
+                }
+            })?,
+        };
+    let spliced = splice_compact_block_wire(
+        shielded_slice,
+        &wire.transparent_transactions,
+        CompactBlockSpliceSelection::RANGE_WITH_TRANSPARENT,
+    )
+    .map_err(map_supplement_read_error)?;
+    let output_bytes = spliced.payload_len();
+    if acc.exceeds_output_budget(output_bytes) {
+        return Ok(false);
+    }
+    acc.push_encoded_block(spliced);
+    acc.record_live_tail_row(link, output_bytes, stored_row_bytes);
+    Ok(!acc.is_budget_spent())
+}
+
+fn project_live_wire_bytes<'a>(
+    shielded_payload: &'a [u8],
+    wire: &LiveTailSpliceWire<'_>,
+    selection: ShieldedProjectionSelection,
+    acc: &mut RangeAccumulator,
+) -> Result<ProjectedWire<'a>, CanonicalStoreError> {
+    if selection == ShieldedProjectionSelection::DEFAULT_SHIELDED {
+        return Ok(ProjectedWire::Borrowed(shielded_payload));
+    }
+    let as_shielded = LiveTailShieldedWire {
+        block_id: wire.block_id,
+        previous_block_hash: wire.previous_block_hash,
+        time: wire.time,
+        shielded_payload,
+        pool_presence: wire.pool_presence,
+        has_unrepresentable_wire_fee: wire.has_unrepresentable_wire_fee,
+    };
+    project_live_wire(&as_shielded, selection, acc)
 }
 
 fn append_live_tail_row(
@@ -431,7 +714,7 @@ enum ProjectedWire<'a> {
 }
 
 fn project_live_wire<'a>(
-    wire: &'a LiveTailShieldedWire<'a>,
+    wire: &LiveTailShieldedWire<'a>,
     selection: ShieldedProjectionSelection,
     acc: &mut RangeAccumulator,
 ) -> Result<ProjectedWire<'a>, CanonicalStoreError> {
@@ -626,6 +909,13 @@ impl RangeAccumulator {
         self.live_tail_read_bytes = self.live_tail_read_bytes.saturating_add(stored_row_bytes);
         self.largest_live_row_bytes = self.largest_live_row_bytes.max(stored_row_bytes);
         self.largest_live_output_bytes = self.largest_live_output_bytes.max(output_bytes);
+    }
+
+    fn push_encoded_block(&mut self, block: EncodedBlock) {
+        match &mut self.output {
+            AccumulatorOutput::Blocks(out) => out.push(block),
+            AccumulatorOutput::Batcher(batcher) => batcher.push_block(block),
+        }
     }
 
     fn push_encoded_payload(&mut self, wire: ProjectedWire<'_>) -> Result<(), CanonicalStoreError> {
@@ -1019,6 +1309,7 @@ mod tests {
             range: full,
             order: HeightOrder::Ascending,
             selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            include_transparent: false,
             output: EncodedCompactBlockOutput::Blocks,
             max_bytes: usize::MAX,
             enforce_wire_fee_limit: true,
@@ -1075,6 +1366,7 @@ mod tests {
                 range,
                 order,
                 selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                include_transparent: false,
                 output: EncodedCompactBlockOutput::Blocks,
                 max_bytes: usize::MAX,
                 enforce_wire_fee_limit: true,
@@ -1148,6 +1440,7 @@ mod tests {
             range,
             order: HeightOrder::Ascending,
             selection: ShieldedProjectionSelection::new(false, true, false, false),
+            include_transparent: false,
             output: EncodedCompactBlockOutput::Blocks,
             max_bytes: 0,
             enforce_wire_fee_limit: true,
@@ -1174,6 +1467,7 @@ mod tests {
             range,
             order: HeightOrder::Descending,
             selection: ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+            include_transparent: false,
             output: EncodedCompactBlockOutput::Blocks,
             max_bytes: 400,
             enforce_wire_fee_limit: true,
@@ -1215,6 +1509,7 @@ mod tests {
             range: BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(4)),
             order: HeightOrder::Ascending,
             selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            include_transparent: false,
             output: EncodedCompactBlockOutput::Blocks,
             max_bytes: usize::MAX,
             enforce_wire_fee_limit: true,
@@ -1338,6 +1633,7 @@ mod tests {
             range: BlockHeightRange::inclusive(BlockHeight::new(4), BlockHeight::new(5)),
             order: HeightOrder::Ascending,
             selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            include_transparent: false,
             output: EncodedCompactBlockOutput::Blocks,
             max_bytes: usize::MAX,
             enforce_wire_fee_limit: true,
@@ -1461,6 +1757,7 @@ mod tests {
                     range,
                     order,
                     selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    include_transparent: false,
                     output: EncodedCompactBlockOutput::Blocks,
                     max_bytes: one_row_budget,
                     enforce_wire_fee_limit: true,
@@ -1483,6 +1780,7 @@ mod tests {
                     range,
                     order,
                     selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    include_transparent: false,
                     output: EncodedCompactBlockOutput::Blocks,
                     max_bytes: two_row_budget,
                     enforce_wire_fee_limit: true,
@@ -1508,6 +1806,7 @@ mod tests {
             range,
             order: HeightOrder::Ascending,
             selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            include_transparent: false,
             output: EncodedCompactBlockOutput::Blocks,
             max_bytes: 16 * 1024,
             enforce_wire_fee_limit: true,
@@ -1622,6 +1921,7 @@ mod tests {
                     range: prefix_range,
                     order,
                     selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    include_transparent: false,
                     output: EncodedCompactBlockOutput::Blocks,
                     max_bytes: usize::MAX,
                     enforce_wire_fee_limit: true,
@@ -1642,6 +1942,7 @@ mod tests {
                     range,
                     order,
                     selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    include_transparent: false,
                     output: EncodedCompactBlockOutput::Blocks,
                     max_bytes: prefix_bytes + 1,
                     enforce_wire_fee_limit: true,
@@ -1656,12 +1957,704 @@ mod tests {
                 range: BlockHeightRange::inclusive(failing_height, failing_height),
                 order,
                 selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                include_transparent: false,
                 output: EncodedCompactBlockOutput::Blocks,
                 max_bytes: prefix_bytes + 1,
                 enforce_wire_fee_limit: true,
             };
             assert!(matches!(
                 encoded_compact_block_range_for_context(ctx, wide_req, None),
+                Err(CanonicalStoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::CompactBlock,
+                    ..
+                })
+            ));
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixtureBlockKind {
+        ShieldedOnly,
+        TransparentOnly,
+        MixedAllPools,
+        ShieldedWithFee,
+        ComponentlessTx,
+        EmptyBlock,
+    }
+
+    fn splice_fixture_action(tag: u8) -> CompactShieldedAction {
+        CompactShieldedAction {
+            nullifier: [tag; 32],
+            commitment: [tag.wrapping_add(1); 32],
+            ephemeral_key: [tag.wrapping_add(2); 32],
+            ciphertext: [tag.wrapping_add(3); 52],
+        }
+    }
+
+    fn fixture_txs_for_kind(
+        height_num: u32,
+        kind: FixtureBlockKind,
+        seed: u8,
+    ) -> Vec<CompactTransaction> {
+        let tx_a = TransactionId::from_bytes([seed; 32]);
+        let tx_b = TransactionId::from_bytes([seed.wrapping_add(31); 32]);
+        let mixed_second = CompactTransaction {
+            index: 1,
+            transaction_id: tx_b,
+            data: CompactTransactionData {
+                fee_zat: Some(777),
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: [seed.wrapping_add(2); 32],
+                }],
+                orchard_actions: vec![splice_fixture_action(seed.wrapping_add(6))],
+                ironwood_actions: vec![splice_fixture_action(seed.wrapping_add(10))],
+                transparent_inputs: vec![zinder_core::CompactTransparentInput {
+                    previous_transaction_id: TransactionId::from_bytes([seed.wrapping_add(14); 32]),
+                    previous_output_index: 2,
+                }],
+                transparent_outputs: vec![CompactTransparentOutput {
+                    value_zat: 90_000,
+                    script_pub_key: vec![0x00, 0x14, seed],
+                }],
+                ..Default::default()
+            },
+        };
+        let first_data = match kind {
+            FixtureBlockKind::ShieldedOnly => CompactTransactionData {
+                fee_zat: None,
+                sapling_spends: vec![CompactSaplingSpend {
+                    nullifier: [seed; 32],
+                }],
+                sapling_outputs: vec![CompactSaplingOutput {
+                    commitment: [seed.wrapping_add(1); 32],
+                    ephemeral_key: [seed.wrapping_add(2); 32],
+                    ciphertext: [seed.wrapping_add(3); 52],
+                }],
+                orchard_actions: vec![splice_fixture_action(seed.wrapping_add(4))],
+                ironwood_actions: vec![splice_fixture_action(seed.wrapping_add(8))],
+                ..Default::default()
+            },
+            FixtureBlockKind::TransparentOnly => CompactTransactionData {
+                fee_zat: Some(250 + u64::from(height_num)),
+                transparent_inputs: vec![zinder_core::CompactTransparentInput {
+                    previous_transaction_id: TransactionId::from_bytes([seed.wrapping_add(12); 32]),
+                    previous_output_index: height_num % 5,
+                }],
+                transparent_outputs: vec![CompactTransparentOutput {
+                    value_zat: 50_000 + u64::from(height_num),
+                    script_pub_key: vec![0x76, 0xa9, seed, 0x88, 0xac],
+                }],
+                ..Default::default()
+            },
+            FixtureBlockKind::ShieldedWithFee => CompactTransactionData {
+                fee_zat: Some(333),
+                orchard_actions: vec![splice_fixture_action(seed.wrapping_add(15))],
+                ..Default::default()
+            },
+            FixtureBlockKind::MixedAllPools | FixtureBlockKind::ComponentlessTx => {
+                CompactTransactionData::default()
+            }
+            FixtureBlockKind::EmptyBlock => return Vec::new(),
+        };
+        let mut out = vec![CompactTransaction {
+            index: 0,
+            transaction_id: tx_a,
+            data: first_data,
+        }];
+        if matches!(kind, FixtureBlockKind::MixedAllPools) {
+            out.push(mixed_second);
+        }
+        out
+    }
+
+    fn build_splice_fixture_block(
+        height_num: u32,
+        kind: FixtureBlockKind,
+        parent_hash: BlockHash,
+    ) -> TestOutcome<(CompactBlockArtifact, CanonicalBlockFacts)> {
+        let height = BlockHeight::new(height_num);
+        let block_hash = hash_with_tag(height_num);
+        let seed = u8::try_from(height_num % 200)
+            .unwrap_or(1)
+            .saturating_add(10);
+        let transactions = fixture_txs_for_kind(height_num, kind, seed);
+        let compact = CompactBlockArtifact::new(
+            BlockId::new(height, block_hash),
+            parent_hash,
+            1_700_000_000 + height_num,
+            transactions,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: height_num * 2,
+                orchard_commitment_tree_size: height_num * 3,
+                ironwood_commitment_tree_size: height_num,
+            },
+        )?;
+        let facts = build_facts_for_compact(&compact);
+        Ok((compact, facts))
+    }
+
+    fn append_live_tail_splice_blocks(
+        db: &DB,
+        mut parent: BlockHash,
+        artifacts: &mut Vec<CompactBlockArtifact>,
+    ) -> TestOutcome {
+        let live_cf = db
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("missing live_tail_block cf")?;
+        for h in 21_u32..=24 {
+            let kind = match h {
+                21 => FixtureBlockKind::ShieldedOnly,
+                22 => FixtureBlockKind::TransparentOnly,
+                23 => FixtureBlockKind::MixedAllPools,
+                _ => FixtureBlockKind::ComponentlessTx,
+            };
+            let (compact, facts) = build_splice_fixture_block(h, kind, parent)?;
+            parent = compact.block_hash();
+            artifacts.push(compact.clone());
+            let record = LiveTailBlockRecord::from_compact_block(&compact, true, Some(facts))?;
+            db.put_cf(
+                &live_cf,
+                encode_height_key_ascending(BlockHeight::new(h)),
+                record.encode_v1()?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn seed_spliced_settled_and_live_store(
+        dir: &std::path::Path,
+        settled_wide_fee: Option<u32>,
+    ) -> TestOutcome<(DB, Vec<CompactBlockArtifact>, SettledSegmentIndexEntry)> {
+        use crate::canonical_store::rocksdb::SETTLED_SEGMENT_INDEX_COLUMN_FAMILY;
+        use crate::canonical_store::settled_segments::{
+            layout::SettledSegmentModules,
+            sealer::{SettledSegmentBlockInput, SettledSegmentSealer, SettledSegmentSealerConfig},
+        };
+        use crate::settled_supplement_segment::SettledSupplementSegmentWriteOptions;
+
+        let mut opts = rust_rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let descriptors = CANONICAL_DATA_COLUMN_FAMILIES
+            .into_iter()
+            .map(|name| rust_rocksdb::ColumnFamilyDescriptor::new(name, opts.clone()))
+            .collect::<Vec<_>>();
+        let db = DB::open_cf_descriptors(&opts, dir, descriptors)?;
+        let sealer_config = SettledSegmentSealerConfig::new(
+            Network::ZcashRegtest,
+            crate::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+            SettledSegmentModules {
+                supplement: true,
+                raw_bodies: false,
+            },
+        )
+        .with_segment_blocks(20)
+        .with_supplement_options(SettledSupplementSegmentWriteOptions::default());
+        let mut sealer = SettledSegmentSealer::new(dir, sealer_config, None)?;
+
+        let mut artifacts = Vec::with_capacity(24);
+        let mut parent = Network::ZcashRegtest.genesis_hash();
+        let mut entry = None;
+        for h in 1_u32..=20 {
+            let kind = match h {
+                1..=16 => FixtureBlockKind::ShieldedOnly,
+                17 => FixtureBlockKind::TransparentOnly,
+                18 => FixtureBlockKind::MixedAllPools,
+                19 => FixtureBlockKind::ShieldedWithFee,
+                _ => FixtureBlockKind::EmptyBlock,
+            };
+            let (mut compact, mut facts) = build_splice_fixture_block(h, kind, parent)?;
+            if settled_wide_fee == Some(h) {
+                let mut txs = compact.transactions().to_vec();
+                if let Some(first_tx) = txs.first_mut() {
+                    first_tx.data.fee_zat = Some(u64::from(u32::MAX) + 1);
+                }
+                compact = CompactBlockArtifact::new(
+                    BlockId::new(compact.height(), compact.block_hash()),
+                    compact.previous_block_hash(),
+                    compact.time(),
+                    txs,
+                    compact.chain_metadata(),
+                )?;
+                facts = build_facts_for_compact(&compact);
+            }
+            parent = compact.block_hash();
+            artifacts.push(compact.clone());
+            if let Some(sealed) = sealer
+                .push_block(SettledSegmentBlockInput {
+                    compact_block: compact,
+                    native_bytes: 512,
+                    canonical_facts: facts,
+                    raw_block: None,
+                })?
+                .into_iter()
+                .last()
+            {
+                entry = Some(sealed);
+            }
+        }
+        let settled_entry = entry.ok_or("expected 20-block settled segment")?;
+        let index_cf = db
+            .cf_handle(SETTLED_SEGMENT_INDEX_COLUMN_FAMILY)
+            .ok_or("missing settled_segment_index cf")?;
+        db.put_cf(
+            &index_cf,
+            encode_height_key_ascending(settled_entry.start_height),
+            settled_entry.encode_v1()?,
+        )?;
+        drop(index_cf);
+        append_live_tail_splice_blocks(&db, parent, &mut artifacts)?;
+        Ok((db, artifacts, settled_entry))
+    }
+
+    fn reference_action_proto(
+        action: &CompactShieldedAction,
+        nullifiers_only: bool,
+    ) -> zinder_proto::compat::lightwalletd::CompactOrchardAction {
+        if nullifiers_only {
+            zinder_proto::compat::lightwalletd::CompactOrchardAction {
+                nullifier: action.nullifier.to_vec(),
+                ..Default::default()
+            }
+        } else {
+            zinder_proto::compat::lightwalletd::CompactOrchardAction {
+                nullifier: action.nullifier.to_vec(),
+                cmx: action.commitment.to_vec(),
+                ephemeral_key: action.ephemeral_key.to_vec(),
+                ciphertext: action.ciphertext.to_vec(),
+            }
+        }
+    }
+
+    fn reference_transparent_bundles(
+        scan: &CompactTransactionData,
+        enabled: bool,
+    ) -> (
+        Vec<zinder_proto::compat::lightwalletd::CompactTxIn>,
+        Vec<zinder_proto::compat::lightwalletd::TxOut>,
+    ) {
+        use zinder_core::wire::encode_internal_transaction_id;
+        use zinder_proto::compat::lightwalletd::{CompactTxIn, TxOut};
+        if !enabled {
+            return (Vec::new(), Vec::new());
+        }
+        let vin = scan
+            .transparent_inputs
+            .iter()
+            .map(|inp| CompactTxIn {
+                prevout_txid: encode_internal_transaction_id(inp.previous_transaction_id).to_vec(),
+                prevout_index: inp.previous_output_index,
+            })
+            .collect();
+        let vout = scan
+            .transparent_outputs
+            .iter()
+            .map(|out| TxOut {
+                value: out.value_zat,
+                script_pub_key: out.script_pub_key.clone(),
+            })
+            .collect();
+        (vin, vout)
+    }
+
+    fn reference_shielded_bundles(
+        scan: &CompactTransactionData,
+        projection: ShieldedProjectionSelection,
+    ) -> (
+        Vec<zinder_proto::compat::lightwalletd::CompactSaplingSpend>,
+        Vec<zinder_proto::compat::lightwalletd::CompactSaplingOutput>,
+        Vec<zinder_proto::compat::lightwalletd::CompactOrchardAction>,
+        Vec<zinder_proto::compat::lightwalletd::CompactOrchardAction>,
+    ) {
+        use zinder_proto::compat::lightwalletd::{
+            CompactSaplingOutput as LwdSaplingOut, CompactSaplingSpend as LwdSaplingSpend,
+        };
+        let spends = if projection.sapling {
+            scan.sapling_spends
+                .iter()
+                .map(|spend| LwdSaplingSpend {
+                    nf: spend.nullifier.to_vec(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let outputs = if projection.sapling && !projection.nullifiers_only {
+            scan.sapling_outputs
+                .iter()
+                .map(|out| LwdSaplingOut {
+                    cmu: out.commitment.to_vec(),
+                    ephemeral_key: out.ephemeral_key.to_vec(),
+                    ciphertext: out.ciphertext.to_vec(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let map_actions = |list: &[CompactShieldedAction]| {
+            list.iter()
+                .map(|act| reference_action_proto(act, projection.nullifiers_only))
+                .collect()
+        };
+        let actions = if projection.orchard {
+            map_actions(&scan.orchard_actions)
+        } else {
+            Vec::new()
+        };
+        let ironwood = if projection.ironwood {
+            map_actions(&scan.ironwood_actions)
+        } else {
+            Vec::new()
+        };
+        (spends, outputs, actions, ironwood)
+    }
+
+    fn reference_compact_tx(
+        tx: &CompactTransaction,
+        projection: ShieldedProjectionSelection,
+        include_transparent: bool,
+        retain_all_transactions: bool,
+    ) -> TestOutcome<Option<zinder_proto::compat::lightwalletd::CompactTx>> {
+        use zinder_core::wire::encode_internal_transaction_id;
+        use zinder_proto::compat::lightwalletd::CompactTx;
+
+        let scan = &tx.data;
+        let show_transparent = include_transparent && !projection.nullifiers_only;
+        let keep = retain_all_transactions
+            || (projection.sapling
+                && (!scan.sapling_spends.is_empty() || !scan.sapling_outputs.is_empty()))
+            || (projection.orchard && !scan.orchard_actions.is_empty())
+            || (projection.ironwood && !scan.ironwood_actions.is_empty())
+            || (show_transparent
+                && (!scan.transparent_outputs.is_empty() || !scan.transparent_inputs.is_empty()));
+        if !keep {
+            return Ok(None);
+        }
+        let fee = scan
+            .fee_zat
+            .map(u32::try_from)
+            .transpose()?
+            .unwrap_or_default();
+        let (spends, outputs, actions, ironwood_actions) =
+            reference_shielded_bundles(scan, projection);
+        let (vin, vout) = reference_transparent_bundles(scan, show_transparent);
+        Ok(Some(CompactTx {
+            index: tx.index,
+            txid: encode_internal_transaction_id(tx.transaction_id).to_vec(),
+            fee,
+            spends,
+            outputs,
+            actions,
+            vin,
+            vout,
+            ironwood_actions,
+        }))
+    }
+
+    fn reference_wire_bytes(
+        artifact: &CompactBlockArtifact,
+        projection: ShieldedProjectionSelection,
+        include_transparent: bool,
+        retain_all_transactions: bool,
+    ) -> TestOutcome<Vec<u8>> {
+        use prost::Message as _;
+        use zinder_proto::compat::lightwalletd::{ChainMetadata, CompactBlock as LwdCompactBlock};
+
+        let mut vtx = Vec::new();
+        for tx in artifact.transactions() {
+            if let Some(proto_tx) =
+                reference_compact_tx(tx, projection, include_transparent, retain_all_transactions)?
+            {
+                vtx.push(proto_tx);
+            }
+        }
+        let meta = artifact.chain_metadata();
+        let chain_metadata = Some(if projection.nullifiers_only {
+            ChainMetadata::default()
+        } else {
+            ChainMetadata {
+                sapling_commitment_tree_size: meta.sapling_commitment_tree_size,
+                orchard_commitment_tree_size: meta.orchard_commitment_tree_size,
+                ironwood_commitment_tree_size: meta.ironwood_commitment_tree_size,
+            }
+        });
+        let msg = LwdCompactBlock {
+            height: u64::from(artifact.height().value()),
+            hash: encode_internal_block_hash(artifact.block_hash()).to_vec(),
+            prev_hash: encode_internal_block_hash(artifact.previous_block_hash()).to_vec(),
+            time: artifact.time(),
+            header: Vec::new(),
+            vtx,
+            chain_metadata,
+        };
+        Ok(msg.encode_to_vec())
+    }
+
+    fn expected_range_payloads(
+        artifacts: &[CompactBlockArtifact],
+        range: BlockHeightRange,
+        order: HeightOrder,
+        projection: ShieldedProjectionSelection,
+        include_transparent: bool,
+    ) -> TestOutcome<Vec<Vec<u8>>> {
+        let low = usize::try_from(range.start.value() - 1)?;
+        let high = usize::try_from(range.end.value() - 1)?;
+        let mut slice = artifacts[low..=high]
+            .iter()
+            .map(|blk| reference_wire_bytes(blk, projection, include_transparent, false))
+            .collect::<TestOutcome<Vec<_>>>()?;
+        if order == HeightOrder::Descending {
+            slice.reverse();
+        }
+        Ok(slice)
+    }
+
+    #[test]
+    fn range_with_transparent_matches_reference_across_pool_subsets_orders_and_outputs()
+    -> TestOutcome {
+        let dir = TempDir::new()?;
+        let (db, artifacts, _) = seed_spliced_settled_and_live_store(dir.path(), None)?;
+        let ctx = SegmentStoreContext {
+            db: &db,
+            segment_cache: None,
+            sealed_segments: None,
+        };
+        let selections = [
+            ShieldedProjectionSelection::new(false, false, false, false),
+            ShieldedProjectionSelection::new(true, false, false, false),
+            ShieldedProjectionSelection::new(false, true, false, false),
+            ShieldedProjectionSelection::new(true, true, false, false),
+            ShieldedProjectionSelection::DEFAULT_SHIELDED,
+        ];
+        for span in [
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(24)),
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(20)),
+            BlockHeightRange::inclusive(BlockHeight::new(17), BlockHeight::new(24)),
+        ] {
+            for selection in selections {
+                for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+                    let expected =
+                        expected_range_payloads(&artifacts, span, order, selection, true)?;
+                    let blocks_resp = encoded_compact_block_range_for_context(
+                        ctx,
+                        EncodedCompactBlockRangeRequest {
+                            range: span,
+                            order,
+                            selection,
+                            include_transparent: true,
+                            output: EncodedCompactBlockOutput::Blocks,
+                            max_bytes: usize::MAX,
+                            enforce_wire_fee_limit: true,
+                        },
+                        None,
+                    )?
+                    .ok_or("expected Blocks response")?;
+                    let EncodedCompactBlockPayload::Blocks(actual_blocks) = blocks_resp.payload
+                    else {
+                        return Err("expected Blocks variant".into());
+                    };
+                    let actual_wire: Vec<Vec<u8>> = actual_blocks
+                        .iter()
+                        .map(|blk| blk.payload().to_vec())
+                        .collect();
+                    assert_eq!(actual_wire, expected);
+
+                    let frames_resp = encoded_compact_block_range_for_context(
+                        ctx,
+                        EncodedCompactBlockRangeRequest {
+                            range: span,
+                            order,
+                            selection,
+                            include_transparent: true,
+                            output: EncodedCompactBlockOutput::BatchedFrames {
+                                opening_frame: false,
+                            },
+                            max_bytes: usize::MAX,
+                            enforce_wire_fee_limit: true,
+                        },
+                        None,
+                    )?
+                    .ok_or("expected BatchedFrames response")?;
+                    let EncodedCompactBlockPayload::BatchedFrames(frames) = frames_resp.payload
+                    else {
+                        return Err("expected BatchedFrames variant".into());
+                    };
+                    let mut ref_batcher = EncodedBlockBatcher::new(false);
+                    for blk in actual_blocks {
+                        ref_batcher.push_block(blk);
+                    }
+                    assert_eq!(frames, ref_batcher.finish());
+                }
+            }
+        }
+        assert_spliced_range_budget_cancel_and_wide_fee(ctx, &artifacts)
+    }
+
+    fn assert_spliced_range_budget_cancel_and_wide_fee(
+        ctx: SegmentStoreContext<'_>,
+        artifacts: &[CompactBlockArtifact],
+    ) -> TestOutcome {
+        let bounded = encoded_compact_block_range_for_context(
+            ctx,
+            EncodedCompactBlockRangeRequest {
+                range: BlockHeightRange::inclusive(BlockHeight::new(16), BlockHeight::new(24)),
+                order: HeightOrder::Ascending,
+                selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                include_transparent: true,
+                output: EncodedCompactBlockOutput::Blocks,
+                max_bytes: 1_100,
+                enforce_wire_fee_limit: true,
+            },
+            None,
+        )?
+        .ok_or("expected bounded spliced prefix")?;
+        assert!(bounded.block_count >= 1 && bounded.covered.end < BlockHeight::new(24));
+        let expected = expected_range_payloads(
+            artifacts,
+            bounded.covered,
+            HeightOrder::Ascending,
+            ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            true,
+        )?;
+        let EncodedCompactBlockPayload::Blocks(actual) = bounded.payload else {
+            return Err("expected Blocks variant".into());
+        };
+        let wire: Vec<Vec<u8>> = actual.iter().map(|blk| blk.payload().to_vec()).collect();
+        assert_eq!(wire, expected);
+
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            encoded_compact_block_range_for_context(
+                ctx,
+                EncodedCompactBlockRangeRequest {
+                    range: BlockHeightRange::inclusive(BlockHeight::new(17), BlockHeight::new(23)),
+                    order: HeightOrder::Descending,
+                    selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                    include_transparent: true,
+                    output: EncodedCompactBlockOutput::Blocks,
+                    max_bytes: usize::MAX,
+                    enforce_wire_fee_limit: true,
+                },
+                Some(&cancel),
+            ),
+            Err(CanonicalStoreError::ReplayCancelled)
+        ));
+
+        let wide_dir = TempDir::new()?;
+        let (wide_db, _, _) = seed_spliced_settled_and_live_store(wide_dir.path(), Some(18))?;
+        let wide_ctx = SegmentStoreContext {
+            db: &wide_db,
+            segment_cache: None,
+            sealed_segments: None,
+        };
+        let err = encoded_compact_block_range_for_context(
+            wide_ctx,
+            EncodedCompactBlockRangeRequest {
+                range: BlockHeightRange::inclusive(BlockHeight::new(17), BlockHeight::new(20)),
+                order: HeightOrder::Ascending,
+                selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+                include_transparent: true,
+                output: EncodedCompactBlockOutput::Blocks,
+                max_bytes: usize::MAX,
+                enforce_wire_fee_limit: true,
+            },
+            None,
+        );
+        assert!(matches!(
+            err,
+            Err(CanonicalStoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    fn assert_unary_parity_at(
+        ctx: SegmentStoreContext<'_>,
+        height: BlockHeight,
+        artifact: &CompactBlockArtifact,
+    ) -> TestOutcome {
+        for selection in [
+            CompactBlockSpliceSelection::FULL_BLOCK,
+            CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+        ] {
+            let encoded = encoded_compact_block_at_for_context(ctx, height, selection)?
+                .ok_or("expected unary compact block")?;
+            let expected = reference_wire_bytes(
+                artifact,
+                ShieldedProjectionSelection::new(true, true, true, selection.nullifiers_only),
+                selection.include_transparent,
+                selection.retain_all_transactions,
+            )?;
+            assert_eq!(encoded.payload().as_ref(), expected.as_slice());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unary_encoded_compact_block_matches_reference_and_skips_shielded_only_supplement_chunks()
+    -> TestOutcome {
+        use crate::canonical_store::settled_segments::{
+            cache::SettledSegmentReaderCache, layout::SettledSegmentKind,
+        };
+
+        let dir = TempDir::new()?;
+        let (db, artifacts, entry) = seed_spliced_settled_and_live_store(dir.path(), None)?;
+        let cache = SettledSegmentReaderCache::with_default_capacity(dir.path(), false)?;
+        let ctx = SegmentStoreContext {
+            db: &db,
+            segment_cache: Some(&cache),
+            sealed_segments: None,
+        };
+
+        let _ = encoded_compact_block_at_for_context(
+            ctx,
+            BlockHeight::new(1),
+            CompactBlockSpliceSelection::DEFAULT_SHIELDED,
+        )?
+        .ok_or("expected height 1 DEFAULT_SHIELDED")?;
+        assert_eq!(cache.open_count(SettledSegmentKind::Supplement), 0);
+
+        for height_val in [1_u32, 16_u32] {
+            assert_unary_parity_at(
+                ctx,
+                BlockHeight::new(height_val),
+                &artifacts[usize::try_from(height_val - 1)?],
+            )?;
+        }
+        let sup_reader = cache
+            .get_or_open_supplement(&entry)?
+            .ok_or("expected cached supplement reader")?;
+        assert!(sup_reader.chunk_is_unvalidated_at(BlockHeight::new(1))?);
+        assert!(sup_reader.chunk_is_unvalidated_at(BlockHeight::new(16))?);
+
+        for (idx, artifact) in artifacts.iter().enumerate() {
+            assert_unary_parity_at(ctx, BlockHeight::new(u32::try_from(idx + 1)?), artifact)?;
+        }
+        assert!(
+            encoded_compact_block_at_for_context(
+                ctx,
+                BlockHeight::new(25),
+                CompactBlockSpliceSelection::FULL_BLOCK,
+            )?
+            .is_none()
+        );
+
+        let wide_dir = TempDir::new()?;
+        let wide_db = seed_wide_fee_live_tail_store(wide_dir.path(), 2)?;
+        let wide_ctx = SegmentStoreContext {
+            db: &wide_db,
+            segment_cache: None,
+            sealed_segments: Some(&[]),
+        };
+        for selection in [
+            CompactBlockSpliceSelection::FULL_BLOCK,
+            CompactBlockSpliceSelection::BLOCK_NULLIFIERS,
+        ] {
+            assert!(matches!(
+                encoded_compact_block_at_for_context(wide_ctx, BlockHeight::new(2), selection),
                 Err(CanonicalStoreError::ArtifactCorrupt {
                     family: ArtifactFamily::CompactBlock,
                     ..

@@ -1,6 +1,7 @@
 mod admission;
 mod high_concurrency;
 mod tail_identity;
+mod wire_splice_parity;
 
 use super::{
     DrainedBlockRange, EpochPinRecorder, assert_one_linked_chain, assert_stream_ended_with,
@@ -1178,9 +1179,18 @@ async fn grpc_pool_subset_ranges_and_nullifiers_match_stock_wire_bytes_with_zero
         wallet.blocks(transparent_orchard.clone()).await?,
         stock.blocks(transparent_orchard).await?
     );
-    assert_ne!(
+    assert_eq!(
         recorder.recorded_compact_block_ranges(),
         [] as [BlockHeightRange; 0]
+    );
+    assert!(
+        recorder
+            .recorded_encoded_ranges
+            .lock()
+            .iter()
+            .any(|covered| *covered
+                == BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(8))),
+        "expected transparent + orchard range to stream via direct encoded wire splicing"
     );
     Ok(())
 }

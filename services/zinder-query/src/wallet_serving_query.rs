@@ -1109,6 +1109,39 @@ where
         .await
     }
 
+    async fn encoded_compact_block_at(
+        &self,
+        height: BlockHeight,
+        selection: zinder_store::CompactBlockSpliceSelection,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<Option<crate::EncodedCompactBlock>, QueryError> {
+        serving_read::run(
+            "compact_block_at",
+            self.pin(at_epoch_id),
+            move |pair| async move {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                match pair
+                    .canonical()
+                    .encoded_compact_block_at(height, selection)
+                    .await
+                    .map_err(QueryError::canonical_read)?
+                {
+                    crate::EncodedCompactBlockLookup::Block(compact_block) => {
+                        Ok(Some(crate::EncodedCompactBlock {
+                            chain_epoch,
+                            compact_block,
+                        }))
+                    }
+                    crate::EncodedCompactBlockLookup::NotFound => {
+                        Err(artifact_unavailable(ArtifactFamily::CompactBlock, height))
+                    }
+                    crate::EncodedCompactBlockLookup::Unsupported => Ok(None),
+                }
+            },
+        )
+        .await
+    }
+
     async fn compact_blocks_in_range(
         &self,
         block_range: zinder_core::BlockHeightRange,

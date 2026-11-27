@@ -19,12 +19,16 @@ use zinder_core::{
 };
 use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, ChainEventEnvelope,
-    ChainEventStreamFamily, ChainEventStreamResume, EncodedCompactBlockRange,
-    EncodedCompactBlockRangeRequest, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    ServedTreeState, StreamCursorTokenV1, TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome,
+    ChainEventStreamFamily, ChainEventStreamResume, CompactBlockSpliceSelection,
+    EncodedCompactBlockRange, EncodedCompactBlockRangeRequest, EventStreamStartPosition,
+    HeightOrder, RawBlobRetention, ServedTreeState, StreamCursorTokenV1, TreeStateLookup,
+    TreeStateReplay, TreeStateReplayOutcome,
 };
 
-use crate::{CanonicalReader, IndexedTransaction, RocksDbCanonicalReader, StorageReadError};
+use crate::{
+    CanonicalReader, EncodedCompactBlockLookup, IndexedTransaction, RocksDbCanonicalReader,
+    StorageReadError,
+};
 
 /// A [`CanonicalReader`] that counts its storage reads and can hold replays.
 pub(crate) struct ObservedCanonicalReader {
@@ -173,6 +177,26 @@ impl CanonicalReader for ObservedCanonicalReader {
         height: BlockHeight,
     ) -> Result<Option<CompactBlockArtifact>, StorageReadError> {
         self.count().compact_block_at(height).await
+    }
+
+    async fn encoded_compact_block_at(
+        &self,
+        height: BlockHeight,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        self.count()
+            .encoded_compact_block_at(height, selection)
+            .await
+    }
+
+    async fn encoded_compact_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+        selection: CompactBlockSpliceSelection,
+    ) -> Result<EncodedCompactBlockLookup, StorageReadError> {
+        self.count()
+            .encoded_compact_block_by_hash(block_hash, selection)
+            .await
     }
 
     async fn compact_blocks_in_range(

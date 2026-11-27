@@ -1,6 +1,12 @@
 //! Positional sans-I/O range planner and reader for `ZSTSUP01` segments.
 
-use std::{fs::File, io, ops::Range, path::Path, sync::atomic::Ordering};
+use std::{
+    fs::File,
+    io,
+    ops::Range,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use sha2::{Digest as _, Sha256};
 use zinder_core::{BlockHash, BlockHeight, CompactBlockArtifact};
@@ -8,6 +14,7 @@ use zinder_proto::compat::lightwalletd::EncodedBlock;
 use zstd::bulk::Decompressor;
 
 use crate::{
+    HeightOrder,
     positional_source::{ByteRange, PositionalByteSource},
     segment_verity,
 };
@@ -231,6 +238,13 @@ impl SupplementSplicePlan {
     #[must_use]
     pub fn chunks(&self) -> &[SupplementSpliceChunkStep] {
         &self.chunks
+    }
+
+    /// Returns `true` when at least one chunk in this plan carries Tag-1 entries
+    /// required by the splice selection.
+    #[must_use]
+    pub fn needs_any_chunk(&self) -> bool {
+        self.chunks.iter().any(|step| step.needs_chunk)
     }
 }
 
@@ -1169,6 +1183,16 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
             .load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn chunk_is_unvalidated_at(
+        &self,
+        height: BlockHeight,
+    ) -> Result<bool, SettledSupplementSegmentError> {
+        let row_idx = self.index.row_index_for(height)?;
+        let chunk_idx = self.index.chunk_index_for_row(row_idx)?;
+        Ok(self.chunk_validation_state(chunk_idx) == super::format::VALIDATION_UNVALIDATED)
+    }
+
     /// Returns `true` if `height` carries Tag-1 transparent supplement transactions.
     ///
     /// # Errors
@@ -1392,59 +1416,24 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         if shielded_payloads.is_empty() {
             return Ok(Vec::new());
         }
-        let end_height = self.end_height_for_count(start_height, shielded_payloads.len())?;
-        let plan = self
-            .index
-            .plan_splice_range(start_height, end_height, selection)?;
-        let row_range = plan.row_index_range();
-        let raw_row_index = self
-            .source
-            .read_vec_at(row_range.offset, row_range.len)
-            .inspect_err(|_| {
-                mark_row_range_invalid(&self.index, plan.first_row(), plan.last_row());
-            })?;
-        let verified_rows =
-            self.index
-                .authenticate_row_index_slice(SupplementRowIndexSlice::new(
-                    row_range.offset,
-                    &raw_row_index,
-                ))?;
         let mut encoded_blocks = Vec::with_capacity(shielded_payloads.len());
-        let mut scratch = SpliceScratch::default();
-        let mut decompressor = match self.index.codec {
-            SupplementCompressionCodec::None => None,
-            SupplementCompressionCodec::Zstd => Some(Decompressor::new()?),
-        };
-        for splice_step in plan.chunks() {
-            let decode_step = splice_step.decode_step();
-            let decoded_chunk = match splice_step.compressed_range() {
-                Some(chunk_range) => {
-                    let compressed = self
-                        .source
-                        .read_vec_at(chunk_range.offset, chunk_range.len)
-                        .inspect_err(|_| {
-                            self.index.chunks[decode_step.chunk_idx()].mark_invalid();
-                        })?;
-                    Some(self.index.verify_and_decode_verified_chunk(
-                        decode_step,
-                        &compressed,
-                        verified_rows,
-                        decompressor.as_mut(),
-                    )?)
-                }
-                None => None,
-            };
-            splice_chunk_rows(
-                &self.index.header,
-                verified_rows,
-                decode_step.row_range(),
-                plan.first_row(),
-                shielded_payloads,
-                decoded_chunk.as_deref(),
+        let completed = self.splice_payloads_into(
+            SupplementSpliceRequest {
+                start_height,
                 selection,
-                &mut scratch,
-                &mut encoded_blocks,
-            )?;
+                order: HeightOrder::Ascending,
+                cancel: None,
+            },
+            shielded_payloads,
+            &mut |block| {
+                encoded_blocks.push(block);
+                Ok(())
+            },
+        )?;
+        if !completed {
+            return Err(SettledSupplementSegmentError::InvalidFormat(
+                "uncancellable splice aborted unexpectedly".to_owned(),
+            ));
         }
         Ok(encoded_blocks)
     }
@@ -1462,9 +1451,152 @@ impl<S: PositionalByteSource> SettledSupplementSegmentReader<S> {
         shielded_blocks: &[EncodedBlock],
         selection: CompactBlockSpliceSelection,
     ) -> Result<Vec<EncodedBlock>, SettledSupplementSegmentError> {
+        let mut encoded_blocks = Vec::with_capacity(shielded_blocks.len());
+        let completed = self.splice_encoded_range_into(
+            SupplementSpliceRequest {
+                start_height,
+                selection,
+                order: HeightOrder::Ascending,
+                cancel: None,
+            },
+            shielded_blocks,
+            |block| {
+                encoded_blocks.push(block);
+                Ok(())
+            },
+        )?;
+        if !completed {
+            return Err(SettledSupplementSegmentError::InvalidFormat(
+                "uncancellable splice aborted unexpectedly".to_owned(),
+            ));
+        }
+        Ok(encoded_blocks)
+    }
+
+    /// Splices a contiguous slice of `ZSHRNG02` [`EncodedBlock`] entries in `request.order`,
+    /// reading `row_index_range` once and decompressing only chunks with needed Tag-1 entries.
+    ///
+    /// Returns `Ok(false)` if cooperative cancellation triggered before completion.
+    pub(crate) fn splice_encoded_range_into(
+        &self,
+        request: SupplementSpliceRequest<'_>,
+        shielded_blocks: &[EncodedBlock],
+        mut emit: impl FnMut(EncodedBlock) -> Result<(), SettledSupplementSegmentError>,
+    ) -> Result<bool, SettledSupplementSegmentError> {
+        if request
+            .cancel
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Ok(false);
+        }
+        if shielded_blocks.is_empty() {
+            return Ok(true);
+        }
         let payloads: Vec<bytes::Bytes> =
             shielded_blocks.iter().map(EncodedBlock::payload).collect();
-        self.splice_range_wire(start_height, &payloads, selection)
+        self.splice_payloads_into(request, &payloads, &mut emit)
+    }
+
+    fn splice_payloads_into<P: AsRef<[u8]>>(
+        &self,
+        request: SupplementSpliceRequest<'_>,
+        shielded_payloads: &[P],
+        emit: &mut impl FnMut(EncodedBlock) -> Result<(), SettledSupplementSegmentError>,
+    ) -> Result<bool, SettledSupplementSegmentError> {
+        let end_height =
+            self.end_height_for_count(request.start_height, shielded_payloads.len())?;
+        let plan =
+            self.index
+                .plan_splice_range(request.start_height, end_height, request.selection)?;
+        let row_range = plan.row_index_range();
+        let raw_row_index = self
+            .source
+            .read_vec_at(row_range.offset, row_range.len)
+            .inspect_err(|_| {
+                mark_row_range_invalid(&self.index, plan.first_row(), plan.last_row());
+            })?;
+        let verified_rows =
+            self.index
+                .authenticate_row_index_slice(SupplementRowIndexSlice::new(
+                    row_range.offset,
+                    &raw_row_index,
+                ))?;
+        let mut scratch = SpliceScratch::default();
+        let mut decompressor = match self.index.codec {
+            SupplementCompressionCodec::None => None,
+            SupplementCompressionCodec::Zstd => Some(Decompressor::new()?),
+        };
+        let mut ctx = OrderedSpliceContext {
+            verified_rows,
+            plan: &plan,
+            shielded_payloads,
+            selection: request.selection,
+            order: request.order,
+            cancel: request.cancel,
+            decompressor: decompressor.as_mut(),
+            scratch: &mut scratch,
+            emit,
+        };
+        match request.order {
+            HeightOrder::Ascending => {
+                for splice_step in plan.chunks() {
+                    if !self.process_splice_step(splice_step, &mut ctx)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            HeightOrder::Descending => {
+                for splice_step in plan.chunks().iter().rev() {
+                    if !self.process_splice_step(splice_step, &mut ctx)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn process_splice_step<P: AsRef<[u8]>>(
+        &self,
+        splice_step: &SupplementSpliceChunkStep,
+        ctx: &mut OrderedSpliceContext<'_, '_, P>,
+    ) -> Result<bool, SettledSupplementSegmentError> {
+        if ctx.cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Ok(false);
+        }
+        let decode_step = splice_step.decode_step();
+        let decoded_chunk = match splice_step.compressed_range() {
+            Some(chunk_range) => {
+                let compressed = self
+                    .source
+                    .read_vec_at(chunk_range.offset, chunk_range.len)
+                    .inspect_err(|_| {
+                        self.index.chunks[decode_step.chunk_idx()].mark_invalid();
+                    })?;
+                Some(self.index.verify_and_decode_verified_chunk(
+                    decode_step,
+                    &compressed,
+                    ctx.verified_rows,
+                    ctx.decompressor.as_deref_mut(),
+                )?)
+            }
+            None => None,
+        };
+        splice_chunk_rows_ordered(
+            &self.index.header,
+            ctx.verified_rows,
+            decode_step.row_range(),
+            ctx.plan.first_row(),
+            &OrderedChunkInputs {
+                shielded_payloads: ctx.shielded_payloads,
+                decoded_chunk: decoded_chunk.as_deref(),
+                selection: ctx.selection,
+                order: ctx.order,
+            },
+            ctx.scratch,
+            ctx.emit,
+        )?;
+        Ok(true)
     }
 
     /// Losslessly reconstructs one [`CompactBlockArtifact`] at `height` by combining
@@ -1590,24 +1722,52 @@ fn mark_row_range_invalid(
     }
 }
 
+/// Ordering and cancellation controls for [`SettledSupplementSegmentReader::splice_encoded_range_into`].
+#[derive(Clone, Copy)]
+pub(crate) struct SupplementSpliceRequest<'a> {
+    pub(crate) start_height: BlockHeight,
+    pub(crate) selection: CompactBlockSpliceSelection,
+    pub(crate) order: HeightOrder,
+    pub(crate) cancel: Option<&'a AtomicBool>,
+}
+
+struct OrderedSpliceContext<'a, 'd, P> {
+    verified_rows: VerifiedSupplementRowIndexSlice<'a>,
+    plan: &'a SupplementSplicePlan,
+    shielded_payloads: &'a [P],
+    selection: CompactBlockSpliceSelection,
+    order: HeightOrder,
+    cancel: Option<&'a AtomicBool>,
+    decompressor: Option<&'d mut Decompressor<'static>>,
+    scratch: &'a mut SpliceScratch,
+    emit: &'a mut dyn FnMut(EncodedBlock) -> Result<(), SettledSupplementSegmentError>,
+}
+
+struct OrderedChunkInputs<'a, P> {
+    shielded_payloads: &'a [P],
+    decoded_chunk: Option<&'a [BlockSupplementRecord]>,
+    selection: CompactBlockSpliceSelection,
+    order: HeightOrder,
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "Internal chunk splice loops over header, authenticated row view, payloads, and optional chunk records."
 )]
-fn splice_chunk_rows<P: AsRef<[u8]>>(
+fn splice_chunk_rows_ordered<P: AsRef<[u8]>>(
     header: &SupplementSegmentHeader,
     verified_rows: VerifiedSupplementRowIndexSlice<'_>,
     row_range: Range<usize>,
     first_row: usize,
-    shielded_payloads: &[P],
-    decoded_chunk: Option<&[BlockSupplementRecord]>,
-    selection: CompactBlockSpliceSelection,
+    inputs: &OrderedChunkInputs<'_, P>,
     scratch: &mut SpliceScratch,
-    encoded_blocks: &mut Vec<EncodedBlock>,
+    emit: &mut dyn FnMut(EncodedBlock) -> Result<(), SettledSupplementSegmentError>,
 ) -> Result<(), SettledSupplementSegmentError> {
-    for (local_idx, row_idx) in row_range.enumerate() {
+    let chunk_start_row = row_range.start;
+    let mut emit_row = |row_idx: usize| -> Result<(), SettledSupplementSegmentError> {
+        let local_idx = row_idx - chunk_start_row;
         let slice_idx = row_idx - first_row;
-        let shielded_payload = shielded_payloads[slice_idx].as_ref();
+        let shielded_payload = inputs.shielded_payloads[slice_idx].as_ref();
         let entry = verified_rows.entry(row_idx)?;
         let expected_envelope = Some(expected_envelope_from_slice(
             header,
@@ -1615,7 +1775,8 @@ fn splice_chunk_rows<P: AsRef<[u8]>>(
             &entry,
             verified_rows,
         )?);
-        let transparent = decoded_chunk
+        let transparent = inputs
+            .decoded_chunk
             .and_then(|records| records.get(local_idx))
             .map_or(&[][..], |record| record.transparent_transactions.as_slice());
         let mut frame = Vec::with_capacity(EncodedBlock::PREFIX_LEN + shielded_payload.len() + 64);
@@ -1623,13 +1784,25 @@ fn splice_chunk_rows<P: AsRef<[u8]>>(
             shielded_payload,
             SpliceTarget {
                 transparent,
-                selection,
+                selection: inputs.selection,
                 expected_envelope,
             },
             &mut frame,
             scratch,
         )?;
-        encoded_blocks.push(finish_encoded_frame(frame)?);
+        emit(finish_encoded_frame(frame)?)
+    };
+    match inputs.order {
+        HeightOrder::Ascending => {
+            for row_idx in row_range {
+                emit_row(row_idx)?;
+            }
+        }
+        HeightOrder::Descending => {
+            for row_idx in row_range.rev() {
+                emit_row(row_idx)?;
+            }
+        }
     }
     Ok(())
 }

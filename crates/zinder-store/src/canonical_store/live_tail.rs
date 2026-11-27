@@ -360,6 +360,20 @@ pub(crate) struct LiveTailShieldedWire<'a> {
     pub(crate) has_unrepresentable_wire_fee: bool,
 }
 
+/// Authenticated shielded wire payload paired with decoded Tag-1 transparent
+/// supplement transactions from a `live_tail_block` `V1` row, skipping
+/// `canonical_facts` decoding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LiveTailSpliceWire<'a> {
+    pub(crate) block_id: BlockId,
+    pub(crate) previous_block_hash: BlockHash,
+    pub(crate) time: u32,
+    pub(crate) shielded_payload: &'a [u8],
+    pub(crate) pool_presence: PoolPresenceMask,
+    pub(crate) transparent_transactions: Vec<CompactTransparentSupplementTx>,
+    pub(crate) has_unrepresentable_wire_fee: bool,
+}
+
 /// Encoding toggles for [`LiveTailBlockRecord::encode_from_compact_block_v1`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LiveTailEncodeOptions {
@@ -526,6 +540,49 @@ impl LiveTailBlockRecord {
             time: header.block_time,
             shielded_payload,
             pool_presence: header.pool_presence,
+            has_unrepresentable_wire_fee,
+        })
+    }
+
+    /// Authenticates a `V1` record, borrows its raw shielded `CompactBlock` protobuf
+    /// payload zero-copy alongside header links and wide-fee detection, and decodes
+    /// Tag-1 transparent supplement entries without decoding `canonical_facts`.
+    pub(crate) fn decode_splice_wire_v1(
+        bytes: &[u8],
+        expected_height: BlockHeight,
+    ) -> Result<LiveTailSpliceWire<'_>, SettledSegmentsError> {
+        let (header, mut cursor) = parse_authenticated_header_v1(bytes, expected_height)?;
+        let shielded_payload = cursor.read_len_prefixed_slice(
+            SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
+            "live_tail.shielded",
+        )?;
+        let (transparent_transactions, has_unrepresentable_wire_fee) =
+            if (header.flags & LIVE_TAIL_FLAG_SUPPLEMENT) != 0 {
+                decode_tag1_and_scan_wide_fee(&mut cursor)?
+            } else {
+                (Vec::new(), false)
+            };
+        if (header.flags & LIVE_TAIL_FLAG_CANONICAL_FACTS) != 0 {
+            let _ = cursor.read_len_prefixed_slice(
+                SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+                "live_tail.facts",
+            )?;
+        }
+        cursor.finish("LiveTailBlockRecord")?;
+        let _ = decode_and_validate_shielded_payload(
+            shielded_payload,
+            header.block_id,
+            header.previous_block_hash,
+            header.block_time,
+            header.pool_presence,
+        )?;
+        Ok(LiveTailSpliceWire {
+            block_id: header.block_id,
+            previous_block_hash: header.previous_block_hash,
+            time: header.block_time,
+            shielded_payload,
+            pool_presence: header.pool_presence,
+            transparent_transactions,
             has_unrepresentable_wire_fee,
         })
     }
@@ -1152,6 +1209,48 @@ fn opt_u64_exceeds_u32(
     }
 }
 
+fn scan_tag2_for_wide_fee(cursor: &mut ByteReader<'_>) -> Result<bool, SettledSegmentsError> {
+    if !cursor.read_bool("supplement.has_canonical_metadata")? {
+        return Ok(false);
+    }
+    let mut has_wide_fee = false;
+    let _ = cursor.read_slice(32, "canonical_sup.serialized_bytes_digest")?;
+    let meta_tx_count =
+        read_bounded_count(cursor, MAX_LIVE_TAIL_TX_COUNT, "canonical_sup.tx_count")?;
+    for _ in 0..meta_tx_count {
+        if scan_canonical_tx_supplement_for_wide_fee(cursor)? {
+            has_wide_fee = true;
+        }
+    }
+    Ok(has_wide_fee)
+}
+
+fn decode_tag1_and_scan_wide_fee(
+    cursor: &mut ByteReader<'_>,
+) -> Result<(Vec<CompactTransparentSupplementTx>, bool), SettledSegmentsError> {
+    let tx_count = read_bounded_count(
+        cursor,
+        MAX_LIVE_TAIL_TX_COUNT,
+        "supplement.transparent_count",
+    )?;
+    let mut transparent = Vec::with_capacity(tx_count.min(MAX_LIVE_TAIL_PREALLOC_COUNT));
+    let mut has_wide_fee = false;
+    for _ in 0..tx_count {
+        let sup_tx = decode_transparent_supplement_tx(cursor)?;
+        if sup_tx
+            .fee_zat
+            .is_some_and(|fee_zat| u32::try_from(fee_zat).is_err())
+        {
+            has_wide_fee = true;
+        }
+        transparent.push(sup_tx);
+    }
+    if scan_tag2_for_wide_fee(cursor)? {
+        has_wide_fee = true;
+    }
+    Ok((transparent, has_wide_fee))
+}
+
 fn scan_supplement_for_wide_fee(cursor: &mut ByteReader<'_>) -> Result<bool, SettledSegmentsError> {
     let mut has_wide_fee = false;
     let tx_count = read_bounded_count(
@@ -1186,15 +1285,8 @@ fn scan_supplement_for_wide_fee(cursor: &mut ByteReader<'_>) -> Result<bool, Set
             )?;
         }
     }
-    if cursor.read_bool("supplement.has_canonical_metadata")? {
-        let _ = cursor.read_slice(32, "canonical_sup.serialized_bytes_digest")?;
-        let meta_tx_count =
-            read_bounded_count(cursor, MAX_LIVE_TAIL_TX_COUNT, "canonical_sup.tx_count")?;
-        for _ in 0..meta_tx_count {
-            if scan_canonical_tx_supplement_for_wide_fee(cursor)? {
-                has_wide_fee = true;
-            }
-        }
+    if scan_tag2_for_wide_fee(cursor)? {
+        has_wide_fee = true;
     }
     Ok(has_wide_fee)
 }

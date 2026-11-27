@@ -276,7 +276,7 @@ impl CanonicalEncodedMode {
         if read.cancel.is_cancelled() {
             return cancelled_outcome(None);
         }
-        let Some(selection) = self.shape.shielded_projection() else {
+        let Some((selection, include_transparent)) = self.shape.encoded_range_selection() else {
             return reads
                 .read_compact_block_chunk(read, move |epoch, blocks| {
                     convert(epoch, EncodedRangeChunk::fallback(blocks))
@@ -301,6 +301,7 @@ impl CanonicalEncodedMode {
             range: chunk,
             order,
             selection,
+            include_transparent,
             output,
             max_bytes,
             enforce_wire_fee_limit: true,
