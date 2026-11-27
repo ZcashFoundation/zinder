@@ -25,6 +25,7 @@ use tonic::{
 };
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
+use zinder_compat_lightwalletd::LightwalletdPing;
 use zinder_core::{BlockHash, TransactionId};
 use zinder_proto::{
     DARKSIDE_FILE_DESCRIPTOR_SET,
@@ -97,6 +98,7 @@ struct Darkside {
     stop: CancellationToken,
     fixtures: Option<Arc<FixtureOrigin>>,
     reject_broadcasts: bool,
+    ping: LightwalletdPing,
 }
 
 impl Darkside {
@@ -189,6 +191,7 @@ pub(crate) async fn run(args: DarksideArgs) -> Result<(), StartError> {
         stop: stop.clone(),
         fixtures,
         reject_broadcasts: args.reject_broadcasts,
+        ping: LightwalletdPing::enabled(stop.clone()),
     };
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(DARKSIDE_FILE_DESCRIPTOR_SET)

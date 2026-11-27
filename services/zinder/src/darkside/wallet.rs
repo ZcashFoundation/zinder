@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc};
 
 use futures_util::stream;
 use tonic::{Request, Response, Status, Streaming};
@@ -6,7 +6,7 @@ use zinder_core::{
     BlockHash,
     wire::{
         decode_internal_block_hash, decode_internal_transaction_id, decode_rpc_block_hash_bytes,
-        decode_rpc_block_hash_hex,
+        decode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
     },
 };
 use zinder_proto::compat::lightwalletd::{
@@ -84,29 +84,35 @@ struct ScanShape {
 
 impl ScanShape {
     fn select(pool_types: &[i32], nullifiers: bool, mempool: bool) -> Result<Self, Status> {
-        if pool_types.len() > 4 {
-            return Err(Status::invalid_argument("too many pool types"));
-        }
         let mut shape = Self {
             pools: [false; 5],
             nullifiers,
             mempool,
         };
+        let mut use_default = true;
         for &pool in pool_types {
-            let pool = PoolType::try_from(pool)
-                .map_err(|_| Status::invalid_argument("unknown pool type"))?;
-            match pool {
-                PoolType::Invalid => return Err(Status::invalid_argument("invalid pool type")),
-                PoolType::Transparent if nullifiers => {}
-                PoolType::Transparent
-                | PoolType::Sapling
-                | PoolType::Orchard
-                | PoolType::Ironwood => {
+            match PoolType::try_from(pool) {
+                Ok(PoolType::Invalid) => {
+                    return Err(if mempool {
+                        Status::invalid_argument("invalid pool type requested")
+                    } else {
+                        Status::unknown("GetBlockRange: invalid pool type requested")
+                    });
+                }
+                Ok(PoolType::Transparent) if nullifiers => continue,
+                Ok(
+                    pool @ (PoolType::Transparent
+                    | PoolType::Sapling
+                    | PoolType::Orchard
+                    | PoolType::Ironwood),
+                ) => {
                     shape.pools[pool as usize] = true;
                 }
+                Err(_) => {}
             }
+            use_default = false;
         }
-        if !shape.pools.into_iter().any(|selected| selected) {
+        if use_default {
             shape.pools = [false, false, true, true, true];
         }
         Ok(shape)
@@ -385,11 +391,15 @@ impl CompactTxStreamer for Darkside {
         {
             return Err(Status::resource_exhausted("broadcast pool is full"));
         }
+        let txid_hex = encode_rpc_transaction_id_hex(tx.id);
         scenario.incoming.push(Arc::clone(&tx));
         scenario.mempool.push(tx);
         drop(scenario);
         self.changed.send_replace(());
-        Ok(Response::new(SendResponse::default()))
+        Ok(Response::new(SendResponse {
+            error_code: 0,
+            error_message: txid_hex,
+        }))
     }
 
     type GetTaddressTxidsStream = StreamReply<RawTransaction>;
@@ -475,9 +485,7 @@ impl CompactTxStreamer for Darkside {
     async fn get_mempool_stream(&self, _: Request<Empty>) -> Rpc<Self::GetMempoolStreamStream> {
         let permit = self.stream_slot()?;
         let scenario = self.scenario.lock();
-        let visible_tip = scenario
-            .visible_tip()
-            .ok_or_else(|| Status::failed_precondition("no visible blocks"))?;
+        tip(&scenario)?;
         let generation = Arc::clone(&scenario.tip_generation);
         let changed = self.changed.subscribe();
         drop(scenario);
@@ -498,10 +506,7 @@ impl CompactTxStreamer for Darkside {
                                 return None;
                             }
                             if let Some(tx) = scenario.mempool.get(index) {
-                                return Some((
-                                    Ok(tx.raw(visible_tip.0)),
-                                    (changed, index + 1, permit),
-                                ));
+                                return Some((Ok(tx.raw(0)), (changed, index + 1, permit)));
                             }
                         }
                         tokio::select! {
@@ -615,14 +620,13 @@ impl CompactTxStreamer for Darkside {
     }
 
     async fn ping(&self, request: Request<PingDuration>) -> Rpc<PingResponse> {
-        let micros = u64::try_from(request.get_ref().interval_us)
-            .ok()
-            .filter(|micros| *micros <= 5_000_000)
-            .ok_or_else(|| {
-                Status::invalid_argument("ping interval must be between zero and five seconds")
-            })?;
-        tokio::time::sleep(Duration::from_micros(micros)).await;
-        Ok(Response::new(PingResponse { entry: 1, exit: 0 }))
+        let request = request.into_inner();
+        if !(0..=5_000_000).contains(&request.interval_us) {
+            return Err(Status::invalid_argument(
+                "ping interval must be between zero and five seconds",
+            ));
+        }
+        self.ping.respond(request).await.map(Response::new)
     }
 }
 
@@ -630,6 +634,25 @@ impl CompactTxStreamer for Darkside {
 mod tests {
     use super::ScanShape;
     use zinder_proto::compat::lightwalletd::{CompactSaplingSpend, CompactTx, PoolType, TxOut};
+
+    #[test]
+    fn unknown_pool_numbers_keep_the_selection_explicit() -> eyre::Result<()> {
+        let shape = ScanShape::select(&[i32::MAX], false, false)?;
+        assert_eq!(shape.pools, [false; 5]);
+
+        let shape = ScanShape::select(&[PoolType::Transparent.into(), i32::MAX], true, false)?;
+        assert_eq!(shape.pools, [false; 5]);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_known_pools_still_select_the_same_projection() -> eyre::Result<()> {
+        let sapling = PoolType::Sapling.into();
+        let single = ScanShape::select(&[sapling], false, false)?;
+        let repeated = ScanShape::select(&[sapling; 6], false, false)?;
+        assert_eq!(repeated.pools, single.pools);
+        Ok(())
+    }
 
     #[test]
     fn nullifier_range_with_only_transparent_selection_uses_shielded_defaults() -> eyre::Result<()>

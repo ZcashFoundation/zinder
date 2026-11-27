@@ -1319,10 +1319,12 @@ Call `Reset` to clear a scenario if its staged inputs need replacement.
   `AddAddressUtxo` after applying the relevant blocks. Reads hide entries
   above the presented tip. Replacing or dropping a block removes the
   fixtures from the orphaned range. Add replacements explicitly.
-- `SendTransaction` captures successful broadcasts and exposes them in the
-  mempool until mined or reset. `GetIncomingTransactions` drains the capture
-  queue. Set the returned transaction's height to its destination block
-  before staging it. A tip change closes open `GetMempoolStream` calls.
+- `SendTransaction` returns the accepted transaction ID as display-order
+  hexadecimal in `errorMessage`. Pending transactions have height zero in
+  `GetTransaction` and `GetMempoolStream`. A tip change closes open
+  `GetMempoolStream` calls. `GetIncomingTransactions` drains the capture
+  queue and returns each transaction with height `u64::MAX`. Set its height
+  to the destination block before staging it.
   Start the server with `--reject-broadcasts` to test a wallet's send
   failure path using a valid transaction.
 - For browser SDKs, add `--grpc-web-origin http://127.0.0.1:5173` or

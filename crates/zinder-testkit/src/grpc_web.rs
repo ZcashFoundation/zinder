@@ -1,6 +1,6 @@
 //! Binary gRPC-Web framing assertions for HTTP integration tests.
 
-use eyre::{ensure, eyre};
+use eyre::{ContextCompat, ensure, eyre};
 
 /// Frames one protobuf payload for a binary gRPC-Web request.
 pub fn encode_grpc_web_frame(payload: &[u8]) -> eyre::Result<Vec<u8>> {
@@ -14,53 +14,58 @@ pub fn encode_grpc_web_frame(payload: &[u8]) -> eyre::Result<Vec<u8>> {
 
 /// Decodes one binary gRPC-Web response and checks its final success trailer.
 pub fn decode_grpc_web_message<M: prost::Message + Default>(bytes: &[u8]) -> eyre::Result<M> {
-    ensure!(bytes.len() >= 5, "grpc-web response truncated");
-    ensure!(bytes[0] == 0, "expected gRPC data frame header 0");
-    let frame_len = usize::try_from(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]))?;
-    let payload_end = 5 + frame_len;
-    ensure!(
-        bytes.len() >= payload_end,
-        "grpc-web frame extends past body"
-    );
-    let trailer_bytes = &bytes[payload_end..];
-    ensure!(
-        trailer_bytes.len() >= 5,
-        "grpc-web response missing trailers frame"
-    );
-    ensure!(
-        trailer_bytes[0] == 0x80,
-        "expected uncompressed grpc-web trailers frame header 0x80, got {:#x}",
-        trailer_bytes[0]
-    );
-    let trailer_len = usize::try_from(u32::from_be_bytes([
-        trailer_bytes[1],
-        trailer_bytes[2],
-        trailer_bytes[3],
-        trailer_bytes[4],
-    ]))?;
-    let trailer_end = 5 + trailer_len;
-    ensure!(
-        trailer_bytes.len() == trailer_end,
-        "expected single complete final grpc-web trailers frame (len={}, got {})",
-        trailer_end,
-        trailer_bytes.len()
-    );
-    let trailer_text = std::str::from_utf8(&trailer_bytes[5..trailer_end])?;
-    let mut grpc_status = None;
-    for raw_line in trailer_text.split("\r\n") {
-        if raw_line.is_empty() {
-            continue;
+    let [message] = decode_grpc_web_messages(bytes)?
+        .try_into()
+        .map_err(|messages: Vec<M>| {
+            eyre!("expected one gRPC-Web message, got {}", messages.len())
+        })?;
+    Ok(message)
+}
+
+/// Decodes all binary gRPC-Web messages in order and requires a final success trailer.
+pub fn decode_grpc_web_messages<M: prost::Message + Default>(
+    mut bytes: &[u8],
+) -> eyre::Result<Vec<M>> {
+    let mut messages = Vec::new();
+    loop {
+        let (&[flag, a, b, c, d], remainder) = bytes
+            .split_first_chunk::<5>()
+            .wrap_err("gRPC-Web response truncated or missing trailers")?;
+        let frame_len = usize::try_from(u32::from_be_bytes([a, b, c, d]))?;
+        let (payload, remainder) = remainder
+            .split_at_checked(frame_len)
+            .wrap_err("gRPC-Web frame extends past body")?;
+        match flag {
+            0 => messages.push(M::decode(payload)?),
+            0x80 => {
+                ensure!(
+                    remainder.is_empty(),
+                    "unexpected bytes after gRPC-Web trailers"
+                );
+                check_success_trailers(payload)?;
+                return Ok(messages);
+            }
+            _ => return Err(eyre!("unsupported gRPC-Web frame flag {flag:#x}")),
         }
-        let (header_name, header_val) = raw_line
+        bytes = remainder;
+    }
+}
+
+fn check_success_trailers(payload: &[u8]) -> eyre::Result<()> {
+    let trailers = std::str::from_utf8(payload)?;
+    let mut grpc_status = None;
+    for line in trailers.split("\r\n").filter(|line| !line.is_empty()) {
+        let (name, header) = line
             .split_once(':')
-            .ok_or_else(|| eyre!("malformed grpc-web trailer line: {raw_line:?}"))?;
-        if header_name.trim().eq_ignore_ascii_case("grpc-status") {
-            grpc_status = Some(header_val.trim().to_owned());
+            .ok_or_else(|| eyre!("malformed gRPC-Web trailer line: {line:?}"))?;
+        if name.trim().eq_ignore_ascii_case("grpc-status") {
+            ensure!(grpc_status.is_none(), "duplicate gRPC-Web status trailers");
+            grpc_status = Some(header.trim());
         }
     }
     ensure!(
-        grpc_status.as_deref() == Some("0"),
-        "expected trailing grpc-status: 0, got {grpc_status:?} in {trailer_text:?}"
+        grpc_status == Some("0"),
+        "expected trailing grpc-status: 0, got {grpc_status:?} in {trailers:?}"
     );
-    Ok(M::decode(&bytes[5..payload_end])?)
+    Ok(())
 }
