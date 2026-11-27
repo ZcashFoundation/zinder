@@ -27,6 +27,14 @@ producer_lifecycle_report_format_version="$(sed -n \
   "$repository_root/services/zinder-bench/src/report.rs")"
 [[ "$producer_lifecycle_report_format_version" == "1" ]] ||
   fail "rocksdb-storage-lifecycle producer report format version must be v1"
+producer_segmented_report_format_version="$(sed -n \
+  's/^pub const POSTGRES_SEGMENTED_REPORT_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
+  "$repository_root/services/zinder-bench/src/report.rs")"
+[[ "$producer_segmented_report_format_version" == "1" ]] ||
+  fail "postgres-segmented-storage producer report format version must be v1"
+grep -Fq ".report_format_version == $producer_segmented_report_format_version" \
+  "$validator" ||
+  fail "$(basename "$validator") does not require segmented report format $producer_segmented_report_format_version"
 producer_fixture_format_version="$(sed -n \
   's/^pub const FIXTURE_FORMAT_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' \
   "$repository_root/services/zinder-bench/src/fixture.rs")"
@@ -1324,5 +1332,143 @@ expect_lifecycle_rejected legacy-sorter-temp-budget '.resource_limits.wallet_max
 for obsolete_version in 4 5 6; do
   expect_lifecycle_rejected "obsolete-version-$obsolete_version" ".report_format_version = $obsolete_version"
 done
+
+segmented_valid_report="$scratch_directory/segmented-valid.json"
+cat >"$segmented_valid_report" <<'JSON'
+{
+  "contract_identity": "benchmark-report",
+  "measurement_kind": "postgres-segmented-storage",
+  "report_format_version": 1,
+  "storage_candidate": {
+    "id": "postgres-segmented-storage",
+    "canonical_engine": "postgres",
+    "canonical_model": "settled-segments-with-bounded-live-tail",
+    "topology": "postgres-segmented"
+  },
+  "fixture": {
+    "contract_identity": "canonical-fixture",
+    "fixture_format_version": 1,
+    "canonical_block_facts_digest_evidence": {
+      "block_digest_version": 1,
+      "sequence_digest_version": 1,
+      "block_count": 10,
+      "sequence_digest_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "from_height": 1,
+    "to_height": 10,
+    "block_count": 10,
+    "tip_hash_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "server_settings": {
+    "fsync": true,
+    "full_page_writes": true,
+    "synchronous_commit": "on",
+    "wal_level": "replica"
+  },
+  "provenance": {
+    "runner": {
+      "cpu_limit_cores": 8.0,
+      "memory_limit_bytes": 17179869184
+    }
+  },
+  "runtime_evidence": {
+    "client_cpu_limit_cores": 1.5,
+    "client_memory_limit_bytes": 8053063680,
+    "database_cpu_limit_cores": 6.0,
+    "database_memory_limit_bytes": 8589934592,
+    "pooler_cpu_limit_cores": 0.5,
+    "pooler_memory_limit_bytes": 536870912
+  },
+  "configuration": {
+    "schema_version": 2,
+    "reader_mode": "pgbouncer-transaction",
+    "max_segment_bytes": 268435456,
+    "live_tail_max_blocks": 4,
+    "concurrent_readers": 4,
+    "bulk_block_count": 6,
+    "tip_follow_block_count": 4,
+    "total_block_count": 10
+  },
+  "validation": {
+    "first_height": 1,
+    "tip_height": 10,
+    "tip_hash_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "persisted_sequence_digest_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "fixture_sequence_digest_match": true,
+    "fresh_reader_validated": true
+  },
+  "timings": {
+    "wall_clock_seconds": 1.5,
+    "prepare_seconds": 0.2,
+    "tip_prepare_seconds": 0.05,
+    "schema_create_seconds": 0.1,
+    "wallet_projection_seconds": 0.1,
+    "seal_seconds": 0.2,
+    "bulk_copy_seconds": 0.3,
+    "finalize_seconds": 0.2,
+    "bulk_build_seconds": 1.1,
+    "streaming_blocks_per_second": 42.0
+  },
+  "tip_follow": {
+    "uncontended_commit_latencies_ms": { "sample_count": 2, "max_ms": 8.0 },
+    "contended_commit_latencies_ms": { "sample_count": 2, "max_ms": 12.0 }
+  },
+  "reader_workload": {
+    "ready_workers": 4,
+    "overlapping_workers": 4,
+    "completed_transactions": 20,
+    "per_reader_blocks_per_second_mean": 42.0,
+    "per_reader_bytes_per_second_mean": 16384.0
+  },
+  "footprint": {
+    "canonical_storage_bytes": 80000,
+    "wallet_storage_bytes": 20000,
+    "total_storage_bytes": 100000,
+    "max_segment_byte_len": 4096,
+    "live_tail_rows": 2
+  },
+  "adr0004_gate_evaluation": {
+    "tip_commit_latency_under_2s": true,
+    "max_segment_bytes_respected": true,
+    "live_tail_bounded": true,
+    "concurrent_readers_zero_errors": true
+  }
+}
+JSON
+
+"$validator" --segmented-report "$segmented_valid_report" >/dev/null ||
+  fail "valid postgres-segmented-storage report was rejected"
+
+expect_segmented_rejected() {
+  local name="$1" mutation="$2"
+  local mutated="$scratch_directory/segmented-$name.json"
+  jq "$mutation" "$segmented_valid_report" >"$mutated"
+  if "$validator" --segmented-report "$mutated" >/dev/null 2>&1; then
+    fail "segmented report $name was accepted"
+  fi
+}
+
+expect_segmented_rejected corrupt-digest '.validation.fixture_sequence_digest_match = false'
+expect_segmented_rejected altered-persisted-digest '.validation.persisted_sequence_digest_hex = "9999999999999999999999999999999999999999999999999999999999999999"'
+expect_segmented_rejected missing-persisted-digest 'del(.validation.persisted_sequence_digest_hex)'
+expect_segmented_rejected missing-fixture-digest 'del(.fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256)'
+expect_segmented_rejected malformed-digest '.validation.persisted_sequence_digest_hex = "abcd" | .fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256 = "abcd"'
+expect_segmented_rejected uppercase-digest '.validation.persisted_sequence_digest_hex = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" | .fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"'
+expect_segmented_rejected bulk-build-seconds-mismatch '.timings.bulk_build_seconds = 5.0'
+expect_segmented_rejected build-ratio-with-tip-follow '.adr0004_gate_evaluation.build_time_ratio_vs_rocksdb = 1.5'
+expect_segmented_rejected unready-reader-workers '.reader_workload.ready_workers = 3'
+expect_segmented_rejected non-overlapping-reader-workers '.reader_workload.overlapping_workers = 3'
+expect_segmented_rejected non-durable-fsync '.server_settings.fsync = false'
+expect_segmented_rejected oversized-segment '.footprint.max_segment_byte_len = 268435457'
+expect_segmented_rejected unbounded-live-tail '.footprint.live_tail_rows = 5'
+expect_segmented_rejected wrong-report-version '.report_format_version = 2'
+expect_segmented_rejected zero-reader-throughput '.reader_workload.per_reader_blocks_per_second_mean = 0'
+expect_segmented_rejected storage-mismatch '.footprint.total_storage_bytes = 999'
+expect_segmented_rejected zero-tip-samples-claiming-pass '.tip_follow.contended_commit_latencies_ms.sample_count = 0'
+expect_segmented_rejected over-threshold-contended-latency '.tip_follow.contended_commit_latencies_ms.max_ms = 2500.0'
+expect_segmented_rejected threshold-boundary-uncontended-latency '.tip_follow.uncontended_commit_latencies_ms.max_ms = 2000.0'
+expect_segmented_rejected missing-pooler-cpu-budget '.runtime_evidence.pooler_cpu_limit_cores = null'
+expect_segmented_rejected pooler-memory-budget-mismatch '.runtime_evidence.pooler_memory_limit_bytes = 1073741824'
+expect_segmented_rejected missing-wallet-projection-timing 'del(.timings.wallet_projection_seconds)'
 
 printf 'storage benchmark campaign validator tests passed\n'

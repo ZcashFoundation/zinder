@@ -15,8 +15,13 @@ use crate::{
         FixtureManifest, WorkloadDensity,
     },
     metrics_scrape::{MetricSample, parse_prometheus_samples, sum_by_name},
+    postgres_segmented::{
+        PostgresSegmentedRunReport, schema::MAX_SETTLED_SEGMENT_BYTES,
+        tip_follow::LatencyPercentilesMillis,
+    },
     rss::PeakRss,
 };
+use zinder_core::wire::encode_zinder_native_chain_name;
 
 /// Machine-readable report schema version for `canonical-replay-storage` reports.
 pub const REPORT_FORMAT_VERSION: u32 = 1;
@@ -24,6 +29,8 @@ pub const REPORT_FORMAT_VERSION: u32 = 1;
 pub const ROCKSDB_CANONICAL_FIXTURE_REPLAY_REPORT_FORMAT_VERSION: u32 = 1;
 /// Machine-readable report schema version for `rocksdb-storage-lifecycle` reports.
 pub const ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION: u32 = 1;
+/// Machine-readable report schema version for `postgres-segmented-storage` reports.
+pub const POSTGRES_SEGMENTED_REPORT_FORMAT_VERSION: u32 = 1;
 /// Stable identity stamped into every benchmark report.
 pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
 /// CPU envelope used to derive canonical fixture replay defaults.
@@ -189,6 +196,17 @@ impl StorageCandidateIdentity {
             canonical_engine: "postgres",
             canonical_model: "block-granular-canonical-replays",
             topology: "postgres-diagnostic",
+        }
+    }
+
+    /// Identifies the segmented canonical + wallet `PostgreSQL` benchmark arm.
+    #[must_use]
+    pub const fn postgres_segmented_storage() -> Self {
+        Self {
+            id: "postgres-segmented-storage",
+            canonical_engine: "postgres",
+            canonical_model: "settled-segments-with-bounded-live-tail",
+            topology: "postgres-segmented",
         }
     }
 
@@ -577,6 +595,27 @@ pub struct PostgresBenchmarkRuntimeEvidence {
     pub database_cpu_limit_cores: Option<f64>,
     /// Memory limit applied to the database container.
     pub database_memory_limit_bytes: Option<u64>,
+}
+
+/// `PostgreSQL` client, database, and connection-pooler runtime evidence for segmented runs.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedRuntimeEvidence {
+    /// Immutable database container image reference supplied by the operator.
+    pub database_image_reference: Option<String>,
+    /// Immutable pooler container image reference (`PgBouncer`), when configured.
+    pub pooler_image_reference: Option<String>,
+    /// CPU limit applied to the benchmark client container.
+    pub client_cpu_limit_cores: Option<f64>,
+    /// Memory limit applied to the benchmark client container.
+    pub client_memory_limit_bytes: Option<u64>,
+    /// CPU limit applied to the database container.
+    pub database_cpu_limit_cores: Option<f64>,
+    /// Memory limit applied to the database container.
+    pub database_memory_limit_bytes: Option<u64>,
+    /// CPU limit applied to the connection pooler container (`PgBouncer`), when configured.
+    pub pooler_cpu_limit_cores: Option<f64>,
+    /// Memory limit applied to the connection pooler container (`PgBouncer`), when configured.
+    pub pooler_memory_limit_bytes: Option<u64>,
 }
 
 /// Engine-specific settings and physical write evidence for one canonical-replay round-trip arm.
@@ -1397,6 +1436,350 @@ pub struct RocksDbStorageLifecycleReport {
     pub benchmark_client_peak_rss: PeakRss,
 }
 
+/// Nearest-rank latency percentiles in milliseconds serialized into segmented reports.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedLatencySummary {
+    /// Sample count represented by these percentiles.
+    pub sample_count: u64,
+    /// Median latency (`p50`) in milliseconds.
+    pub p50_ms: f64,
+    /// 95th-percentile latency (`p95`) in milliseconds.
+    pub p95_ms: f64,
+    /// 99th-percentile latency (`p99`) in milliseconds.
+    pub p99_ms: f64,
+    /// Maximum observed latency (`max`) in milliseconds.
+    pub max_ms: f64,
+}
+
+impl From<&LatencyPercentilesMillis> for PostgresSegmentedLatencySummary {
+    fn from(stats: &LatencyPercentilesMillis) -> Self {
+        Self {
+            sample_count: stats.sample_count,
+            p50_ms: stats.p50_ms,
+            p95_ms: stats.p95_ms,
+            p99_ms: stats.p99_ms,
+            max_ms: stats.max_ms,
+        }
+    }
+}
+
+/// Configuration parameters recorded in a segmented PostgreSQL benchmark report.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedConfigSummary {
+    /// Isolated schema written and validated during the run.
+    pub schema_name: String,
+    /// Persisted segmented schema revision (`2`).
+    pub schema_version: u16,
+    /// Zinder-native network name (`zcash-mainnet`, `zcash-testnet`, `zcash-regtest`).
+    pub network: String,
+    /// Whether `ZSBLKB01` raw consensus block segments were retained.
+    pub full_blocks: bool,
+    /// Maximum allowed settled segment size in bytes (`<= 268435456`).
+    pub max_segment_bytes: u64,
+    /// Target block span per sealed settled segment batch.
+    pub settled_segment_blocks: u32,
+    /// Maximum rows retained in `canonical_live_tail`.
+    pub live_tail_max_blocks: u32,
+    /// Declared reader connection pooling mode (`direct` or `pgbouncer-transaction`).
+    pub reader_mode: String,
+    /// Number of concurrent readers active during contended tip-following.
+    pub concurrent_readers: u32,
+    /// Mempool churn entries admitted and evicted per tip block.
+    pub mempool_churn_txs_per_block: u32,
+    /// Count of blocks loaded via bulk `COPY`.
+    pub bulk_block_count: u64,
+    /// Count of blocks appended incrementally during tip-following phases.
+    pub tip_follow_block_count: u64,
+    /// Total committed blocks (`bulk_block_count + tip_follow_block_count`).
+    pub total_block_count: u64,
+}
+
+/// Validation evidence recorded from the fresh read-only connection check.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedValidationSummary {
+    /// First committed height observed in `schema_meta`.
+    pub first_height: u32,
+    /// Highest committed height observed at completion.
+    pub tip_height: u32,
+    /// Hex-encoded internal byte-order hash at `tip_height`.
+    pub tip_hash_hex: String,
+    /// Count of settled blocks reconstructed via `ZSHRNG02` + `ZSTSUP01`.
+    pub settled_blocks_verified: u64,
+    /// Count of live-tail blocks verified from `canonical_live_tail`.
+    pub live_tail_blocks_verified: u64,
+    /// Count of settled raw consensus blocks verified via `ZSBLKB01`.
+    pub raw_blocks_verified: u64,
+    /// Reconstructed ordered canonical sequence digest hex.
+    pub persisted_sequence_digest_hex: String,
+    /// Exact agreement with the fixture manifest digest oracle.
+    pub fixture_sequence_digest_match: bool,
+    /// Confirmation that validation ran over an independent fresh connection.
+    pub fresh_reader_validated: bool,
+}
+
+/// Build and streaming timing/throughput summary for `postgres-segmented-storage`.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedTimingSummary {
+    /// End-to-end wall-clock duration across all phases.
+    pub wall_clock_seconds: f64,
+    /// Bulk-prefix source-open, block parse, canonical synthesis, and replay encoding duration.
+    pub prepare_seconds: f64,
+    /// Tip-follow block fetch, canonical preparation, and replay encoding duration.
+    pub tip_prepare_seconds: f64,
+    /// Schema and table creation DDL duration.
+    pub schema_create_seconds: f64,
+    /// Provisional wallet projection construction and final UTXO sort duration.
+    pub wallet_projection_seconds: f64,
+    /// Settled segment sealing duration.
+    pub seal_seconds: f64,
+    /// Binary `COPY` ingest duration.
+    pub bulk_copy_seconds: f64,
+    /// Primary key/index build, `ANALYZE`, and post-finalize writer-term acquisition duration.
+    pub finalize_seconds: f64,
+    /// Complete bulk-prefix build duration (`prepare + schema_create + wallet_projection + seal + bulk_copy + finalize`).
+    pub bulk_build_seconds: f64,
+    /// Uncontended tip-follow phase duration (`0` concurrent readers).
+    pub uncontended_tip_follow_seconds: f64,
+    /// Contended tip-follow phase duration (`N` concurrent readers).
+    pub contended_tip_follow_seconds: f64,
+    /// Fresh-connection validation duration.
+    pub fresh_validation_seconds: f64,
+    /// Relation/TOAST/index/WAL footprint query duration.
+    pub footprint_measurement_seconds: f64,
+    /// Bulk build rate in blocks per second over initial prefix.
+    pub bulk_build_blocks_per_second: f64,
+    /// Per-reader streaming throughput mean in blocks per second.
+    pub streaming_blocks_per_second: f64,
+}
+
+/// Tip-follow commit latency, live-tail sealing, and mempool churn summary.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedTipFollowSummary {
+    /// Per-block commit latency percentiles with `0` concurrent readers.
+    pub uncontended_commit_latencies_ms: PostgresSegmentedLatencySummary,
+    /// Per-block commit latency percentiles with concurrent readers running.
+    pub contended_commit_latencies_ms: PostgresSegmentedLatencySummary,
+    /// Number of runtime tail-to-settled segment seal transitions completed.
+    pub tail_seal_transitions: u64,
+    /// Cumulative `mempool_active_entry` admit operations.
+    pub mempool_admits: u64,
+    /// Cumulative `mempool_active_entry` eviction operations.
+    pub mempool_evictions: u64,
+}
+
+/// Concurrent reader streaming throughput and transaction latency summary.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedReaderWorkloadSummary {
+    /// Reader workers that completed readiness warm-up before the writer started.
+    pub ready_workers: u32,
+    /// Reader workers that executed at least one iteration overlapping the active writer phase.
+    pub overlapping_workers: u32,
+    /// Total completed `REPEATABLE READ READ ONLY` transactions overlapping the writer phase.
+    pub completed_transactions: u64,
+    /// Total settled compact-block ranges verified via `substring()`.
+    pub settled_range_reads: u64,
+    /// Total blocks decoded across settled ranges and live tail.
+    pub blocks_decoded: u64,
+    /// Total payload bytes transferred over reader queries.
+    pub bytes_fetched: u64,
+    /// Mean streaming rate per reader in blocks per second.
+    pub per_reader_blocks_per_second_mean: f64,
+    /// Mean streaming rate per reader in bytes per second.
+    pub per_reader_bytes_per_second_mean: f64,
+    /// Aggregate streaming rate across all concurrent readers in blocks per second.
+    pub aggregate_blocks_per_second: f64,
+    /// Aggregate streaming rate across all concurrent readers in bytes per second.
+    pub aggregate_bytes_per_second: f64,
+    /// Reader transaction latency percentiles in milliseconds.
+    pub transaction_latencies_ms: PostgresSegmentedLatencySummary,
+}
+
+/// Non-double-counted per-table PostgreSQL relation footprint in report JSON.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedRelationFootprint {
+    /// Table name inside `{schema}`.
+    pub table_name: String,
+    /// Exact table row count.
+    pub row_count: u64,
+    /// Main fork heap size in bytes.
+    pub heap_bytes: u64,
+    /// Dedicated TOAST table size in bytes.
+    pub toast_bytes: u64,
+    /// Secondary + PK index size in bytes.
+    pub index_bytes: u64,
+    /// Non-double-counted `pg_total_relation_size` in bytes.
+    pub total_relation_bytes: u64,
+    /// Whether this relation stores provisional wallet projection data.
+    pub is_wallet_table: bool,
+}
+
+/// Schema-wide storage, TOAST, index, segment, and WAL footprint summary.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedFootprintSummary {
+    /// Sum of `pg_total_relation_size` across canonical and operational tables.
+    pub canonical_storage_bytes: u64,
+    /// Sum of `pg_total_relation_size` across wallet projection tables.
+    pub wallet_storage_bytes: u64,
+    /// Total PostgreSQL storage bytes (`canonical_storage_bytes + wallet_storage_bytes`).
+    pub total_storage_bytes: u64,
+    /// Main heap fork bytes across all relations.
+    pub total_heap_bytes: u64,
+    /// Dedicated TOAST bytes across all relations.
+    pub total_toast_bytes: u64,
+    /// Index bytes across all relations.
+    pub total_index_bytes: u64,
+    /// WAL bytes emitted during bulk ingest (`pg_wal_lsn_diff`).
+    pub bulk_wal_bytes: u64,
+    /// WAL bytes emitted during tip-following (`pg_wal_lsn_diff`).
+    pub tip_follow_wal_bytes: u64,
+    /// Count of `shielded` settled segment rows.
+    pub settled_shielded_segments: u64,
+    /// Count of `supplement` settled segment rows.
+    pub settled_supplement_segments: u64,
+    /// Count of `raw_block` settled segment rows.
+    pub settled_raw_block_segments: u64,
+    /// Largest individual `segment_byte_len` persisted across all settled segments.
+    pub max_segment_byte_len: u64,
+    /// Final remaining row count in `canonical_live_tail`.
+    pub live_tail_rows: u64,
+    /// Individual relation footprints ordered by table name.
+    pub relations: Vec<PostgresSegmentedRelationFootprint>,
+}
+
+/// Optional `RocksDB` comparison baseline parsed from `--rocksdb-baseline-report`.
+#[derive(Clone, Debug, Default)]
+pub struct PostgresSegmentedBaselineInput {
+    /// Measured `RocksDB` build duration in seconds, when available.
+    pub build_seconds: Option<f64>,
+    /// Measured `RocksDB` physical store footprint in bytes, when available.
+    pub storage_bytes: Option<u64>,
+    /// Measured `RocksDB` per-reader streaming rate in blocks/s, when available.
+    pub streaming_blocks_per_second: Option<f64>,
+    /// Zinder-native network identifier covered by the baseline.
+    pub network: String,
+    /// First retained block height covered by the baseline.
+    pub first_height: u32,
+    /// Final persisted tip height covered by the baseline.
+    pub tip_height: u32,
+    /// Total contiguous block count covered by the baseline.
+    pub block_count: u64,
+    /// Ordered canonical sequence digest hex covered by the baseline.
+    pub sequence_digest_sha256: String,
+    /// Whether the baseline retained raw consensus blocks (`RawBlobRetention::All`).
+    pub full_blocks: bool,
+    /// Whether the baseline includes both canonical storage and wallet projection.
+    pub includes_wallet_projection: bool,
+}
+
+/// ADR-0004 Decision 7 diagnostic gate evaluation recorded in segmented reports.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "serialized ADR-0004 Decision 7 gate summary exposes explicit independent boolean flags"
+)]
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedGateEvaluation {
+    /// `Some(true)` only when both uncontended and contended phases recorded nonzero samples below 2,000 ms; `None` if either phase recorded zero samples.
+    pub tip_commit_latency_under_2s: Option<bool>,
+    /// All settled segments stayed within `<= max_segment_bytes <= 256 MiB`.
+    pub max_segment_bytes_respected: bool,
+    /// Final `canonical_live_tail` row count stayed within `<= live_tail_max_blocks`.
+    pub live_tail_bounded: bool,
+    /// Concurrent reader pool completed without worker failures.
+    pub concurrent_readers_zero_errors: bool,
+    /// True when `--rocksdb-baseline-report` supplied comparison measurements.
+    pub baseline_provided: bool,
+    /// Baseline `RocksDB` build duration in seconds, if supplied.
+    pub rocksdb_build_seconds: Option<f64>,
+    /// Baseline `RocksDB` physical store bytes, if supplied.
+    pub rocksdb_storage_bytes: Option<u64>,
+    /// Baseline `RocksDB` streaming blocks/s from a range-read measurement, if supplied.
+    pub rocksdb_streaming_blocks_per_second: Option<f64>,
+    /// Build duration ratio (`postgres_build / rocksdb_build`, target `<= 4.0`).
+    pub build_time_ratio_vs_rocksdb: Option<f64>,
+    /// Whether build-time ratio satisfied `<= 4.0` (`None` when unmeasured).
+    pub build_time_gate_passed: Option<bool>,
+    /// Storage footprint ratio (`postgres_bytes / rocksdb_bytes`, target `< 2.0`).
+    pub storage_size_ratio_vs_rocksdb: Option<f64>,
+    /// Whether storage-size ratio satisfied `< 2.0` (`None` when unmeasured).
+    pub storage_size_gate_passed: Option<bool>,
+    /// Per-reader streaming throughput ratio (`postgres_rate / rocksdb_rate`, target `>= 0.5`).
+    pub streaming_throughput_ratio_vs_rocksdb: Option<f64>,
+    /// Whether streaming throughput ratio satisfied `>= 0.5` (`None` when unmeasured).
+    pub streaming_throughput_gate_passed: Option<bool>,
+    /// True when every standalone segmented invariant/gate was measured and passed.
+    pub all_standalone_gates_passed: bool,
+    /// `Some(true)` when standalone and all three baseline comparisons are measured and pass; `Some(false)` when any measured gate fails; `None` when any gate comparison is unmeasured.
+    pub all_baseline_gates_passed: Option<bool>,
+}
+
+/// Segmented `PostgreSQL` build, tip-following, mempool churn, and pooled-reader report.
+#[derive(Clone, Debug, Serialize)]
+pub struct PostgresSegmentedStorageReport {
+    /// Stable report contract identity.
+    pub contract_identity: String,
+    /// Machine-readable report schema version.
+    pub report_format_version: u32,
+    /// Build and runner provenance.
+    pub provenance: ReportProvenance,
+    /// Storage engine identity (`postgres-segmented-storage`).
+    pub storage_candidate: StorageCandidateIdentity,
+    /// Container image and resource-partition evidence across client, database, and pooler.
+    pub runtime_evidence: PostgresSegmentedRuntimeEvidence,
+    /// Durable PostgreSQL server settings inspected at connection start.
+    pub server_settings: PostgresServerSettings,
+    /// Authenticated fixture summary and oracle digest.
+    pub fixture: FixtureSummary,
+    /// Benchmark run parameters.
+    pub configuration: PostgresSegmentedConfigSummary,
+    /// End-to-end validation outcome.
+    pub validation: PostgresSegmentedValidationSummary,
+    /// Phased wall-clock durations and build/streaming throughput.
+    pub timings: PostgresSegmentedTimingSummary,
+    /// Tip-follow latencies, tail sealing transitions, and mempool churn counts.
+    pub tip_follow: PostgresSegmentedTipFollowSummary,
+    /// Pooled concurrent reader workload throughput and latencies.
+    pub reader_workload: PostgresSegmentedReaderWorkloadSummary,
+    /// Non-double-counted relation/TOAST/index/WAL footprint.
+    pub footprint: PostgresSegmentedFootprintSummary,
+    /// ADR-0004 Decision 7 diagnostic evaluation.
+    pub adr0004_gate_evaluation: PostgresSegmentedGateEvaluation,
+    /// Benchmark client process peak RSS.
+    pub benchmark_client_peak_rss: PeakRss,
+}
+
+/// Assembly inputs passed to [`build_postgres_segmented_storage_report`].
+#[derive(Clone, Debug)]
+pub struct PostgresSegmentedReportInputs {
+    /// Completed benchmark domain output.
+    pub run: PostgresSegmentedRunReport,
+    /// Optional `RocksDB` baseline report comparison inputs.
+    pub baseline: Option<PostgresSegmentedBaselineInput>,
+    /// Runtime container resource partition and DB/pooler image evidence.
+    pub runtime_evidence: PostgresSegmentedRuntimeEvidence,
+    /// Benchmark client process peak RSS.
+    pub benchmark_client_peak_rss: PeakRss,
+    /// Source revision supplied via CLI.
+    pub software_revision: Option<String>,
+    /// Trial identity shared across paired arms.
+    pub trial_id: Option<String>,
+    /// Controlled fixture-cache treatment.
+    pub fixture_cache_policy: Option<FixtureCachePolicy>,
+    /// Run start timestamp in Unix milliseconds.
+    pub run_started_at_unix_millis: u64,
+    /// Run completion timestamp in Unix milliseconds.
+    pub run_completed_at_unix_millis: u64,
+    /// Operator label for the complete benchmark arm.
+    pub runner_id: Option<String>,
+    /// Aggregate CPU limit for the complete arm.
+    pub cpu_limit_cores: Option<f64>,
+    /// Aggregate memory limit for the complete arm.
+    pub memory_limit_bytes: Option<u64>,
+    /// Operator storage performance class label.
+    pub storage_class: Option<String>,
+    /// Immutable container image reference for the client binary.
+    pub image_reference: Option<String>,
+}
+
 /// One versioned benchmark report with a closed, candidate-honest measurement
 /// shape.
 ///
@@ -1413,6 +1796,9 @@ pub enum BenchmarkReport {
     /// Fixed-tip canonical and wallet `RocksDB` storage lifecycle.
     #[serde(rename = "rocksdb-storage-lifecycle")]
     RocksDbStorageLifecycle(Box<RocksDbStorageLifecycleReport>),
+    /// Segmented `PostgreSQL` build, tip-follow, mempool churn, and pooled-reader run.
+    #[serde(rename = "postgres-segmented-storage")]
+    PostgresSegmentedStorage(Box<PostgresSegmentedStorageReport>),
 }
 
 impl From<CanonicalReplayStorageReport> for BenchmarkReport {
@@ -1430,6 +1816,12 @@ impl From<RocksDbStorageLifecycleReport> for BenchmarkReport {
 impl From<RocksDbCanonicalFixtureReplayReport> for BenchmarkReport {
     fn from(report: RocksDbCanonicalFixtureReplayReport) -> Self {
         Self::RocksDbCanonicalFixtureReplay(Box::new(report))
+    }
+}
+
+impl From<PostgresSegmentedStorageReport> for BenchmarkReport {
+    fn from(report: PostgresSegmentedStorageReport) -> Self {
+        Self::PostgresSegmentedStorage(Box::new(report))
     }
 }
 
@@ -1475,6 +1867,7 @@ impl BenchmarkReport {
             }
             Self::RocksDbCanonicalFixtureReplay(report) => report.validate_evidence(),
             Self::RocksDbStorageLifecycle(report) => report.validate_acceptance(),
+            Self::PostgresSegmentedStorage(report) => report.validate_segmented(),
         }
     }
 
@@ -1496,6 +1889,11 @@ impl BenchmarkReport {
                 report.report_format_version,
                 ROCKSDB_STORAGE_LIFECYCLE_REPORT_FORMAT_VERSION,
             ),
+            Self::PostgresSegmentedStorage(report) => (
+                report.contract_identity.as_str(),
+                report.report_format_version,
+                POSTGRES_SEGMENTED_REPORT_FORMAT_VERSION,
+            ),
         };
         if contract_identity != REPORT_CONTRACT_IDENTITY {
             return Err(BenchError::report_format(format!(
@@ -1510,6 +1908,7 @@ impl BenchmarkReport {
         let fixture = match self {
             Self::CanonicalReplayStorage(report) => Some(&report.fixture),
             Self::RocksDbCanonicalFixtureReplay(report) => Some(&report.fixture),
+            Self::PostgresSegmentedStorage(report) => Some(&report.fixture),
             Self::RocksDbStorageLifecycle(_) => None,
         };
         if let Some(fixture) = fixture {
@@ -1533,8 +1932,10 @@ impl BenchmarkReport {
     #[must_use]
     pub const fn canonical_replay_storage(&self) -> Option<&CanonicalReplayStorageReport> {
         match self {
-            Self::RocksDbCanonicalFixtureReplay(_) | Self::RocksDbStorageLifecycle(_) => None,
             Self::CanonicalReplayStorage(report) => Some(report),
+            Self::RocksDbCanonicalFixtureReplay(_)
+            | Self::RocksDbStorageLifecycle(_)
+            | Self::PostgresSegmentedStorage(_) => None,
         }
     }
 
@@ -1543,8 +1944,760 @@ impl BenchmarkReport {
     pub const fn rocksdb_storage_lifecycle(&self) -> Option<&RocksDbStorageLifecycleReport> {
         match self {
             Self::RocksDbStorageLifecycle(report) => Some(report),
-            Self::CanonicalReplayStorage(_) | Self::RocksDbCanonicalFixtureReplay(_) => None,
+            Self::CanonicalReplayStorage(_)
+            | Self::RocksDbCanonicalFixtureReplay(_)
+            | Self::PostgresSegmentedStorage(_) => None,
         }
+    }
+
+    /// Returns the segmented `PostgreSQL` measurement when present.
+    #[must_use]
+    pub const fn postgres_segmented_storage(&self) -> Option<&PostgresSegmentedStorageReport> {
+        match self {
+            Self::PostgresSegmentedStorage(report) => Some(report),
+            Self::CanonicalReplayStorage(_)
+            | Self::RocksDbCanonicalFixtureReplay(_)
+            | Self::RocksDbStorageLifecycle(_) => None,
+        }
+    }
+}
+
+impl PostgresSegmentedStorageReport {
+    /// Validates every segmented `PostgreSQL` invariant, durable server posture,
+    /// latency-sample gate, resource partition sum, and non-double-counted storage metric.
+    pub fn validate_segmented(&self) -> Result<(), BenchError> {
+        self.validate_server_and_config()?;
+        self.validate_validation_and_footprint()?;
+        self.validate_timings_and_rates()?;
+        self.validate_gates_and_resources()
+    }
+
+    fn validate_gates_and_resources(&self) -> Result<(), BenchError> {
+        let uncontended = &self.tip_follow.uncontended_commit_latencies_ms;
+        let contended = &self.tip_follow.contended_commit_latencies_ms;
+        let missing_samples = uncontended.sample_count == 0 || contended.sample_count == 0;
+        let exceeded_threshold = uncontended.max_ms >= 2_000.0 || contended.max_ms >= 2_000.0;
+        if self.adr0004_gate_evaluation.tip_commit_latency_under_2s == Some(true)
+            && (missing_samples || exceeded_threshold)
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented tip_commit_latency_under_2s cannot be true when tip-commit samples are missing or max_ms >= 2000 ms",
+            ));
+        }
+        let rw = &self.reader_workload;
+        if rw.ready_workers > self.configuration.concurrent_readers
+            || rw.overlapping_workers > rw.ready_workers
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented reader worker counts exceed configured concurrent_readers",
+            ));
+        }
+        if self.adr0004_gate_evaluation.concurrent_readers_zero_errors
+            && self.configuration.concurrent_readers > 0
+            && (rw.ready_workers != self.configuration.concurrent_readers
+                || rw.overlapping_workers != self.configuration.concurrent_readers
+                || rw.completed_transactions == 0)
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented concurrent_readers_zero_errors requires all N readers ready, overlapping, and executing transactions",
+            ));
+        }
+        if (self
+            .adr0004_gate_evaluation
+            .build_time_ratio_vs_rocksdb
+            .is_some()
+            || self
+                .adr0004_gate_evaluation
+                .build_time_gate_passed
+                .is_some())
+            && (self.configuration.tip_follow_block_count != 0
+                || self.configuration.bulk_block_count != self.configuration.total_block_count)
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented build_time_ratio_vs_rocksdb is only valid when the full fixture is built in the bulk phase (tip_follow_block_count == 0)",
+            ));
+        }
+        self.validate_runtime_resources()
+    }
+
+    fn validate_runtime_resources(&self) -> Result<(), BenchError> {
+        let rt = &self.runtime_evidence;
+        if let Some(ref img) = rt.pooler_image_reference
+            && !is_immutable_image_reference(img)
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented pooler_image_reference must be digest-pinned or a sha256 image ID",
+            ));
+        }
+        if self.configuration.reader_mode == "direct"
+            && (rt.pooler_cpu_limit_cores.is_some()
+                || rt.pooler_memory_limit_bytes.is_some()
+                || rt.pooler_image_reference.is_some())
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented direct reader mode must not record pooler resource evidence",
+            ));
+        }
+        self.validate_cpu_partition()?;
+        self.validate_memory_partition()
+    }
+
+    fn validate_cpu_partition(&self) -> Result<(), BenchError> {
+        let rt = &self.runtime_evidence;
+        let is_pooled = self.configuration.reader_mode == "pgbouncer-transaction";
+        let any_cpu = self.provenance.runner.cpu_limit_cores.is_some()
+            || rt.client_cpu_limit_cores.is_some()
+            || rt.database_cpu_limit_cores.is_some()
+            || rt.pooler_cpu_limit_cores.is_some();
+        if !any_cpu {
+            return Ok(());
+        }
+        let agg = self.provenance.runner.cpu_limit_cores.ok_or_else(|| {
+            BenchError::report_format("missing provenance.runner.cpu_limit_cores")
+        })?;
+        let cli = rt.client_cpu_limit_cores.ok_or_else(|| {
+            BenchError::report_format("missing runtime_evidence.client_cpu_limit_cores")
+        })?;
+        let db = rt.database_cpu_limit_cores.ok_or_else(|| {
+            BenchError::report_format("missing runtime_evidence.database_cpu_limit_cores")
+        })?;
+        let pooler = if is_pooled {
+            rt.pooler_cpu_limit_cores.ok_or_else(|| {
+                BenchError::report_format(
+                    "pgbouncer-transaction requires runtime_evidence.pooler_cpu_limit_cores",
+                )
+            })?
+        } else {
+            0.0
+        };
+        if (cli + db + pooler - agg).abs() > f64::EPSILON * agg.max(1.0) {
+            return Err(BenchError::report_format(
+                "postgres-segmented client + database (+ pooler) CPUs must equal provenance.runner.cpu_limit_cores",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_memory_partition(&self) -> Result<(), BenchError> {
+        let rt = &self.runtime_evidence;
+        let is_pooled = self.configuration.reader_mode == "pgbouncer-transaction";
+        let any_mem = self.provenance.runner.memory_limit_bytes.is_some()
+            || rt.client_memory_limit_bytes.is_some()
+            || rt.database_memory_limit_bytes.is_some()
+            || rt.pooler_memory_limit_bytes.is_some();
+        if !any_mem {
+            return Ok(());
+        }
+        let agg = self.provenance.runner.memory_limit_bytes.ok_or_else(|| {
+            BenchError::report_format("missing provenance.runner.memory_limit_bytes")
+        })?;
+        let cli = rt.client_memory_limit_bytes.ok_or_else(|| {
+            BenchError::report_format("missing runtime_evidence.client_memory_limit_bytes")
+        })?;
+        let db = rt.database_memory_limit_bytes.ok_or_else(|| {
+            BenchError::report_format("missing runtime_evidence.database_memory_limit_bytes")
+        })?;
+        let pooler = if is_pooled {
+            rt.pooler_memory_limit_bytes.ok_or_else(|| {
+                BenchError::report_format(
+                    "pgbouncer-transaction requires runtime_evidence.pooler_memory_limit_bytes",
+                )
+            })?
+        } else {
+            0
+        };
+        if cli.checked_add(db).and_then(|s| s.checked_add(pooler)) != Some(agg) {
+            return Err(BenchError::report_format(
+                "postgres-segmented client + database (+ pooler) memory bytes must equal provenance.runner.memory_limit_bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_server_and_config(&self) -> Result<(), BenchError> {
+        if !self.server_settings.fsync
+            || !self.server_settings.full_page_writes
+            || self.server_settings.synchronous_commit != "on"
+            || (self.server_settings.wal_level != "replica"
+                && self.server_settings.wal_level != "logical")
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented requires durable server posture (fsync, full_page_writes, synchronous_commit=on, replica/logical wal_level)",
+            ));
+        }
+        if self.configuration.schema_version != 2 {
+            return Err(BenchError::report_format(format!(
+                "postgres-segmented schema_version {} must equal 2",
+                self.configuration.schema_version
+            )));
+        }
+        if self.configuration.max_segment_bytes == 0
+            || self.configuration.max_segment_bytes > MAX_SETTLED_SEGMENT_BYTES
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented max_segment_bytes must be within 1..=256 MiB",
+            ));
+        }
+        if self.configuration.total_block_count != u64::from(self.fixture.block_count)
+            || self
+                .configuration
+                .bulk_block_count
+                .saturating_add(self.configuration.tip_follow_block_count)
+                != self.configuration.total_block_count
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented block count breakdown disagrees with fixture.block_count",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_validation_and_footprint(&self) -> Result<(), BenchError> {
+        let expected_digest = &self
+            .fixture
+            .canonical_block_facts_digest_evidence
+            .sequence_digest_sha256;
+        if !self.validation.fixture_sequence_digest_match || !self.validation.fresh_reader_validated
+        {
+            return Err(BenchError::canonical_replay_storage_sequence_mismatch(
+                "postgres-segmented report lacks validated fresh-reader digest parity",
+            ));
+        }
+        if !is_lowercase_sha256(&self.validation.persisted_sequence_digest_hex)
+            || !is_lowercase_sha256(expected_digest)
+            || self.validation.persisted_sequence_digest_hex != *expected_digest
+        {
+            return Err(BenchError::canonical_replay_storage_sequence_mismatch(
+                "postgres-segmented persisted_sequence_digest_hex disagrees with fixture sequence_digest_sha256 or is not valid SHA-256 hex",
+            ));
+        }
+        if self.validation.first_height != self.fixture.from_height
+            || self.validation.tip_height != self.fixture.to_height
+            || self.validation.tip_hash_hex != self.fixture.tip_hash_hex
+        {
+            return Err(BenchError::canonical_replay_storage_sequence_mismatch(
+                "postgres-segmented validated heights/hash disagree with fixture",
+            ));
+        }
+        if self.footprint.max_segment_byte_len > self.configuration.max_segment_bytes {
+            return Err(BenchError::acceptance_hard_limit_missed(
+                "max_segment_byte_len exceeded configured max_segment_bytes",
+            ));
+        }
+        if self.footprint.live_tail_rows > u64::from(self.configuration.live_tail_max_blocks) {
+            return Err(BenchError::acceptance_hard_limit_missed(
+                "canonical_live_tail exceeded configured live_tail_max_blocks",
+            ));
+        }
+        if self
+            .footprint
+            .canonical_storage_bytes
+            .checked_add(self.footprint.wallet_storage_bytes)
+            != Some(self.footprint.total_storage_bytes)
+        {
+            return Err(BenchError::report_format(
+                "total_storage_bytes does not equal canonical_storage_bytes + wallet_storage_bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_timings_and_rates(&self) -> Result<(), BenchError> {
+        let numeric_metrics = [
+            ("wall_clock_seconds", self.timings.wall_clock_seconds),
+            ("prepare_seconds", self.timings.prepare_seconds),
+            ("tip_prepare_seconds", self.timings.tip_prepare_seconds),
+            ("schema_create_seconds", self.timings.schema_create_seconds),
+            (
+                "wallet_projection_seconds",
+                self.timings.wallet_projection_seconds,
+            ),
+            ("seal_seconds", self.timings.seal_seconds),
+            ("bulk_copy_seconds", self.timings.bulk_copy_seconds),
+            ("finalize_seconds", self.timings.finalize_seconds),
+            ("bulk_build_seconds", self.timings.bulk_build_seconds),
+            (
+                "uncontended_tip_follow_seconds",
+                self.timings.uncontended_tip_follow_seconds,
+            ),
+            (
+                "contended_tip_follow_seconds",
+                self.timings.contended_tip_follow_seconds,
+            ),
+            (
+                "fresh_validation_seconds",
+                self.timings.fresh_validation_seconds,
+            ),
+            (
+                "footprint_measurement_seconds",
+                self.timings.footprint_measurement_seconds,
+            ),
+            (
+                "bulk_build_blocks_per_second",
+                self.timings.bulk_build_blocks_per_second,
+            ),
+            (
+                "streaming_blocks_per_second",
+                self.timings.streaming_blocks_per_second,
+            ),
+            (
+                "per_reader_blocks_per_second_mean",
+                self.reader_workload.per_reader_blocks_per_second_mean,
+            ),
+            (
+                "per_reader_bytes_per_second_mean",
+                self.reader_workload.per_reader_bytes_per_second_mean,
+            ),
+            (
+                "aggregate_blocks_per_second",
+                self.reader_workload.aggregate_blocks_per_second,
+            ),
+            (
+                "aggregate_bytes_per_second",
+                self.reader_workload.aggregate_bytes_per_second,
+            ),
+        ];
+        for (name, val) in numeric_metrics {
+            if !val.is_finite() || val < 0.0 {
+                return Err(BenchError::report_format(format!(
+                    "postgres-segmented metric `{name}` must be finite and non-negative"
+                )));
+            }
+        }
+        self.validate_timing_consistency()?;
+        self.validate_latency_distributions()
+    }
+
+    fn validate_timing_consistency(&self) -> Result<(), BenchError> {
+        let expected_bulk = self.timings.prepare_seconds
+            + self.timings.schema_create_seconds
+            + self.timings.wallet_projection_seconds
+            + self.timings.seal_seconds
+            + self.timings.bulk_copy_seconds
+            + self.timings.finalize_seconds;
+        let tolerance = expected_bulk.abs().max(1.0) * 1e-9;
+        if (self.timings.bulk_build_seconds - expected_bulk).abs() > tolerance {
+            return Err(BenchError::report_format(
+                "postgres-segmented bulk_build_seconds disagrees with sum of bulk build phases",
+            ));
+        }
+        if self.configuration.tip_follow_block_count == 0 && self.timings.tip_prepare_seconds != 0.0
+        {
+            return Err(BenchError::report_format(
+                "postgres-segmented tip_prepare_seconds must be zero when tip_follow_block_count is zero",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_latency_distributions(&self) -> Result<(), BenchError> {
+        for (label, lat) in [
+            (
+                "uncontended_commit_latencies_ms",
+                &self.tip_follow.uncontended_commit_latencies_ms,
+            ),
+            (
+                "contended_commit_latencies_ms",
+                &self.tip_follow.contended_commit_latencies_ms,
+            ),
+            (
+                "reader_transaction_latencies_ms",
+                &self.reader_workload.transaction_latencies_ms,
+            ),
+        ] {
+            for stat in [lat.p50_ms, lat.p95_ms, lat.p99_ms, lat.max_ms] {
+                if !stat.is_finite() || stat < 0.0 {
+                    return Err(BenchError::report_format(format!(
+                        "postgres-segmented latency `{label}` must be finite and non-negative"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Builds a closed [`BenchmarkReport::PostgresSegmentedStorage`] report from a
+/// completed segmented benchmark run and optional `RocksDB` comparison baseline.
+#[must_use]
+pub fn build_postgres_segmented_storage_report(
+    fixture: FixtureSummary,
+    inputs: PostgresSegmentedReportInputs,
+) -> BenchmarkReport {
+    let provenance = build_segmented_provenance(&inputs);
+    let run = inputs.run;
+    let tip_hash_hex = hex::encode(zinder_core::wire::encode_internal_block_hash(run.tip_hash));
+    let expected_digest = &fixture
+        .canonical_block_facts_digest_evidence
+        .sequence_digest_sha256;
+    let fixture_sequence_digest_match = is_lowercase_sha256(&run.persisted_sequence_digest_hex)
+        && is_lowercase_sha256(expected_digest)
+        && run.persisted_sequence_digest_hex == *expected_digest;
+    let bulk_build_seconds = run.timings.prepare_seconds
+        + run.timings.schema_create_seconds
+        + run.timings.wallet_projection_seconds
+        + run.timings.seal_seconds
+        + run.timings.bulk_copy_seconds
+        + run.timings.finalize_seconds;
+    let bulk_build_blocks_per_second = if bulk_build_seconds > 0.0 {
+        u64_to_f64(run.bulk_block_count) / bulk_build_seconds
+    } else {
+        0.0
+    };
+    let streaming_blocks_per_second = run.reader_workload.per_reader_blocks_per_second_mean;
+    let adr0004_gate_evaluation = evaluate_adr0004_gates(
+        &fixture,
+        &run,
+        bulk_build_seconds,
+        streaming_blocks_per_second,
+        inputs.baseline.as_ref(),
+    );
+
+    let configuration = build_segmented_config_summary(&run);
+    let validation =
+        build_segmented_validation_summary(&run, tip_hash_hex, fixture_sequence_digest_match);
+    let timings = build_segmented_timing_summary(
+        &run,
+        bulk_build_seconds,
+        bulk_build_blocks_per_second,
+        streaming_blocks_per_second,
+    );
+    let tip_follow = build_segmented_tip_follow_summary(&run);
+    let reader_workload = build_segmented_reader_summary(&run);
+    let footprint = build_segmented_footprint_summary(run.footprint);
+
+    BenchmarkReport::PostgresSegmentedStorage(Box::new(PostgresSegmentedStorageReport {
+        contract_identity: REPORT_CONTRACT_IDENTITY.to_owned(),
+        report_format_version: POSTGRES_SEGMENTED_REPORT_FORMAT_VERSION,
+        provenance,
+        storage_candidate: StorageCandidateIdentity::postgres_segmented_storage(),
+        runtime_evidence: inputs.runtime_evidence,
+        server_settings: run.server_settings,
+        fixture,
+        configuration,
+        validation,
+        timings,
+        tip_follow,
+        reader_workload,
+        footprint,
+        adr0004_gate_evaluation,
+        benchmark_client_peak_rss: inputs.benchmark_client_peak_rss,
+    }))
+}
+
+fn build_segmented_provenance(inputs: &PostgresSegmentedReportInputs) -> ReportProvenance {
+    ReportProvenance {
+        benchmark_version: env!("CARGO_PKG_VERSION"),
+        software_revision: inputs.software_revision.clone(),
+        run: BenchmarkRunProvenance {
+            trial_id: inputs.trial_id.clone(),
+            fixture_cache_policy: inputs.fixture_cache_policy,
+            started_at_unix_millis: inputs.run_started_at_unix_millis,
+            completed_at_unix_millis: inputs.run_completed_at_unix_millis,
+        },
+        runner: RunnerProvenance {
+            id: inputs.runner_id.clone(),
+            cpu_limit_cores: inputs.cpu_limit_cores,
+            memory_limit_bytes: inputs.memory_limit_bytes,
+            storage_class: inputs.storage_class.clone(),
+        },
+        image_reference: inputs.image_reference.clone(),
+        target_os: std::env::consts::OS,
+        target_arch: std::env::consts::ARCH,
+    }
+}
+
+fn build_segmented_config_summary(
+    run: &PostgresSegmentedRunReport,
+) -> PostgresSegmentedConfigSummary {
+    PostgresSegmentedConfigSummary {
+        schema_name: run.schema_name.clone(),
+        schema_version: run.schema_version,
+        network: encode_zinder_native_chain_name(run.network).to_owned(),
+        full_blocks: run.full_blocks,
+        max_segment_bytes: run.max_segment_bytes,
+        settled_segment_blocks: run.settled_segment_blocks,
+        live_tail_max_blocks: run.live_tail_max_blocks,
+        reader_mode: run.reader_mode.as_str().to_owned(),
+        concurrent_readers: run.concurrent_readers,
+        mempool_churn_txs_per_block: run.mempool_churn_txs_per_block,
+        bulk_block_count: run.bulk_block_count,
+        tip_follow_block_count: run.tip_follow_block_count,
+        total_block_count: run.total_block_count,
+    }
+}
+
+fn build_segmented_validation_summary(
+    run: &PostgresSegmentedRunReport,
+    tip_hash_hex: String,
+    fixture_sequence_digest_match: bool,
+) -> PostgresSegmentedValidationSummary {
+    PostgresSegmentedValidationSummary {
+        first_height: run.first_height.value(),
+        tip_height: run.tip_height.value(),
+        tip_hash_hex,
+        settled_blocks_verified: run.settled_blocks_verified,
+        live_tail_blocks_verified: run.live_tail_blocks_verified,
+        raw_blocks_verified: run.raw_blocks_verified,
+        persisted_sequence_digest_hex: run.persisted_sequence_digest_hex.clone(),
+        fixture_sequence_digest_match,
+        fresh_reader_validated: true,
+    }
+}
+
+fn build_segmented_timing_summary(
+    run: &PostgresSegmentedRunReport,
+    bulk_build_seconds: f64,
+    bulk_build_blocks_per_second: f64,
+    streaming_blocks_per_second: f64,
+) -> PostgresSegmentedTimingSummary {
+    PostgresSegmentedTimingSummary {
+        wall_clock_seconds: run.timings.wall_clock_seconds,
+        prepare_seconds: run.timings.prepare_seconds,
+        tip_prepare_seconds: run.timings.tip_prepare_seconds,
+        schema_create_seconds: run.timings.schema_create_seconds,
+        wallet_projection_seconds: run.timings.wallet_projection_seconds,
+        seal_seconds: run.timings.seal_seconds,
+        bulk_copy_seconds: run.timings.bulk_copy_seconds,
+        finalize_seconds: run.timings.finalize_seconds,
+        bulk_build_seconds,
+        uncontended_tip_follow_seconds: run.timings.uncontended_tip_follow_seconds,
+        contended_tip_follow_seconds: run.timings.contended_tip_follow_seconds,
+        fresh_validation_seconds: run.timings.fresh_validation_seconds,
+        footprint_measurement_seconds: run.timings.footprint_measurement_seconds,
+        bulk_build_blocks_per_second,
+        streaming_blocks_per_second,
+    }
+}
+
+fn build_segmented_tip_follow_summary(
+    run: &PostgresSegmentedRunReport,
+) -> PostgresSegmentedTipFollowSummary {
+    PostgresSegmentedTipFollowSummary {
+        uncontended_commit_latencies_ms: PostgresSegmentedLatencySummary::from(
+            &run.tip_follow.uncontended_commit_latencies_ms,
+        ),
+        contended_commit_latencies_ms: PostgresSegmentedLatencySummary::from(
+            &run.tip_follow.contended_commit_latencies_ms,
+        ),
+        tail_seal_transitions: run.tip_follow.tail_seal_transitions,
+        mempool_admits: run.tip_follow.mempool_admits,
+        mempool_evictions: run.tip_follow.mempool_evictions,
+    }
+}
+
+fn build_segmented_reader_summary(
+    run: &PostgresSegmentedRunReport,
+) -> PostgresSegmentedReaderWorkloadSummary {
+    PostgresSegmentedReaderWorkloadSummary {
+        ready_workers: run.reader_workload.ready_workers,
+        overlapping_workers: run.reader_workload.overlapping_workers,
+        completed_transactions: run.reader_workload.completed_transactions,
+        settled_range_reads: run.reader_workload.settled_range_reads,
+        blocks_decoded: run.reader_workload.blocks_decoded,
+        bytes_fetched: run.reader_workload.bytes_fetched,
+        per_reader_blocks_per_second_mean: run.reader_workload.per_reader_blocks_per_second_mean,
+        per_reader_bytes_per_second_mean: run.reader_workload.per_reader_bytes_per_second_mean,
+        aggregate_blocks_per_second: run.reader_workload.aggregate_blocks_per_second,
+        aggregate_bytes_per_second: run.reader_workload.aggregate_bytes_per_second,
+        transaction_latencies_ms: PostgresSegmentedLatencySummary::from(&run.reader_latencies_ms),
+    }
+}
+
+fn build_segmented_footprint_summary(
+    footprint: crate::postgres_segmented::storage_footprint::StorageFootprintSummary,
+) -> PostgresSegmentedFootprintSummary {
+    PostgresSegmentedFootprintSummary {
+        canonical_storage_bytes: footprint.canonical_storage_bytes,
+        wallet_storage_bytes: footprint.wallet_storage_bytes,
+        total_storage_bytes: footprint.total_storage_bytes,
+        total_heap_bytes: footprint.total_heap_bytes,
+        total_toast_bytes: footprint.total_toast_bytes,
+        total_index_bytes: footprint.total_index_bytes,
+        bulk_wal_bytes: footprint.bulk_wal_bytes,
+        tip_follow_wal_bytes: footprint.tip_follow_wal_bytes,
+        settled_shielded_segments: footprint.settled_shielded_segments,
+        settled_supplement_segments: footprint.settled_supplement_segments,
+        settled_raw_block_segments: footprint.settled_raw_block_segments,
+        max_segment_byte_len: footprint.max_segment_byte_len,
+        live_tail_rows: footprint.live_tail_rows,
+        relations: footprint
+            .relations
+            .into_iter()
+            .map(|rel| PostgresSegmentedRelationFootprint {
+                table_name: rel.table_name,
+                row_count: rel.row_count,
+                heap_bytes: rel.heap_bytes,
+                toast_bytes: rel.toast_bytes,
+                index_bytes: rel.index_bytes,
+                total_relation_bytes: rel.total_relation_bytes,
+                is_wallet_table: rel.is_wallet_table,
+            })
+            .collect(),
+    }
+}
+
+struct BaselineGateComparison {
+    rocksdb_build_seconds: Option<f64>,
+    rocksdb_storage_bytes: Option<u64>,
+    rocksdb_streaming_blocks_per_second: Option<f64>,
+    build_time_ratio_vs_rocksdb: Option<f64>,
+    build_time_gate_passed: Option<bool>,
+    storage_size_ratio_vs_rocksdb: Option<f64>,
+    storage_size_gate_passed: Option<bool>,
+    streaming_throughput_ratio_vs_rocksdb: Option<f64>,
+    streaming_throughput_gate_passed: Option<bool>,
+}
+
+fn evaluate_baseline_comparison(
+    fixture: &FixtureSummary,
+    run: &PostgresSegmentedRunReport,
+    bulk_build_seconds: f64,
+    streaming_blocks_per_second: f64,
+    baseline: Option<&PostgresSegmentedBaselineInput>,
+) -> BaselineGateComparison {
+    let matched_baseline = baseline.filter(|base| {
+        base.includes_wallet_projection
+            && base.full_blocks == run.full_blocks
+            && base.network == fixture.network
+            && (base.first_height, base.tip_height) == (fixture.from_height, fixture.to_height)
+            && base.block_count == run.total_block_count
+            && is_lowercase_sha256(&base.sequence_digest_sha256)
+            && base.sequence_digest_sha256
+                == fixture
+                    .canonical_block_facts_digest_evidence
+                    .sequence_digest_sha256
+    });
+    let Some(base) = matched_baseline else {
+        return BaselineGateComparison {
+            rocksdb_build_seconds: None,
+            rocksdb_storage_bytes: None,
+            rocksdb_streaming_blocks_per_second: None,
+            build_time_ratio_vs_rocksdb: None,
+            build_time_gate_passed: None,
+            storage_size_ratio_vs_rocksdb: None,
+            storage_size_gate_passed: None,
+            streaming_throughput_ratio_vs_rocksdb: None,
+            streaming_throughput_gate_passed: None,
+        };
+    };
+
+    let full_fixture_bulk_run =
+        run.tip_follow_block_count == 0 && run.bulk_block_count == run.total_block_count;
+    let rocksdb_build_seconds = if full_fixture_bulk_run {
+        base.build_seconds.filter(|&b| b.is_finite() && b > 0.0)
+    } else {
+        None
+    };
+    let comparable_pg_build_seconds = bulk_build_seconds + run.timings.fresh_validation_seconds;
+    let build_time_ratio_vs_rocksdb =
+        rocksdb_build_seconds.map(|b| comparable_pg_build_seconds / b);
+    let build_time_gate_passed = build_time_ratio_vs_rocksdb.map(|r| r <= 4.0);
+
+    let rocksdb_storage_bytes = base.storage_bytes.filter(|&b| b > 0);
+    let storage_size_ratio_vs_rocksdb = rocksdb_storage_bytes
+        .map(|b| u64_to_f64(run.footprint.total_storage_bytes) / u64_to_f64(b));
+    let storage_size_gate_passed = storage_size_ratio_vs_rocksdb.map(|r| r < 2.0);
+
+    let rocksdb_streaming_blocks_per_second = base
+        .streaming_blocks_per_second
+        .filter(|&b| b.is_finite() && b > 0.0);
+    let streaming_throughput_ratio_vs_rocksdb =
+        rocksdb_streaming_blocks_per_second.map(|b| streaming_blocks_per_second / b);
+    let streaming_throughput_gate_passed = streaming_throughput_ratio_vs_rocksdb.map(|r| r >= 0.5);
+
+    BaselineGateComparison {
+        rocksdb_build_seconds,
+        rocksdb_storage_bytes,
+        rocksdb_streaming_blocks_per_second,
+        build_time_ratio_vs_rocksdb,
+        build_time_gate_passed,
+        storage_size_ratio_vs_rocksdb,
+        storage_size_gate_passed,
+        streaming_throughput_ratio_vs_rocksdb,
+        streaming_throughput_gate_passed,
+    }
+}
+
+fn evaluate_adr0004_gates(
+    fixture: &FixtureSummary,
+    run: &PostgresSegmentedRunReport,
+    bulk_build_seconds: f64,
+    streaming_blocks_per_second: f64,
+    baseline: Option<&PostgresSegmentedBaselineInput>,
+) -> PostgresSegmentedGateEvaluation {
+    let uncontended = &run.tip_follow.uncontended_commit_latencies_ms;
+    let contended = &run.tip_follow.contended_commit_latencies_ms;
+    let tip_commit_latency_under_2s = if (uncontended.sample_count > 0
+        && uncontended.max_ms >= 2_000.0)
+        || (contended.sample_count > 0 && contended.max_ms >= 2_000.0)
+    {
+        Some(false)
+    } else if uncontended.sample_count > 0 && contended.sample_count > 0 {
+        Some(true)
+    } else {
+        None
+    };
+
+    let max_segment_bytes_respected = run.footprint.max_segment_byte_len <= run.max_segment_bytes
+        && run.max_segment_bytes <= MAX_SETTLED_SEGMENT_BYTES;
+    let live_tail_bounded = run.footprint.live_tail_rows <= u64::from(run.live_tail_max_blocks);
+    let concurrent_readers_zero_errors = run.concurrent_readers == 0
+        || (contended.sample_count > 0
+            && run.reader_workload.ready_workers == run.concurrent_readers
+            && run.reader_workload.overlapping_workers == run.concurrent_readers
+            && run.reader_workload.completed_transactions > 0);
+    let all_standalone_gates_passed = tip_commit_latency_under_2s == Some(true)
+        && max_segment_bytes_respected
+        && live_tail_bounded
+        && concurrent_readers_zero_errors;
+
+    let cmp = evaluate_baseline_comparison(
+        fixture,
+        run,
+        bulk_build_seconds,
+        streaming_blocks_per_second,
+        baseline,
+    );
+    let baseline_provided = baseline.is_some();
+    let standalone_failed = tip_commit_latency_under_2s == Some(false)
+        || !max_segment_bytes_respected
+        || !live_tail_bounded
+        || !concurrent_readers_zero_errors;
+    let any_baseline_failed = cmp.build_time_gate_passed == Some(false)
+        || cmp.storage_size_gate_passed == Some(false)
+        || cmp.streaming_throughput_gate_passed == Some(false);
+    let all_baseline_gates_passed = if !baseline_provided {
+        None
+    } else if standalone_failed || any_baseline_failed {
+        Some(false)
+    } else if all_standalone_gates_passed
+        && cmp.build_time_gate_passed == Some(true)
+        && cmp.storage_size_gate_passed == Some(true)
+        && cmp.streaming_throughput_gate_passed == Some(true)
+    {
+        Some(true)
+    } else {
+        None
+    };
+
+    PostgresSegmentedGateEvaluation {
+        tip_commit_latency_under_2s,
+        max_segment_bytes_respected,
+        live_tail_bounded,
+        concurrent_readers_zero_errors,
+        baseline_provided,
+        rocksdb_build_seconds: cmp.rocksdb_build_seconds,
+        rocksdb_storage_bytes: cmp.rocksdb_storage_bytes,
+        rocksdb_streaming_blocks_per_second: cmp.rocksdb_streaming_blocks_per_second,
+        build_time_ratio_vs_rocksdb: cmp.build_time_ratio_vs_rocksdb,
+        build_time_gate_passed: cmp.build_time_gate_passed,
+        storage_size_ratio_vs_rocksdb: cmp.storage_size_ratio_vs_rocksdb,
+        storage_size_gate_passed: cmp.storage_size_gate_passed,
+        streaming_throughput_ratio_vs_rocksdb: cmp.streaming_throughput_ratio_vs_rocksdb,
+        streaming_throughput_gate_passed: cmp.streaming_throughput_gate_passed,
+        all_standalone_gates_passed,
+        all_baseline_gates_passed,
     }
 }
 
@@ -3462,6 +4615,472 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
                 bytes: Some(1_048_576),
                 source: "proc_status_vmhwm",
             },
+        }
+    }
+
+    #[test]
+    fn postgres_segmented_report_validates_and_rejects_boundary_tampering()
+    -> Result<(), crate::BenchError> {
+        let mut report = super::build_postgres_segmented_storage_report(
+            sample_fixture_summary(),
+            sample_postgres_segmented_inputs(),
+        );
+        report.validate()?;
+
+        let json_text = serde_json::to_string(&report).map_err(|err| {
+            crate::BenchError::report_format(format!("serialize segmented report: {err}"))
+        })?;
+        assert!(json_text.contains("\"measurement_kind\":\"postgres-segmented-storage\""));
+
+        let Some(seg_mut) = (match &mut report {
+            super::BenchmarkReport::PostgresSegmentedStorage(inner) => Some(inner),
+            super::BenchmarkReport::CanonicalReplayStorage(_)
+            | super::BenchmarkReport::RocksDbCanonicalFixtureReplay(_)
+            | super::BenchmarkReport::RocksDbStorageLifecycle(_) => None,
+        }) else {
+            return Err(crate::BenchError::report_format(
+                "expected postgres-segmented-storage variant",
+            ));
+        };
+
+        seg_mut.server_settings.fsync = false;
+        assert!(seg_mut.validate_segmented().is_err());
+        seg_mut.server_settings.fsync = true;
+
+        seg_mut.footprint.live_tail_rows =
+            u64::from(seg_mut.configuration.live_tail_max_blocks) + 1;
+        assert!(seg_mut.validate_segmented().is_err());
+        seg_mut.footprint.live_tail_rows = 2;
+
+        seg_mut.footprint.max_segment_byte_len = seg_mut.configuration.max_segment_bytes + 1;
+        assert!(seg_mut.validate_segmented().is_err());
+        seg_mut.footprint.max_segment_byte_len = 4096;
+
+        seg_mut.adr0004_gate_evaluation.build_time_ratio_vs_rocksdb = Some(1.5);
+        assert!(seg_mut.validate_segmented().is_err());
+        seg_mut.adr0004_gate_evaluation.build_time_ratio_vs_rocksdb = None;
+
+        seg_mut.reader_workload.overlapping_workers = 1;
+        assert!(seg_mut.validate_segmented().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_segmented_rejects_inconsistent_or_nonhex_digests_even_when_flag_true()
+    -> Result<(), crate::BenchError> {
+        let report = super::build_postgres_segmented_storage_report(
+            sample_fixture_summary(),
+            sample_postgres_segmented_inputs(),
+        );
+        let super::BenchmarkReport::PostgresSegmentedStorage(mut seg) = report else {
+            return Err(crate::BenchError::report_format(
+                "expected postgres-segmented-storage variant",
+            ));
+        };
+
+        let original_digest = seg.validation.persisted_sequence_digest_hex.clone();
+        seg.validation.persisted_sequence_digest_hex = "99".repeat(32);
+        assert!(seg.validation.fixture_sequence_digest_match);
+        assert!(seg.validate_segmented().is_err());
+
+        seg.validation.persisted_sequence_digest_hex = "AA".repeat(32);
+        seg.fixture
+            .canonical_block_facts_digest_evidence
+            .sequence_digest_sha256 = "AA".repeat(32);
+        assert!(seg.validate_segmented().is_err());
+
+        seg.validation.persisted_sequence_digest_hex = "abcd".to_owned();
+        seg.fixture
+            .canonical_block_facts_digest_evidence
+            .sequence_digest_sha256 = "abcd".to_owned();
+        assert!(seg.validate_segmented().is_err());
+
+        seg.validation.persisted_sequence_digest_hex = original_digest.clone();
+        seg.fixture
+            .canonical_block_facts_digest_evidence
+            .sequence_digest_sha256 = original_digest;
+        seg.validate_segmented()
+    }
+
+    #[test]
+    fn postgres_segmented_separates_bulk_and_tip_prepare_and_enforces_matching_baseline()
+    -> Result<(), crate::BenchError> {
+        let mut inputs = sample_postgres_segmented_inputs();
+        inputs.run.timings.schema_create_seconds = 1.0;
+        inputs.run.timings.wallet_projection_seconds = 1.0;
+        inputs.run.timings.tip_prepare_seconds = 9.9;
+        let tip_run_report = super::build_postgres_segmented_storage_report(
+            sample_fixture_summary(),
+            inputs.clone(),
+        );
+        tip_run_report.validate()?;
+        let seg = tip_run_report
+            .postgres_segmented_storage()
+            .ok_or_else(|| crate::BenchError::report_format("expected segmented variant"))?;
+        assert!((seg.timings.bulk_build_seconds - 3.0).abs() < 1e-9);
+        assert!((seg.timings.bulk_build_blocks_per_second - 2.0).abs() < 1e-9);
+        assert!((seg.timings.tip_prepare_seconds - 9.9).abs() < 1e-9);
+        assert_eq!(
+            seg.adr0004_gate_evaluation.build_time_ratio_vs_rocksdb,
+            None
+        );
+        assert_eq!(seg.adr0004_gate_evaluation.build_time_gate_passed, None);
+        assert_eq!(
+            seg.adr0004_gate_evaluation.storage_size_ratio_vs_rocksdb,
+            Some(0.96)
+        );
+        assert_eq!(seg.adr0004_gate_evaluation.all_baseline_gates_passed, None);
+
+        // Full-fixture bulk build (tip_follow_block_count == 0) compares build + fresh validation.
+        let mut full_bulk = inputs.clone();
+        full_bulk.run.bulk_block_count = 10;
+        full_bulk.run.tip_follow_block_count = 0;
+        full_bulk.run.concurrent_readers = 0;
+        full_bulk.run.reader_workload.ready_workers = 0;
+        full_bulk.run.reader_workload.overlapping_workers = 0;
+        full_bulk.run.reader_workload.completed_transactions = 0;
+        full_bulk.run.timings.tip_prepare_seconds = 0.0;
+        full_bulk.run.timings.fresh_validation_seconds = 0.5;
+        let full_bulk_report =
+            super::build_postgres_segmented_storage_report(sample_fixture_summary(), full_bulk);
+        full_bulk_report.validate()?;
+        let seg_bulk = full_bulk_report
+            .postgres_segmented_storage()
+            .ok_or_else(|| crate::BenchError::report_format("expected segmented variant"))?;
+        assert_eq!(
+            seg_bulk.adr0004_gate_evaluation.build_time_ratio_vs_rocksdb,
+            Some(3.5)
+        );
+        assert_eq!(
+            seg_bulk.adr0004_gate_evaluation.build_time_gate_passed,
+            Some(true)
+        );
+
+        // Mismatched baseline scope/retention/network leaves all comparison metrics None.
+        let mut wrong_scope = inputs;
+        wrong_scope.run.bulk_block_count = 10;
+        wrong_scope.run.tip_follow_block_count = 0;
+        wrong_scope.run.timings.tip_prepare_seconds = 0.0;
+        if let Some(ref mut base) = wrong_scope.baseline {
+            base.includes_wallet_projection = false;
+        }
+        let mismatched =
+            super::build_postgres_segmented_storage_report(sample_fixture_summary(), wrong_scope);
+        let seg_mismatch = mismatched
+            .postgres_segmented_storage()
+            .ok_or_else(|| crate::BenchError::report_format("expected segmented variant"))?;
+        assert_eq!(
+            seg_mismatch
+                .adr0004_gate_evaluation
+                .build_time_ratio_vs_rocksdb,
+            None
+        );
+        assert_eq!(
+            seg_mismatch
+                .adr0004_gate_evaluation
+                .storage_size_ratio_vs_rocksdb,
+            None
+        );
+        assert_eq!(
+            seg_mismatch
+                .adr0004_gate_evaluation
+                .all_baseline_gates_passed,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_segmented_zero_tip_samples_leave_latency_gate_unset()
+    -> Result<(), crate::BenchError> {
+        let mut inputs = sample_postgres_segmented_inputs();
+        inputs.run.tip_follow.contended_commit_latencies_ms =
+            crate::postgres_segmented::tip_follow::LatencyPercentilesMillis::default();
+        let single_tip =
+            super::build_postgres_segmented_storage_report(sample_fixture_summary(), inputs);
+        let seg_single = single_tip
+            .postgres_segmented_storage()
+            .ok_or_else(|| crate::BenchError::report_format("expected segmented variant"))?;
+        assert_eq!(
+            seg_single
+                .adr0004_gate_evaluation
+                .tip_commit_latency_under_2s,
+            None
+        );
+        assert!(
+            !seg_single
+                .adr0004_gate_evaluation
+                .all_standalone_gates_passed
+        );
+        assert!(
+            !seg_single
+                .adr0004_gate_evaluation
+                .concurrent_readers_zero_errors
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_segmented_validation_enforces_pooler_resource_budget()
+    -> Result<(), crate::BenchError> {
+        let mut inputs = sample_postgres_segmented_inputs();
+        inputs.run.reader_mode =
+            crate::postgres_segmented::reader::ReaderConnectionMode::PgbouncerTransaction;
+        inputs.cpu_limit_cores = Some(8.0);
+        inputs.memory_limit_bytes = Some(17_179_869_184);
+        inputs.runtime_evidence = super::PostgresSegmentedRuntimeEvidence {
+            database_image_reference: None,
+            pooler_image_reference: None,
+            client_cpu_limit_cores: Some(1.5),
+            client_memory_limit_bytes: Some(8_053_063_680),
+            database_cpu_limit_cores: Some(6.0),
+            database_memory_limit_bytes: Some(8_589_934_592),
+            pooler_cpu_limit_cores: Some(0.5),
+            pooler_memory_limit_bytes: Some(536_870_912),
+        };
+        let valid_report = super::build_postgres_segmented_storage_report(
+            sample_fixture_summary(),
+            inputs.clone(),
+        );
+        valid_report.validate()?;
+
+        inputs.runtime_evidence.pooler_cpu_limit_cores = None;
+        let missing_pooler_cpu =
+            super::build_postgres_segmented_storage_report(sample_fixture_summary(), inputs);
+        assert!(missing_pooler_cpu.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_segmented_validation_rejects_over_threshold_latency_claiming_pass()
+    -> Result<(), crate::BenchError> {
+        let mut over_contended = super::build_postgres_segmented_storage_report(
+            sample_fixture_summary(),
+            sample_postgres_segmented_inputs(),
+        );
+        over_contended.validate()?;
+        if let super::BenchmarkReport::PostgresSegmentedStorage(ref mut seg) = over_contended {
+            assert_eq!(
+                seg.adr0004_gate_evaluation.tip_commit_latency_under_2s,
+                Some(true)
+            );
+            seg.tip_follow.contended_commit_latencies_ms.max_ms = 2_500.0;
+        }
+        assert!(over_contended.validate().is_err());
+
+        let mut boundary_uncontended = super::build_postgres_segmented_storage_report(
+            sample_fixture_summary(),
+            sample_postgres_segmented_inputs(),
+        );
+        if let super::BenchmarkReport::PostgresSegmentedStorage(ref mut seg) = boundary_uncontended
+        {
+            assert_eq!(
+                seg.adr0004_gate_evaluation.tip_commit_latency_under_2s,
+                Some(true)
+            );
+            seg.tip_follow.uncontended_commit_latencies_ms.max_ms = 2_000.0;
+        }
+        assert!(boundary_uncontended.validate().is_err());
+        Ok(())
+    }
+
+    fn sample_fixture_summary() -> super::FixtureSummary {
+        super::FixtureSummary {
+            contract_identity: super::FIXTURE_CONTRACT_IDENTITY.to_owned(),
+            fixture_format_version: super::FIXTURE_FORMAT_VERSION,
+            canonical_artifact_schema_version: 1,
+            canonical_block_facts_digest_evidence: super::CanonicalBlockFactsDigestEvidence {
+                block_digest_version: 1,
+                sequence_digest_version: 1,
+                block_count: 10,
+                sequence_digest_sha256: "22".repeat(32),
+            },
+            tip_hash_hex: "11".repeat(32),
+            digest_sha256: "33".repeat(32),
+            network: "zcash-regtest".to_owned(),
+            from_height: 1,
+            to_height: 10,
+            block_count: 10,
+            workload_density: super::WorkloadDensity {
+                block_count: 10,
+                raw_block_bytes: 1_400,
+                transaction_count: 10,
+                transparent_input_count: 0,
+                transparent_output_count: 10,
+                blocks_with_transparent_inputs: 0,
+                blocks_with_transparent_outputs: 10,
+                max_raw_block_bytes_per_block: 140,
+                max_transactions_per_block: 1,
+                max_transparent_inputs_per_block: 0,
+                max_transparent_outputs_per_block: 1,
+            },
+            segment_count: 1,
+        }
+    }
+
+    fn sample_postgres_server_settings() -> super::PostgresServerSettings {
+        super::PostgresServerSettings {
+            server_version: "18.7".to_owned(),
+            server_version_number: 180_007,
+            max_connections: 100,
+            shared_buffers_bytes: 128 * 1024 * 1024,
+            effective_cache_size_bytes: 512 * 1024 * 1024,
+            maintenance_work_mem_bytes: 64 * 1024 * 1024,
+            work_mem_bytes: 4 * 1024 * 1024,
+            max_wal_size_bytes: 1024 * 1024 * 1024,
+            min_wal_size_bytes: 80 * 1024 * 1024,
+            checkpoint_timeout_seconds: 300,
+            checkpoint_completion_target: 0.9,
+            wal_compression: "off".to_owned(),
+            password_encryption_default: "scram-sha-256".to_owned(),
+            max_worker_processes: 8,
+            max_parallel_workers: 8,
+            max_parallel_maintenance_workers: 2,
+            track_io_timing: false,
+            huge_pages: "try".to_owned(),
+            fsync: true,
+            full_page_writes: true,
+            synchronous_commit: "on".to_owned(),
+            wal_level: "replica".to_owned(),
+            data_checksums: true,
+        }
+    }
+
+    fn sample_postgres_segmented_run() -> crate::postgres_segmented::PostgresSegmentedRunReport {
+        use crate::postgres_segmented::{
+            PostgresSegmentedBuildTimings, PostgresSegmentedRunReport,
+            reader::ReaderConnectionMode,
+            tip_follow::{LatencyPercentilesMillis, TipFollowRunMetrics},
+        };
+        PostgresSegmentedRunReport {
+            schema_name: "zinder_bench_segmented".to_owned(),
+            schema_version: 2,
+            network: zinder_core::Network::ZcashRegtest,
+            full_blocks: false,
+            max_segment_bytes: 256 * 1024 * 1024,
+            settled_segment_blocks: 4,
+            live_tail_max_blocks: 3,
+            reader_mode: ReaderConnectionMode::Direct,
+            concurrent_readers: 2,
+            mempool_churn_txs_per_block: 4,
+            bulk_block_count: 6,
+            tip_follow_block_count: 4,
+            total_block_count: 10,
+            first_height: zinder_core::BlockHeight::new(1),
+            tip_height: zinder_core::BlockHeight::new(10),
+            tip_hash: zinder_core::BlockHash::from_bytes([0x11; 32]),
+            persisted_sequence_digest_hex: "22".repeat(32),
+            settled_blocks_verified: 8,
+            live_tail_blocks_verified: 2,
+            raw_blocks_verified: 0,
+            server_settings: sample_postgres_server_settings(),
+            timings: PostgresSegmentedBuildTimings {
+                wall_clock_seconds: 2.0,
+                prepare_seconds: 0.2,
+                tip_prepare_seconds: 0.05,
+                schema_create_seconds: 0.0,
+                wallet_projection_seconds: 0.0,
+                seal_seconds: 0.2,
+                bulk_copy_seconds: 0.3,
+                finalize_seconds: 0.3,
+                uncontended_tip_follow_seconds: 0.4,
+                contended_tip_follow_seconds: 0.4,
+                fresh_validation_seconds: 0.1,
+                footprint_measurement_seconds: 0.1,
+            },
+            tip_follow: TipFollowRunMetrics {
+                uncontended_commit_latencies_ms: LatencyPercentilesMillis::from_samples(&[
+                    5.0, 6.0,
+                ]),
+                contended_commit_latencies_ms: LatencyPercentilesMillis::from_samples(&[7.0, 9.0]),
+                tail_seal_transitions: 1,
+                mempool_admits: 16,
+                mempool_evictions: 8,
+                max_segment_bytes_observed: 4096,
+            },
+            reader_workload: sample_postgres_segmented_reader_workload(),
+            reader_latencies_ms: LatencyPercentilesMillis::from_samples(&[2.0, 3.0]),
+            footprint: sample_postgres_segmented_footprint(),
+        }
+    }
+
+    fn sample_postgres_segmented_reader_workload()
+    -> crate::postgres_segmented::reader::ConcurrentReaderSummary {
+        crate::postgres_segmented::reader::ConcurrentReaderSummary {
+            ready_workers: 2,
+            overlapping_workers: 2,
+            completed_transactions: 12,
+            settled_range_reads: 12,
+            blocks_decoded: 48,
+            bytes_fetched: 24_000,
+            per_reader_blocks_per_second_mean: 60.0,
+            per_reader_bytes_per_second_mean: 30_000.0,
+            aggregate_blocks_per_second: 120.0,
+            aggregate_bytes_per_second: 60_000.0,
+            tx_latencies_ms: vec![2.0, 3.0],
+            per_reader_stats: Vec::new(),
+        }
+    }
+
+    fn sample_postgres_segmented_footprint()
+    -> crate::postgres_segmented::storage_footprint::StorageFootprintSummary {
+        crate::postgres_segmented::storage_footprint::StorageFootprintSummary {
+            canonical_storage_bytes: 80_000,
+            wallet_storage_bytes: 16_000,
+            total_storage_bytes: 96_000,
+            total_heap_bytes: 40_000,
+            total_toast_bytes: 24_000,
+            total_index_bytes: 32_000,
+            bulk_wal_bytes: 50_000,
+            tip_follow_wal_bytes: 20_000,
+            settled_shielded_segments: 2,
+            settled_supplement_segments: 2,
+            settled_raw_block_segments: 0,
+            max_segment_byte_len: 4_096,
+            live_tail_rows: 2,
+            relations: Vec::new(),
+        }
+    }
+
+    fn sample_postgres_segmented_inputs() -> super::PostgresSegmentedReportInputs {
+        super::PostgresSegmentedReportInputs {
+            run: sample_postgres_segmented_run(),
+            baseline: Some(super::PostgresSegmentedBaselineInput {
+                build_seconds: Some(1.0),
+                storage_bytes: Some(100_000),
+                streaming_blocks_per_second: Some(80.0),
+                network: "zcash-regtest".to_owned(),
+                first_height: 1,
+                tip_height: 10,
+                block_count: 10,
+                sequence_digest_sha256: "22".repeat(32),
+                full_blocks: false,
+                includes_wallet_projection: true,
+            }),
+            runtime_evidence: super::PostgresSegmentedRuntimeEvidence {
+                database_image_reference: None,
+                pooler_image_reference: None,
+                client_cpu_limit_cores: None,
+                client_memory_limit_bytes: None,
+                database_cpu_limit_cores: None,
+                database_memory_limit_bytes: None,
+                pooler_cpu_limit_cores: None,
+                pooler_memory_limit_bytes: None,
+            },
+            benchmark_client_peak_rss: crate::rss::PeakRss {
+                bytes: Some(1_048_576),
+                source: "proc_status_vmhwm",
+            },
+            software_revision: None,
+            trial_id: None,
+            fixture_cache_policy: None,
+            run_started_at_unix_millis: 1_700_000_000_000,
+            run_completed_at_unix_millis: 1_700_000_002_000,
+            runner_id: None,
+            cpu_limit_cores: None,
+            memory_limit_bytes: None,
+            storage_class: None,
+            image_reference: None,
         }
     }
 }

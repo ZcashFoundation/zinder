@@ -6,8 +6,117 @@ fail() {
   exit 1
 }
 
+validate_segmented_report() {
+  local report_path="$1"
+  [[ -f "$report_path" ]] || fail "segmented report does not exist: $report_path"
+  jq -e '
+    def lowercase_sha256: type == "string" and test("^[0-9a-f]{64}$");
+    def close_to($actual; $expected):
+      (($actual - $expected) | fabs)
+      <= ([($actual | fabs), ($expected | fabs), 1] | max) * 0.000000001;
+    .contract_identity == "benchmark-report"
+    and .measurement_kind == "postgres-segmented-storage"
+    and .report_format_version == 1
+    and .storage_candidate.id == "postgres-segmented-storage"
+    and .storage_candidate.canonical_engine == "postgres"
+    and .storage_candidate.topology == "postgres-segmented"
+    and .fixture.contract_identity == "canonical-fixture"
+    and .fixture.fixture_format_version == 1
+    and (.fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256 | lowercase_sha256)
+    and .server_settings.fsync == true
+    and .server_settings.full_page_writes == true
+    and .server_settings.synchronous_commit == "on"
+    and (.server_settings.wal_level == "replica" or .server_settings.wal_level == "logical")
+    and .configuration.schema_version == 2
+    and (.configuration.max_segment_bytes > 0 and .configuration.max_segment_bytes <= 268435456)
+    and .configuration.total_block_count == .fixture.block_count
+    and (.configuration.bulk_block_count + .configuration.tip_follow_block_count) == .configuration.total_block_count
+    and (.validation.persisted_sequence_digest_hex | lowercase_sha256)
+    and (.validation.persisted_sequence_digest_hex == .fixture.canonical_block_facts_digest_evidence.sequence_digest_sha256)
+    and .validation.fixture_sequence_digest_match == true
+    and .validation.fresh_reader_validated == true
+    and .validation.first_height == .fixture.from_height
+    and .validation.tip_height == .fixture.to_height
+    and .validation.tip_hash_hex == .fixture.tip_hash_hex
+    and (.footprint.max_segment_byte_len <= .configuration.max_segment_bytes)
+    and (.footprint.live_tail_rows <= .configuration.live_tail_max_blocks)
+    and (.footprint.canonical_storage_bytes + .footprint.wallet_storage_bytes) == .footprint.total_storage_bytes
+    and (.timings.wall_clock_seconds | type == "number" and . >= 0)
+    and (.timings.prepare_seconds | type == "number" and . >= 0)
+    and (.timings.tip_prepare_seconds | type == "number" and . >= 0)
+    and (.timings.schema_create_seconds | type == "number" and . >= 0)
+    and (.timings.wallet_projection_seconds | type == "number" and . >= 0)
+    and (.timings.seal_seconds | type == "number" and . >= 0)
+    and (.timings.bulk_copy_seconds | type == "number" and . >= 0)
+    and (.timings.finalize_seconds | type == "number" and . >= 0)
+    and (.timings.bulk_build_seconds | type == "number" and . >= 0)
+    and close_to(
+      .timings.bulk_build_seconds;
+      (.timings.prepare_seconds
+        + .timings.schema_create_seconds
+        + .timings.wallet_projection_seconds
+        + .timings.seal_seconds
+        + .timings.bulk_copy_seconds
+        + .timings.finalize_seconds)
+    )
+    and (if .configuration.tip_follow_block_count == 0 then .timings.tip_prepare_seconds == 0 else true end)
+    and (.timings.streaming_blocks_per_second | type == "number" and . >= 0)
+    and (.reader_workload.ready_workers | type == "number" and . >= 0)
+    and (.reader_workload.ready_workers <= .configuration.concurrent_readers)
+    and (.reader_workload.overlapping_workers | type == "number" and . >= 0)
+    and (.reader_workload.overlapping_workers <= .reader_workload.ready_workers)
+    and (.reader_workload.per_reader_blocks_per_second_mean | type == "number" and . >= 0)
+    and (.reader_workload.per_reader_bytes_per_second_mean | type == "number" and . >= 0)
+    and (.tip_follow.uncontended_commit_latencies_ms.sample_count | type == "number" and . >= 0)
+    and (.tip_follow.contended_commit_latencies_ms.sample_count | type == "number" and . >= 0)
+    and (.tip_follow.uncontended_commit_latencies_ms.max_ms | type == "number" and . >= 0)
+    and (.tip_follow.contended_commit_latencies_ms.max_ms | type == "number" and . >= 0)
+    and (if .adr0004_gate_evaluation.tip_commit_latency_under_2s == true then .tip_follow.uncontended_commit_latencies_ms.sample_count > 0 and .tip_follow.contended_commit_latencies_ms.sample_count > 0 and .tip_follow.uncontended_commit_latencies_ms.max_ms < 2000 and .tip_follow.contended_commit_latencies_ms.max_ms < 2000 else true end)
+    and (if .configuration.concurrent_readers > 0 then .reader_workload.ready_workers == .configuration.concurrent_readers and .reader_workload.overlapping_workers == .configuration.concurrent_readers and .reader_workload.completed_transactions > 0 and .reader_workload.per_reader_blocks_per_second_mean > 0 else true end)
+    and (if .adr0004_gate_evaluation.build_time_ratio_vs_rocksdb != null or .adr0004_gate_evaluation.build_time_gate_passed != null then .configuration.tip_follow_block_count == 0 and .configuration.bulk_block_count == .configuration.total_block_count else true end)
+    and (
+      if (.provenance.runner.cpu_limit_cores != null or .runtime_evidence.client_cpu_limit_cores != null or .runtime_evidence.database_cpu_limit_cores != null or .runtime_evidence.pooler_cpu_limit_cores != null) then
+        (.provenance.runner.cpu_limit_cores | type == "number" and . > 0)
+        and (.runtime_evidence.client_cpu_limit_cores | type == "number" and . > 0)
+        and (.runtime_evidence.database_cpu_limit_cores | type == "number" and . > 0)
+        and (if .configuration.reader_mode == "pgbouncer-transaction" then
+              (.runtime_evidence.pooler_cpu_limit_cores | type == "number" and . > 0)
+              and (((.runtime_evidence.client_cpu_limit_cores + .runtime_evidence.database_cpu_limit_cores + .runtime_evidence.pooler_cpu_limit_cores) - .provenance.runner.cpu_limit_cores) | fabs <= 0.000001)
+            else
+              .runtime_evidence.pooler_cpu_limit_cores == null
+              and (((.runtime_evidence.client_cpu_limit_cores + .runtime_evidence.database_cpu_limit_cores) - .provenance.runner.cpu_limit_cores) | fabs <= 0.000001)
+            end)
+      else true end
+    )
+    and (
+      if (.provenance.runner.memory_limit_bytes != null or .runtime_evidence.client_memory_limit_bytes != null or .runtime_evidence.database_memory_limit_bytes != null or .runtime_evidence.pooler_memory_limit_bytes != null) then
+        (.provenance.runner.memory_limit_bytes | type == "number" and . > 0)
+        and (.runtime_evidence.client_memory_limit_bytes | type == "number" and . > 0)
+        and (.runtime_evidence.database_memory_limit_bytes | type == "number" and . > 0)
+        and (if .configuration.reader_mode == "pgbouncer-transaction" then
+              (.runtime_evidence.pooler_memory_limit_bytes | type == "number" and . > 0)
+              and (.runtime_evidence.client_memory_limit_bytes + .runtime_evidence.database_memory_limit_bytes + .runtime_evidence.pooler_memory_limit_bytes) == .provenance.runner.memory_limit_bytes
+            else
+              .runtime_evidence.pooler_memory_limit_bytes == null
+              and (.runtime_evidence.client_memory_limit_bytes + .runtime_evidence.database_memory_limit_bytes) == .provenance.runner.memory_limit_bytes
+            end)
+      else true end
+    )
+    and .adr0004_gate_evaluation.max_segment_bytes_respected == true
+    and .adr0004_gate_evaluation.live_tail_bounded == true
+    and .adr0004_gate_evaluation.concurrent_readers_zero_errors == true
+  ' "$report_path" >/dev/null || fail "postgres-segmented-storage report contract validation failed: $report_path"
+  cat "$report_path"
+}
+
+if [[ "$#" -eq 2 && "$1" == "--segmented-report" ]]; then
+  command -v jq >/dev/null 2>&1 || fail "jq is required"
+  validate_segmented_report "$2"
+  exit 0
+fi
+
 if [[ "$#" -ne 1 ]]; then
-  echo >&2 "usage: $0 CAMPAIGN_LEDGER.tsv"
+  echo >&2 "usage: $0 CAMPAIGN_LEDGER.tsv | $0 --segmented-report SEGMENTED_REPORT.json"
   exit 2
 fi
 command -v jq >/dev/null 2>&1 || fail "jq is required"

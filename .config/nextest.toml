@@ -143,7 +143,7 @@ junit = { path = "target/nextest/perf.xml" }
 # a fresh disposable PostgreSQL database. CI supplies that database and runs
 # this profile with --run-ignored=all.
 [profile.ci-postgres]
-default-filter = "test(/^integration::postgres_canonical_replay::/)"
+default-filter = "test(/^integration::postgres_canonical_replay::/) | test(/^integration::postgres_segmented::/)"
 slow-timeout = { period = "60s", terminate-after = 1 }
 junit = { path = "target/nextest/postgres.xml" }
 

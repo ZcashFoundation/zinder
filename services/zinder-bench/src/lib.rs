@@ -17,6 +17,7 @@ pub mod capture;
 pub mod error;
 pub mod fixture;
 pub mod metrics_scrape;
+pub mod postgres_segmented;
 pub mod recorder;
 pub mod report;
 pub mod rss;
