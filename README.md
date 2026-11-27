@@ -29,10 +29,17 @@ flowchart LR
 
 ## Quickstart
 
-Start Zinder on Testnet with Docker Compose (requires an archive node URL in `deploy/.env.testnet` or environment variables; zero TOML config files needed):
+Start Zinder on Testnet with Docker Compose (requires an archive node URL in `deploy/.env.testnet`, control token files in `${ZINDER_CONTROL_SECRETS_DIR}`, and an initialized history directory via `scripts/prepare-shielded-history.sh`; zero TOML config files needed):
 
 ```bash
-docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml up -d
+export ZINDER_CONTROL_SECRETS_DIR=/etc/zinder/control-secrets
+sudo install -d -m 0755 "$ZINDER_CONTROL_SECRETS_DIR"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee "$ZINDER_CONTROL_SECRETS_DIR/ingest.token" >/dev/null
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee "$ZINDER_CONTROL_SECRETS_DIR/checkpoint.token" >/dev/null
+sudo install -d -m 0700 /srv/zinder-history/testnet
+sudo ./scripts/prepare-shielded-history.sh /srv/zinder-history/testnet/key-1
+docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml \
+  --profile history-publisher up -d
 ```
 
 Or run the unified `zinder` CLI directly against an existing store or node:

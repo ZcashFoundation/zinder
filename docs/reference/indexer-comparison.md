@@ -368,7 +368,7 @@ The tables reflect Zinder `0.26.0` (`f40fa20`, reviewed 2026-11-26) alongside Go
 
 [^zinder-pinned]: A pinned chain view stays readable for one minute after a newer epoch replaces it ([wallet_serving_pair_publisher.rs](../../services/zinder-query/src/wallet_serving_pair_publisher.rs#L92-L100)).
 
-[^zinder-explorer]: Core canonical explorer RPCs (`BlockProductionSeries`, `BlockProductionInTimeRange`, `BlockTransactions`, `CommitmentRootSearch`, `DisplacedBlockHistory`, `DisplacedBlockDetail`) read `RocksDbCanonicalSecondary` directly; full aggregate/search views and Cipherscan REST compat run automatically under `zinder serve --preset explorer` (which enables `ingest.explorer_views = true`; [explorer-plane.md](../architecture/explorer-plane.md#turn-it-on)).
+[^zinder-explorer]: Canonical-only displaced-block RPCs (`DisplacedBlockHistory`, `DisplacedBlockDetail`) read `RocksDbCanonicalSecondary` directly once canonical ingest is `READY`; `BlockDetail`, `BlockProductionSeries`, `BlockProductionInTimeRange`, `BlockTransactions`, `CommitmentRootSearch`, fee/flow/ranking analytics, and Cipherscan REST compat additionally require `ingest.explorer_views = true` (qualified by catch-up and backfill coverage) and/or `WalletQuery` under `zinder serve --preset explorer` ([explorer-plane.md](../architecture/explorer-plane.md#turn-it-on)).
 
 [^ztr-replicator]: Replicator gRPC on the lightwalletd gRPC listener plus `export-snapshot` ([launcher.rs](https://github.com/zcashlabs/ztreamer/blob/498258159d868d5592ff44c75e9b311353d51e35/crates/daemon/src/launcher.rs#L183-L192), [replicate.proto](https://github.com/zcashlabs/ztreamer/blob/498258159d868d5592ff44c75e9b311353d51e35/crates/protocol/proto/ztreamer/replicate.proto#L9-L16)).
 

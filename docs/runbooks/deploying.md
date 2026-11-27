@@ -14,10 +14,10 @@ Select the preset (`--preset <light-wallet|wallet|explorer>` on `zinder serve` /
 | --- | --- | --- | --- | --- |
 | **`wallet`** *(recommended production default)* | `zinder-ingest`, `zinder-projector`, optional `zinder-history-publisher`, `zinder-query`, `zinder-compat-lightwalletd` | ~123 GB | ~76 min | Local transparent index (`wallet` store); verified mined transaction bodies forwarded from your primary `[node]` and cached. |
 | **`light-wallet`** (`lightwalletd`) | `zinder-ingest`, `zinder-compat-lightwalletd` (plus optional `zinder-history-publisher`) | ~72 GB | ~49–60 min | No projector or `zinder-query`. Forwards transparent address reads and omitted transaction bodies to one archive node with transparent address indexes. |
-| **`explorer`** | Everything in `wallet`, plus `ingest.explorer_views = true`, `zinder-explorer`, and `zinder-compat-cipherscan` | Additional view disk & build time | ~76+ min + view backfill | Core canonical explorer RPCs read `RocksDbCanonicalSecondary` directly once canonical ingest reaches READY; `explorer_views` adds search, fee, flow, and ranking views, and `zinder-compat-cipherscan` serves Cipherscan REST compatibility. |
+| **`explorer`** | Everything in `wallet`, plus `ingest.explorer_views = true`, `zinder-explorer`, and `zinder-compat-cipherscan` | Additional view disk & build time | ~76+ min + view backfill | Canonical-only displaced-block RPCs (`DisplacedBlockHistory`, `DisplacedBlockDetail`) read `RocksDbCanonicalSecondary` once canonical ingest is READY; `BlockDetail`, block-production, `BlockTransactions`, `CommitmentRootSearch`, fee/flow/ranking analytics, and Cipherscan routes additionally require `explorer_views` catch-up/backfill coverage and/or `WalletQuery`. |
 | **Add `--full-blocks`** (`storage.full_blocks = true`) | Combinable with any preset above | Adds ~251+ GiB raw block & tx blobs | Same + raw blob I/O | Sets `raw_blob_policy = "all"` to retain full serialized blocks and raw transaction bytes locally (`FullBlocksInRange` + local tx bodies). |
 
-If you are carrying forward an existing pre-profile store built with `raw_blob_policy = "transactions"` (+~251.1 GiB, no raw block blobs), leave `ZINDER_DEPLOYMENT__PROFILE` unset and set `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions` (or rebuild on fresh storage under `--preset wallet`). See [Deployment profiles](../reference/configuration.md#deployment-profiles) for setting conflicts and [ADR-0023](../adrs/0023-deployment-profiles.md) for the design contract.
+If you are carrying forward an existing pre-profile store built with `raw_blob_policy = "transactions"` (+~251.1 GiB, no raw block blobs), run standalone `zinder serve` / `zinder index` (or override `deploy/docker-compose.yml`'s `command` and clear `ZINDER_DEPLOYMENT__PROFILE` in a Compose override) with `--preset` / `ZINDER_DEPLOYMENT__PROFILE` **unset** and `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions`, or rebuild on fresh storage under `--preset wallet`. Default `deploy/docker-compose.yml` always passes `--preset` (`wallet` by default), which refuses `transactions`-only stores. See [Deployment profiles](../reference/configuration.md#deployment-profiles) for setting conflicts and [ADR-0023](../adrs/0023-deployment-profiles.md) for the design contract.
 
 <a id="choose-a-deployment"></a>
 
@@ -113,26 +113,36 @@ This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](h
    git checkout vX.Y.Z
    ```
 
-3. Pull the signed release image for your tag and start Zinder (select `--preset` via `ZINDER_PRESET=light-wallet|wallet|explorer`, defaulting to `wallet`; keep `--no-build` so Compose uses the published image; add `--profile observability` to also start Prometheus on `19095` and Grafana on `13002`):
+3. Provision the required host control tokens (`ingest.token` and `checkpoint.token`) and the required Testnet shielded-history generation (`scripts/prepare-shielded-history.sh`, because `zinder-serve` mounts `publisher.pub` and `catalog/` with `create_host_path: false` and needs `--profile history-publisher` when starting with an empty catalog):
+
+   ```bash
+   sudo install -d -m 0755 /etc/zinder/control-secrets
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
+   sudo install -d -m 0700 /srv/zinder-history/testnet
+   sudo ./scripts/prepare-shielded-history.sh /srv/zinder-history/testnet/key-1
+   ```
+
+4. Pull the signed release image for your tag and start Zinder with `--profile history-publisher` (select `--preset` via `ZINDER_PRESET=light-wallet|wallet|explorer`, defaulting to `wallet`; keep `--no-build` so Compose uses the published image; add `--profile observability` to also start Prometheus on `19095` and Grafana on `13002`):
 
    ```bash
    export ZINDER_VERSION=vX.Y.Z
    docker compose --env-file deploy/.env.testnet \
-     -f deploy/docker-compose.yml pull
+     -f deploy/docker-compose.yml --profile history-publisher pull
    docker compose --env-file deploy/.env.testnet \
-     -f deploy/docker-compose.yml up -d --no-build
+     -f deploy/docker-compose.yml --profile history-publisher up -d --no-build
    ```
 
-   Compose runs `state-init` (setting `/var/lib/zinder` ownership to `10001:10001`), starts `zinder-index`, and starts `zinder-serve --readers-only` sharing its volume and network namespace.
+   Compose runs `state-init` (setting `/var/lib/zinder` ownership to `10001:10001` while keeping `/var/lib/zinder/canonical` and `/var/lib/zinder/wallet` absent until writers publish them), starts `zinder-index`, starts `zinder-serve --readers-only` sharing its volume and network namespace, and runs `zinder-history-publisher` to seal initial settled segments.
 
-4. Check `/healthz` and `/readyz` on `zinder-index` and `zinder-serve` (`{"status":"ready",...}` once serving, or HTTP 503 while syncing):
+5. Check `/healthz` and `/readyz` on `zinder-index` and `zinder-serve` (`{"status":"ready",...}` once serving, or HTTP 503 while syncing):
 
    ```bash
    curl -fsS http://127.0.0.1:19105/readyz   # zinder-index (ingest + projector)
    curl -fsS http://127.0.0.1:19108/readyz   # zinder-serve (readers)
    ```
 
-5. Verify one native RPC and one lightwalletd RPC:
+6. Verify one native RPC and one lightwalletd RPC:
 
    ```bash
    grpcurl -plaintext -d '{}' 127.0.0.1:19102 \

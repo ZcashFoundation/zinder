@@ -41,17 +41,21 @@ or wallet schema needs a new fixture, built by that release.
 - Use a workstation with `gcloud`, `jq`, Python 3, Docker, `curl`, and
   `zstd`, and access to the fixture project.
 - Have the fixture's `fixture.json`.
-- Have Zinder release binaries for the release you will serve with. When the
-  fixture pins binaries in `verified_with_release.binaries`, use matching
-  role executables (for unified `bin/zinder` releases, invoke via
-  `zinder run <role>` or extract workspace binaries matching the fixture
-  manifest); otherwise the `release-binaries` target of
-  `deploy/Dockerfile` produces the release binary artifact:
+- Have Zinder role binaries for the release you will serve with. When the
+  fixture pins binaries in `verified_with_release.binaries`, use exact
+  executables matching those recorded SHA-256 digests. Because
+  `scripts/mainnet-fixture/build-stage.sh` and the guest runner currently
+  require the five named role executables (`zinder-ingest`, `zinder-projector`,
+  `zinder-query`, `zinder-compat-lightwalletd`, `zinder-explorer`) rather than
+  invoking `zinder run <role>`, build them directly from source when staging an
+  unpinned checkout until the staging harness adopts the unified binary:
 
   ```bash
-  docker buildx build -f deploy/Dockerfile --target release-binaries \
-    --build-arg ZINDER_BUILD_GIT_COMMIT="$(git rev-parse HEAD)" \
-    --platform linux/amd64 --output type=local,dest=.tmp/release-binaries .
+  cargo build --release --locked \
+    -p zinder-ingest -p zinder-projector -p zinder-query \
+    -p zinder-compat-lightwalletd -p zinder-explorer
+  scripts/mainnet-fixture/build-stage.sh --binaries target/release \
+    --out .tmp/zfx-stage.tar.zst
   ```
 
 - Have a private bucket for the stage tarball. Fixture hosts have no

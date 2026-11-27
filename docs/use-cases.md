@@ -13,7 +13,7 @@ In every pattern, Zinder serves public chain data from your configured node. Key
 | Native wallet or backend | `WalletQuery` on `zinder-query`, or `zinder-client` | Yes | Multi-call epoch-pinned reads, typed retries, capability checks |
 | Payment or deposit tracker | `ChainEvents` + transparent queries on `zinder-query` | Yes | Resumable reorg-aware cursor + outpoint spend checks |
 | Faucet or transaction sender | `BroadcastTransaction` + `Transaction` on `zinder-query` | Yes | Typed broadcast verdicts with multi-node failover |
-| Block explorer | `ExplorerQuery` on `zinder-explorer` (plus optional `zinder-compat-cipherscan`) | Optional (`--preset explorer`) | Block/tx/address queries from canonical store; search, fees, mempool, and pools with optional views |
+| Block explorer | `ExplorerQuery` on `zinder-explorer` (plus optional `zinder-compat-cipherscan`) | Optional (`--preset explorer`) | Displaced-block queries from canonical store; `BlockDetail`, block production, `BlockTransactions`, search, fee/pool/address views, and mempool with materialized views and `WalletQuery` |
 | Multi-product operator | All of the above | Explorer optional | Several products sharing one canonical index |
 
 ## Light wallets
@@ -62,7 +62,7 @@ Block templates and mined-block submission stay on the node; miners and mining f
 
 ## Block explorers
 
-Run with `--preset explorer` (or set `deployment.profile = "explorer"`) to start `zinder-explorer` and `zinder-compat-cipherscan` alongside the wallet plane. Core block, transaction, address history, address UTXO, and network statistics RPCs read `RocksDbCanonicalSecondary` directly without materialized views, while `explorer_views` (enabled automatically by the `explorer` preset) adds rebuildable views for commitment-root search, block production, and mempool analytics:
+Run with `--preset explorer` (or set `deployment.profile = "explorer"`) to start `zinder-explorer` and `zinder-compat-cipherscan` alongside the wallet plane. Canonical-only displaced-block RPCs (`DisplacedBlockHistory`, `DisplacedBlockDetail`) read `RocksDbCanonicalSecondary` directly once canonical ingest is `READY`, while `BlockDetail`, block-production queries, `BlockTransactions`, `CommitmentRootSearch`, fee/flow/ranking analytics, and mempool/search endpoints require `explorer_views` (enabled automatically by `--preset explorer`) qualified by catch-up/backfill coverage and/or `WalletQuery`:
 
 - Explorer views live in a separate, rebuildable store and never block wallet serving.
 - Shielded addresses return a typed privacy refusal; the Explorer never scans shielded data.

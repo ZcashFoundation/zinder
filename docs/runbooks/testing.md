@@ -1303,8 +1303,7 @@ scripts/regtest-fixture.py down --project zinder-fixture-review-a
 
 Choose an unused project name and port range for each run. Ports are loopback
 only: base + 32 is node RPC, + 2 is native WalletQuery, + 67 is lightwalletd,
-and + 5, + 10, + 6, and + 7 are the ingest, projector, query, and compat ops
-listeners. Each project owns distinct internal Compose networks and volumes. The node's
+and + 5 and + 8 are the `zinder-index` and `zinder-serve` ops listeners. Each project owns distinct internal Compose networks and volumes. The node's
 peer listener binds container loopback; it has no published peer port. An owned
 Python TCP relay exposes only the selected loopback ports while containers
 retain internal networks without an outbound default route. Readiness verifies
@@ -1328,15 +1327,16 @@ funding and lifecycle transactions.
 
 Pass `--raw-blob-policy all` for Zallet full-block serving. Every canonical
 reader receives the same retention admission expectation. Use a new fixture
-when changing retention. To test built or extracted release executables with
-existing runtime images, add `--bin-dir /absolute/candidate/bin`; the command
-mounts the four named executables and records their SHA256 values. All four
-running `/healthz` revisions must equal `--revision`, including this mode.
+when changing retention. To test a built or extracted unified `bin/zinder`
+executable with an existing runtime image, add `--bin-dir /absolute/candidate/bin`;
+the command mounts `/usr/local/bin/zinder` into both `zinder-index` and
+`zinder-serve` and records its SHA256 value. Both running `/healthz` revisions
+must equal `--revision`, including this mode.
 This check establishes executable identity, not release signature provenance.
 Verify downloaded archives or images through the release workflow separately.
 
-The command prints the absolute `ready.json` path only after all four `/readyz`
-responses reach the node tip. The receipt includes the actual node activation
+The command prints the absolute `ready.json` path only after both `zinder-index`
+and `zinder-serve` `/readyz` responses reach the node tip. The receipt includes the actual node activation
 map, complete health capabilities and versions, candidate commit, image IDs,
 optional binary hashes, endpoints, retention, chain hash, and observation time.
 `mine` and `status` refresh it; a failed refresh removes stale readiness.

@@ -109,7 +109,7 @@ The probe sends one HTTP/1.1 `GET` and exits 0 only when the endpoint answers 20
 - The whole probe takes at most 3 seconds, below the 5-second timeout of the
   image and Compose healthchecks.
 
-In `deploy/docker-compose.yml`, `zinder-index` binds `:9105` (probing `/healthz`) and `zinder-serve` binds `:9108` (probing `/readyz`). The single OCI image sets `HEALTHCHECK ... CMD ["/usr/local/bin/zinder", "healthcheck"]` for `/healthz`, while Kubernetes readiness probes query `/readyz` on `:9108` (see [Deploying the single-volume container](../runbooks/deploying-single-volume.md)).
+In `deploy/docker-compose.yml`, `zinder-index` (`:9105`) and `zinder-serve` (`:9108`) both run `zinder healthcheck` without `--ready`, probing `/healthz` liveness so Docker can keep containers marked healthy while initial construction and catch-up run. Always check readiness separately via `/readyz` (`http://127.0.0.1:9108/readyz`, `zinder healthcheck --ready --addr 127.0.0.1:9108`, or `grpc.health.v1.Health`) before routing client traffic. The single OCI image sets `HEALTHCHECK ... CMD ["/usr/local/bin/zinder", "healthcheck"]` for `/healthz`, while Kubernetes readiness probes query `/readyz` on `:9108` (see [Deploying the single-volume container](../runbooks/deploying-single-volume.md)).
 
 ## gRPC health
 
