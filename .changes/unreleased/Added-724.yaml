@@ -1,0 +1,6 @@
+kind: added
+body: Serve both wallet gRPC interfaces through a Tor v3 onion service with the reference Compose profile. The runbook covers private home-server access and the metadata each RPC reveals.
+time: 2026-11-27T22:47:25.964848288Z
+custom:
+    Bump: patch
+    PR: "724"
