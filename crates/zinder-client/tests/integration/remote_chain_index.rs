@@ -1239,3 +1239,54 @@ where
 
     Ok(format!("http://{addr}"))
 }
+
+#[tokio::test]
+async fn wallet_scan_extensions_require_exact_capabilities_on_older_endpoints() -> eyre::Result<()>
+{
+    let endpoint =
+        spawn_malformed_event_service::<wallet::ChainEventsRequest, wallet::ChainEventEnvelope>(
+            "/zinder.v1.wallet.WalletQuery/ChainEvents",
+            Vec::new(),
+            WalletRevision::Reported(15),
+        )
+        .await?;
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    let descending =
+        zinder_client::CompactRangeQuery::new(BlockHeight::new(2), BlockHeight::new(1));
+    let address = TransparentAddressScriptHash::from_bytes([0x51; 32]);
+    let failures = [
+        (
+            index.scan_compact_blocks(descending.clone()).await.err(),
+            Capability::CompactBlockScan,
+        ),
+        (
+            index.scan_compact_nullifiers(descending).await.err(),
+            Capability::CompactNullifierRange,
+        ),
+        (
+            index
+                .transparent_address_balances(&[address], None)
+                .await
+                .err(),
+            Capability::TransparentAddressBalances,
+        ),
+        (
+            index
+                .transparent_addresses_unspent_outputs(&[address], BlockHeight::new(1), None)
+                .await
+                .err(),
+            Capability::TransparentAddressesUnspentOutputs,
+        ),
+        (index.standard_fee().await.err(), Capability::StandardFee),
+    ];
+    for (failure, capability) in failures {
+        assert!(
+            matches!(failure, Some(IndexerError::FailedPrecondition { reason })
+            if reason.ends_with(capability.as_str()))
+        );
+    }
+    Ok(())
+}

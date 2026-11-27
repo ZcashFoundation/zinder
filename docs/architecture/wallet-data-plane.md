@@ -76,7 +76,7 @@ Use `CompactNullifiersInRange` for spend detection without downloading note comm
 
 Canonical history never contains height 0. A complete store retains blocks from height 1.
 
-`zinder-client` validates the range stream. It fails with `IndexerError::MalformedResponse` when the server sends a block before the header, a second header, no header, a header for another network or another pinned epoch, a skipped, repeated, or extra height, a short stream, or a block above the header's visible tip. The client requires contract revision 8 or later and refuses an older server.
+`zinder-client` validates the range stream. It fails with `IndexerError::MalformedResponse` when the server sends a block before the header, a second header, no header, a header for another network or another pinned epoch, a skipped, repeated, or extra height, a short stream, or a block above the header's visible tip. The client requires contract revision 8 or later. Use `ChainSnapshot::scan_compact_blocks` to select pools or scan descending, and `ChainSnapshot::scan_compact_nullifiers` for spends. The remote SDK checks the endpoint's exact capability before it requests either extension.
 
 ## Full blocks
 

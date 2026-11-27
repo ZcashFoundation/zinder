@@ -2606,3 +2606,37 @@ impl ingest::canonical_control_server::CanonicalControl for BalanceWriterStatus 
         Err(Status::unimplemented("fixture only serves writer status"))
     }
 }
+
+#[test]
+fn query_config_resolves_and_prints_bounded_epoch_pin_retention() -> eyre::Result<()> {
+    use zinder_query::runtime::{
+        QueryConfigOverrides, load_query_config_with_env, query_config_toml,
+    };
+
+    let load = |seconds: Option<&str>| {
+        let environment = [
+            ("ZINDER_NETWORK__NAME", "zcash-regtest"),
+            ("ZINDER_INGEST_CONTROL__ADDR", "http://127.0.0.1:9101"),
+        ]
+        .into_iter()
+        .chain(seconds.map(|seconds| ("ZINDER_QUERY__EPOCH_PIN_RETENTION_SECONDS", seconds)))
+        .map(|(key, setting)| (key.to_owned(), setting.to_owned()));
+        load_query_config_with_env(None, QueryConfigOverrides::default(), environment)
+    };
+
+    assert_eq!(load(None)?.epoch_pin_retention.seconds(), 60);
+    let configured = load(Some("180"))?;
+    assert_eq!(configured.epoch_pin_retention.seconds(), 180);
+    assert!(query_config_toml(&configured)?.contains("epoch_pin_retention_seconds = 180"));
+    for outside_bound in ["59", "301"] {
+        let error = load(Some(outside_bound))
+            .err()
+            .ok_or_else(|| eyre!("accepted an invalid retention"))?;
+        assert!(
+            error
+                .to_string()
+                .contains("query.epoch_pin_retention_seconds")
+        );
+    }
+    Ok(())
+}

@@ -173,3 +173,37 @@ async fn spawn_wallet_query() -> Result<(
     let client = WalletQueryClient::connect(format!("http://{server_addr}")).await?;
     Ok((client, (store_fixture, ingest_control_fixture)))
 }
+
+#[tokio::test]
+async fn address_batch_requests_are_refused_before_decoding_above_the_wire_bound() -> Result<()> {
+    let (mut client, _fixtures) = spawn_wallet_query().await?;
+    let addresses = vec![
+        wallet::AddressLookup::default();
+        2 * zinder_core::MAX_TRANSPARENT_ADDRESSES_PER_BATCH + 1
+    ];
+    let balance_refusal = client
+        .transparent_address_balances(wallet::TransparentAddressBalancesRequest {
+            addresses: addresses.clone(),
+            at_epoch_id: None,
+        })
+        .await
+        .err();
+    assert_refused_before_decoding(
+        balance_refusal.as_ref(),
+        "TransparentAddressBalances",
+        "addresses",
+    )?;
+    let output_refusal = client
+        .transparent_addresses_unspent_outputs(wallet::TransparentAddressesUnspentOutputsRequest {
+            addresses,
+            start_height: 1,
+            at_epoch_id: None,
+        })
+        .await
+        .err();
+    assert_refused_before_decoding(
+        output_refusal.as_ref(),
+        "TransparentAddressesUnspentOutputs",
+        "addresses",
+    )
+}
