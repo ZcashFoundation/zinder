@@ -280,6 +280,30 @@ git -C "$fixture_repository" rm -q .changes/unreleased/multiline-upgrade.yaml
 git -C "$fixture_repository" commit -qm "cleanup multiline Upgrade"
 clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
 
+# Unquoted flow-mapping key without space after colon must not satisfy Upgrade.
+cat > "$fixture_repository/.changes/unreleased/flow-unseparated-upgrade.yaml" <<'YAML'
+kind: fixed
+body: Put Upgrade without space after the colon inside a flow mapping.
+time: 2026-07-21T19:14:00Z
+custom: { Bump: patch, PR: "24", Upgrade:compatible }
+YAML
+git -C "$fixture_repository" add .changes/unreleased/flow-unseparated-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with Upgrade:compatible in flow mapping"
+flow_unseparated_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with Upgrade:compatible in flow mapping (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with Upgrade:compatible in flow mapping (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$flow_unseparated_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/flow-unseparated-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup flow-unseparated Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
 # projection-layout missing projection name must fail in both fragments and pr modes.
 cat > "$fixture_repository/.changes/unreleased/proj-no-name.yaml" <<'YAML'
 kind: changed

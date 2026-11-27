@@ -310,9 +310,14 @@ def parse_flow_mapping(lines, start_idx, first_rest):
         m = TOP_KEY_RE.match(entry)
         if not m:
             continue
-        k = unquote_key(m.group(1))
+        raw_key = m.group(1)
+        is_quoted_key = raw_key[0] in ("'", '"')
+        rest = m.group(2)
+        if not is_quoted_key and rest and rest[0] not in (" ", "\t"):
+            continue
+        k = unquote_key(raw_key)
         if k == "Upgrade":
-            v_raw = m.group(2).strip()
+            v_raw = rest.strip()
             if len(v_raw) >= 2 and v_raw[0] == "'" and v_raw[-1] == "'":
                 upgrade_values.append((v_raw[1:-1].replace("''", "'"), True))
             elif len(v_raw) >= 2 and v_raw[0] == '"' and v_raw[-1] == '"':
