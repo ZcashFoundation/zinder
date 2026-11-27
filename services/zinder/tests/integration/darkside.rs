@@ -18,7 +18,7 @@ use zinder_core::{
     },
 };
 use zinder_proto::compat::lightwalletd::{
-    BlockId, BlockRange, ChainSpec, CompactBlock, DarksideBlock, DarksideBlocksUrl,
+    BlockId, BlockRange, ChainSpec, CompactBlock, CompactTxIn, DarksideBlock, DarksideBlocksUrl,
     DarksideEmptyBlocks, DarksideHeight, DarksideMetaState, DarksideSubtreeRoots,
     DarksideTransactionsUrl, Empty, GetAddressUtxosArg, GetAddressUtxosReply, GetMempoolTxRequest,
     GetSubtreeRootsArg, PoolType, RawTransaction, SubtreeRoot, TreeState, TxFilter,
@@ -124,6 +124,10 @@ async fn stage_blocks(
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The scenario checks fixture visibility across one continuous chain replacement."
+)]
 async fn darkside_reorg_replaces_blocks_and_removes_orphaned_fixtures() -> Result<()> {
     let process = TestProcess::start(&[]).await?;
     let (mut control, mut wallet) = process.clients().await?;
@@ -227,13 +231,13 @@ async fn darkside_reorg_replaces_blocks_and_removes_orphaned_fixtures() -> Resul
     assert_eq!(first.prev_hash, common.hash);
     assert_eq!(blocks.message().await?, Some(common));
     assert!(blocks.message().await?.is_none());
-    assert!(
+    assert_eq!(
         wallet
             .get_address_utxos(utxos)
             .await?
             .into_inner()
-            .address_utxos
-            .is_empty()
+            .address_utxos,
+        Vec::<GetAddressUtxosReply>::new()
     );
     assert!(
         wallet
@@ -276,6 +280,10 @@ fn broadcast_fixture() -> Result<(RawTransaction, Vec<u8>)> {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The scenario tracks the same broadcast through mempool, mining, and rollback."
+)]
 async fn darkside_captures_mempool_broadcasts_and_mines_staged_transactions() -> Result<()> {
     let process = TestProcess::start(&[]).await?;
     let (mut control, mut wallet) = process.clients().await?;
@@ -546,7 +554,7 @@ async fn darkside_stages_serialized_fixtures_and_preserves_active_state_on_faile
     let original = wallet.get_block(at(1)).await?.into_inner();
     assert_eq!(original.hash, encode_internal_block_hash(hash));
     assert_eq!(original.vtx.len(), 1);
-    assert!(original.vtx[0].vin.is_empty());
+    assert_eq!(original.vtx[0].vin, Vec::<CompactTxIn>::new());
 
     stage_blocks(&mut control, 3, 5, 1).await?;
     let failed = control.apply_staged(DarksideHeight { height: 3 }).await;
