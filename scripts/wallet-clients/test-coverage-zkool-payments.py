@@ -538,6 +538,21 @@ class ZkoolPaymentImport(unittest.TestCase):
                 with self.rejects():
                     self.rows()
 
+    def test_accepts_unified_zinder_image_layout_and_rejects_mixed(self):
+        import coverage_zkool_payments as zp
+        unified_pre = preflight()
+        unified_pre["images"] = {"zinder": "sha256:" + token("image/zinder")}
+        unified_pre["image_references"] = {"zinder": "offline-pin/zinder:0.22.0"}
+        zp.preflight(unified_pre, RELEASE)
+        zp.recipe(fixture_recipe(unified_pre), unified_pre)
+
+        mixed_pre = copy.deepcopy(unified_pre)
+        mixed_pre["image_references"] = {
+            s: f"offline-pin/zinder-{s}:0.22.0" for s in SERVICES
+        }
+        with self.assertRaisesRegex(ValueError, "image references and IDs"):
+            zp.preflight(mixed_pre, RELEASE)
+
     def test_pins_inputs_and_release_binding_reject(self):
         mutations = (
             lambda r: r["pins"]["post"]["executables_sha256"].update(zkool="0" * 64),

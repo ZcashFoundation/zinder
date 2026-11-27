@@ -121,6 +121,8 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 IMAGE = re.compile(r"sha256:[0-9a-f]{64}")
 LOOPBACK = re.compile(r"http://127\.0\.0\.1:\d{2,5}")
 SERVICES = ("compat-lightwalletd", "ingest", "projector", "query")
+UNIFIED_ARTIFACTS = ("zinder",)
+UNIFIED_PROCESSES = ("index", "serve")
 IDENTITY_KEYS = {"lightwalletd": "lightwalletd",
                  "native-wallet-query": "native_wallet_query"}
 ACTIVATION = ("Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy",
@@ -310,10 +312,18 @@ def readiness(path, pins, engine, release):
             f"{engine}: activation schedule differs")
     require(IMAGE.fullmatch(pins.get("node_image", "")), f"{engine}: invalid node image pin")
     require(ready.get("node_image") == pins["node_image"], f"{engine}: node image differs")
-    require(set(ready.get("images", {})) == set(SERVICES), f"{engine}: incomplete image ids")
-    for value in ready["images"].values():
+    images = ready.get("images")
+    require(isinstance(images, dict), f"{engine}: incomplete image ids")
+    if set(images) == set(UNIFIED_ARTIFACTS):
+        expected_artifacts = set(UNIFIED_ARTIFACTS)
+        expected_processes = set(UNIFIED_PROCESSES)
+    else:
+        require(set(images) == set(SERVICES), f"{engine}: incomplete image ids")
+        expected_artifacts = set(SERVICES)
+        expected_processes = set(SERVICES)
+    for value in images.values():
         require(IMAGE.fullmatch(value), f"{engine}: invalid image id")
-    require(set(ready.get("image_references", {})) == set(SERVICES),
+    require(set(ready.get("image_references", {})) == expected_artifacts,
             f"{engine}: incomplete image references")
     version = release["tag"].lstrip("v")
     for value in ready["image_references"].values():
@@ -321,7 +331,7 @@ def readiness(path, pins, engine, release):
                 f"{engine}: image reference does not select the release")
     token(ready.get("image_manifest_sha256"), f"{engine} image manifest")
     binaries = ready.get("binaries")
-    require(isinstance(binaries, dict) and set(binaries) == set(SERVICES),
+    require(isinstance(binaries, dict) and set(binaries) == expected_artifacts,
             f"{engine}: incomplete release binaries")
     for name, entry in binaries.items():
         require(isinstance(entry, dict) and isinstance(entry.get("source"), str)
@@ -337,21 +347,41 @@ def readiness(path, pins, engine, release):
             and isolation.get("default_ipv4_route") is False,
             f"{engine}: fixture is not peer-isolated")
     health = ready.get("health")
-    require(isinstance(health, dict) and set(health) == set(SERVICES),
+    require(isinstance(health, dict) and set(health) == expected_processes,
             f"{engine}: incomplete service health")
     for name, entry in health.items():
+        if expected_processes == set(UNIFIED_PROCESSES):
+            require(entry.get("service") == "zinder",
+                    f"{engine}: {name} service identity differs")
         require(entry.get("git_commit") == release["commit"]
                 and entry.get("network") == "zcash-regtest"
                 and entry.get("version") == version, f"{engine}: {name} identity differs")
     state = ready.get("readiness")
-    require(isinstance(state, dict) and set(state) == set(SERVICES),
+    require(isinstance(state, dict) and set(state) == expected_processes,
             f"{engine}: incomplete readiness state")
     for name, entry in state.items():
         require(entry.get("status") == "ready"
                 and type(entry.get("current_height")) is int
-                and type(entry.get("target_height")) is int
-                and entry["current_height"] >= entry["target_height"],
+                and entry["current_height"] >= ready["current_tip"],
                 f"{engine}: {name} was not ready")
+        target = entry.get("target_height")
+        if expected_processes == set(SERVICES):
+            require(type(target) is int and entry["current_height"] >= target,
+                    f"{engine}: {name} was not ready")
+        else:
+            if target is not None or name == "index":
+                require(type(target) is int and entry["current_height"] >= target,
+                        f"{engine}: {name} was not ready")
+            if name == "serve" and "roles" in entry:
+                roles = entry["roles"]
+                require(isinstance(roles, list), f"{engine}: invalid serve roles")
+                for required_role in ("query", "compat-lightwalletd"):
+                    require(any(
+                        isinstance(role_entry, dict)
+                        and role_entry.get("role") == required_role
+                        and role_entry.get("ready") is True
+                        for role_entry in roles
+                    ), f"{engine}: serve role {required_role} was not ready")
     require(isinstance(ready.get("raw_blob_policy"), str) and ready["raw_blob_policy"],
             f"{engine}: missing raw blob policy")
     return ready_path, ready
@@ -412,8 +442,9 @@ def source_gate(engine, pins, inputs):
 def binary_gate(engine, ready, inputs):
     if inputs is None:
         return gate("unexercised", "receipt records no portable client input pins")
-    for name in SERVICES:
-        pinned = find_pin(inputs, (f"zinder-{name}", name))
+    for name in ready["binaries"]:
+        candidates = ("zinder",) if name == "zinder" else (f"zinder-{name}", name)
+        pinned = find_pin(inputs, candidates)
         if pinned is None:
             return gate("unexercised", f"pinned input set is missing release binary {name}")
         if pinned[1] != ready["binaries"][name]["sha256"]:

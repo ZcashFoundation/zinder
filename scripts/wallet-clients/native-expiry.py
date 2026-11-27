@@ -61,8 +61,9 @@ def exercise(args, project, receipt):
     initial_tip = ready['current_tip']
     node_rpc = lambda method, *params: operator['rpc'](ready, method, list(params))
     require(node_rpc('getblockhash', initial_tip) == ready['current_hash'], 'node anchor changed')
+    serve_health = ready['health'].get('serve') or ready['health']['query']
     receipt['fixture'] = {'network': ready['network'], 'release_revision': ready['zinder_commit'],
-                          'release_version': ready['health']['query']['version'],
+                          'release_version': serve_health['version'],
                           'anchor_height': initial_tip, 'anchor_hash': ready['current_hash'],
                           'ready_sha256': sha256(ready_path), 'raw_blob_policy': ready['raw_blob_policy'],
                           'image_ids': ready['images'], 'node_image': ready['node_image'],

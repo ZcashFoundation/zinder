@@ -364,6 +364,10 @@ for deployment_env in "${deployment_env_names[@]}"; do
     and any(.services["zinder-history-publisher"].volumes[];
       .source == "/srv/zinder-history/\($deploy_network)/key-1/publisher.pk8")
     and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_GRPC_ADDR == ""
+    and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__SERVER_NAME == ""
+    and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM == ""
+    and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM == ""
+    and .services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM == ""
     and $json_rpc_addr != ""
     and (.services["zinder-index"].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr)
     and (.services["zinder-serve"].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr)
@@ -511,6 +515,57 @@ jq 'del(.services["zinder-serve"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND
 expect_rejected \
   "a Compose contract relying on an image-baked public-bind opt-in" \
   --compose-contract "$implicit_security_compose"
+
+# Verify inline indexer TLS passthrough reaches only zinder-index when set in env.
+resolved_inline_tls_compose="$temporary_directory/resolved-inline-tls-compose.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230 \
+ZINDER_NODE__INDEXER_TLS__SERVER_NAME=zakura.internal \
+ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM="CA-PEM" \
+ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM="CLIENT-CERT-PEM" \
+ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM="CLIENT-KEY-PEM" \
+docker compose \
+  --env-file "$repository_root/deploy/.env.zakura-mainnet" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config --format json > "$resolved_inline_tls_compose"
+bash "$validator" --compose-contract "$resolved_inline_tls_compose"
+jq -e '
+  .services["zinder-index"].environment as $env
+  | $env.ZINDER_NODE__INDEXER_GRPC_ADDR == "https://zakura:8230"
+  and $env.ZINDER_NODE__INDEXER_TLS__SERVER_NAME == "zakura.internal"
+  and $env.ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM == "CA-PEM"
+  and $env.ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM == "CLIENT-CERT-PEM"
+  and $env.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM == "CLIENT-KEY-PEM"
+' "$resolved_inline_tls_compose" >/dev/null \
+  || fail "Compose did not forward inline ZINDER_NODE__INDEXER_TLS__* credentials to zinder-index"
+
+missing_tls_env_compose="$temporary_directory/missing-tls-env-compose.json"
+jq 'del(.services["zinder-index"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM)' \
+  "$resolved_compose" > "$missing_tls_env_compose"
+expect_rejected \
+  "a Compose contract dropping inline indexer TLS passthrough" \
+  --compose-contract "$missing_tls_env_compose"
+
+leaked_tls_env_compose="$temporary_directory/leaked-tls-env-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM = ""' \
+  "$resolved_compose" > "$leaked_tls_env_compose"
+expect_rejected \
+  "a Compose contract forwarding indexer TLS keys to zinder-serve" \
+  --compose-contract "$leaked_tls_env_compose"
+
+missing_cipherscan_port_compose="$temporary_directory/missing-cipherscan-port-compose.json"
+jq '.services["zinder-index"].ports |= map(select(.target != 9070))' \
+  "$resolved_compose" > "$missing_cipherscan_port_compose"
+expect_rejected \
+  "a Compose contract omitting loopback Cipherscan port 9070" \
+  --compose-contract "$missing_cipherscan_port_compose"
+
+missing_cipherscan_listen_compose="$temporary_directory/missing-cipherscan-listen-compose.json"
+jq 'del(.services["zinder-serve"].environment.ZINDER_CIPHERSCAN__LISTEN_ADDR)' \
+  "$resolved_compose" > "$missing_cipherscan_listen_compose"
+expect_rejected \
+  "a Compose contract omitting ZINDER_CIPHERSCAN__LISTEN_ADDR on zinder-serve" \
+  --compose-contract "$missing_cipherscan_listen_compose"
 
 mixed_release_workflow="$temporary_directory/release.yml"
 cp "$repository_root/.github/workflows/release.yml" "$mixed_release_workflow"

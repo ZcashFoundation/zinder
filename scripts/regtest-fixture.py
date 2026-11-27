@@ -317,6 +317,7 @@ def provision(args, directory):
             service['environment']['ZINDER_COMPAT__STALE_TIP_LIMIT_MS'] = '0'
         if binary_mount:
             service['volumes'].append(dict(binary_mount))
+            service['entrypoint'] = ['/usr/local/bin/zinder']
         service['healthcheck'].update(interval='1s', start_period='1s', retries=180)
     model['services']['zinder-index'].pop('ports', None)
     model['services']['node'] = dict(image=node_image, pull_policy='never', restart='no',

@@ -242,6 +242,16 @@ class RecoveryImport(unittest.TestCase):
             with self.subTest(missing=key), self.assertRaises(ValueError):
                 matrix(other)
 
+        unified = copy.deepcopy(initial)
+        unified["fixture"]["image_ids"] = {"zinder": NODE_IMAGE}
+        unified["fixture"]["release_binary_sha256"] = {"zinder": token("zinder-bin")}
+        self.assertEqual(len(list(recovery_actions(self.write(case, unified), RELEASE))), 2)
+
+        mixed = copy.deepcopy(unified)
+        mixed["fixture"]["image_ids"] = dict.fromkeys(BINARIES, NODE_IMAGE)
+        with self.assertRaises(ValueError):
+            matrix(mixed)
+
     def test_supervised_case_requires_the_final_cooperative_result_for_this_receipt(self):
         case = "disconnect"
         doc = self.receipts[case]

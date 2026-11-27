@@ -1120,6 +1120,80 @@ class NegativeControls(CounterpartyCase):
             with self.subTest(mutation=index):
                 self.reject_ready("vizor", change)
 
+    def test_accepts_unified_zinder_readiness_and_rejects_mixed_or_unready_roles(self):
+        self.campaign.reset()
+        ready_path = self.campaign.ready_path("vizor")
+        legacy_ready = json.loads(ready_path.read_text())
+        version = RELEASE["tag"].lstrip("v")
+        zinder_sha = token("binary/zinder")
+        unified = copy.deepcopy(legacy_ready)
+        unified["images"] = {"zinder": "sha256:" + token("image/zinder")}
+        unified["image_references"] = {"zinder": f"offline-pin/zinder:{version}"}
+        unified["binaries"] = {"zinder": {"source": "/private/release/zinder", "sha256": zinder_sha}}
+        unified["health"] = {
+            proc: {
+                "status": "alive",
+                "service": "zinder",
+                "version": version,
+                "git_commit": RELEASE["commit"],
+                "network": "zcash-regtest",
+                "capabilities": [],
+            }
+            for proc in ("index", "serve")
+        }
+        unified["readiness"] = {
+            "index": {
+                "status": "ready",
+                "phase": "ready",
+                "current_height": 150,
+                "target_height": 150,
+                "roles": [{"role": "ingest", "ready": True, "state": "ready"}],
+            },
+            "serve": {
+                "status": "ready",
+                "phase": "ready",
+                "current_height": 150,
+                "target_height": None,
+                "roles": [
+                    {"role": "query", "ready": True, "state": "ready"},
+                    {"role": "compat-lightwalletd", "ready": True, "state": "ready"},
+                ],
+            },
+        }
+        self.campaign.mutate_ready("vizor", lambda r: (r.clear(), r.update(copy.deepcopy(unified))))
+        receipt_doc = json.loads(self.campaign.receipt_path("vizor").read_text())
+        receipt_doc["pins"]["client_inputs_sha256"]["zinder"] = zinder_sha
+        receipt_doc["client_inputs_sha256_after"]["zinder"] = zinder_sha
+        self.campaign.write_receipt("vizor", receipt_doc)
+        rows = roles.counterparty_actions(self.campaign.receipt_path("vizor"), RELEASE)
+        self.assertTrue(rows)
+
+        mixed = copy.deepcopy(unified)
+        mixed["readiness"] = copy.deepcopy(legacy_ready["readiness"])
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "fixtures" / legacy_ready["project"] / "ready.initial.json"
+            p.parent.mkdir(parents=True)
+            p.write_text(json.dumps(mixed))
+            pins = {
+                "fixture_project": legacy_ready["project"],
+                "fixture_ready_sha256": digest(p),
+                "release_commit": RELEASE["commit"],
+                "release": RELEASE["tag"],
+                "fixture_base": legacy_ready["port_base"],
+                "fixture_node_rpc": legacy_ready["node_rpc"],
+                "activation_schedule_sha256": legacy_ready["activation_schedule_sha256"],
+                "node_image": legacy_ready["node_image"],
+            }
+            with self.assertRaisesRegex(ValueError, "incomplete readiness state"):
+                roles.readiness(Path(td) / "receipt.json", pins, "vizor", RELEASE)
+
+            unready_role = copy.deepcopy(unified)
+            unready_role["readiness"]["serve"]["roles"][1]["ready"] = False
+            p.write_text(json.dumps(unready_role))
+            pins["fixture_ready_sha256"] = digest(p)
+            with self.assertRaisesRegex(ValueError, "compat-lightwalletd was not ready"):
+                roles.readiness(Path(td) / "receipt.json", pins, "vizor", RELEASE)
+
     def test_ledger_and_inclusion_controls(self):
         mutations = (
             lambda r: r["engine_pays"]["payer_fee"].update(debit_zat=1_000_001),

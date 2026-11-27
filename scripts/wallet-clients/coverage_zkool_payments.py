@@ -20,6 +20,8 @@ MEMOS = {"outbound": "zinder/zkool-cake-v1/outbound",
          "inbound": "zinder/zkool-cake-v1/inbound",
          "spendback": "zinder/zkool-cake-v1/spendback"}
 SERVICES = ("ingest", "projector", "query", "compat-lightwalletd")
+UNIFIED_SERVICES = ("zinder",)
+ALLOWED_SERVICE_SETS = (set(UNIFIED_SERVICES), set(SERVICES))
 ACTIVATION = {"Overwinter": 1, "Sapling": 1, "Blossom": 1, "Heartwood": 1,
               "Canopy": 1, "NU5": 1, "NU6": 1, "NU6.1": 1, "NU6.2": 1, "NU6.3": 250}
 OUTCOME_LEGS = ("tx_fingerprint", "mined_height", "amount_zat", "fee_zat",
@@ -149,9 +151,12 @@ def preflight(value, release):
     token(value["image_manifest_sha256"], "fixture image manifest")
     require(IMAGE.fullmatch(value["node_image"]), "invalid fixture node image")
     for field in ("image_references", "images"):
-        exact(value[field], SERVICES, f"fixture {field}")
+        require(isinstance(value[field], dict) and set(value[field]) in ALLOWED_SERVICE_SETS,
+                f"fixture {field}")
         require(all(isinstance(item, str) and item.strip() for item in value[field].values()),
                 f"fixture {field} is incomplete")
+    require(set(value["image_references"]) == set(value["images"]),
+            "fixture image references and IDs disagree")
     version = release["tag"].lstrip("v")
     require(all(reference.rsplit(":", 1)[-1] == version
                 for reference in value["image_references"].values()),

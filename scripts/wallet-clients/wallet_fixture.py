@@ -13,6 +13,44 @@ def loopback(url):
     return url
 
 
+def require_service_ops(
+    fetch_json,
+    expected_service,
+    expected_role,
+    expected_network,
+    expected_revision,
+    *,
+    require_alive=True,
+    identity_error=None,
+):
+    """Verify a standalone reader or unified `zinder` supervisor serves `expected_role`."""
+    message = identity_error or f"{expected_service} identity mismatch"
+    health = fetch_json("/healthz")
+    status = health.get("status")
+    status_ok = status == "alive" if require_alive else status in (None, "alive")
+    if (
+        not status_ok
+        or health.get("network") != expected_network
+        or health.get("git_commit") != expected_revision
+    ):
+        raise ValueError(message)
+    service = health.get("service")
+    if service == expected_service:
+        return
+    if service != "zinder":
+        raise ValueError(message)
+    readiness = fetch_json("/readyz")
+    roles = readiness.get("roles")
+    if readiness.get("status") != "ready" or not isinstance(roles, list) or not any(
+        isinstance(entry, dict)
+        and entry.get("role") == expected_role
+        and entry.get("ready") is True
+        and entry.get("state") == "ready"
+        for entry in roles
+    ):
+        raise ValueError(message)
+
+
 def binding(ready_path, candidate_path=None, endpoint=None, node=None):
     ready = json.loads(Path(ready_path).read_text())
     if ready["network"] != "zcash-regtest" or not re.fullmatch("[a-f0-9]{40}", ready["zinder_commit"]):

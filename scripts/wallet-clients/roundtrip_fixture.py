@@ -6,7 +6,7 @@ import re
 import time
 from urllib.parse import urlsplit
 
-from wallet_fixture import loopback, verify_node
+from wallet_fixture import loopback, require_service_ops, verify_node
 
 
 GENESIS = {
@@ -86,10 +86,17 @@ def verify(ready: dict, network: str, revision: str) -> dict:
     else:
         require(peer_count > 0, "live Testnet node has no peers")
 
-    for key, service in (("compat_ops", "zinder-compat-lightwalletd"), ("query_ops", "zinder-query")):
-        health = http_json(ready[key], "/healthz")
-        require((health.get("service"), health.get("status"), health.get("network"), health.get("git_commit"))
-                == (service, "alive", name, revision), f"{service} identity mismatch")
+    for key, service, role in (
+        ("compat_ops", "zinder-compat-lightwalletd", "compat-lightwalletd"),
+        ("query_ops", "zinder-query", "query"),
+    ):
+        require_service_ops(
+            lambda path, base_url=ready[key]: http_json(base_url, path),
+            service,
+            role,
+            name,
+            revision,
+        )
 
     def call(channel, package, method, message, response, streaming=False):
         invoke = channel.unary_stream if streaming else channel.unary_unary

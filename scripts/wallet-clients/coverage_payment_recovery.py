@@ -21,6 +21,8 @@ COMMIT = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 IMAGE = re.compile(r"sha256:[0-9a-f]{64}")
 BINARIES = ("compat-lightwalletd", "ingest", "projector", "query")
+UNIFIED_BINARIES = ("zinder",)
+ALLOWED_BINARY_SETS = (set(UNIFIED_BINARIES), set(BINARIES))
 ACCOUNTING = {"amount_zat", "fee_zat", "payee_after_zat", "payee_credit_zat",
               "payer_after_zat", "payer_debit_zat"}
 WALLETS = {"zingo": ("lightwalletd", "engine", "nakednet-cli"),
@@ -79,12 +81,14 @@ def receipt(result, release, case):
     token(result["preflight"]["sha256"], f"{case} preflight")
     token(fixture.get("configuration_sha256"), f"{case} effective fixture configuration")
     images = fixture.get("image_ids")
-    require(isinstance(images, dict) and set(images) == set(BINARIES)
+    require(isinstance(images, dict) and set(images) in ALLOWED_BINARY_SETS
             and all(isinstance(v, str) and IMAGE.fullmatch(v) for v in images.values()),
             f"{case}: missing or invalid runtime image IDs")
     require(IMAGE.fullmatch(fixture["node_image"]), f"{case}: invalid node image")
-    require(set(fixture["release_binary_sha256"]) == set(BINARIES), f"{case}: incomplete binary pins")
-    for name in BINARIES:
+    require(isinstance(fixture["release_binary_sha256"], dict)
+            and set(fixture["release_binary_sha256"]) == set(images),
+            f"{case}: incomplete binary pins")
+    for name in fixture["release_binary_sha256"]:
         token(fixture["release_binary_sha256"][name], f"{case} {name} binary")
     require(clients["payer"] == "zingo-cli" and clients["payee"] == "zallet-zinder",
             f"{case}: unexpected wallet roles")

@@ -217,7 +217,7 @@ class RoundTripGateTests(unittest.TestCase):
         archive = make_candidate(self.root / "one")
         with self.assertRaisesRegex(ValueError, "does not name the requested"):
             gate.load_candidate(archive, None, "v9.9.8", "a" * 40, self.root / "wrong-tag")
-        tampered = make_candidate(self.root / "two", tamper="zinder-ingest")
+        tampered = make_candidate(self.root / "two", tamper="zinder")
         with self.assertRaisesRegex(ValueError, "differs from the BUILD-INFO pin"):
             gate.load_candidate(tampered, None, "v9.9.9", "a" * 40, self.root / "tampered")
 
@@ -245,7 +245,7 @@ class RoundTripGateTests(unittest.TestCase):
     def binding_inputs(self):
         binaries = {name: hashlib.sha256(("binary-" + name).encode()).hexdigest()
                     for name in gate.CANDIDATE_BINARIES}
-        receipt_pins = {name: binaries["zinder-" + name] for name in gate.IMAGE_NAMES}
+        receipt_pins = {name: binaries[name] for name in gate.CANDIDATE_BINARIES}
         candidate = {"tag": "v9.9.9", "commit": "a" * 40, "archive_sha256": "b" * 64,
                      "binaries": {name: {"sha256": sha} for name, sha in binaries.items()}}
         clients = {"zingo": {"sha256": "c" * 64}, "zallet": {"sha256": "d" * 64}}
@@ -269,7 +269,7 @@ class RoundTripGateTests(unittest.TestCase):
         state, candidate, clients, _ = self.binding_inputs()
         cases = {}
         binaries = dict(candidate["binaries"])
-        binaries["zinder-ingest"] = {"sha256": "0" * 64}
+        binaries["zinder"] = {"sha256": "0" * 64}
         cases["binary"] = (dict(candidate, binaries=binaries), clients, "release archive")
         cases["zingo"] = (candidate, {"zingo": {"sha256": "0" * 64}, "zallet": clients["zallet"]},
                           "pinned bundle")
@@ -287,7 +287,7 @@ class RoundTripGateTests(unittest.TestCase):
         good = {name: "sha256:" + "a" * 64 for name in gate.IMAGE_NAMES}
         images.write_text(json.dumps(good))
         self.assertEqual(gate.load_images(images), good)
-        good["ingest"] = "ghcr.io/zcashfoundation/zinder-ingest:latest"
+        good["zinder"] = "ghcr.io/zcashfoundation/zinder:latest"
         images.write_text(json.dumps(good))
         with self.assertRaisesRegex(ValueError, "immutable digest"):
             gate.load_images(images)
@@ -388,7 +388,7 @@ class RoundTripGateTests(unittest.TestCase):
         evidence = self.root / "evidence"
         summary = {"schema_version": 1, "status": "passed"}
         rows = {"schema_version": 1, "candidate": {"tag": "v9.9.9", "commit": "a" * 40},
-                "binding": {"binaries": {"zinder-ingest": "b" * 64},
+                "binding": {"binaries": {"zinder": "b" * 64},
                             "zingo_sha256": "c" * 64, "zallet_sha256": "d" * 64},
                 "rows": [{"id": "row"}]}
         result = gate.publish_evidence(evidence, summary, {"schema_version": 1, "status": "ready"},
