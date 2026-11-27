@@ -110,7 +110,7 @@ Clients reach `<service>.railway.internal:9067` and `:9102` over Railway private
 [deploy/kubernetes/statefulset.yaml](../../deploy/kubernetes/statefulset.yaml) packages the single-volume `zinder serve` pattern as a single-replica Kubernetes `StatefulSet` (`replicas: 1`) alongside headless and cluster `Service` manifests:
 
 - **Storage & permissions:** `volumeClaimTemplates` requests a `ReadWriteOnce` `PersistentVolumeClaim` mounted at `/var/lib/zinder`, with pod `securityContext.fsGroup: 10001`, `runAsNonRoot: true`, `runAsUser: 10001`, and `runAsGroup: 10001` so the distroless non-root container owns its RocksDB stores cleanly.
-- **T=0 probes:** `startupProbe` and `livenessProbe` hit `/healthz` on `:9108` (`failureThreshold: 30` allows initial startup without premature restarts), while `readinessProbe` hits `/readyz` on `:9108` so Kubernetes `Service` endpoints admit wallet traffic only after `ingest`, `projector`, and serving listeners reach `ready`.
+- **T=0 probes:** `startupProbe` (`periodSeconds: 5`, `failureThreshold: 12`, up to 60 s to bind) and `livenessProbe` (`initialDelaySeconds: 10`, `periodSeconds: 30`, `failureThreshold: 3`) run `zinder healthcheck` against `/healthz` on `:9108`, while `readinessProbe` runs `zinder healthcheck --ready` against `/readyz` on `:9108` so Kubernetes `Service` endpoints admit wallet traffic only after `ingest`, `projector`, and serving listeners reach `ready`.
 - **Single-replica constraint:** Keep `replicas: 1`. Because RocksDB secondaries share one local filesystem with their writers, you cannot scale `StatefulSet` replicas or convert to a stateless `Deployment` until M3 PostgreSQL ([Cloud and serverless boundaries](deploying.md#cloud-and-serverless-boundaries)).
 
 ## What a fresh sync looks like

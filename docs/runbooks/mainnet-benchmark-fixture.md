@@ -62,9 +62,10 @@ or wallet schema needs a new fixture, built by that release.
     --target x86_64-unknown-linux-gnu \
     -p zinder-ingest -p zinder-projector -p zinder-query \
     -p zinder-compat-lightwalletd -p zinder-explorer
-  scripts/mainnet-fixture/build-stage.sh \
-    --binaries target/x86_64-unknown-linux-gnu/release \
-    --out .tmp/zfx-stage.tar.zst
+  mkdir -p .tmp/release-binaries/bin
+  install -m 0755 \
+    target/x86_64-unknown-linux-gnu/release/{zinder-ingest,zinder-projector,zinder-query,zinder-compat-lightwalletd,zinder-explorer} \
+    .tmp/release-binaries/bin/
   ```
 
 - Have a private bucket for the stage tarball. Fixture hosts have no
@@ -90,6 +91,7 @@ with a reason that says to rebuild the stage. Rebuild every stage from the
 current checkout, with the same binaries.
 
 ```bash
+mkdir -p .tmp
 scripts/mainnet-fixture/build-stage.sh --binaries .tmp/release-binaries/bin \
   --out .tmp/zfx-stage.tar.zst \
   --upload gs://zfnd-dev-zinder-fixture-backups/zinder/tools/zfx-stage-905dac4e.tar.zst
