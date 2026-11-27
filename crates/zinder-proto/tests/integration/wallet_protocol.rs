@@ -150,6 +150,85 @@ fn compact_block_round_trips_through_prost() -> eyre::Result<()> {
 }
 
 #[test]
+fn mixed_pool_projection_keeps_consensus_indexes_and_full_tree_sizes() -> eyre::Result<()> {
+    use zinder_core::{
+        CompactBlockArtifact, CompactChainMetadata, CompactPool, CompactTransaction,
+    };
+    use zinder_proto::wire::{
+        compact_block_from_message, compact_block_message, compact_block_message_for_pools,
+    };
+
+    let mixed = all_pool_scan_fields();
+    let sapling = CompactTransactionData {
+        sapling_spends: mixed.sapling_spends.clone(),
+        sapling_outputs: mixed.sapling_outputs.clone(),
+        ..CompactTransactionData::default()
+    };
+    let orchard = CompactTransactionData {
+        orchard_actions: mixed.orchard_actions.clone(),
+        ..CompactTransactionData::default()
+    };
+    let ironwood = CompactTransactionData {
+        ironwood_actions: mixed.ironwood_actions.clone(),
+        ..CompactTransactionData::default()
+    };
+    let transparent = CompactTransactionData {
+        transparent_inputs: mixed.transparent_inputs.clone(),
+        transparent_outputs: mixed.transparent_outputs.clone(),
+        ..CompactTransactionData::default()
+    };
+    let transactions = [(2, mixed), (5, orchard.clone()), (9, sapling.clone())]
+        .into_iter()
+        .map(|(index, scan)| CompactTransaction {
+            index: u64::from(index),
+            transaction_id: TransactionId::from_bytes([index; 32]),
+            data: scan,
+        })
+        .collect();
+    let trees = CompactChainMetadata {
+        sapling_commitment_tree_size: 8,
+        orchard_commitment_tree_size: 13,
+        ironwood_commitment_tree_size: 21,
+    };
+    let block = CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(42), BlockHash::from_bytes([6; 32])),
+        BlockHash::from_bytes([7; 32]),
+        123,
+        transactions,
+        trees,
+    )?;
+
+    for (pool, indexes, scan) in [
+        (CompactPool::Sapling, &[2, 9][..], sapling),
+        (CompactPool::Orchard, &[2, 5][..], orchard),
+        (CompactPool::Ironwood, &[2][..], ironwood),
+        (CompactPool::Transparent, &[2][..], transparent),
+    ] {
+        let projected =
+            compact_block_from_message(compact_block_message_for_pools(&block, &[pool]))?;
+        assert_eq!(projected.chain_metadata(), trees);
+        let expected = indexes
+            .iter()
+            .map(|&index| CompactTransaction {
+                index: u64::from(index),
+                transaction_id: TransactionId::from_bytes([index; 32]),
+                data: scan.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projected.transactions(), expected);
+    }
+    assert_eq!(
+        compact_block_message_for_pools(&block, &[]),
+        compact_block_message(&block)
+    );
+    assert_eq!(
+        compact_block_from_message(compact_block_message(&block))?,
+        block
+    );
+    Ok(())
+}
+
+#[test]
 fn compact_block_decoder_rejects_non_increasing_transaction_indexes() {
     let data = wallet::CompactTransactionData::default();
     let block = wallet::CompactBlock {
@@ -214,10 +293,8 @@ fn chain_epoch_decoder_rejects_distinct_hashes_at_same_height() -> eyre::Result<
     Ok(())
 }
 
-#[test]
-fn mempool_entry_round_trips_shared_all_pool_scan_data() -> eyre::Result<()> {
-    let transaction_id = TransactionId::from_bytes([0x44; 32]);
-    let scan_data = CompactTransactionData {
+fn all_pool_scan_fields() -> CompactTransactionData {
+    CompactTransactionData {
         fee_zat: None,
         sapling_spends: vec![CompactSaplingSpend {
             nullifier: [0x45; 32],
@@ -247,12 +324,17 @@ fn mempool_entry_round_trips_shared_all_pool_scan_data() -> eyre::Result<()> {
             value_zat: 2_000,
             script_pub_key: vec![0x52, 0x53],
         }],
-    };
+    }
+}
+
+#[test]
+fn mempool_entry_round_trips_shared_all_pool_scan_data() -> eyre::Result<()> {
+    let transaction_id = TransactionId::from_bytes([0x44; 32]);
     let entry = MempoolEntry::new(
         transaction_id,
         None,
         RawTransactionBytes::new(vec![0x01, 0x02]),
-        scan_data,
+        all_pool_scan_fields(),
         MempoolObservation {
             first_seen_unix_millis: UnixTimestampMillis::new(1_774_670_000_000),
             first_seen_chain_epoch: zinder_proto::wire::chain_epoch_from_message(
