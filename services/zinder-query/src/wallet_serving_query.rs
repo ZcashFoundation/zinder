@@ -1080,6 +1080,9 @@ where
                 .map_err(QueryError::canonical_read)?
                 .ok_or(QueryError::BlockNotInBestChain)?
                 .into_header();
+                if block_header.block_id.height > chain_epoch.visible_tip_height {
+                    return Err(QueryError::BlockNotInBestChain);
+                }
                 Ok(BlockHeaderAtEpoch {
                     chain_epoch,
                     block_header,

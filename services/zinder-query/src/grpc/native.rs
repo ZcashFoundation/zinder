@@ -974,6 +974,7 @@ mod server_info_tests {
             WALLET_READ_VISIBLE_TIP_BLOCK_V1,
             WALLET_READ_SETTLED_TIP_BLOCK_V1,
             WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2,
             WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
             WALLET_READ_SERVER_INFO_V2,
@@ -989,7 +990,6 @@ mod server_info_tests {
             WALLET_READ_FULL_BLOCK_AT_V1,
             WALLET_READ_FULL_BLOCK_RANGE_V1,
             WALLET_BROADCAST_TRANSACTION_V1,
-            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
         ] {
             assert!(!transactions.contains(structurally_absent));
         }

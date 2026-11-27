@@ -1,0 +1,6 @@
+kind: changed
+body: Serve ExplorerQuery canonical RPCs and Cipherscan REST routes using RocksDB canonical secondary reads alongside materialized views, and promote block-header selector reads to production readiness.
+time: 2026-11-27T03:42:18Z
+custom:
+  Bump: minor
+  PR: "668"

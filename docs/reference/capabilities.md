@@ -161,7 +161,7 @@ persisted retention.
 | `wallet.read.visible_tip_block_v1` | `VisibleTipBlock` | Always |
 | `wallet.read.settled_tip_block_v1` | `SettledTipBlock` | Always |
 | `wallet.read.block_id_by_selector_v1` | `BlockIdBySelector` | Always |
-| `wallet.read.block_header_by_selector_v1` | `BlockHeaderBySelector` | Never; `zinder-query` does not serve it |
+| `wallet.read.block_header_by_selector_v1` | `BlockHeaderBySelector` | Always |
 | `wallet.read.compact_block_at_v2` | `CompactBlock` | Always |
 | `wallet.read.compact_block_range_v2` | `CompactBlocksInRange` | Always |
 | `wallet.read.compact_block_ironwood_v2` | Ironwood fields on compact blocks | Always |
@@ -199,10 +199,10 @@ answers `ServerInfo`. For `ValuePoolSummary`, it also checks the wallet
 endpoint's advertised capabilities. It caches a successful probe for 60
 seconds. A probe has two seconds to connect and read the descriptor. When a
 probe fails, the Explorer omits the capability and can retry after five seconds. In the table, "wallet query" means
-`explorer.wallet_query_endpoint` is set, and "views" means the Explorer
-materialized-view store is open, which requires `ingest.explorer_views = true`
-on the writer. The explorer does not read the canonical store, so it never
-advertises a capability that needs it.
+`explorer.wallet_query_endpoint` is set, "views" means the Explorer
+materialized-view store is open (which requires `ingest.explorer_views = true`
+on the writer), and "canonical store" means the read-only canonical secondary
+for `storage.path` is open.
 
 | Capability | Gates | Advertised when |
 | --- | --- | --- |
@@ -214,19 +214,30 @@ advertises a capability that needs it.
 | `explorer.value_pool.summary_v1` | `ValuePoolSummary` | Wallet query advertises `wallet.read.chain_value_pools_at_tip_v1` |
 | `explorer.network_upgrade.status_v1` | `NetworkUpgradeStatus` | Wallet query |
 | `explorer.chain.reorg_history_v1` | `ChainReorgHistory` | Views |
+| `explorer.chain.displaced_block_history_v1` | `DisplacedBlockHistory` | Canonical store |
+| `explorer.chain.displaced_block_detail_v1` | `DisplacedBlockDetail` | Canonical store |
 | `explorer.transaction.detail_v4` | `TransactionDetail` | Views and wallet query |
 | `explorer.transaction.fees_v1` | Input values and paid fee on `TransactionDetail` | Views and wallet query |
+| `explorer.transaction.intrinsic_value_balances_v1` | `intrinsic_value_balances` on `TransactionDetail` and `TransactionHistory` | Views, wallet query, and canonical store |
 | `explorer.transaction.recent_v1` | `RecentTransactions` | Views and wallet query |
 | `explorer.transaction.component_summary_v2` | `TransactionComponentSummary` | Views and wallet query |
 | `explorer.transaction.history_v1` | `TransactionHistory` | Wallet query, and the transaction history view has data |
+| `explorer.transaction.history_v2` | `TransactionHistory` | Wallet query, canonical store, and complete transaction-history coverage matching the canonical tip |
 | `explorer.block.summary_v1` | `BlockSummariesInRange` | Views and wallet query |
+| `explorer.block.production_series_v2` | `BlockProductionSeries` | Views and canonical store |
+| `explorer.block.production_time_range_v1` | `BlockProductionInTimeRange` | Views, canonical store, and the block production time view covers the chain |
 | `explorer.block.detail_v1` | `BlockDetail` | Views and wallet query |
+| `explorer.block.transactions_v2` | `BlockTransactions` | Views, wallet query, and canonical store |
+| `explorer.block.final_note_commitment_roots_v1` | `final_note_commitment_roots` on `BlockTransactions` | Views, wallet query, and canonical store |
 | `explorer.block.activity_distribution_v1` | `BlockActivityDistribution` | Views and wallet query |
+| `explorer.commitment_root.search_v1` | `CommitmentRootSearch` | Views and canonical store |
+| `explorer.commitment_root.displaced_matches_v1` | Displaced matches and coverage on `CommitmentRootSearch` | Views and canonical store |
 | `explorer.transparent_address.activity_v2` | `TransparentAddressActivity` | Views and wallet query, and the address ranking is built |
 | `explorer.transparent_address.ranking_v1` | `TransparentAddressRanking` | Views and wallet query, and the address ranking is built |
 | `explorer.transparent_address.deltas_v1` | `TransparentAddressDeltas` | Views and wallet query |
 | `explorer.fee.summary_v1` | `FeeSummary` | Views and wallet query |
 | `explorer.fee.conventional_distribution_v1` | `ConventionalFeeDistribution` | Views and wallet query, and the distribution covers the chain |
+| `explorer.fee.paid_distribution_v1` | `PaidFeeDistribution` | Unadvertised. No runtime builds a canonical paid-fee distribution view |
 | `explorer.value_pool.flow_history_v1` | `ValuePoolFlowHistory` | Views and wallet query |
 | `explorer.value_pool.flow_events_in_range_v1` | `ValuePoolFlowEventsInRange` | Views and wallet query |
 | `explorer.value_pool.flow_summary_v1` | `ValuePoolFlowSummary` | Views and wallet query |
@@ -239,20 +250,11 @@ advertises a capability that needs it.
 | `explorer.migration.cohorts_v1` | `MigrationCohorts` | Views and wallet query |
 | `explorer.migration.denominations_v1` | `MigrationDenominations` | Views and wallet query |
 
-These explorer capabilities are defined but never advertised, because they
-need the canonical store or complete canonical history:
+These explorer capabilities are defined on the wire but never advertised by `zinder-explorer` in this release:
 
-- `explorer.block.production_series_v2`
-- `explorer.block.production_time_range_v1`
-- `explorer.block.transactions_v2`
-- `explorer.block.final_note_commitment_roots_v1`
-- `explorer.commitment_root.search_v1`
-- `explorer.commitment_root.displaced_matches_v1`
-- `explorer.chain.displaced_block_history_v1`
-- `explorer.chain.displaced_block_detail_v1`
-- `explorer.transaction.intrinsic_value_balances_v1`
-- `explorer.transaction.history_v2`
 - `explorer.fee.paid_distribution_v1`
+- `explorer.value_pool.balance_history_v1`
+- `explorer.mempool.event_counts_v1`
 
 [Explorer plane](../architecture/explorer-plane.md) describes what each
 explorer method returns.

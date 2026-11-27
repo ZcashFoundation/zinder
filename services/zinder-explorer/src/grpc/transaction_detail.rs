@@ -44,6 +44,7 @@ use zinder_runtime::AuthenticatedChannel;
 use zinder_source::TransactionPublicFactSet;
 use zinder_store::{chain_epoch_from_message, transparent_spend_message};
 
+use super::canonical_read::encode_intrinsic_value_balances;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
@@ -56,6 +57,7 @@ use super::transparent_input::encode_unresolved_transparent_inputs;
 /// workspace's clippy `too-many-arguments` threshold and so adding a new
 /// shared dependency does not ripple through every call site.
 pub(crate) struct TransactionDetailContext<'context> {
+    pub(crate) include_intrinsic_value_balances: bool,
     pub(crate) materialized_view_store: Option<&'context MaterializedViewStore>,
     pub(crate) network_upgrade_activations: &'context NetworkUpgradeActivations,
     pub(crate) upstream_observation_cache: &'context UpstreamObservationCache,
@@ -68,6 +70,7 @@ pub(crate) async fn query_transaction_detail(
     request: Request<TransactionDetailRequest>,
 ) -> Result<Response<TransactionDetailResponse>, Status> {
     let TransactionDetailContext {
+        include_intrinsic_value_balances,
         materialized_view_store,
         network_upgrade_activations,
         upstream_observation_cache,
@@ -101,6 +104,9 @@ pub(crate) async fn query_transaction_detail(
         chain_epoch,
         location,
     )?;
+    if !include_intrinsic_value_balances {
+        response.intrinsic_value_balances = None;
+    }
     let freshness = response.freshness.take().unwrap_or_default();
     response.freshness =
         Some(attach_upstream_observation(upstream_observation_cache, freshness).await);
@@ -116,6 +122,7 @@ fn transaction_detail_response(
     chain_epoch: wallet::ChainEpoch,
     location: wire_location::Location,
 ) -> Result<TransactionDetailResponse, Status> {
+    let is_mined = matches!(location, wire_location::Location::Mined(_));
     let transaction =
         resolve_facts_and_location(network_upgrade_activations, transaction_id, location)?;
 
@@ -148,7 +155,9 @@ fn transaction_detail_response(
         prevout_resolution_status,
         transparent_inputs: transparent_rows.inputs,
         transparent_outputs: transparent_rows.outputs,
-        intrinsic_value_balances: None,
+        intrinsic_value_balances: is_mined.then(|| {
+            encode_intrinsic_value_balances(transaction.fact_set.intrinsic_value_balances)
+        }),
     })
 }
 
@@ -750,6 +759,41 @@ mod tests {
         let mut bytes = [0xC3; 32];
         bytes[..4].copy_from_slice(&height.to_be_bytes());
         BlockHash::from_bytes(bytes)
+    }
+
+    #[test]
+    fn mempool_detail_omits_intrinsic_value_balances() -> eyre::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let materialized_view_store = open_spend_view_store(tempdir.path())?;
+        let payload_bytes = transparent_transaction_bytes();
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let parsed =
+            zinder_source::parse_transaction_public_fact_set(&payload_bytes, None, &activations)?;
+        let transaction_id = parsed.public_facts.transaction_id;
+
+        let mempool_response = transaction_detail_response(
+            Some(&materialized_view_store),
+            &activations,
+            transaction_id,
+            chain_epoch_message(chain_epoch_at(2)),
+            wire_location::Location::InMempool(wallet::MempoolEntry {
+                raw_transaction_bytes: payload_bytes,
+                first_seen_unix_millis: 1_700_000_000_000,
+                ..Default::default()
+            }),
+        )?;
+        assert!(mempool_response.intrinsic_value_balances.is_none());
+
+        let (mined_txid, mined_loc) = mined_transparent_location()?;
+        let mined_response = transaction_detail_response(
+            Some(&materialized_view_store),
+            &activations,
+            mined_txid,
+            chain_epoch_message(chain_epoch_at(2)),
+            mined_loc,
+        )?;
+        assert!(mined_response.intrinsic_value_balances.is_some());
+        Ok(())
     }
 
     #[test]

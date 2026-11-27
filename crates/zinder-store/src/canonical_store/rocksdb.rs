@@ -51,11 +51,18 @@ use super::{
 pub struct CanonicalReadyStoreSummary {
     admitted_activations: Option<NetworkUpgradeActivations>,
     construction_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+    reorg_policy: super::CanonicalReorgPolicy,
     visible_tip: BlockId,
     settled_tip: BlockId,
 }
 
 impl CanonicalReadyStoreSummary {
+    /// Returns the effective canonical replacement depth admitted by this store.
+    #[must_use]
+    pub const fn reorg_policy(&self) -> super::CanonicalReorgPolicy {
+        self.reorg_policy
+    }
+
     /// Returns the visible tip of the store's READY fence.
     #[must_use]
     pub const fn visible_tip(&self) -> BlockId {
@@ -636,6 +643,7 @@ impl RocksDbCanonicalStore {
             reorg_policy,
             &opened_ready_evidence,
         )?;
+        super::displaced_archive::backfill_displaced_root_index_if_absent(&bounded_open.db)?;
         Ok(Self {
             bounded_open,
             workload: opened_control.workload,
@@ -911,12 +919,15 @@ impl RocksDbCanonicalStore {
                 "visible chain epoch does not match the READY fence",
             ));
         }
+        let admitted_activations = read_admitted_schedule(db, path, &control)?
+            .map(|schedule| schedule.activations().clone());
+        let reorg_policy = control.effective_reorg_policy();
         Ok(Some(CanonicalReadyStoreSummary {
-            admitted_activations: read_admitted_schedule(db, path, &control)?
-                .map(|schedule| schedule.activations().clone()),
+            admitted_activations,
             construction_activations_fingerprint: control
                 .build_plan
                 .network_upgrade_activations_fingerprint(),
+            reorg_policy,
             visible_tip,
             settled_tip,
         }))

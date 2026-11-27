@@ -7,9 +7,10 @@ use std::collections::BTreeSet;
 
 use zinder_proto::capabilities::{
     AdvertisePolicy, CAPABILITIES, CapabilitySurface, EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
-    EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1, EXPLORER_VALUE_POOL_SUMMARY_V1, ExplorerReadiness,
-    WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
-    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1, capabilities_for_surface,
+    EXPLORER_PAID_FEE_DISTRIBUTION_V1, EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
+    EXPLORER_VALUE_POOL_SUMMARY_V1, ExplorerReadiness, WALLET_READ_FULL_BLOCK_AT_V1,
+    WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
+    WALLET_READ_TRANSACTION_BYTES_V1, capabilities_for_surface,
 };
 
 use zinder_proto::v1::wallet::WalletServerInfo;
@@ -133,6 +134,7 @@ fn explorer_value_pool_and_mempool_count_policies_require_runtime_support() {
     assert!(summary.explorer_satisfied_with_wallet(readiness, Some(&wallet)));
     assert!(!summary.explorer_satisfied_with_wallet(ExplorerReadiness::default(), Some(&wallet)));
     for capability in [
+        EXPLORER_PAID_FEE_DISTRIBUTION_V1,
         EXPLORER_MEMPOOL_EVENT_COUNTS_V1,
         EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1,
     ] {

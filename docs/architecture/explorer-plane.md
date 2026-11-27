@@ -49,41 +49,45 @@ Plan disk, build time, and memory for the Explorer. [Deploying Zinder](../runboo
 
 ## How the Explorer reads data
 
-`zinder-explorer` owns no primary store. It reads three sources:
+`zinder-explorer` owns no primary store. It reads four sources:
 
-- The view store, opened as a RocksDB secondary and caught up every second.
+- The canonical store at `storage.path`, opened read-only as a RocksDB secondary under `<storage.secondary_path>/canonical` and caught up continuously on `storage.secondary_catchup_interval` whenever the canonical primary is READY.
+- The view store at `<storage.path>/materialized-views`, opened as a RocksDB secondary under `<storage.secondary_path>/materialized-views` and caught up on the same cadence.
 - `WalletQuery` on `zinder-query`, for transaction status, tips, the mempool, value pools, and the network-upgrade table. Each wallet read is pinned to one chain epoch, the consistent chain snapshot the wallet reader serves ([Wallet data plane](wallet-data-plane.md)).
 - Optionally, the node in `[node]`, polled in the background for the upstream tip. It never supplies a chain fact.
 
-The Explorer does not open the canonical store. Methods that need canonical reads are [unadvertised](#unadvertised-methods).
-
-When the view store is absent, the Explorer starts with view-backed methods unadvertised. When the store was built by a release with a different set of views, the Explorer exits at startup with `ConsumerNotDeclared` or `ExplorerViewManifestRequiresFreshStore`. Rebuild the views on a fresh path as [Add the Explorer](../runbooks/deploying-on-a-vm.md#add-the-explorer) describes.
+When the canonical or view store is absent (or not yet `READY` when the Explorer starts), the Explorer opens only what is available at startup and starts with the missing capability groups unadvertised. Because secondary handles are opened only at startup and the catch-up task advances already-opened handles, an Explorer started while the canonical primary is still constructing must be restarted after the primary reaches `READY` to advertise canonical-backed capabilities. When the view store was built by a release with a different set of views, the Explorer exits at startup with `ConsumerNotDeclared` or `ExplorerViewManifestRequiresFreshStore`. Rebuild the views on a fresh path as [Add the Explorer](../runbooks/deploying-on-a-vm.md#add-the-explorer) describes.
 
 ## Query families
 
 Each method has a capability string. `ExplorerQuery.ServerInfo` lists only the capabilities the running Explorer can serve now, so a client checks it before calling. [Capabilities](../reference/capabilities.md) lists every string and the condition that enables it.
 
-In the table, "views" means the method reads the view store and "wallet" means it composes `WalletQuery`. A range above its cap is rejected with `INVALID_ARGUMENT`. A page size above its cap is clamped.
+In the table, "canonical" means the canonical secondary store, "views" means the view store, and "wallet" means `WalletQuery`. A range above its cap is rejected with `INVALID_ARGUMENT`. A page size above its cap is clamped.
 
 | Methods | Returns | Source and limits |
 | --- | --- | --- |
 | `ServerInfo` | Capabilities, view store identities, and view health (live, catching up, or paused) | Always served, even before views exist |
 | `BlockSummariesInRange`, `BlockDetail` | Block summaries by height; one block by height or hash with its transaction ids | Views and wallet. At most 1,024 summaries per request |
+| `BlockProductionSeries`, `BlockProductionInTimeRange` | Block summaries enriched with header `nBits` and canonical coinbase summary over a height range or bounded time window | Views and canonical. Up to 1,024 blocks per series or 1,000 candidates per time-range page |
+| `BlockTransactions` | Canonical block summary, ordered block transactions with public facts, outputs, and resolved transparent inputs, plus final note-commitment roots | Views and canonical. Optional wallet fallback for network-upgrade activations |
 | `BlockActivityDistribution` | Transactions and blocks by weekday and hour over a height range, with a missing-row count | Views and wallet. At most 20,000 blocks |
-| `RecentTransactions`, `TransactionHistory` | Newest-first canonical transactions. `TransactionHistory` adds filters, a read fence, and coverage | Views and wallet. History pages up to 256 rows |
-| `TransactionDetail` | Parsed public facts, mined or mempool location, transparent inputs and outputs, paid fee, and spent-by relations | Wallet, plus views for fees and spends. See [Transaction detail](#transaction-detail) |
+| `RecentTransactions`, `TransactionHistory` | Newest-first canonical transactions. `TransactionHistory` adds filters, a read fence, coverage, and intrinsic value balances when canonical is open | Views, wallet, and optional canonical. History pages up to 256 rows |
+| `TransactionDetail` | Parsed public facts, mined or mempool location, transparent inputs and outputs, paid fee, spent-by relations, and intrinsic value balances when canonical is open | Wallet, plus views for fees/spends and canonical for intrinsic balances. See [Transaction detail](#transaction-detail) |
 | `Search` | Typed candidates for a height, block hash, transaction id, or address | Wallet. Input up to 4 KiB |
+| `CommitmentRootSearch` | Canonical and displaced block matches for a 32-byte final note-commitment root plus coverage | Views and canonical. Up to 1,024 matches per request |
 | `MempoolSummary`, `MempoolSnapshot`, `MempoolActivity` | Mempool totals; a summary and one page from a single snapshot; newest-first entries with component counts and ZIP-317 fee floors | Wallet, computed per request. Snapshot reads up to 4,096 entries; activity pages up to 256 |
 | `MempoolEventCounts` | Added, mined, and invalidated counts over a 60 to 3,600 second window | Views and wallet. Unadvertised; see [Methods that return no data in this release](#methods-that-return-no-data-in-this-release) |
 | `TransparentAddressActivity`, `TransparentAddressDeltas`, `TransparentAddressRanking` | Per-address transaction rows and summary; per-output and per-spend value events; addresses ordered by balance | Views and wallet. See [Transparent addresses](#transparent-addresses) |
 | `FeeSummary` | ZIP-317 conventional fee floors over a block range, excluding coinbase | Views and wallet. At most 256 blocks |
 | `ConventionalFeeDistribution` | Exact conventional-fee frequencies by UTC day over a time range | Views and wallet, with coverage |
+| `PaidFeeDistribution` | Per-UTC-day miner-collected fee frequencies | Unadvertised (`DEPENDENCY_NOT_CONFIGURED`); Cipherscan falls back to `ConventionalFeeDistribution` |
 | `TransactionComponentSummary` | Transparent, Sapling, Orchard, Ironwood, and Sprout component totals by UTC day | Views and wallet, with coverage |
 | `ValuePoolSummary` | The pool totals the node reports in `getblockchaininfo`, bound to one tip | Wallet endpoint with `ChainValuePoolsAtTip` support |
 | `ValuePoolFlowHistory`, `ValuePoolFlowEventsInRange`, `ValuePoolFlowSummary`, `ValuePoolFlowAmountThresholdSummary`, `ValuePoolFlowRoundedAmountSummary` | Per-transaction value moving into or out of the shielded pools, and aggregates by time, amount threshold, or rounded amount | Views and wallet. Summaries fail above 500,000 scanned events |
 | `ValuePoolBalanceHistory` | Pool balances at UTC-day boundaries | Views and wallet. Unadvertised; see [Methods that return no data in this release](#methods-that-return-no-data-in-this-release) |
 | `NetworkUpgradeStatus` | The network-upgrade table ingest admitted, with the current tip and active upgrade | Wallet |
 | `ChainReorgHistory` | Observed reorgs from the reorg-incident view | Views. Up to 1,024 events per request |
+| `DisplacedBlockHistory`, `DisplacedBlockDetail` | Archived non-canonical blocks displaced by reorgs and their current canonical counterparts | Canonical. History pages up to 4,096 blocks |
 | `MigrationOverview`, `MigrationCohorts`, `MigrationDenominations` | Orchard-to-Ironwood migration totals, cohorts by shared anchor, and amount bins | Views and wallet. Cohort and denomination ranges up to 4,096 blocks |
 | `OverviewSnapshot` | One dashboard bundle: tip time, mempool, fee summary, value pools, recent blocks, and recent transactions, anchored on one tip | Views and wallet |
 
@@ -160,15 +164,10 @@ The proto defines a `CursorExpiredError` message, but no method returns it.
 
 ## Unadvertised methods
 
-These methods are defined on the wire and read the canonical store. The Explorer does not advertise them, and each call fails with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`:
+`PaidFeeDistribution`, `MempoolEventCounts`, and `ValuePoolBalanceHistory` remain unadvertised in `zinder-explorer` in this release because no materialized view supplies paid-fee distribution or daily value-pool balance history, and no runtime indexes mempool event counts:
 
-- `BlockTransactions`
-- `BlockProductionSeries`
-- `BlockProductionInTimeRange`
-- `CommitmentRootSearch`
-- `PaidFeeDistribution`
-- `DisplacedBlockHistory`
-- `DisplacedBlockDetail`
+- `PaidFeeDistribution` fails with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`.
+- `BlockProductionSeries`, `BlockProductionInTimeRange`, `BlockTransactions`, `CommitmentRootSearch`, `DisplacedBlockHistory`, and `DisplacedBlockDetail` also fail with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED` when a required canonical secondary store or materialized-view store is absent (or was not yet `READY` when the Explorer started); start or restart `zinder-explorer` once `storage.path` has a `READY` canonical primary and the required view/wallet dependencies in the [Query families](#query-families) table are satisfied to advertise and serve them.
 
 When a method that also reads views runs without a view store, it fails with the same reason first. With a store that lacks the exact view manifest, it fails with `UNIMPLEMENTED` and `EXPLORER_METHOD_DISABLED`. [Error vocabulary](../reference/error-vocabulary.md) lists every reason.
 
@@ -176,16 +175,14 @@ When a method that also reads views runs without a view store, it fails with the
 
 An Explorer crash stops neither `zinder-ingest` nor `zinder-query`, and its readiness never feeds wallet readiness. In the single-volume image, an Explorer exit restarts only the Explorer. A damaged view store never changes canonical or wallet state; rebuild it on a fresh path.
 
-The Explorer serves `/healthz`, `/readyz`, and `/metrics` on its ops listener, `127.0.0.1:9069` by default. `/readyz` fails while the latest view catch-up failed, with `schema_mismatch` or `storage_unavailable`, and recovers on the next successful catch-up. [Readiness](../reference/readiness.md) and [Metrics](../reference/metrics.md) describe the endpoints and the `zinder_explorer_*` metrics.
+The Explorer serves `/healthz`, `/readyz`, and `/metrics` on its ops listener, `127.0.0.1:9069` by default. `/readyz` fails while the latest secondary catch-up (materialized views or canonical secondary) failed, with `schema_mismatch` or `storage_unavailable`, and recovers on the next successful catch-up. [Readiness](../reference/readiness.md) and [Metrics](../reference/metrics.md) describe the endpoints and the `zinder_explorer_*` metrics.
 
 ## Methods that return no data in this release
 
 | Method or field | Behavior |
 | --- | --- |
-| The seven [unadvertised methods](#unadvertised-methods) | Fail with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`. |
+| `PaidFeeDistribution` | Never advertised; fails with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`. |
 | `MempoolEventCounts` | No runtime indexes mempool events. A direct call for a window with no indexed counts fails with `NOT_FOUND` and `ARTIFACT_UNAVAILABLE`. |
 | `OverviewSnapshot.mempool_events` | Absent for a window with no indexed counts. `freshness.unavailable` lists `mempool_events` with `UNAVAILABLE_NOT_INDEXED`. |
 | `ValuePoolBalanceHistory` | No runtime writes balance history. A direct call returns no points and reports incomplete coverage. |
-| `TransactionDetail.intrinsic_value_balances` | Never returned. |
 | Previous-output scripts on mined `TransactionDetail` inputs | Never returned. |
-| Full-history totals in `TransactionHistory` | Never claimed, because that claim must match a canonical tip, and the Explorer does not read the canonical store. |

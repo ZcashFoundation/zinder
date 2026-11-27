@@ -35,8 +35,14 @@ zinder-source.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
+parking_lot.workspace = true
 tempfile.workspace = true
 tower.workspace = true
+zinder-explorer = { path = "../zinder-explorer" }
+zinder-ingest.workspace = true
+zinder-materialized-views.workspace = true
+zinder-query.workspace = true
+zinder-store.workspace = true
 zinder-testkit.workspace = true
 
 [[bin]]

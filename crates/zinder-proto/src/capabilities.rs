@@ -960,7 +960,7 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         EXPLORER_PAID_FEE_DISTRIBUTION_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.PaidFeeDistribution"),
-        AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
+        AdvertisePolicy::Unserved,
     ),
     CapabilitySpec::new(
         EXPLORER_TRANSACTION_COMPONENT_SUMMARY_V2,

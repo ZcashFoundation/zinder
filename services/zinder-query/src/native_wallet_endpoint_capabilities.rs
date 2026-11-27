@@ -98,6 +98,7 @@ impl NativeWalletEndpointCapabilities {
             capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1
                 | capabilities::WALLET_READ_SETTLED_TIP_BLOCK_V1
                 | capabilities::WALLET_READ_BLOCK_ID_BY_SELECTOR_V1
+                | capabilities::WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1
                 | capabilities::WALLET_READ_COMPACT_BLOCK_AT_V2
                 | capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2
                 | capabilities::WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2

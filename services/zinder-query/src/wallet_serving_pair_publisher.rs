@@ -6577,6 +6577,7 @@ mod tests {
             WALLET_READ_VISIBLE_TIP_BLOCK_V1,
             WALLET_READ_SETTLED_TIP_BLOCK_V1,
             WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+            WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
             WALLET_READ_COMPACT_BLOCK_AT_V2,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2,
             WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,
@@ -6597,14 +6598,6 @@ mod tests {
                 "admitted serving-pair query omitted structural capability {required}"
             );
         }
-        let partially_implemented = WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1;
-        assert!(
-            !advertised
-                .iter()
-                .any(|capability| capability == partially_implemented),
-            "serving-pair query advertised an operation that is not production-admitted: \
-             {partially_implemented}"
-        );
         let (healthy_status, healthy_healthz) = fetch_operations_json(ops_address, "/healthz")?;
         assert_eq!(healthy_status, 200);
         let (ready_status, readyz) = fetch_operations_json(ops_address, "/readyz")?;

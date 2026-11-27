@@ -1047,7 +1047,17 @@ impl CipherscanRestAdapter {
         at_epoch_id: u64,
         cutoff_unix_seconds: i64,
     ) -> Result<NetworkActivityWindow, CipherscanRestError> {
-        let minimum_height = tip_height.saturating_sub(MAX_NETWORK_STATS_BLOCKS - 1);
+        if tip_height == 0 {
+            return NetworkActivityWindow::from_entries(
+                self.network,
+                &[],
+                tip_height,
+                cutoff_unix_seconds,
+            );
+        }
+        let minimum_height = tip_height
+            .saturating_sub(MAX_NETWORK_STATS_BLOCKS - 1)
+            .max(1);
         let mut end_height = tip_height;
         let mut entries = Vec::new();
 
@@ -1069,7 +1079,7 @@ impl CipherscanRestAdapter {
                 .is_some_and(|entry| entry.summary.block_time_unix_seconds < cutoff_unix_seconds);
             entries.extend(page);
 
-            if reached_cutoff || start_height == 0 {
+            if reached_cutoff || start_height <= 1 {
                 break;
             }
             if start_height == minimum_height {
@@ -1095,9 +1105,21 @@ impl CipherscanRestAdapter {
         let chain_epoch_id = at_epoch_id.ok_or(CipherscanRestError::MissingUpstreamField(
             "visible_tip_block.chain_view.chain_epoch",
         ))?;
+        if tip.height == 0 {
+            return Ok(MiningProductionWindow {
+                entries: Vec::new(),
+                requested_cutoff_unix_seconds,
+                covered_from_unix_seconds: None,
+                covered_through_unix_seconds: None,
+                scanned_block_count: 0,
+                coverage_complete: true,
+                generated_at,
+            });
+        }
         let minimum_height = tip
             .height
-            .saturating_sub(MAX_MINING_PRODUCTION_BLOCKS.saturating_sub(1));
+            .saturating_sub(MAX_MINING_PRODUCTION_BLOCKS.saturating_sub(1))
+            .max(1);
         let mut end_height = tip.height;
         let mut entries = Vec::new();
         let mut scanned_block_count = 0_u32;
@@ -1116,20 +1138,11 @@ impl CipherscanRestAdapter {
 
             scanned_block_count =
                 scanned_block_count.saturating_add(u32::try_from(page.len()).unwrap_or(u32::MAX));
-            for entry in &page {
-                let summary = &entry.summary;
-                covered_from_unix_seconds = Some(
-                    covered_from_unix_seconds.map_or(summary.block_time_unix_seconds, |current| {
-                        current.min(summary.block_time_unix_seconds)
-                    }),
-                );
-                covered_through_unix_seconds = Some(
-                    covered_through_unix_seconds
-                        .map_or(summary.block_time_unix_seconds, |current| {
-                            current.max(summary.block_time_unix_seconds)
-                        }),
-                );
-            }
+            update_covered_time_bounds(
+                &page,
+                &mut covered_from_unix_seconds,
+                &mut covered_through_unix_seconds,
+            );
 
             let page_is_before_cutoff =
                 mining_production_page_is_before_cutoff(&page, requested_cutoff_unix_seconds);
@@ -1141,7 +1154,7 @@ impl CipherscanRestAdapter {
                 )
             }));
 
-            if page_is_before_cutoff || start_height == 0 {
+            if page_is_before_cutoff || start_height <= 1 {
                 coverage_complete = true;
                 break;
             }
@@ -7541,6 +7554,22 @@ impl NetworkActivityWindow {
         tip_height: u32,
         cutoff_unix_seconds: i64,
     ) -> Result<Self, CipherscanRestError> {
+        if tip_height == 0 {
+            if !entries.is_empty() {
+                return Err(CipherscanRestError::InvalidUpstreamField(
+                    "network_stats.activity_window",
+                ));
+            }
+            let average_block_time_seconds =
+                target_block_spacing_seconds(&zebra_network_for(network)?, 0)?;
+            return Ok(Self {
+                latest_difficulty: 0.0,
+                network_hashrate_raw: 0.0,
+                average_block_time_seconds,
+                block_count: 0,
+                transaction_count: 0,
+            });
+        }
         let latest_difficulty = entries
             .iter()
             .find(|entry| entry.summary.block_height == tip_height)
@@ -10919,6 +10948,21 @@ fn mining_reward_block_date(block_time_unix_seconds: i64) -> Option<String> {
     OffsetDateTime::from_unix_timestamp(block_time_unix_seconds)
         .ok()
         .map(|timestamp| timestamp.date().to_string())
+}
+
+fn update_covered_time_bounds(
+    page: &[CipherscanBlockListEntry],
+    covered_from_unix_seconds: &mut Option<i64>,
+    covered_through_unix_seconds: &mut Option<i64>,
+) {
+    for entry in page {
+        let block_time = entry.summary.block_time_unix_seconds;
+        *covered_from_unix_seconds =
+            Some(covered_from_unix_seconds.map_or(block_time, |current| current.min(block_time)));
+        *covered_through_unix_seconds = Some(
+            covered_through_unix_seconds.map_or(block_time, |current| current.max(block_time)),
+        );
+    }
 }
 
 fn validate_mining_production_page(
@@ -17509,6 +17553,41 @@ mod tests {
         assert!((activity.latest_difficulty - 72.0).abs() < f64::EPSILON);
         assert!((activity.network_hashrate_raw - (72.0 / 43_200.0)).abs() < f64::EPSILON);
         assert_eq!(cipherscan_hashrate_string(1.829_992), "1.83 H/s");
+        Ok(())
+    }
+
+    #[test]
+    fn network_activity_window_handles_tip_height_zero_empty_chain()
+    -> Result<(), CipherscanRestError> {
+        let empty =
+            NetworkActivityWindow::from_entries(Network::ZcashRegtest, &[], 0, 1_700_000_000)?;
+
+        assert_eq!(empty.block_count, 0);
+        assert_eq!(empty.transaction_count, 0);
+        assert_eq!(
+            empty.average_block_time_seconds,
+            target_block_spacing_seconds(&zebra_network_for(Network::ZcashRegtest)?, 0)?
+        );
+        assert!((empty.latest_difficulty - 0.0).abs() < f64::EPSILON);
+        assert!((empty.network_hashrate_raw - 0.0).abs() < f64::EPSILON);
+        assert_eq!(
+            cipherscan_hashrate_string(empty.network_hashrate_raw),
+            "0.00 H/s"
+        );
+
+        let unexpected_entry = vec![network_activity_entry(1, 1_700_000_001, 1, 1.0)];
+        let rejected = NetworkActivityWindow::from_entries(
+            Network::ZcashRegtest,
+            &unexpected_entry,
+            0,
+            1_700_000_000,
+        );
+        assert!(matches!(
+            rejected,
+            Err(CipherscanRestError::InvalidUpstreamField(
+                "network_stats.activity_window"
+            ))
+        ));
         Ok(())
     }
 
