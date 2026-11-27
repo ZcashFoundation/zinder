@@ -73,6 +73,7 @@ global:
     network: zcash-testnet
 scrape_configs:
   - job_name: zinder-serve
+    honor_labels: true
     static_configs:
       - targets: ["127.0.0.1:9108"]
         labels: {service: zinder}

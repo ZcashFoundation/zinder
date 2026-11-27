@@ -116,9 +116,9 @@ This quickstart runs Zinder on Testnet beside a Zebra node from the [Z3 stack](h
 3. Provision the required host control tokens (`ingest.token` and `checkpoint.token`) and the required Testnet shielded-history generation (`scripts/prepare-shielded-history.sh`, because `zinder-serve` mounts `publisher.pub` and `catalog/` with `create_host_path: false` and needs `--profile history-publisher` when starting with an empty catalog):
 
    ```bash
-   sudo install -d -m 0755 /etc/zinder/control-secrets
-   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
-   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
+   sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin /etc/zinder/control-secrets/ingest.token
+   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin /etc/zinder/control-secrets/checkpoint.token
    sudo install -d -m 0700 /srv/zinder-history/testnet
    sudo ./scripts/prepare-shielded-history.sh /srv/zinder-history/testnet/key-1
    ```

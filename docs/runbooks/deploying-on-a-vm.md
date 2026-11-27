@@ -24,10 +24,9 @@ See [Releasing](releasing.md) to verify the signed release image and binary arch
 `deploy/docker-compose.yml` requires host control tokens in `${ZINDER_CONTROL_SECRETS_DIR:-/etc/zinder/control-secrets}` (`ingest.token` and `checkpoint.token`) and bind-mounts `publisher.pub` and `catalog/` from `${ZINDER_HISTORY_DIR:-/srv/zinder-history/${ZINDER_DEPLOY_NETWORK}/key-1}` with `create_host_path: false` (`state-init` creates neither). Initialize both before starting Compose (substitute `testnet` or `regtest` as needed):
 
 ```bash
-sudo install -d -m 0755 /etc/zinder/control-secrets
-head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
-head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
-sudo chmod 0644 /etc/zinder/control-secrets/ingest.token /etc/zinder/control-secrets/checkpoint.token
+sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin /etc/zinder/control-secrets/ingest.token
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin /etc/zinder/control-secrets/checkpoint.token
 sudo install -d -m 0700 /srv/zinder-history/mainnet
 sudo /opt/zinder/scripts/prepare-shielded-history.sh /srv/zinder-history/mainnet/key-1
 ```

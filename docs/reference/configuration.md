@@ -26,7 +26,7 @@ Most deployments need no TOML files at all and configure everything through `ZIN
 
 Every standalone listener binds to loopback by default. The [security boundary](../architecture/service-operations.md#security-boundary) explains which addresses `security.allow_public_bind` admits and why a public listener needs your own proxy.
 
-The unified `ghcr.io/zcashfoundation/zinder` OCI image runs `zinder serve` (or `zinder index` in [deploy/docker-compose.yml](../../deploy/docker-compose.yml)) without a baked-in `/etc/zinder/config.toml`. Compose configures public container listeners on `[::]` with `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`, exposing `:9108` (`zinder serve` ops), `:9105` (`zinder index` ops), `:9102` (`WalletQuery`), `:9067` (`CompactTxStreamer`), `:9068` (`ExplorerQuery`, `explorer` preset), and `:9070` (`Cipherscan` REST, `explorer` preset), while `ingest_control.listen_addr` keeps its loopback default.
+The unified `ghcr.io/zcashfoundation/zinder` OCI image runs `zinder serve` (or `zinder index` in [deploy/docker-compose.yml](../../deploy/docker-compose.yml)) without a baked-in `/etc/zinder/config.toml`. Compose configures public container listeners on `[::]` with `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true` and publishes loopback host ports for `:9108` (`zinder serve` ops), `:9105` (`zinder index` ops), `:9102` (`WalletQuery`), `:9067` (`CompactTxStreamer`), and `:9068` (`ExplorerQuery`, `explorer` preset); Cipherscan REST (`explorer` preset) binds `127.0.0.1:9070` inside the container and is not published by Compose unless listener and port overrides are added, while `ingest_control.listen_addr` keeps its loopback default (see [Integration surfaces](integration-surfaces.md#endpoints)).
 
 ## Deployment profiles
 

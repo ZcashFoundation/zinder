@@ -33,9 +33,9 @@ Start Zinder on Testnet with Docker Compose (requires an archive node URL in `de
 
 ```bash
 export ZINDER_CONTROL_SECRETS_DIR=/etc/zinder/control-secrets
-sudo install -d -m 0755 "$ZINDER_CONTROL_SECRETS_DIR"
-head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee "$ZINDER_CONTROL_SECRETS_DIR/ingest.token" >/dev/null
-head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee "$ZINDER_CONTROL_SECRETS_DIR/checkpoint.token" >/dev/null
+sudo install -d -o root -g 10001 -m 0750 "$ZINDER_CONTROL_SECRETS_DIR"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin "$ZINDER_CONTROL_SECRETS_DIR/ingest.token"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo install -o root -g 10001 -m 0440 /dev/stdin "$ZINDER_CONTROL_SECRETS_DIR/checkpoint.token"
 sudo install -d -m 0700 /srv/zinder-history/testnet
 sudo ./scripts/prepare-shielded-history.sh /srv/zinder-history/testnet/key-1
 docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml \
