@@ -10,7 +10,8 @@ Zinder serves plaintext gRPC only; keep all gRPC, ops, control, and observabilit
 
 - All `/readyz` endpoints return `200` ([Initial sync](initial-sync.md)) on the host loopback ports in [Processes and canonical ports](deploying.md#what-you-deploy).
 - A public DNS name (`A` and optional `AAAA` records) pointing to the Caddy host, and a certificate/key chain trusted by WebPKI/platform roots for that exact FQDN. (Installing a private CA on a device does not establish that mobile or bundled-root wallets will trust it.)
-- Caddy v2 on the Zinder host and `grpcurl` on an external host. Allow inbound TCP `443` for HTTP/2 and UDP `443` for HTTP/3 through the host firewall and any network firewall, port forward, or container port mapping in front of Caddy. Keep all other Zinder ports closed externally.
+- Caddy on the Zinder host (tested with Caddy 2.11.9) and `grpcurl` on an external host. For QUIC connection migration, use a Caddy build with quic-go 0.50.0 or later. [quic-go server-side path validation](https://github.com/quic-go/quic-go/releases/tag/v0.50.0).
+- Inbound TCP `443` for HTTP/2 and UDP `443` for HTTP/3 through the host firewall and any network firewall, port forward, or container port mapping in front of Caddy. Keep all other Zinder ports closed externally.
 
 ### Configure Caddy
 
@@ -38,7 +39,9 @@ Apply in this exact order so Caddy strips client-supplied headers **before** Zin
 
 The template sets `auto_https off` and uses the supplied certificate. When renewing certificates, replace the files and reload Caddy.
 
-Caddy advertises HTTP/3 on responses over HTTP/2 with an `Alt-Svc` header containing `h3=":443"`. A client that supports QUIC connection migration can keep an active HTTP/3 stream open when a mobile device switches between Wi-Fi and cellular, provided the new path can reach the same Caddy instance. Clients that fall back to HTTP/2 can reach the endpoint over TCP `443` when UDP is blocked. Native gRPC clients that use HTTP/2 continue to negotiate `h2`. [HTTP/3 discovery](https://www.rfc-editor.org/rfc/rfc9114#section-3.1), [QUIC connection migration](https://www.rfc-editor.org/rfc/rfc9000#section-9).
+The template explicitly sets `protocols h1 h2 h3`. Caddy advertises HTTP/3 on responses over HTTP/2 with an `Alt-Svc` header containing `h3=":443"`. Clients that fall back to HTTP/2 can reach the endpoint over TCP `443` when UDP is blocked. Native gRPC clients that use HTTP/2 continue to negotiate `h2`. [HTTP/3 discovery](https://www.rfc-editor.org/rfc/rfc9114#section-3.1).
+
+An active HTTP/3 stream can survive a network change when the client initiates QUIC connection migration and Caddy can validate and switch to the new path. That path must reach the same Caddy instance. Loopback testing covered a change of client IP and port. Physical handoffs between Wi-Fi and cellular remain unverified. [QUIC connection migration](https://www.rfc-editor.org/rfc/rfc9000#section-9).
 
 ## Keep wallets apart in the receive limit
 

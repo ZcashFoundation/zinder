@@ -387,6 +387,7 @@ jobs:
 
       - name: Lint runbook shell blocks
         run: |
+          scripts/test-runbook-lint.sh
           scripts/runbook-lint.sh docs/runbooks/testing.md
           scripts/runbook-lint.sh docs/runbooks/exposing-over-tls.md
 

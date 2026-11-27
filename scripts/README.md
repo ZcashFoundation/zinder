@@ -21,6 +21,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [test-install-ci-tool.sh](test-install-ci-tool.sh) | Self-tests `install-ci-tool.sh` checksum verification and download failures |
 | [test-lthash16-backends.sh](test-lthash16-backends.sh) | Verifies `lthash16` backend equivalence across feature flags |
 | [test-nextest-selectors.sh](test-nextest-selectors.sh) | Verifies `.config/nextest.toml` profile selectors and test tier filters |
+| [test-runbook-lint.sh](test-runbook-lint.sh) | Tests Bash syntax checks for top-level fences and fences inside numbered steps |
 | [test-workflow-action-pins.sh](test-workflow-action-pins.sh) | Verifies every external GitHub Action under `.github/` is pinned to a full commit SHA |
 | [validate-changelog.sh](validate-changelog.sh) | Validates `.changes/unreleased/*.yaml` fragments or the exact PR no-note waiver |
 | [validate-deployment-admission.sh](validate-deployment-admission.sh) | Static policy gate validating deployment classes and Compose, Kubernetes, Prometheus, and release-packaging contracts |

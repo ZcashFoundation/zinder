@@ -32,23 +32,27 @@ fi
 TMPDIR_LINT="$(mktemp -d -t zinder-runbook-lint.XXXXXX)"
 trap 'rm -rf "$TMPDIR_LINT"' EXIT
 
-awk '
-  /^```bash$/ {
+awk -v lint_directory="$TMPDIR_LINT" '
+  !in_block && /^[ \t]*```bash[ \t]*$/ {
+    match($0, /^[ \t]*/)
+    fence_indent = RLENGTH
     in_block = 1
     block_idx += 1
-    out = sprintf("'"$TMPDIR_LINT"'/block-%04d.sh", block_idx)
+    out = sprintf("%s/block-%04d.sh", lint_directory, block_idx)
     next
   }
-  /^```$/ && in_block {
+  in_block && /^[ \t]*```[ \t]*$/ {
+    close(out)
     in_block = 0
-    out = ""
     next
   }
-  in_block && out {
-    print > out
+  in_block {
+    match($0, /^[ \t]*/)
+    indent_to_strip = RLENGTH < fence_indent ? RLENGTH : fence_indent
+    print substr($0, indent_to_strip + 1) > out
   }
   END {
-    print block_idx > "'"$TMPDIR_LINT"'/block-count"
+    print block_idx + 0 > (lint_directory "/block-count")
   }
 ' "$RUNBOOK"
 

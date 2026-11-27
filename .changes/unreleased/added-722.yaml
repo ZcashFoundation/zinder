@@ -1,5 +1,5 @@
 kind: added
-body: The reference Caddy proxy now offers HTTP/3 on UDP port 443 alongside HTTP/2 on TCP. Open UDP port 443 to let compatible wallets keep active connections across Wi-Fi and cellular handoffs.
+body: The reference Caddyfile explicitly configures `protocols h1 h2 h3`. The TLS runbook covers exposing UDP port 443, verifying HTTP/3, and testing HTTP/2 fallback. CI validates the proxy template.
 time: 2026-11-27T22:42:27.123536755Z
 custom:
     Bump: minor
