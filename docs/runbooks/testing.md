@@ -1272,6 +1272,71 @@ check this file on every `ci` run: the quoted `default-filter` must match
 `.config/nextest.toml`, every profile in `RUNBOOK_REFERENCED_PROFILES` must
 exist and appear here, and the capability list must match the code.
 
+## Run Darkside in wallet SDK CI
+
+Use `zinder dev darkside` to serve a deterministic chain to a wallet on a
+Linux or macOS runner. The command uses memory and needs no node, database,
+or Docker. Build the binary with `cargo build --locked -p zinder` if a
+release binary is unavailable for your runner. Start one process per test
+worker. The listener defaults to
+`127.0.0.1:9067` and exits after 1,800 seconds. Use `--listen-addr 127.0.0.1:0`
+for parallel workers and read the bound address from the first stdout line.
+
+```bash
+zinder dev darkside --listen-addr 127.0.0.1:9067 --timeout-secs 120
+```
+
+Point the wallet SDK at the listener over native gRPC with TLS disabled.
+Drive the separate `cash.z.wallet.sdk.rpc.DarksideStreamer` control API from
+the test runner. Native gRPC reflection lets a runner with `grpcurl` try a
+fresh scenario as follows.
+
+```bash
+grpcurl -plaintext -d '{"saplingActivation":100,"branchID":"c2d6d0b4","chainName":"regtest"}' \
+  127.0.0.1:9067 cash.z.wallet.sdk.rpc.DarksideStreamer/Reset
+grpcurl -plaintext -d '{"height":100,"nonce":1,"count":6}' \
+  127.0.0.1:9067 cash.z.wallet.sdk.rpc.DarksideStreamer/StageBlocksCreate
+grpcurl -plaintext -d '{"height":105}' \
+  127.0.0.1:9067 cash.z.wallet.sdk.rpc.DarksideStreamer/ApplyStaged
+grpcurl -plaintext 127.0.0.1:9067 cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock
+```
+
+To test a reorg, stage two blocks starting at height 103 with a different
+nonce and apply height 104. Compare the wallet's responses before and after
+the apply. The new branch keeps heights 100 through 102, replaces 103 and
+104, and drops 105. Present an earlier tip by calling `ApplyStaged` at an
+earlier height with an empty staging area. A later apply can reveal the hidden
+suffix again. Failed applies leave the published chain and staging area intact.
+Call `Reset` to clear a scenario if its staged inputs need replacement.
+
+- Stage serialized blocks as hex with `StageBlocksStream` and transactions
+  as raw bytes with `StageTransactionsStream`. The latter requires the
+  height of the block that will contain each transaction. For URL staging,
+  pass `--fixture-origin` for the HTTP(S) origin that serves the fixture
+  files, with one hex record per line. The server refuses other origins and
+  redirects.
+- Register fixtures with `AddTreeState`, `SetSubtreeRoots`, and
+  `AddAddressUtxo` after applying the relevant blocks. Reads hide entries
+  above the presented tip. Replacing or dropping a block removes the
+  fixtures from the orphaned range. Add replacements explicitly.
+- `SendTransaction` captures successful broadcasts and exposes them in the
+  mempool until mined or reset. `GetIncomingTransactions` drains the capture
+  queue. Set the returned transaction's height to its destination block
+  before staging it. A tip change closes open `GetMempoolStream` calls.
+  Start the server with `--reject-broadcasts` to test a wallet's send
+  failure path using a valid transaction.
+- For browser SDKs, add `--grpc-web-origin http://127.0.0.1:5173` or
+  the origin of the browser test page. Use gRPC-Web for wallet reads
+  and native gRPC from the test runner for client-streaming fixture setup.
+- Keep the listener on loopback where possible. Use
+  `--allow-non-loopback` only on an isolated runner network, such as for a
+  device emulator that needs a non-loopback bind. Any reachable client can
+  change the scenario or shut down the server. Call `Stop` during teardown
+  or let the process exit at its deadline.
+
+Darkside exercises wallet behavior against supplied fixtures. Use the live
+validator lanes to verify consensus and node compatibility.
+
 ## Disposable wallet Regtest fixtures
 
 Select the fixture using the wallet binary's compiled or configured activation
