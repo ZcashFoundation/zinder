@@ -92,14 +92,12 @@ impl ScanShape {
             nullifiers,
             mempool,
         };
-        if pool_types.is_empty() {
-            shape.pools = [false, false, true, true, true];
-        }
         for &pool in pool_types {
             let pool = PoolType::try_from(pool)
                 .map_err(|_| Status::invalid_argument("unknown pool type"))?;
             match pool {
                 PoolType::Invalid => return Err(Status::invalid_argument("invalid pool type")),
+                PoolType::Transparent if nullifiers => {}
                 PoolType::Transparent
                 | PoolType::Sapling
                 | PoolType::Orchard
@@ -107,6 +105,9 @@ impl ScanShape {
                     shape.pools[pool as usize] = true;
                 }
             }
+        }
+        if !shape.pools.into_iter().any(|selected| selected) {
+            shape.pools = [false, false, true, true, true];
         }
         Ok(shape)
     }
@@ -622,5 +623,30 @@ impl CompactTxStreamer for Darkside {
             })?;
         tokio::time::sleep(Duration::from_micros(micros)).await;
         Ok(Response::new(PingResponse { entry: 1, exit: 0 }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScanShape;
+    use zinder_proto::compat::lightwalletd::{CompactSaplingSpend, CompactTx, PoolType, TxOut};
+
+    #[test]
+    fn nullifier_range_with_only_transparent_selection_uses_shielded_defaults() -> eyre::Result<()>
+    {
+        let spend = CompactSaplingSpend { nf: vec![17; 32] };
+        let mut tx = CompactTx {
+            spends: vec![spend.clone()],
+            vout: vec![TxOut {
+                value: 1,
+                script_pub_key: vec![0x51],
+            }],
+            ..CompactTx::default()
+        };
+        let shape = ScanShape::select(&[PoolType::Transparent.into()], true, false)?;
+        assert!(shape.project(&mut tx));
+        assert_eq!(tx.spends, [spend]);
+        assert_eq!(tx.vout, Vec::<TxOut>::new());
+        Ok(())
     }
 }
