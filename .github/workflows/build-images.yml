@@ -25,6 +25,7 @@ on:
       - "deploy/kubernetes/**"
       - "scripts/validate-deployment-admission.sh"
       - "scripts/test-deployment-admission.sh"
+      - "scripts/render-personal-compose.sh"
       - "buf.yaml"
       - ".github/workflows/build-images.yml"
   push:
@@ -48,6 +49,7 @@ on:
       - "deploy/kubernetes/**"
       - "scripts/validate-deployment-admission.sh"
       - "scripts/test-deployment-admission.sh"
+      - "scripts/render-personal-compose.sh"
       - "buf.yaml"
       - ".github/workflows/build-images.yml"
   workflow_dispatch:

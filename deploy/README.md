@@ -19,8 +19,8 @@ Single-container deployments run `zinder serve --preset <preset>` (writer + read
 [personal/compose.yaml](personal/compose.yaml) runs a bundled archive Zebra node
 alongside `zinder serve --preset light-wallet`. It limits Zinder to 8 GiB by
 default, gives Zinder one persistent volume, and publishes wallet and ops ports
-on host loopback. The signed manifest is available from the release as
-`zinder-personal-compose.yaml`. Follow the
+on host loopback. Download `zinder-personal-compose.yaml` from the release
+for a signed manifest with both images pinned by digest. Follow the
 [personal-node runbook](../docs/runbooks/deploying.md#personal-node-compose)
 to size, start, verify, and stop the stack.
 

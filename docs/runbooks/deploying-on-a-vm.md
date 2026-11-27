@@ -270,19 +270,23 @@ Verify with GitHub CLI 2.94+ and Cosign:
 ```bash
 release=vX.Y.Z
 platform=x86_64-v3-unknown-linux-gnu
-gh release download "$release" --repo ZcashFoundation/zinder \
-  --pattern "zinder-${release#v}-${platform}.tar.gz" \
-  --pattern "zinder-${release#v}-${platform}.spdx.json" \
-  --pattern SHA256SUMS --pattern SHA256SUMS.sigstore.json
-cosign verify-blob --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity "https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/${release}" \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  SHA256SUMS
 archive="zinder-${release#v}-${platform}.tar.gz"
-awk -v archive="$archive" '$2 == archive { print; found = 1 } END { if (!found) exit 1 }' \
-  SHA256SUMS > archive.sha256
-shasum -a 256 -c archive.sha256
-tar -xzf "$archive"
+sbom="zinder-${release#v}-${platform}.spdx.json"
+
+gh release download "$release" --repo ZcashFoundation/zinder \
+  --pattern "$archive" --pattern "$sbom" \
+  --pattern SHA256SUMS --pattern SHA256SUMS.sigstore.json &&
+  cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+    --certificate-identity "https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/${release}" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    SHA256SUMS &&
+  checksums="$(awk -v archive="$archive" -v sbom="$sbom" '
+    $2 == archive { print; archive_count++ }
+    $2 == sbom { print; sbom_count++ }
+    END { if (archive_count != 1 || sbom_count != 1) exit 1 }
+  ' SHA256SUMS)" &&
+  shasum -a 256 -c <<< "$checksums" &&
+  tar -xzf "$archive"
 ```
 
 On macOS, run the verified `bin/zinder` from the extracted directory.

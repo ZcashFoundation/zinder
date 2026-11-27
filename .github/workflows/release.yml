@@ -834,6 +834,8 @@ jobs:
       packages: write
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      verified_zinder_image_digest: ${{ steps.verified-image.outputs.zinder_image_digest }}
     strategy:
       fail-fast: false
       matrix:
@@ -980,6 +982,7 @@ jobs:
         run: cosign sign --yes "${IMAGE}@${ROOT_DIGEST}"
 
       - name: Verify image signature and attestations
+        id: verified-image
         env:
           AMD64_DIGEST: ${{ steps.evidence.outputs.amd64_digest }}
           ARM64_DIGEST: ${{ steps.evidence.outputs.arm64_digest }}
@@ -1000,6 +1003,9 @@ jobs:
             --workflow release.yml \
             --tag "$RELEASE_TAG" \
             --commit "$BUILD_GIT_COMMIT"
+          if [[ "$IMAGE" == */zinder ]]; then
+            printf 'zinder_image_digest=%s\n' "$ROOT_DIGEST" >> "$GITHUB_OUTPUT"
+          fi
 
   assemble-and-sign:
     name: assemble and sign release assets
@@ -1046,6 +1052,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          ZINDER_IMAGE_DIGEST: ${{ needs.merge.outputs.verified_zinder_image_digest }}
         run: |
           set -euo pipefail
 
@@ -1063,7 +1070,8 @@ jobs:
               "zinder-personal-compose.yaml" \
               "zinder.v1.descriptor.bin"
           })"
-          cp deploy/personal/compose.yaml dist/release-assets/zinder-personal-compose.yaml
+          scripts/render-personal-compose.sh "$ZINDER_IMAGE_DIGEST" \
+            > dist/release-assets/zinder-personal-compose.yaml
           actual="$(find dist/release-assets -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
           [[ "$actual" == "$expected" ]] || {
             echo "release asset candidates differ from the exact catalog" >&2

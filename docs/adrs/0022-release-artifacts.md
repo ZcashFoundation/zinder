@@ -84,8 +84,8 @@ The release procedure and how operators verify a download are in
 - x86 hosts without AVX2 or ADX can use the baseline GNU/Linux archive.
   The AMD64 OCI image continues to use the optimized x86-64-v3 archive.
 - The personal-node Compose manifest is a release asset covered by the signed
-  `SHA256SUMS`. It uses the standard OCI image and the single-volume RocksDB
-  topology. See [Deploying Zinder](../runbooks/deploying.md#personal-node-compose)
+  `SHA256SUMS`. It pins both images by digest. The Zinder image digest comes
+  from the verified multi-platform release index. See [Deploying Zinder](../runbooks/deploying.md#personal-node-compose)
   for sizing and operating instructions.
 - A binary that fails to build, reproduce, or package stops the whole
   release before any crate, image, or GitHub Release is published.

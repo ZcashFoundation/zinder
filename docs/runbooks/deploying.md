@@ -81,14 +81,14 @@ headroom and [Zebra's separate disk budget](https://zebra.zfnd.org/user/requirem
    asset with GitHub CLI before you start it.
 
    ```bash
-   export ZINDER_VERSION=vX.Y.Z
-   gh release download "$ZINDER_VERSION" --repo ZcashFoundation/zinder \
+   release=vX.Y.Z
+   gh release download "$release" --repo ZcashFoundation/zinder \
      --pattern zinder-personal-compose.yaml
-   gh release verify-asset "$ZINDER_VERSION" zinder-personal-compose.yaml \
+   gh release verify-asset "$release" zinder-personal-compose.yaml \
      --repo ZcashFoundation/zinder
    ```
 
-2. Start the bundle.
+2. Start the bundle. The release manifest pins both images by digest.
 
    ```bash
    docker compose -f zinder-personal-compose.yaml up -d

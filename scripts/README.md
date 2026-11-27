@@ -44,6 +44,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [package-release-images.sh](package-release-images.sh) | Packages and manifests `ghcr.io/zcashfoundation/zinder` OCI release images |
 | [prepare-changelog-release.sh](prepare-changelog-release.sh) | Rolls pending `.changes/unreleased/*.yaml` fragments into `CHANGELOG.md` for a release |
 | [release-binary-platform.sh](release-binary-platform.sh) | Resolves release platform names, CPU baselines, and native library metadata for the archive scripts |
+| [render-personal-compose.sh](render-personal-compose.sh) | Renders the release Compose asset with both images pinned by digest |
 | [resolve-release-image-manifest.sh](resolve-release-image-manifest.sh) | Resolves `deploy/release-images.json` into concrete image build matrix entries |
 | [test-github-release-lookup.sh](test-github-release-lookup.sh) | Unit-tests `find-github-release.sh` |
 | [test-release-binary-archive.sh](test-release-binary-archive.sh) | Unit-tests `build-release-binary-archive.sh` and `check-release-binary-archive.sh` |

@@ -794,22 +794,13 @@ impl VerifiedDir {
     pub(super) fn list_entry_names(&self) -> Result<Vec<String>, SettledSegmentsError> {
         #[cfg(unix)]
         {
-            use rustix::fs::{Mode, OFlags, RawDir, openat};
+            use rustix::fs::Dir;
 
-            let iter_fd = openat(
-                &self.fd,
-                ".",
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(io::Error::from)?;
             let mut names = Vec::new();
-            let mut buf = [std::mem::MaybeUninit::uninit(); 8192];
-            let mut dir = RawDir::new(&iter_fd, &mut buf);
-            while let Some(next_entry) = dir.next() {
-                let entry = next_entry.map_err(io::Error::from)?;
+            for entry in Dir::read_from(&self.fd).map_err(io::Error::from)? {
+                let entry = entry.map_err(io::Error::from)?;
                 let raw_name = entry.file_name().to_bytes();
-                if raw_name == b"." || raw_name == b".." {
+                if matches!(raw_name, b"." | b"..") {
                     continue;
                 }
                 let name = std::str::from_utf8(raw_name).map_err(|_| {
