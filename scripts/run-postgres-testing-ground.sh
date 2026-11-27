@@ -269,15 +269,26 @@ verify_postgres_version() {
   grep -q '^auth_type|scram-sha-256|' <<<"${pgb_cfg}"
   grep -q '^max_prepared_statements|0|' <<<"${pgb_cfg}"
 
-  local max_server_conns distinct_pids
-  distinct_pids="$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD=zinder_reader_local_only postgres \
-    bash -c '
+  local probe_output probe_rows distinct_pids max_server_conns
+  probe_output="$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD=zinder_reader_local_only postgres \
+    bash -euo pipefail -c '
+      pids=()
       for i in 1 2 3 4 5 6 7 8; do
-        psql -w -h pgbouncer -p 6432 -U zinder_reader -d zinder_testing -Atc \
+        psql -v ON_ERROR_STOP=1 -w -h pgbouncer -p 6432 -U zinder_reader -d zinder_testing -Atc \
           "SELECT pg_backend_pid(), count(*) FROM zinder.topology_probe; SELECT pg_sleep(0.05); SELECT pg_backend_pid();" &
+        pids+=("$!")
       done
-      wait
-    ' | awk -F'|' 'NF == 2 {print $1}' | sort -u | wc -l)"
+      for pid in "${pids[@]}"; do
+        wait "${pid}"
+      done
+    ' | tr -d '\r')"
+  probe_rows="$(awk -F'|' 'NF == 2 {print $1}' <<<"${probe_output}")"
+  if [[ "$(wc -l <<<"${probe_rows}")" -ne 8 ]]; then
+    echo "PgBouncer concurrent pooling expected 8 probe rows, got:" >&2
+    printf '%s\n' "${probe_output}" >&2
+    return 1
+  fi
+  distinct_pids="$(sort -u <<<"${probe_rows}" | wc -l)"
   max_server_conns="$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD=zinder_admin_local_only pgbouncer \
     psql -w -h 127.0.0.1 -p 6432 -U zinder_admin -d pgbouncer -Atc "SHOW POOLS;" | awk -F'|' '$1 == "zinder_testing" {print $5 + $6 + $7; exit}')"
   if [[ -z "${distinct_pids}" || "${distinct_pids}" -lt 1 || "${distinct_pids}" -gt 4 ]]; then
@@ -350,10 +361,12 @@ for svc in ("probe-reader-a", "probe-reader-b"):
     binds = [m for m in inspected["Mounts"] if m["Type"] != "bind" or not m["Source"].endswith("probe_replica.py")]
     assert not binds, f"{svc} must have zero persistent volumes, got {binds}"
 
-# 2. Check /healthz & /readyz across proxy.
+# 2. Check /healthz & /readyz across proxy (readyz must verify PgBouncer TCP reachability).
 for path in ("/healthz", "/readyz"):
     code, _, body = http_json("GET", f"{http_base}{path}")
     assert code == 200 and body["readonly_rootfs"] is True and body["local_db_files"] == [], body
+    if path == "/readyz":
+        assert body["pgbouncer_tcp_reachable"] is True, body
 
 # 3. Mock R2 immutable PUT / GET / Range / HEAD persistence / fault injection.
 payload = b"zinder-settled-segment-0001-" * 8
@@ -588,12 +601,24 @@ PY
 }
 
 cd "${REPO_ROOT}"
-verify_compose_definitions
 
+CURRENT_STAGE="postgres_version_validation"
 IFS=',' read -r -a VERSION_ARRAY <<<"${POSTGRES_VERSIONS}"
+EFFECTIVE_VERSIONS=()
 for raw_ver in "${VERSION_ARRAY[@]}"; do
   pg_ver="$(echo "${raw_ver}" | tr -d '[:space:]')"
-  [[ -n "${pg_ver}" ]] || continue
+  if [[ -n "${pg_ver}" ]]; then
+    EFFECTIVE_VERSIONS+=("${pg_ver}")
+  fi
+done
+if (( ${#EFFECTIVE_VERSIONS[@]} == 0 )); then
+  echo "--postgres-versions must specify at least one version (supported: 18, 17)" >&2
+  exit 2
+fi
+
+verify_compose_definitions
+
+for pg_ver in "${EFFECTIVE_VERSIONS[@]}"; do
   verify_postgres_version "${pg_ver}"
 done
 

@@ -628,11 +628,17 @@ class ProbeReplicaHandler(BaseHTTPRequestHandler):
             ro = is_rootfs_read_only()
             db_files = local_database_entries()
             pg_ok = pgbouncer_tcp_reachable()
-            status = HTTPStatus.OK if (ro and not db_files) else HTTPStatus.SERVICE_UNAVAILABLE
+            if parsed.path == "/healthz":
+                is_ok = ro and not db_files
+                status_label = "ok" if is_ok else "unhealthy"
+            else:
+                is_ok = ro and not db_files and pg_ok
+                status_label = "ok" if is_ok else "not_ready"
+            status = HTTPStatus.OK if is_ok else HTTPStatus.SERVICE_UNAVAILABLE
             self._send_json(
                 status,
                 {
-                    "status": "ok" if status == HTTPStatus.OK else "unhealthy",
+                    "status": status_label,
                     "replica_id": REPLICA_ID,
                     "readonly_rootfs": ro,
                     "local_db_files": db_files,

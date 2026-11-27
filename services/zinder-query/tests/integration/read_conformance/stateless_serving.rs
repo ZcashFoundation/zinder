@@ -1,8 +1,12 @@
 //! Engine-neutral conformance tests for stateless multi-instance wallet readers.
 
-use std::{net::SocketAddr, num::NonZeroU32, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, net::SocketAddr, num::NonZeroU32, ops::Bound, pin::Pin, sync::Arc,
+    time::Duration,
+};
 
 use eyre::{ensure, eyre};
+use parking_lot::RwLock;
 use tokio::net::TcpListener;
 use tokio_stream::{Stream, StreamExt as _, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
@@ -14,7 +18,9 @@ use zinder_core::{
     BlockHeight, BlockId, ChainEpoch, CompactTransactionData, MempoolEntry, MempoolObservation,
     Network, RawTransactionBytes, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
     TransparentUnspentOutput, UnixTimestampMillis,
-    wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name},
+    wire::{
+        encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex, encode_zinder_native_chain_name,
+    },
 };
 use zinder_proto::{
     CONTRACT_REVISION,
@@ -267,78 +273,185 @@ async fn verify_chain_event_continuity(
     Ok(())
 }
 
-struct SharedKeyMempoolIngest {
-    cursor_auth_key: [u8; 32],
-    chain_epoch: ChainEpoch,
-    entries: Vec<MempoolEntry>,
+struct SharedKeyMempoolState {
+    entries: BTreeMap<TransactionId, MempoolEntry>,
     envelopes: Vec<MempoolEventEnvelope>,
 }
 
-impl SharedKeyMempoolIngest {
+#[derive(Clone)]
+struct SharedKeyMempoolHandle {
+    cursor_auth_key: [u8; 32],
+    chain_epoch: ChainEpoch,
+    state: Arc<RwLock<SharedKeyMempoolState>>,
+}
+
+struct SharedKeyMempoolIngest {
+    handle: SharedKeyMempoolHandle,
+}
+
+fn build_mempool_added_entry(
+    seq: u64,
+    tx_id: TransactionId,
+    chain_epoch: ChainEpoch,
+    cursor_auth_key: [u8; 32],
+) -> eyre::Result<(MempoolEntry, MempoolEventEnvelope)> {
+    let fill_byte = u8::try_from(seq & 0xFF).unwrap_or(1);
+    let observed_ms = 1_700_000_000_000 + seq;
+    let entry = MempoolEntry::new(
+        tx_id,
+        None,
+        RawTransactionBytes::new(vec![fill_byte; 96]),
+        CompactTransactionData::default(),
+        MempoolObservation {
+            first_seen_unix_millis: UnixTimestampMillis::new(observed_ms),
+            first_seen_chain_epoch: chain_epoch,
+        },
+    )?;
+    let cursor =
+        StreamCursorTokenV1::mempool_event(Network::ZcashRegtest, seq, tx_id, cursor_auth_key)?;
+    let envelope = MempoolEventEnvelope {
+        cursor,
+        event_sequence: seq,
+        source_observed_unix_millis: observed_ms,
+        event: MempoolEvent::Added {
+            entry: entry.clone(),
+        },
+    };
+    Ok((entry, envelope))
+}
+
+impl SharedKeyMempoolHandle {
     fn create(cursor_auth_key: [u8; 32], chain_epoch: ChainEpoch) -> eyre::Result<Self> {
-        let mut entries = Vec::with_capacity(3);
+        let mut entries = BTreeMap::new();
         let mut envelopes = Vec::with_capacity(3);
-        for index in 1_u8..=3_u8 {
-            let tx_id = synthetic_tx_id(0x55, u32::from(index));
-            let entry = MempoolEntry::new(
-                tx_id,
-                None,
-                RawTransactionBytes::new(vec![index; 96]),
-                CompactTransactionData::default(),
-                MempoolObservation {
-                    first_seen_unix_millis: UnixTimestampMillis::new(
-                        1_700_000_000_000 + u64::from(index),
-                    ),
-                    first_seen_chain_epoch: chain_epoch,
-                },
-            )?;
-            let cursor = StreamCursorTokenV1::mempool_event(
-                Network::ZcashRegtest,
-                u64::from(index),
-                tx_id,
-                cursor_auth_key,
-            )?;
-            envelopes.push(MempoolEventEnvelope {
-                cursor,
-                event_sequence: u64::from(index),
-                source_observed_unix_millis: 1_700_000_000_000 + u64::from(index),
-                event: MempoolEvent::Added {
-                    entry: entry.clone(),
-                },
-            });
-            entries.push(entry);
+        for index in 1_u32..=3_u32 {
+            let tx_id = synthetic_tx_id(0x55, index);
+            let (entry, envelope) =
+                build_mempool_added_entry(u64::from(index), tx_id, chain_epoch, cursor_auth_key)?;
+            entries.insert(tx_id, entry);
+            envelopes.push(envelope);
         }
         Ok(Self {
             cursor_auth_key,
             chain_epoch,
-            entries,
-            envelopes,
+            state: Arc::new(RwLock::new(SharedKeyMempoolState { entries, envelopes })),
         })
     }
 
-    fn anchor(&self) -> eyre::Result<MempoolEventPosition> {
-        let first = self
-            .envelopes
-            .first()
-            .ok_or_else(|| eyre!("expected seeded mempool event"))?;
-        Ok(MempoolEventPosition {
-            event_sequence: first.event_sequence,
-            transaction_id: self.entries[0].transaction_id(),
-        })
+    fn push_added_event(&self, tx_id: TransactionId) -> eyre::Result<u64> {
+        let mut guard = self.state.write();
+        let next_seq = u64::try_from(guard.envelopes.len() + 1)?;
+        let (entry, envelope) =
+            build_mempool_added_entry(next_seq, tx_id, self.chain_epoch, self.cursor_auth_key)?;
+        guard.entries.insert(tx_id, entry);
+        guard.envelopes.push(envelope);
+        drop(guard);
+        Ok(next_seq)
     }
 
-    fn decode_page_start(&self, cursor_bytes: Vec<u8>) -> Result<usize, Status> {
+    fn resolve_snapshot_start(
+        &self,
+        guard: &SharedKeyMempoolState,
+        cursor_bytes: Vec<u8>,
+    ) -> Result<(Option<TransactionId>, Option<MempoolEventPosition>), Status> {
+        let current_head = guard.envelopes.last().map(MempoolEventEnvelope::position);
+        let current_seq = current_head.map_or(0, |head| head.event_sequence);
         if cursor_bytes.is_empty() {
-            return Ok(0);
+            return Ok((None, current_head));
         }
         let decoded = StreamCursorTokenV1::from_bytes(cursor_bytes)
             .decode_snapshot_page(Network::ZcashRegtest, self.cursor_auth_key)
             .map_err(|_| Status::invalid_argument("snapshot cursor rejected by shared key"))?;
-        self.entries
-            .iter()
-            .position(|entry| entry.transaction_id() == decoded.after_transaction_id)
-            .map(|pos| pos + 1)
-            .ok_or_else(|| Status::invalid_argument("snapshot cursor anchor missing"))
+        if decoded
+            .events_resume_anchor
+            .is_some_and(|anchor| anchor.event_sequence > current_seq)
+        {
+            return Err(Status::failed_precondition("snapshot cursor expired"));
+        }
+        if !guard.entries.contains_key(&decoded.after_transaction_id) {
+            return Err(Status::invalid_argument("snapshot cursor anchor missing"));
+        }
+        Ok((
+            Some(decoded.after_transaction_id),
+            decoded.events_resume_anchor,
+        ))
+    }
+
+    fn collect_snapshot_page<'a>(
+        guard: &'a SharedKeyMempoolState,
+        after_tx_id: Option<TransactionId>,
+        limit: usize,
+    ) -> (Vec<&'a MempoolEntry>, bool) {
+        let iter: Box<dyn Iterator<Item = &'a MempoolEntry> + 'a> = match after_tx_id {
+            None => Box::new(guard.entries.values()),
+            Some(tx_id) => Box::new(
+                guard
+                    .entries
+                    .range((Bound::Excluded(tx_id), Bound::Unbounded))
+                    .map(|(_id, entry)| entry),
+            ),
+        };
+        let mut selected: Vec<&'a MempoolEntry> = iter.take(limit.saturating_add(1)).collect();
+        let has_more = selected.len() > limit;
+        if has_more {
+            selected.truncate(limit);
+        }
+        (selected, has_more)
+    }
+
+    fn build_snapshot_response(
+        &self,
+        req: wallet::MempoolSnapshotRequest,
+    ) -> Result<wallet::MempoolSnapshotResponse, Status> {
+        let guard = self.state.read();
+        let (after_tx_id, events_resume_anchor) =
+            self.resolve_snapshot_start(&guard, req.from_cursor)?;
+        let limit = usize::try_from(req.max_entries.max(1)).unwrap_or(1);
+        let (page_entries, has_more) = Self::collect_snapshot_page(&guard, after_tx_id, limit);
+        let resume_cursor_bytes = events_resume_anchor
+            .map(|anchor| {
+                StreamCursorTokenV1::mempool_event(
+                    Network::ZcashRegtest,
+                    anchor.event_sequence,
+                    anchor.transaction_id,
+                    self.cursor_auth_key,
+                )
+                .map(|token| token.as_bytes().to_vec())
+                .map_err(|error| Status::internal(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let trailing_cursor = match (has_more, page_entries.last()) {
+            (true, Some(last_entry)) => StreamCursorTokenV1::snapshot_page(
+                SnapshotPageCursorAnchor {
+                    network: Network::ZcashRegtest,
+                    events_resume_anchor,
+                    after_transaction_id: last_entry.transaction_id(),
+                },
+                self.cursor_auth_key,
+            )
+            .map_err(|error| Status::internal(error.to_string()))?
+            .as_bytes()
+            .to_vec(),
+            _ => Vec::new(),
+        };
+        Ok(wallet::MempoolSnapshotResponse {
+            chain_view: Some(wallet::ChainView {
+                chain_epoch: Some(chain_epoch_message(self.chain_epoch)),
+                ..wallet::ChainView::default()
+            }),
+            events_resume_cursor: resume_cursor_bytes,
+            snapshot_age_millis: 1,
+            entries: page_entries
+                .into_iter()
+                .map(mempool_entry_message)
+                .collect(),
+            next_cursor: trailing_cursor,
+            source_tip: Some(wallet::BlockTip {
+                height: self.chain_epoch.visible_tip_height.value(),
+                hash: encode_rpc_block_hash_hex(self.chain_epoch.visible_tip_hash),
+            }),
+        })
     }
 }
 
@@ -378,7 +491,7 @@ impl IngestControl for SharedKeyMempoolIngest {
     ) -> Result<Response<ingest::WriterStatusResponse>, Status> {
         Ok(Response::new(ingest::WriterStatusResponse {
             chain_view: Some(wallet::ChainView {
-                chain_epoch: Some(chain_epoch_message(self.chain_epoch)),
+                chain_epoch: Some(chain_epoch_message(self.handle.chain_epoch)),
                 ..wallet::ChainView::default()
             }),
             network_name: encode_zinder_native_chain_name(Network::ZcashRegtest).to_owned(),
@@ -399,51 +512,9 @@ impl IngestControl for SharedKeyMempoolIngest {
         &self,
         request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
-        let req = request.into_inner();
-        let start_idx = self.decode_page_start(req.from_cursor)?;
-        let limit = usize::try_from(req.max_entries.max(1)).unwrap_or(1);
-        let end_idx = start_idx.saturating_add(limit).min(self.entries.len());
-        let page_entries = &self.entries[start_idx..end_idx];
-        let anchor = self
-            .anchor()
-            .map_err(|error| Status::internal(error.to_string()))?;
-        let resume_cursor = StreamCursorTokenV1::mempool_event(
-            Network::ZcashRegtest,
-            anchor.event_sequence,
-            anchor.transaction_id,
-            self.cursor_auth_key,
-        )
-        .map_err(|error| Status::internal(error.to_string()))?;
-        let trailing_cursor = if end_idx < self.entries.len() {
-            let last_entry = &page_entries[page_entries.len() - 1];
-            StreamCursorTokenV1::snapshot_page(
-                SnapshotPageCursorAnchor {
-                    network: Network::ZcashRegtest,
-                    events_resume_anchor: Some(anchor),
-                    after_transaction_id: last_entry.transaction_id(),
-                },
-                self.cursor_auth_key,
-            )
-            .map_err(|error| Status::internal(error.to_string()))?
-            .as_bytes()
-            .to_vec()
-        } else {
-            Vec::new()
-        };
-        Ok(Response::new(wallet::MempoolSnapshotResponse {
-            chain_view: Some(wallet::ChainView {
-                chain_epoch: Some(chain_epoch_message(self.chain_epoch)),
-                ..wallet::ChainView::default()
-            }),
-            events_resume_cursor: resume_cursor.as_bytes().to_vec(),
-            snapshot_age_millis: 1,
-            entries: page_entries.iter().map(mempool_entry_message).collect(),
-            next_cursor: trailing_cursor,
-            source_tip: Some(wallet::BlockTip {
-                height: self.chain_epoch.visible_tip_height.value(),
-                hash: encode_rpc_block_hash_hex(self.chain_epoch.visible_tip_hash),
-            }),
-        }))
+        self.handle
+            .build_snapshot_response(request.into_inner())
+            .map(Response::new)
     }
 
     async fn mempool_transaction(
@@ -461,19 +532,20 @@ impl IngestControl for SharedKeyMempoolIngest {
     ) -> Result<Response<Self::MempoolEventsStream>, Status> {
         let start = event_stream_start_from_message(request.into_inner().start)
             .ok_or_else(|| Status::invalid_argument("mempool events start required"))?;
+        let guard = self.handle.state.read();
         let min_sequence = match start {
             EventStreamStartPosition::EarliestRetained => 0,
             EventStreamStartPosition::LiveTail => {
-                self.envelopes.last().map_or(0, |env| env.event_sequence)
+                guard.envelopes.last().map_or(0, |env| env.event_sequence)
             }
             EventStreamStartPosition::AfterCursor(cursor) => {
                 cursor
-                    .decode_mempool_event(Network::ZcashRegtest, self.cursor_auth_key)
+                    .decode_mempool_event(Network::ZcashRegtest, self.handle.cursor_auth_key)
                     .map_err(|_| Status::invalid_argument("mempool event cursor rejected"))?
                     .event_sequence
             }
         };
-        let encoded = self
+        let encoded = guard
             .envelopes
             .iter()
             .filter(|env| env.event_sequence > min_sequence)
@@ -482,6 +554,7 @@ impl IngestControl for SharedKeyMempoolIngest {
                     .map_err(|error| Status::internal(error.to_string()))
             })
             .collect::<Vec<_>>();
+        drop(guard);
         Ok(Response::new(Box::pin(tokio_stream::iter(encoded))))
     }
 
@@ -498,10 +571,17 @@ impl IngestControl for SharedKeyMempoolIngest {
 async fn spawn_shared_key_ingest(
     chain_epoch: ChainEpoch,
     cancel: &CancellationToken,
-) -> eyre::Result<(String, tokio::task::JoinHandle<eyre::Result<()>>)> {
+) -> eyre::Result<(
+    String,
+    SharedKeyMempoolHandle,
+    tokio::task::JoinHandle<eyre::Result<()>>,
+)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", listener.local_addr()?);
-    let ingest = SharedKeyMempoolIngest::create(SHARED_CURSOR_AUTH_KEY, chain_epoch)?;
+    let handle = SharedKeyMempoolHandle::create(SHARED_CURSOR_AUTH_KEY, chain_epoch)?;
+    let ingest = SharedKeyMempoolIngest {
+        handle: handle.clone(),
+    };
     let shutdown = cancel.clone();
     let task = tokio::spawn(async move {
         Server::builder()
@@ -513,7 +593,7 @@ async fn spawn_shared_key_ingest(
             .await?;
         Ok(())
     });
-    Ok((endpoint, task))
+    Ok((endpoint, handle, task))
 }
 
 async fn connect_adapter_replica<H: WalletReaderHarness>(
@@ -552,12 +632,13 @@ pub(crate) async fn cross_instance_mempool_snapshot_and_events_continue_with_sha
     )?;
     let published_epoch = harness.canonical_reader()?.chain_epoch();
     let cancel = CancellationToken::new();
-    let (ingest_endpoint, ingest_task) = spawn_shared_key_ingest(published_epoch, &cancel).await?;
+    let (ingest_endpoint, ingest_handle, ingest_task) =
+        spawn_shared_key_ingest(published_epoch, &cancel).await?;
 
     let adapter_a = connect_adapter_replica(&mut harness, &ingest_endpoint).await?;
     let adapter_b = connect_adapter_replica(&mut harness, &ingest_endpoint).await?;
 
-    verify_cross_instance_mempool_paging(&adapter_a, &adapter_b).await?;
+    verify_cross_instance_mempool_paging(&adapter_a, &adapter_b, &ingest_handle).await?;
     verify_forged_mempool_cursors_rejected(&adapter_a, &adapter_b).await?;
 
     cancel.cancel();
@@ -568,7 +649,13 @@ pub(crate) async fn cross_instance_mempool_snapshot_and_events_continue_with_sha
 async fn verify_cross_instance_mempool_paging(
     adapter_a: &WalletQueryGrpcAdapter<IngestConnectedWalletQuery>,
     adapter_b: &WalletQueryGrpcAdapter<IngestConnectedWalletQuery>,
+    ingest_handle: &SharedKeyMempoolHandle,
 ) -> eyre::Result<()> {
+    let injected_tx_id = synthetic_tx_id(0x10, 0);
+    ensure!(
+        injected_tx_id < synthetic_tx_id(0x55, 1),
+        "injected transaction id must sort before seeded snapshot keys"
+    );
     let mut snapshot_txids = Vec::new();
     let mut page_cursor = Vec::new();
     let mut resume_event_cursor = Vec::new();
@@ -583,8 +670,18 @@ async fn verify_cross_instance_mempool_paging(
         )
         .await?
         .into_inner();
-        if resume_event_cursor.is_empty() {
+        if step == 0 {
             resume_event_cursor = page.events_resume_cursor.clone();
+            let injected_seq = ingest_handle.push_added_event(injected_tx_id)?;
+            ensure!(
+                injected_seq == 4,
+                "expected injected sequence 4, got {injected_seq}"
+            );
+        } else {
+            ensure!(
+                page.events_resume_cursor == resume_event_cursor,
+                "snapshot page {step} must preserve initial event-head anchor cursor"
+            );
         }
         for entry in page.entries {
             snapshot_txids.push(entry.transaction_id);
@@ -596,7 +693,7 @@ async fn verify_cross_instance_mempool_paging(
     }
     ensure!(
         snapshot_txids.len() == 3,
-        "expected 3 paged mempool snapshot entries, got {}",
+        "expected 3 seeded mempool snapshot entries, got {}",
         snapshot_txids.len()
     );
 
@@ -611,13 +708,21 @@ async fn verify_cross_instance_mempool_paging(
     )
     .await?
     .into_inner();
-    let mut sequences = Vec::new();
+    let mut streamed = Vec::new();
     while let Some(envelope_res) = stream.next().await {
-        sequences.push(envelope_res?.event_sequence);
+        let envelope = envelope_res?;
+        let txid = match envelope.event {
+            Some(wallet::mempool_event_envelope::Event::Added(added)) => {
+                added.entry.map_or_default(|entry| entry.transaction_id)
+            }
+            other => return Err(eyre!("expected Added mempool event, got {other:?}")),
+        };
+        streamed.push((envelope.event_sequence, txid));
     }
+    let expected_injected_hex = encode_rpc_transaction_id_hex(injected_tx_id);
     ensure!(
-        sequences == vec![2, 3],
-        "expected events [2, 3] after shared snapshot resume cursor on adapter B, got {sequences:?}"
+        streamed == vec![(4_u64, expected_injected_hex)],
+        "expected concurrent arrival [4] after initial snapshot anchor on adapter B, got {streamed:?}"
     );
     Ok(())
 }

@@ -869,7 +869,7 @@ fn workspace_root_dir() -> eyre::Result<PathBuf> {
     if let Some(root) = std::env::var_os("NEXTEST_WORKSPACE_ROOT") {
         return Ok(PathBuf::from(root));
     }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = zinder_testkit::manifest_dir!();
     manifest_dir
         .parent()
         .and_then(Path::parent)
