@@ -4764,7 +4764,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address_a, address_b.clone()],
         start_height: 1,
-        max_entries: 2,
+        max_entries: 3,
     };
     let list_response = adapter
         .get_address_utxos(Request::new(request.clone()))

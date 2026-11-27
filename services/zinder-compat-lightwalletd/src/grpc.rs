@@ -19,6 +19,7 @@ use thiserror::Error;
 use tokio_stream as stream;
 use tokio_stream::StreamExt as _;
 use tonic::{Request, Response, Status};
+use tonic_types::{ErrorDetails, StatusExt as _};
 use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHeight, BlockSelector, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
@@ -127,7 +128,7 @@ pub struct LightwalletdResponseLimits {
     /// Most UTXOs one `GetAddressUtxos` or `GetAddressUtxosStream` response
     /// returns.
     ///
-    /// A positive `maxEntries` finishes the height containing that entry.
+    /// A positive `maxEntries` caps the page at a complete height.
     /// Zero requests every matching UTXO. A page that exceeds this bound
     /// fails with `RESOURCE_EXHAUSTED`.
     pub max_address_utxos: NonZeroU32,
@@ -1987,6 +1988,7 @@ impl AddressUtxoMerge {
             return Ok(Vec::new());
         };
         let height = first.reply.height;
+        let first_height = self.budget.entries == 0;
         let mut outputs = Vec::new();
         while let Some(Reverse(next_output)) = self
             .next_outputs
@@ -1994,9 +1996,16 @@ impl AddressUtxoMerge {
             .filter(|next_output| next_output.0.reply.height == height)
             .map(PeekMut::pop)
         {
+            if !first_height && self.max_entries == Some(self.budget.entries) {
+                self.ended = true;
+                return Ok(Vec::new());
+            }
             self.budget.record(&next_output.reply)?;
             self.read_next_output(next_output.address_position).await?;
             outputs.push(next_output);
+        }
+        if first_height && self.max_entries.is_some_and(|limit| outputs.len() > limit) {
+            return Err(address_utxo_height_limit_exceeded(height, outputs.len()));
         }
         outputs
             .sort_unstable_by(|left, right| left.block_order_key().cmp(&right.block_order_key()));
@@ -2029,6 +2038,23 @@ impl ResponseSource for AddressUtxoMerge {
             }
         }
     }
+}
+
+fn address_utxo_height_limit_exceeded(height: u64, count: usize) -> Status {
+    let mut details = ErrorDetails::new();
+    details.set_error_info(
+        "MAX_ENTRIES_EXCEEDED_AT_HEIGHT",
+        "cash.z.wallet.sdk.rpc",
+        [
+            ("height".to_owned(), height.to_string()),
+            ("count".to_owned(), count.to_string()),
+        ],
+    );
+    Status::with_error_details(
+        tonic::Code::FailedPrecondition,
+        format!("height {height} has {count} unspent outputs, exceeding maxEntries"),
+        details,
+    )
 }
 
 /// Counts each row as a field of the unary reply, including its protobuf

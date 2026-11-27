@@ -1362,7 +1362,7 @@ async fn assert_degraded_node_readiness(
 }
 
 #[tokio::test]
-async fn utxo_prefix_completes_its_last_height_at_one_node_tip() -> Result<()> {
+async fn utxo_overflow_count_requires_one_node_tip() -> Result<()> {
     let script = hex::encode(
         zinder_source::parse_transparent_address(ADDRESS)?
             .script()
@@ -1407,20 +1407,17 @@ async fn utxo_prefix_completes_its_last_height_at_one_node_tip() -> Result<()> {
     let request = || {
         Request::new(lightwalletd::GetAddressUtxosArg {
             addresses: vec![ADDRESS.to_owned()],
-            start_height: 1,
+            start_height: 2,
             max_entries: 2,
         })
     };
-    let outputs = fixture
+    let status = fixture
         .adapter
         .get_address_utxos(request())
-        .await?
-        .into_inner()
-        .address_utxos;
-    assert_eq!(
-        outputs.into_iter().map(|row| row.txid).collect::<Vec<_>>(),
-        [4, 3, 2, 1].map(|byte| vec![byte; 32]),
-    );
+        .await
+        .err()
+        .ok_or_else(|| eyre!("accepted an oversized first height"))?;
+    super::transparent_wallet_serving::assert_address_utxo_height_refused(&status, 2, 3)?;
     served_view::served_tip_mismatch(fixture.adapter.get_address_utxos(request()).await)?;
     Ok(())
 }
@@ -1584,9 +1581,16 @@ async fn populated_confirmed_utxos(
 }
 
 #[tokio::test]
-async fn cap_sized_cutoff_height_finishes_above_the_target() -> Result<()> {
+async fn cap_sized_first_height_reports_the_count_and_accepts_an_exact_retry() -> Result<()> {
     let fixture = populated_utxo_fixture(100_000, 0, UtxoNode::Zebra)?;
-    let rows = populated_confirmed_utxos(&fixture, 99_999, 100_000).await?;
+    let status = fixture
+        .adapter
+        .get_address_utxos(utxo_request(99_999))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("admitted an oversized first height"))?;
+    super::transparent_wallet_serving::assert_address_utxo_height_refused(&status, 5, 100_000)?;
+    let rows = populated_confirmed_utxos(&fixture, 100_000, 100_000).await?;
     assert_eq!((rows[99_998].height, rows[99_998].index), (5, 99_998));
     let reads = fixture.node.requests_for("getaddressutxos")?;
     let last = reads.last().ok_or_else(|| eyre!("missing cutoff lookup"))?;
@@ -1621,14 +1625,14 @@ fn utxo_request(max_entries: u32) -> Request<lightwalletd::GetAddressUtxosArg> {
 
 #[tokio::test]
 async fn later_outputs_can_prevent_proving_a_full_cutoff_height() -> Result<()> {
-    for node in [UtxoNode::Zebra, UtxoNode::Zakura] {
+    for (node, max_entries) in [(UtxoNode::Zebra, 100_000), (UtxoNode::Zakura, 99_999)] {
         let fixture = populated_utxo_fixture(100_000, 1, node)?;
         let error = fixture
             .adapter
-            .get_address_utxos(utxo_request(99_999))
+            .get_address_utxos(utxo_request(max_entries))
             .await
             .err()
-            .ok_or_else(|| eyre!("returned a prefix with unknown final-height order"))?;
+            .ok_or_else(|| eyre!("returned a prefix with unproved height completeness"))?;
         assert_eq!(error.code(), Code::ResourceExhausted);
         let reads = fixture.node.requests_for("getaddressutxos")?;
         let last = reads.last().ok_or_else(|| eyre!("missing cutoff lookup"))?;
@@ -1661,7 +1665,7 @@ async fn an_above_limit_wallet_request_succeeds_only_when_the_complete_set_fits(
 
 #[tokio::test]
 async fn forwarded_utxo_pages_resume_after_the_last_complete_height() -> Result<()> {
-    let fixture = populated_utxo_fixture(3, 2, UtxoNode::Zebra)?;
+    let fixture = populated_utxo_fixture(2, 2, UtxoNode::Zebra)?;
     let complete = fixture
         .adapter
         .get_address_utxos(utxo_request(0))
@@ -1672,7 +1676,7 @@ async fn forwarded_utxo_pages_resume_after_the_last_complete_height() -> Result<
     for target in [2, 3] {
         let mut start_height = 5;
         let mut walked = Vec::new();
-        for count in [3, 2, 0] {
+        for count in [2, 2, 0] {
             let mut request = utxo_request(target).into_inner();
             request.start_height = start_height;
             let page = fixture
@@ -1702,9 +1706,43 @@ async fn forwarded_utxo_pages_resume_after_the_last_complete_height() -> Result<
 }
 
 #[tokio::test]
+async fn forwarded_utxos_refuse_first_height_above_max_entries() -> Result<()> {
+    let fixture = populated_utxo_fixture(3, 2, UtxoNode::Zebra)?;
+    let adapter = &fixture.adapter;
+    let unary = adapter
+        .get_address_utxos(utxo_request(2))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("admitted an oversized first height"))?;
+    let streaming = adapter
+        .get_address_utxos_stream(utxo_request(2))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("opened a stream for an oversized first height"))?;
+    for status in [unary, streaming] {
+        super::transparent_wallet_serving::assert_address_utxo_height_refused(&status, 5, 3)?;
+    }
+    let page = adapter
+        .get_address_utxos(utxo_request(3))
+        .await?
+        .into_inner()
+        .address_utxos;
+    assert_eq!(page.len(), 3);
+    let mut stream = adapter
+        .get_address_utxos_stream(utxo_request(3))
+        .await?
+        .into_inner();
+    for expected in page {
+        assert_eq!(stream.next().await.transpose()?, Some(expected));
+    }
+    assert!(stream.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn forwarded_utxo_pages_continue_past_the_response_row_limit() -> Result<()> {
     let fixture = populated_utxo_fixture(50_001, 50_001, UtxoNode::Zebra)?;
-    let mut request = utxo_request(50_000).into_inner();
+    let mut request = utxo_request(50_001).into_inner();
     for height in [5, 6] {
         let page = fixture
             .adapter
@@ -1740,7 +1778,13 @@ async fn forwarded_utxo_pages_continue_past_the_response_row_limit() -> Result<(
 #[tokio::test]
 async fn a_node_that_supplies_the_complete_utxo_page_needs_one_read() -> Result<()> {
     let fixture = populated_utxo_fixture(17, 1, UtxoNode::Zakura)?;
-    populated_confirmed_utxos(&fixture, 1, 17).await?;
+    let status = fixture
+        .adapter
+        .get_address_utxos(utxo_request(1))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("admitted an oversized first height"))?;
+    super::transparent_wallet_serving::assert_address_utxo_height_refused(&status, 5, 17)?;
     let reads = fixture.node.requests_for("getaddressutxos")?;
     assert_eq!(reads.len(), 1);
     assert_eq!(reads[0].params[0]["maxEntries"], 2);
@@ -1940,7 +1984,7 @@ async fn history_rows_out_of_canonical_order_end_the_stream() -> Result<()> {
     Ok(())
 }
 
-/// A node whose first page shows one output at height 1 and two at height 2,
+/// A node whose first page shows three outputs at height 2,
 /// and whose reread from height 2 returns `continuation`.
 fn utxo_cutoff_fixture(continuation: RpcReply) -> Result<Fixture> {
     let script = hex::encode(
@@ -1949,7 +1993,7 @@ fn utxo_cutoff_fixture(continuation: RpcReply) -> Result<Fixture> {
             .as_raw_bytes(),
     );
     let tip = served_tip(2)?;
-    let first = [(1_u32, "04"), (2, "03"), (2, "02")]
+    let first = [(2_u32, "04"), (2, "03"), (2, "02")]
         .map(|(height, id)| address_output(&id.repeat(32), height, &script));
     Fixture::with_node_timeout(
         2,
@@ -1990,9 +2034,9 @@ async fn a_reread_that_changes_an_output_value_is_unavailable() -> Result<()> {
             .script()
             .as_raw_bytes(),
     );
-    // The reread repeats both outpoints at height 2 but values one of them
+    // The reread repeats the outpoints at height 2 but values one of them
     // differently.
-    let mut changed = [(2_u32, "03"), (2, "02")]
+    let mut changed = [(2_u32, "04"), (2, "03"), (2, "02")]
         .map(|(height, id)| address_output(&id.repeat(32), height, &script));
     changed[1]["satoshis"] = json!(7);
     let fixture = utxo_cutoff_fixture(utxos_at(served_tip(2)?, &json!(changed)))?;
@@ -2075,22 +2119,16 @@ async fn a_later_reread_that_drops_outputs_an_earlier_reread_showed_is_unavailab
 }
 
 #[tokio::test]
-async fn a_reread_that_moves_an_earlier_output_above_the_cutoff_is_unavailable() -> Result<()> {
-    // The first read places 04 below the cutoff height 2; the reread from 2
-    // places the same output at height 3, above it.
-    let fixture = utxo_pages_fixture(
-        3,
-        &[
-            &[(1, "04"), (2, "03"), (2, "02")],
-            &[(2, "03"), (2, "02"), (3, "04")],
-        ],
-    )?;
-    let status = fixture
+async fn a_later_height_that_would_exceed_max_entries_needs_no_reread() -> Result<()> {
+    let fixture = utxo_pages_fixture(2, &[&[(1, "04"), (2, "03"), (2, "02")]])?;
+    let page = fixture
         .adapter
         .get_address_utxos(bounded_utxos(2))
-        .await
-        .err()
-        .ok_or_else(|| eyre!("accepted an output at two heights"))?;
-    assert_eq!(status.code(), Code::Unavailable);
+        .await?
+        .into_inner()
+        .address_utxos;
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].height, 1);
+    assert_eq!(fixture.node.requests_for("getaddressutxos")?.len(), 1);
     Ok(())
 }

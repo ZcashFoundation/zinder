@@ -198,7 +198,7 @@ async fn a_paused_utxo_stream_leaves_node_admission_for_another_call() -> Result
         .ok_or_else(|| eyre!("missing first output"))?;
     let fast = fixture
         .adapter
-        .get_address_utxos(utxo_request(1))
+        .get_address_utxos(utxo_request(2))
         .await?
         .into_inner();
     let second = paused
@@ -212,7 +212,7 @@ async fn a_paused_utxo_stream_leaves_node_admission_for_another_call() -> Result
 }
 
 fn unary_utxo_request() -> Result<http::Request<Body>> {
-    let request = utxo_request(1).into_inner();
+    let request = utxo_request(2).into_inner();
     let mut frame = vec![0];
     frame.extend_from_slice(&u32::try_from(request.encoded_len())?.to_be_bytes());
     request.encode(&mut frame)?;
@@ -279,7 +279,7 @@ async fn two_unfinished_unary_utxo_bodies_refuse_a_third_but_allow_balance() -> 
 async fn light_wallet_listener_returns_a_small_unary_utxo_reply() -> Result<()> {
     let fixture = populated_utxo_fixture(2, 1, UtxoNode::Zakura)?;
     with_fixture_client(fixture, async |mut client| {
-        let reply = client.get_address_utxos(utxo_request(1)).await?;
+        let reply = client.get_address_utxos(utxo_request(2)).await?;
         let outputs = reply.into_inner().address_utxos;
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].address, ADDRESS);

@@ -51,11 +51,11 @@ use zinder_store::{ArtifactFamily, BlockHashLookup};
 use super::{
     AddressUtxoResponseBudget, CanonicalTransactionMiss, GrpcStream, LightwalletdGrpcAdapter,
     SUBTREE_ROOT_STREAM_CHANNEL_CAPACITY, SubtreeRootReads, SubtreeRootsStream,
-    lightwalletd_tree_state, lightwalletd_tree_state_from_hex, reject_future_tree_state_height,
-    reject_genesis_tree_state, require_sapling_tree_state, send_response_from_broadcast_outcome,
-    shielded_protocol_from_request, spawn_response_stream, standard_fee_response,
-    transparent_address_tx_history_request, tree_state_block_lookup_status, tree_state_status,
-    u32_to_usize, wire_decode_error_to_status,
+    address_utxo_height_limit_exceeded, lightwalletd_tree_state, lightwalletd_tree_state_from_hex,
+    reject_future_tree_state_height, reject_genesis_tree_state, require_sapling_tree_state,
+    send_response_from_broadcast_outcome, shielded_protocol_from_request, spawn_response_stream,
+    standard_fee_response, transparent_address_tx_history_request, tree_state_block_lookup_status,
+    tree_state_status, u32_to_usize, wire_decode_error_to_status,
 };
 use crate::CanonicalReaderSlot;
 use crate::block_methods::{self, RequestedBlock, requested_block};
@@ -403,6 +403,15 @@ impl NodeBackedLightWallet {
                 Ok(reply)
             })
             .collect::<Result<Vec<_>, Status>>()?;
+        if let Some(first) = replies.first()
+            && request.max_entries != 0
+            && replies.len() > u32_to_usize(request.max_entries)
+        {
+            return Err(address_utxo_height_limit_exceeded(
+                first.height,
+                replies.len(),
+            ));
+        }
         Ok(Some((replies, response_permit)))
     }
 
@@ -620,16 +629,21 @@ async fn height_complete_utxos(
         .unwrap_or(TransparentAddressRowLimit::MAX);
     let page = served_utxo_page(node, lookup, height, Some(limit), served).await?;
     let mut rows = page.outputs;
-    if rows.len() < u32_to_usize(requested.get()) {
+    let max_entries = u32_to_usize(requested.get());
+    if rows.len() < max_entries {
         return Ok(rows);
     }
-    let cutoff = rows[u32_to_usize(requested.get() - 1)].block_height;
+    let cutoff = rows[max_entries - 1].block_height;
     let through_cutoff = rows.partition_point(|row| row.block_height <= cutoff);
+    let before_cutoff = rows.partition_point(|row| row.block_height < cutoff);
+    if before_cutoff > 0 && through_cutoff > max_entries {
+        rows.truncate(before_cutoff);
+        return Ok(rows);
+    }
     if page.complete || through_cutoff < rows.len() {
         rows.truncate(through_cutoff);
         return Ok(rows);
     }
-    let before_cutoff = rows.partition_point(|row| row.block_height < cutoff);
     // Every reread answers at the served tip, so it must agree with every
     // earlier page: it repeats, in order, the longest run of cutoff-height
     // outputs seen so far, and names no output an earlier page placed below
@@ -658,6 +672,9 @@ async fn height_complete_utxos(
                 .any(|row| earlier.contains(&row.outpoint));
         if !agrees {
             return Err(UtxoAttemptError::PagesDisagreed);
+        }
+        if before_cutoff > 0 && before_cutoff + at_cutoff > max_entries {
+            return Ok(rows);
         }
         let finished = unbounded || page.complete || at_cutoff < page.outputs.len();
         verified = page.outputs;

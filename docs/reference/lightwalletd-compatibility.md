@@ -366,12 +366,18 @@ Both methods return confirmed unspent outputs mined at or above
 `startHeight`, ordered by block height, transaction position within the block,
 and output index. A repeated address counts once. Mempool state is excluded.
 
-A positive `maxEntries` sets the target number of outputs. The response includes
-every matching output at the height containing the target entry, so it can exceed
-the target, even when the first matching height alone exceeds it. When the
-target falls at the end of a height, the page ends there. When fewer outputs
-match, the page returns all of them. Zero requests every matching output,
-subject to the same hard response limits.
+A positive `maxEntries` caps the output count. If the next height would exceed
+the limit, the page ends before that height. An exact fit includes the whole
+height. A page can contain fewer outputs than requested while more remain.
+See the [upstream paging proposal](https://github.com/zcash/lightwallet-protocol/pull/36).
+
+If the first matching height alone exceeds `maxEntries` and fits the hard
+response limits, both methods fail with `FAILED_PRECONDITION` before sending
+any rows. The message gives the height and count. The `google.rpc.ErrorInfo`
+detail has reason `MAX_ENTRIES_EXCEEDED_AT_HEIGHT`, domain
+`cash.z.wallet.sdk.rpc`, and decimal `height` and `count` metadata. Retry
+with `maxEntries` at least as large as `count`. Zero requests every matching
+output subject to the hard response limits.
 
 To walk the set, pass the last returned height plus one as `startHeight` for
 the next page. Stop on an empty successful reply. Each request sees the chain
@@ -381,7 +387,7 @@ between pages.
 Each response is limited to 100,000 outputs and 16 MiB (16,777,216 bytes) of
 encoded protobuf reply-list data, including the per-output field framing. The
 same limits apply to unary and streaming calls. A page that exceeds either
-limit fails with `RESOURCE_EXHAUSTED`. A smaller positive target can shorten
+limit fails with `RESOURCE_EXHAUSTED`. A smaller positive limit can shorten
 the page when it ends at an earlier height. One height that alone exceeds a
 limit cannot be fetched through these methods. Unary gRPC clients may need to
 raise their receive limit or use the streaming method.
@@ -399,10 +405,13 @@ including one that has already sent earlier heights.
 In light-wallet serving, both methods read a bounded node prefix for an
 in-range positive target and verify the completeness of its final height.
 The node's reply is also subject to its own row limit and
-`node.max_response_bytes` (64 MiB by default). The call can fail with
-`RESOURCE_EXHAUSTED` if those limits prevent the server from verifying the
-final height. Each node page must name the captured canonical tip. A tip
-mismatch after any configured [tip wait](#waiting-for-a-height-just-past-the-tip)
+`node.max_response_bytes` (64 MiB by default). The call fails with
+`RESOURCE_EXHAUSTED` if those limits prevent the server from verifying a
+height. For example, if the first matching height holds 100,000 outputs and
+another matching height follows, the node RPC has no upper-height bound.
+Its response cap prevents Zinder from proving that the 100,000th output
+completes the first height. Each node page must name the captured canonical
+tip. A tip mismatch after any configured [tip wait](#waiting-for-a-height-just-past-the-tip)
 and retry, or disagreeing pages at that tip, fails with `UNAVAILABLE`, reason
 `SERVED_TIP_MISMATCH`, and `grpc-retry-pushback-ms: 1000`.
 
