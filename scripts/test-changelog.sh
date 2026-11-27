@@ -464,6 +464,98 @@ git -C "$fixture_repository" rm -q .changes/unreleased/block-clip-newline-upgrad
 git -C "$fixture_repository" commit -qm "cleanup clip block Upgrade"
 clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
 
+# Folded block-scalar Upgrade with leading blank line must fail.
+cat > "$fixture_repository/.changes/unreleased/folded-leading-blank-upgrade.yaml" <<'YAML'
+kind: fixed
+body: Reject folded block-scalar Upgrade with a leading blank line.
+time: 2026-07-21T19:14:52Z
+custom:
+  Bump: patch
+  PR: "29"
+  Upgrade: >-
+
+    compatible
+YAML
+git -C "$fixture_repository" add .changes/unreleased/folded-leading-blank-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with folded leading blank Upgrade"
+folded_leading_blank_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with folded leading blank Upgrade (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with folded leading blank Upgrade (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$folded_leading_blank_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/folded-leading-blank-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup folded leading blank Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
+# Literal block-scalar Upgrade with trailing whitespace-only line more indented than block indent must fail.
+printf '%s\n' \
+  'kind: fixed' \
+  'body: Reject literal block-scalar Upgrade with trailing indented spaces.' \
+  'time: 2026-07-21T19:14:54Z' \
+  'custom:' \
+  '  Bump: patch' \
+  '  PR: "30"' \
+  '  Upgrade: |-' \
+  '    compatible' \
+  '      ' \
+  > "$fixture_repository/.changes/unreleased/block-trailing-indented-blank-upgrade.yaml"
+git -C "$fixture_repository" add .changes/unreleased/block-trailing-indented-blank-upgrade.yaml
+git -C "$fixture_repository" commit -qm "add fragment with trailing indented spaces in block Upgrade"
+block_trailing_indented_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+expect_rejected \
+  "fragment with trailing indented spaces in block Upgrade (fragments)" \
+  run_validator fragments "$fixture_repository"
+expect_rejected \
+  "fragment with trailing indented spaces in block Upgrade (pr)" \
+  run_validator pr \
+  "$clean_commit" \
+  "$block_trailing_indented_commit" \
+  "$empty_body" \
+  "$fixture_repository"
+git -C "$fixture_repository" rm -q .changes/unreleased/block-trailing-indented-blank-upgrade.yaml
+git -C "$fixture_repository" commit -qm "cleanup trailing indented spaces in block Upgrade"
+clean_commit="$(git -C "$fixture_repository" rev-parse HEAD)"
+
+# Non-scalar custom.Upgrade must fail.
+cat > "$fixture_repository/.changes/unreleased/non-scalar-upgrade.yaml" <<'YAML'
+kind: fixed
+body: Reject non-scalar custom.Upgrade values.
+time: 2026-07-21T19:14:56Z
+custom:
+  Bump: patch
+  PR: "30"
+  Upgrade: [compatible]
+YAML
+expect_rejected \
+  "fragment with non-scalar Upgrade" \
+  run_validator fragments "$fixture_repository"
+rm "$fixture_repository/.changes/unreleased/non-scalar-upgrade.yaml"
+
+# Duplicate top-level custom mapping must fail.
+cat > "$fixture_repository/.changes/unreleased/duplicate-custom.yaml" <<'YAML'
+kind: fixed
+body: Reject duplicate top-level custom mappings.
+time: 2026-07-21T19:14:58Z
+custom:
+  Bump: patch
+  PR: "30"
+  Upgrade: compatible
+custom:
+  Bump: patch
+  PR: "30"
+  Upgrade: canonical-layout
+YAML
+expect_rejected \
+  "fragment with duplicate top-level custom mapping" \
+  run_validator fragments "$fixture_repository"
+rm "$fixture_repository/.changes/unreleased/duplicate-custom.yaml"
+
 # projection-layout missing projection name must fail in both fragments and pr modes.
 cat > "$fixture_repository/.changes/unreleased/proj-no-name.yaml" <<'YAML'
 kind: changed

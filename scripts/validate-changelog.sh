@@ -86,13 +86,16 @@ derive_pending_upgrade_class() {
   local derived_class
 
   if ! derived_class="$(
-    python3 - "$repository_root/.changes/unreleased" 2>&1 <<'PY'
+    python3 - "$repository_root" "$changie_bin" 2>&1 <<'PY'
 import glob
 import os
 import re
+import subprocess
 import sys
+import tempfile
 
-unreleased_dir = sys.argv[1]
+repository_root, changie_bin = sys.argv[1:3]
+unreleased_dir = os.path.join(repository_root, ".changes", "unreleased")
 PRECEDENCE = {
     "compatible": 0,
     "additive-schema": 1,
@@ -108,551 +111,116 @@ REBUILD_ROLLBACK_RE = re.compile(
     r"(?<![A-Za-z0-9])(rebuilds?|rebuilding|rebuilt|roll(?:ed)?(?:-|\s+)?backs?|restor(?:e|ing|ed))(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
-TOP_KEY_RE = re.compile(r'^("[^"]+"|\'[^\']+\'|[A-Za-z0-9_.-]+)\s*:(.*)$')
-BLOCK_SCALAR_RE = re.compile(r"^([|>])([+-]?[1-9]?|[1-9]?[+-]?)(?:\s+#.*)?$")
-YAML_ESCAPES = {
-    "0": "\x00",
-    "a": "\x07",
-    "b": "\x08",
-    "t": "\t",
-    "\t": "\t",
-    "n": "\n",
-    "v": "\x0b",
-    "f": "\x0c",
-    "r": "\r",
-    "e": "\x1b",
-    " ": " ",
-    '"': '"',
-    "/": "/",
-    "\\": "\\",
-    "N": "\u0085",
-    "_": "\u00a0",
-    "L": "\u2028",
-    "P": "\u2029",
-}
 
-
-def unquote_key(token):
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
-        return token[1:-1]
-    return token
-
-
-def strip_inline_comment(text):
-    return re.sub(r"(?:^|\s+)#.*$", "", text).strip()
-
-
-def parse_quoted_scalar(lines, start_idx, first_text, quote_char):
-    buf = []
-    pos = 1  # skip opening quote
-    idx = start_idx
-    segment = first_text
-    while True:
-        if quote_char == "'":
-            while pos < len(segment):
-                ch = segment[pos]
-                if ch == "'":
-                    if pos + 1 < len(segment) and segment[pos + 1] == "'":
-                        buf.append("'")
-                        pos += 2
-                        continue
-                    return "".join(buf), idx
-                buf.append(ch)
-                pos += 1
-        else:
-            while pos < len(segment):
-                ch = segment[pos]
-                if ch == "\\":
-                    if pos + 1 < len(segment):
-                        nxt = segment[pos + 1]
-                        if nxt in YAML_ESCAPES:
-                            buf.append(YAML_ESCAPES[nxt])
-                            pos += 2
-                        elif nxt in ("x", "u", "U"):
-                            hex_len = {"x": 2, "u": 4, "U": 8}[nxt]
-                            hex_part = segment[pos + 2 : pos + 2 + hex_len]
-                            if len(hex_part) == hex_len and all(
-                                c in "0123456789abcdefABCDEF" for c in hex_part
-                            ):
-                                buf.append(chr(int(hex_part, 16)))
-                                pos += 2 + hex_len
-                            else:
-                                buf.append("\\" + nxt)
-                                pos += 2
-                        else:
-                            buf.append("\\" + nxt)
-                            pos += 2
-                    else:
-                        # line continuation
-                        pos += 1
-                    continue
-                if ch == '"':
-                    return "".join(buf), idx
-                buf.append(ch)
-                pos += 1
-        idx += 1
-        if idx >= len(lines):
-            return "".join(buf), idx - 1
-        buf.append("\n")
-        segment = lines[idx]
-        pos = 0
-
-
-def parse_scalar_value(lines, idx, rest_text, key_indent):
-    stripped = rest_text.lstrip(" \t")
-    if stripped.startswith(("'", '"')):
-        val, end_idx = parse_quoted_scalar(lines, idx, stripped, stripped[0])
-        return val, end_idx, True
-
-    inline_comment = bool(re.search(r"(?:^|\s+)#", stripped))
-    parts = []
-    first_val = strip_inline_comment(stripped)
-    if first_val:
-        parts.append(first_val)
-    last_consumed = idx
-    if not inline_comment:
-        j = idx + 1
-        while j < len(lines):
-            pl = lines[j]
-            ps = pl.strip()
-            if ps == "":
-                j += 1
-                continue
-            if ps.startswith("#"):
-                break
-            pi = len(pl) - len(pl.lstrip(" "))
-            if pi <= key_indent:
-                break
-            if re.search(r"(?:^|\s+)#", ps):
-                part = strip_inline_comment(ps)
-                if part:
-                    parts.append(part)
-                last_consumed = j
-                break
-            parts.append(ps)
-            last_consumed = j
-            j += 1
-    combined = " ".join(parts).strip()
-    if combined in ("", "null", "Null", "NULL", "~"):
-        return "", last_consumed, False
-    return combined, last_consumed, False
-
-
-def parse_flow_mapping(lines, start_idx, first_rest):
-    buf = []
-    idx = start_idx
-    segment = first_rest
-    in_quote = None
-    escaped = False
-    depth = 0
-    found_end = False
-    while idx < len(lines):
-        pos = 0
-        while pos < len(segment):
-            ch = segment[pos]
-            if in_quote == "'":
-                buf.append(ch)
-                if ch == "'":
-                    if pos + 1 < len(segment) and segment[pos + 1] == "'":
-                        buf.append("'")
-                        pos += 2
-                        continue
-                    in_quote = None
-            elif in_quote == '"':
-                buf.append(ch)
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_quote = None
-            else:
-                if ch == "#" and (pos == 0 or segment[pos - 1].isspace()):
-                    break
-                if ch in ("'", '"'):
-                    in_quote = ch
-                    buf.append(ch)
-                elif ch == "{":
-                    depth += 1
-                    if depth > 1:
-                        buf.append(ch)
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        found_end = True
-                        break
-                    buf.append(ch)
-                else:
-                    buf.append(ch)
-            pos += 1
-        if found_end:
-            break
-        buf.append(" ")
-        idx += 1
-        if idx < len(lines):
-            segment = lines[idx]
-
-    inner = "".join(buf).strip()
-    entries = []
-    cur = []
-    in_quote = None
-    escaped = False
-    nested_depth = 0
-    pos = 0
-    while pos < len(inner):
-        ch = inner[pos]
-        if in_quote == "'":
-            cur.append(ch)
-            if ch == "'":
-                if pos + 1 < len(inner) and inner[pos + 1] == "'":
-                    cur.append("'")
-                    pos += 2
-                    continue
-                in_quote = None
-        elif in_quote == '"':
-            cur.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_quote = None
-        else:
-            if ch in ("'", '"'):
-                in_quote = ch
-                cur.append(ch)
-            elif ch in ("{", "["):
-                nested_depth += 1
-                cur.append(ch)
-            elif ch in ("}", "]"):
-                if nested_depth > 0:
-                    nested_depth -= 1
-                cur.append(ch)
-            elif ch == "," and nested_depth == 0:
-                item_str = "".join(cur).strip()
-                if item_str:
-                    entries.append(item_str)
-                cur = []
-                pos += 1
-                continue
-            else:
-                cur.append(ch)
-        pos += 1
-    tail = "".join(cur).strip()
-    if tail:
-        entries.append(tail)
-
-    upgrade_values = []
-    for entry in entries:
-        m = TOP_KEY_RE.match(entry)
-        if not m:
-            continue
-        raw_key = m.group(1)
-        is_quoted_key = raw_key[0] in ("'", '"')
-        rest = m.group(2)
-        if not is_quoted_key and rest and rest[0] not in (" ", "\t"):
-            continue
-        k = unquote_key(raw_key)
-        if k == "Upgrade":
-            v_raw = rest.strip()
-            if len(v_raw) >= 2 and v_raw[0] == "'" and v_raw[-1] == "'":
-                upgrade_values.append((v_raw[1:-1].replace("''", "'"), True))
-            elif len(v_raw) >= 2 and v_raw[0] == '"' and v_raw[-1] == '"':
-                parsed, _ = parse_quoted_scalar([v_raw], 0, v_raw, '"')
-                upgrade_values.append((parsed, True))
-            else:
-                clean = strip_inline_comment(v_raw)
-                if clean in ("null", "Null", "NULL", "~"):
-                    clean = ""
-                upgrade_values.append((clean, False))
-    return upgrade_values, idx
-
-
-def consume_block_scalar(lines, start_idx, rest_stripped, parent_indent):
-    block_match = BLOCK_SCALAR_RE.match(rest_stripped)
-    if not block_match:
-        return None
-    style = block_match.group(1)
-    mod = block_match.group(2)
-    chomp = "clip"
-    if "-" in mod:
-        chomp = "-"
-    elif "+" in mod:
-        chomp = "+"
-    explicit_indent = None
-    for ch in mod:
-        if ch.isdigit():
-            explicit_indent = int(ch)
-    j = start_idx + 1
-    block_lines = []
-    while j < len(lines):
-        bl = lines[j]
-        if bl.strip() == "":
-            block_lines.append("")
-            j += 1
-            continue
-        bi = len(bl) - len(bl.lstrip(" "))
-        if bi <= parent_indent:
-            break
-        block_lines.append(bl)
-        j += 1
-    trailing_blanks = 0
-    while block_lines and block_lines[-1] == "":
-        block_lines.pop()
-        trailing_blanks += 1
-    if explicit_indent is not None:
-        base_indent = parent_indent + explicit_indent if parent_indent > 0 else explicit_indent
-    else:
-        base_indent = None
-        for bl in block_lines:
-            if bl.strip() != "":
-                base_indent = len(bl) - len(bl.lstrip(" "))
-                break
-        if base_indent is None:
-            base_indent = 0
-    cleaned = [
-        bl[base_indent:] if len(bl) >= base_indent and bl.strip() != "" else ""
-        for bl in block_lines
-    ]
-    if style == ">":
-        paragraphs = []
-        current = []
-        for cl in cleaned:
-            if cl == "":
-                if current:
-                    paragraphs.append(" ".join(current))
-                    current = []
-            else:
-                current.append(cl)
-        if current:
-            paragraphs.append(" ".join(current))
-        text = "\n".join(paragraphs)
-    else:
-        text = "\n".join(cleaned)
-    if chomp == "clip":
-        if text:
-            text += "\n"
-    elif chomp == "+":
-        if text:
-            text += "\n" * (1 + trailing_blanks)
-        else:
-            text += "\n" * trailing_blanks
-    return text, j
-
-
-def consume_flow_value(lines, start_idx, first_rest):
-    idx = start_idx
-    segment = first_rest
-    in_quote = None
-    escaped = False
-    depth = 0
-    while idx < len(lines):
-        pos = 0
-        while pos < len(segment):
-            ch = segment[pos]
-            if in_quote == "'":
-                if ch == "'":
-                    if pos + 1 < len(segment) and segment[pos + 1] == "'":
-                        pos += 2
-                        continue
-                    in_quote = None
-            elif in_quote == '"':
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_quote = None
-            else:
-                if ch == "#" and (pos == 0 or segment[pos - 1].isspace()):
-                    break
-                if ch in ("'", '"'):
-                    in_quote = ch
-                elif ch in ("{", "["):
-                    depth += 1
-                elif ch in ("}", "]"):
-                    depth -= 1
-                    if depth <= 0:
-                        return idx
-            pos += 1
-        idx += 1
-        if idx < len(lines):
-            segment = lines[idx]
-    return len(lines) - 1
-
-
-def parse_fragment(path):
-    with open(path, "r", encoding="utf-8") as fh:
-        raw = fh.read()
-    text = raw.lstrip("\ufeff").replace("\r\n", "\n")
-    lines = text.split("\n")
-
-    body_text = ""
-    upgrade_entries = []
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
-            i += 1
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        if indent != 0:
-            i += 1
-            continue
-        m = TOP_KEY_RE.match(line)
-        if not m:
-            i += 1
-            continue
-        key = unquote_key(m.group(1))
-        rest = m.group(2)
-        if rest and rest[0] not in (" ", "\t"):
-            i += 1
-            continue
-
-        if key == "body":
-            rest_stripped = rest.lstrip(" \t")
-            block = consume_block_scalar(lines, i, rest_stripped, 0)
-            if block is not None:
-                body_text, i = block
-                continue
-            elif rest_stripped and rest_stripped[0] in ("'", '"'):
-                body_text, end_idx = parse_quoted_scalar(
-                    lines, i, rest_stripped, rest_stripped[0]
-                )
-                i = end_idx + 1
-                continue
-            else:
-                parts = []
-                if rest_stripped and not rest_stripped.startswith("#"):
-                    parts.append(strip_inline_comment(rest_stripped))
-                j = i + 1
-                while j < len(lines):
-                    pl = lines[j]
-                    ps = pl.strip()
-                    if ps == "":
-                        j += 1
-                        continue
-                    pi = len(pl) - len(pl.lstrip(" "))
-                    if pi == 0:
-                        break
-                    if not ps.startswith("#"):
-                        parts.append(strip_inline_comment(ps))
-                    j += 1
-                body_text = " ".join(p for p in parts if p)
-                i = j
-                continue
-
-        if key == "custom":
-            rest_stripped = rest.lstrip(" \t")
-            if rest_stripped.startswith("#"):
-                rest_stripped = ""
-            if rest_stripped.startswith("{"):
-                entries, end_idx = parse_flow_mapping(lines, i, rest_stripped)
-                upgrade_entries.extend(entries)
-                i = end_idx + 1
-                continue
-            if rest_stripped == "":
-                j = i + 1
-                child_indent = None
-                while j < len(lines):
-                    cl = lines[j]
-                    cs = cl.strip()
-                    if not cs or cs.startswith("#"):
-                        j += 1
-                        continue
-                    ci = len(cl) - len(cl.lstrip(" "))
-                    if ci == 0:
-                        break
-                    if child_indent is None:
-                        child_indent = ci
-                    if ci == child_indent:
-                        cm = TOP_KEY_RE.match(cl.lstrip(" "))
-                        if cm:
-                            raw_ck = cm.group(1)
-                            is_quoted_ck = raw_ck[0] in ("'", '"')
-                            ck = unquote_key(raw_ck)
-                            crest = cm.group(2)
-                            if not crest or crest[0] in (" ", "\t") or is_quoted_ck:
-                                crest_stripped = crest.lstrip(" \t")
-                                if crest_stripped.startswith("#"):
-                                    crest_stripped = ""
-                                block = consume_block_scalar(
-                                    lines, j, crest_stripped, child_indent
-                                )
-                                if block is not None:
-                                    val, next_j = block
-                                    if ck == "Upgrade":
-                                        upgrade_entries.append((val, True))
-                                    j = next_j
-                                    continue
-                                if crest_stripped.startswith(("{", "[")):
-                                    end_idx = consume_flow_value(
-                                        lines, j, crest_stripped
-                                    )
-                                    if ck == "Upgrade":
-                                        upgrade_entries.append(("<non-scalar>", False))
-                                    j = end_idx + 1
-                                    continue
-                                val, end_idx, was_quoted = parse_scalar_value(
-                                    lines, j, crest, child_indent
-                                )
-                                if ck == "Upgrade":
-                                    upgrade_entries.append((val, was_quoted))
-                                j = end_idx + 1
-                                continue
-                    j += 1
-                i = j
-                continue
-
-        rest_stripped = rest.lstrip(" \t")
-        if rest_stripped.startswith("#"):
-            rest_stripped = ""
-        block = consume_block_scalar(lines, i, rest_stripped, 0)
-        if block is not None:
-            _, i = block
-            continue
-        if rest_stripped.startswith(("{", "[")):
-            end_idx = consume_flow_value(lines, i, rest_stripped)
-            i = end_idx + 1
-            continue
-        _val, end_idx, _was_quoted = parse_scalar_value(lines, i, rest, 0)
-        i = end_idx + 1
-
-    return body_text, upgrade_entries
-
-
-fragment_paths = sorted(
-    path
+expected_files = sorted(
+    os.path.basename(path)
     for path in glob.glob(os.path.join(unreleased_dir, "*.yaml"))
     if os.path.isfile(path)
 )
-if not fragment_paths:
+if not expected_files:
     print("no pending .changes/unreleased/*.yaml fragments", file=sys.stderr)
+    sys.exit(1)
+
+with open(os.path.join(repository_root, ".changie.yaml"), "r", encoding="utf-8") as fh:
+    cfg_lines = fh.read().splitlines()
+
+strip_keys = {
+    "versionFormat",
+    "kindFormat",
+    "changeFormat",
+    "componentFormat",
+    "headerFormat",
+    "footerFormat",
+    "newlines",
+}
+out_lines = []
+skip = False
+for line in cfg_lines:
+    if line and not line[0].isspace() and not line.lstrip().startswith("#"):
+        key = line.split(":", 1)[0].strip().strip("'\"")
+        skip = key in strip_keys
+    if not skip:
+        out_lines.append(line)
+
+out_lines.extend(
+    [
+        "versionFormat: ''",
+        "kindFormat: ''",
+        "componentFormat: ''",
+        "headerFormat: ''",
+        "footerFormat: ''",
+        'changeFormat: \'ZINDER_FRAG|{{printf "%x" .Filename}}|{{printf "%x" .Body}}{{range $k, $v := .Custom}}|{{printf "%x" $k}}={{printf "%x" $v}}{{end}}\'',
+        "newlines: {}",
+    ]
+)
+
+with tempfile.NamedTemporaryFile(
+    mode="w", suffix=".yaml", delete=False, encoding="utf-8"
+) as tf:
+    tf.write("\n".join(out_lines) + "\n")
+    cfg_path = tf.name
+
+try:
+    env = dict(os.environ)
+    env["CHANGIE_CONFIG_PATH"] = cfg_path
+    proc = subprocess.run(
+        [changie_bin, "batch", "auto", "--dry-run", "--allow-no-changes=false"],
+        cwd=repository_root,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+finally:
+    if os.path.exists(cfg_path):
+        os.unlink(cfg_path)
+
+if proc.returncode != 0:
+    msg = (proc.stderr or proc.stdout).strip() or f"{changie_bin} batch failed"
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+fragments = {}
+for raw_line in proc.stdout.splitlines():
+    if not raw_line:
+        continue
+    parts = raw_line.split("|")
+    if len(parts) < 3 or parts[0] != "ZINDER_FRAG":
+        print(f"unexpected changie inspection output: {raw_line!r}", file=sys.stderr)
+        sys.exit(1)
+    filename = os.path.basename(bytes.fromhex(parts[1]).decode("utf-8"))
+    body_text = bytes.fromhex(parts[2]).decode("utf-8")
+    custom = {}
+    for item in parts[3:]:
+        if "=" not in item:
+            print(f"unexpected changie custom field output: {item!r}", file=sys.stderr)
+            sys.exit(1)
+        k_hex, v_hex = item.split("=", 1)
+        custom[bytes.fromhex(k_hex).decode("utf-8")] = bytes.fromhex(v_hex).decode("utf-8")
+    if filename in fragments:
+        print(f"duplicate fragment reported by changie: {filename}", file=sys.stderr)
+        sys.exit(1)
+    fragments[filename] = (body_text, custom)
+
+if sorted(fragments.keys()) != expected_files:
+    print(
+        f"changie fragment set mismatch: expected {expected_files}, got {sorted(fragments.keys())}",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 highest_class = None
 highest_rank = -1
 
-for fragment_path in fragment_paths:
-    filename = os.path.basename(fragment_path)
-    body_text, upgrade_entries = parse_fragment(fragment_path)
-
-    if len(upgrade_entries) == 0:
+for filename in expected_files:
+    body_text, custom = fragments[filename]
+    if "Upgrade" not in custom:
         print(
             f"{filename}: missing custom.Upgrade (expected one of: {ALLOWED_LIST})",
             file=sys.stderr,
         )
         sys.exit(1)
-    if len(upgrade_entries) > 1:
-        print(
-            f"{filename}: duplicate custom.Upgrade key",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
-    upgrade_value, _was_quoted = upgrade_entries[0]
+    upgrade_value = custom["Upgrade"]
     if upgrade_value == "":
         print(
             f"{filename}: empty custom.Upgrade (expected one of: {ALLOWED_LIST})",
@@ -661,7 +229,7 @@ for fragment_path in fragment_paths:
         sys.exit(1)
     if upgrade_value not in PRECEDENCE:
         print(
-            f"{filename}: unknown custom.Upgrade '{upgrade_value}' (expected one of: {ALLOWED_LIST})",
+            f"{filename}: unknown custom.Upgrade {upgrade_value!r} (expected one of: {ALLOWED_LIST})",
             file=sys.stderr,
         )
         sys.exit(1)
