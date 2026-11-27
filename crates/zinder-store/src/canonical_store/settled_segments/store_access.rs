@@ -22,8 +22,8 @@ use crate::{
     },
     settled_shielded_segment::{SettledShieldedSegmentError, SettledShieldedSegmentReader},
     settled_supplement_segment::{
-        BlockSupplementRecord, SettledSupplementSegmentReader, reconstruct_canonical_block_facts,
-        reconstruct_compact_block_artifact,
+        BlockSupplementRecord, SettledSupplementSegmentError, SettledSupplementSegmentReader,
+        reconstruct_canonical_block_facts, reconstruct_compact_block_artifact,
     },
 };
 
@@ -423,6 +423,54 @@ pub(in crate::canonical_store) fn open_shielded_segment_reader(
         temp_cache.get_or_open_shielded(entry)
     };
     opened.map_err(map_settled_segments_read_error)
+}
+
+/// Opens ONLY `ZSTSUP01` when `entry.modules.supplement` is enabled, never opening `ZSBLKB01`.
+pub(in crate::canonical_store) fn open_supplement_segment_reader(
+    ctx: SegmentStoreContext<'_>,
+    entry: &SettledSegmentIndexEntry,
+) -> Result<Option<Arc<SettledSupplementSegmentReader>>, CanonicalStoreError> {
+    if !entry.modules.supplement {
+        return Ok(None);
+    }
+    let opened = if let Some(cache) = ctx.segment_cache {
+        cache.get_or_open_supplement(entry)
+    } else {
+        let temp_cache = SettledSegmentReaderCache::new(ctx.db.path(), 1, false)
+            .map_err(map_settled_segments_read_error)?;
+        temp_cache.get_or_open_supplement(entry)
+    };
+    opened.map_err(map_settled_segments_read_error)
+}
+
+pub(in crate::canonical_store) fn map_supplement_read_error(
+    error: SettledSupplementSegmentError,
+) -> CanonicalStoreError {
+    match error {
+        SettledSupplementSegmentError::Io(ref io_err)
+            if rustix::io::Errno::from_io_error(io_err) == Some(rustix::io::Errno::IO) =>
+        {
+            CanonicalStoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                reason: error.to_string(),
+            }
+        }
+        SettledSupplementSegmentError::Io(io_err) => CanonicalStoreError::SettledSegment {
+            reason: io_err.to_string(),
+        },
+        SettledSupplementSegmentError::InvalidFormat(_)
+        | SettledSupplementSegmentError::InvalidCodecId(_)
+        | SettledSupplementSegmentError::ChainLinkage(_)
+        | SettledSupplementSegmentError::PayloadIntegrity(_)
+        | SettledSupplementSegmentError::PayloadLimitExceeded { .. }
+        | SettledSupplementSegmentError::FsVerityRequired
+        | SettledSupplementSegmentError::HeightOutOfRange { .. } => {
+            CanonicalStoreError::ArtifactCorrupt {
+                family: ArtifactFamily::CompactBlock,
+                reason: error.to_string(),
+            }
+        }
+    }
 }
 
 pub(in crate::canonical_store) fn map_shielded_read_error(
