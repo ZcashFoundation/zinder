@@ -1,0 +1,6 @@
+kind: added
+body: Enable optional OTLP tracing and expose a JSON status summary with readiness, build identity, and served chain heights.
+time: 2026-11-27T23:12:27.025348524Z
+custom:
+    Bump: minor
+    PR: "727"
