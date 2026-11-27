@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: zinder
+  labels:
+    app.kubernetes.io/name: zinder
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: zinder
+  ports:
+    - name: compat-grpc
+      port: 9067
+      targetPort: compat-grpc
+    - name: query-grpc
+      port: 9102
+      targetPort: query-grpc
+    - name: explorer-grpc
+      port: 9068
+      targetPort: explorer-grpc
+    - name: ops
+      port: 9108
+      targetPort: ops
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zinder
+  labels:
+    app.kubernetes.io/name: zinder
+spec:
+  serviceName: zinder
+  # Single writer + supervised readers share one ReadWriteOnce volume per Pod.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zinder
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zinder
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: zinder
+          # Replace v0.27.0 with an immutable release tag or @sha256 digest.
+          image: ghcr.io/zcashfoundation/zinder:v0.27.0
+          args:
+            - serve
+            - --preset
+            - wallet
+          env:
+            - name: ZINDER_NETWORK__NAME
+              value: zcash-mainnet
+            - name: ZINDER_NODE__JSON_RPC_ADDR
+              value: http://zcash-node:8232
+            - name: ZINDER_NODE__AUTH__METHOD
+              value: cookie
+            - name: ZINDER_NODE__AUTH__PATH
+              value: /var/run/auth/.cookie
+            - name: ZINDER_STORAGE__DATA_DIR
+              value: /var/lib/zinder
+            - name: ZINDER_OPS__LISTEN_ADDR
+              value: "[::]:9108"
+            - name: ZINDER_COMPAT__LISTEN_ADDR
+              value: "[::]:9067"
+            - name: ZINDER_QUERY__LISTEN_ADDR
+              value: "[::]:9102"
+            - name: ZINDER_EXPLORER__LISTEN_ADDR
+              value: "[::]:9068"
+            - name: ZINDER_SECURITY__ALLOW_PUBLIC_BIND
+              value: "true"
+          ports:
+            - name: compat-grpc
+              containerPort: 9067
+            - name: explorer-grpc
+              containerPort: 9068
+            - name: query-grpc
+              containerPort: 9102
+            - name: ops
+              containerPort: 9108
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          startupProbe:
+            exec:
+              command:
+                - /usr/local/bin/zinder
+                - healthcheck
+                - --addr
+                - 127.0.0.1:9108
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command:
+                - /usr/local/bin/zinder
+                - healthcheck
+                - --addr
+                - 127.0.0.1:9108
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/zinder
+                - healthcheck
+                - --ready
+                - --addr
+                - 127.0.0.1:9108
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/zinder
+            - name: tmp
+              mountPath: /tmp
+            - name: node-cookie
+              mountPath: /var/run/auth
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: node-cookie
+          secret:
+            secretName: zinder-node-cookie
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 500Gi

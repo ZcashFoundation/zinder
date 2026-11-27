@@ -1,4 +1,4 @@
-# Real zinder-ingest certification against an existing Zebra.
+# Real zinder canonical-runtime certification against an existing Zebra.
 #
 # This topology owns only its disposable Zinder volume. It attaches Zebra's
 # external network and read-only auth cookie, and never mounts Zebra chain
@@ -37,6 +37,7 @@ services:
       state-init:
         condition: service_completed_successfully
     networks: [source]
+    command: ["run", "ingest"]
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       ZINDER_NETWORK__NAME: ${ZINDER_NETWORK:-zcash-testnet}
@@ -72,7 +73,7 @@ services:
     ports:
       - "127.0.0.1:${ZINDER_CANONICAL_RUNTIME_OPS_HOST_PORT:-19105}:9105"
     healthcheck:
-      test: ["CMD", "zinder-ingest", "healthcheck", "--path", "/healthz"]
+      test: ["CMD", "/usr/local/bin/zinder", "healthcheck", "--path", "/healthz"]
       interval: 10s
       timeout: 5s
       start_period: 10s

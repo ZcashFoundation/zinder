@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
-compose_file="$repository_root/deploy/docker-compose.storage-lifecycle-test.yml"
+compose_file="$repository_root/deploy/bench/docker-compose.storage-lifecycle-test.yml"
 validator="$repository_root/scripts/validate-rocksdb-storage-lifecycle-report.sh"
 evidence_path="${ZINDER_STORAGE_LIFECYCLE_EVIDENCE_PATH:-$repository_root/.tmp/rocksdb-storage-lifecycle-evidence}"
 project_name="${ZINDER_STORAGE_LIFECYCLE_PROJECT_NAME:-zinder-storage-lifecycle-test}"

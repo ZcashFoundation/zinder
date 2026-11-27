@@ -14,7 +14,7 @@ fail() {
 
 fixture_binaries="$temporary_directory/binaries"
 mkdir -p "$fixture_binaries"
-for binary_name in zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd zinder-explorer; do
+for binary_name in zinder; do
   printf '#!/usr/bin/env bash\n# 0123456789abcdef0123456789abcdef01234567\nprintf "%%s 0.5.0-rc.1\\n" "$(basename "$0")"\n' \
     > "$fixture_binaries/$binary_name"
   chmod 755 "$fixture_binaries/$binary_name"
@@ -132,7 +132,7 @@ if ZINDER_RELEASE_SKIP_ELF_CHECKS=true \
   fail "archive checker accepted invalid --pasta-asm 2"
 fi
 
-cp "$fixture_binaries/zinder-ingest" "$fixture_binaries/zinder-bench"
+cp "$fixture_binaries/zinder" "$fixture_binaries/zinder-bench"
 if "$builder" \
   --binaries "$fixture_binaries" \
   --output "$temporary_directory/rejected-catalog" \
@@ -249,7 +249,7 @@ tamper_root="$temporary_directory/tamper"
 mkdir -p "$tamper_root"
 tar --extract --gzip --same-permissions --file "$first_asset" --directory "$tamper_root"
 root_name="$(find "$tamper_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')"
-printf 'tampered\n' >> "$tamper_root/$root_name/bin/zinder-query"
+printf 'tampered\n' >> "$tamper_root/$root_name/bin/zinder"
 tampered_asset="$temporary_directory/tampered.tar.gz"
 tar -C "$tamper_root" -czf "$tampered_asset" "$root_name"
 if ZINDER_RELEASE_SKIP_ELF_CHECKS=true \

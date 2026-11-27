@@ -62,7 +62,7 @@ done
 [[ "$platform" == linux/amd64 || "$platform" == linux/arm64 ]] || usage
 [[ "$source_date_epoch" =~ ^[0-9]+$ && "$commit" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$release_tag" =~ ^v[0-9] && "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || usage
-jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^zinder-[a-z0-9-]+$"))' \
+jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^zinder(-[a-z0-9-]+)?$"))' \
   <<< "$images_json" >/dev/null 2>&1 || usage
 case "$mode" in
   push) [[ "$registry" =~ ^[a-z0-9.:-]+/[a-z0-9._/-]+$ && -n "$digest_directory" ]] || usage ;;
@@ -99,37 +99,9 @@ trap cleanup EXIT
 describe_image() {
   local documentation_path
   case "$1" in
-    zinder-ingest)
-      image_description="Zinder canonical ingest: follows a Zcash node and writes the canonical chain store."
-      documentation_path=docs/runbooks/deploying-on-a-vm.md
-      ;;
-    zinder-projector)
-      image_description="Zinder wallet projector: builds the wallet projection from the canonical chain store."
-      documentation_path=docs/runbooks/deploying-on-a-vm.md
-      ;;
-    zinder-query)
-      image_description="Zinder native WalletQuery gRPC server for wallets and applications."
-      documentation_path=docs/runbooks/deploying-on-a-vm.md
-      ;;
-    zinder-compat-lightwalletd)
-      image_description="Zinder lightwalletd-compatible gRPC server for existing light wallets."
-      documentation_path=docs/runbooks/deploying-on-a-vm.md
-      ;;
-    zinder-explorer)
-      image_description="Zinder ExplorerQuery gRPC server for block explorers."
-      documentation_path=docs/runbooks/deploying-on-a-vm.md
-      ;;
-    zinder-canonical-runtime)
-      image_description="Zinder ingest-only canary runtime for one volume; it serves no client protocol."
-      documentation_path=docs/runbooks/deploying-single-volume.md
-      ;;
-    zinder-wallet-serving)
-      image_description="Zinder ingest, wallet projector, native WalletQuery, and lightwalletd compatibility supervised together on one volume."
-      documentation_path=docs/runbooks/deploying-single-volume.md
-      ;;
-    zinder-wallet-serving-explorer)
-      image_description="Zinder wallet serving and the ExplorerQuery server supervised together on one volume."
-      documentation_path=docs/runbooks/deploying-single-volume.md
+    zinder)
+      image_description="Unified Zinder node indexer, wallet projector, WalletQuery, lightwalletd compatibility, and Explorer server."
+      documentation_path=deploy/README.md
       ;;
     *)
       echo >&2 "no image description for ${1}; add one to describe_image"

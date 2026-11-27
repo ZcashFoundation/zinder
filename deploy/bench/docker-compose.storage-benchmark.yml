@@ -31,13 +31,13 @@ services:
         hard: 1048576
     volumes:
       - type: bind
-        source: ${ZINDER_BENCH_FIXTURE_PATH:-../fixtures/mainnet-150k-200k}
+        source: ${ZINDER_BENCH_FIXTURE_PATH:-../../fixtures/mainnet-150k-200k}
         target: /benchmark/fixture
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${ZINDER_BENCH_RESULTS_PATH:-../benchmark-results}
+        source: ${ZINDER_BENCH_RESULTS_PATH:-../../benchmark-results}
         target: /benchmark/results
         bind:
           create_host_path: false
@@ -98,13 +98,13 @@ services:
       ZINDER_BENCH_RESOURCE_REQUIRE_PRIVATE_CGROUP_NAMESPACE: "true"
     volumes:
       - type: bind
-        source: ${ZINDER_BENCH_FIXTURE_PATH:-../fixtures/mainnet-150k-200k}
+        source: ${ZINDER_BENCH_FIXTURE_PATH:-../../fixtures/mainnet-150k-200k}
         target: /benchmark/fixture
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${ZINDER_BENCH_RESULTS_PATH:-../benchmark-results}
+        source: ${ZINDER_BENCH_RESULTS_PATH:-../../benchmark-results}
         target: /benchmark/results
         bind:
           create_host_path: false
@@ -181,13 +181,13 @@ services:
       - "127.0.0.1:${ZINDER_BENCH_POSTGRES_HOST_PORT:-55432}:5432"
     volumes:
       - type: bind
-        source: ./capture-container-resource-evidence.sh
+        source: ../capture-container-resource-evidence.sh
         target: /usr/local/bin/zinder-capture-container-resource-evidence
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${ZINDER_BENCH_RESULTS_PATH:-../benchmark-results}
+        source: ${ZINDER_BENCH_RESULTS_PATH:-../../benchmark-results}
         target: /benchmark/results
         bind:
           create_host_path: false

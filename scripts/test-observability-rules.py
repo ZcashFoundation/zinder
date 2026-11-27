@@ -9,7 +9,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = "/etc/prometheus/prometheus.yml"
-ROLES = ["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd"]
+COMPOSE_ROLES = ["zinder-index", "zinder-serve"]
+SMOKE_ROLES = ["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd"]
 
 
 def output(*args):
@@ -22,8 +23,10 @@ def promql_labels(labels):
 
 def rule_test(rule_files, targets, panel):
     target = next(
-        (labels for labels in targets if labels["service"] == "zinder-query"),
-        next(labels for labels in targets if labels["service"] == "zinder-compat-lightwalletd"),
+        labels
+        for service in ("zinder-serve", "zinder-query", "zinder-compat-lightwalletd")
+        for labels in targets
+        if labels["service"] == service
     )
     inputs = [
         {"series": "up" + promql_labels(labels),
@@ -64,8 +67,7 @@ def rule_test(rule_files, targets, panel):
                       "promql_expr_test": [check for check in checks
                                            if check["eval_time"] in ("2m", "150s")]})
     return {"rule_files": rule_files, "evaluation_interval": "15s",
-            "group_eval_order": ["zinder-compose-targets", "zinder-smoke-targets",
-                                 "zinder-explorer-target", "zinder-readiness"],
+            "group_eval_order": ["zinder-compose-targets", "zinder-smoke-targets", "zinder-readiness"],
             "tests": tests}
 
 
@@ -98,13 +100,10 @@ def check(compose_args, service, roles, panel):
 if __name__ == "__main__":
     dashboard = json.loads((ROOT / "observability/grafana/dashboards/zinder-overview.json").read_text())
     panel = next(p for p in dashboard["panels"] if p["title"] == "Scrape Targets")["targets"][0]["expr"]
-    compose = ["--env-file", "deploy/.env.regtest", "-f", "deploy/docker-compose.yml"]
-    check(compose, "zinder-prometheus", ROLES, panel)
-    check(compose + ["-f", "deploy/docker-compose.explorer.yml"], "zinder-prometheus",
-          ROLES + ["zinder-explorer"], panel)
-    check([
+    compose = [
         "--env-file", "deploy/.env.regtest",
-        "-f", "deploy/docker-compose.light-wallet.yml",
+        "-f", "deploy/docker-compose.yml",
         "--profile", "observability",
-    ], "zinder-prometheus", ["zinder-ingest", "zinder-compat-lightwalletd"], panel)
-    check(["-f", "docker-compose.observability.yml"], "prometheus", ROLES, panel)
+    ]
+    check(compose, "zinder-prometheus", COMPOSE_ROLES, panel)
+    check(["-f", "deploy/bench/docker-compose.observability.yml"], "prometheus", SMOKE_ROLES, panel)

@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 digest_pattern='^sha256:[0-9a-f]{64}$'
-[[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder-[a-z0-9-]+$ ]] || usage
+[[ "$image" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/zinder(-[a-z0-9-]+)?$ ]] || usage
 [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || usage
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$amd64_build_digest" =~ $digest_pattern ]] || usage

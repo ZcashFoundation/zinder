@@ -2,27 +2,22 @@
 
 # Canonical Zinder runtime image builder.
 #
-# Build service images from the repository root with:
+# Build the unified release image from the repository root with:
 #
-#     docker build -f deploy/Dockerfile --target zinder-ingest -t zinder-ingest .
-#     docker build -f deploy/Dockerfile --target zinder-projector -t zinder-projector .
-#     docker build -f deploy/Dockerfile --target zinder-query -t zinder-query .
-#     docker build -f deploy/Dockerfile --target zinder-compat-lightwalletd -t zinder-compat-lightwalletd .
-#     docker build -f deploy/Dockerfile --target zinder-canonical-runtime -t zinder-canonical-runtime .
-#     docker build -f deploy/Dockerfile --target zinder-wallet-serving -t zinder-wallet-serving .
-#     docker build -f deploy/Dockerfile --target zinder-wallet-serving-explorer -t zinder-wallet-serving-explorer .
-#     docker build -f deploy/Dockerfile --target zinder-explorer -t zinder-explorer .
+#     docker build -f deploy/Dockerfile --target zinder -t zinder .
+#
+# Internal CI and benchmark targets (not shipped as release images):
+#
 #     docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench .
 #     docker build -f deploy/Dockerfile --target zinder-ingest-live-tests -t zinder-ingest-live-tests .
 #
 # Every runtime target copies its binaries from the `zinder-binaries-selected`
 # stage, which `ZINDER_BINARIES_SOURCE` names. By default it is
-# `zinder-binaries`, which compiles all shipped binaries in one Cargo
-# invocation and keeps Cargo registry, git, and target artifacts in BuildKit
-# cache mounts, so rebuilding one service warms the shared cache for every
-# other service image. The benchmark compiles in its own stage against the
-# same cache and is not part of that invocation. `RELEASE_CACHE_SCOPE` names
-# the target cache and defaults to `shared`.
+# `zinder-binaries`, which compiles the unified `zinder` binary and keeps Cargo
+# registry, git, and target artifacts in BuildKit cache mounts. The benchmark
+# compiles in its own stage against the same cache and is not part of the
+# release invocation. `RELEASE_CACHE_SCOPE` names the target cache and defaults
+# to `shared`.
 #
 # Cargo decides whether a workspace crate is up to date from file modification
 # times, and a source tree from `git archive` or a tarball carries its commit
@@ -34,10 +29,10 @@
 # change the output: it builds each platform twice from checkouts with
 # different file times and compares the bytes.
 #
-# The release packages its images from the reproduced binary archive instead
-# of compiling again. DIR/zinder-binaries/ holds the extracted archive binaries:
+# The release packages its image from the reproduced binary archive instead of
+# compiling again. DIR/zinder-binaries/ holds the extracted archive binary:
 #
-#     docker buildx build -f deploy/Dockerfile --target zinder-ingest \
+#     docker buildx build -f deploy/Dockerfile --target zinder \
 #       --build-arg ZINDER_BINARIES_SOURCE=zinder-archived-binaries \
 #       --build-context zinder-archived-binaries=DIR .
 
@@ -124,17 +119,9 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     && pasta_asm_flag="$(if [ "${ZINDER_PASTA_ASM}" = "1" ]; then printf '%s' '--features pasta_curves/asm'; else printf '%s' ''; fi)" \
     && rustup target add "$rust_target" \
     && cargo auditable build --locked --release --target "$rust_target" $pasta_asm_flag \
-        --bin zinder-ingest \
-        --bin zinder-projector \
-        --bin zinder-query \
-        --bin zinder-compat-lightwalletd \
-        --bin zinder-explorer \
+        --bin zinder \
     && mkdir -p /zinder-binaries \
-    && cp "/workspace/target/${rust_target}/release/zinder-ingest" /zinder-binaries/zinder-ingest \
-    && cp "/workspace/target/${rust_target}/release/zinder-projector" /zinder-binaries/zinder-projector \
-    && cp "/workspace/target/${rust_target}/release/zinder-query" /zinder-binaries/zinder-query \
-    && cp "/workspace/target/${rust_target}/release/zinder-compat-lightwalletd" /zinder-binaries/zinder-compat-lightwalletd \
-    && cp "/workspace/target/${rust_target}/release/zinder-explorer" /zinder-binaries/zinder-explorer
+    && cp "/workspace/target/${rust_target}/release/zinder" /zinder-binaries/zinder
 
 FROM zinder-release-source AS zinder-bench-binary
 
@@ -161,11 +148,7 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
 
 FROM scratch AS release-binaries
 
-COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /bin/zinder-ingest
-COPY --from=zinder-binaries /zinder-binaries/zinder-projector /bin/zinder-projector
-COPY --from=zinder-binaries /zinder-binaries/zinder-query /bin/zinder-query
-COPY --from=zinder-binaries /zinder-binaries/zinder-compat-lightwalletd /bin/zinder-compat-lightwalletd
-COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /bin/zinder-explorer
+COPY --from=zinder-binaries /zinder-binaries/zinder /bin/zinder
 
 # Release image packaging replaces this empty stage with a build context of
 # archived binaries. A build that selects it without that context fails at the
@@ -199,12 +182,12 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     && test "$(printf '%s\n' "$test_binary" | wc -l)" -eq 1 \
     && cp "$test_binary" /zinder-live-tests/zinder-ingest-acceptance
 
-# Per-service release images run one binary on distroless cc, which carries
-# glibc, libgcc_s, libstdc++, and CA certificates but no shell, package
-# manager, or HTTP client. The image HEALTHCHECK runs the binary's own
-# `healthcheck` subcommand. BuildKit creates a WORKDIR in an empty stage, so
-# the state directories need no RUN. UID and GID 10001 match the Zebra and
-# Zakura images, so the services read the node's mode-0600 RPC cookie.
+# The release image runs the unified `zinder` binary on distroless cc, which
+# carries glibc, libgcc_s, libstdc++, and CA certificates without a shell,
+# package manager, or HTTP client. The image HEALTHCHECK invokes `zinder
+# healthcheck`. BuildKit creates a WORKDIR in an empty stage, so the state
+# directories need no RUN. UID and GID 10001 match the Zebra and Zakura images,
+# so Zinder reads the node's mode-0600 RPC cookie.
 FROM scratch AS zinder-service-state
 
 WORKDIR /var/lib/zinder/secondary
@@ -213,101 +196,35 @@ FROM gcr.io/distroless/cc-debian12:nonroot@${DISTROLESS_IMAGE_DIGEST} AS zinder-
 
 COPY --from=zinder-service-state --chown=10001:10001 /var/lib/zinder /var/lib/zinder
 
-# Each service image installs deploy/config/images/<service>.toml as
-# /etc/zinder/config.toml and passes it with CMD. The file binds every
-# container interface so `docker run -p` works; other containers on the same
-# network can still reach these listeners, and host networking binds the
-# host's interfaces (see docs/architecture/service-operations.md, Security boundary). A config
-# mounted at the same path replaces the file as a whole, and arguments after
-# the image name replace CMD.
 USER 10001:10001
 WORKDIR /var/lib/zinder
 
-FROM zinder-service-base AS zinder-ingest
+FROM zinder-service-base AS zinder
 
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder /usr/local/bin/zinder
 
-COPY deploy/config/images/ingest.toml /etc/zinder/config.toml
+USER 10001:10001
+WORKDIR /var/lib/zinder
 
-EXPOSE 9105
+EXPOSE 9067 9068 9069 9102 9108
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["zinder-ingest", "--config", "/etc/zinder/config.toml", "healthcheck"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["/usr/local/bin/zinder", "healthcheck"]
 
-ENTRYPOINT ["zinder-ingest"]
-CMD ["--config", "/etc/zinder/config.toml"]
+ENTRYPOINT ["/usr/local/bin/zinder"]
+CMD ["serve"]
 
-FROM zinder-service-base AS zinder-projector
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
-
-COPY deploy/config/images/projector.toml /etc/zinder/config.toml
-
-EXPOSE 9110
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["zinder-projector", "--config", "/etc/zinder/config.toml", "healthcheck"]
-
-ENTRYPOINT ["zinder-projector"]
-CMD ["--config", "/etc/zinder/config.toml"]
-
-FROM zinder-service-base AS zinder-query
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query /usr/local/bin/zinder-query
-
-COPY deploy/config/images/query.toml /etc/zinder/config.toml
-
-EXPOSE 9102 9106
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["zinder-query", "--config", "/etc/zinder/config.toml", "healthcheck"]
-
-ENTRYPOINT ["zinder-query"]
-CMD ["--config", "/etc/zinder/config.toml"]
-
-FROM zinder-service-base AS zinder-compat-lightwalletd
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-compat-lightwalletd /usr/local/bin/zinder-compat-lightwalletd
-
-COPY deploy/config/images/compat-lightwalletd.toml /etc/zinder/config.toml
-
-EXPOSE 9067 9107
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["zinder-compat-lightwalletd", "--config", "/etc/zinder/config.toml", "healthcheck"]
-
-ENTRYPOINT ["zinder-compat-lightwalletd"]
-CMD ["--config", "/etc/zinder/config.toml"]
-
-FROM zinder-service-base AS zinder-explorer
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
-
-COPY deploy/config/images/explorer.toml /etc/zinder/config.toml
-
-EXPOSE 9068 9069
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
-    CMD ["zinder-explorer", "--config", "/etc/zinder/config.toml", "healthcheck"]
-
-ENTRYPOINT ["zinder-explorer"]
-CMD ["--config", "/etc/zinder/config.toml"]
-
-# Debian base for the images whose POSIX entrypoints and helper scripts need a
-# shell, curl, and the zinder account: the single-volume host images, the
-# benchmark, and the live-test runner.
+# Slim Debian base for internal CI and benchmark stages that need a shell and
+# helper scripts (not shipped as release images).
 FROM debian:${DEBIAN_RELEASE}-slim@${DEBIAN_IMAGE_DIGEST} AS zinder-runtime-base
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-# BuildKit gives directories that `COPY --chmod` creates the file mode, so
-# /usr/local/lib/zinder must exist before a 0644 file is copied into it. The
-# zinder account uses the per-service images' UID and GID.
 RUN groupadd --system --gid 10001 zinder \
     && useradd --system --uid 10001 --gid zinder --home /var/lib/zinder --shell /usr/sbin/nologin zinder \
-    && mkdir -p /var/lib/zinder/secondary /etc/zinder /usr/local/lib/zinder \
+    && mkdir -p /var/lib/zinder/secondary /etc/zinder \
     && chown -R zinder:zinder /var/lib/zinder /etc/zinder
 
 FROM zinder-runtime-base AS zinder-ingest-live-tests
@@ -318,102 +235,6 @@ USER zinder:zinder
 WORKDIR /var/lib/zinder
 
 ENTRYPOINT ["zinder-ingest-acceptance"]
-
-# Single-volume host images. Platforms that attach one volume to one container
-# mount it root-owned, so these targets start as root and their entrypoints
-# drop every runtime process to zinder.
-
-# Ingest-only diagnostic or canary runtime. It projects no wallet state and
-# serves no client protocol.
-FROM zinder-runtime-base AS zinder-canonical-runtime
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
-
-COPY --chmod=0644 deploy/materialize-indexer-tls \
-    /usr/local/lib/zinder/materialize-indexer-tls
-COPY --chmod=0755 deploy/canonical-runtime-entrypoint \
-    /usr/local/bin/zinder-canonical-runtime-entrypoint
-
-ENV ZINDER_OPS__LISTEN_ADDR=[::]:9105
-ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true
-
-USER root:root
-WORKDIR /var/lib/zinder
-
-EXPOSE 9105
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["zinder-ingest", "healthcheck", "--path", "/healthz"]
-
-ENTRYPOINT ["zinder-canonical-runtime-entrypoint"]
-
-# Wallet-serving runtime: the canonical writer, the wallet writer, the native
-# query reader, and the lightwalletd compatibility reader run as supervised
-# processes against the one volume mounted at /var/lib/zinder, because the
-# readers open secondaries over paths the writers own. The compatibility
-# reader can be turned off with ZINDER_WALLET_SERVING__LIGHTWALLETD=false.
-# Hosts with shared volumes across containers use deploy/docker-compose.yml.
-FROM zinder-runtime-base AS zinder-wallet-serving
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query /usr/local/bin/zinder-query
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-compat-lightwalletd /usr/local/bin/zinder-compat-lightwalletd
-
-COPY deploy/config/wallet-serving/ingest.toml /etc/zinder/ingest.toml
-COPY deploy/config/wallet-serving/projector.toml /etc/zinder/projector.toml
-COPY deploy/config/wallet-serving/query.toml /etc/zinder/query.toml
-COPY deploy/config/wallet-serving/compat-lightwalletd.toml /etc/zinder/compat-lightwalletd.toml
-
-COPY --chmod=0644 deploy/materialize-indexer-tls \
-    /usr/local/lib/zinder/materialize-indexer-tls
-COPY --chmod=0755 deploy/wallet-serving-runtime-entrypoint \
-    /usr/local/bin/zinder-wallet-serving-runtime-entrypoint
-COPY --chmod=0755 deploy/wallet-serving-healthcheck \
-    /usr/local/bin/zinder-wallet-serving-healthcheck
-
-# Platform volume mounts replace the ownership baked into the image, and the
-# nofile limit is raised before any store opens. Start as root; the entrypoint
-# drops every runtime process to zinder.
-USER root:root
-WORKDIR /var/lib/zinder
-
-EXPOSE 9067 9102 9106 9107
-
-# The start period covers the entrypoint's default canonical, wallet, and
-# serving deadlines, which together run to five and a half hours; query and
-# compatibility share the serving deadline. A parked canonical writer counts
-# as healthy: both readers then refuse wallets with the typed
-# REORG_WINDOW_EXCEEDED halt, and the entrypoint keeps that refusal up. A
-# projector parked on a wallet transition over its logical-byte limit counts
-# as healthy too, because restarting only parks it on the same transition.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
-    CMD ["zinder-wallet-serving-healthcheck"]
-
-ENTRYPOINT ["zinder-wallet-serving-runtime-entrypoint"]
-
-# Wallet serving plus the Explorer on one volume. zinder-explorer opens the
-# materialized-view store that zinder-ingest writes as a RocksDB secondary, so
-# it must share the writer's filesystem. The baked ingest config differs from
-# zinder-wallet-serving in one setting: ingest also writes the Explorer views.
-FROM zinder-wallet-serving AS zinder-wallet-serving-explorer
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
-
-COPY deploy/config/wallet-serving/explorer.toml /etc/zinder/explorer.toml
-
-RUN sed -i 's/^explorer_views = false$/explorer_views = true/' /etc/zinder/ingest.toml \
-    && grep -qx 'explorer_views = true' /etc/zinder/ingest.toml
-
-COPY --chmod=0755 deploy/wallet-serving-explorer-runtime-entrypoint \
-    /usr/local/bin/zinder-wallet-serving-explorer-runtime-entrypoint
-
-EXPOSE 9067 9068 9069 9102 9106 9107
-
-# The inherited wallet-serving HEALTHCHECK deliberately ignores the Explorer:
-# the entrypoint restarts the Explorer alone, and a host that restarts
-# unhealthy containers must not tear down wallet serving when it fails.
-ENTRYPOINT ["zinder-wallet-serving-explorer-runtime-entrypoint"]
 
 FROM zinder-runtime-base AS zinder-bench
 

@@ -796,15 +796,36 @@ fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
 #[test]
 fn packaged_wallet_configs_select_dense_construction_unless_overridden_or_serving_explorer()
 -> Result<(), Box<dyn Error>> {
-    let configs = zinder_testkit::manifest_dir!().join("../../deploy/config");
     let temporary = tempdir()?;
     let token = temporary.path().join("fixture.token");
     fs::write(&token, "fixture-token\n")?;
+    let json_rpc_toml = temporary.path().join("ingest-json-rpc.toml");
+    let grpc_toml = temporary.path().join("ingest-grpc.toml");
+    for (path, source) in [
+        (&json_rpc_toml, "zebra-json-rpc"),
+        (&grpc_toml, "zebra-indexer-grpc"),
+    ] {
+        fs::write(
+            path,
+            format!(
+                concat!(
+                    "[storage]\npath = \"/var/lib/zinder/canonical\"\n\n",
+                    "[ingest]\nsource = \"{source}\"\nexplorer_views = false\nreorg_window_blocks = 1000\n\n",
+                    "[ingest.run_overrides]\ncoverage = \"wallet-serving\"\n\n",
+                    "[ingest_control]\nlisten_addr = \"127.0.0.1:9100\"\n",
+                    "checkpoint_staging_root = \"/var/lib/zinder/checkpoints\"\n",
+                    "bearer_token_path = \"/var/run/zinder-control/ingest.token\"\n",
+                    "checkpoint_bearer_token_path = \"/var/run/zinder-checkpoint/checkpoint.token\"\n",
+                ),
+                source = source,
+            ),
+        )?;
+    }
     let core_bounded_workers = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
         .min(8);
 
-    for file in ["ingest.toml", "wallet-serving/ingest.toml"] {
+    for (label, config_path) in [("json-rpc", &json_rpc_toml), ("indexer-grpc", &grpc_toml)] {
         for (setting, dense) in [
             (None, true),
             (Some(("ZINDER_INGEST__EXPLORER_VIEWS", "true")), false),
@@ -818,7 +839,7 @@ fn packaged_wallet_configs_select_dense_construction_unless_overridden_or_servin
         ] {
             let output = zinder_ingest_command()
                 .args(["--print-config", "--config"])
-                .arg(configs.join(file))
+                .arg(config_path)
                 .env("ZINDER_NETWORK__NAME", "zcash-regtest")
                 .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
                 .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "http://127.0.0.1:18155")
@@ -829,21 +850,21 @@ fn packaged_wallet_configs_select_dense_construction_unless_overridden_or_servin
                 )
                 .envs(setting)
                 .output()?;
-            assert!(output.status.success(), "{file}: {output:?}");
+            assert!(output.status.success(), "{label}: {output:?}");
             let config: toml::Table = toml::from_str(std::str::from_utf8(&output.stdout)?)?;
             let policy = &config["ingest"]["tree_state_densification"];
-            assert_eq!(policy["enabled"].as_bool(), Some(true), "{file}");
-            assert_eq!(policy["selection"].as_str(), Some("every-block"), "{file}");
+            assert_eq!(policy["enabled"].as_bool(), Some(true), "{label}");
+            assert_eq!(policy["selection"].as_str(), Some("every-block"), "{label}");
             assert_eq!(
                 policy["during_construction"].as_bool(),
                 Some(dense),
-                "{file}, override={setting:?}"
+                "{label}, override={setting:?}"
             );
             let expected_workers = if dense { core_bounded_workers } else { 1 };
             assert_eq!(
                 config["ingest"]["construction"]["tree_hashing_workers"].as_integer(),
                 Some(i64::try_from(expected_workers)?),
-                "{file}, override={setting:?}"
+                "{label}, override={setting:?}"
             );
         }
     }
@@ -1521,8 +1542,19 @@ fn assert_single_volume_legacy_transactions_print_config(
     temporary_root: &Path,
     store_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    let wallet_serving_ingest_config =
-        zinder_testkit::manifest_dir!().join("../../deploy/config/wallet-serving/ingest.toml");
+    let wallet_serving_ingest_config = temporary_root.join("wallet-serving-ingest.toml");
+    fs::write(
+        &wallet_serving_ingest_config,
+        concat!(
+            "[storage]\npath = \"/var/lib/zinder/canonical\"\n\n",
+            "[ingest]\nsource = \"zebra-indexer-grpc\"\nexplorer_views = false\nreorg_window_blocks = 1000\n\n",
+            "[ingest.run_overrides]\ncoverage = \"wallet-serving\"\n\n",
+            "[ingest_control]\nlisten_addr = \"127.0.0.1:9100\"\n",
+            "checkpoint_staging_root = \"/var/lib/zinder/checkpoints\"\n",
+            "bearer_token_path = \"/var/run/zinder-control/ingest.token\"\n",
+            "checkpoint_bearer_token_path = \"/var/run/zinder-checkpoint/checkpoint.token\"\n",
+        ),
+    )?;
     let printed = run_wallet_serving_ingest_print_config(
         temporary_root,
         &wallet_serving_ingest_config,
@@ -1616,7 +1648,7 @@ async fn legacy_transactions_single_volume_override_reopens_pre_change_store()
     );
 
     // Leaving ZINDER_DEPLOYMENT__PROFILE unset when ZINDER_STORAGE__RAW_BLOB_POLICY=transactions
-    // (as deploy/wallet-serving-runtime-entrypoint does) resolves cleanly and reopens without rebuild.
+    // resolves cleanly and reopens without rebuild.
     assert_single_volume_legacy_transactions_print_config(directory.path(), &store_path)?;
 
     let reopened = admit_canonical_store(
@@ -1654,13 +1686,17 @@ async fn mounted_toml_wallet_profile_with_full_blocks_preserves_all_retention()
 
     let directory = tempdir()?;
     let custom_ingest_toml = directory.path().join("ingest.toml");
-    let shipped = fs::read_to_string(
-        zinder_testkit::manifest_dir!().join("../../deploy/config/wallet-serving/ingest.toml"),
-    )?;
-    let patched = shipped.replacen("[storage]\n", "[storage]\nfull_blocks = true\n", 1);
     fs::write(
         &custom_ingest_toml,
-        format!("[deployment]\nprofile = \"wallet\"\n\n{patched}"),
+        concat!(
+            "[deployment]\nprofile = \"wallet\"\n\n",
+            "[storage]\nfull_blocks = true\npath = \"/var/lib/zinder/canonical\"\n\n",
+            "[ingest]\nsource = \"zebra-indexer-grpc\"\nexplorer_views = false\nreorg_window_blocks = 1000\n\n",
+            "[ingest_control]\nlisten_addr = \"127.0.0.1:9100\"\n",
+            "checkpoint_staging_root = \"/var/lib/zinder/checkpoints\"\n",
+            "bearer_token_path = \"/var/run/zinder-control/ingest.token\"\n",
+            "checkpoint_bearer_token_path = \"/var/run/zinder-checkpoint/checkpoint.token\"\n",
+        ),
     )?;
 
     let store_path = directory.path().join("canonical");

@@ -245,20 +245,39 @@ fn wallet_serving_accepts_node_fallbacks_only_with_a_primary_node() -> eyre::Res
 /// secondary roots and with the cache budget pinned as query's is.
 #[test]
 fn wallet_serving_image_config_resolves() -> eyre::Result<()> {
-    let config_path = zinder_testkit::manifest_dir!()
-        .join("../../deploy/config/wallet-serving/compat-lightwalletd.toml");
     let temporary = tempdir()?;
     let token_path = temporary.path().join("ingest.token");
     fs::write(&token_path, "fixture-token\n")?;
 
     let output = zinder_compat_command()
-        .args(["--config", path_str(&config_path)?, "--print-config"])
+        .args(["--print-config"])
+        .env("ZINDER_DEPLOYMENT__PROFILE", "wallet")
         .env("ZINDER_NETWORK__NAME", "zcash-testnet")
         .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+        .env("ZINDER_STORAGE__PATH", "/var/lib/zinder/canonical")
+        .env(
+            "ZINDER_STORAGE__SECONDARY_PATH",
+            "/var/lib/zinder/compat/canonical-secondary",
+        )
+        .env(
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__BLOCK_CACHE_BYTES",
+            "268435456",
+        )
+        .env("ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES", "1024")
+        .env("ZINDER_WALLET__PATH", "/var/lib/zinder/wallet")
+        .env(
+            "ZINDER_WALLET__SECONDARY_PATH",
+            "/var/lib/zinder/compat/wallet-secondary",
+        )
+        .env("ZINDER_INGEST_CONTROL__ADDR", "http://127.0.0.1:9100")
         .env(
             "ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH",
             path_str(&token_path)?,
         )
+        .env("ZINDER_COMPAT__LISTEN_ADDR", "[::]:9067")
+        .env("ZINDER_COMPAT__REORG_WINDOW_BLOCKS", "1000")
+        .env("ZINDER_OPS__LISTEN_ADDR", "[::]:9107")
+        .env("ZINDER_SECURITY__ALLOW_PUBLIC_BIND", "true")
         .output()?;
 
     assert!(output.status.success(), "{output:?}");
@@ -272,7 +291,7 @@ fn wallet_serving_image_config_resolves() -> eyre::Result<()> {
         "secondary_path = \"/var/lib/zinder/compat/wallet-secondary\"",
         "addr = \"http://127.0.0.1:9100\"",
         "listen_addr = \"[::]:9067\"",
-        "serving = \"wallet\"",
+        "profile = \"wallet\"",
         "listen_addr = \"[::]:9107\"",
         "allow_public_bind = true",
     ] {
