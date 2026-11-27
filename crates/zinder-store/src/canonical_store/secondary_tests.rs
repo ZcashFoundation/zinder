@@ -3610,7 +3610,7 @@ fn assert_unary_lookup_tickers(
 }
 
 #[test]
-fn unary_encoded_compact_block_reports_missing_retained_live_tail_row_as_storage_damage()
+fn unary_encoded_compact_block_reports_missing_retained_live_tail_row_as_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::CompactBlockSpliceSelection;
 
@@ -3648,8 +3648,10 @@ fn unary_encoded_compact_block_reports_missing_retained_live_tail_row_as_storage
     ] {
         assert!(matches!(
             store.encoded_compact_block_at(BlockHeight::new(3), selection),
-            Err(CanonicalStoreError::PublicationRefused { ref reason })
-                if reason.contains("compact block at height 3 is absent")
+            Err(CanonicalStoreError::ArtifactUnavailable {
+                family: crate::ArtifactFamily::CompactBlock,
+                height,
+            }) if height == BlockHeight::new(3)
         ));
         assert!(
             store

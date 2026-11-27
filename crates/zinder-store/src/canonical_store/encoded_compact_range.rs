@@ -130,7 +130,10 @@ fn encoded_compact_block_at_for_context(
             height,
             &verified_read_options(),
         )?
-        .ok_or_else(|| missing_compact_block_row(height))?;
+        .ok_or(CanonicalStoreError::ArtifactUnavailable {
+            family: ArtifactFamily::CompactBlock,
+            height,
+        })?;
     let wire = LiveTailBlockRecord::decode_splice_wire_v1(&raw_row, height)
         .map_err(map_settled_segments_read_error)?;
     if wire.has_unrepresentable_wire_fee {
@@ -2634,8 +2637,10 @@ mod tests {
         ] {
             assert!(matches!(
                 encoded_compact_block_at_for_context(ctx, BlockHeight::new(25), selection),
-                Err(CanonicalStoreError::PublicationRefused { ref reason })
-                    if reason.contains("compact block at height 25 is absent")
+                Err(CanonicalStoreError::ArtifactUnavailable {
+                    family: ArtifactFamily::CompactBlock,
+                    height,
+                }) if height == BlockHeight::new(25)
             ));
         }
 

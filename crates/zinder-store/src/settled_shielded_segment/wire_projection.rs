@@ -312,21 +312,35 @@ pub(super) fn project_shielded_block_wire_into(
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ExpectedShieldedBlock<'a> {
-    pub(super) height: BlockHeight,
-    pub(super) block_hash_wire: &'a [u8; 32],
-    pub(super) prev_hash_wire: &'a [u8; 32],
-    pub(super) block_time: u32,
-    pub(super) pool_presence: PoolPresenceMask,
+pub(crate) struct ExpectedShieldedBlock<'a> {
+    pub(crate) height: BlockHeight,
+    pub(crate) block_hash_wire: &'a [u8; 32],
+    pub(crate) prev_hash_wire: &'a [u8; 32],
+    pub(crate) block_time: u32,
+    pub(crate) pool_presence: PoolPresenceMask,
 }
+
+const OBSERVED_HASH: u8 = 1 << 0;
+const OBSERVED_PREV_HASH: u8 = 1 << 1;
+const OBSERVED_CHAIN_METADATA: u8 = 1 << 2;
+const OBSERVED_EMPTY_VTX: u8 = 1 << 3;
 
 #[derive(Default)]
 struct ObservedShieldedBlock {
     height: Option<u64>,
     time: Option<u64>,
-    has_hash: bool,
-    has_prev_hash: bool,
+    flags: u8,
     pool_presence: PoolPresenceMask,
+}
+
+impl ObservedShieldedBlock {
+    const fn has_flag(&self, bit: u8) -> bool {
+        (self.flags & bit) != 0
+    }
+
+    const fn set_flag(&mut self, bit: u8) {
+        self.flags |= bit;
+    }
 }
 
 /// Validates a `Slab 0` `CompactBlock` protobuf payload without heap allocation.
@@ -334,6 +348,34 @@ pub(super) fn validate_shielded_block_wire(
     raw_payload: &[u8],
     expected: ExpectedShieldedBlock<'_>,
 ) -> Result<(), SettledShieldedSegmentError> {
+    let _observed = scan_and_validate_shielded_block_wire(raw_payload, expected)?;
+    Ok(())
+}
+
+/// Validates a live-tail `CompactBlock` protobuf payload without heap allocation,
+/// enforcing `chain_metadata` presence and non-empty `vtx` transaction entries.
+pub(crate) fn validate_live_tail_shielded_block_wire(
+    raw_payload: &[u8],
+    expected: ExpectedShieldedBlock<'_>,
+) -> Result<(), SettledShieldedSegmentError> {
+    let observed = scan_and_validate_shielded_block_wire(raw_payload, expected)?;
+    if !observed.has_flag(OBSERVED_CHAIN_METADATA) {
+        return Err(SettledShieldedSegmentError::PayloadIntegrity(
+            "live-tail shielded payload is missing chain_metadata".to_owned(),
+        ));
+    }
+    if observed.has_flag(OBSERVED_EMPTY_VTX) {
+        return Err(SettledShieldedSegmentError::PayloadIntegrity(
+            "live-tail DEFAULT_RANGE transaction carries neither Sapling, Orchard, nor Ironwood fields".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn scan_and_validate_shielded_block_wire(
+    raw_payload: &[u8],
+    expected: ExpectedShieldedBlock<'_>,
+) -> Result<ObservedShieldedBlock, SettledShieldedSegmentError> {
     let mut cursor = raw_payload;
     let mut observed = ObservedShieldedBlock::default();
     while !cursor.is_empty() {
@@ -343,22 +385,26 @@ pub(super) fn validate_shielded_block_wire(
                 check_unique_varint_field(wire_type, &mut cursor, &mut observed.height, "height")?;
             }
             COMPACT_BLOCK_TAG_HASH => {
-                observed.has_hash = check_header_hash_field(
+                if check_header_hash_field(
                     wire_type,
                     &mut cursor,
                     expected.block_hash_wire,
-                    observed.has_hash,
+                    observed.has_flag(OBSERVED_HASH),
                     "hash",
-                )?;
+                )? {
+                    observed.set_flag(OBSERVED_HASH);
+                }
             }
             COMPACT_BLOCK_TAG_PREV_HASH => {
-                observed.has_prev_hash = check_header_hash_field(
+                if check_header_hash_field(
                     wire_type,
                     &mut cursor,
                     expected.prev_hash_wire,
-                    observed.has_prev_hash,
+                    observed.has_flag(OBSERVED_PREV_HASH),
                     "prev_hash",
-                )?;
+                )? {
+                    observed.set_flag(OBSERVED_PREV_HASH);
+                }
             }
             COMPACT_BLOCK_TAG_TIME => {
                 check_unique_varint_field(wire_type, &mut cursor, &mut observed.time, "time")?;
@@ -376,17 +422,22 @@ pub(super) fn validate_shielded_block_wire(
                 expect_wire_type(wire_type, WireType::LengthDelimited, "chain_metadata")?;
                 let nested = take_length_delimited(&mut cursor)?;
                 validate_chain_metadata_wire(nested)?;
+                observed.set_flag(OBSERVED_CHAIN_METADATA);
             }
             COMPACT_BLOCK_TAG_VTX => {
                 expect_wire_type(wire_type, WireType::LengthDelimited, "CompactBlock.vtx")?;
                 let tx_bytes = take_length_delimited(&mut cursor)?;
                 let tx_presence = validate_compact_tx_wire(tx_bytes)?;
+                if tx_presence.is_empty() {
+                    observed.set_flag(OBSERVED_EMPTY_VTX);
+                }
                 observed.pool_presence = observed.pool_presence.union(tx_presence);
             }
             _ => skip_wire_field(wire_type, &mut cursor)?,
         }
     }
-    verify_observed_shielded_block(&observed, expected)
+    verify_observed_shielded_block(&observed, expected)?;
+    Ok(observed)
 }
 
 fn check_unique_varint_field(
@@ -410,8 +461,8 @@ fn verify_observed_shielded_block(
     expected: ExpectedShieldedBlock<'_>,
 ) -> Result<(), SettledShieldedSegmentError> {
     if observed.height.unwrap_or(0) != u64::from(expected.height.value())
-        || !observed.has_hash
-        || !observed.has_prev_hash
+        || !observed.has_flag(OBSERVED_HASH)
+        || !observed.has_flag(OBSERVED_PREV_HASH)
     {
         return Err(SettledShieldedSegmentError::PayloadIntegrity(
             "shielded segment payload height, hash, or prev_hash mismatches index".to_owned(),

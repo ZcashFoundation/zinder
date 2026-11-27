@@ -299,8 +299,10 @@ macro_rules! impl_canonical_typed_reads {
             /// directly from `ZSHRNG02` + `ZSTSUP01` or `live_tail_block`, skipping
             /// `ZSTSUP01` chunk decompression when no Tag-1 supplement is needed.
             ///
-            /// Returns `Ok(None)` when `height` falls outside retained history, or
-            /// [`CanonicalStoreError::PublicationRefused`] if a retained row is absent.
+            /// Returns `Ok(None)` when `height` falls outside retained history,
+            /// [`CanonicalStoreError::ArtifactUnavailable`] if a retained `live_tail_block`
+            /// row is absent, or [`CanonicalStoreError::PublicationRefused`] if a settled
+            /// segment is missing that block.
             pub fn encoded_compact_block_at(
                 &self,
                 height: BlockHeight,
