@@ -20,7 +20,8 @@ use zinder_testkit::{
 };
 
 use super::{
-    ReaderHarness, WalletReaderHarness, canonical_reader_conformance, wallet_reader_conformance,
+    ReaderHarness, WalletReaderHarness, canonical_reader_conformance,
+    stateless_serving_conformance, wallet_reader_conformance,
 };
 
 /// A production canonical primary, with readers opened as `RocksDB`
@@ -226,4 +227,8 @@ mod canonical_cases {
 
 mod wallet_cases {
     super::wallet_reader_conformance!(super::RocksDbReaderHarness);
+}
+
+mod stateless_serving_cases {
+    super::stateless_serving_conformance!(super::RocksDbReaderHarness);
 }

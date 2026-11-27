@@ -46,4 +46,4 @@ See [compat-lightwalletd.Caddyfile](compat-lightwalletd.Caddyfile) and [Exposing
 
 ## Benchmark and test harnesses
 
-Maintainer-only storage benchmarks, RocksDB lifecycle tests, live test topologies, and local observability stacks live under [bench/](bench/). See [storage-benchmark.md](storage-benchmark.md) and [rocksdb-storage-lifecycle.md](rocksdb-storage-lifecycle.md).
+Maintainer-only storage benchmarks, RocksDB lifecycle tests, live test topologies, and local observability stacks live under [bench/](bench/). See [storage-benchmark.md](storage-benchmark.md), [rocksdb-storage-lifecycle.md](rocksdb-storage-lifecycle.md), and the [Stateless-Topology Testing Ground](bench/postgres-testing-ground/README.md).

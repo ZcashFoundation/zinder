@@ -1,0 +1,169 @@
+# Stateless-Topology Testing Ground (PostgreSQL 17/18 + PgBouncer + Mock R2 + Caddy)
+# Local diagnostic/test harness only; does not change Zinder's supported `rocksdb` production posture.
+#
+# Live multi-replica `zinder serve --readers-only` containers inside this Compose stack await
+# `#676` (PostgreSQL Slice 1), because current `rocksdb` readers require a local canonical
+# store and `IngestControl`. Stateless `read_only: true` replicas in this stack validate
+# PostgreSQL transaction pooling, R2 fault injection + primary fallback, HTTP REST, gRPC-Web,
+# and native HTTP/2 h2c gRPC round-robin routing.
+
+name: ${ZINDER_PG_TESTING_GROUND_PROJECT:-zinder-pg-testing-ground}
+
+services:
+  postgres:
+    image: ${ZINDER_PG_TESTING_GROUND_POSTGRES_IMAGE:-postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402}
+    environment:
+      POSTGRES_DB: zinder_testing
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: zinder_pg_superuser_local_only
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--data-checksums --auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    command:
+      - postgres
+      - -c
+      - fsync=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - password_encryption=scram-sha-256
+    volumes:
+      - ./init-roles.sql:/docker-entrypoint-initdb.d/01-init-roles.sql:ro
+    ports:
+      - "127.0.0.1:${ZINDER_PG_TG_POSTGRES_PORT:-15432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zinder_testing"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.25.1-p0@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/usr/bin/pgbouncer"]
+    command: ["/etc/pgbouncer/pgbouncer.ini"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "127.0.0.1:${ZINDER_PG_TG_PGBOUNCER_PORT:-16432}:6432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 || nc -z 127.0.0.1 6432"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  mock-r2:
+    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
+    command: ["python3", "/app/server.py"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    volumes:
+      - ./mock-r2/server.py:/app/server.py:ro
+    ports:
+      - "127.0.0.1:${ZINDER_PG_TG_R2_PORT:-19000}:9000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  probe-reader-a:
+    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      mock-r2:
+        condition: service_healthy
+    environment:
+      REPLICA_ID: probe-reader-a
+      PROBE_PORT: "8081"
+      PROBE_GRPC_PORT: "8082"
+      PGBOUNCER_HOST: pgbouncer
+      PGBOUNCER_PORT: "6432"
+      MOCK_R2_BASE: http://mock-r2:9000
+    command: ["python3", "/app/probe_replica.py"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    volumes:
+      - ./proxy/probe_replica.py:/app/probe_replica.py:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import socket, urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2); socket.create_connection(('127.0.0.1', 8082), timeout=2).close()",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  probe-reader-b:
+    image: python:3.13-alpine@sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      mock-r2:
+        condition: service_healthy
+    environment:
+      REPLICA_ID: probe-reader-b
+      PROBE_PORT: "8081"
+      PROBE_GRPC_PORT: "8082"
+      PGBOUNCER_HOST: pgbouncer
+      PGBOUNCER_PORT: "6432"
+      MOCK_R2_BASE: http://mock-r2:9000
+    command: ["python3", "/app/probe_replica.py"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    volumes:
+      - ./proxy/probe_replica.py:/app/probe_replica.py:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import socket, urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2); socket.create_connection(('127.0.0.1', 8082), timeout=2).close()",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  proxy:
+    image: caddy:2.11-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    depends_on:
+      probe-reader-a:
+        condition: service_healthy
+      probe-reader-b:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /config:rw,noexec,nosuid,size=16m
+      - /data:rw,noexec,nosuid,size=16m
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "127.0.0.1:${ZINDER_PG_TG_HTTP_PORT:-18080}:8080"
+      - "127.0.0.1:${ZINDER_PG_TG_GRPC_PORT:-19067}:9067"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 15

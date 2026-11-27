@@ -96,6 +96,16 @@ ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_
   cargo nextest run -p zinder-bench --profile=ci-postgres --run-ignored=all
 ```
 
+#### Containerized stateless-topology testing ground
+
+Run the disposable PostgreSQL 17/18 + `PgBouncer` (`pool_mode = transaction`) + Mock R2 + non-sticky Caddy L7 proxy verification harness (plus optional `--zinder-image` `--readers-only` read-only config validation):
+
+```bash
+scripts/run-postgres-testing-ground.sh --postgres-versions 18,17 --zinder-image zinder:local
+```
+
+Reports are written to `.tmp/postgres-testing-ground-<timestamp>/report.json` and `report.md`. See [deploy/bench/postgres-testing-ground/README.md](../../deploy/bench/postgres-testing-ground/README.md).
+
 ### Heavy probes
 
 Coverage and mutation testing are slow. Scheduled CI runs them weekly. The

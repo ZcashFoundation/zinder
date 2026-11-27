@@ -46,10 +46,18 @@ name = "zinder"
 path = "src/main.rs"
 
 [dev-dependencies]
+base64.workspace = true
 eyre.workspace = true
+prost.workspace = true
+reqwest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-web.workspace = true
+zinder-materialized-views.workspace = true
 zinder-proto.workspace = true
+zinder-store.workspace = true
 zinder-testkit.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]

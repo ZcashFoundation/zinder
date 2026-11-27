@@ -83,6 +83,7 @@ Every tracked script, harness, fixture helper, and policy asset under `scripts/`
 | [regtest-fixture-relay.py](regtest-fixture-relay.py) | Relays and controls Regtest node state during reproducible wallet certification runs |
 | [regtest-fixture.py](regtest-fixture.py) | Brings up disposable Regtest fixture nodes and Zinder runtimes for testing |
 | [run-benchmark-campaign.py](run-benchmark-campaign.py) | Orchestrates storage benchmark campaigns (`zinder-bench`) and writes campaign artifacts |
+| [run-postgres-testing-ground.sh](run-postgres-testing-ground.sh) | Boots and verifies the containerized PG 17/18 + PgBouncer + Mock R2 + Caddy stateless-topology testing ground |
 | [run-rocksdb-storage-lifecycle.sh](run-rocksdb-storage-lifecycle.sh) | Executes RocksDB compaction, recovery, and space-lifecycle qualification probes |
 | [test-benchmark-campaign.py](test-benchmark-campaign.py) | Unit-tests `run-benchmark-campaign.py` |
 | [test-cbb-interop-report.sh](test-cbb-interop-report.sh) | Unit-tests CBB interop benchmark report checks |
