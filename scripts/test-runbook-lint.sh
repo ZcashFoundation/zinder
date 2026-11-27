@@ -15,7 +15,7 @@ true
 
    ```bash
    cat <<'END'
-   Endpoint verification
+       ```
    END
    if true; then
      true
@@ -39,6 +39,35 @@ sed -i '/^     true$/a\   fi' "$fixture"
 output="$("$lint" "$fixture" 2>&1)"
 if [[ "$output" != *'checked 2 bash blocks'*'0 failed'* ]]; then
   echo >&2 "runbook lint did not check both valid Bash blocks: $output"
+  exit 1
+fi
+
+cat > "$fixture" <<'MARKDOWN'
+1. Show a literal Markdown example.
+
+   ````text
+   ```bash
+   if true; then
+   ```
+   ````
+
+2. Run a Bash example with a tilde fence.
+
+     ~~~~bash
+     if true; then
+     cat <<'END'
+     ~~~
+     ````
+     ~~~~ text
+       ~~~~
+     END
+     fi
+   ~~~~~
+MARKDOWN
+
+if ! output="$("$lint" "$fixture" 2>&1)" ||
+   [[ "$output" != *'checked 1 bash blocks'*'0 failed'* ]]; then
+  echo >&2 "runbook lint confused a literal Markdown example with a Bash block: $output"
   exit 1
 fi
 

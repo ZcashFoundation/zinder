@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lints every fenced ```bash``` block in a Zinder runbook for syntactic
+# Lints fenced Bash blocks in a Zinder runbook for syntactic
 # correctness by piping each block through `bash -n` (parse-only mode).
 #
 # Catches typos and unclosed quotes/braces in operator-facing shell
@@ -33,23 +33,69 @@ TMPDIR_LINT="$(mktemp -d -t zinder-runbook-lint.XXXXXX)"
 trap 'rm -rf "$TMPDIR_LINT"' EXIT
 
 awk -v lint_directory="$TMPDIR_LINT" '
-  !in_block && /^[ \t]*```bash[ \t]*$/ {
-    match($0, /^[ \t]*/)
-    fence_indent = RLENGTH
-    in_block = 1
-    block_idx += 1
-    out = sprintf("%s/block-%04d.sh", lint_directory, block_idx)
-    next
+  function indent_columns(whitespace, column,    position) {
+    for (position = 1; position <= length(whitespace); position++)
+      column += substr(whitespace, position, 1) == "\t" ? 4 - column % 4 : 1
+    return column
   }
-  in_block && /^[ \t]*```[ \t]*$/ {
-    close(out)
-    in_block = 0
-    next
+
+  function strip_indent(line, width,    position, columns, whitespace, leftover) {
+    for (position = 1; columns < width && (whitespace = substr(line, position, 1)) ~ /[ \t]/; position++)
+      columns = indent_columns(whitespace, columns)
+    leftover = columns > width ? columns - width : 0
+    return sprintf("%*s", leftover, "") substr(line, position)
   }
-  in_block {
+
+  function close_fence() {
+    if (out != "") close(out)
+    out = ""
+    fence_len = 0
+  }
+
+  {
     match($0, /^[ \t]*/)
-    indent_to_strip = RLENGTH < fence_indent ? RLENGTH : fence_indent
-    print substr($0, indent_to_strip + 1) > out
+    line_indent = indent_columns(substr($0, 1, RLENGTH), 0)
+    content = substr($0, RLENGTH + 1)
+
+    if (fence_len && (content == "" || line_indent >= fence_margin)) {
+      if (line_indent <= fence_margin + 3 && match(content, /^(```+|~~~+)/) &&
+          RLENGTH >= fence_len && substr(content, 1, 1) == fence_char &&
+          substr(content, RLENGTH + 1) ~ /^[ \t]*$/)
+        close_fence()
+      else if (out != "")
+        print strip_indent($0, open_indent) > out
+      next
+    }
+    if (fence_len) close_fence()
+    if (content == "") next
+
+    while (list_depth && line_indent < list_margin[list_depth]) list_depth--
+    container_margin = list_depth ? list_margin[list_depth] : 0
+    if (line_indent <= container_margin + 3 && match(content, /^([0-9]+[.)]|[-+*])[ \t]+/)) {
+      list_prefix = substr(content, 1, RLENGTH)
+      content = substr(content, RLENGTH + 1)
+      padding_start = match(list_prefix, /[ \t]/)
+      marker_end = line_indent + padding_start - 1
+      line_indent = indent_columns(substr(list_prefix, padding_start), marker_end)
+      container_margin = line_indent <= marker_end + 4 && content != "" ? line_indent : marker_end + 1
+      list_margin[++list_depth] = container_margin
+    }
+
+    if (line_indent > container_margin + 3 || !match(content, /^(```+|~~~+)/)) next
+    delimiter_len = RLENGTH
+    delimiter_char = substr(content, 1, 1)
+    info_string = substr(content, delimiter_len + 1)
+    if (delimiter_char == "`" && info_string ~ /`/) next
+
+    # The container determines where a fence can close. The opener determines how much to strip.
+    fence_margin = container_margin
+    open_indent = line_indent
+    fence_len = delimiter_len
+    fence_char = delimiter_char
+    if (info_string ~ /^[ \t]*bash([ \t]|$)/) {
+      block_idx += 1
+      out = sprintf("%s/block-%04d.sh", lint_directory, block_idx)
+    }
   }
   END {
     print block_idx + 0 > (lint_directory "/block-count")
