@@ -53,17 +53,22 @@ curl() {
 }
 source "$1" http://127.0.0.1:1 12
 '''
-        with tempfile.TemporaryDirectory() as scratch:
-            tip_path = Path(scratch) / 'tip'
-            tip_path.write_text('0')
-            output = operator['run'](
-                shutil.which('bash'), '-c', shell, 'test-mining', (ROOT / 'scripts/mine-live-regtest.sh').as_posix(),
-                env=dict(os.environ, MINED_TIP=tip_path.as_posix()), timeout=10)
-            self.assertEqual(tip_path.read_text().strip(), '12')
-        self.assertEqual(output.splitlines(), [
-            'shielded prefix: Sapling 2, Orchard 3, Ironwood 4 notes at height 10',
-            'regtest tip: 12',
-        ])
+        script_bytes = (ROOT / 'scripts/mine-live-regtest.sh').read_bytes().replace(b'\r\n', b'\n')
+        for line_endings, newline in [('LF', b'\n'), ('CRLF', b'\r\n')]:
+            with self.subTest(line_endings=line_endings), tempfile.TemporaryDirectory() as scratch:
+                checkout_bytes = script_bytes.replace(b'\n', newline)
+                mining_script = Path(scratch) / 'mine-live-regtest.sh'
+                mining_script.write_bytes(checkout_bytes.replace(b'\r\n', b'\n'))
+                tip_path = Path(scratch) / 'tip'
+                tip_path.write_text('0')
+                output = operator['run'](
+                    shutil.which('bash'), '-c', shell, 'test-mining', mining_script.as_posix(),
+                    env=dict(os.environ, MINED_TIP=tip_path.as_posix()), timeout=10)
+                self.assertEqual(tip_path.read_text().strip(), '12')
+                self.assertEqual(output.splitlines(), [
+                    'shielded prefix: Sapling 2, Orchard 3, Ironwood 4 notes at height 10',
+                    'regtest tip: 12',
+                ])
 
     def test_successful_miner_below_requested_tip_does_not_start_indexer(self):
         model = {'services': {
