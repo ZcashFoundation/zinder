@@ -1290,9 +1290,11 @@ block explicitly and keep the original target in the assertion.
 
 
 Use `scripts/regtest-fixture.py` to give a real wallet a fresh, owned node and
-following single-host Zinder endpoints (`zinder-index` and `zinder-serve` from `deploy/docker-compose.yml`). A local Linux
-Docker host with bridge addresses reachable from the host, Python 3.11 or
-later, Docker Compose, iproute2, curl, and jq are required. Start from the checkout matching
+following single-host Zinder endpoints (`zinder-index` and `zinder-serve` from `deploy/docker-compose.yml`). Use a local Docker Engine on Linux or Docker Desktop
+in Linux container mode on macOS or Windows. You need Python 3.11 or later and
+Docker Compose. Native Linux Engine also needs iproute2. The default mining
+schedule needs Bash, curl, and jq. On Windows, put a Bash distribution such as
+Git Bash on your PATH and invoke the scripts with Python. Start from the checkout matching
 the candidate release. Pull the unified `ghcr.io/zcashfoundation/zinder` image first, or build `--target zinder` via
 `deploy/Dockerfile`.
 
@@ -1316,11 +1318,12 @@ Choose an unused project name and port range for each run. Ports are loopback
 only: base + 32 is node RPC, + 2 is native WalletQuery, + 67 is lightwalletd,
 and + 5 and + 8 are the `zinder-index` and `zinder-serve` ops listeners. Each project owns distinct internal Compose networks and volumes. The node's
 peer listener binds container loopback; it has no published peer port. An owned
-Python TCP relay exposes only the selected loopback ports while containers
-retain internal networks without an outbound default route. Readiness verifies
+Python TCP relay exposes only the selected loopback ports. On native Linux the
+relay connects to bridge addresses. On Docker Desktop it uses `docker exec` to
+connect from inside the fixture's internal network. Readiness verifies
 internal network isolation, absence of a default route, and an empty peer list.
 Two unused /28 subnets are selected from `10.253.0.0/16`, excluding existing
-Docker networks and host routes. Set `--subnet-pool` if that range conflicts
+Docker networks and, for direct bridge access, Linux host routes. Set `--subnet-pool` if that range conflicts
 with your host. This avoids consuming Docker's large default address pools.
 Do not attach unrelated containers to these fixture networks. The unauthenticated RPC can mine only this project's
 fresh Regtest chain.
@@ -1371,6 +1374,12 @@ repeat, failed-start cleanup, and project-name reuse protection with:
 ```bash
 scripts/test-regtest-fixture.py --images /tmp/fixture-images.json \
   --revision 830b426060169f5b2e94d84ff0f134bc1ad96004 --port-base 43100
+```
+
+Run the platform-selection and relay shutdown unit tests without Docker:
+
+```bash
+python3 -m unittest scripts/test-regtest-fixture.py
 ```
 
 ## Gate a real wallet lifecycle

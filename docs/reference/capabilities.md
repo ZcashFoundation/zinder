@@ -192,6 +192,12 @@ endpoint is verified; see
 [Node source boundary](../architecture/node-source-boundary.md#capabilities)
 for verification.
 
+`BlockHeaderBySelector` returns a typed header with the block identity,
+previous block hash, transaction Merkle root, commitment bytes, Unix time,
+compact difficulty target, nonce, and version. The header omits the Equihash
+solution. For the consensus-serialized header, decode it from a `FullBlock`
+response on a store that retains all raw block blobs.
+
 ## Explorer capabilities
 
 `zinder-explorer` computes its set from what it has open, each time it
