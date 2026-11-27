@@ -50,7 +50,7 @@ Light-wallet serving supports the methods in the Wallet serving column, with nod
 | `GetTreeState` | Served | `UNIMPLEMENTED` | Retained heights at or after Sapling activation |
 | `GetLatestTreeState` | Served | `UNIMPLEMENTED` | |
 | `GetSubtreeRoots` | Served | `UNIMPLEMENTED` | `maxEntries = 0` streams every remaining root |
-| `GetAddressUtxos`, `GetAddressUtxosStream` | Served | `UNIMPLEMENTED` | At most 100,000 outputs per response |
+| `GetAddressUtxos`, `GetAddressUtxosStream` | Served | `UNIMPLEMENTED` | Height-complete pages with hard response limits |
 | `GetStandardFee` | Served when a configured node implements `getstandardfee` | `UNIMPLEMENTED` | See [`GetStandardFee`](#getstandardfee) |
 | `Ping` | Refused unless enabled | Refused unless enabled | See above |
 
@@ -362,23 +362,57 @@ Both methods return the confirmed balance, the sum of unspent outputs, of up to 
 
 ### `GetAddressUtxos` and `GetAddressUtxosStream`
 
-Both methods follow lightwalletd's `maxEntries` rule: 0 returns every unspent output at or above `startHeight`, and a positive value returns at most that many, oldest first. Within one block, Zinder orders rows by transaction id and output index, where Zebra uses block position; this matters only when `maxEntries` splits a block.
+Both methods return confirmed unspent outputs mined at or above
+`startHeight`, ordered by block height, transaction position within the block,
+and output index. A repeated address counts once. Mempool state is excluded.
 
-A request that lists an address more than once gets that address's rows once, as lightwalletd v0.6.2 does. A wallet that adds up the rows counts each output once, and duplicate rows never use up `maxEntries`.
+A positive `maxEntries` sets the target number of outputs. The response includes
+every matching output at the height containing the target entry, so it can exceed
+the target, even when the first matching height alone exceeds it. When the
+target falls at the end of a height, the page ends there. When fewer outputs
+match, the page returns all of them. Zero requests every matching output,
+subject to the same hard response limits.
 
-One response returns at most 100,000 outputs. The handling of an oversized response depends on the serving mode.
+To walk the set, pass the last returned height plus one as `startHeight` for
+the next page. Stop on an empty successful reply. Each request sees the chain
+available when it starts. A reorg or a newly mined spend can change the set
+between pages.
 
-- In wallet serving, `GetAddressUtxos` reads every row before it answers. A request that would return more fails with `RESOURCE_EXHAUSTED` and no rows.
-- In wallet serving, `GetAddressUtxosStream` sends rows as it merges them, at most 64 ahead of the client. A request that would return more sends the first 100,000 rows and then ends with `RESOURCE_EXHAUSTED`. A later failure such as `CHAIN_EPOCH_PIN_UNAVAILABLE` also ends the stream after the rows already sent. Treat a stream that ends with an error as incomplete.
-- In light-wallet serving, both methods fetch the node results and check the response limit before sending any rows. A response that exceeds the limit returns `RESOURCE_EXHAUSTED` without a partial output list. Each node page must name the captured canonical tip. For a bounded prefix, Zinder verifies the outputs at the cutoff height before selecting rows in wallet order. A tip mismatch (after any [tip wait](#waiting-for-a-height-just-past-the-tip) and single retry) or disagreeing pages at the served tip fail with `UNAVAILABLE`, reason `SERVED_TIP_MISMATCH`, and `grpc-retry-pushback-ms: 1000` instead of `NODE_UNAVAILABLE`.
+Each response is limited to 100,000 outputs and 16 MiB (16,777,216 bytes) of
+encoded protobuf reply-list data, including the per-output field framing. The
+same limits apply to unary and streaming calls. A page that exceeds either
+limit fails with `RESOURCE_EXHAUSTED`. A smaller positive target can shorten
+the page when it ends at an earlier height. One height that alone exceeds a
+limit cannot be fetched through these methods. Unary gRPC clients may need to
+raise their receive limit or use the streaming method.
 
-In light-wallet serving, the unspent-output and balance methods share the UTXO kind of node-call slots, and each node page holds a slot only while it is read. The unspent-output methods also take one of the unspent-output response slots before their first node call, as [Admission](#admission) describes. An empty reply releases its response slot before the stream opens, and a streamed reply holds its response slot only until its last row is yielded or the stream is dropped. A unary reply holds its response slot until its body ends or fails after the send-stall layer hands the buffered data to the transport, or until the handler body is dropped on disconnect or a send stall. The bound covers the listener’s buffered reply. Bytes already handed to the transport are outside this bound.
+In wallet serving, both methods merge on-demand reads for distinct addresses at
+one chain epoch. Each address starts with an even share of 8,192 outputs,
+capped at 1,024 and at a positive target, with a minimum of 16. Subsequent
+storage pages double up to 1,024 outputs as the merge consumes them. The merge
+stages at most one height within the response budget to order it and checks
+one output ahead per address for the height boundary. The streaming method
+queues up to 64 replies beyond that staging. A refused height sends no rows
+from that height. Treat any stream that ends with an error as incomplete,
+including one that has already sent earlier heights.
 
-In wallet serving, both methods read each distinct address at one chain epoch and merge the addresses' outputs in response order as they send them. Each address is read in pages that double only as its rows are sent. Its first page holds an even share of 8,192 outputs, capped at 1,024 and at a positive `maxEntries`, but never fewer than 16. A request that lists up to eight distinct addresses therefore reads up to 1,024 outputs of each in one page.
+In light-wallet serving, both methods read a bounded node prefix for an
+in-range positive target and verify the completeness of its final height.
+The node's reply is also subject to its own row limit and
+`node.max_response_bytes` (64 MiB by default). The call can fail with
+`RESOURCE_EXHAUSTED` if those limits prevent the server from verifying the
+final height. Each node page must name the captured canonical tip. A tip
+mismatch after any configured [tip wait](#waiting-for-a-height-just-past-the-tip)
+and retry, or disagreeing pages at that tip, fails with `UNAVAILABLE`, reason
+`SERVED_TIP_MISMATCH`, and `grpc-retry-pushback-ms: 1000`.
 
-A request holds at most about twice the rows it has sent, plus 2 outputs and one first page for each distinct address. Its first pages together hold at most 8,192 outputs, or 16 for each distinct address when it lists more than 512. At the limits of 10,000 addresses and 100,000 rows, that is about 380,000 outputs.
-
-The protocol has no lossless way to page past the cap. A single block with more matching outputs than the cap always fails with `RESOURCE_EXHAUSTED`.
+Both forwarded methods check response limits before sending rows. They hold an
+unspent-output response slot from before the first node call until the response
+finishes or is dropped. An empty reply releases its slot before the stream
+opens. Node-call slots are held only while reading each page and are shared
+with the balance methods. The response slot covers the listener's buffered
+reply until the send-stall layer hands it to the transport. See
+[Admission](#admission) for these limits.
 
 ### `GetMempoolTx`
 

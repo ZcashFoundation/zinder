@@ -49,13 +49,13 @@ use zinder_source::{
 use zinder_store::{ArtifactFamily, BlockHashLookup};
 
 use super::{
-    CanonicalTransactionMiss, GrpcStream, LightwalletdGrpcAdapter,
+    AddressUtxoResponseBudget, CanonicalTransactionMiss, GrpcStream, LightwalletdGrpcAdapter,
     SUBTREE_ROOT_STREAM_CHANNEL_CAPACITY, SubtreeRootReads, SubtreeRootsStream,
-    address_utxo_limit_exceeded, lightwalletd_tree_state, lightwalletd_tree_state_from_hex,
-    reject_future_tree_state_height, reject_genesis_tree_state, require_sapling_tree_state,
-    send_response_from_broadcast_outcome, shielded_protocol_from_request, spawn_response_stream,
-    standard_fee_response, transparent_address_tx_history_request, tree_state_block_lookup_status,
-    tree_state_status, u32_to_usize, wire_decode_error_to_status,
+    lightwalletd_tree_state, lightwalletd_tree_state_from_hex, reject_future_tree_state_height,
+    reject_genesis_tree_state, require_sapling_tree_state, send_response_from_broadcast_outcome,
+    shielded_protocol_from_request, spawn_response_stream, standard_fee_response,
+    transparent_address_tx_history_request, tree_state_block_lookup_status, tree_state_status,
+    u32_to_usize, wire_decode_error_to_status,
 };
 use crate::CanonicalReaderSlot;
 use crate::block_methods::{self, RequestedBlock, requested_block};
@@ -338,8 +338,13 @@ impl NodeBackedLightWallet {
         response_limit: NonZeroU32,
         method: &'static str,
         tip_wait: &TipWait,
-    ) -> Result<Option<(Vec<SourceTransparentUnspentOutput>, ForwardedResponsePermit)>, Status>
-    {
+    ) -> Result<
+        Option<(
+            Vec<lightwalletd::GetAddressUtxosReply>,
+            ForwardedResponsePermit,
+        )>,
+        Status,
+    > {
         if request.addresses.is_empty() {
             return Ok(None);
         }
@@ -362,7 +367,7 @@ impl NodeBackedLightWallet {
         // request never holds a node-call slot while it waits, and it is
         // dropped before TipWait waits on a mismatch.
         let deadline = self.reads.deadline();
-        let (mut rows, response_permit) = self
+        let (rows, response_permit) = self
             .run_with_tip_wait(method, tip_wait, deadline, || async {
                 let response_permit = self
                     .reads
@@ -381,25 +386,24 @@ impl NodeBackedLightWallet {
                     deadline,
                 };
                 let rows =
-                    wallet_ordered_utxos(&reads, &lookup, height, request.max_entries, view.tip)
+                    height_complete_utxos(&reads, &lookup, height, request.max_entries, view.tip)
                         .await?;
                 Ok((rows, response_permit))
             })
             .await?;
-        let count = wallet_utxo_response_len(rows.len(), request.max_entries, response_limit)?;
-        if count == 0 {
+        if rows.is_empty() {
             return Ok(None);
         }
-        rows.sort_unstable_by_key(|row| {
-            (
-                row.block_height,
-                row.outpoint.transaction_id,
-                row.outpoint.output_index,
-            )
-        });
-        rows.truncate(count);
-        rows.shrink_to_fit();
-        Ok(Some((rows, response_permit)))
+        let mut budget = AddressUtxoResponseBudget::new(u32_to_usize(response_limit.get()));
+        let replies = rows
+            .into_iter()
+            .map(|row| {
+                let reply = utxo_reply(row)?;
+                budget.record(&reply)?;
+                Ok(reply)
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(Some((replies, response_permit)))
     }
 
     async fn run_with_tip_wait<T, Attempt, Fut>(
@@ -550,20 +554,6 @@ fn forwarded_transaction_status(error: ForwardedTransactionError) -> Status {
     forwarded_query_status(QueryError::from(error))
 }
 
-fn wallet_utxo_response_len(
-    available: usize,
-    requested: u32,
-    limit: NonZeroU32,
-) -> Result<usize, Status> {
-    let count =
-        NonZeroU32::new(requested).map_or(available, |max| available.min(u32_to_usize(max.get())));
-    let limit = u32_to_usize(limit.get());
-    if count > limit {
-        return Err(address_utxo_limit_exceeded(limit));
-    }
-    Ok(count)
-}
-
 fn indexed_address(text: &str, network: Network) -> Result<Address, Status> {
     let address =
         parse_transparent_address(text).map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -610,11 +600,11 @@ async fn served_utxo_page(
     }
 }
 
-/// The node orders same-height outputs by block position, the wallet by txid.
+/// Reads a height-complete prefix in the node's transaction order.
 ///
-/// Complete the last height before sorting a bounded prefix. A second lookup
-/// starts at that height so earlier outputs cannot exhaust its row budget.
-async fn wallet_ordered_utxos(
+/// A second lookup starts at the cutoff height so earlier outputs cannot
+/// exhaust its row budget.
+async fn height_complete_utxos(
     node: &NodeReads<'_>,
     lookup: &TransparentAddressLookup,
     height: BlockHeight,
@@ -1439,8 +1429,9 @@ impl compact_tx_streamer_server::CompactTxStreamer
                 lightwalletd::GetAddressUtxosReplyList::default(),
             ));
         };
-        let address_utxos = rows.into_iter().map(utxo_reply).collect::<Result<_, _>>()?;
-        let mut response = Response::new(lightwalletd::GetAddressUtxosReplyList { address_utxos });
+        let mut response = Response::new(lightwalletd::GetAddressUtxosReplyList {
+            address_utxos: rows,
+        });
         response.extensions_mut().insert(UtxoResponsePermit {
             _permit: Arc::new(permit),
         });
@@ -1467,10 +1458,9 @@ impl compact_tx_streamer_server::CompactTxStreamer
             Some((rows, permit)) => Box::pin(try_unfold(
                 (rows.into_iter(), Some(permit)),
                 |(mut rows, mut permit)| async move {
-                    let Some(row) = rows.next() else {
+                    let Some(reply) = rows.next() else {
                         return Ok(None);
                     };
-                    let reply = utxo_reply(row)?;
                     if rows.as_slice().is_empty() {
                         rows = Vec::new().into_iter();
                         permit = None;
@@ -1702,23 +1692,6 @@ mod tests {
         drop(stream);
         assert!(slot_free(&reads, kind).await);
         Ok(())
-    }
-
-    #[test]
-    fn light_wallet_utxo_limit_applies_to_the_requested_response() {
-        let limit = NonZeroU32::MIN.saturating_add(9);
-        for (available, requested, expected) in [(20, 4, 4), (20, 10, 10), (10, 0, 10), (7, 11, 7)]
-        {
-            assert_eq!(
-                wallet_utxo_response_len(available, requested, limit).ok(),
-                Some(expected)
-            );
-        }
-        for requested in [0, 11] {
-            assert!(
-                matches!(wallet_utxo_response_len(20, requested, limit), Err(status) if status.code() == tonic::Code::ResourceExhausted)
-            );
-        }
     }
 
     #[test]

@@ -1417,9 +1417,10 @@ async fn utxo_prefix_completes_its_last_height_at_one_node_tip() -> Result<()> {
         .await?
         .into_inner()
         .address_utxos;
-    assert_eq!(outputs.len(), 2);
-    assert_eq!(outputs[0].txid, vec![4; 32]);
-    assert_eq!(outputs[1].txid, vec![1; 32]);
+    assert_eq!(
+        outputs.into_iter().map(|row| row.txid).collect::<Vec<_>>(),
+        [4, 3, 2, 1].map(|byte| vec![byte; 32]),
+    );
     served_view::served_tip_mismatch(fixture.adapter.get_address_utxos(request()).await)?;
     Ok(())
 }
@@ -1560,9 +1561,10 @@ fn populated_utxo_fixture_with(
     )
 }
 
-async fn populated_wallet_utxos(
+async fn populated_confirmed_utxos(
     fixture: &Fixture,
     max_entries: u32,
+    expected_entries: usize,
 ) -> Result<Vec<lightwalletd::GetAddressUtxosReply>> {
     let outputs = fixture
         .adapter
@@ -1575,17 +1577,17 @@ async fn populated_wallet_utxos(
         .into_inner()
         .address_utxos;
     let mut expected_first = [0; 32];
-    expected_first[31] = 2;
-    assert_eq!(outputs.len(), usize::try_from(max_entries)?);
+    expected_first[0] = 1;
+    assert_eq!(outputs.len(), expected_entries);
     assert_eq!(outputs[0].txid, expected_first);
     Ok(outputs)
 }
 
 #[tokio::test]
-async fn cap_sized_cutoff_height_returns_a_smaller_wallet_ordered_prefix() -> Result<()> {
+async fn cap_sized_cutoff_height_finishes_above_the_target() -> Result<()> {
     let fixture = populated_utxo_fixture(100_000, 0, UtxoNode::Zebra)?;
-    let rows = populated_wallet_utxos(&fixture, 99_999).await?;
-    assert_eq!((rows[99_998].height, rows[99_998].index), (5, 99_997));
+    let rows = populated_confirmed_utxos(&fixture, 99_999, 100_000).await?;
+    assert_eq!((rows[99_998].height, rows[99_998].index), (5, 99_998));
     let reads = fixture.node.requests_for("getaddressutxos")?;
     let last = reads.last().ok_or_else(|| eyre!("missing cutoff lookup"))?;
     assert_eq!(last.params[0]["startHeight"], 5);
@@ -1594,9 +1596,9 @@ async fn cap_sized_cutoff_height_returns_a_smaller_wallet_ordered_prefix() -> Re
 }
 
 #[tokio::test]
-async fn cap_sized_multi_height_prefix_stays_bounded_and_wallet_ordered() -> Result<()> {
+async fn cap_sized_multi_height_prefix_stays_bounded_and_ordered() -> Result<()> {
     let fixture = populated_utxo_fixture(2, 99_998, UtxoNode::Zebra)?;
-    let rows = populated_wallet_utxos(&fixture, 100_000).await?;
+    let rows = populated_confirmed_utxos(&fixture, 100_000, 100_000).await?;
     assert_eq!((rows[99_999].height, rows[99_999].index), (6, 99_997));
     let reads = fixture.node.requests_for("getaddressutxos")?;
     assert_eq!(reads.len(), 2);
@@ -1658,9 +1660,87 @@ async fn an_above_limit_wallet_request_succeeds_only_when_the_complete_set_fits(
 }
 
 #[tokio::test]
+async fn forwarded_utxo_pages_resume_after_the_last_complete_height() -> Result<()> {
+    let fixture = populated_utxo_fixture(3, 2, UtxoNode::Zebra)?;
+    let complete = fixture
+        .adapter
+        .get_address_utxos(utxo_request(0))
+        .await?
+        .into_inner()
+        .address_utxos;
+
+    for target in [2, 3] {
+        let mut start_height = 5;
+        let mut walked = Vec::new();
+        for count in [3, 2, 0] {
+            let mut request = utxo_request(target).into_inner();
+            request.start_height = start_height;
+            let page = fixture
+                .adapter
+                .get_address_utxos(Request::new(request.clone()))
+                .await?
+                .into_inner()
+                .address_utxos;
+            let mut stream = fixture
+                .adapter
+                .get_address_utxos_stream(Request::new(request))
+                .await?
+                .into_inner();
+            for expected in &page {
+                assert_eq!(stream.next().await.transpose()?.as_ref(), Some(expected));
+            }
+            assert!(stream.next().await.is_none());
+            assert_eq!(page.len(), count);
+            if let Some(last) = page.last() {
+                start_height = last.height + 1;
+            }
+            walked.extend(page);
+        }
+        assert_eq!(walked, complete);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwarded_utxo_pages_continue_past_the_response_row_limit() -> Result<()> {
+    let fixture = populated_utxo_fixture(50_001, 50_001, UtxoNode::Zebra)?;
+    let mut request = utxo_request(50_000).into_inner();
+    for height in [5, 6] {
+        let page = fixture
+            .adapter
+            .get_address_utxos(Request::new(request.clone()))
+            .await?
+            .into_inner()
+            .address_utxos;
+        assert_eq!(page.len(), 50_001);
+        assert!(page.iter().all(|row| row.height == height));
+        request.start_height = height + 1;
+    }
+    assert_eq!(
+        fixture
+            .adapter
+            .get_address_utxos(Request::new(request))
+            .await?
+            .into_inner()
+            .address_utxos,
+        []
+    );
+    assert!(
+        fixture
+            .node
+            .requests_for("getaddressutxos")?
+            .iter()
+            .all(|read| read.params[0]["maxEntries"]
+                .as_u64()
+                .is_some_and(|limit| limit > 0))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_node_that_supplies_the_complete_utxo_page_needs_one_read() -> Result<()> {
     let fixture = populated_utxo_fixture(17, 1, UtxoNode::Zakura)?;
-    populated_wallet_utxos(&fixture, 1).await?;
+    populated_confirmed_utxos(&fixture, 1, 17).await?;
     let reads = fixture.node.requests_for("getaddressutxos")?;
     assert_eq!(reads.len(), 1);
     assert_eq!(reads[0].params[0]["maxEntries"], 2);
@@ -1704,7 +1784,7 @@ async fn utxo_response_slots_release_on_drain_or_drop_and_leave_room_for_balance
             assert!(first.next().await.transpose()?.is_some());
             assert!(first.next().await.is_none());
         }
-        populated_wallet_utxos(&fixture, 2).await?;
+        populated_confirmed_utxos(&fixture, 2, 2).await?;
         drop(second);
     }
     Ok(())

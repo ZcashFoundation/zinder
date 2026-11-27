@@ -28,7 +28,7 @@ use tracing::Instrument as _;
 use zinder_core::{
     BlockHeight, ChainEpoch, TransparentAddressScriptHash, TransparentUnspentOutput,
 };
-use zinder_wallet_projection::WalletAddressUnspentOutputKey;
+use zinder_wallet_projection::{WalletAddressUnspentOutputKey, WalletUnspentOutput};
 
 use crate::{
     QueryError, TransparentAddressUnspentOutputsRequest, WalletServingPairSlot,
@@ -64,7 +64,7 @@ pub struct TransparentAddressUnspentOutputs {
     /// Chain epoch every output is read at.
     pub chain_epoch: ChainEpoch,
     pages: mpsc::Receiver<Result<UnspentOutputPage, QueryError>>,
-    page: std::vec::IntoIter<TransparentUnspentOutput>,
+    page: std::vec::IntoIter<WalletUnspentOutput>,
     finished: bool,
     on_demand: Option<OnDemandPages>,
 }
@@ -170,31 +170,47 @@ impl TransparentAddressUnspentOutputs {
     fn buffered_outputs(&self) -> usize {
         self.page.len()
     }
-}
 
-impl Stream for TransparentAddressUnspentOutputs {
-    type Item = Result<TransparentUnspentOutput, QueryError>;
+    /// Reads the next unspent output and its transaction index within the block.
+    ///
+    /// This advances the same stream in the same order as polling it directly.
+    /// The index lets callers order all outputs of a height by block position.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same terminal query errors as the stream.
+    pub async fn next_with_tx_index(
+        &mut self,
+    ) -> Option<Result<(u32, TransparentUnspentOutput), QueryError>> {
+        std::future::poll_fn(|context| self.poll_output(context))
+            .await
+            .map(|output| {
+                output.map(|output| (output.created_at.tx_index_in_block, unspent_output(output)))
+            })
+    }
 
-    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
+    fn poll_output(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<WalletUnspentOutput, QueryError>>> {
         loop {
-            if let Some(output) = this.page.next() {
+            if let Some(output) = self.page.next() {
                 return Poll::Ready(Some(Ok(output)));
             }
-            if this.finished {
+            if self.finished {
                 return Poll::Ready(None);
             }
-            if let Some(on_demand) = this.on_demand.as_mut().filter(|pages| !pages.requested) {
+            if let Some(on_demand) = self.on_demand.as_mut().filter(|pages| !pages.requested) {
                 // A failed request means the producer ended; its pages
                 // channel then reports why.
                 let _ = on_demand.requests.try_send(on_demand.next_page_size);
                 on_demand.requested = true;
             }
-            match ready!(this.pages.poll_recv(context)) {
+            match ready!(self.pages.poll_recv(context)) {
                 Some(Ok(page)) => {
-                    this.finished = page.last;
-                    this.page = page.outputs.into_iter();
-                    if let Some(on_demand) = this.on_demand.as_mut() {
+                    self.finished = page.last;
+                    self.page = page.outputs.into_iter();
+                    if let Some(on_demand) = self.on_demand.as_mut() {
                         on_demand.requested = false;
                         on_demand.next_page_size = on_demand
                             .next_page_size
@@ -203,11 +219,11 @@ impl Stream for TransparentAddressUnspentOutputs {
                     }
                 }
                 Some(Err(error)) => {
-                    this.finished = true;
+                    self.finished = true;
                     return Poll::Ready(Some(Err(error)));
                 }
                 None => {
-                    this.finished = true;
+                    self.finished = true;
                     return Poll::Ready(Some(Err(QueryError::BlockingTaskFailed {
                         reason: "the unspent-output read ended before its last page".to_owned(),
                     })));
@@ -217,10 +233,30 @@ impl Stream for TransparentAddressUnspentOutputs {
     }
 }
 
+impl Stream for TransparentAddressUnspentOutputs {
+    type Item = Result<TransparentUnspentOutput, QueryError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.poll_output(context)
+            .map(|output| output.map(|output| output.map(unspent_output)))
+    }
+}
+
+fn unspent_output(output: WalletUnspentOutput) -> TransparentUnspentOutput {
+    TransparentUnspentOutput::new(
+        output.address_script_hash,
+        output.script_pub_key,
+        output.outpoint,
+        output.value_zat,
+        output.created_at.block.height,
+        output.created_at.block.hash,
+    )
+}
+
 /// One storage page of a stream. `last` marks the page that completes it.
 #[derive(Debug)]
 struct UnspentOutputPage {
-    outputs: Vec<TransparentUnspentOutput>,
+    outputs: Vec<WalletUnspentOutput>,
     last: bool,
 }
 
@@ -325,7 +361,7 @@ async fn read_page(
     page_size: NonZeroU16,
 ) -> Result<
     (
-        Vec<TransparentUnspentOutput>,
+        Vec<WalletUnspentOutput>,
         Option<WalletAddressUnspentOutputKey>,
     ),
     QueryError,
@@ -340,21 +376,7 @@ async fn read_page(
         )
         .await
         .map_err(QueryError::wallet_read)?;
-    let outputs = page
-        .outputs
-        .into_iter()
-        .map(|output| {
-            TransparentUnspentOutput::new(
-                output.address_script_hash,
-                output.script_pub_key,
-                output.outpoint,
-                output.value_zat,
-                output.created_at.block.height,
-                output.created_at.block.hash,
-            )
-        })
-        .collect();
-    Ok((outputs, page.next_page_after))
+    Ok((page.outputs, page.next_page_after))
 }
 
 #[cfg(test)]

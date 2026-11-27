@@ -39,7 +39,7 @@ fn utxo_page(params: &Value, script_hex: &str, tip: BlockId) -> RpcReply {
     let limit = params[0]["maxEntries"].as_u64().unwrap_or_default();
     let mut rows = Vec::new();
     for height in (1..=HEIGHTS).filter(|height| u64::from(*height) >= start) {
-        // Both block position and RPC hex order run opposite to wallet txid order.
+        // Transaction position runs opposite to internal txid order.
         for rank in [1, 0] {
             let txid =
                 encode_rpc_transaction_id_hex(TransactionId::from_bytes(wallet_txid(height, rank)));
@@ -81,9 +81,9 @@ fn request() -> GetAddressUtxosArg {
     }
 }
 
-fn wallet_outputs(script: &[u8]) -> impl Iterator<Item = GetAddressUtxosReply> {
+fn block_ordered_outputs(script: &[u8]) -> impl Iterator<Item = GetAddressUtxosReply> {
     (1..=HEIGHTS).flat_map(move |height| {
-        [0, 1].into_iter().flat_map(move |rank| {
+        [1, 0].into_iter().flat_map(move |rank| {
             let txid = wallet_txid(height, rank);
             (0..OUTPUTS_PER_TX).map(move |index| GetAddressUtxosReply {
                 address: ADDRESS.to_owned(),
@@ -148,7 +148,7 @@ async fn default_client_rejects_a_maximum_unary_utxo_response() -> Result<()> {
 }
 
 #[tokio::test]
-async fn larger_client_decode_limit_accepts_every_wallet_ordered_utxo() -> Result<()> {
+async fn larger_client_decode_limit_accepts_every_block_ordered_utxo() -> Result<()> {
     with_client(async |client, script| {
         let reply = client
             .max_decoding_message_size(16 * 1024 * 1024)
@@ -158,7 +158,7 @@ async fn larger_client_decode_limit_accepts_every_wallet_ordered_utxo() -> Resul
         assert!(reply.encoded_len() > DEFAULT_DECODE_BYTES);
         assert_eq!(reply.address_utxos.len(), usize::try_from(MAX_ENTRIES)?);
         let mut outputs = reply.address_utxos.into_iter();
-        for expected in wallet_outputs(script) {
+        for expected in block_ordered_outputs(script) {
             assert_eq!(outputs.next(), Some(expected));
         }
         assert!(outputs.next().is_none());
@@ -168,13 +168,13 @@ async fn larger_client_decode_limit_accepts_every_wallet_ordered_utxo() -> Resul
 }
 
 #[tokio::test]
-async fn default_client_streams_every_wallet_ordered_utxo() -> Result<()> {
+async fn default_client_streams_every_block_ordered_utxo() -> Result<()> {
     with_client(async |mut client, script| {
         let mut stream = client
             .get_address_utxos_stream(request())
             .await?
             .into_inner();
-        for expected in wallet_outputs(script) {
+        for expected in block_ordered_outputs(script) {
             assert_eq!(stream.message().await?, Some(expected));
         }
         assert!(stream.message().await?.is_none());
@@ -201,8 +201,12 @@ async fn a_paused_utxo_stream_leaves_node_admission_for_another_call() -> Result
         .get_address_utxos(utxo_request(1))
         .await?
         .into_inner();
-    assert_eq!(fast.address_utxos, [first]);
-    assert!(paused.next().await.transpose()?.is_some());
+    let second = paused
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| eyre!("missing second output"))?;
+    assert_eq!(fast.address_utxos, [first, second]);
     assert!(paused.next().await.is_none());
     Ok(())
 }
@@ -277,7 +281,7 @@ async fn light_wallet_listener_returns_a_small_unary_utxo_reply() -> Result<()> 
     with_fixture_client(fixture, async |mut client| {
         let reply = client.get_address_utxos(utxo_request(1)).await?;
         let outputs = reply.into_inner().address_utxos;
-        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].address, ADDRESS);
         Ok(())
     })

@@ -4710,7 +4710,7 @@ async fn get_address_utxos_txid_round_trips_through_get_transaction_by_hash() ->
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "the acceptance scenario keeps multi-address ordering and truncation assertions together"
+    reason = "the acceptance scenario keeps multi-address ordering and height completion assertions together"
 )]
 async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Result<()> {
     let transparent_address_a =
@@ -4721,9 +4721,9 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
     let address_b = transparent_address_b.to_string();
     let script_pub_key_a = transparent_address_a.script().as_raw_bytes().to_vec();
     let script_pub_key_b = transparent_address_b.script().as_raw_bytes().to_vec();
-    let first_transaction_id = TransactionId::from_bytes([0x10; 32]);
-    let second_transaction_id = TransactionId::from_bytes([0x20; 32]);
-    let truncated_transaction_id = TransactionId::from_bytes([0x30; 32]);
+    let first_transaction_id = TransactionId::from_bytes([0x30; 32]);
+    let second_transaction_id = TransactionId::from_bytes([0x10; 32]);
+    let third_transaction_id = TransactionId::from_bytes([0x20; 32]);
     let store_fixture = acceptance_store_fixture_with_transaction_rows_and_transparent(
         RawBlobRetention::None,
         |_| Vec::new(),
@@ -4733,7 +4733,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
                     TransparentUnspentOutput::new(
                         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key_a),
                         script_pub_key_a.clone(),
-                        TransparentOutPoint::new(truncated_transaction_id, 0),
+                        TransparentOutPoint::new(first_transaction_id, 0),
                         30,
                         block.height,
                         block.hash,
@@ -4741,7 +4741,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
                     TransparentUnspentOutput::new(
                         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key_b),
                         script_pub_key_b.clone(),
-                        TransparentOutPoint::new(first_transaction_id, 0),
+                        TransparentOutPoint::new(second_transaction_id, 0),
                         10,
                         block.height,
                         block.hash,
@@ -4749,7 +4749,7 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
                     TransparentUnspentOutput::new(
                         TransparentAddressScriptHash::of_script_pub_key(&script_pub_key_b),
                         script_pub_key_b.clone(),
-                        TransparentOutPoint::new(second_transaction_id, 0),
+                        TransparentOutPoint::new(third_transaction_id, 0),
                         20,
                         block.height,
                         block.hash,
@@ -4781,15 +4781,17 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
         .collect();
 
     assert_eq!(list_response.address_utxos, streamed_utxos);
-    assert_eq!(streamed_utxos.len(), 2);
+    assert_eq!(streamed_utxos.len(), 3);
     assert_eq!(
         returned_txids,
         vec![
             first_transaction_id.as_bytes().to_vec(),
             second_transaction_id.as_bytes().to_vec(),
+            third_transaction_id.as_bytes().to_vec(),
         ]
     );
-    assert!(streamed_utxos.iter().all(|utxo| utxo.address == address_b));
+    assert_eq!(streamed_utxos[1].address, address_b);
+    assert_eq!(streamed_utxos[2].address, address_b);
 
     Ok(())
 }
