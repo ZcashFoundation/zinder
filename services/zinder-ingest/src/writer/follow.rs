@@ -574,7 +574,7 @@ where
 /// The receiver is owned by this loop, not by a storage adapter. While the
 /// follower waits on the node, it answers read-only commands at once and
 /// applies writes in arrival order when the wait ends. `AtTip` waits yield
-/// immediately to canonical work on [`CanonicalControlScheduling::YieldToCanonical`]
+/// immediately to canonical work on `YieldToCanonical`
 /// maintenance commands while preserving the poll delay across reads,
 /// non-yielding commands, and mempool hydration changes.
 pub async fn follow_canonical_tip_with_control<Source>(
