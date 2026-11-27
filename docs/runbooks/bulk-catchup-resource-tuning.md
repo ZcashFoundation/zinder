@@ -2,7 +2,7 @@
 
 Use this runbook when canonical or wallet construction hits OOM, stalls, or runs slower than host hardware allows.
 
-Both `zinder-ingest` and `zinder-projector` scale default construction budgets from the detected container cgroup memory limit and CPU count, so most deployments need no overrides. Inspect resolved values with `--print-config` ([Inspect a runtime container](deploying-on-a-vm.md#inspect-a-runtime-container)) and tune only the bottleneck shown in `/metrics`.
+Both `zinder-ingest` and `zinder-projector` scale default construction budgets from the detected container cgroup memory limit and CPU count, so most deployments need no overrides. Inspect resolved values with `zinder config print` or `--print-config` ([Inspect a runtime container](deploying-on-a-vm.md#inspect-a-runtime-container)) and tune only the bottleneck shown in `/metrics`.
 
 ## Find the limiting resource
 
@@ -26,7 +26,7 @@ Ingest construction keys live under `[ingest.construction]` (`ZINDER_INGEST__CON
 | Ingest OOM with full fetch queue | `source_fetch_max_in_flight_bytes` | `max(node.max_response_bytes, clamp(container_mem / 64, 128 MiB, 384 MiB))` | Lower to hold fewer fetched node responses (must be ≥ largest `node.max_response_bytes` across fallbacks). |
 | Projector OOM | `projector.build.max_outpoint_sort_memory_bytes` and `projector.build.max_secondary_sort_memory_bytes_per_sorter` | Cgroup-scaled: `40%` (`64 MiB..=4 GiB`) and `10%` (`32 MiB..=1 GiB`); `4 GiB` / `1 GiB` without a cgroup limit | Lower together so sorters spill sooner. After outpoint drain frees its buffer, address-transaction sort recycles up to half of `max_outpoint_sort_memory_bytes` (10 GiB defaults peak at ~3 GiB). Lowering also clamps concurrent key-prefix drain shards below a 256 MiB per-shard sort floor within `MAX_MERGE_FAN_IN`. |
 | Idle CPUs during wallet build (`canonical_scan`, `*_drain`, or `cold_validation_family_readback` dominate) | `projector.build.accumulator_hashing_workers` | `min(logical CPUs, 4)` (1 if unknown) | Raise toward idle CPUs (up to 64; sharded key-prefix drains cap at 8 shards within the 256 MiB per-shard sort floor), or lower to reserve CPU for ingest/node. |
-| Container ceiling too small for defaults | `ZINDER_INGEST_MEMORY_LIMIT`, `ZINDER_PROJECTOR_MEMORY_LIMIT` | `14g` and `10g` (Mainnet Compose) | Raise ceiling; cgroup-scaled construction budgets scale up automatically (projector defaults cap at `4 GiB` / `1 GiB` / `512 MiB`). |
+| Container ceiling too small for defaults | `ZINDER_INDEX_MEMORY_LIMIT`, `ZINDER_SERVE_MEMORY_LIMIT` | `16g` / `4g` (Mainnet Compose; single-volume `8g`+) | Raise ceiling; cgroup-scaled construction budgets scale up automatically (projector defaults cap at `4 GiB` / `1 GiB` / `512 MiB`). |
 | Slow node or timeouts | `source_fetch_max_in_flight_requests` | `12` | Lower to reduce node pressure; raise only with spare node headroom. |
 | Node rejects large batches | `source_segment_target_response_bytes` | `min(node.max_response_bytes, 32 MiB)` (smallest across fallbacks) | Keep below node limit (50 MiB default on Zebra 7.1.0 and Zakura 1.8.6). |
 | Idle CPUs and fast node | `block_prepare_concurrency` | `min(CPUs, 16)` | Raise together with `block_prepare_memory_watermark_bytes`. |

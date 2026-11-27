@@ -22,25 +22,15 @@ Most settings have working defaults. A wallet-serving deployment of `zinder-inge
 | `ingest_control.bearer_token_path` | ingest, projector, query, compat | File holding a shared secret. Ingest requires it when `ingest_control.listen_addr` is not a loopback address. |
 | `security.allow_public_bind` | any runtime bound to `0.0.0.0`, `::`, or a public address | `true`, and only behind a proxy that terminates TLS |
 
-The `*.toml` files directly in `deploy/config/` are complete examples for the Compose topology, and [Deploying Zinder](../runbooks/deploying.md) walks through them. Run any binary with `--print-config` to see the merged result before you start it.
+Most deployments need no TOML files at all and configure everything through `ZINDER_*` environment variables (with `[storage].data_dir` path derivation). Combined TOML files passed via `--config <path>` tolerate sibling service sections, and [Deploying Zinder](../runbooks/deploying.md) walks through the zero-TOML Compose setup. Run `zinder config print` or `zinder serve --print-config` (or `--print-config` on any role binary) to see the merged result before starting.
 
-Every listener binds to loopback by default. The [security boundary](../architecture/service-operations.md#security-boundary) explains which addresses `security.allow_public_bind` admits and why a public listener needs your own proxy.
+Every standalone listener binds to loopback by default. The [security boundary](../architecture/service-operations.md#security-boundary) explains which addresses `security.allow_public_bind` admits and why a public listener needs your own proxy.
 
-The runtime images change those defaults. Each image installs a file from `deploy/config/images/` at `/etc/zinder/config.toml` and starts with `--config /etc/zinder/config.toml`. The file sets `security.allow_public_bind = true` and these listeners:
-
-| Image | Listeners |
-| --- | --- |
-| `zinder-ingest` | `ops.listen_addr = "[::]:9105"` |
-| `zinder-projector` | `ops.listen_addr = "[::]:9110"` |
-| `zinder-query` | `query.listen_addr = "[::]:9102"`, `ops.listen_addr = "[::]:9106"` |
-| `zinder-compat-lightwalletd` | `compat.listen_addr = "[::]:9067"`, `ops.listen_addr = "[::]:9107"` |
-| `zinder-explorer` | `explorer.listen_addr = "[::]:9068"`, `ops.listen_addr = "[::]:9069"` |
-
-Other listeners, such as `ingest_control.listen_addr`, keep their loopback defaults. The image files leave network, node, and storage settings to each binary. Supply required values and any overrides with `ZINDER_*` variables or a mounted file. A file you mount at `/etc/zinder/config.toml` replaces the image file whole. A listener it does not set then binds loopback, and without `allow_public_bind = true` a listener on `[::]` or a public address is refused. Arguments after the image name replace `--config /etc/zinder/config.toml`, so repeat it when you pass your own.
+The unified `ghcr.io/zcashfoundation/zinder` OCI image runs `zinder serve` (or `zinder index` in [deploy/docker-compose.yml](../../deploy/docker-compose.yml)) without a baked-in `/etc/zinder/config.toml`. Compose configures public container listeners on `[::]` with `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`, exposing `:9108` (`zinder serve` ops), `:9105` (`zinder index` ops), `:9102` (`WalletQuery`), `:9067` (`CompactTxStreamer`), `:9068` (`ExplorerQuery`, `explorer` preset), and `:9070` (`Cipherscan` REST, `explorer` preset), while `ingest_control.listen_addr` keeps its loopback default.
 
 ## Deployment profiles
 
-Set `deployment.profile` on each participating standalone runtime (`light-wallet`, `wallet` default, or `explorer`; add `storage.full_blocks = true` on any profile to retain full raw blocks). The existing single-volume `zinder-wallet-serving` image runs `zinder-projector` and `zinder-query` only: it supports `wallet` (plus deprecated `wallet-archive`) without Explorer views and rejects `light-wallet`, `explorer`, and combined profiles with `ingest.explorer_views = true`. Matching explicit settings are accepted; conflicting settings fail configuration resolution. `--print-config` prints the profile and omits the settings it supplies.
+Set `deployment.profile` on each participating runtime, or pass `--preset` to `zinder serve` / `zinder index` (`light-wallet`, `wallet` default, or `explorer`; add `--full-blocks` or `storage.full_blocks = true` on any preset to retain full raw blocks). Matching explicit settings are accepted; conflicting settings fail configuration resolution. `--print-config` prints the profile and omits the settings it supplies.
 
 | Profile | Canonical workload | Raw blobs | Serving |
 | --- | --- | --- | --- |
@@ -52,7 +42,7 @@ All profiles build complete canonical history, and changing retention requires a
 
 ## Light-wallet profile
 
-Set `deployment.profile = "light-wallet"` (or `ZINDER_DEPLOYMENT__PROFILE=light-wallet`) on standalone `zinder-ingest` and `zinder-compat-lightwalletd` (the bundled `zinder-wallet-serving` image starts `zinder-projector` and `zinder-query` and rejects `light-wallet`). Give both the same network, canonical primary path, and reorg window, plus a unique secondary path, `ingest_control.addr`, and one archive node with transparent address indexes.
+Set `deployment.profile = "light-wallet"` (or `ZINDER_DEPLOYMENT__PROFILE=light-wallet` / `--preset light-wallet`) on `zinder serve`, `zinder index`, or standalone `zinder-ingest` and `zinder-compat-lightwalletd`. Give both the same network, canonical primary path, and reorg window, plus a unique secondary path, `ingest_control.addr`, and one archive node with transparent address indexes.
 
 Compatibility requires complete block history and a complete subtree-root prefix, and also admits a store with retained blobs. Without the profile, setting `compat.serving = "light-wallet"` applies the same requirements against `storage.raw_blob_policy` (which defaults to `transactions`; set it to `none` explicitly to admit a lean store). See [Lightwalletd compatibility](lightwalletd-compatibility.md#runtime-serving-selection) and [Node-forwarded reads](lightwalletd-compatibility.md#node-forwarded-reads).
 

@@ -73,30 +73,35 @@ A wallet-serving reader during a node outage answers like this:
 `cause`. A script that reads the first `"cause"` key therefore gets the
 runtime's own cause.
 
+## Supervisor endpoint (`zinder serve` / `zinder index`)
+
+When running under the unified `zinder serve` (default `:9108`) or `zinder index` (default `:9105`) supervisor, the parent process binds its operational HTTP endpoint at **T=0** before child stores finish constructing:
+
+- `/healthz`: returns HTTP 200 immediately with `{"status":"alive","service":"zinder","version":...,"git_commit":...,"network":...}` so container liveness and startup probes succeed while initial sync runs.
+- `/readyz`: aggregates every supervised role into `{"status":"ready"|"not_ready","mode":...,"preset":...,"network":...,"phase":"bootstrapping_canonical"|"catching_up_wallet_projection"|"waiting_for_explorer_views"|"waiting_for_serving_listeners"|"ready"|"shutting_down"|"failed","roles":[...]}` and returns HTTP 200 only once every required role reports ready.
+- `/metrics`: exports `zinder_supervisor_ready` and `zinder_supervisor_role_ready` alongside scraped child role metrics.
+
 ## Container healthcheck
 
-The runtime images have no shell or HTTP client, so every runtime binary
-except `zinder-compat-cipherscan` probes its own endpoint with a `healthcheck`
-subcommand:
+The unified distroless image has no shell or HTTP client, so probes invoke `zinder healthcheck` directly (and individual role binaries also accept `healthcheck`):
 
 ```bash
-zinder-query --config /etc/zinder/config.toml healthcheck
-zinder-ingest healthcheck --addr 127.0.0.1:9105 --path /healthz
+zinder healthcheck
+zinder healthcheck --ready --addr 127.0.0.1:9108
+zinder healthcheck --addr 127.0.0.1:9105 --path /healthz
 ```
 
-The probe sends one HTTP/1.1 `GET` and exits 0 only when the endpoint answers
-200. Otherwise it exits 1 and prints the reason to stderr, which Docker
-records as the failure reason.
+The probe sends one HTTP/1.1 `GET` and exits 0 only when the endpoint answers 200. Otherwise it exits 1 and prints the reason to stderr, which Docker records as the failure reason.
 
 | Flag | Default |
 | --- | --- |
-| `--path` | `/readyz`. Use `/healthz` to check liveness only. |
-| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then `[ops] listen_addr` in the `--config` file, then the runtime's built-in ops address. |
+| `--ready` | Probes `/readyz` instead of `/healthz` (unless `--path` is passed). |
+| `--path` | `/healthz`. Override to `/readyz` or pass `--ready`. |
+| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then `[ops] listen_addr` in the `--config` file, then `127.0.0.1:9108` (`zinder serve` ops default; standalone binaries default to their own ops ports). |
 
 - The probe reads only `[ops] listen_addr` from the config file. It skips a
   file that is missing, unreadable, or not TOML.
-- It ignores the runtime's `--ops-listen-addr` flag. Pass that address with
-  `--addr`.
+- It ignores `--ops-listen-addr`. Pass a non-default address with `--addr`.
 - An unspecified host probes loopback. `0.0.0.0` probes `127.0.0.1`, and
   `[::]` probes `[::1]`, then `127.0.0.1`.
 - An empty address disables the endpoint, so the probe fails without
@@ -104,15 +109,7 @@ records as the failure reason.
 - The whole probe takes at most 3 seconds, below the 5-second timeout of the
   image and Compose healthchecks.
 
-Each runtime image runs `zinder-<runtime> --config /etc/zinder/config.toml
-healthcheck`. The ingest image adds `--path /healthz`, because ingest reports
-`syncing` throughout a first sync. The reference Compose file probes `/readyz`
-for every runtime. If you start a container with a config file at another
-path that changes the ops address, override the healthcheck with the same
-`--config`. The `zinder-canonical-runtime` image runs
-`zinder-ingest healthcheck --path /healthz`. The two wallet-serving images
-run their own healthcheck script, described in
-[Single-volume deployment](../runbooks/deploying-single-volume.md).
+In `deploy/docker-compose.yml`, `zinder-index` binds `:9105` (probing `/healthz`) and `zinder-serve` binds `:9108` (probing `/readyz`). The single OCI image sets `HEALTHCHECK ... CMD ["/usr/local/bin/zinder", "healthcheck"]` for `/healthz`, while Kubernetes readiness probes query `/readyz` on `:9108` (see [Deploying the single-volume container](../runbooks/deploying-single-volume.md)).
 
 ## gRPC health
 
@@ -287,15 +284,11 @@ While ingest follows the node, its `/readyz` can include the optional field
   the canonical chain, including preparing the next block. The last reported
   heights can still match during preparation.
 
-Only `mempool_hydration_at_tip` lets the supervisor
-count a relayed mempool `node_unavailable` toward the 24-hour outage
-tolerance. See [Recovery](../architecture/service-operations.md#recovery).
-
 `IngestControl.WriterStatus` reports `upstream_not_ready` when the latest
 health probe says the node is syncing, even while ingest's own `/readyz`
 shows `syncing`. If a later probe fails to obtain a health response, its
 input becomes `node_unavailable` and writer status clears `upstream_not_ready`.
-The supervisor then applies its ordinary unready budgets when ingest reports lag.
+Ingest then keeps retrying until the node synchronizes.
 With fallback nodes, a switch resets the probe's input to `starting` until
 the first successful observation of the new endpoint. See
 [Chain ingestion](../architecture/chain-ingestion.md#node-endpoint-failover).
@@ -435,13 +428,12 @@ Readers stop serving in these cases:
 
 - **Ingest stops.** Readers lose the writer's status RPC and keep serving for
   `storage.serving_pair_staleness_ceiling_ms`, 5 minutes by default. Then
-  they report `writer_status_unavailable` and refuse traffic.
+  they report `writer_status_unavailable` and refuse traffic (and under
+  `zinder serve`, an unexpected child exit triggers fail-fast shutdown so the
+  orchestrator restarts cleanly).
 - **Ingest restarts while the node is down.** Ingest needs a node to start and
   to confirm its tip. Readers report `canonical_tip_unconfirmed` until it
   does.
-- **The single-volume supervisor counts 24 hours of unreachable-node time.**
-  It then ends the container, so a stuck node client restarts. See
-  [Single-volume failure handling](../runbooks/deploying-single-volume.md#failure-handling).
 
 A reader that restarts during a node outage serves local data once its pair
 or canonical generation converges and the writer attests it. Readers can open

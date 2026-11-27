@@ -49,9 +49,9 @@ When shutdown interrupts an initial wallet build, the projector asks ingest to r
 
 When step 4 completes, no call handler or response of the gRPC server remains, and each ended response sends its status before any more of its data. A client-streaming call's request stream also ends, so work its handler handed the stream to cannot keep the connection open. Other work a handler already handed off finishes on its own and holds the generation it reads until then: a storage read running on a blocking thread completes and its result is discarded, and a block-range reader finishes the chunk it is reading and stops when it tries to send it, because the response it fed has ended.
 
-A client that has stopped reading cannot receive its status, so step 5 gives up on its connection after 2 seconds; a client that reads gets its status within milliseconds. These limits bound the gRPC drain. The single-volume wallet-serving entrypoint gives its processes 20 seconds to exit.
+A client that has stopped reading cannot receive its status, so step 5 gives up on its connection after 2 seconds; a client that reads gets its status within milliseconds. These limits bound the gRPC drain. The unified `zinder serve` supervisor gives its child processes 20 seconds to exit.
 
-In `compact-blocks` and `light-wallet` modes, the publisher interrupts pending writer-status reads and retry delays when shutdown begins, including during candidate convergence. It keeps the published reader and skips refresh-failure reporting for the interrupted refresh. RocksDB work already running finishes, and the publisher closes its serving generations after the drain. Slow storage can extend process shutdown beyond the entrypoint's grace window.
+In `compact-blocks` and `light-wallet` modes, the publisher interrupts pending writer-status reads and retry delays when shutdown begins, including during candidate convergence. It keeps the published reader and skips refresh-failure reporting for the interrupted refresh. RocksDB work already running finishes, and the publisher closes its serving generations after the drain. Slow storage can extend process shutdown beyond the supervisor's 20-second drain window.
 
 ### Background task failure
 
@@ -95,20 +95,20 @@ Zinder's own listener bounds, listed in [Configuration](../reference/configurati
 
 Bearer tokens are read from files. Configuration output, such as `--print-config`, shows redaction markers in place of secrets, and errors name only the field or the path. Log events that carry a node URL replace its user information, query, and fragment with `[REDACTED]`.
 
-### Runtime images
+### Runtime image
 
-Each runtime image runs its one binary as UID and GID 10001 on a digest-pinned `gcr.io/distroless/cc-debian12:nonroot` base. The image has no shell, package manager, or HTTP client. The single-volume images keep a Debian base with a shell, because their entrypoint scripts need one. [ADR-0022](../adrs/0022-release-artifacts.md) records why.
+The unified release image (`ghcr.io/zcashfoundation/zinder`) runs the `zinder` binary as UID and GID 10001 on a digest-pinned `gcr.io/distroless/cc-debian12:nonroot` base (`ENTRYPOINT ["/usr/local/bin/zinder"]`, default `CMD ["serve"]`). The image has no shell, package manager, or HTTP client; health checks invoke `/usr/local/bin/zinder healthcheck`. [ADR-0022](../adrs/0022-release-artifacts.md) records why.
 
-The Zebra and Zakura images also run as UID 10001 and write the node's RPC cookie with mode 0600, so a Zinder container that mounts the cookie reads it directly. The reference Compose file requires the node to run as UID 10001. Its `state-init` service gives the data volume to UID 10001 on every start, so a Zinder container under another UID cannot write its stores. In an orchestrator other than Compose, give mounted volumes to UID 10001 yourself, for example with Kubernetes `fsGroup: 10001`.
+The Zebra and Zakura images also run as UID 10001 and write the node's RPC cookie with mode 0600, so a Zinder container that mounts the cookie reads it directly. The reference Compose file (`deploy/docker-compose.yml`) requires the node to run as UID 10001, and its `state-init` service gives the data volume to UID 10001 on every start. In an orchestrator other than Compose, give mounted volumes to UID 10001 yourself, for example with Kubernetes `fsGroup: 10001` as in `deploy/kubernetes/statefulset.yaml`.
 
-The runtime images listen on every container interface. Their default configuration sets each serving and operational listener to `[::]` and sets `security.allow_public_bind = true`, as [Configuration](../reference/configuration.md) lists. Publishing a port is therefore not the only way in:
+In containerized and `zinder serve` / `zinder index` workflows, Zinder configures via `ZINDER_*` environment variables (deriving store paths from `ZINDER_STORAGE__DATA_DIR`, reading inline `*_PEM` TLS secrets and bearer tokens, and auto-generating private loopback control tokens when running writers under `zinder serve`). When `security.allow_public_bind = true` and listeners bind `[::]`:
 
 - On a Docker bridge network, every container on that network can connect to the listeners, whether or not you publish their ports. On Linux, the host can too, through the container's address.
 - With host networking, `[::]` binds every interface of the host.
 
-To restrict who can connect, run the containers on a dedicated network that holds only the services that need them, and do not use host networking. Publish ports on `127.0.0.1` unless a proxy that terminates TLS and authorization sits in front of them. To keep a listener on container loopback, set its address, for example `ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9106`. The ingest control listener keeps its `127.0.0.1:9100` default.
+To restrict who can connect, run the containers on a dedicated network that holds only the services that need them, and do not use host networking. Publish ports on `127.0.0.1` unless a proxy that terminates TLS and authorization sits in front of them. To keep a listener on container loopback, set its address, for example `ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9108` for `zinder serve` (or `127.0.0.1:9105` for `zinder index`). The ingest control listener keeps its `127.0.0.1:9100` default.
 
-To inspect a running container, run its binary with `docker exec`, as [Inspect a runtime container](../runbooks/deploying-on-a-vm.md#inspect-a-runtime-container) shows.
+To inspect a running container without a shell, run `zinder` inspection commands directly, as [Inspect a runtime container](../runbooks/deploying-on-a-vm.md#inspect-a-runtime-container) shows.
 
 ## Recovery
 
@@ -120,19 +120,19 @@ With no verified backup or snapshot, rebuild from the node on empty storage and 
 
 ### Restore from a private backup
 
-`zinder-projector` can capture and seal a coherent canonical and wallet checkpoint pair (`backup`, `verify`, `restore`) with independent manifest digest verification. See [Back up and restore a wallet-serving indexer](../runbooks/private-backups.md).
+`zinder backup` (backed by `zinder-projector`) can capture and seal a coherent canonical and wallet checkpoint pair (`create`, `verify`, `restore`) with independent manifest digest verification. See [Back up and restore a wallet-serving indexer](../runbooks/private-backups.md).
 
 Do not copy live canonical and wallet directories directly from the filesystem: copies taken at different moments describe different chain states, and a running store mutates during the copy.
 
 ### Bootstrap from a verified edge snapshot
 
-An operator can initialize a separate canonical writer from a publisher's signed `zinder-edge-snapshot.v1` bundle (`zinder-ingest export-edge-snapshot` at a quiesced `READY` height divisible by 4,096, plus optional `sealed-history/`). `zinder-ingest bootstrap-from-snapshot` verifies the Ed25519 manifest signature and file digests, attests consensus anchors, subtree roots, and sampled historical blocks against the receiver's own `NodeSource`, and generates a fresh `cursor_auth_key` before admitting the canonical store. See [ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md).
+An operator can initialize a separate canonical writer from a publisher's signed `zinder-edge-snapshot.v1` bundle (`zinder snapshot export-edge-snapshot` at a quiesced `READY` height divisible by 4,096, plus optional `sealed-history/`). `zinder snapshot bootstrap-from-snapshot` verifies the Ed25519 manifest signature and file digests, attests consensus anchors, subtree roots, and sampled historical blocks against the receiver's own `NodeSource`, and generates a fresh `cursor_auth_key` before admitting the canonical store. See [ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md).
 
 ## Supported deployments
 
-A Zinder deployment runs on one host. Ingest is the only writer of the canonical store, and the projector is the only writer of the wallet store. Every reader opens read-only copies of those stores on the same filesystem. Each deployment builds its stores from its own node (or initializes a new `rocksdb` canonical writer via an [ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md) verified edge snapshot and follows from its own node). [ADR-0004](../adrs/0004-storage-and-deployment-topologies.md) records why.
+A Zinder deployment runs on one host or `ReadWriteOnce` persistent volume. Ingest is the only writer of the canonical store, and the projector is the only writer of the wallet store. Every reader opens read-only copies of those stores on the same filesystem. Each deployment builds its stores from its own node (or initializes a new `rocksdb` canonical writer via an [ADR-0024](../adrs/0024-verified-edge-snapshot-bootstrap.md) verified edge snapshot and follows from its own node). [ADR-0004](../adrs/0004-storage-and-deployment-topologies.md) records why.
 
-[Deploying Zinder](../runbooks/deploying.md#choose-a-deployment) lists the deployments and when to pick each. `deploy/release-images.json` and `deploy/release-single-volume-images.json` list the released images; the Cipherscan adapter and PostgreSQL are not release artifacts. Releases also publish runtime binaries; see [Deploying on a VM](../runbooks/deploying-on-a-vm.md) for host service setup.
+[Deploying Zinder](../runbooks/deploying.md#choose-a-deployment) lists the deployments and when to pick each. `deploy/release-images.json` lists the single released OCI image (`zinder`); the single release binary (`bin/zinder`) bundles all serving, indexing, and compatibility roles (`zinder-compat-cipherscan` included via `zinder serve --preset explorer` and `zinder run compat-cipherscan`), while PostgreSQL remains benchmark-only and is not a release artifact. Releases publish `bin/zinder` archives and `ghcr.io/zcashfoundation/zinder`; see [Deploying on a VM](../runbooks/deploying-on-a-vm.md) for host service setup.
 
 ### More than one reader on a host
 

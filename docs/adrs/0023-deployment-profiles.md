@@ -12,12 +12,12 @@ A name for a deployment shape must not become a second source of truth. Capabili
 
 ## Decision
 
-1. **A profile coordinates the settings of a deployment's processes.** `deployment.profile`, in the shared `[deployment]` section ([ADR-0021](0021-shared-configuration-sections.md)), names the profile that the runtimes of one deployment read. The operator still launches each process. Profiles compose orthogonal optional storage and runtime modules over the shared canonical core (settled-supplement retention policy, single-copy raw block vault, decoupled transparent wallet projection, and optional isolated Explorer consumer). A profile fixes:
+1. **A profile (`--preset`) coordinates the settings of a deployment's processes.** `deployment.profile` (`ZINDER_DEPLOYMENT__PROFILE`, selected conveniently with `--preset` on `zinder serve` / `zinder index`) names one of three presets (`light-wallet`, `wallet`, `explorer`) shared across the runtimes of one deployment, while orthogonal `storage.full_blocks = true` (`--full-blocks`) toggles raw block and transaction blob retention on any preset. Profiles compose optional storage and runtime modules over the shared canonical core:
    - what the canonical writer stores: its coverage, raw-blob retention, and Explorer views;
    - which composition each reader serves; and
    - the minimum data its readers require ([ADR-0004](0004-storage-and-deployment-topologies.md) decision 2).
 
-   A setting the profile fixes may be repeated with the same value. A conflicting value fails at startup. For ingest, projector, native query, and the compatibility listener, `--print-config` shows the profile and omits the settings it supplies. `publish-shielded-history --print-config` renders only the publisher's effective settings.
+   A setting the profile fixes may be repeated with the same value. A conflicting value fails at startup. `--print-config` (and `zinder config print`) shows the profile and omits the settings it supplies; `publish-shielded-history --print-config` renders only the publisher's effective settings.
 2. **A profile is not a capability, a readiness input, or a store identity.** Capabilities derive from the composition and its admitted evidence ([ADR-0015](0015-wallet-runtime-composition.md) decision 1). Readiness follows each runtime's admission rules ([ADR-0016](0016-wallet-serving-readiness.md)). A store records what it holds, not a profile name, and a reader admits any store that meets its requirements.
 3. **The light-wallet profile serves lightwalletd clients without transaction bodies or a wallet projection.** Operators run standalone `zinder-ingest` and `zinder-compat-lightwalletd`, and run no projector and no native query. Ingest builds complete wallet-serving history from height 1, with no raw blobs and no Explorer views. Compatibility serves the light-wallet composition:
    - It requires complete block history and a complete subtree-root prefix, and it also admits a store that retains blobs.
@@ -35,7 +35,7 @@ A name for a deployment shape must not become a second source of truth. Capabili
    - Current certification reads the full replay history. Omitting settled replay requires authenticated evidence for the settled prefix at cold admission and at restore, and enough retained replay for reorg replacement and for every consumer that reads it, as the wallet projector and Explorer views do.
 
    The encoding of transaction evidence, the construction of prefix evidence, and the length of retained replay belong to the format specification.
-6. **Wallet profiles retain complete history.** `wallet` runs the projector, native query, and wallet compatibility without raw blobs. Its serving runtimes require a verified primary node byte source. `wallet-archive` runs the same wallet services and keeps all raw blobs. An Explorer profile waits for canonical publication to authenticate daily value-pool evidence and for live writes to supply final note-commitment roots.
+6. **Wallet and Explorer presets retain complete history.** `wallet` runs the projector, native query, and wallet compatibility without raw blobs (`raw_blob_policy = "none"` unless `--full-blocks` / `storage.full_blocks = true` is set, requiring a verified primary node byte source). `explorer` enables `ingest.explorer_views = true` alongside the full `wallet` stack plus `zinder-explorer` and `zinder-compat-cipherscan`. Combining `--full-blocks` (`storage.full_blocks = true`) with any preset sets `raw_blob_policy = "all"` cleanly without requiring a separate `wallet-archive` profile.
 
 [Configuration](../reference/configuration.md) lists the settings, and [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#runtime-serving-selection) describes each serving mode.
 
@@ -55,19 +55,20 @@ A name for a deployment shape must not become a second source of truth. Capabili
 - An operator sets one value for ingest and compatibility instead of several settings that must agree.
 - Forwarding suits shielded scanning and not transparent-heavy wallets. Forwarded address history costs node calls that grow with the number of returned rows. Each listener [bounds concurrent requests and the time each can hold a slot](../reference/lightwalletd-compatibility.md#gettaddresstxids-and-gettaddresstransactions). A deployment whose wallets are transparent-heavy runs the wallet deployment instead. [#378](https://github.com/ZcashFoundation/zinder/issues/378) records the measurements.
 - Node-backed answers are bound to the served tip, not pinned, and address history is best-effort ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) decision 7). [ADR-0016](0016-wallet-serving-readiness.md) describes what a light-wallet reader serves during a node outage.
-- The profile runs from the release's standalone binaries and needs no new executable ([ADR-0022](0022-release-artifacts.md)). The bundled single-volume image (`zinder-wallet-serving`) defaults `ZINDER_DEPLOYMENT__PROFILE` to `wallet` when Explorer views and explicit `storage.raw_blob_policy` overrides are unset, accepts `wallet-archive`, omits the profile when `ZINDER_STORAGE__RAW_BLOB_POLICY` is set for a pre-profile `transactions` volume or when Explorer views are enabled (`zinder-wallet-serving-explorer`), and rejects `light-wallet` because it always starts `zinder-projector` and `zinder-query`.
+- All three presets (`light-wallet`, `wallet`, `explorer`) and `--full-blocks` run directly from the unified `zinder` binary and distroless OCI image ([ADR-0022](0022-release-artifacts.md)) via `zinder serve` and `zinder index`, defaulting to `wallet` with auto-persisted `projector.build_owner_hex`. Leaving `deployment.profile` unset still supports existing pre-profile `storage.raw_blob_policy = "transactions"` stores in place.
 - Because a store records no profile, a reader that needs less can open a richer store. A writer that should store less needs a new store.
 
 ## Alternatives rejected
 
 - **Record the profile name in the store.** It would be a second identity that could disagree with the data the store holds, and a richer store could not serve a reader that needs less.
 - **Capability profiles.** A name that declares capabilities keeps a shadow model of the composition ([ADR-0015](0015-wallet-runtime-composition.md)).
-- **Ship the light-wallet composition only behind a build feature.** Releases ship one reproducible build of each binary ([ADR-0022](0022-release-artifacts.md)), so a feature-gated composition never reaches operators.
+- **Ship the light-wallet composition only behind a build feature.** Releases ship one reproducible build of `bin/zinder` ([ADR-0022](0022-release-artifacts.md)), so a feature-gated composition never reaches operators.
 - **Forward every read the store lacks.** It is the node fallback that [ADR-0003](0003-epoch-bound-reads-and-storage-roles.md) and [ADR-0014](0014-consumer-neutral-wallet-data-plane.md) reject. Each node-backed method is declared, and each has its own binding to the served tip.
 - **Forward transparent reads in the wallet deployment.** Its consumers need exact transparent history and spend status at one epoch, which a local index gives and the node does not.
 
 ## Revision history
 
+- 2026-11-27. Replaced `wallet-archive` with orthogonal `--full-blocks` (`storage.full_blocks`), elevated `explorer` as a preset across unified `zinder serve` / `zinder index`, and dropped references to the removed `zinder-wallet-serving*` images.
 - 2026-11-26. Consequences reflect that `zinder-wallet-serving` defaults `deployment.profile` to `wallet`, accepts `wallet-archive`, omits the profile when `storage.raw_blob_policy` is set for legacy `transactions` stores or when Explorer views are enabled, and rejects `light-wallet`.
 - 2026-11-24. Decision 1 defines deployment profiles as compositions of orthogonal optional modules over the shared canonical core.
 - 2026-11-24. Decision 3 notes the signed settled-history projection also supplies nullifier-range payloads, which the light-wallet profile's `GetBlockRangeNullifiers` stream reads zero-copy.

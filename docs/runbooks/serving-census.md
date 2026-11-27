@@ -9,18 +9,16 @@ the serving path answered.
 
 1. Keep an inventory outside the application. Give each expected target a
    Railway service, network, runtime role, and replica. Record when each role
-   becomes expected and when it retires. In a single-volume container expect
-   ingest on 9105, projector on 9110, and query on 9106. Add compatibility on
-   9107 when enabled and Explorer on 9069 for the Explorer image. Record
-   construction separately from steady-state serving. Each independent reader
-   needs its own target.
+   becomes expected and when it retires. In a single-volume container running
+   `zinder serve`, the supervisor exposes aggregated `/metrics`, `/healthz`,
+   and `/readyz` on port `9108` (`zinder index` uses `9105` in split mode,
+   and standalone `zinder run <role>` binds `9105`/`9110`/`9106`/`9107`/`9069`).
+   Record construction separately from steady-state serving. Each independent
+   reader needs its own target.
 2. Scrape `/metrics` every 15 seconds with a 10-second timeout as a starting
-   point. The single-volume image binds ingest and projector ops to loopback.
-   Place the scraper in the same network namespace to reach those listeners.
-   A separate Railway service can scrape a privately bound listener after
-   verifying reachability in the same environment. A service DNS name shared
-   by multiple replicas needs per-replica discovery to preserve identity.
-   Leave ops ports out of public routing. [Private networking](https://docs.railway.com/networking/private-networking)
+   point. Keep `9108` (or standalone per-role ops ports) reachable only inside
+   the private network or loopback, and leave ops ports out of public routing.
+   [Private networking](https://docs.railway.com/networking/private-networking)
 3. Remote-write over an authenticated private or TLS connection to a backend
    outside the application volume. Provision 30 days of retention for daily
    and seven-day reports. Supply credentials from a mounted secret. Size the
@@ -58,11 +56,12 @@ the serving path answered.
    estimated gap, version, and last **successful** observation time. Give
    each probe its own availability series.
 
-For a collector beside one Testnet wallet backend, this Prometheus agent
-configuration scrapes the three mandatory processes. Replace the example
-service, replica, and receiver with the identities from your inventory. Use
-one static target per additional enabled role. The remote-write receiver
-owns the retention setting.
+For a collector beside one Testnet single-volume `zinder serve` backend, this
+Prometheus agent configuration scrapes the supervisor's aggregated `/metrics`
+endpoint on port `9108`. Replace the example service, replica, and receiver
+with the identities from your inventory, and add `127.0.0.1:9105` when running
+`zinder-index` separately. The remote-write receiver owns the retention
+setting.
 
 ```yaml
 global:
@@ -73,14 +72,10 @@ global:
     replica: replica-a
     network: zcash-testnet
 scrape_configs:
-  - job_name: wallet-serving
+  - job_name: zinder-serve
     static_configs:
-      - targets: ["127.0.0.1:9105"]
-        labels: {service: zinder-ingest}
-      - targets: ["127.0.0.1:9110"]
-        labels: {service: zinder-projector}
-      - targets: ["127.0.0.1:9106"]
-        labels: {service: zinder-query}
+      - targets: ["127.0.0.1:9108"]
+        labels: {service: zinder}
     relabel_configs:
       - source_labels: [service]
         target_label: job
@@ -113,14 +108,13 @@ operator access controls. Record skipped or rate-limited log intervals.
 [Railway logs](https://docs.railway.com/observability/logs)
 
 Separate a child exit, a supervisor decision, and a subsequent platform
-restart. On the Explorer image, `supervisor_child_exited` with
-`role=zinder-explorer` and `action=restart_child` records an unexpected exit
-and scheduled delay. A changed process start time confirms an observed new
-process. Planned construction completion and forwarded shutdown have a
-different meaning. Keep brief readiness drains even when they never qualify
-as recurrence episodes. Record elapsed time per drain and the supervisor's
-cumulative completed seconds separately. Treat a missing termination cause
-as unknown.
+restart. Under `zinder serve`, an unexpected exit of any child role fails fast
+and drains sibling processes so the orchestrator restarts cleanly. A changed
+process start time confirms an observed new process. Planned construction
+completion and forwarded shutdown have a different meaning. Keep brief
+readiness drains even when they never qualify as recurrence episodes. Record
+elapsed time per drain and the supervisor's cumulative completed seconds
+separately. Treat a missing termination cause as unknown.
 
 Count fatal events, warnings, storage errors, failed epoch pins, and source
 outages at their owners. `canonical_source_recovery` records onset or a

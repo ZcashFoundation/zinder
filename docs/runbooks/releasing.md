@@ -13,9 +13,8 @@ Every first-party crate and service shares one product version, the root
 
 | Artifact | Contents |
 | --- | --- |
-| Runtime images | The five images in `deploy/release-images.json`, for amd64 and arm64 |
-| Single-volume host images | The three images in `deploy/release-single-volume-images.json`, for amd64 and arm64 |
-| Binary archives | One archive per platform (x86-64-v3 with BMI2+ADX Pasta assembly, and AArch64 GNU/Linux) with the five runtime executables, plus an SPDX 2.3 SBOM for each |
+| Runtime image | The single distroless OCI image in `deploy/release-images.json` (`ghcr.io/zcashfoundation/zinder`), for amd64 and arm64 |
+| Binary archives | One archive per platform (x86-64-v3 with BMI2+ADX Pasta assembly, and AArch64 GNU/Linux) with the unified `bin/zinder` executable, plus an SPDX 2.3 SBOM for each |
 | Rust SDK | `zinder-core`, `zinder-proto`, and `zinder-client` on crates.io |
 | API artifacts | `zinder.v1.descriptor.bin` and a `zinder-api-docs` archive with the native `.proto` sources and OpenAPI documents |
 | GitHub Release | All of the above files, `SHA256SUMS`, and its signature `SHA256SUMS.sigstore.json` |
@@ -151,10 +150,10 @@ approve the release only after all four jobs pass on the tag's commit.
    expire, rerun all jobs, which requests a new approval.
 
 4. After approval, the workflow publishes the missing SDK crates and checks
-   them from the registry, packages and pushes the images from the compared
-   binaries, attests and signs them, signs `SHA256SUMS`, and publishes the
-   GitHub Release. For a stable tag only, it then moves the eight `latest`
-   image tags. Prereleases never move `latest`.
+   them from the registry, packages and pushes the unified `zinder` image from
+   the compared archive binary, attests and signs it, signs `SHA256SUMS`, and
+   publishes the GitHub Release. For a stable tag only, it then moves the `latest`
+   image tag. Prereleases never move `latest`.
 
 The workflow publishes one tag at a time and has no manual trigger. For a
 build-only smoke test that publishes nothing, run the `build-images` workflow
@@ -185,14 +184,13 @@ cosign verify-blob \
 
 scripts/verify-published-sdk.sh 0.18.0
 
-for image in $(jq -r '.[]' deploy/release-images.json deploy/release-single-volume-images.json); do
+for image in $(jq -r '.[]' deploy/release-images.json); do
   docker buildx imagetools inspect "ghcr.io/zcashfoundation/${image}:v0.18.0"
 done
 ```
 
 Each image must list amd64 and arm64 manifests. Each binary archive contains
-`bin/` with the five runtime executables, `BUILD-INFO.json`, `LICENSE`,
-`README.md`, and its own `SHA256SUMS`.
+`bin/zinder`, `BUILD-INFO.json`, `LICENSE`, `README.md`, and its own `SHA256SUMS`.
 
 When a release publishes an image name for the first time, GHCR creates the
 package as private. An organization admin must make it public once. An
@@ -203,26 +201,24 @@ Deployments should pin a verified image digest or archive checksum, not
 
 ### Inspect an image
 
-The five runtime images have no shell, so `docker run ... sh` fails. Inspect
-an image from outside, and run its binary as the entrypoint:
+The distroless `zinder` image has no shell, so `docker run ... sh` fails. Inspect
+the image from outside, and invoke `zinder` commands directly:
 
 ```console
-image=ghcr.io/zcashfoundation/zinder-query:v0.18.0
+image=ghcr.io/zcashfoundation/zinder:v0.18.0
 docker pull "$image"
 docker image inspect "$image" --format '{{.Config.User}}'
 docker image inspect "$image" --format '{{json .Config.Labels}}' | jq
-docker run --rm --entrypoint zinder-query "$image" --version
+docker run --rm "$image" --version
 ```
 
-A runtime image runs as `10001:10001`, and `--version` prints
-`zinder-query 0.18.0`. A single-volume image starts as root, and its
-entrypoint drops every Zinder process to UID 10001.
+The image runs as `10001:10001`, and `--version` prints `zinder 0.18.0`.
 
 Every image carries these OCI labels:
 
 | Label | Value |
 | --- | --- |
-| `org.opencontainers.image.title` | The image name, such as `zinder-query` |
+| `org.opencontainers.image.title` | The image name (`zinder`) |
 | `org.opencontainers.image.description` | One line on what the image runs |
 | `org.opencontainers.image.version` | The release tag |
 | `org.opencontainers.image.revision` | The tag-target commit |
@@ -251,9 +247,9 @@ tags from the same commit.
 | `publish public SDK crates` times out on registry propagation | Rerun the job. It reobserves crates.io and skips verified versions. |
 | A crate version exists but was published from another commit | Stop and investigate. Never yank or replace a version to let the release continue. |
 | Exact and commit image tags do not converge in GHCR | Inspect both tags in GHCR before you retry. Do not bypass the topology check. |
-| Image SBOM evidence reports an unexpected runtime package | Regenerate the SBOM from the exact child digest and compare it with the owning service's manifest. A single-volume image must report exactly the executables its `deploy/Dockerfile` target copies. Do not widen the allowed package set. |
+| Image SBOM evidence reports an unexpected runtime package | Regenerate the SBOM from the exact child digest and compare it with `deploy/release-images.json`. The distroless image must report only `bin/zinder` copied from the archive. Do not widen the allowed package set. |
 | A prerelease published crates or images but no GitHub Release | Leave the tag and artifacts as they are. Merge the fix and publish the next release candidate. |
-| Only `promote stable image tags` failed | Rerun that job. It checks all eight exact manifests before it moves any `latest` tag. |
+| Only `promote stable image tags` failed | Rerun that job. It checks the verified manifests before moving `latest`. |
 
 Never move a release tag or rebuild it from another commit. A published
 GitHub Release is immutable, and the workflow refuses to change it.

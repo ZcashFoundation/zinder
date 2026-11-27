@@ -702,9 +702,9 @@ node's chain volume:
 docker build -f deploy/Dockerfile --target zinder-ingest-live-tests \
   -t zinder-ingest-live-tests:local .
 docker compose -p zinder-canonical-live-test \
-  -f deploy/docker-compose.canonical-live-test.yml run --rm canonical-blocks
+  -f deploy/bench/docker-compose.canonical-live-test.yml run --rm canonical-blocks
 docker compose -p zinder-canonical-live-test \
-  -f deploy/docker-compose.canonical-live-test.yml down -v
+  -f deploy/bench/docker-compose.canonical-live-test.yml down -v
 ```
 
 ### Mainnet
@@ -1078,17 +1078,17 @@ for (profile, metric), samples in changes.items():
 
 ### Canonical runtime tracer
 
-This runs the real `zinder-ingest` image beside an existing Zebra Testnet
+This runs the unified `zinder` image (invoking `zinder-ingest`) beside an existing Zebra Testnet
 node, in a 10-CPU, 10 GiB container with its own disposable volume. It mounts
 only the node's cookie, never its chain volume.
 
 ```bash
-docker build -f deploy/Dockerfile --target zinder-ingest \
-  -t zinder-ingest:canonical-runtime-local .
-image_id=$(docker image inspect zinder-ingest:canonical-runtime-local --format '{{.Id}}')
+docker build -f deploy/Dockerfile --target zinder \
+  -t zinder:canonical-runtime-local .
+image_id=$(docker image inspect zinder:canonical-runtime-local --format '{{.Id}}')
 ZINDER_CANONICAL_RUNTIME_IMAGE="$image_id" \
 ZINDER_CANONICAL_RUNTIME_CHECKPOINT_HEIGHT="${checkpoint_height:?set a height below the node tip}" \
-  docker compose -f deploy/docker-compose.canonical-runtime-test.yml up -d zinder-ingest
+  docker compose -f deploy/bench/docker-compose.canonical-runtime-test.yml up -d zinder-ingest
 ```
 
 Set `checkpoint_height` to a height below the node's tip first. Poll `/readyz` and the
@@ -1279,24 +1279,18 @@ block explicitly and keep the original target in the assertion.
 
 
 Use `scripts/regtest-fixture.py` to give a real wallet a fresh, owned node and
-following single-host ingest, projector, native WalletQuery, and lightwalletd
-endpoints. It uses `deploy/docker-compose.yml` and its configs. A local Linux
+following single-host Zinder endpoints (`zinder-index` and `zinder-serve` from `deploy/docker-compose.yml`). A local Linux
 Docker host with bridge addresses reachable from the host, Python 3.11 or
 later, Docker Compose, iproute2, curl, and jq are required. Start from the checkout matching
-the candidate release. Pull the four runtime images first, or build them using
-`deploy/Dockerfile` and its corresponding targets.
+the candidate release. Pull the unified `ghcr.io/zcashfoundation/zinder` image first, or build `--target zinder` via
+`deploy/Dockerfile`.
 
-Create an image map with the exact release tag, digest, or built image reference
-for each runtime. The command resolves references to immutable local image IDs
-before starting anything:
+Create an image map with the exact release tag, digest, or built image reference. The command resolves references to immutable local image IDs before starting anything (see [scripts/README.md](../../scripts/README.md)):
 
 ```bash
 cat > /tmp/fixture-images.json <<'JSON'
 {
-  "ingest": "ghcr.io/zcashfoundation/zinder-ingest:v0.21.0",
-  "projector": "ghcr.io/zcashfoundation/zinder-projector:v0.21.0",
-  "query": "ghcr.io/zcashfoundation/zinder-query:v0.21.0",
-  "compat-lightwalletd": "ghcr.io/zcashfoundation/zinder-compat-lightwalletd:v0.21.0"
+  "zinder": "ghcr.io/zcashfoundation/zinder:vX.Y.Z"
 }
 JSON
 scripts/regtest-fixture.py up --project zinder-fixture-review-a \

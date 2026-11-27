@@ -19,10 +19,11 @@ Zinder serves two wallet protocols on separate endpoints. A client speaks one of
 | A browser wallet using lightwalletd | gRPC-Web on the same `CompactTxStreamer` endpoint | `zinder-compat-lightwalletd` | 9067 |
 | A new native application or backend | Native `zinder.v1.wallet.WalletQuery` gRPC | `zinder-query` | 9102 |
 | A Rust application | The `zinder-client` crate over `WalletQuery` | `zinder-query` | 9102 |
-| An explorer or analytics backend | `zinder.v1.explorer.ExplorerQuery`, plus `WalletQuery` | `zinder-explorer` | 9068 |
+| An explorer or analytics backend | `zinder.v1.explorer.ExplorerQuery`, plus `WalletQuery` | `zinder-explorer` (`--preset explorer`) | 9068 |
+| A Cipherscan frontend | Cipherscan-compatible REST and WebSocket | `zinder-compat-cipherscan` (`--preset explorer`) | 9070 |
 | A server-side wallet | `zinder-client` plus a wallet library such as librustzcash | `zinder-query` | 9102 |
 
-The ports are the defaults in `deploy/docker-compose.yml` and `deploy/docker-compose.explorer.yml`, bound to host loopback. Your operator may publish different ones.
+The ports are the defaults in `deploy/docker-compose.yml`, bound to host loopback (select `--preset explorer` / `ZINDER_PRESET=explorer` to start Explorer and Cipherscan compat alongside wallet serving). Your operator may publish different ones.
 
 ### Choose a network
 

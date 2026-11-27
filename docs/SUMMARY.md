@@ -13,7 +13,7 @@
 
 - [Deploying Zinder](runbooks/deploying.md)
   - [Deploying on a VM](runbooks/deploying-on-a-vm.md)
-  - [Deploying the single-volume container](runbooks/deploying-single-volume.md)
+  - [Deploying the single-volume container & Kubernetes](runbooks/deploying-single-volume.md)
   - [Exposing over TLS](runbooks/exposing-over-tls.md)
 - [Initial sync](runbooks/initial-sync.md)
 - [Bulk-catchup resource tuning](runbooks/bulk-catchup-resource-tuning.md)

@@ -4,9 +4,8 @@ Use this procedure to confirm that an unchanged Cipherscan frontend works agains
 
 ## Prerequisites
 
-- `zinder-explorer` is ready, with `[ingest].explorer_views = true` on ingest ([Explorer plane](../architecture/explorer-plane.md)).
-- `zinder-query` is reachable from the adapter.
-- The adapter is running with its default listeners: REST on `127.0.0.1:9070` and ops on `127.0.0.1:9108`. Adjust the commands below if you changed them.
+- Run `zinder serve --preset explorer` (which enables `[ingest].explorer_views = true` and starts `zinder-explorer`, `zinder-query`, and `zinder-compat-cipherscan` together), or run `zinder-compat-cipherscan` (`zinder run compat-cipherscan`) pointing at running `zinder-explorer` and `zinder-query` instances ([Explorer plane](../architecture/explorer-plane.md)).
+- The adapter listens for REST on `127.0.0.1:9070` and exposes `/healthz` and `/readyz` on `127.0.0.1:9108` (`zinder serve` aggregates `/healthz` and `/readyz` across all roles on `:9108`). Adjust the commands below if you changed them.
 - A Cipherscan checkout whose API base URL points at the adapter.
 
 ## Steps

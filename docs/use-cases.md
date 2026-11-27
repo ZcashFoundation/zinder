@@ -13,14 +13,14 @@ In every pattern, Zinder serves public chain data from your configured node. Key
 | Native wallet or backend | `WalletQuery` on `zinder-query`, or `zinder-client` | Yes | Multi-call epoch-pinned reads, typed retries, capability checks |
 | Payment or deposit tracker | `ChainEvents` + transparent queries on `zinder-query` | Yes | Resumable reorg-aware cursor + outpoint spend checks |
 | Faucet or transaction sender | `BroadcastTransaction` + `Transaction` on `zinder-query` | Yes | Typed broadcast verdicts with multi-node failover |
-| Block explorer | `ExplorerQuery` on `zinder-explorer` | No | Search, block/tx pages, fees, and value-pool aggregates |
+| Block explorer | `ExplorerQuery` on `zinder-explorer` (plus optional `zinder-compat-cipherscan`) | Optional (`--preset explorer`) | Block/tx/address queries from canonical store; search, fees, mempool, and pools with optional views |
 | Multi-product operator | All of the above | Explorer optional | Several products sharing one canonical index |
 
 ## Light wallets
 
 Point an existing `CompactTxStreamer` wallet or SDK at `zinder-compat-lightwalletd`. No client code change is required.
 
-- Choose the `wallet` profile for local transparent indexes or `light-wallet` for a smaller shielded-focused footprint ([Features and roadmap](features.md#deployment-profiles)).
+- Choose the `wallet` preset for local transparent indexes or `light-wallet` for a smaller shielded-focused footprint ([Features and roadmap](features.md#deployment-profiles)).
 - `Ping` stays disabled unless explicitly enabled for load testing, and `GetAddressUtxos` and transparent address history enforce Zinder-specific limits. See [Lightwalletd compatibility](reference/lightwalletd-compatibility.md).
 - A named wallet release is supported once it passes end-to-end certification for the target network.
 
@@ -62,11 +62,11 @@ Block templates and mined-block submission stay on the node; miners and mining f
 
 ## Block explorers
 
-Enable `ingest.explorer_views = true` and run `zinder-explorer` to serve block and transaction detail, typed search, mempool views, transparent address activity and ranking, fee summaries, and value-pool flows over `ExplorerQuery`.
+Run with `--preset explorer` (or set `deployment.profile = "explorer"`) to start `zinder-explorer` and `zinder-compat-cipherscan` alongside the wallet plane. Core block, transaction, address history, address UTXO, and network statistics RPCs read `RocksDbCanonicalSecondary` directly without materialized views, while `explorer_views` (enabled automatically by the `explorer` preset) adds rebuildable views for commitment-root search, block production, and mempool analytics:
 
 - Explorer views live in a separate, rebuildable store and never block wallet serving.
 - Shielded addresses return a typed privacy refusal; the Explorer never scans shielded data.
-- To front an unchanged Cipherscan UI, add `zinder-compat-cipherscan` ([Cipherscan adapter](architecture/cipherscan-adapter.md)).
+- `zinder-compat-cipherscan` fronts an unchanged Cipherscan UI ([Cipherscan adapter](architecture/cipherscan-adapter.md)).
 
 See [Explorer plane](architecture/explorer-plane.md) for setup and method contracts.
 

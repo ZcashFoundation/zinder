@@ -13,11 +13,11 @@ Ingest admits network-upgrade table changes strictly above the store's tip (assi
 
 ## Upgrade the node
 
-1. Stop every Zinder runtime sharing the store (`zinder-ingest`, `zinder-projector`, `zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` if enabled).
+1. Stop Zinder (`zinder-serve` and `zinder-index`, or `zinder serve` / any standalone processes sharing the store).
 2. Upgrade the node and wait until JSON-RPC responds.
 3. Verify `upgrades` in the node's `getblockchaininfo`: entries at or below the store's tip must keep the exact same name, branch ID, height, and order; entries above the tip may be added, moved, or removed.
-4. Start `zinder-ingest` so it admits the updated schedule on reopen.
-5. Start `zinder-projector`, `zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` in order (they read the admitted schedule from the store).
+4. Start `zinder-index` (or `zinder-ingest`) so ingest admits the updated schedule on reopen.
+5. Start `zinder-serve --readers-only` (or `zinder-projector`, `zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` in order; they read the admitted schedule from the store).
 
 ## Verify the upgrade
 

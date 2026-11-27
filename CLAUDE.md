@@ -13,6 +13,11 @@ Zinder is a service-oriented Zcash indexer. Architecture, vocabulary, and bounda
 - [docs/architecture/chain-ingestion.md](docs/architecture/chain-ingestion.md): the canonical commit pipeline.
 - [docs/adrs/README.md](docs/adrs/README.md): the decision records, indexed by domain. [ADR-0003](docs/adrs/0003-epoch-bound-reads-and-storage-roles.md) covers epoch-bound reads and the writer and reader storage roles.
 - [.changes/README.md](.changes/README.md): the pull request release-note workflow and fragment-writing guidance.
+- [deploy/README.md](deploy/README.md) and [scripts/README.md](scripts/README.md): consolidated zero-TOML deployment manifests (`docker-compose.yml`, `kubernetes/statefulset.yaml`, `systemd/zinder.service`, `bench/`) and the repository script inventory.
+
+## Unified Binary & Release Packaging
+
+`services/zinder` provides the unified `zinder` CLI (`zinder serve`, `zinder index`, `zinder run <role>`, `zinder snapshot`, `zinder backup`, `zinder config <print|validate>`, and `zinder healthcheck`). Release packaging emits one archive binary (`bin/zinder`) and one distroless OCI image (`ghcr.io/zcashfoundation/zinder`, `USER 10001:10001`). Runtime presets are `light-wallet`, `wallet` (default), and `explorer` (with optional `--full-blocks` / `storage.full_blocks = true`). Individual role crates (`zinder-ingest`, `zinder-projector`, `zinder-query`, `zinder-compat-lightwalletd`, `zinder-explorer`, `zinder-compat-cipherscan`) remain as libraries and thin binary wrappers. Deployment uses zero-TOML `ZINDER_*` environment variables (`[storage].data_dir` path derivation, inline `*_PEM` TLS, auto-persisted `build_owner_hex`), with optional `--config` TOML files tolerating sibling service sections.
 
 Before changing public types, storage layouts, protocol bytes, or service boundaries, read the relevant doc above and amend it in the same change.
 

@@ -11,20 +11,20 @@ The "Stored in" column names where the data lives. `zinder-ingest` writes the ca
 | Full serialized blocks | Canonical | `WalletQuery.FullBlock`, `FullBlocksInRange` | Only when `storage.raw_blob_policy = "all"` |
 | Tree states (Sapling, Orchard, Ironwood) | Canonical | `WalletQuery.TreeStateAtHeight`, `LatestTreeStateCheckpoint`; lightwalletd `GetTreeState`, `GetLatestTreeState` | Historical checkpoints follow the [construction and backfill policy](../architecture/chain-ingestion.md#tree-state-densification); live following stores one per block; other heights rebuilt from compact blocks |
 | Shielded subtree roots | Canonical | `WalletQuery.SubtreeRoots`; lightwalletd `GetSubtreeRoots` | |
-| Note commitment tree roots per block | Materialized views | None | `ExplorerQuery.CommitmentRootSearch` is not advertised and always fails |
+| Note commitment tree roots per block | Canonical (explorer workload) and materialized views | `ExplorerQuery.CommitmentRootSearch` | Advertised once the canonical secondary is open; returns canonical and displaced block matches |
 | Network-upgrade schedule | Canonical, from the node | `WalletQuery.NetworkUpgradeActivations`; lightwalletd `GetLightdInfo`; `ExplorerQuery.NetworkUpgradeStatus` | |
 | Transaction location and status | Canonical | `WalletQuery.Transaction`; lightwalletd `GetTransaction`; `ExplorerQuery.TransactionDetail` | Absence is reported only when proven |
 | Raw transaction bytes | Canonical | `WalletQuery.Transaction`; lightwalletd `GetTransaction`, `GetTaddressTransactions` | Only when `raw_blob_policy` is `transactions` or `all` |
-| Transaction facts: components, value balances, transparent inputs and outputs | Canonical | `ExplorerQuery.TransactionDetail` | Missing optional facts mean unknown, not zero. `BlockTransactions` is not advertised and always fails |
+| Transaction facts: components, value balances, transparent inputs and outputs | Canonical and materialized views | `ExplorerQuery.TransactionDetail`, `BlockTransactions` | Missing optional facts mean unknown, not zero |
 | Chain events (commits and reorgs) | Canonical | `WalletQuery.ChainEvents`; `ExplorerQuery.ChainReorgHistory` | Cursor-resumable, retention-bounded |
-| Displaced blocks | Canonical | None | Archive of blocks a reorg replaced. `ExplorerQuery.DisplacedBlockHistory` and `DisplacedBlockDetail` are not advertised and always fail |
+| Displaced blocks | Canonical | `ExplorerQuery.DisplacedBlockHistory`, `DisplacedBlockDetail` | Archive of blocks a reorg replaced |
 | Live mempool and mempool events | Ingest's mempool view and event log | `WalletQuery.MempoolSnapshot`, `MempoolEvents`; lightwalletd `GetMempoolTx`, `GetMempoolStream`, `GetTransaction`; `ExplorerQuery` mempool methods | Events kept 60 minutes after mining, 24 hours after invalidation, by default |
 | Transparent unspent outputs by address | Wallet | `WalletQuery.TransparentAddressUnspentOutputs`; lightwalletd `GetAddressUtxos`, `GetAddressUtxosStream` | |
 | Transparent spent outputs | Wallet | `WalletQuery.TransparentOutpointSpendStatus` | |
 | Transparent address transaction history | Wallet | `WalletQuery.TransparentAddressTxIdsInRange`; lightwalletd `GetTaddressTxids`, `GetTaddressTransactions` | Ascending only |
 | Transparent address balance | Wallet | lightwalletd `GetTaddressBalance`, `GetTaddressBalanceStream` | No native balance method |
 | Address activity, deltas, and ranking | Materialized views | `ExplorerQuery.TransparentAddressActivity`, `TransparentAddressDeltas`, `TransparentAddressRanking` | Ranking is advertised only after its view is built |
-| Block summaries, production, and activity distribution | Materialized views | `ExplorerQuery.BlockSummariesInRange`, `BlockActivityDistribution` | `BlockProductionSeries` and `BlockProductionInTimeRange` are not advertised and always fail |
+| Block summaries, production, and activity distribution | Canonical and materialized views | `ExplorerQuery.BlockSummariesInRange`, `BlockProductionSeries`, `BlockProductionInTimeRange`, `BlockActivityDistribution` | Production series reads the canonical secondary |
 | Transaction history and recent transactions | Materialized views | `ExplorerQuery.TransactionHistory`, `RecentTransactions`, `TransactionComponentSummary` | |
 | Fees | Materialized views | `ExplorerQuery.FeeSummary`, `ConventionalFeeDistribution` | ZIP-317 conventional fees; `PaidFeeDistribution` is not advertised |
 | Value-pool balances and flows | Materialized views | `ExplorerQuery.ValuePoolBalanceHistory` and `ValuePoolFlow*` methods | |

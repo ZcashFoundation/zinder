@@ -54,7 +54,7 @@ stop the debate from being repeated.
 | [0001](0001-rocksdb-canonical-store.md) | Store chain data in RocksDB | RocksDB is the storage engine for chain, wallet, and view data in the supported single-host topology. |
 | [0002](0002-serialization-and-byte-order.md) | Serialization and byte order | Each boundary chooses its own serialization, and hashes on the wire use RPC byte order. |
 | [0003](0003-epoch-bound-reads-and-storage-roles.md) | Epoch-bound reads and storage roles | Indexed lookups bind to one chain epoch or event fence, compatibility block ranges join chunks by hash, node-backed reads bind to the served tip, and each store has exactly one writer with secondary readers. |
-| [0004](0004-storage-and-deployment-topologies.md) | Storage and deployment topologies | Canonical and projection storage stay separate, and each deployment runs one topology. Single-host RocksDB is supported; a multi-host PostgreSQL topology for hosted fleets is decided but not implemented. |
+| [0004](0004-storage-and-deployment-topologies.md) | Storage and deployment topologies | Canonical and projection storage stay separate, and each deployment runs one topology. Single-host RocksDB (including RWO Kubernetes `StatefulSet`) is supported; horizontal `Deployment`/serverless topologies wait on PostgreSQL. |
 | [0005](0005-bounded-process-memory.md) | Bounded process memory | Process memory is bounded independently of store size, and service binaries allocate through jemalloc. |
 | [0006](0006-node-source-boundary.md) | Node source boundary | Node adapters sit behind one source boundary, separate from the protocols Zinder serves. |
 | [0007](0007-node-failure-recovery-and-transport-policy.md) | Node failure recovery and transport policy | Ingest recovers from node failures, and each upstream transport owns its own policy. |
@@ -71,9 +71,9 @@ stop the debate from being repeated.
 | [0018](0018-transaction-facts-status-and-broadcast.md) | Transaction facts, status, and broadcast | Transactions are parsed once, "not found" is a typed proof, and broadcast outcomes are typed. |
 | [0019](0019-explorer-plane.md) | Explorer plane | The Explorer is an optional runtime over canonical data with explicit freshness and typed privacy refusals. |
 | [0020](0020-materialized-views.md) | Materialized views | Explorer views are rebuildable projections with exact per-view schema admission and explicit coverage. |
-| [0021](0021-shared-configuration-sections.md) | Shared configuration sections | Shared configuration sections live in `zinder-runtime`, and each runtime composes only what it uses. |
-| [0022](0022-release-artifacts.md) | Release artifacts | Releases ship reproducible GNU/Linux binaries with signatures, provenance, and SBOMs. |
-| [0023](0023-deployment-profiles.md) | Deployment profiles | A profile coordinates what a deployment's writer stores and what its readers serve and require. `wallet` serves verified bytes from the node, `wallet-archive` retains bodies, and only the light-wallet composition forwards indexed reads. |
+| [0021](0021-shared-configuration-sections.md) | Shared configuration sections | Shared configuration sections live in `zinder-runtime` with zero-TOML `ZINDER_*` env-first loading, `storage.data_dir` derivation, sibling-section tolerance, and inline secret injection. |
+| [0022](0022-release-artifacts.md) | Release artifacts | Releases ship a single reproducible GNU/Linux `zinder` binary archive and single distroless OCI image with signatures, provenance, and SBOMs. |
+| [0023](0023-deployment-profiles.md) | Deployment profiles | Presets (`light-wallet`, `wallet`, `explorer`) plus orthogonal `--full-blocks` coordinate what Zinder's writers store and what its readers serve. |
 | [0024](0024-verified-edge-snapshot-bootstrap.md) | Verified edge snapshot bootstrap | Publisher signatures and validator attestation admit a private canonical checkpoint before it becomes a writer. |
 
 ## Earlier numbering

@@ -42,10 +42,11 @@ or wallet schema needs a new fixture, built by that release.
   `zstd`, and access to the fixture project.
 - Have the fixture's `fixture.json`.
 - Have Zinder release binaries for the release you will serve with. When the
-  fixture pins binaries in `verified_with_release.binaries`, use exactly that
-  set, for example from the archive its `executables` field names; the guest
-  refuses any other. Otherwise the `release-binaries` target of
-  `deploy/Dockerfile` produces them:
+  fixture pins binaries in `verified_with_release.binaries`, use matching
+  role executables (for unified `bin/zinder` releases, invoke via
+  `zinder run <role>` or extract workspace binaries matching the fixture
+  manifest); otherwise the `release-binaries` target of
+  `deploy/Dockerfile` produces the release binary artifact:
 
   ```bash
   docker buildx build -f deploy/Dockerfile --target release-binaries \
