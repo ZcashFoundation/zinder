@@ -1973,12 +1973,15 @@ impl PostgresSegmentedStorageReport {
     }
 
     fn validate_gates_and_resources(&self) -> Result<(), BenchError> {
-        let missing_samples = self.tip_follow.uncontended_commit_latencies_ms.sample_count == 0
-            || self.tip_follow.contended_commit_latencies_ms.sample_count == 0;
-        if self.adr0004_gate_evaluation.tip_commit_latency_under_2s == Some(true) && missing_samples
+        let uncontended = &self.tip_follow.uncontended_commit_latencies_ms;
+        let contended = &self.tip_follow.contended_commit_latencies_ms;
+        let missing_samples = uncontended.sample_count == 0 || contended.sample_count == 0;
+        let exceeded_threshold = uncontended.max_ms >= 2_000.0 || contended.max_ms >= 2_000.0;
+        if self.adr0004_gate_evaluation.tip_commit_latency_under_2s == Some(true)
+            && (missing_samples || exceeded_threshold)
         {
             return Err(BenchError::report_format(
-                "postgres-segmented tip_commit_latency_under_2s cannot be true when tip-commit samples are missing",
+                "postgres-segmented tip_commit_latency_under_2s cannot be true when tip-commit samples are missing or max_ms >= 2000 ms",
             ));
         }
         let rw = &self.reader_workload;
@@ -4845,6 +4848,39 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
         let missing_pooler_cpu =
             super::build_postgres_segmented_storage_report(sample_fixture_summary(), inputs);
         assert!(missing_pooler_cpu.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_segmented_validation_rejects_over_threshold_latency_claiming_pass()
+    -> Result<(), crate::BenchError> {
+        let mut over_contended = super::build_postgres_segmented_storage_report(
+            sample_fixture_summary(),
+            sample_postgres_segmented_inputs(),
+        );
+        over_contended.validate()?;
+        if let super::BenchmarkReport::PostgresSegmentedStorage(ref mut seg) = over_contended {
+            assert_eq!(
+                seg.adr0004_gate_evaluation.tip_commit_latency_under_2s,
+                Some(true)
+            );
+            seg.tip_follow.contended_commit_latencies_ms.max_ms = 2_500.0;
+        }
+        assert!(over_contended.validate().is_err());
+
+        let mut boundary_uncontended = super::build_postgres_segmented_storage_report(
+            sample_fixture_summary(),
+            sample_postgres_segmented_inputs(),
+        );
+        if let super::BenchmarkReport::PostgresSegmentedStorage(ref mut seg) = boundary_uncontended
+        {
+            assert_eq!(
+                seg.adr0004_gate_evaluation.tip_commit_latency_under_2s,
+                Some(true)
+            );
+            seg.tip_follow.uncontended_commit_latencies_ms.max_ms = 2_000.0;
+        }
+        assert!(boundary_uncontended.validate().is_err());
         Ok(())
     }
 

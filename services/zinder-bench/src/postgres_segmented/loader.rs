@@ -12,7 +12,7 @@ use zinder_core::wire::{
     encode_zinder_native_chain_name,
 };
 use zinder_core::{
-    BlockHash, BlockHeight, CanonicalBlockFactsDigestVersion,
+    BlockHash, BlockHeight, CanonicalBlockFactsDigest, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion, Network,
     NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootArtifact,
     encode_canonical_block_replay,
@@ -137,6 +137,27 @@ pub struct StreamingPrepareState {
     pub last_block_meta: Option<(BlockHeight, BlockHash, BlockHash)>,
 }
 
+struct BlockingPreparedBlock {
+    prepared: PreparedSegmentedBlock,
+    next_tree_sizes: CommitmentTreeSizes,
+    facts_digest: CanonicalBlockFactsDigest,
+}
+
+fn prepare_block_for_state(
+    source_block: &SourceBlock,
+    activations: &NetworkUpgradeActivations,
+    mut tree_sizes: CommitmentTreeSizes,
+    full_blocks: bool,
+) -> Result<BlockingPreparedBlock, BenchError> {
+    let prepared = prepare_single_block(source_block, activations, &mut tree_sizes, full_blocks)?;
+    let facts_digest = prepared.facts.digest(CanonicalBlockFactsDigestVersion::V1);
+    Ok(BlockingPreparedBlock {
+        prepared,
+        next_tree_sizes: tree_sizes,
+        facts_digest,
+    })
+}
+
 impl StreamingPrepareState {
     /// Initializes an empty accumulator rooted at `first_height`.
     #[must_use]
@@ -169,31 +190,56 @@ impl StreamingPrepareState {
         &mut self,
         source_block: &SourceBlock,
     ) -> Result<PreparedSegmentedBlock, BenchError> {
-        let prepared = prepare_single_block(
+        let outcome = prepare_block_for_state(
             source_block,
             &self.activations,
-            &mut self.tree_sizes,
+            self.tree_sizes,
             self.full_blocks,
         )?;
+        self.apply_prepared_block(outcome)
+    }
+
+    /// Prepares one [`SourceBlock`] on a dedicated blocking worker thread and applies sequential
+    /// state updates back onto `self`, keeping Tokio async workers responsive for reader tasks.
+    pub async fn prepare_source_block_blocking(
+        &mut self,
+        source_block: SourceBlock,
+    ) -> Result<PreparedSegmentedBlock, BenchError> {
+        let activations = self.activations.clone();
+        let tree_sizes = self.tree_sizes;
+        let full_blocks = self.full_blocks;
+        let outcome = tokio::task::spawn_blocking(move || {
+            prepare_block_for_state(&source_block, &activations, tree_sizes, full_blocks)
+        })
+        .await
+        .map_err(|err| candidate_error(format!("tip block preparation worker failed: {err}")))??;
+        self.apply_prepared_block(outcome)
+    }
+
+    fn apply_prepared_block(
+        &mut self,
+        outcome: BlockingPreparedBlock,
+    ) -> Result<PreparedSegmentedBlock, BenchError> {
         self.sequence_builder
-            .try_append(prepared.facts.digest(CanonicalBlockFactsDigestVersion::V1))
+            .try_append(outcome.facts_digest)
             .map_err(|err| candidate_error(format!("sequence builder append: {err}")))?;
+        self.tree_sizes = outcome.next_tree_sizes;
         self.total_tx_count = self
             .total_tx_count
-            .saturating_add(u64::try_from(prepared.facts.transactions.len()).unwrap_or(0));
-        if should_checkpoint_height(self.first_height, prepared.height) {
+            .saturating_add(u64::try_from(outcome.prepared.facts.transactions.len()).unwrap_or(0));
+        if should_checkpoint_height(self.first_height, outcome.prepared.height) {
             self.total_checkpoint_count = self.total_checkpoint_count.saturating_add(1);
         }
         let meta = (
-            prepared.height,
-            prepared.block_hash,
-            prepared.previous_block_hash,
+            outcome.prepared.height,
+            outcome.prepared.block_hash,
+            outcome.prepared.previous_block_hash,
         );
         if self.first_block_meta.is_none() {
             self.first_block_meta = Some(meta);
         }
         self.last_block_meta = Some(meta);
-        Ok(prepared)
+        Ok(outcome.prepared)
     }
 }
 
@@ -1851,4 +1897,115 @@ async fn apply_sealed_tail_transition_in_txn(
     .await
     .map_err(|err| postgres_error("updating settled_tip_height", &err))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zinder_core::{CanonicalBlockFactsDigestVersion, Network};
+    use zinder_testkit::sample_regtest_upgrade_activations;
+
+    const REGTEST_BLOCK_1: &str =
+        include_str!("../../../zinder-ingest/tests/fixtures/z3-regtest-block-1.json");
+    const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
+    const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
+    const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
+
+    fn build_two_regtest_blocks() -> Result<Vec<SourceBlock>, BenchError> {
+        let fixture: serde_json::Value = serde_json::from_str(REGTEST_BLOCK_1)
+            .map_err(|err| candidate_error(format!("parse fixture json: {err}")))?;
+        let raw_hex = fixture
+            .get("raw_block_hex")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| candidate_error("missing raw_block_hex"))?;
+        let base_bytes = hex::decode(raw_hex)
+            .map_err(|err| candidate_error(format!("decode raw_block_hex: {err}")))?;
+
+        let mut parent_hash = Network::ZcashRegtest.genesis_hash();
+        let mut blocks = Vec::with_capacity(2);
+        for height_num in 1_u32..=2 {
+            let mut block_bytes = base_bytes.clone();
+            let header_slice = block_bytes
+                .get_mut(SERIALIZED_HEADER_PARENT_OFFSET..SERIALIZED_HEADER_PARENT_END)
+                .ok_or_else(|| candidate_error("fixture block header shorter than expected"))?;
+            header_slice.copy_from_slice(&parent_hash.as_bytes());
+            let opcode_slot = block_bytes
+                .get_mut(COINBASE_HEIGHT_OPCODE_OFFSET)
+                .ok_or_else(|| candidate_error("fixture coinbase height opcode out of bounds"))?;
+            *opcode_slot = 0x50_u8.saturating_add(u8::try_from(height_num).unwrap_or(0));
+            let source_block = SourceBlock::from_raw_block_bytes(
+                Network::ZcashRegtest,
+                BlockHeight::new(height_num),
+                block_bytes,
+            )
+            .map_err(|err| candidate_error(format!("from_raw_block_bytes: {err}")))?;
+            parent_hash = source_block.hash;
+            blocks.push(source_block);
+        }
+        Ok(blocks)
+    }
+
+    #[tokio::test]
+    async fn prepare_source_block_blocking_matches_sync_state_and_output() -> Result<(), BenchError>
+    {
+        let activations = sample_regtest_upgrade_activations();
+        let blocks = build_two_regtest_blocks()?;
+        let first_height = BlockHeight::new(1);
+
+        let mut sync_state = StreamingPrepareState::new(activations.clone(), true, first_height);
+        let mut blocking_state = StreamingPrepareState::new(activations, true, first_height);
+
+        for source_block in blocks {
+            let sync_prepared = sync_state.prepare_source_block(&source_block)?;
+            let blocking_prepared = blocking_state
+                .prepare_source_block_blocking(source_block)
+                .await?;
+
+            assert_eq!(sync_prepared.height, blocking_prepared.height);
+            assert_eq!(sync_prepared.block_hash, blocking_prepared.block_hash);
+            assert_eq!(
+                sync_prepared.previous_block_hash,
+                blocking_prepared.previous_block_hash
+            );
+            assert_eq!(
+                sync_prepared.compact_block_proto_len,
+                blocking_prepared.compact_block_proto_len
+            );
+            assert_eq!(
+                sync_prepared.compact_block_bytes,
+                blocking_prepared.compact_block_bytes
+            );
+            assert_eq!(
+                sync_prepared
+                    .facts
+                    .digest(CanonicalBlockFactsDigestVersion::V1),
+                blocking_prepared
+                    .facts
+                    .digest(CanonicalBlockFactsDigestVersion::V1)
+            );
+            assert_eq!(
+                sync_prepared.canonical_facts_bytes,
+                blocking_prepared.canonical_facts_bytes
+            );
+            assert_eq!(
+                sync_prepared.raw_block_bytes,
+                blocking_prepared.raw_block_bytes
+            );
+            assert_eq!(sync_prepared.raw_tx_slices, blocking_prepared.raw_tx_slices);
+        }
+
+        assert_eq!(sync_state.tree_sizes, blocking_state.tree_sizes);
+        assert_eq!(sync_state.total_tx_count, blocking_state.total_tx_count);
+        assert_eq!(
+            sync_state.total_checkpoint_count,
+            blocking_state.total_checkpoint_count
+        );
+        assert_eq!(sync_state.first_block_meta, blocking_state.first_block_meta);
+        assert_eq!(sync_state.last_block_meta, blocking_state.last_block_meta);
+        assert_eq!(
+            sync_state.sequence_builder.finish(),
+            blocking_state.sequence_builder.finish()
+        );
+        Ok(())
+    }
 }

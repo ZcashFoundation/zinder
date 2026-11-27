@@ -71,7 +71,7 @@ validate_segmented_report() {
     and (.tip_follow.contended_commit_latencies_ms.sample_count | type == "number" and . >= 0)
     and (.tip_follow.uncontended_commit_latencies_ms.max_ms | type == "number" and . >= 0)
     and (.tip_follow.contended_commit_latencies_ms.max_ms | type == "number" and . >= 0)
-    and (if .adr0004_gate_evaluation.tip_commit_latency_under_2s == true then .tip_follow.uncontended_commit_latencies_ms.sample_count > 0 and .tip_follow.contended_commit_latencies_ms.sample_count > 0 else true end)
+    and (if .adr0004_gate_evaluation.tip_commit_latency_under_2s == true then .tip_follow.uncontended_commit_latencies_ms.sample_count > 0 and .tip_follow.contended_commit_latencies_ms.sample_count > 0 and .tip_follow.uncontended_commit_latencies_ms.max_ms < 2000 and .tip_follow.contended_commit_latencies_ms.max_ms < 2000 else true end)
     and (if .configuration.concurrent_readers > 0 then .reader_workload.ready_workers == .configuration.concurrent_readers and .reader_workload.overlapping_workers == .configuration.concurrent_readers and .reader_workload.completed_transactions > 0 and .reader_workload.per_reader_blocks_per_second_mean > 0 else true end)
     and (if .adr0004_gate_evaluation.build_time_ratio_vs_rocksdb != null or .adr0004_gate_evaluation.build_time_gate_passed != null then .configuration.tip_follow_block_count == 0 and .configuration.bulk_block_count == .configuration.total_block_count else true end)
     and (

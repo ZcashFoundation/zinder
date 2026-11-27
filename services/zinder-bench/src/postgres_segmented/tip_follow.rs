@@ -191,7 +191,10 @@ impl TipFollowState {
                 .map_err(|err| {
                     candidate_error(format!("fetching tip block {height_val}: {err}"))
                 })?;
-            let block = target.prepare_state.prepare_source_block(&source_block)?;
+            let block = target
+                .prepare_state
+                .prepare_source_block_blocking(source_block)
+                .await?;
             self.extra_prepare_duration += prep_started.elapsed();
 
             let commit_ms = self

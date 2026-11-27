@@ -219,6 +219,7 @@ fn seal_recursive_with_cap(
         bundles.push(candidate_bundle);
         return Ok(());
     }
+    drop(candidate_bundle);
     if slice.len() <= 1 {
         let block_height = slice.first().map_or(0, |b| b.height.value());
         return Err(candidate_error(format!(
