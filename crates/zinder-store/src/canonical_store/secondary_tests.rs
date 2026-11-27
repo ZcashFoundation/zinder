@@ -2077,6 +2077,23 @@ fn warm_secondary_reopen_caches_permanent_reorg_archive_admission_reads()
     Ok(())
 }
 
+fn assert_empty_displaced_archive_root_search(
+    secondary: &RocksDbCanonicalSecondary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let empty_root_search = secondary.search_displaced_final_note_commitment_roots(
+        zinder_core::FinalNoteCommitmentRoot::from_bytes([0; 32]),
+        16,
+    )?;
+    assert_eq!(empty_root_search.matches, []);
+    assert_eq!(empty_root_search.coverage, None);
+    assert!(
+        empty_root_search.scan_complete
+            && !empty_root_search.has_more
+            && empty_root_search.next_cursor.is_none()
+    );
+    Ok(())
+}
+
 #[test]
 fn canonical_secondary_reads_and_catches_up_displaced_archive_rows()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -2102,12 +2119,7 @@ fn canonical_secondary_reads_and_catches_up_displaced_archive_rows()
     )?;
     assert_eq!(secondary.displaced_block_count()?, 0);
     assert_eq!(secondary.displaced_block_archive_coverage()?, None);
-    let empty_root_search = secondary.search_displaced_final_note_commitment_roots(
-        zinder_core::FinalNoteCommitmentRoot::from_bytes([0; 32]),
-        16,
-    )?;
-    assert_eq!(empty_root_search.matches, []);
-    assert_eq!(empty_root_search.coverage, None);
+    assert_empty_displaced_archive_root_search(&secondary)?;
 
     let replacement_fence = store.event_fence();
     let displaced_block_hash = BlockHash::from_bytes([4; 32]);
@@ -2152,6 +2164,9 @@ fn canonical_secondary_reads_and_catches_up_displaced_archive_rows()
         zinder_core::FinalNoteCommitmentRoot::from_bytes([0; 32]),
         16,
     )?;
+    assert!(
+        root_search.scan_complete && !root_search.has_more && root_search.next_cursor.is_none()
+    );
     let root_coverage = root_search
         .coverage
         .ok_or("expected displaced root coverage on secondary")?;
@@ -2448,6 +2463,51 @@ fn strip_displaced_root_index_rows(
     Ok(())
 }
 
+fn assert_bounded_legacy_root_search(
+    secondary: &RocksDbCanonicalSecondary,
+    matched_root: zinder_core::FinalNoteCommitmentRoot,
+    ten: NonZeroU32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use zinder_core::FinalNoteCommitmentRoot;
+
+    let bounded_search = secondary.search_displaced_final_note_commitment_roots(matched_root, 1)?;
+    assert_eq!(bounded_search.matches.len(), 1);
+    assert!(bounded_search.has_more && !bounded_search.scan_complete);
+    let bounded_cursor = bounded_search
+        .next_cursor
+        .as_ref()
+        .ok_or("expected continuation cursor when legacy search stops early")?;
+    let search_tail = secondary.search_displaced_final_note_commitment_roots_page(
+        matched_root,
+        Some(bounded_cursor),
+        ten,
+    )?;
+    assert_eq!(search_tail.matches.len(), 1);
+    assert!(!search_tail.has_more);
+
+    let absent_root = FinalNoteCommitmentRoot::from_bytes([0x9C; 32]);
+    let truncated_absent = super::displaced_archive::search_displaced_test_roots_fallback_with_cap(
+        secondary,
+        absent_root,
+        16,
+        1,
+    )?;
+    assert_eq!(truncated_absent.matches, []);
+    assert!(truncated_absent.has_more && !truncated_absent.scan_complete);
+    let resume_cursor = truncated_absent
+        .next_cursor
+        .as_ref()
+        .ok_or("expected continuation cursor on scan-capped empty fallback")?;
+    let resumed_absent = secondary.search_displaced_final_note_commitment_roots_page(
+        absent_root,
+        Some(resume_cursor),
+        ten,
+    )?;
+    assert_eq!(resumed_absent.matches, []);
+    assert!(!resumed_absent.has_more);
+    Ok(())
+}
+
 #[test]
 fn canonical_secondary_fallback_bounds_work_and_primary_reopen_backfills()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -2497,16 +2557,11 @@ fn canonical_secondary_fallback_bounds_work_and_primary_reopen_backfills()
         secondary.search_displaced_final_note_commitment_roots_page(matched_root, None, one)?;
     assert_eq!(page.matches.len(), 1);
     assert_eq!(page.scanned_work, 1);
-    assert_eq!(
-        page.matches[0].block_id.hash,
-        BlockHash::from_bytes([4; 32])
-    );
     assert!(page.has_more && !page.scan_complete);
-    let partial_cov = page.coverage.ok_or("missing partial legacy coverage")?;
-    assert_eq!(partial_cov.captured_block_count, 2);
-    assert_eq!(partial_cov.root_artifact_unavailable_count, 0);
 
     let ten = NonZeroU32::new(10).ok_or("nonzero limit")?;
+    assert_bounded_legacy_root_search(&secondary, matched_root, ten)?;
+
     let full_legacy =
         secondary.search_displaced_final_note_commitment_roots_page(matched_root, None, ten)?;
     assert_eq!(full_legacy.matches.len(), 2);

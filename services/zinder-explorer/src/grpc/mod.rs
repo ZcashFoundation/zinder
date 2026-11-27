@@ -2,6 +2,7 @@
 
 mod adapter;
 mod block_activity;
+mod block_paid_fees;
 mod block_production;
 mod block_transactions;
 mod block_view;

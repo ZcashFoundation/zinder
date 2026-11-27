@@ -95,7 +95,7 @@ where
     .map_err(|error| ExplorerError::internal(format!("canonical read task failed: {error}")))?
 }
 
-fn maybe_catch_up_for_epoch(
+pub(crate) fn maybe_catch_up_for_epoch(
     store: &SharedCanonicalSecondary,
     at_epoch_id: Option<u64>,
 ) -> Result<(), Status> {
@@ -116,7 +116,7 @@ fn maybe_catch_up_for_epoch(
     Ok(())
 }
 
-fn resolve_locked_canonical_epoch(
+pub(crate) fn resolve_locked_canonical_epoch(
     secondary: &RocksDbCanonicalSecondary,
     at_epoch_id: Option<u64>,
 ) -> Result<ChainEpoch, Status> {

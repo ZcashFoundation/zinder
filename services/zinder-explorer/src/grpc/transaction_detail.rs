@@ -122,6 +122,7 @@ fn transaction_detail_response(
     chain_epoch: wallet::ChainEpoch,
     location: wire_location::Location,
 ) -> Result<TransactionDetailResponse, Status> {
+    let is_mined = matches!(location, wire_location::Location::Mined(_));
     let transaction =
         resolve_facts_and_location(network_upgrade_activations, transaction_id, location)?;
 
@@ -154,9 +155,9 @@ fn transaction_detail_response(
         prevout_resolution_status,
         transparent_inputs: transparent_rows.inputs,
         transparent_outputs: transparent_rows.outputs,
-        intrinsic_value_balances: Some(encode_intrinsic_value_balances(
-            transaction.fact_set.intrinsic_value_balances,
-        )),
+        intrinsic_value_balances: is_mined.then(|| {
+            encode_intrinsic_value_balances(transaction.fact_set.intrinsic_value_balances)
+        }),
     })
 }
 
@@ -758,6 +759,41 @@ mod tests {
         let mut bytes = [0xC3; 32];
         bytes[..4].copy_from_slice(&height.to_be_bytes());
         BlockHash::from_bytes(bytes)
+    }
+
+    #[test]
+    fn mempool_detail_omits_intrinsic_value_balances() -> eyre::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let materialized_view_store = open_spend_view_store(tempdir.path())?;
+        let payload_bytes = transparent_transaction_bytes();
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let parsed =
+            zinder_source::parse_transaction_public_fact_set(&payload_bytes, None, &activations)?;
+        let transaction_id = parsed.public_facts.transaction_id;
+
+        let mempool_response = transaction_detail_response(
+            Some(&materialized_view_store),
+            &activations,
+            transaction_id,
+            chain_epoch_message(chain_epoch_at(2)),
+            wire_location::Location::InMempool(wallet::MempoolEntry {
+                raw_transaction_bytes: payload_bytes,
+                first_seen_unix_millis: 1_700_000_000_000,
+                ..Default::default()
+            }),
+        )?;
+        assert!(mempool_response.intrinsic_value_balances.is_none());
+
+        let (mined_txid, mined_loc) = mined_transparent_location()?;
+        let mined_response = transaction_detail_response(
+            Some(&materialized_view_store),
+            &activations,
+            mined_txid,
+            chain_epoch_message(chain_epoch_at(2)),
+            mined_loc,
+        )?;
+        assert!(mined_response.intrinsic_value_balances.is_some());
+        Ok(())
     }
 
     #[test]

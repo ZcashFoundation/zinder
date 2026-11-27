@@ -462,6 +462,14 @@ pub struct DisplacedFinalRootSearch {
     pub matches: Vec<DisplacedRootCandidate>,
     /// Coverage across all displaced blocks archived at or after activation.
     pub coverage: Option<DisplacedRootArchiveCoverage>,
+    /// True when the result reflects complete inspection of the active archive
+    /// without truncating an unindexed fallback scan at the bounded work limit.
+    pub scan_complete: bool,
+    /// Whether additional matching or uninspected archive entries remain beyond this result.
+    pub has_more: bool,
+    /// Cursor for continuing strictly older than this result with
+    /// `search_displaced_final_note_commitment_roots_page`.
+    pub next_cursor: Option<DisplacedRootCursor>,
 }
 
 /// Bounded newest-first page of displaced final-root candidates.
@@ -877,57 +885,72 @@ fn search_displaced_roots(
     root: FinalNoteCommitmentRoot,
     max_matches: usize,
 ) -> Result<DisplacedFinalRootSearch, CanonicalStoreError> {
+    let bounded = max_matches.min(MAX_PUBLIC_PAGE_LIMIT as usize);
     if let Some(unavailable_count) = read_root_unavailable_count_optional(store)? {
         let Some(state) = read_archive_state(store)? else {
             return Err(CanonicalStoreError::displaced_archive(
                 "archive root-unavailable state exists without version-1 archive state",
             ));
         };
-        let bounded = max_matches.min(MAX_PUBLIC_PAGE_LIMIT as usize);
-        let matches = if bounded == 0 {
-            Vec::new()
-        } else {
-            search_displaced_roots_indexed(
-                store,
-                state,
-                unavailable_count,
-                RootSearchQuery {
-                    root,
-                    after: None,
-                    limit: bounded,
-                },
-            )?
-            .matches
-        };
+        let page = search_displaced_roots_indexed(
+            store,
+            state,
+            unavailable_count,
+            RootSearchQuery {
+                root,
+                after: None,
+                limit: bounded,
+            },
+        )?;
+        let next_cursor = if bounded == 0 { None } else { page.next_cursor };
         return Ok(DisplacedFinalRootSearch {
-            matches,
-            coverage: Some(DisplacedRootArchiveCoverage {
-                activation_event_sequence: state.coverage.activation_event_sequence,
-                activation_epoch: state.coverage.activation_epoch,
-                activated_at: state.coverage.activated_at,
-                captured_block_count: state.block_count,
-                root_artifact_unavailable_count: unavailable_count,
-            }),
+            matches: page.matches,
+            coverage: page.coverage,
+            scan_complete: page.scan_complete,
+            has_more: page.has_more,
+            next_cursor,
         });
     }
     let Some(state) = read_archive_state(store)? else {
         return Ok(DisplacedFinalRootSearch {
             matches: Vec::new(),
             coverage: None,
+            scan_complete: true,
+            has_more: false,
+            next_cursor: None,
         });
     };
-    let page = search_displaced_roots_fallback(
+    if bounded == 0 {
+        return Ok(DisplacedFinalRootSearch {
+            matches: Vec::new(),
+            coverage: Some(DisplacedRootArchiveCoverage {
+                activation_event_sequence: state.coverage.activation_event_sequence,
+                activation_epoch: state.coverage.activation_epoch,
+                activated_at: state.coverage.activated_at,
+                captured_block_count: state.block_count,
+                root_artifact_unavailable_count: 0,
+            }),
+            scan_complete: false,
+            has_more: true,
+            next_cursor: None,
+        });
+    }
+    let page = search_displaced_roots_fallback_with_cap(
         store,
         state,
         RootSearchQuery {
             root,
             after: None,
-            limit: max_matches.min(MAX_PUBLIC_PAGE_LIMIT as usize),
+            limit: bounded,
         },
+        MAX_PUBLIC_PAGE_LIMIT as usize,
     )?;
     Ok(DisplacedFinalRootSearch {
         matches: page.matches,
         coverage: page.coverage,
+        scan_complete: page.scan_complete,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
     })
 }
 
@@ -1049,6 +1072,15 @@ fn search_displaced_roots_fallback(
     state: ArchiveState,
     query: RootSearchQuery<'_>,
 ) -> Result<DisplacedFinalRootPage, CanonicalStoreError> {
+    search_displaced_roots_fallback_with_cap(store, state, query, MAX_PUBLIC_PAGE_LIMIT as usize)
+}
+
+fn search_displaced_roots_fallback_with_cap(
+    store: &impl DisplacedArchiveRead,
+    state: ArchiveState,
+    query: RootSearchQuery<'_>,
+    max_scanned_blocks: usize,
+) -> Result<DisplacedFinalRootPage, CanonicalStoreError> {
     let family = archive_family(store)?;
     let mut options = ReadOptions::default();
     options.fill_cache(false);
@@ -1065,10 +1097,7 @@ fn search_displaced_roots_fallback(
         (&mut unavailable_in_scanned, &mut matches),
     )?;
 
-    while rows.valid()
-        && matches.len() < lookahead
-        && blocks_scanned < MAX_PUBLIC_PAGE_LIMIT as usize
-    {
+    while rows.valid() && matches.len() < lookahead && blocks_scanned < max_scanned_blocks {
         let Some((key, encoded_record)) = rows.item() else {
             break;
         };
@@ -3029,6 +3058,41 @@ fn read_existing_test_archive(
         }
     }
     Ok((contexts, records, all_keys))
+}
+
+#[cfg(test)]
+pub(super) fn search_displaced_test_roots_fallback_with_cap(
+    secondary: &RocksDbCanonicalSecondary,
+    root: FinalNoteCommitmentRoot,
+    max_matches: usize,
+    max_scanned_blocks: usize,
+) -> Result<DisplacedFinalRootSearch, CanonicalStoreError> {
+    let Some(state) = read_archive_state(secondary)? else {
+        return Ok(DisplacedFinalRootSearch {
+            matches: Vec::new(),
+            coverage: None,
+            scan_complete: true,
+            has_more: false,
+            next_cursor: None,
+        });
+    };
+    let page = search_displaced_roots_fallback_with_cap(
+        secondary,
+        state,
+        RootSearchQuery {
+            root,
+            after: None,
+            limit: max_matches.min(MAX_PUBLIC_PAGE_LIMIT as usize),
+        },
+        max_scanned_blocks,
+    )?;
+    Ok(DisplacedFinalRootSearch {
+        matches: page.matches,
+        coverage: page.coverage,
+        scan_complete: page.scan_complete,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+    })
 }
 
 #[cfg(test)]

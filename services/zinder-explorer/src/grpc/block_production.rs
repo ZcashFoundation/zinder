@@ -1,10 +1,10 @@
 //! `ExplorerQuery.BlockProductionSeries` and `BlockProductionInTimeRange` handlers.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{collections::BTreeMap, sync::Arc};
 
 use tonic::{Request, Response, Status};
 use zinder_core::{
-    BlockHash, BlockHeight, CanonicalBlockFacts, ChainEpoch, TransactionId, TransparentOutPoint,
+    BlockHash, BlockHeight, ChainEpoch,
     wire::{
         decode_height_key_ascending, decode_internal_block_hash, encode_height_key_ascending,
         encode_internal_block_hash, encode_rpc_block_hash_hex,
@@ -24,15 +24,15 @@ use zinder_proto::v1::{
         BlockProductionInTimeRangeRequest, BlockProductionInTimeRangeResponse,
         BlockProductionPoint, BlockProductionSeriesRequest, BlockProductionSeriesResponse,
         BlockProductionTimeRangeCoverage, BlockProductionTimeRangeReadFence, BlockSummary,
-        CoinbaseTransactionSummary,
     },
     wallet::BlockTip,
 };
-use zinder_store::{RocksDbCanonicalSecondary, chain_epoch_message};
+use zinder_store::chain_epoch_message;
 
+use super::block_paid_fees::{FeeHydrationBudget, hydrate_coinbase_and_paid_fees_with_budget};
 use super::canonical_read::{
-    CanonicalReplayVisitError, SharedCanonicalSecondary, encode_coinbase_summary,
-    internal_canonical_error, join_block_summary_with_header, read_with_pinned_canonical_epoch,
+    SharedCanonicalSecondary, internal_canonical_error, join_block_summary_with_header,
+    maybe_catch_up_for_epoch, resolve_locked_canonical_epoch,
 };
 use super::clamp_max_entries;
 use super::error::ExplorerError;
@@ -64,15 +64,20 @@ pub(crate) async fn query_block_production_series(
     let start_height = inner.start_height;
     let end_height = inner.end_height;
 
+    let canonical_store = Arc::clone(context.canonical_store);
     let mv_store = context.materialized_view_store.clone();
-    let (epoch, points) = read_with_pinned_canonical_epoch(
-        context.canonical_store,
-        inner.at_epoch_id,
-        move |secondary, epoch| {
-            read_block_production_series_sync(secondary, &mv_store, epoch, start_height, end_height)
-        },
-    )
-    .await?;
+    let at_epoch_id = inner.at_epoch_id;
+    let (epoch, points) = tokio::task::spawn_blocking(move || {
+        read_block_production_series_sync(
+            &canonical_store,
+            &mv_store,
+            at_epoch_id,
+            start_height,
+            end_height,
+        )
+    })
+    .await
+    .map_err(|error| ExplorerError::internal(format!("canonical read task failed: {error}")))??;
 
     let covered_block_count = u32::try_from(points.len())
         .map_err(|_| ExplorerError::internal("block-production series point count exceeds u32"))?;
@@ -121,23 +126,21 @@ pub(crate) async fn query_block_production_in_time_range(
     let decoded_cursor = decode_time_cursor(&inner.from_cursor, start_time, end_time)?;
     let pinned_epoch_id = resolve_time_range_epoch_id(decoded_cursor.as_ref(), inner.at_epoch_id)?;
 
+    let canonical_store = Arc::clone(context.canonical_store);
     let mv_store = context.materialized_view_store.clone();
-    let page_outcome = read_with_pinned_canonical_epoch(
-        context.canonical_store,
-        pinned_epoch_id,
-        move |secondary, epoch| {
-            read_block_production_in_time_range_sync(TimeRangeReadParams {
-                secondary,
-                mv_store: &mv_store,
-                epoch,
-                start_time,
-                end_time,
-                max_entries,
-                cursor: decoded_cursor.as_ref(),
-            })
-        },
-    )
-    .await?;
+    let page_outcome = tokio::task::spawn_blocking(move || {
+        read_block_production_in_time_range_sync(TimeRangeReadParams {
+            canonical_store: &canonical_store,
+            mv_store: &mv_store,
+            at_epoch_id: pinned_epoch_id,
+            start_time,
+            end_time,
+            max_entries,
+            cursor: decoded_cursor.as_ref(),
+        })
+    })
+    .await
+    .map_err(|error| ExplorerError::internal(format!("canonical read task failed: {error}")))??;
 
     let freshness = attach_upstream_observation(
         context.upstream_observation_cache,
@@ -183,23 +186,63 @@ fn validate_block_production_series_range(
 }
 
 fn read_block_production_series_sync(
-    secondary: &RocksDbCanonicalSecondary,
+    canonical_store: &SharedCanonicalSecondary,
     mv_store: &MaterializedViewStore,
-    epoch: ChainEpoch,
+    at_epoch_id: Option<u64>,
     start_height: u32,
     end_height: u32,
 ) -> Result<(ChainEpoch, Vec<BlockProductionPoint>), Status> {
+    let (epoch, mut matched) = read_series_candidates(
+        canonical_store,
+        mv_store,
+        at_epoch_id,
+        start_height,
+        end_height,
+    )?;
+    let mut budget = FeeHydrationBudget::default();
+    let coinbases = hydrate_coinbase_and_paid_fees_with_budget(
+        canonical_store,
+        epoch,
+        &mut matched,
+        &mut budget,
+    )?;
+    let points = matched
+        .into_iter()
+        .zip(coinbases)
+        .map(|((_, _, bits, summary), coinbase)| BlockProductionPoint {
+            summary: Some(summary),
+            bits,
+            coinbase,
+        })
+        .collect();
+    Ok((epoch, points))
+}
+
+type MatchedBlockRow = (BlockHeight, BlockHash, u32, BlockSummary);
+
+fn read_series_candidates(
+    canonical_store: &SharedCanonicalSecondary,
+    mv_store: &MaterializedViewStore,
+    at_epoch_id: Option<u64>,
+    start_height: u32,
+    end_height: u32,
+) -> Result<(ChainEpoch, Vec<MatchedBlockRow>), Status> {
+    maybe_catch_up_for_epoch(canonical_store, at_epoch_id)?;
+    let guard = canonical_store.read();
+    let epoch = resolve_locked_canonical_epoch(&guard, at_epoch_id)?;
     let visible_tip = epoch.visible_tip_height.value();
     let clamped_end = end_height.min(visible_tip);
     if start_height > clamped_end {
+        drop(guard);
         return Ok((epoch, Vec::new()));
     }
     let heights: Vec<BlockHeight> = (start_height..=clamped_end).map(BlockHeight::new).collect();
-    let headers = secondary
+    let headers = guard
         .block_headers_at(&heights)
         .map_err(internal_canonical_error)?;
-    let mv_payloads = read_mv_summary_payloads_in_range(mv_store, start_height, clamped_end)?;
+    drop(guard);
 
+    let mv_payloads = read_mv_summary_payloads_in_range(mv_store, start_height, clamped_end)?;
     let mut matched = Vec::with_capacity(heights.len());
     for (height, maybe_header) in heights.into_iter().zip(headers) {
         let Some(header) = maybe_header else {
@@ -213,18 +256,7 @@ fn read_block_production_series_sync(
         };
         matched.push((height, header.block_hash, header.bits, summary));
     }
-
-    let coinbases = hydrate_coinbase_and_paid_fees(secondary, &mut matched)?;
-    let points = matched
-        .into_iter()
-        .zip(coinbases)
-        .map(|((_, _, bits, summary), coinbase)| BlockProductionPoint {
-            summary: Some(summary),
-            bits,
-            coinbase,
-        })
-        .collect();
-    Ok((epoch, points))
+    Ok((epoch, matched))
 }
 
 fn read_mv_summary_payloads_in_range(
@@ -251,209 +283,11 @@ fn read_mv_summary_payloads_in_range(
     Ok(payloads)
 }
 
-struct TxFeeInputs {
-    spent_outpoints: Vec<TransparentOutPoint>,
-    transparent_output_sum_zat: u64,
-    shielded_net_to_transparent_zat: i128,
-}
-
-struct BlockFeeInputs {
-    intra_block_outputs: HashMap<TransparentOutPoint, u64>,
-    non_coinbase_txs: Vec<TxFeeInputs>,
-}
-
-fn hydrate_coinbase_and_paid_fees(
-    secondary: &RocksDbCanonicalSecondary,
-    matched: &mut [(BlockHeight, BlockHash, u32, BlockSummary)],
-) -> Result<Vec<Option<CoinbaseTransactionSummary>>, Status> {
-    if matched.is_empty() {
-        return Ok(Vec::new());
-    }
-    let heights: Vec<BlockHeight> = matched.iter().map(|(height, _, _, _)| *height).collect();
-    let mut coinbases = vec![None; matched.len()];
-    let mut block_fee_inputs: Vec<Option<BlockFeeInputs>> = Vec::with_capacity(matched.len());
-    block_fee_inputs.resize_with(matched.len(), || None);
-    let mut needed_external_txids = HashSet::new();
-    let mut needed_external_outpoints = HashSet::new();
-    secondary
-        .visit_block_replay_facts_at_heights(&heights, |idx, maybe_facts| {
-            let Some(facts) = maybe_facts else {
-                return Ok(());
-            };
-            let Some((_, expected_hash, _, _)) = matched.get(idx) else {
-                return Err(Status::from(ExplorerError::internal(
-                    "replay height index out of bounds",
-                ))
-                .into());
-            };
-            if facts.block_header.block_hash != *expected_hash {
-                return Err(Status::from(ExplorerError::unsatisfied_precondition(
-                    "canonical replay block hash disagrees with canonical header",
-                ))
-                .into());
-            }
-            coinbases[idx] = encode_coinbase_summary(&facts)?;
-            block_fee_inputs[idx] = collect_block_fee_inputs(
-                &facts,
-                &mut needed_external_txids,
-                &mut needed_external_outpoints,
-            );
-            Ok::<(), CanonicalReplayVisitError>(())
-        })
-        .map_err(Status::from)?;
-    let external_prevouts = resolve_external_prevout_values(
-        secondary,
-        &needed_external_txids,
-        &needed_external_outpoints,
-    )?;
-    for ((_, _, _, summary), fee_inputs) in matched.iter_mut().zip(block_fee_inputs) {
-        summary.paid_fees_collected_zat = fee_inputs
-            .as_ref()
-            .and_then(|inputs| compute_block_paid_fees(inputs, &external_prevouts));
-    }
-    Ok(coinbases)
-}
-
-fn collect_block_fee_inputs(
-    facts: &CanonicalBlockFacts,
-    needed_external_txids: &mut HashSet<TransactionId>,
-    needed_external_outpoints: &mut HashSet<TransparentOutPoint>,
-) -> Option<BlockFeeInputs> {
-    let mut intra_block_outputs = HashMap::new();
-    let mut non_coinbase_txs = Vec::new();
-    let mut local_external_txids = Vec::new();
-    let mut local_external_outpoints = Vec::new();
-    for transaction in &facts.transactions {
-        let txid = transaction.public_facts.transaction_id;
-        if !transaction.public_facts.is_coinbase {
-            if !transaction.public_facts.version.is_supported()
-                || !transaction.public_facts.unsupported_sections.is_empty()
-            {
-                return None;
-            }
-            let mut output_sum_zat = 0_u64;
-            for output in &transaction.transparent_outputs {
-                output_sum_zat = output_sum_zat.checked_add(output.value_zat)?;
-            }
-            let mut spent_outpoints = Vec::with_capacity(transaction.transparent_inputs.len());
-            for input in &transaction.transparent_inputs {
-                if input.spent_outpoint == TransparentOutPoint::COINBASE_SENTINEL {
-                    return None;
-                }
-                if !intra_block_outputs.contains_key(&input.spent_outpoint) {
-                    local_external_txids.push(input.spent_outpoint.transaction_id);
-                    local_external_outpoints.push(input.spent_outpoint);
-                }
-                spent_outpoints.push(input.spent_outpoint);
-            }
-            let balances = transaction.intrinsic_value_balances;
-            let shielded_net_to_transparent_zat = i128::from(balances.sprout_zat)
-                .checked_add(i128::from(balances.sapling_zat))?
-                .checked_add(i128::from(balances.orchard_zat))?
-                .checked_add(i128::from(balances.ironwood_zat))?;
-            non_coinbase_txs.push(TxFeeInputs {
-                spent_outpoints,
-                transparent_output_sum_zat: output_sum_zat,
-                shielded_net_to_transparent_zat,
-            });
-        }
-        for output in &transaction.transparent_outputs {
-            intra_block_outputs.insert(
-                TransparentOutPoint::new(txid, output.output_index),
-                output.value_zat,
-            );
-        }
-    }
-    needed_external_txids.extend(local_external_txids);
-    needed_external_outpoints.extend(local_external_outpoints);
-    Some(BlockFeeInputs {
-        intra_block_outputs,
-        non_coinbase_txs,
-    })
-}
-
-fn resolve_external_prevout_values(
-    secondary: &RocksDbCanonicalSecondary,
-    needed_txids: &HashSet<TransactionId>,
-    needed_outpoints: &HashSet<TransparentOutPoint>,
-) -> Result<HashMap<TransparentOutPoint, u64>, Status> {
-    if needed_txids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let txids: Vec<TransactionId> = needed_txids.iter().copied().collect();
-    let locations = secondary
-        .transaction_locations(&txids)
-        .map_err(internal_canonical_error)?;
-    let mut parent_hashes_by_height = BTreeMap::new();
-    for location in locations.into_iter().flatten() {
-        parent_hashes_by_height.insert(location.block_height, location.block_hash);
-    }
-    let parent_heights: Vec<BlockHeight> = parent_hashes_by_height.keys().copied().collect();
-    if parent_heights.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let mut resolved = HashMap::with_capacity(needed_outpoints.len());
-    secondary
-        .visit_block_replay_facts_at_heights(&parent_heights, |idx, maybe_facts| {
-            let Some(facts) = maybe_facts else {
-                return Ok(());
-            };
-            let Some(parent_height) = parent_heights.get(idx) else {
-                return Err(Status::from(ExplorerError::internal(
-                    "parent replay height index out of bounds",
-                ))
-                .into());
-            };
-            if parent_hashes_by_height.get(parent_height) != Some(&facts.block_header.block_hash) {
-                return Err(Status::from(ExplorerError::unsatisfied_precondition(
-                    "canonical parent replay block hash disagrees with transaction location",
-                ))
-                .into());
-            }
-            for transaction in facts.transactions {
-                let txid = transaction.public_facts.transaction_id;
-                for output in transaction.transparent_outputs {
-                    let outpoint = TransparentOutPoint::new(txid, output.output_index);
-                    if needed_outpoints.contains(&outpoint) {
-                        resolved.insert(outpoint, output.value_zat);
-                    }
-                }
-            }
-            Ok::<(), CanonicalReplayVisitError>(())
-        })
-        .map_err(Status::from)?;
-    Ok(resolved)
-}
-
-fn compute_block_paid_fees(
-    fee_inputs: &BlockFeeInputs,
-    external_prevouts: &HashMap<TransparentOutPoint, u64>,
-) -> Option<u64> {
-    let mut total_paid_fee_zat = 0_u64;
-    for transaction in &fee_inputs.non_coinbase_txs {
-        let mut input_sum_zat = 0_u64;
-        for outpoint in &transaction.spent_outpoints {
-            let prevout_value_zat = fee_inputs
-                .intra_block_outputs
-                .get(outpoint)
-                .or_else(|| external_prevouts.get(outpoint))
-                .copied()?;
-            input_sum_zat = input_sum_zat.checked_add(prevout_value_zat)?;
-        }
-        let tx_fee_i128 = i128::from(input_sum_zat)
-            .checked_add(transaction.shielded_net_to_transparent_zat)?
-            .checked_sub(i128::from(transaction.transparent_output_sum_zat))?;
-        let tx_fee_zat = u64::try_from(tx_fee_i128).ok()?;
-        total_paid_fee_zat = total_paid_fee_zat.checked_add(tx_fee_zat)?;
-    }
-    Some(total_paid_fee_zat)
-}
-
 #[derive(Clone, Copy)]
 struct TimeRangeReadParams<'a> {
-    secondary: &'a RocksDbCanonicalSecondary,
+    canonical_store: &'a SharedCanonicalSecondary,
     mv_store: &'a MaterializedViewStore,
-    epoch: ChainEpoch,
+    at_epoch_id: Option<u64>,
     start_time: i64,
     end_time: i64,
     max_entries: u32,
@@ -474,14 +308,6 @@ struct TimeRangePageOutcome {
     read_fence: BlockProductionTimeRangeReadFence,
 }
 
-struct EvaluatedTimeRange {
-    points: Vec<BlockProductionPoint>,
-    covered_block_count: u32,
-    missing_block_count: u32,
-    missing_coinbase_count: u32,
-    missing_paid_fee_count: u32,
-}
-
 fn read_block_production_in_time_range_sync(
     params: TimeRangeReadParams<'_>,
 ) -> Result<TimeRangePageOutcome, Status> {
@@ -494,6 +320,63 @@ fn read_block_production_in_time_range_sync(
         )
         .into());
     }
+    let snapshot_read = read_time_range_snapshot_and_candidates(&params)?;
+    let mut matched = snapshot_read.matched;
+    let mut budget = FeeHydrationBudget::default();
+    let coinbases = hydrate_coinbase_and_paid_fees_with_budget(
+        params.canonical_store,
+        snapshot_read.epoch,
+        &mut matched,
+        &mut budget,
+    )?;
+    let (points, covered_block_count, missing_coinbase_count, missing_paid_fee_count) =
+        collect_hydrated_time_range_points(matched, coinbases)?;
+    let (coverage, read_fence) = build_time_range_coverage_and_fence(TimeRangeCoverageInput {
+        first_retained: snapshot_read.first_retained,
+        epoch: snapshot_read.epoch,
+        mv_state: snapshot_read.mv_state,
+        mv_coverage: snapshot_read.mv_coverage,
+        missing_block_count: snapshot_read.missing_block_count,
+        mv_matches_canonical_epoch: snapshot_read.mv_matches_canonical_epoch,
+        scan_exhausted: snapshot_read.scan_exhausted,
+    });
+    let next_cursor = snapshot_read.next_cursor.map_or_else(Vec::new, |cursor| {
+        encode_time_cursor(params.start_time, params.end_time, &read_fence, cursor)
+    });
+
+    Ok(TimeRangePageOutcome {
+        epoch: snapshot_read.epoch,
+        points,
+        next_cursor,
+        covered_block_count,
+        missing_block_count: snapshot_read.missing_block_count,
+        missing_coinbase_count,
+        missing_paid_fee_count,
+        coverage,
+        read_fence,
+    })
+}
+
+struct TimeRangeSnapshotRead {
+    epoch: ChainEpoch,
+    first_retained: BlockHeight,
+    mv_state: MaterializedViewState,
+    mv_coverage: Option<BlockProductionTimeBackfillCoverage>,
+    matched: Vec<(BlockHeight, BlockHash, u32, BlockSummary)>,
+    missing_block_count: u32,
+    mv_matches_canonical_epoch: bool,
+    scan_exhausted: bool,
+    next_cursor: Option<BlockProductionTimeCursor>,
+}
+
+fn read_time_range_snapshot_and_candidates(
+    params: &TimeRangeReadParams<'_>,
+) -> Result<TimeRangeSnapshotRead, Status> {
+    maybe_catch_up_for_epoch(params.canonical_store, params.at_epoch_id)?;
+    let guard = params.canonical_store.read();
+    let epoch = resolve_locked_canonical_epoch(&guard, params.at_epoch_id)?;
+    let first_retained = guard.history_bounds().first_available_height();
+
     let snapshot = params.mv_store.read_snapshot();
     let mv_state = snapshot
         .consumer_state(BLOCK_PRODUCTION_TIME_CONSUMER_NAME)
@@ -503,14 +386,14 @@ fn read_block_production_in_time_range_sync(
                 "block-production-time materialized view has not committed state yet",
             )
         })?;
-    validate_time_cursor_fence(params.cursor, params.epoch, mv_state)?;
+    validate_time_cursor_fence(params.cursor, epoch, mv_state)?;
     let page = BlockProductionTimeConsumer::read_page_snapshot(
         &snapshot,
         BlockProductionTimePageRequest {
             start_time_unix_seconds: params.start_time,
             end_time_unix_seconds: params.end_time,
             after: params.cursor.map(|cursor| cursor.time_cursor),
-            maximum_height: Some(params.epoch.visible_tip_height),
+            maximum_height: Some(epoch.visible_tip_height),
             limit: params.max_entries as usize,
             max_scanned_rows: Some(MAX_TIME_RANGE_SCANNED_CANDIDATES),
         },
@@ -518,52 +401,68 @@ fn read_block_production_in_time_range_sync(
     .map_err(|error| ExplorerError::internal(error.to_string()))?;
     let mv_coverage = BlockProductionTimeConsumer::coverage_snapshot(&snapshot)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
-
-    let evaluated =
-        evaluate_time_range_candidates(params.secondary, &snapshot, params.epoch, &page.rows)?;
+    let (matched, missing_block_count) =
+        collect_time_range_candidates(&guard, &snapshot, epoch, &page.rows)?;
     drop(snapshot);
 
-    let canonical_tip_hash = params
-        .secondary
-        .block_header_at(params.epoch.visible_tip_height)
+    let canonical_tip_hash = guard
+        .block_header_at(epoch.visible_tip_height)
         .map_err(internal_canonical_error)?
         .map(|header| header.block_hash);
-    let mv_matches_canonical_epoch = mv_state.chain_epoch_id == params.epoch.id
-        && mv_state.tip_height == params.epoch.visible_tip_height
-        && canonical_tip_hash == Some(mv_state.tip_hash);
+    drop(guard);
 
-    let (coverage, read_fence) = build_time_range_coverage_and_fence(TimeRangeCoverageInput {
-        first_retained: params.secondary.history_bounds().first_available_height(),
-        epoch: params.epoch,
+    let mv_matches_canonical_epoch = mv_state.chain_epoch_id == epoch.id
+        && mv_state.tip_height == epoch.visible_tip_height
+        && canonical_tip_hash == Some(mv_state.tip_hash);
+    Ok(TimeRangeSnapshotRead {
+        epoch,
+        first_retained,
         mv_state,
         mv_coverage,
-        missing_block_count: evaluated.missing_block_count,
+        matched,
+        missing_block_count,
         mv_matches_canonical_epoch,
         scan_exhausted: page.scan_exhausted,
-    });
-    let next_cursor = page.next_cursor.map_or_else(Vec::new, |cursor| {
-        encode_time_cursor(params.start_time, params.end_time, &read_fence, cursor)
-    });
-
-    Ok(TimeRangePageOutcome {
-        epoch: params.epoch,
-        points: evaluated.points,
-        next_cursor,
-        covered_block_count: evaluated.covered_block_count,
-        missing_block_count: evaluated.missing_block_count,
-        missing_coinbase_count: evaluated.missing_coinbase_count,
-        missing_paid_fee_count: evaluated.missing_paid_fee_count,
-        coverage,
-        read_fence,
+        next_cursor: page.next_cursor,
     })
 }
 
-fn evaluate_time_range_candidates(
-    secondary: &RocksDbCanonicalSecondary,
+fn collect_hydrated_time_range_points(
+    matched: Vec<(BlockHeight, BlockHash, u32, BlockSummary)>,
+    coinbases: Vec<Option<zinder_proto::v1::explorer::CoinbaseTransactionSummary>>,
+) -> Result<(Vec<BlockProductionPoint>, u32, u32, u32), Status> {
+    let mut points = Vec::with_capacity(matched.len());
+    let mut missing_coinbase_count = 0_u32;
+    let mut missing_paid_fee_count = 0_u32;
+    for ((_, _, bits, summary), coinbase) in matched.into_iter().zip(coinbases) {
+        if coinbase.is_none() {
+            missing_coinbase_count = missing_coinbase_count.saturating_add(1);
+        }
+        if summary.paid_fees_collected_zat.is_none() {
+            missing_paid_fee_count = missing_paid_fee_count.saturating_add(1);
+        }
+        points.push(BlockProductionPoint {
+            summary: Some(summary),
+            bits,
+            coinbase,
+        });
+    }
+    let covered_block_count = u32::try_from(points.len())
+        .map_err(|_| ExplorerError::internal("block-production page point count exceeds u32"))?;
+    Ok((
+        points,
+        covered_block_count,
+        missing_coinbase_count,
+        missing_paid_fee_count,
+    ))
+}
+
+fn collect_time_range_candidates(
+    secondary: &zinder_store::RocksDbCanonicalSecondary,
     snapshot: &zinder_materialized_views::MaterializedViewStoreReadSnapshot<'_>,
     epoch: ChainEpoch,
     rows: &[BlockProductionTimeRow],
-) -> Result<EvaluatedTimeRange, Status> {
+) -> Result<(Vec<MatchedBlockRow>, u32), Status> {
     let heights: Vec<BlockHeight> = rows.iter().map(|row| row.block_height).collect();
     let headers = secondary
         .block_headers_at(&heights)
@@ -601,34 +500,7 @@ fn evaluate_time_range_candidates(
             missing_block_count = missing_block_count.saturating_add(1);
         }
     }
-
-    let coinbases = hydrate_coinbase_and_paid_fees(secondary, &mut matched)?;
-    let mut points = Vec::with_capacity(matched.len());
-    let mut missing_coinbase_count = 0_u32;
-    let mut missing_paid_fee_count = 0_u32;
-    for ((_, _, bits, summary), coinbase) in matched.into_iter().zip(coinbases) {
-        if coinbase.is_none() {
-            missing_coinbase_count = missing_coinbase_count.saturating_add(1);
-        }
-        if summary.paid_fees_collected_zat.is_none() {
-            missing_paid_fee_count = missing_paid_fee_count.saturating_add(1);
-        }
-        points.push(BlockProductionPoint {
-            summary: Some(summary),
-            bits,
-            coinbase,
-        });
-    }
-    let covered_block_count = u32::try_from(points.len())
-        .map_err(|_| ExplorerError::internal("block-production page point count exceeds u32"))?;
-
-    Ok(EvaluatedTimeRange {
-        points,
-        covered_block_count,
-        missing_block_count,
-        missing_coinbase_count,
-        missing_paid_fee_count,
-    })
+    Ok((matched, missing_block_count))
 }
 
 #[derive(Clone, Copy)]

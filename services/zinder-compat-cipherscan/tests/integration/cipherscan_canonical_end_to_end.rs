@@ -1316,6 +1316,12 @@ async fn assert_cipherscan_block_routes(
     let block_by_height = get_json(client, &format!("{base}/api/block/2")).await?;
     assert_eq!(block_by_height["height"], json!("2"));
     assert!(block_by_height["miner_address"].is_string());
+    let listed_block2 = blocks_json["blocks"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["height"] == json!("2")))
+        .ok_or_else(|| eyre!("block 2 missing from /api/blocks"))?;
+    assert_eq!(block_by_height["total_fees"], listed_block2["total_fees"]);
+    assert_eq!(block_by_height["total_fees"], json!("15000"));
 
     let canonical_hash = encode_rpc_block_hash_hex(env.b2_new_hash);
     let block_by_hash = get_json(client, &format!("{base}/api/block/{canonical_hash}")).await?;

@@ -1229,6 +1229,14 @@ async fn assert_block_transactions_rpc(
         .await?
         .into_inner();
     assert_eq!(by_height.transactions, by_hash.transactions);
+    assert_eq!(by_height.summary, by_hash.summary);
+    assert_eq!(
+        by_height
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.paid_fees_collected_zat),
+        Some(15_000)
+    );
     assert_eq!(by_height.transactions.len(), 2);
     assert_eq!(by_height.transactions[0].transparent_inputs, []);
     assert_eq!(
@@ -1248,6 +1256,13 @@ async fn assert_block_transactions_rpc(
         })
         .await?
         .into_inner();
+    assert_eq!(
+        block3_txs
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.paid_fees_collected_zat),
+        Some(7_000)
+    );
     assert_eq!(block3_txs.transactions.len(), 3);
     assert_eq!(
         block3_txs.transactions[2].transparent_inputs[0].value_zat,

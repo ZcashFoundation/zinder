@@ -22,6 +22,7 @@ use zinder_store::{
     BlockHashLookup, CanonicalStoreError, RocksDbCanonicalSecondary, chain_epoch_message,
 };
 
+use super::block_paid_fees::BlockFeeInputs;
 use super::canonical_read::{
     CanonicalReplayVisitError, SharedCanonicalSecondary, internal_canonical_error,
     join_block_summary_with_header, read_with_pinned_canonical_epoch,
@@ -151,7 +152,7 @@ fn read_block_transactions_sync(
                 height.value(),
             ))
         })?;
-    let summary = join_block_summary_with_header(
+    let mut summary = join_block_summary_with_header(
         &summary_payload,
         &facts.block_header,
         epoch.visible_tip_height.value(),
@@ -164,6 +165,12 @@ fn read_block_transactions_sync(
     })?;
 
     let prevouts = resolve_block_prevouts(secondary, epoch, &facts)?;
+    summary.paid_fees_collected_zat = BlockFeeInputs::from_transactions(&facts.transactions)
+        .and_then(|fee_inputs| {
+            fee_inputs.compute_paid_fees(|outpoint| {
+                prevouts.get(outpoint).map(|(amount_zat, _)| *amount_zat)
+            })
+        });
     let transactions = encode_block_transactions(&facts.transactions, &prevouts)?;
     let final_roots = read_block_final_roots(secondary, height, fallback_activations)?;
 
