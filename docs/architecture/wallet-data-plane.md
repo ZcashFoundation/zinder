@@ -77,7 +77,7 @@ Canonical history never contains height 0. A complete store retains blocks from 
 
 `FullBlock(height, at_epoch_id)` returns one consensus-serialized block. `FullBlocksInRange(start_height, end_height, at_epoch_id)` streams an inclusive range of at most 1,000 blocks and repeats the `ChainView` on every chunk. The server reads 16 blocks at a time and buffers at most 4 chunks, so a slow client does not make it hold the whole range.
 
-Full blocks exist only when ingest writes block blobs, which requires `storage.raw_blob_policy = "all"`. Under `none` or `transactions` the methods are not advertised. A missing block inside an `all` store returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. Changing an existing store to `all` requires a rebuilt store.
+Full blocks exist only when ingest writes raw block segments, which requires `storage.raw_blob_policy = "all"` (`storage.full_blocks = true`). Under `none` the methods are not advertised. A missing block inside an `all` store returns `NOT_FOUND` with `ARTIFACT_UNAVAILABLE`. Changing an existing store to `all` requires a rebuilt store.
 
 ## Block identity and tips
 

@@ -565,16 +565,18 @@ fn reset_local_state(store: &RocksDbCanonicalStore) -> Result<(), EdgeSnapshotEr
 ///
 /// # Errors
 ///
-/// Refuses an occupied output, an ineligible tip, an invalid PKCS#8 key, or
-/// failed checkpoint, filesystem, or store admission operations.
+/// Refuses an occupied output, overlapping source, output, or staging paths, an
+/// ineligible tip, an invalid PKCS#8 key, or failed checkpoint, filesystem, or
+/// store admission operations.
 pub fn export_edge_snapshot(
     store: &mut RocksDbCanonicalStore,
     output: &Path,
     signing_key: &Path,
 ) -> Result<(), EdgeSnapshotError> {
+    let source = store.path().canonicalize()?;
     let output = resolve_destination(output)?;
     let stage = sibling_path(&output, ".export.staging")?;
-    require_disjoint(&[&output, &stage])?;
+    require_disjoint(&[&source, &output, &stage])?;
     let key_file = open_regular(&signing_key.canonicalize()?)?;
     // PKCS#8 v1 carries only the seed. Ring checks the embedded public key in v2.
     let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&read_bounded(&key_file, 1024)?)

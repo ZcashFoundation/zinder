@@ -1,5 +1,5 @@
 kind: changed
-body: Cut lightwalletd compact-block and nullifier range serving over directly to canonical ZSHRNG02 settled segments and live_tail_block, removing the external history-publisher role, duplicate ZSHRNG01 catalog storage, and ZINDER_COMPAT__SHIELDED_HISTORY__* configuration.
+body: "Cut canonical storage over to Canonical Schema v2 (CANONICAL_STORE_SCHEMA_VERSION = 2) and STATE_BUNDLE_FORMAT_VERSION = 2 (\"rocksdb\" topology), removed storage.raw_blob_policy = \"transactions\" (only none and all / storage.full_blocks = true remain), and switched lightwalletd compact-block and nullifier range serving directly to canonical ZSHRNG02 settled segments and live_tail_block while removing the external history-publisher role, duplicate ZSHRNG01 catalog storage, and ZINDER_COMPAT__SHIELDED_HISTORY__* configuration. Upgrading from Schema v1 requires a fresh store rebuild or v2 state bundle."
 time: 2026-11-27T18:02:10Z
 custom:
   Bump: minor

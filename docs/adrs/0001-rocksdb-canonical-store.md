@@ -19,11 +19,11 @@ The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB th
 ## Decision
 
 1. Zinder stores its canonical chain data in RocksDB through `rust-rocksdb`. The wallet store and the materialized-view stores use the same engine.
-2. Column families separate artifact families. One write batch commits everything a new chain epoch changes, so a crash leaves either the previous epoch or the new one. Canonical schema v1 binds the initial activation schedule in the same batch as READY. Fixed control fields carry the admitted schedule revision and digest and the effective reorg window, so admission can validate all three together.
+2. Column families and external settled segment files separate artifact sets by access pattern. One RocksDB write batch commits everything a new chain epoch changes (together with pre-staged, fsynced aligned settled segments when crossing a settled stride boundary), so a crash leaves either the previous epoch or the new one. Canonical schema v2 binds the initial activation schedule in the same batch as READY. Fixed control fields carry the admitted schedule revision and digest and the effective reorg window, so admission can validate all three together.
 3. RocksDB stays inside the storage crates. Runtimes and public APIs see chain epochs, typed artifacts, and typed errors, never RocksDB handles, options, or errors.
-4. Store checkpoints use RocksDB's own checkpoint primitive. A wallet-serving backup binds a canonical and a wallet checkpoint together ([ADR-0004](0004-storage-and-deployment-topologies.md)). [Private backups](../runbooks/private-backups.md) describes capture and restore of the pair.
+4. Store checkpoints use RocksDB's own checkpoint primitive alongside pinned external settled segment files (`segments-manifest.json` and `segments/`). A wallet-serving backup binds a canonical and a wallet checkpoint together ([ADR-0004](0004-storage-and-deployment-topologies.md)). [Private backups](../runbooks/private-backups.md) describes capture and restore of the pair.
 
-5. Canonical schema v1 keeps the serialized transaction digest in the transaction location index so readers can retrieve it with a point lookup. RocksDB uses fast compression for frequently accessed data, denser compression for cold history, and uncompressed hash indexes.
+5. Canonical schema v2 keeps the 32-byte serialized transaction digest in the 72-byte `transaction_location` index so readers can verify node-forwarded or segment-sliced transaction bytes with a point lookup. RocksDB uses LZ4 on hot families, LZ4 on upper levels with Zstandard level 3 on the bottommost level and bulk SSTs for cold checkpoint, displaced-fact, and live raw-block families, and uncompressed hash indexes with partitioned hybrid Ribbon filters.
 
 [Storage backend](../architecture/storage-backend.md) describes the stores, their column families, and their layout.
 
@@ -41,6 +41,8 @@ The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB th
 - **LMDB through `heed`.** It excels at memory-mapped, read-heavy access from several processes. Zinder does not need several processes to open one database as primary, and LMDB fits append-heavy, frequently replaced data less well.
 
 ## Revision history
+
+- 2026-11-27. Updated decisions 2, 4, and 5 for Canonical Schema v2 (12 active data column families plus external `ZSHRNG02`/`ZSTSUP01`/`ZSBLKB01` settled segments and `live_tail_block`/`live_tail_raw_block` unsealed tail).
 
 - 2026-11-24. Added canonical transaction digests and per-family SST compression to decision 5.
 
