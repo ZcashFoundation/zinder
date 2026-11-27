@@ -37,12 +37,13 @@ use zinder_proto::v1::ops;
 use zinder_runtime::{BearerToken, BearerTokenServerInterceptor, ReadinessCause, not_ready_status};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
-    CanonicalMempoolSnapshotStart, CanonicalOwnerCheckpointAdmission,
-    CanonicalOwnerCheckpointEvidence, CanonicalStoreError, EventStreamStartPosition, MempoolEvent,
-    MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventPosition,
-    MempoolEventRetentionConfig, MempoolEventRetentionStepBudget, MempoolEventRetentionStepOutcome,
-    ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalStore,
-    RocksDbResourceBudget, StreamCursorTokenV1, TreeStateStrideCommit,
+    CanonicalMempoolEventStreamStart, CanonicalMempoolSnapshotStart,
+    CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence, CanonicalStoreError,
+    EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest,
+    MempoolEventPosition, MempoolEventRetentionConfig, MempoolEventRetentionStepBudget,
+    MempoolEventRetentionStepOutcome, ProjectionBuildAnchor, ProjectionBuildLease,
+    ProjectionBuildLeaseId, RocksDbCanonicalStore, RocksDbResourceBudget, StreamCursorTokenV1,
+    TreeStateStrideCommit,
 };
 
 use crate::tree_state_verification::{CanonicalStoreDamage, CanonicalStoreDamageSignal};
@@ -426,11 +427,12 @@ impl CanonicalControlHandle {
         .await
     }
 
-    /// Resolves a public mempool-event stream start through the durable log.
+    /// Resolves a public mempool-event stream start and head subscription
+    /// through the durable log.
     pub(crate) async fn resolve_mempool_event_start(
         &self,
         start: EventStreamStartPosition,
-    ) -> Result<Option<StreamCursorTokenV1>, Status> {
+    ) -> Result<CanonicalMempoolEventStreamStart, Status> {
         self.request(|reply| CanonicalControlCommand::ResolveMempoolEventStart { start, reply })
             .await
     }
@@ -650,12 +652,13 @@ pub enum CanonicalControlCommand {
         /// One-shot response carrying retained event envelopes.
         reply: oneshot::Sender<Result<Vec<MempoolEventEnvelope>, Status>>,
     },
-    /// Resolve one public mempool-event stream start position.
+    /// Resolve one public mempool-event stream start position and live head
+    /// subscription.
     ResolveMempoolEventStart {
         /// Typed stream selector decoded at the authenticated gRPC boundary.
         start: EventStreamStartPosition,
-        /// One-shot response carrying the strict-after cursor.
-        reply: oneshot::Sender<Result<Option<StreamCursorTokenV1>, Status>>,
+        /// One-shot response carrying the strict-after cursor and live head subscription.
+        reply: oneshot::Sender<Result<CanonicalMempoolEventStreamStart, Status>>,
     },
     /// Decode or capture the durable event anchor for a mempool snapshot walk.
     BeginMempoolSnapshot {
@@ -1078,12 +1081,12 @@ fn read_mempool_event_page(
 fn resolve_mempool_event_start(
     store: &RocksDbCanonicalStore,
     start: &EventStreamStartPosition,
-    reply: oneshot::Sender<Result<Option<StreamCursorTokenV1>, Status>>,
+    reply: oneshot::Sender<Result<CanonicalMempoolEventStreamStart, Status>>,
 ) {
     send_control_response(
         reply,
         store
-            .resolve_mempool_event_stream_start(start)
+            .open_mempool_event_stream(start)
             .map_err(|error| map_store_error(&error)),
     );
 }

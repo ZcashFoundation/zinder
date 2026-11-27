@@ -34,9 +34,9 @@ are optional explorer aggregates. Use `canonical`, `wallet projection`, and
 | `MempoolEvent` | A live-pool change: added, invalidated, or mined. | `zinder-store`, `zinder-client` |
 
 Native services advertise network contract revision 15. Store admission checks
-the on-disk persistence schema independently. The schema v1 cutover requires fresh
-canonical, wallet, and materialized-view stores. State bundles and recovery
-archives must be captured again from the rebuilt stores.
+the on-disk persistence schema independently (`CANONICAL_STORE_SCHEMA_VERSION = 2`).
+Schema cutovers require fresh canonical, wallet, and materialized-view stores;
+state bundles and recovery archives must be captured again from the rebuilt stores.
 
 ### Serving
 

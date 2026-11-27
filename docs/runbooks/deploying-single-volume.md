@@ -52,7 +52,7 @@ Set `ZINDER_OPS__LISTEN_ADDR=[::]:9108`, `ZINDER_QUERY__LISTEN_ADDR=[::]:9102`, 
 | `ZINDER_INGEST__SOURCE` | `zebra-json-rpc` (default) or `zebra-indexer-grpc`. |
 | `RUST_LOG` | Log filter (default `info`; unparseable values stop startup). |
 
-On hosts with fewer than 8 logical CPUs, also check [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus). When running `zinder serve` directly in a single-volume container, omitting `ZINDER_DEPLOYMENT__PROFILE` / `--preset` and setting `ZINDER_STORAGE__RAW_BLOB_POLICY=transactions` carries forward an existing pre-profile `raw_blob_policy = "transactions"` store without rebuilding (unlike `deploy/docker-compose.yml`, which passes `--preset`).
+On hosts with fewer than 8 logical CPUs, also check [First sync on fewer than 8 logical CPUs](bulk-catchup-resource-tuning.md#first-sync-on-fewer-than-8-logical-cpus). Note that Canonical Schema `v2` removes `storage.raw_blob_policy = "transactions"`; pass `--full-blocks` (`ZINDER_STORAGE__FULL_BLOCKS=true`, setting `raw_blob_policy = "all"`) on fresh storage when retaining local raw block and transaction bytes.
 
 ### Indexer TLS
 
