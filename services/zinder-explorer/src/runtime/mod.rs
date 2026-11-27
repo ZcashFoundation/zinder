@@ -104,15 +104,11 @@ pub async fn main_from_env(binary_name: &str) -> ExitCode {
     if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
         return run_healthcheck(binary_name, healthcheck, cli.config_path.as_deref());
     }
-    if let Err(error) = install_tracing_subscriber() {
-        return emit_tracing_subscriber_error(binary_name, &error);
-    }
 
-    run_parsed_cli(cli).await
+    run_cli(binary_name, cli).await
 }
 
-/// Runs `zinder-explorer` from explicit CLI arguments when tracing is already
-/// initialized by a parent process such as `zinder run`.
+/// Runs `zinder-explorer` from explicit CLI arguments.
 pub async fn run_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -126,7 +122,7 @@ where
         return run_healthcheck(binary_name, healthcheck, cli.config_path.as_deref());
     }
 
-    run_parsed_cli(cli).await
+    run_cli(binary_name, cli).await
 }
 
 /// Supervises the explorer server inside a parent runtime such as `zinder serve`.
@@ -149,6 +145,25 @@ pub async fn serve_supervised(
     let outcome = serve_explorer(explorer_config, runtime, readiness).await;
     cancel_bridge.abort();
     outcome
+}
+
+async fn run_cli(binary_name: &str, cli: Cli) -> ExitCode {
+    if cli.print_config {
+        if let Err(error) = install_tracing_subscriber() {
+            return emit_tracing_subscriber_error(binary_name, &error);
+        }
+        return run_parsed_cli(cli).await;
+    }
+    let tracing = match zinder_runtime::install_runtime_tracing_subscriber(
+        RuntimeService::Explorer,
+        cli.config_path.as_deref(),
+    ) {
+        Ok(tracing) => tracing,
+        Err(error) => return emit_tracing_subscriber_error(binary_name, &error),
+    };
+    let exit = run_parsed_cli(cli).await;
+    tracing.shutdown().await;
+    exit
 }
 
 async fn run_parsed_cli(cli: Cli) -> ExitCode {
@@ -233,12 +248,19 @@ fn build_materialized_view_catchup_task(
 ) -> Option<JoinHandle<()>> {
     match (materialized_view_store, canonical_secondary) {
         (None, None) => None,
-        (mv_store, canonical_store) => Some(spawn_materialized_view_catchup_task(
-            move || catch_up_secondaries(mv_store.as_ref(), canonical_store.as_ref()),
-            composed_readiness.clone(),
-            explorer_config.storage.secondary_catchup_interval,
-            stopping,
-        )),
+        (mv_store, canonical_store) => {
+            let readiness = composed_readiness.runtime_readiness();
+            Some(spawn_materialized_view_catchup_task(
+                move || {
+                    let outcome = catch_up_secondaries(mv_store.as_ref(), canonical_store.as_ref());
+                    publish_served_epoch(&readiness, canonical_store.as_ref());
+                    outcome
+                },
+                composed_readiness.clone(),
+                explorer_config.storage.secondary_catchup_interval,
+                stopping,
+            ))
+        }
     }
 }
 
@@ -258,6 +280,7 @@ async fn serve_explorer(
             }
         };
     report_materialized_view_identities(&readiness, materialized_view_store.as_ref());
+    publish_served_epoch(&readiness, canonical_secondary.as_ref());
     let required_inputs: &[ReadinessInput] =
         if materialized_view_store.is_some() || canonical_secondary.is_some() {
             &[ReadinessInput::MaterializedViewCatchup]
@@ -324,6 +347,15 @@ async fn serve_explorer(
         "explorer query gRPC server stopped"
     );
     Ok(())
+}
+
+fn publish_served_epoch(
+    readiness: &Readiness,
+    canonical_secondary: Option<&SharedCanonicalSecondary>,
+) {
+    if let Some(epoch) = canonical_secondary.and_then(|store| store.read().chain_epoch().ok()) {
+        readiness.set_served_chain_epoch(&epoch);
+    }
 }
 
 fn report_materialized_view_identities(

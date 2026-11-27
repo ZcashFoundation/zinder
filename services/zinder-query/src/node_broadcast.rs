@@ -332,7 +332,10 @@ where
             if !self.inner.verifications.is_verified(position) {
                 continue;
             }
-            let outcome = source.broadcast_transaction(raw_transaction.clone()).await;
+            let outcome = zinder_runtime::trace_node_rpc(
+                source.broadcast_transaction(raw_transaction.clone()),
+            )
+            .await;
             record_attempt(position, &outcome);
             match outcome {
                 Ok(TransactionBroadcastOutcome::Rejected(rejected))

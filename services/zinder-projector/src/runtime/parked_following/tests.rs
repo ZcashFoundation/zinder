@@ -785,6 +785,7 @@ fn park_config(
             checkpoint_staging_root: root.join("checkpoint-staging"),
         },
         ops_listen_addr: None,
+        observability: zinder_runtime::ObservabilityConfig::default(),
         allow_public_bind: false,
     })
 }

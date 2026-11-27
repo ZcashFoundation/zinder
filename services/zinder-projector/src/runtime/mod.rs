@@ -29,7 +29,7 @@ use zinder_proto::v1::ingest::{CreateStateBundleCaptureRequest, CreateStateBundl
 use zinder_runtime::{
     CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
     CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, OpsHealthcheckArgs, OpsServer,
-    OpsServerError, Readiness, ReadinessState, StartupPhase, StartupPhaseGuard,
+    OpsServerError, Readiness, ReadinessState, RuntimeService, StartupPhase, StartupPhaseGuard,
     TracingSubscriberError, cancel_on_terminating_signal, compare_canonical_writer_fences,
     converge_on_canonical_writer_fence, expected_writer_fence, host_cpu_meets_compiled_baseline,
     host_cpu_meets_pasta_backend_baseline, install_metrics_recorder, install_tracing_subscriber,
@@ -182,14 +182,10 @@ pub async fn main_from_env(binary_name: &str) -> ExitCode {
         Some(Command::Recovery(command)) => Some(command),
         None => None,
     };
-    if let Err(error) = install_tracing_subscriber() {
-        return emit_tracing_subscriber_error(binary_name, &error);
-    }
-    run_parsed_cli(binary_name, cli, recovery).await
+    run_cli(binary_name, cli, recovery).await
 }
 
-/// Runs `zinder-projector` from explicit CLI arguments when tracing is already
-/// initialized by a parent process such as `zinder run`.
+/// Runs `zinder-projector` from explicit CLI arguments.
 pub async fn run_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -206,7 +202,30 @@ where
         Some(Command::Recovery(command)) => Some(command),
         None => None,
     };
-    run_parsed_cli(binary_name, cli, recovery).await
+    run_cli(binary_name, cli, recovery).await
+}
+
+async fn run_cli(
+    binary_name: &str,
+    cli: Cli,
+    recovery: Option<recovery::RecoveryCommand>,
+) -> ExitCode {
+    if cli.print_config || recovery.is_some() {
+        if let Err(error) = install_tracing_subscriber() {
+            return emit_tracing_subscriber_error(binary_name, &error);
+        }
+        return run_parsed_cli(binary_name, cli, recovery).await;
+    }
+    let tracing = match zinder_runtime::install_runtime_tracing_subscriber(
+        RuntimeService::Projector,
+        cli.config_path.as_deref(),
+    ) {
+        Ok(tracing) => tracing,
+        Err(error) => return emit_tracing_subscriber_error(binary_name, &error),
+    };
+    let exit = run_parsed_cli(binary_name, cli, recovery).await;
+    tracing.shutdown().await;
+    exit
 }
 
 async fn run_parsed_cli(

@@ -79,10 +79,6 @@ async fn run_supervised_scope(scope: &ConfigScope, print_config: bool) -> ExitCo
 }
 
 async fn run_single_role(args: cli::RunArgs) -> ExitCode {
-    let has_healthcheck = args.args.iter().any(|arg| arg == "healthcheck");
-    if !has_healthcheck && let Err(error) = install_tracing_subscriber() {
-        return emit_tracing_error(args.role.binary_name(), &error);
-    }
     let forwarded: Vec<OsString> = std::iter::once(OsString::from(args.role.binary_name()))
         .chain(args.args)
         .collect();

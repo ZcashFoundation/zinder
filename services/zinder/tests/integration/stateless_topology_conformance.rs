@@ -203,6 +203,7 @@ fn build_cipherscan_config(
         network: Network::ZcashRegtest,
         listen_addr,
         ops_listen_addr: None,
+        observability: zinder_runtime::ObservabilityConfig::default(),
         allow_public_bind: false,
         explorer_query_endpoint: format!("http://{explorer_addr}"),
         wallet_query_endpoint: format!("http://{wallet_addr}"),

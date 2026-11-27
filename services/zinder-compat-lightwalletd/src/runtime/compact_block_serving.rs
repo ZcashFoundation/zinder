@@ -183,11 +183,11 @@ impl CompactServingReadiness {
         false
     }
 
-    /// Records the writer's commit time of the chain epoch `reader` serves.
+    /// Publishes the status of the chain epoch `reader` serves.
     fn publish_served_epoch(&self, reader: &RocksDbCanonicalReader) {
         self.inputs
             .runtime_readiness()
-            .set_served_epoch_committed_at(reader.chain_epoch().created_at);
+            .set_served_chain_epoch(&reader.chain_epoch());
     }
 
     pub(crate) fn publish_shutting_down(&self) {

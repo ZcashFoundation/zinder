@@ -70,6 +70,10 @@ orchard = { version = "0.16.0", default-features = false }
 # see `deploy/Dockerfile`), while Cargo leaves it opt-in and excluded from
 # `--all-features` so `cargo test` and CI `pasta-parity` can test both the
 # portable and assembly backends.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["grpc-tonic", "trace", "tls-ring", "tls-roots"] }
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic", "trace"] }
 pasta_curves = { version = "=0.6.3", default-features = false }
 prost = "0.14.6"
 prost-types = "0.14.6"
@@ -115,6 +119,7 @@ tonic-web = "0.14.9"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.11", default-features = false }
 tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "smallvec", "std", "tracing-log"] }
 url = "2.5.8"
 # These protocol crates share concrete types with Zebra. Keep them on the

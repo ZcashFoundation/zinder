@@ -664,3 +664,13 @@ information and query.
 
 Startup phases log under the `zinder::startup` target, as
 [Service operations](../architecture/service-operations.md) describes.
+
+
+## Distributed traces
+
+To export spans, configure [trace export](configuration.md#trace-export).
+Wallet RPC spans identify the protocol surface and method. Ingest control
+spans share the trace ID when the caller forwards W3C Trace Context. Wallet
+transaction broadcasts also include a span for the upstream node call. Use
+that ID in your collector to relate control and node work to the wallet request.
+Collector export uses a bounded queue that can drop spans during overload.

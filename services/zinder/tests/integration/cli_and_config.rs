@@ -85,7 +85,9 @@ fn config_validate_and_print_cover_all_presets_with_redaction() -> eyre::Result<
             "[node]\njson_rpc_addr = \"http://rpcuser:super-secret-url@127.0.0.1:18232/?token=url-secret\"\n",
             "[node.auth]\nmethod = \"basic\"\nusername = \"rpcuser\"\npassword = \"secret-password\"\n\n",
             "[ingest_control]\nbearer_token = \"secret-control-token\"\n",
-            "checkpoint_bearer_token = \"secret-checkpoint-token\"\n"
+            "checkpoint_bearer_token = \"secret-checkpoint-token\"\n\n",
+            "[observability]\notlp_endpoint = \"http://private-collector.internal:4317\"\n",
+            "sampling_rate = 0.25\n"
         ),
         storage_root.display()
     );
@@ -106,6 +108,7 @@ fn config_validate_and_print_cover_all_presets_with_redaction() -> eyre::Result<
         );
 
         let printed = zinder_command(&["config", "print", "--preset", preset, "--config", cfg_str])
+            .env("ZINDER_OBSERVABILITY__SAMPLING_RATE", "0.5")
             .output()?;
         assert!(
             printed.status.success(),
@@ -119,12 +122,24 @@ fn config_validate_and_print_cover_all_presets_with_redaction() -> eyre::Result<
             "url-secret",
             "secret-control-token",
             "secret-checkpoint-token",
+            "private-collector.internal",
         ] {
             assert!(
                 !stdout.contains(leaked),
                 "preset `{preset}` leaked `{leaked}`:\n{stdout}"
             );
         }
+        let config: toml::Table = toml::from_str(&stdout)?;
+        assert_eq!(
+            config["observability"]["otlp_endpoint"].as_str(),
+            Some("[REDACTED]")
+        );
+        assert_eq!(
+            config["observability"]["sampling_rate"]
+                .as_float()
+                .map(f64::to_bits),
+            Some(0.5_f64.to_bits())
+        );
         assert!(
             stdout.contains("[REDACTED]"),
             "expected redaction marker:\n{stdout}"

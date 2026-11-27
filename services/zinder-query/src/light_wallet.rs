@@ -230,7 +230,8 @@ impl LightWalletNodeQuery {
             .map_err(QueryError::Node)?;
         reservation
             .hold_during(async {
-                let outcome = node.broadcast_transaction(bytes).await;
+                let outcome =
+                    zinder_runtime::trace_node_rpc(node.broadcast_transaction(bytes)).await;
                 crate::node_broadcast::record_attempt(0, &outcome);
                 outcome.map_err(QueryError::Node)
             })

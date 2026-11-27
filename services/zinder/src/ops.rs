@@ -21,8 +21,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use zinder_runtime::{
-    BUILD_GIT_COMMIT, HttpListenerLimits, MetricsHandle, MetricsInstallError, OpsServer,
-    install_metrics_recorder, serve_http,
+    BUILD_GIT_COMMIT, HttpListenerLimits, MetricsHandle, MetricsInstallError, OpsServer, OpsStatus,
+    ServedChainStatus, install_metrics_recorder, serve_http,
 };
 
 use crate::cli::ServiceRole;
@@ -101,6 +101,8 @@ pub struct RoleOpsSnapshot {
     pub(crate) capabilities: Vec<String>,
     #[serde(skip)]
     pub(crate) capabilities_loaded: bool,
+    #[serde(skip)]
+    pub(crate) served_chain: Option<ServedChainStatus>,
 }
 
 impl RoleOpsSnapshot {
@@ -121,6 +123,7 @@ impl RoleOpsSnapshot {
             role_kind: role,
             capabilities: Vec::new(),
             capabilities_loaded: false,
+            served_chain: None,
         }
     }
 }
@@ -138,6 +141,22 @@ struct OpsStateInner {
     network_name: &'static str,
     stage: StartupStage,
     roles: Vec<RoleOpsSnapshot>,
+}
+
+impl OpsStateInner {
+    fn readiness_status(&self) -> &'static str {
+        if self.stage == StartupStage::Ready
+            && !self.roles.is_empty()
+            && self
+                .roles
+                .iter()
+                .all(|snapshot| !snapshot.required || snapshot.ready)
+        {
+            "ready"
+        } else {
+            "not_ready"
+        }
+    }
 }
 
 impl SharedOpsState {
@@ -211,14 +230,32 @@ impl SharedOpsState {
         unique.into_iter().collect()
     }
 
+    fn public_status(&self) -> OpsStatus {
+        let guard = self.inner.read();
+        let served_chain = [ServiceRole::Query, ServiceRole::CompatLightwalletd]
+            .iter()
+            .find_map(|role| {
+                guard
+                    .roles
+                    .iter()
+                    .find(|snapshot| snapshot.role_kind == *role)?
+                    .served_chain
+            });
+        OpsStatus {
+            status: guard.readiness_status(),
+            service: "zinder",
+            version: env!("CARGO_PKG_VERSION"),
+            git_commit: BUILD_GIT_COMMIT,
+            network: guard.network_name,
+            cause: guard.stage.as_str(),
+            mode: Some(guard.mode),
+            preset: Some(guard.preset),
+            served_chain: served_chain.unwrap_or_default(),
+        }
+    }
+
     fn ready_summary(&self) -> ReadyzResponseBody {
         let guard = self.inner.read();
-        let ready = guard.stage == StartupStage::Ready
-            && !guard.roles.is_empty()
-            && guard
-                .roles
-                .iter()
-                .all(|snapshot| !snapshot.required || snapshot.ready);
         let current_height = guard
             .roles
             .iter()
@@ -232,7 +269,7 @@ impl SharedOpsState {
             .filter_map(|snapshot| snapshot.target_height)
             .max();
         ReadyzResponseBody {
-            status: if ready { "ready" } else { "not_ready" },
+            status: guard.readiness_status(),
             mode: guard.mode,
             preset: guard.preset,
             network: guard.network_name,
@@ -397,6 +434,7 @@ async fn serve_loop(
     let app = Router::new()
         .route("/healthz", get(handle_healthz))
         .route("/readyz", get(handle_readyz))
+        .route("/status", get(handle_status))
         .route("/metrics", get(handle_metrics))
         .with_state(state);
 
@@ -413,6 +451,10 @@ async fn serve_loop(
     };
     let outcome = serve_http(listener, app, limits, cancel.cancelled_owned()).await;
     outcome.map_err(|source| SupervisorOpsError::Transport { source })
+}
+
+async fn handle_status(State(state): State<SupervisorHttpState>) -> Json<OpsStatus> {
+    Json(state.shared.public_status())
 }
 
 async fn handle_healthz(
@@ -605,6 +647,15 @@ pub async fn fetch_child_readyz(addr: SocketAddr) -> Option<(bool, ChildReadyzPa
     let (status, body) = http_get_localhost(addr, "/readyz").await.ok()?;
     let payload = serde_json::from_str::<ChildReadyzPayload>(&body).ok()?;
     Some((status == StatusCode::OK, payload))
+}
+
+pub(crate) async fn fetch_child_served_chain(addr: SocketAddr) -> Option<ServedChainStatus> {
+    let (status, body) = http_get_localhost(addr, "/status").await.ok()?;
+    if status != StatusCode::OK {
+        return None;
+    }
+    let chain: ServedChainStatus = serde_json::from_str(&body).ok()?;
+    chain.served_visible_tip_height.map(|_| chain)
 }
 
 /// Fetches a child operational `/healthz` capability list over loopback HTTP/1.1.

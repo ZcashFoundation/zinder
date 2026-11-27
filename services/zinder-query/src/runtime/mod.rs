@@ -113,14 +113,10 @@ pub async fn main_from_env(binary_name: &str) -> ExitCode {
             Command::GrpcHealthcheck { addr } => grpc_healthcheck::run(*addr).await,
         };
     }
-    if let Err(error) = install_tracing_subscriber() {
-        return emit_tracing_subscriber_error(binary_name, &error);
-    }
-    run_parsed_cli(cli).await
+    run_cli(binary_name, cli).await
 }
 
-/// Runs `zinder-query` from explicit CLI arguments when tracing is already
-/// initialized by a parent process such as `zinder run`.
+/// Runs `zinder-query` from explicit CLI arguments.
 pub async fn run_from_args<I, T>(binary_name: &str, args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -138,7 +134,7 @@ where
             Command::GrpcHealthcheck { addr } => grpc_healthcheck::run(*addr).await,
         };
     }
-    run_parsed_cli(cli).await
+    run_cli(binary_name, cli).await
 }
 
 /// Supervises the native `WalletQuery` server inside a parent runtime such as `zinder serve`.
@@ -162,6 +158,25 @@ pub async fn serve_supervised(
     let outcome = serve_query(query_config, runtime, readiness, cancel).await;
     cancel_bridge.abort();
     outcome
+}
+
+async fn run_cli(binary_name: &str, cli: Cli) -> ExitCode {
+    if cli.print_config {
+        if let Err(error) = install_tracing_subscriber() {
+            return emit_tracing_subscriber_error(binary_name, &error);
+        }
+        return run_parsed_cli(cli).await;
+    }
+    let tracing = match zinder_runtime::install_runtime_tracing_subscriber(
+        RuntimeService::Query,
+        cli.config_path.as_deref(),
+    ) {
+        Ok(tracing) => tracing,
+        Err(error) => return emit_tracing_subscriber_error(binary_name, &error),
+    };
+    let exit = run_parsed_cli(cli).await;
+    tracing.shutdown().await;
+    exit
 }
 
 async fn run_parsed_cli(cli: Cli) -> ExitCode {

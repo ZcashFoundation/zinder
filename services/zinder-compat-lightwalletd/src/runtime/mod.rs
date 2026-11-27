@@ -113,10 +113,7 @@ pub async fn main_from_env(binary_name: &str) -> ExitCode {
     if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
         return run_healthcheck(binary_name, healthcheck, cli.config_path.as_deref());
     }
-    if let Err(error) = install_tracing_subscriber() {
-        return emit_tracing_subscriber_error(binary_name, &error);
-    }
-    run_parsed_cli(cli).await
+    run_cli(binary_name, cli).await
 }
 
 /// Runs `zinder-compat-lightwalletd` from explicit CLI arguments when tracing
@@ -133,7 +130,7 @@ where
     if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
         return run_healthcheck(binary_name, healthcheck, cli.config_path.as_deref());
     }
-    run_parsed_cli(cli).await
+    run_cli(binary_name, cli).await
 }
 
 /// Supervises the lightwalletd compatibility adapter inside a parent runtime.
@@ -161,6 +158,25 @@ pub async fn serve_supervised(
 
 fn cpu_meets_baseline() -> bool {
     host_cpu_meets_compiled_baseline() && host_cpu_meets_pasta_backend_baseline()
+}
+
+async fn run_cli(binary_name: &str, cli: Cli) -> ExitCode {
+    if cli.print_config {
+        if let Err(error) = install_tracing_subscriber() {
+            return emit_tracing_subscriber_error(binary_name, &error);
+        }
+        return run_parsed_cli(cli).await;
+    }
+    let tracing = match zinder_runtime::install_runtime_tracing_subscriber(
+        RuntimeService::CompatLightwalletd,
+        cli.config_path.as_deref(),
+    ) {
+        Ok(tracing) => tracing,
+        Err(error) => return emit_tracing_subscriber_error(binary_name, &error),
+    };
+    let exit = run_parsed_cli(cli).await;
+    tracing.shutdown().await;
+    exit
 }
 
 async fn run_parsed_cli(cli: Cli) -> ExitCode {

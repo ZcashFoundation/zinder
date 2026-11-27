@@ -282,8 +282,13 @@ where
         } else {
             request
         };
-        let response = self.inner.call(request);
-        Either::Right(Box::pin(async move {
+        let response = if let Some(span) = rpc.span.as_ref() {
+            span.in_scope(|| self.inner.call(request))
+        } else {
+            self.inner.call(request)
+        };
+        let span = rpc.span.clone();
+        let observed = async move {
             match response.await {
                 Ok(response) => Ok(rpc.observe_response(response)),
                 Err(error) => {
@@ -292,7 +297,11 @@ where
                     Err(error)
                 }
             }
-        }))
+        };
+        Either::Right(match span {
+            Some(span) => Box::pin(tracing::Instrument::instrument(observed, span)),
+            None => Box::pin(observed),
+        })
     }
 }
 
@@ -376,6 +385,7 @@ impl WalletRpcMethod {
 }
 
 struct ObservedRpc {
+    span: Option<tracing::Span>,
     method: WalletRpcMethod,
     shape: RpcShape,
     in_flight: metrics::Gauge,
@@ -395,6 +405,7 @@ impl ObservedRpc {
             metrics::gauge!(IN_FLIGHT, "surface" => method.surface, "method" => method.name);
         in_flight.increment(1);
         Self {
+            span: crate::logging::wallet_rpc_span(method.surface, method.name),
             method,
             shape,
             in_flight,
@@ -579,9 +590,13 @@ impl http_body::Body for ObservedBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Status>>> {
         let this = &mut *self;
-        let frame = Pin::new(&mut this.body).poll_frame(cx);
         let Some(rpc) = &mut this.rpc else {
-            return frame;
+            return Pin::new(&mut this.body).poll_frame(cx);
+        };
+        let frame = if let Some(span) = &rpc.span {
+            span.in_scope(|| Pin::new(&mut this.body).poll_frame(cx))
+        } else {
+            Pin::new(&mut this.body).poll_frame(cx)
         };
         let outcome = match &frame {
             Poll::Pending => return frame,
