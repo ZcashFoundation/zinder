@@ -1002,14 +1002,19 @@ kind: fixed
 body: Correct an operator-visible release defect.
 time: 2026-11-27T10:00:00Z
 custom:
-  Bump: patch
+  Bump: minor
   PR: "24"
 YAML
 baseline_prepare_digest="$(sha256sum "$prepare_repository/CHANGELOG.md")"
-expect_rejected \
-  "prepare-changelog-release.sh with fragment missing Upgrade" \
-  env CHANGIE_BIN="$changie_bin" \
-  bash "$prepare_repository/scripts/prepare-changelog-release.sh" 0.28.0
+missing_upgrade_err="$temporary_directory/missing-upgrade.err"
+if env CHANGIE_BIN="$changie_bin" \
+  bash "$prepare_repository/scripts/prepare-changelog-release.sh" 0.28.0 \
+  >/dev/null 2>"$missing_upgrade_err"
+then
+  fail "prepare-changelog-release.sh with fragment missing Upgrade was admitted"
+fi
+grep -Fq 'missing custom.Upgrade' "$missing_upgrade_err" \
+  || fail "prepare-changelog-release.sh rejected missing Upgrade for the wrong reason: $(cat "$missing_upgrade_err")"
 [[ "$(sha256sum "$prepare_repository/CHANGELOG.md")" == "$baseline_prepare_digest" ]] \
   || fail "prepare-changelog-release.sh modified CHANGELOG.md after rejecting missing Upgrade"
 
@@ -1032,6 +1037,8 @@ set_prepare_product_version() {
   )
 }
 
+sed -i 's/Bump: minor/Bump: patch/' \
+  "$prepare_repository/.changes/unreleased/fixed-example.yaml"
 expect_rejected \
   "explicit version that differs from changie next auto" \
   env CHANGIE_BIN="$changie_bin" \
