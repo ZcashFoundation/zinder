@@ -56,7 +56,7 @@ enum RpcShape {
 }
 
 impl WalletRpcMetricsLayer {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::WalletQuery => "wallet_query",
             Self::Lightwalletd => "lightwalletd",
@@ -322,7 +322,7 @@ where
         let mut rpc = ObservedRpc::start(method, shape);
         rpc.deadline = request.extensions().get::<DeadlineExpiry>().cloned();
         if let Some(admissions) = self.range_admissions.as_ref().filter(|_| rpc.is_range()) {
-            match admissions.claim(&request, method.surface) {
+            match admissions.claim(&request, self.surface) {
                 Ok(permit) => rpc.range_permit = Some(permit),
                 Err(status) => {
                     rpc.outcome = Outcome::from_status(&status);

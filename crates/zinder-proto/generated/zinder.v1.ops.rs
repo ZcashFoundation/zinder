@@ -605,6 +605,10 @@ pub enum ErrorReason {
     /// tip than the reader's served tip, or consecutive pages disagreed at that
     /// tip. The node is up; retry after the `grpc-retry-pushback-ms` delay.
     ServedTipMismatch = 59,
+    /// UNAVAILABLE family.
+    /// The wallet listener refused a native block-range stream at admission.
+    /// Retry on the existing connection after the grpc-retry-pushback-ms delay.
+    BlockRangeAdmissionRefused = 60,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -673,6 +677,7 @@ impl ErrorReason {
             Self::NodeRateLimited => "NODE_RATE_LIMITED",
             Self::ForwardedReadLimitReached => "FORWARDED_READ_LIMIT_REACHED",
             Self::ServedTipMismatch => "SERVED_TIP_MISMATCH",
+            Self::BlockRangeAdmissionRefused => "BLOCK_RANGE_ADMISSION_REFUSED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -746,6 +751,7 @@ impl ErrorReason {
             "NODE_RATE_LIMITED" => Some(Self::NodeRateLimited),
             "FORWARDED_READ_LIMIT_REACHED" => Some(Self::ForwardedReadLimitReached),
             "SERVED_TIP_MISMATCH" => Some(Self::ServedTipMismatch),
+            "BLOCK_RANGE_ADMISSION_REFUSED" => Some(Self::BlockRangeAdmissionRefused),
             _ => None,
         }
     }

@@ -17,9 +17,11 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep_until};
 use tokio_util::task::AbortOnDropHandle;
 use tonic::{Status, body::Body, metadata::MetadataValue};
+use zinder_proto::{status_for_reason, v1::ops::ErrorReason};
 
 use super::{
-    ClientAddressSource, proxy_named_client, receive_slots::ClientFairnessKey, remote_address,
+    ClientAddressSource, WalletRpcMetricsLayer, proxy_named_client,
+    receive_slots::ClientFairnessKey, remote_address,
 };
 
 const MAX_TRACKED_CLIENTS: usize = 4096;
@@ -77,13 +79,18 @@ impl Refusal {
         }
     }
 
-    fn status(self) -> Status {
+    fn status(self, surface: WalletRpcMetricsLayer) -> Status {
         let message = match self {
             Self::ClientQuota => "block-range stream limit reached for this client",
             Self::ClientCapacity => "block-range client tracking limit reached",
             Self::SchedulingDelay => "runtime overloaded; retry the block range",
         };
-        let mut status = Status::unavailable(message);
+        let mut status = match surface {
+            WalletRpcMetricsLayer::WalletQuery => {
+                status_for_reason(ErrorReason::BlockRangeAdmissionRefused, message)
+            }
+            WalletRpcMetricsLayer::Lightwalletd => Status::unavailable(message),
+        };
         status
             .metadata_mut()
             .insert("grpc-retry-pushback-ms", MetadataValue::from_static("250"));
@@ -129,7 +136,7 @@ impl RangeAdmissions {
     pub(super) fn claim(
         self: &Arc<Self>,
         request: &Request<Body>,
-        surface: &'static str,
+        surface: WalletRpcMetricsLayer,
     ) -> Result<RangePermit, Status> {
         let peer = || remote_address(request).map(ClientFairnessKey::Connection);
         let client = match self.source {
@@ -139,9 +146,9 @@ impl RangeAdmissions {
             }
         };
         self.claim_client(client).map_err(|reason| {
-            metrics::counter!(RANGE_REFUSALS, "surface" => surface, "reason" => reason.label())
+            metrics::counter!(RANGE_REFUSALS, "surface" => surface.label(), "reason" => reason.label())
                 .increment(1);
-            reason.status()
+            reason.status(surface)
         })
     }
 

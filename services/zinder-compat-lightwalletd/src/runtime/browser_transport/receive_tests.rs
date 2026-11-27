@@ -1,6 +1,6 @@
 use std::{
     convert::Infallible,
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     sync::Arc,
     task::{Context, Waker},
     time::Duration,
@@ -9,12 +9,14 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use eyre::{OptionExt as _, Result, ensure};
 use http::{HeaderValue, Request, Response, header};
-use http_body::Frame;
+use http_body::{Body as _, Frame};
 use http_body_util::{BodyExt as _, StreamBody};
 use prost::{Message, bytes::Bytes};
 use tokio_stream::StreamExt as _;
 use tonic::{Code, Status, body::Body, transport::server::TcpConnectInfo};
-use tower::{Layer as _, Service, ServiceExt as _};
+use tonic_types::StatusExt as _;
+use tonic_web::GrpcWebLayer;
+use tower::{Layer as _, Service, ServiceExt as _, service_fn, util::Either};
 use zinder_core::Network;
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_server::CompactTxStreamerServer,
@@ -22,7 +24,7 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_query::RocksDbCanonicalReader;
 use zinder_runtime::{
     ClientAddressSource, GrpcRangeAdmission, GrpcReceiveLimitLayer, GrpcReceiveLimits,
-    MAX_UNCAPPED_ENUM_LIST_ELEMENTS, RepeatedFieldGuard,
+    MAX_UNCAPPED_ENUM_LIST_ELEMENTS, RepeatedFieldGuard, WalletRpcMetricsLayer,
 };
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
@@ -74,7 +76,11 @@ fn service(
 }
 
 fn request(method: &str, encoding: &'static str, body: Body) -> Result<Request<Body>> {
-    Ok(Request::post(format!("/{SERVICE_NAME}/{method}"))
+    browser_request(&format!("/{SERVICE_NAME}/{method}"), encoding, body)
+}
+
+fn browser_request(path: &str, encoding: &'static str, body: Body) -> Result<Request<Body>> {
+    Ok(Request::post(path)
         .version(http::Version::HTTP_11)
         .header(header::ORIGIN, WALLET_ORIGIN)
         .extension(TcpConnectInfo {
@@ -301,6 +307,109 @@ async fn browser_listener_records_the_native_status_and_block_count_in_both_enco
             exposition.lines().any(|line| line == sample),
             "{sample}\n{exposition}"
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn browser_range_refusals_preserve_status_pushback_and_rpc_counts() -> Result<()> {
+    for (surface, path, surface_label, method, error_class) in [
+        (
+            WalletRpcMetricsLayer::Lightwalletd,
+            "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
+            "lightwalletd",
+            "GetBlockRange",
+            "none",
+        ),
+        (
+            WalletRpcMetricsLayer::WalletQuery,
+            "/zinder.v1.wallet.WalletQuery/CompactBlocksInRange",
+            "wallet_query",
+            "CompactBlocksInRange",
+            "BLOCK_RANGE_ADMISSION_REFUSED",
+        ),
+    ] {
+        for (encoding, response_encoding) in [
+            ("application/grpc-web", ENCODINGS[0]),
+            ("application/grpc-web-text", ENCODINGS[1]),
+        ] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _metrics = metrics::set_default_local_recorder(&recorder);
+            let admission = surface
+                .with_range_admission(
+                    GrpcRangeAdmission {
+                        max_streams_per_client: NonZeroU32::MIN,
+                        ..GrpcRangeAdmission::default()
+                    },
+                    ClientAddressSource::Connection,
+                )
+                .layer(service_fn(|_| async {
+                    let body =
+                        StreamBody::new(tokio_stream::pending::<Result<Frame<Bytes>, Status>>());
+                    Ok::<_, Infallible>(Response::new(Body::new(body)))
+                }));
+            // Only the compatibility listener exposes gRPC-Web in production.
+            let web = match surface {
+                WalletRpcMetricsLayer::Lightwalletd => Either::Left(
+                    transport_layers(&[HeaderValue::from_static(WALLET_ORIGIN)]).layer(admission),
+                ),
+                WalletRpcMetricsLayer::WalletQuery => {
+                    Either::Right(GrpcWebLayer::new().layer(admission))
+                }
+            };
+            let request = || browser_request(path, encoding, Body::empty());
+            let held = web.clone().oneshot(request()?).await?;
+            assert!(!held.body().is_end_stream());
+
+            let refused = web.clone().oneshot(request()?).await?;
+            let status =
+                assert_response_error(refused, response_encoding, Code::Unavailable).await?;
+            assert_range_refusal_details(&status, surface, error_class)?;
+            let exposition = handle.render();
+            for sample in [
+                format!(
+                    r#"zinder_grpc_block_range_admission_refusals_total{{surface="{surface_label}",reason="client_quota"}} 1"#
+                ),
+                format!(
+                    r#"zinder_wallet_rpc_requests_total{{surface="{surface_label}",method="{method}",grpc_code="unavailable",error_class="{error_class}"}} 1"#
+                ),
+            ] {
+                assert!(
+                    exposition.lines().any(|line| line == sample),
+                    "{sample}\n{exposition}"
+                );
+            }
+
+            drop(held);
+            let resumed = web.oneshot(request()?).await?;
+            assert!(!resumed.body().is_end_stream());
+        }
+    }
+    Ok(())
+}
+
+fn assert_range_refusal_details(
+    status: &Status,
+    surface: WalletRpcMetricsLayer,
+    error_class: &str,
+) -> Result<()> {
+    assert_eq!(
+        status
+            .metadata()
+            .get("grpc-retry-pushback-ms")
+            .and_then(|header| header.to_str().ok()),
+        Some("250")
+    );
+    match surface {
+        WalletRpcMetricsLayer::Lightwalletd => assert!(status.get_details_error_info().is_none()),
+        WalletRpcMetricsLayer::WalletQuery => {
+            let error_info = status
+                .get_details_error_info()
+                .ok_or_eyre("missing native error info")?;
+            assert_eq!(error_info.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+            assert_eq!(error_info.reason, error_class);
+        }
     }
     Ok(())
 }
