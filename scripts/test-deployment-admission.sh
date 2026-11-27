@@ -502,6 +502,41 @@ expect_rejected \
   "a Compose contract publishing the private control port" \
   --compose-contract "$published_control_compose"
 
+published_projector_control_compose="$temporary_directory/published-projector-control-compose.json"
+jq '.services["zinder-index"].ports += [{"host_ip":"127.0.0.1","target":9101,"published":"9101","protocol":"tcp"}]' \
+  "$resolved_compose" > "$published_projector_control_compose"
+expect_rejected \
+  "a Compose contract publishing the private projector control port" \
+  --compose-contract "$published_projector_control_compose"
+
+missing_projector_control_compose="$temporary_directory/missing-projector-control-compose.json"
+jq 'del(.services["zinder-index"].environment.ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR)' \
+  "$resolved_compose" > "$missing_projector_control_compose"
+expect_rejected \
+  "a Compose contract disabling zinder-index projector control" \
+  --compose-contract "$missing_projector_control_compose"
+
+mismatched_projector_token_compose="$temporary_directory/mismatched-projector-token-compose.json"
+jq '.services["zinder-index"].environment.ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH = "/var/run/zinder-control/projector.token"' \
+  "$resolved_compose" > "$mismatched_projector_token_compose"
+expect_rejected \
+  "a Compose contract with mismatched projector and canonical checkpoint tokens" \
+  --compose-contract "$mismatched_projector_token_compose"
+
+serve_projector_control_compose="$temporary_directory/serve-projector-control-compose.json"
+jq '.services["zinder-serve"].environment.ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH = "/var/run/zinder-checkpoint/checkpoint.token"' \
+  "$resolved_compose" > "$serve_projector_control_compose"
+expect_rejected \
+  "a Compose contract exposing projector control configuration to zinder-serve" \
+  --compose-contract "$serve_projector_control_compose"
+
+legacy_publisher_subcommand_compose="$temporary_directory/legacy-publisher-subcommand-compose.json"
+jq '.services["zinder-history-publisher"].command += ["publish-shielded-history"]' \
+  "$resolved_compose_full" > "$legacy_publisher_subcommand_compose"
+expect_rejected \
+  "a Compose contract passing the legacy publish-shielded-history subcommand under zinder run" \
+  --compose-contract "$legacy_publisher_subcommand_compose"
+
 split_namespace_compose="$temporary_directory/split-namespace-compose.json"
 jq '.services["zinder-serve"].network_mode = null' \
   "$resolved_compose" > "$split_namespace_compose"

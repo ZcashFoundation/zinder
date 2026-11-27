@@ -190,10 +190,11 @@ validate_signed_history_compose_contract() {
       and (if $publisher != null then
           $publisher.network_mode == "none"
           and $publisher.image == $reader.image
-          and ($publisher.command | index("history-publisher") != null
-            and index("publish-shielded-history") != null
-            and index("--follow-interval-secs") != null
-            and index("--workers") != null)
+          and ($publisher.command[0] == "run"
+            and $publisher.command[1] == "history-publisher"
+            and ($publisher.command | index("publish-shielded-history") == null)
+            and ($publisher.command | index("--follow-interval-secs") != null)
+            and ($publisher.command | index("--workers") != null))
           and (($publisher.tmpfs // []) | any(. == "/tmp:rw,noexec,nosuid,size=512m"))
           and ($publisher | any(.volumes[]?; .type == "volume" and .source == "data" and .target == "/var/lib/zinder" and .read_only))
           and ($publisher | binds($generation + "/publisher.pk8"; $private_key; true))
@@ -290,7 +291,7 @@ if [[ -n "$compose_contract" ]]; then
     and (($services["zinder-index"].ports | map(.published) | unique | length) == 6)
     and (($services["zinder-index"].ports | map(.target) | sort) == [9067, 9068, 9070, 9102, 9105, 9108])
     and ([ $services[] | (.ports // [])[] ] | all(.host_ip == "127.0.0.1"))
-    and ([ $services[] | (.ports // [])[] | .target ] | index(9100) == null)
+    and ([ $services[] | (.ports // [])[] | .target ] | index(9100) == null and index(9101) == null)
     and (($services["zinder-index"].volumes // [])
       | any(.target == "/var/run/zinder-checkpoint/checkpoint.token" and .read_only == true))
     and (($services["zinder-serve"].volumes // [])
@@ -311,6 +312,8 @@ if [[ -n "$compose_contract" ]]; then
     and ($services["zinder-index"].environment.ZINDER_INGEST_CONTROL__LISTEN_ADDR == "127.0.0.1:9100")
     and ($services["zinder-index"].environment.ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH == "/var/run/zinder-control/ingest.token")
     and ($services["zinder-index"].environment.ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH == "/var/run/zinder-checkpoint/checkpoint.token")
+    and ($services["zinder-index"].environment.ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR == "127.0.0.1:9101")
+    and ($services["zinder-index"].environment.ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH == "/var/run/zinder-checkpoint/checkpoint.token")
     and ($services["zinder-index"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9105")
     and ($services["zinder-index"].environment.ZINDER_SECURITY__ALLOW_PUBLIC_BIND == "true")
     and (($services["zinder-index"].environment.ZINDER_INGEST__SOURCE | type) == "string"
@@ -325,6 +328,7 @@ if [[ -n "$compose_contract" ]]; then
     and ($services["zinder-serve"].environment.ZINDER_INGEST_CONTROL__ADDR == "http://127.0.0.1:9100")
     and ($services["zinder-serve"].environment.ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH == "/var/run/zinder-control/ingest.token")
     and (($services["zinder-serve"].environment // {}) | has("ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH") | not)
+    and ((($services["zinder-serve"].environment // {}) | keys | all(startswith("ZINDER_PROJECTOR_CONTROL__") | not)))
     and (($services["zinder-serve"].environment // {}) | has("ZINDER_INGEST__SOURCE") | not)
     and ((($services["zinder-serve"].environment // {}) | keys | all(startswith("ZINDER_NODE__INDEXER_TLS__") | not)))
     and ($services["zinder-serve"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9108")

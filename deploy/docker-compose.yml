@@ -99,6 +99,8 @@ services:
       ZINDER_INGEST_CONTROL__LISTEN_ADDR: "127.0.0.1:9100"
       ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH: /var/run/zinder-control/ingest.token
       ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH: /var/run/zinder-checkpoint/checkpoint.token
+      ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR: "127.0.0.1:9101"
+      ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH: /var/run/zinder-checkpoint/checkpoint.token
       # Namespace-wide binds are explicit deployment opt-ins. Host publication
       # below remains loopback-only, while Prometheus reaches ops internally.
       ZINDER_OPS__LISTEN_ADDR: "[::]:9105"
@@ -201,7 +203,6 @@ services:
       - /tmp/secondary
       - --reorg-window-blocks
       - "${ZINDER_COMPAT__REORG_WINDOW_BLOCKS:-1000}"
-      - publish-shielded-history
       - --directory
       - /var/lib/zinder-history
       - --signing-key
