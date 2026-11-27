@@ -30,6 +30,10 @@ Optional profiles:
 
 Stop or restart the stack with the same `--env-file` and `-f` arguments. Check readiness via `curl -sf http://127.0.0.1:9108/readyz` (or `:19108` on testnet, `:29108` on regtest).
 
+## Tor onion service
+
+The [Tor overlay](docker-compose.tor.yml) adds a Tor v3 sidecar on the shared Zinder loopback. Follow [Serve wallets over Tor](../docs/runbooks/tor-onion-service.md) to configure access and verify the wallet endpoints.
+
 ## Kubernetes
 
 [kubernetes/statefulset.yaml](kubernetes/statefulset.yaml) runs `zinder serve --preset wallet` in a single non-root `StatefulSet` (`UID 10001`, `fsGroup: 10001`, read-only root filesystem, ReadWriteOnce PVC at `/var/lib/zinder`, `startupProbe` and `livenessProbe` on `/healthz`, `readinessProbe` on `/readyz`).
