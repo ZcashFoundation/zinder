@@ -657,6 +657,7 @@ async fn serving_pair_compact_range_outside_retained_history_is_artifact_unavail
                 start_height,
                 end_height,
                 at_epoch_id: None,
+                pool_types: Vec::new(),
             }),
         )
         .await
@@ -735,6 +736,7 @@ async fn native_compact_block_streams_are_refused_past_the_stream_limit() -> eyr
             start_height: 1,
             end_height: 3,
             at_epoch_id: None,
+            pool_types: Vec::new(),
         })
     };
 

@@ -525,6 +525,41 @@ fn unused_wallet_method<T>() -> Result<Response<T>, Status> {
 
 #[tonic::async_trait]
 impl WalletQuery for ScriptedWalletQuery {
+    type CompactNullifiersInRangeStream = EmptyWalletStream<wallet::CompactNullifiersInRangeChunk>;
+    type TransparentAddressesUnspentOutputsStream = Self::TransparentAddressUnspentOutputsStream;
+
+    async fn compact_nullifiers_in_range(
+        &self,
+        _: Request<wallet::CompactNullifiersInRangeRequest>,
+    ) -> Result<Response<Self::CompactNullifiersInRangeStream>, Status> {
+        Err(Status::unimplemented(
+            "compact nullifier ranges are unavailable",
+        ))
+    }
+
+    async fn standard_fee(
+        &self,
+        _: Request<wallet::StandardFeeRequest>,
+    ) -> Result<Response<wallet::StandardFeeResponse>, Status> {
+        Err(Status::unimplemented("standard fee is unavailable"))
+    }
+
+    async fn transparent_address_balances(
+        &self,
+        _: Request<wallet::TransparentAddressBalancesRequest>,
+    ) -> Result<Response<wallet::TransparentAddressBalancesResponse>, Status> {
+        Err(Status::unimplemented("address balances are unavailable"))
+    }
+
+    async fn transparent_addresses_unspent_outputs(
+        &self,
+        _: Request<wallet::TransparentAddressesUnspentOutputsRequest>,
+    ) -> Result<Response<Self::TransparentAddressesUnspentOutputsStream>, Status> {
+        Err(Status::unimplemented(
+            "batched unspent outputs are unavailable",
+        ))
+    }
+
     type CompactBlocksInRangeStream = EmptyWalletStream<wallet::CompactBlocksInRangeChunk>;
     type FullBlocksInRangeStream = EmptyWalletStream<wallet::FullBlocksInRangeChunk>;
     type ChainEventsStream = EmptyWalletStream<wallet::ChainEventEnvelope>;

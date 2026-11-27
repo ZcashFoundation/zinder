@@ -1875,3 +1875,72 @@ fn transaction_absence_survives_status_detail_bytes() -> eyre::Result<()> {
     assert_eq!(TransactionAbsence::from_status(&received)?, Some(absence));
     Ok(())
 }
+
+#[test]
+fn compact_scan_and_transparent_batches_round_trip_through_prost() -> eyre::Result<()> {
+    let pools = [
+        zinder_core::CompactPool::Sapling,
+        zinder_core::CompactPool::Ironwood,
+    ]
+    .map(|pool| zinder_proto::wire::compact_pool_message(pool) as i32)
+    .to_vec();
+    let request = wallet::CompactBlocksInRangeRequest {
+        start_height: 42,
+        end_height: 40,
+        at_epoch_id: Some(7),
+        pool_types: pools.clone(),
+    };
+    assert_eq!(round_trip(&request)?, request);
+    let request = wallet::CompactNullifiersInRangeRequest {
+        start_height: 42,
+        end_height: 40,
+        at_epoch_id: Some(7),
+        pool_types: pools,
+    };
+    assert_eq!(round_trip(&request)?, request);
+    let block = zinder_core::CompactBlockNullifiers {
+        height: BlockHeight::new(42),
+        block_hash: BlockHash::from_bytes([1; 32]),
+        previous_block_hash: BlockHash::from_bytes([2; 32]),
+        time: 123,
+        transactions: vec![zinder_core::CompactTransactionNullifiers {
+            index: 1,
+            transaction_id: TransactionId::from_bytes([3; 32]),
+            sapling_nullifiers: vec![[4; 32]],
+            orchard_nullifiers: Vec::new(),
+            ironwood_nullifiers: vec![[5; 32]],
+        }],
+    };
+    let message = zinder_proto::wire::compact_block_nullifiers_message(&block);
+    assert_eq!(
+        zinder_proto::wire::compact_block_nullifiers_from_message(round_trip(&message)?)?,
+        block,
+    );
+    let fee =
+        zinder_core::StandardFee::new(5_000, 1).ok_or_else(|| eyre!("invalid fixture fee"))?;
+    let message = zinder_proto::wire::standard_fee_message(fee);
+    assert_eq!(
+        zinder_proto::wire::standard_fee_from_message(round_trip(&message)?),
+        Some(fee)
+    );
+
+    let addresses = [[6; 32], [7; 32]]
+        .map(|script_hash| wallet::AddressLookup {
+            selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                script_hash.to_vec(),
+            )),
+        })
+        .to_vec();
+    let request = wallet::TransparentAddressBalancesRequest {
+        addresses: addresses.clone(),
+        at_epoch_id: Some(7),
+    };
+    assert_eq!(round_trip(&request)?, request);
+    let request = wallet::TransparentAddressesUnspentOutputsRequest {
+        addresses,
+        at_epoch_id: Some(7),
+        start_height: 40,
+    };
+    assert_eq!(round_trip(&request)?, request);
+    Ok(())
+}

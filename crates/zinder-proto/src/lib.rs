@@ -22,7 +22,7 @@ pub use error_policy::{
 /// existing wire surface are revised in place. Consumers require the minimum
 /// revision they implement and may accept newer revisions when the server's
 /// advertised capabilities satisfy their requirements.
-pub const CONTRACT_REVISION: u32 = 15;
+pub const CONTRACT_REVISION: u32 = 16;
 
 /// Milliseconds an ingest-control caller can wait for `MempoolEvents` response
 /// headers. Unlike a gRPC deadline, this budget ends once the stream opens.

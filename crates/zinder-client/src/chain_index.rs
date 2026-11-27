@@ -9,15 +9,16 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
-    ChainEpoch, ChainEpochId, CompactBlockArtifact, NetworkUpgradeActivations, SubtreeRootArtifact,
-    SubtreeRootRange, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutpointSpendStatus,
-    TransparentUnspentOutput, TreeStateArtifact, TxStatus,
+    ChainEpoch, ChainEpochId, CompactBlockArtifact, CompactBlockNullifiers, CompactPool,
+    NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange, TransactionId,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TransparentUnspentOutput,
+    TreeStateArtifact, TxStatus,
 };
 #[cfg(feature = "remote")]
 use zinder_core::{
     BlockHash, ChainValuePoolsAtTip, MempoolEntry, MempoolEvictionReason, RawTransactionBytes,
-    TransactionBroadcastOutcome,
+    StandardFee, TransactionBroadcastOutcome,
 };
 
 /// Chain-event stream selected by a subscription.
@@ -276,6 +277,33 @@ pub enum MempoolEvent {
 #[cfg(feature = "remote")]
 pub type MempoolEventStream = IndexStream<MempoolEventEnvelope>;
 
+/// An inclusive compact scan in the order of its height endpoints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactRangeQuery {
+    /// First height to scan.
+    pub start_height: BlockHeight,
+    /// Last height to scan. May be below the start height.
+    pub end_height: BlockHeight,
+    /// Pools to include. Empty includes every pool supported by the scan.
+    /// Nullifier scans accept shielded pools.
+    pub pools: Vec<CompactPool>,
+    /// Optional chain epoch to read.
+    pub at_epoch_id: Option<ChainEpochId>,
+}
+
+impl CompactRangeQuery {
+    /// Selects every pool for a scan from the first height through the last.
+    #[must_use]
+    pub const fn new(start_height: BlockHeight, end_height: BlockHeight) -> Self {
+        Self {
+            start_height,
+            end_height,
+            pools: Vec::new(),
+            at_epoch_id: None,
+        }
+    }
+}
+
 /// Read parameters for [`ChainIndex::transparent_address_unspent_outputs`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentAddressUnspentOutputsQuery {
@@ -378,11 +406,11 @@ pub struct TransparentOutpointSpendStatuses {
 /// stops retaining that epoch. On that error, capture a new snapshot and
 /// restart the whole operation.
 ///
-/// Zinder's wallet-serving runtime keeps serving an epoch for one minute after
-/// a newer epoch replaces it, however fast later blocks arrive. Reads that
+/// Zinder's wallet-serving runtime keeps serving an exposed epoch for the
+/// endpoint's configured retention window after replacement. Reads that
 /// send the snapshot's epoch id with the request, such as
-/// [`Self::transparent_address_unspent_outputs`], therefore finish on one view
-/// across new blocks when the operation ends within that minute. The first
+/// [`Self::transparent_address_unspent_outputs`], share one view across new
+/// blocks while the operation stays inside that window. The first
 /// page of [`Self::transparent_address_tx_ids_in_range`] sends no epoch id:
 /// the server answers it from its current epoch, so it fails once a newer
 /// epoch is published. Its continuation pages resume on the epoch that issued
@@ -557,6 +585,49 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
     ) -> Result<TxStatus, IndexerError> {
         self.chain_index
             .transaction_by_id(transaction_id, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Streams compact blocks in endpoint order from the captured epoch.
+    pub async fn scan_compact_blocks(
+        &self,
+        mut query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
+        query.at_epoch_id = Some(self.chain_epoch.id);
+        self.chain_index.scan_compact_blocks(query).await
+    }
+
+    /// Streams selected shielded nullifiers from the captured epoch.
+    pub async fn scan_compact_nullifiers(
+        &self,
+        mut query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockNullifiers>, IndexerError> {
+        query.at_epoch_id = Some(self.chain_epoch.id);
+        self.chain_index.scan_compact_nullifiers(query).await
+    }
+
+    /// Returns the confirmed balance across the selected addresses.
+    pub async fn transparent_address_balances(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+    ) -> Result<TransparentAddressBalance, IndexerError> {
+        self.chain_index
+            .transparent_address_balances(addresses, Some(self.chain_epoch.id))
+            .await
+    }
+
+    /// Streams the complete unspent set for the selected addresses.
+    pub async fn transparent_addresses_unspent_outputs(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+        start_height: BlockHeight,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
+        self.chain_index
+            .transparent_addresses_unspent_outputs(
+                addresses,
+                start_height,
+                Some(self.chain_epoch.id),
+            )
             .await
     }
 
@@ -795,6 +866,43 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
         transaction_id: TransactionId,
     ) -> Result<TxStatus, IndexerError> {
         self.borrowed().transaction_by_id(transaction_id).await
+    }
+
+    /// Streams compact blocks in endpoint order from the captured epoch.
+    pub async fn scan_compact_blocks(
+        &self,
+        query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
+        self.borrowed().scan_compact_blocks(query).await
+    }
+
+    /// Streams selected shielded nullifiers from the captured epoch.
+    pub async fn scan_compact_nullifiers(
+        &self,
+        query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockNullifiers>, IndexerError> {
+        self.borrowed().scan_compact_nullifiers(query).await
+    }
+
+    /// Returns the confirmed balance across the selected addresses.
+    pub async fn transparent_address_balances(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+    ) -> Result<TransparentAddressBalance, IndexerError> {
+        self.borrowed()
+            .transparent_address_balances(addresses)
+            .await
+    }
+
+    /// Streams the complete unspent set for the selected addresses.
+    pub async fn transparent_addresses_unspent_outputs(
+        &self,
+        addresses: &[TransparentAddressScriptHash],
+        start_height: BlockHeight,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
+        self.borrowed()
+            .transparent_addresses_unspent_outputs(addresses, start_height)
+            .await
     }
 
     /// Streams one address's unspent outputs from the captured epoch.
@@ -1220,6 +1328,78 @@ pub trait ChainIndex: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError>;
 
+    /// Scans compact blocks in the requested order with the selected pools.
+    ///
+    /// A successful stream covers every requested height at one chain epoch.
+    /// For descending requests, set `start_height` above `end_height`.
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, ChainIndex, CompactPool, CompactRangeQuery, IndexerError};
+    /// # async fn scan<T: ChainIndex>(index: &T) -> Result<(), IndexerError> {
+    /// let snapshot = index.snapshot().await?;
+    /// let mut query = CompactRangeQuery::new(BlockHeight::new(200), BlockHeight::new(101));
+    /// query.pools = vec![CompactPool::Orchard];
+    /// let _blocks = snapshot.scan_compact_blocks(query).await?;
+    /// # Ok(()) }
+    /// ```
+    async fn scan_compact_blocks(
+        &self,
+        query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockArtifact>, IndexerError> {
+        if query.start_height <= query.end_height && query.pools.is_empty() {
+            return self
+                .compact_blocks_in_range(
+                    BlockHeightRange::inclusive(query.start_height, query.end_height),
+                    query.at_epoch_id,
+                )
+                .await;
+        }
+        Err(IndexerError::FailedPrecondition {
+            reason: "the chain index does not support descending or pool-filtered scans".to_owned(),
+        })
+    }
+
+    /// Scans shielded nullifiers in block and transaction order at one epoch.
+    ///
+    /// This stream carries block identities and selected nullifiers for spend
+    /// detection. It can scan heights in either direction.
+    async fn scan_compact_nullifiers(
+        &self,
+        _query: CompactRangeQuery,
+    ) -> Result<IndexStream<CompactBlockNullifiers>, IndexerError> {
+        Err(IndexerError::FailedPrecondition {
+            reason: "the chain index does not support compact nullifier scans".to_owned(),
+        })
+    }
+
+    /// Returns the confirmed balance across a bounded address batch at one epoch.
+    ///
+    /// Supply 1 to 256 script hashes. Duplicate addresses count once.
+    async fn transparent_address_balances(
+        &self,
+        _addresses: &[TransparentAddressScriptHash],
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressBalance, IndexerError> {
+        Err(IndexerError::FailedPrecondition {
+            reason: "the chain index does not support transparent address balances".to_owned(),
+        })
+    }
+
+    /// Streams the complete unspent set across a bounded address batch at one epoch.
+    ///
+    /// Supply 1 to 256 script hashes. Outputs are grouped by each distinct
+    /// address in first-seen order. The mined height floor applies to every address.
+    async fn transparent_addresses_unspent_outputs(
+        &self,
+        _addresses: &[TransparentAddressScriptHash],
+        _start_height: BlockHeight,
+        _at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentAddressUnspentOutputsStream, IndexerError> {
+        Err(IndexerError::FailedPrecondition {
+            reason: "the chain index does not support batched transparent outputs".to_owned(),
+        })
+    }
+
     /// Streams the complete unspent transparent output set for one
     /// transparent address at a single pinned chain epoch.
     ///
@@ -1347,6 +1527,13 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// # let _ = descriptor; Ok(()) }
     /// ```
     async fn server_info(&self) -> Result<ServerInfo, IndexerError>;
+
+    /// Reads the recommended fee per logical action from a verified upstream node.
+    async fn standard_fee(&self) -> Result<StandardFee, IndexerError> {
+        Err(IndexerError::FailedPrecondition {
+            reason: "the endpoint does not support standard fee reads".to_owned(),
+        })
+    }
 
     /// Reads chain-wide value-pool totals at the upstream node's current tip.
     ///

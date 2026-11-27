@@ -9,11 +9,13 @@ use zinder_core::wire::{
 };
 use zinder_core::{
     ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, BlockId, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
-    CompactSaplingSpend, CompactShieldedAction, CompactTransaction, CompactTransactionData,
+    ChainTipMetadata, CompactBlockArtifact, CompactBlockNullifiers, CompactChainMetadata,
+    CompactPool, CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction,
+    CompactTransaction, CompactTransactionData, CompactTransactionNullifiers,
     CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolObservation,
-    RawTransactionBytes, TransactionId, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint, TransparentOutpointSpendStatus, UnixTimestampMillis,
+    RawTransactionBytes, StandardFee, TransactionId, TransparentMempoolOutput,
+    TransparentMempoolSpend, TransparentOutPoint, TransparentOutpointSpendStatus,
+    UnixTimestampMillis,
 };
 
 use crate::v1::wallet;
@@ -100,6 +102,17 @@ impl WalletWireDecodeError {
 /// Encodes one structured compact block.
 #[must_use]
 pub fn compact_block_message(block: &CompactBlockArtifact) -> wallet::CompactBlock {
+    compact_block_message_for_pools(block, &[])
+}
+
+/// Encodes a compact block with only the requested pools' scan fields.
+///
+/// The block identity and commitment-tree sizes describe the full block.
+#[must_use]
+pub fn compact_block_message_for_pools(
+    block: &CompactBlockArtifact,
+    pools: &[CompactPool],
+) -> wallet::CompactBlock {
     wallet::CompactBlock {
         height: block.height().value(),
         block_hash: encode_rpc_block_hash_hex(block.block_hash()),
@@ -108,10 +121,25 @@ pub fn compact_block_message(block: &CompactBlockArtifact) -> wallet::CompactBlo
         transactions: block
             .transactions()
             .iter()
-            .map(|transaction| wallet::CompactTransaction {
-                index: transaction.index,
-                transaction_id: encode_internal_transaction_id(transaction.transaction_id).to_vec(),
-                data: Some(compact_transaction_data_message(&transaction.data)),
+            .filter_map(|transaction| {
+                let scan_fields =
+                    compact_transaction_data_message_for_pools(&transaction.data, pools);
+                if !pools.is_empty()
+                    && scan_fields.sapling_spends.is_empty()
+                    && scan_fields.sapling_outputs.is_empty()
+                    && scan_fields.orchard_actions.is_empty()
+                    && scan_fields.ironwood_actions.is_empty()
+                    && scan_fields.transparent_inputs.is_empty()
+                    && scan_fields.transparent_outputs.is_empty()
+                {
+                    return None;
+                }
+                Some(wallet::CompactTransaction {
+                    index: transaction.index,
+                    transaction_id: encode_internal_transaction_id(transaction.transaction_id)
+                        .to_vec(),
+                    data: Some(scan_fields),
+                })
             })
             .collect(),
         chain_metadata: Some(wallet::CompactChainMetadata {
@@ -190,11 +218,24 @@ pub fn decode_compact_block(encoded: &[u8]) -> Result<CompactBlockArtifact, Wall
 pub fn compact_transaction_data_message(
     scan_data: &CompactTransactionData,
 ) -> wallet::CompactTransactionData {
+    compact_transaction_data_message_for_pools(scan_data, &[])
+}
+
+fn compact_transaction_data_message_for_pools(
+    scan_data: &CompactTransactionData,
+    pools: &[CompactPool],
+) -> wallet::CompactTransactionData {
+    let includes = |pool| pools.is_empty() || pools.contains(&pool);
     wallet::CompactTransactionData {
         fee_zat: scan_data.fee_zat,
         sapling_spends: scan_data
             .sapling_spends
             .iter()
+            .take(if includes(CompactPool::Sapling) {
+                usize::MAX
+            } else {
+                0
+            })
             .map(|spend| wallet::CompactSaplingSpend {
                 nullifier: spend.nullifier.to_vec(),
             })
@@ -202,6 +243,11 @@ pub fn compact_transaction_data_message(
         sapling_outputs: scan_data
             .sapling_outputs
             .iter()
+            .take(if includes(CompactPool::Sapling) {
+                usize::MAX
+            } else {
+                0
+            })
             .map(|output| wallet::CompactSaplingOutput {
                 commitment: output.commitment.to_vec(),
                 ephemeral_key: output.ephemeral_key.to_vec(),
@@ -211,16 +257,31 @@ pub fn compact_transaction_data_message(
         orchard_actions: scan_data
             .orchard_actions
             .iter()
+            .take(if includes(CompactPool::Orchard) {
+                usize::MAX
+            } else {
+                0
+            })
             .map(compact_action_message)
             .collect(),
         ironwood_actions: scan_data
             .ironwood_actions
             .iter()
+            .take(if includes(CompactPool::Ironwood) {
+                usize::MAX
+            } else {
+                0
+            })
             .map(compact_action_message)
             .collect(),
         transparent_inputs: scan_data
             .transparent_inputs
             .iter()
+            .take(if includes(CompactPool::Transparent) {
+                usize::MAX
+            } else {
+                0
+            })
             .map(|input| wallet::CompactTransparentInput {
                 previous_transaction_id: encode_internal_transaction_id(
                     input.previous_transaction_id,
@@ -232,6 +293,11 @@ pub fn compact_transaction_data_message(
         transparent_outputs: scan_data
             .transparent_outputs
             .iter()
+            .take(if includes(CompactPool::Transparent) {
+                usize::MAX
+            } else {
+                0
+            })
             .map(|output| wallet::CompactTransparentOutput {
                 value_zat: output.value_zat,
                 script_pub_key: output.script_pub_key.clone(),
@@ -662,5 +728,189 @@ fn decode_auth_digest(
     decode_rpc_auth_digest_hex(encoded).map_err(|error| WalletWireDecodeError::InvalidRpcHex {
         field,
         reason: error.to_string(),
+    })
+}
+
+/// Encodes a compact scan pool for a native request.
+#[must_use]
+pub const fn compact_pool_message(pool: CompactPool) -> wallet::CompactPool {
+    match pool {
+        CompactPool::Sapling => wallet::CompactPool::Sapling,
+        CompactPool::Orchard => wallet::CompactPool::Orchard,
+        CompactPool::Ironwood => wallet::CompactPool::Ironwood,
+        CompactPool::Transparent => wallet::CompactPool::Transparent,
+    }
+}
+
+/// Decodes a compact scan pool. Unspecified and unrecognized values return `None`.
+#[must_use]
+pub fn compact_pool_from_message(pool: i32) -> Option<CompactPool> {
+    match wallet::CompactPool::try_from(pool).ok()? {
+        wallet::CompactPool::Sapling => Some(CompactPool::Sapling),
+        wallet::CompactPool::Orchard => Some(CompactPool::Orchard),
+        wallet::CompactPool::Ironwood => Some(CompactPool::Ironwood),
+        wallet::CompactPool::Transparent => Some(CompactPool::Transparent),
+        wallet::CompactPool::Unspecified => None,
+    }
+}
+
+/// Encodes a verified node's recommended marginal fee.
+#[must_use]
+pub const fn standard_fee_message(fee: StandardFee) -> wallet::StandardFeeResponse {
+    wallet::StandardFeeResponse {
+        fee_zat: fee.fee_zat(),
+        estimator_version: fee.estimator_version(),
+    }
+}
+
+/// Decodes a marginal fee. A zero fee is invalid.
+#[must_use]
+pub const fn standard_fee_from_message(
+    message: wallet::StandardFeeResponse,
+) -> Option<StandardFee> {
+    StandardFee::new(message.fee_zat, message.estimator_version)
+}
+
+/// Encodes a canonical block's selected shielded nullifiers.
+#[must_use]
+pub fn compact_block_nullifiers_message(
+    block: &CompactBlockNullifiers,
+) -> wallet::CompactBlockNullifiers {
+    wallet::CompactBlockNullifiers {
+        height: block.height.value(),
+        block_hash: encode_rpc_block_hash_hex(block.block_hash),
+        previous_block_hash: encode_rpc_block_hash_hex(block.previous_block_hash),
+        time: block.time,
+        transactions: block
+            .transactions
+            .iter()
+            .map(|tx| wallet::CompactTransactionNullifiers {
+                index: tx.index,
+                transaction_id: encode_internal_transaction_id(tx.transaction_id).to_vec(),
+                sapling_nullifiers: tx.sapling_nullifiers.iter().map(|nf| nf.to_vec()).collect(),
+                orchard_nullifiers: tx.orchard_nullifiers.iter().map(|nf| nf.to_vec()).collect(),
+                ironwood_nullifiers: tx
+                    .ironwood_nullifiers
+                    .iter()
+                    .map(|nf| nf.to_vec())
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Decodes a canonical block's selected shielded nullifiers.
+pub fn compact_block_nullifiers_from_message(
+    block: wallet::CompactBlockNullifiers,
+) -> Result<CompactBlockNullifiers, WalletWireDecodeError> {
+    let transactions = block
+        .transactions
+        .into_iter()
+        .map(|tx| {
+            Ok(CompactTransactionNullifiers {
+                index: tx.index,
+                transaction_id: TransactionId::from_bytes(fixed_bytes(
+                    "nullifiers.transaction_id",
+                    tx.transaction_id,
+                )?),
+                sapling_nullifiers: decode_nullifiers(
+                    "nullifiers.sapling_nullifiers",
+                    tx.sapling_nullifiers,
+                )?,
+                orchard_nullifiers: decode_nullifiers(
+                    "nullifiers.orchard_nullifiers",
+                    tx.orchard_nullifiers,
+                )?,
+                ironwood_nullifiers: decode_nullifiers(
+                    "nullifiers.ironwood_nullifiers",
+                    tx.ironwood_nullifiers,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if transactions
+        .windows(2)
+        .any(|pair| pair[0].index >= pair[1].index)
+    {
+        return Err(WalletWireDecodeError::InvalidCompactTransactionOrder);
+    }
+    Ok(CompactBlockNullifiers {
+        height: BlockHeight::new(block.height),
+        block_hash: decode_block_hash("nullifiers.block_hash", &block.block_hash)?,
+        previous_block_hash: decode_block_hash(
+            "nullifiers.previous_block_hash",
+            &block.previous_block_hash,
+        )?,
+        time: block.time,
+        transactions,
+    })
+}
+
+fn decode_nullifiers(
+    field: &'static str,
+    nullifiers: Vec<Vec<u8>>,
+) -> Result<Vec<[u8; 32]>, WalletWireDecodeError> {
+    nullifiers
+        .into_iter()
+        .map(|nf| fixed_bytes(field, nf))
+        .collect()
+}
+
+/// Decodes a stored nullifier projection from a canonical shielded block segment.
+///
+/// `encoded` is the protobuf payload without the gRPC length prefix.
+pub fn decode_projected_block_nullifiers(
+    encoded: &[u8],
+) -> Result<CompactBlockNullifiers, WalletWireDecodeError> {
+    let block = crate::compat::lightwalletd::CompactBlock::decode(encoded).map_err(|_| {
+        WalletWireDecodeError::MalformedMessage {
+            field: "projected_block_nullifiers",
+        }
+    })?;
+    let mut transactions = Vec::with_capacity(block.vtx.len());
+    for tx in block.vtx {
+        if tx.spends.is_empty() && tx.actions.is_empty() && tx.ironwood_actions.is_empty() {
+            continue;
+        }
+        transactions.push(CompactTransactionNullifiers {
+            index: tx.index,
+            transaction_id: TransactionId::from_bytes(fixed_bytes(
+                "nullifiers.transaction_id",
+                tx.txid,
+            )?),
+            sapling_nullifiers: decode_nullifiers(
+                "nullifiers.sapling_nullifiers",
+                tx.spends.into_iter().map(|spend| spend.nf).collect(),
+            )?,
+            orchard_nullifiers: decode_nullifiers(
+                "nullifiers.orchard_nullifiers",
+                tx.actions
+                    .into_iter()
+                    .map(|action| action.nullifier)
+                    .collect(),
+            )?,
+            ironwood_nullifiers: decode_nullifiers(
+                "nullifiers.ironwood_nullifiers",
+                tx.ironwood_actions
+                    .into_iter()
+                    .map(|action| action.nullifier)
+                    .collect(),
+            )?,
+        });
+    }
+    Ok(CompactBlockNullifiers {
+        height: BlockHeight::new(u32::try_from(block.height).map_err(|_| {
+            WalletWireDecodeError::Overflow {
+                field: "nullifiers.height",
+                target: "u32",
+            }
+        })?),
+        block_hash: BlockHash::from_bytes(fixed_bytes("nullifiers.block_hash", block.hash)?),
+        previous_block_hash: BlockHash::from_bytes(fixed_bytes(
+            "nullifiers.previous_block_hash",
+            block.prev_hash,
+        )?),
+        time: block.time,
+        transactions,
     })
 }

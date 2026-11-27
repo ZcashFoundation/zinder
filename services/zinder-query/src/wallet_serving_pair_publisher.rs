@@ -6493,6 +6493,7 @@ mod tests {
                 start_height: visible_tip.height.value(),
                 end_height: visible_tip.height.value(),
                 at_epoch_id: Some(visible_tip.chain_epoch.id.value()),
+                pool_types: Vec::new(),
             })
             .await?
             .into_inner();

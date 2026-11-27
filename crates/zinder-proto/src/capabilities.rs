@@ -34,6 +34,17 @@ pub const WALLET_READ_COMPACT_BLOCK_AT_V2: &str = "wallet.read.compact_block_at_
 /// Since contract revision 7, the stream sends one leading `ChainView` header
 /// and then one bare compact block per requested height.
 pub const WALLET_READ_COMPACT_BLOCK_RANGE_V2: &str = "wallet.read.compact_block_range_v2";
+/// Descending ranges and pool selection on `WalletQuery.CompactBlocksInRange`.
+pub const WALLET_READ_COMPACT_BLOCK_RANGE_V3: &str = "wallet.read.compact_block_range_v3";
+/// Capability advertised for `WalletQuery.CompactNullifiersInRange`.
+pub const WALLET_READ_COMPACT_NULLIFIER_RANGE_V1: &str = "wallet.read.compact_nullifier_range_v1";
+/// Capability advertised for `WalletQuery.StandardFee`.
+pub const WALLET_READ_STANDARD_FEE_V1: &str = "wallet.read.standard_fee_v1";
+/// Capability advertised for `WalletQuery.TransparentAddressBalances`.
+pub const WALLET_ADDRESS_TRANSPARENT_BALANCES_V1: &str = "wallet.address.transparent_balances_v1";
+/// Capability advertised for `WalletQuery.TransparentAddressesUnspentOutputs`.
+pub const WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1: &str =
+    "wallet.address.transparent_batch_unspent_outputs_v1";
 /// Field capability gating native `ironwood_actions` and
 /// `ironwood_commitment_tree_size` structured compact-block fields.
 ///
@@ -727,6 +738,36 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.CompactBlocksInRange"),
         AdvertisePolicy::AlwaysOn,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_COMPACT_BLOCK_RANGE_V3,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.CompactBlocksInRange"),
+        AdvertisePolicy::Unserved,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_COMPACT_NULLIFIER_RANGE_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.CompactNullifiersInRange"),
+        AdvertisePolicy::Unserved,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_STANDARD_FEE_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.StandardFee"),
+        AdvertisePolicy::Unserved,
+    ),
+    CapabilitySpec::new(
+        WALLET_ADDRESS_TRANSPARENT_BALANCES_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentAddressBalances"),
+        AdvertisePolicy::Unserved,
+    ),
+    CapabilitySpec::new(
+        WALLET_ADDRESS_TRANSPARENT_BATCH_UNSPENT_OUTPUTS_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentAddressesUnspentOutputs"),
+        AdvertisePolicy::Unserved,
     ),
     CapabilitySpec::new(
         WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2,

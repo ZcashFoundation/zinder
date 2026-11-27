@@ -31,8 +31,10 @@ const UNCAPABILITIED_METHODS: &[&str] = &[];
 
 /// RPCs whose additive protocol revision is intentionally advertised beside
 /// its predecessor on the same method.
-const VERSIONED_CAPABILITY_METHODS: &[&str] =
-    &["zinder.v1.explorer.ExplorerQuery.TransactionHistory"];
+const VERSIONED_CAPABILITY_METHODS: &[&str] = &[
+    "zinder.v1.explorer.ExplorerQuery.TransactionHistory",
+    "zinder.v1.wallet.WalletQuery.CompactBlocksInRange",
+];
 
 /// Proto service names that back each capability surface.
 const SURFACE_SERVICES: &[(CapabilitySurface, &str)] = &[

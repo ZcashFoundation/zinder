@@ -449,6 +449,7 @@ async fn native_grpc_service_checks_range_limit_before_opening_reader() -> eyre:
             start_height: 1,
             end_height: over_limit,
             at_epoch_id: None,
+            pool_types: Vec::new(),
         }),
     )
     .await
@@ -1593,6 +1594,7 @@ async fn read_wallet_grpc_responses(
             start_height: 1,
             end_height: 1,
             at_epoch_id: None,
+            pool_types: Vec::new(),
         }),
     )
     .await?

@@ -77,8 +77,12 @@ async fn native_listener_counts_readiness_refusals_and_completed_ranges_once() -
         start_height: 1,
         end_height: 2,
         at_epoch_id: None,
+        pool_types: Vec::new(),
     };
-    let mut chunks = client.compact_blocks_in_range(range).await?.into_inner();
+    let mut chunks = client
+        .compact_blocks_in_range(range.clone())
+        .await?
+        .into_inner();
     let mut received = 0;
     while chunks.message().await?.is_some() {
         received += 1;
@@ -117,7 +121,7 @@ async fn compare_gate_and_stream_shutdown(
 
     readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
     let refused = client
-        .compact_blocks_in_range(range)
+        .compact_blocks_in_range(range.clone())
         .await
         .err()
         .ok_or_else(|| eyre!("closed gate served a range"))?;
@@ -150,6 +154,7 @@ fn release_native_reads_record_query_request_samples() -> eyre::Result<()> {
                 start_height: 1,
                 end_height: 1001,
                 at_epoch_id: None,
+                pool_types: Vec::new(),
             }),
         )
         .await;

@@ -3284,6 +3284,7 @@ mod compact_block_stream_tests {
             start_height: 1,
             end_height,
             at_epoch_id: None,
+            pool_types: Vec::new(),
         })
     }
 
