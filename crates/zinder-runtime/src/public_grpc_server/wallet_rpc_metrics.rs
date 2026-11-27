@@ -4,6 +4,7 @@
 use std::{
     cell::RefCell,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Instant,
 };
@@ -21,8 +22,11 @@ use zinder_proto::{
     v1::{ops::ErrorReason, wallet},
 };
 
-use super::MessageBoundaries;
-use super::grpc_timeout::DeadlineExpiry;
+use super::{
+    ClientAddressSource, GrpcRangeAdmission, MessageBoundaries,
+    grpc_timeout::DeadlineExpiry,
+    range_admission::{RangeAdmissions, RangePermit},
+};
 
 const REQUESTS: &str = "zinder_wallet_rpc_requests_total";
 const READINESS_REFUSALS: &str = "zinder_wallet_rpc_readiness_refusals_total";
@@ -116,6 +120,22 @@ impl WalletRpcMetricsLayer {
                 ("GetStandardFee", Unary),
                 ("Ping", Unary),
             ],
+        }
+    }
+
+    /// Adds per-client block-range admission to wallet RPC metrics. Use the
+    /// same address source as the listener and apply the layer inside transport
+    /// translation.
+    #[must_use]
+    pub fn with_range_admission<S>(
+        self,
+        policy: GrpcRangeAdmission,
+        source: ClientAddressSource,
+    ) -> impl Layer<S, Service = WalletRpcMetrics<S>> + Clone {
+        WalletRangeAdmissionLayer {
+            surface: self,
+            policy,
+            source,
         }
     }
 
@@ -233,7 +253,29 @@ impl<S> Layer<S> for WalletRpcMetricsLayer {
         WalletRpcMetrics {
             inner,
             surface: *self,
+            range_admissions: None,
         }
+    }
+}
+
+#[derive(Clone)]
+struct WalletRangeAdmissionLayer {
+    surface: WalletRpcMetricsLayer,
+    policy: GrpcRangeAdmission,
+    source: ClientAddressSource,
+}
+
+impl<S> Layer<S> for WalletRangeAdmissionLayer {
+    type Service = WalletRpcMetrics<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        let mut service = self.surface.layer(inner);
+        service.range_admissions = Some(RangeAdmissions::new(
+            self.policy,
+            self.source,
+            self.surface.label(),
+        ));
+        service
     }
 }
 
@@ -242,6 +284,7 @@ impl<S> Layer<S> for WalletRpcMetricsLayer {
 pub struct WalletRpcMetrics<S> {
     inner: S,
     surface: WalletRpcMetricsLayer,
+    range_admissions: Option<Arc<RangeAdmissions>>,
 }
 
 impl<S> Service<Request<Body>> for WalletRpcMetrics<S>
@@ -271,6 +314,15 @@ where
         request.extensions_mut().insert(method);
         let mut rpc = ObservedRpc::start(method, shape);
         rpc.deadline = request.extensions().get::<DeadlineExpiry>().cloned();
+        if let Some(admissions) = self.range_admissions.as_ref().filter(|_| rpc.is_range()) {
+            match admissions.claim(&request, method.surface) {
+                Ok(permit) => rpc.range_permit = Some(permit),
+                Err(status) => {
+                    rpc.outcome = Outcome::from_status(&status);
+                    return Either::Right(Box::pin(async move { Ok(status.into_http()) }));
+                }
+            }
+        }
         let request = if shape == RpcShape::Upload {
             request.map(|body| {
                 Body::new(ObservedUpload {
@@ -382,6 +434,7 @@ struct ObservedRpc {
     started: Instant,
     stream_opened: Option<Instant>,
     range_messages: f64,
+    range_permit: Option<RangePermit>,
     outcome: Outcome,
     /// Set when the client's `grpc-timeout` bounds the call, so a call the
     /// deadline abandoned records `DEADLINE_EXCEEDED`, the status the client
@@ -401,6 +454,7 @@ impl ObservedRpc {
             started: Instant::now(),
             stream_opened: None,
             range_messages: 0.0,
+            range_permit: None,
             outcome: Outcome::plain(Code::Cancelled),
             deadline: None,
         }

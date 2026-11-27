@@ -21,8 +21,8 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_query::RocksDbCanonicalReader;
 use zinder_runtime::{
-    ClientAddressSource, GrpcReceiveLimitLayer, GrpcReceiveLimits, MAX_UNCAPPED_ENUM_LIST_ELEMENTS,
-    RepeatedFieldGuard,
+    ClientAddressSource, GrpcRangeAdmission, GrpcReceiveLimitLayer, GrpcReceiveLimits,
+    MAX_UNCAPPED_ENUM_LIST_ELEMENTS, RepeatedFieldGuard,
 };
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
@@ -61,8 +61,16 @@ fn service(
         GrpcReceiveLimits::new(NonZeroUsize::MIN, RECEIVE_TIMEOUT),
         ClientAddressSource::Connection,
     );
-    Ok(transport_layers(&[HeaderValue::from_static(WALLET_ORIGIN)])
-        .layer(wallet_layers(true).layer(receive.layer(guard))))
+    Ok(
+        transport_layers(&[HeaderValue::from_static(WALLET_ORIGIN)]).layer(
+            wallet_layers(
+                true,
+                GrpcRangeAdmission::default(),
+                ClientAddressSource::Connection,
+            )
+            .layer(receive.layer(guard)),
+        ),
+    )
 }
 
 fn request(method: &str, encoding: &'static str, body: Body) -> Result<Request<Body>> {
@@ -320,7 +328,14 @@ async fn wallet_rpc_in_wallet_mode_counts_one_lightwalletd_range_across_query_re
     let query =
         WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(pair)));
     let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?.into_server();
-    let native = transport_layers(&[]).layer(wallet_layers(false).layer(adapter));
+    let native = transport_layers(&[]).layer(
+        wallet_layers(
+            false,
+            GrpcRangeAdmission::default(),
+            ClientAddressSource::Connection,
+        )
+        .layer(adapter),
+    );
     let id = lightwalletd::BlockId {
         height: 1,
         hash: vec![],
