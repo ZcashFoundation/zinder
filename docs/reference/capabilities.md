@@ -192,11 +192,12 @@ endpoint is verified; see
 [Node source boundary](../architecture/node-source-boundary.md#capabilities)
 for verification.
 
-`BlockHeaderBySelector` returns a typed header with the block identity,
-previous block hash, transaction Merkle root, commitment bytes, Unix time,
-compact difficulty target, nonce, and version. The header omits the Equihash
-solution. For the consensus-serialized header, decode it from a `FullBlock`
-response on a store that retains all raw block blobs.
+`BlockHeaderBySelector` returns the block identity, previous block hash,
+transaction Merkle root, raw commitment bytes, block time in Unix seconds,
+compact difficulty target, nonce, and version. Hashes and the Merkle root use
+lowercase hex in RPC byte order. The header omits the Equihash solution. For
+the consensus-serialized header, decode it from a `FullBlock` response on a
+store that retains all raw block blobs.
 
 ## Explorer capabilities
 

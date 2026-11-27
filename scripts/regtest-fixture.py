@@ -300,6 +300,11 @@ def provision(args, directory):
     node = tomllib.loads(config.read_text())
     if node.get('network', {}).get('network') != 'Regtest':
         raise ValueError('--node-config must explicitly select Regtest')
+    default_schedule = config == (ROOT / 'deploy/zebra/regtest.toml').resolve()
+    if default_schedule:
+        bash = shutil.which('bash')
+        if not bash or not all(shutil.which(command) for command in ('curl', 'jq')):
+            raise RuntimeError('the default fixture schedule requires Bash, curl, and jq on PATH')
     activations = node['network']['testnet_parameters']['activation_heights']
     if args.port_base < 1024 or args.port_base + max(OFFSETS) > 65535:
         raise ValueError('port range must be unprivileged and fit TCP ports')
@@ -388,6 +393,8 @@ def provision(args, directory):
             service['volumes'].append(dict(binary_mount))
             service['entrypoint'] = ['/usr/local/bin/zinder']
         service['healthcheck'].update(interval='1s', start_period='1s', retries=180)
+    # The fixture builds fresh stores before starting the readers that open them.
+    model['services']['zinder-index']['healthcheck']['test'].append('--ready')
     model['services']['zinder-index'].pop('ports', None)
     model['services']['node'] = dict(image=node_image, pull_policy='never', restart='no',
         networks=['node'], environment={'CONFIG_FILE_PATH': '/etc/zebrad/zebrad.toml',
@@ -418,8 +425,8 @@ def provision(args, directory):
         write(directory / 'state.json', state)
         start_relay(directory, state, direct_bridge=direct_bridge)
         wait(lambda: rpc(state, 'getblockcount', []), lambda h: h == 0, args.timeout)
-        if config == (ROOT / 'deploy/zebra/regtest.toml').resolve():
-            run('bash', (ROOT / 'scripts/mine-live-regtest.sh').as_posix(), state['node_rpc'], str(args.tip))
+        if default_schedule:
+            run(bash, (ROOT / 'scripts/mine-live-regtest.sh').as_posix(), state['node_rpc'], str(args.tip))
         else:
             rpc(state, 'generate', [args.tip])
         compose(directory, 'up', '-d', '--wait', '--wait-timeout', str(args.timeout),

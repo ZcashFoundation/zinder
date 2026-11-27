@@ -1349,7 +1349,8 @@ must equal `--revision`, including this mode.
 This check establishes executable identity, not release signature provenance.
 Verify downloaded archives or images through the release workflow separately.
 
-The command prints the absolute `ready.json` path only after both `zinder-index`
+The fixture waits for `zinder-index` to build its stores before starting the
+readers. The command prints the absolute `ready.json` path only after both `zinder-index`
 and `zinder-serve` `/readyz` responses reach the node tip. The receipt includes the actual node activation
 map, complete health capabilities and versions, candidate commit, image IDs,
 optional binary hashes, endpoints, retention, chain hash, and observation time.
