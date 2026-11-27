@@ -74,10 +74,12 @@ impl GrpcProxyProtocol {
     /// Shows whether an allowlist is configured without exposing proxy networks.
     #[must_use]
     pub fn redacted_cidrs(&self) -> Option<&'static str> {
-        self.enabled().then_some("[REDACTED]")
+        self.is_enabled().then_some("[REDACTED]")
     }
 
-    pub(super) fn enabled(&self) -> bool {
+    /// Whether the listener requires a PROXY preface.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
         !self.0.is_empty()
     }
 
@@ -130,7 +132,11 @@ async fn read_preface(stream: &mut TcpStream, peer: SocketAddr) -> io::Result<So
 }
 
 fn parse_v1(line: &[u8], peer: SocketAddr) -> Option<SocketAddr> {
-    let line = str::from_utf8(line.strip_suffix(b"\r\n")?).ok()?;
+    let line = line.strip_suffix(b"\r\n")?;
+    if line == b"PROXY UNKNOWN" || line.starts_with(b"PROXY UNKNOWN ") {
+        return Some(peer);
+    }
+    let line = str::from_utf8(line).ok()?;
     if !line
         .bytes()
         .all(|byte| byte.is_ascii_graphic() || byte == b' ')
@@ -139,9 +145,6 @@ fn parse_v1(line: &[u8], peer: SocketAddr) -> Option<SocketAddr> {
     }
     let mut fields = line.strip_prefix("PROXY ")?.split(' ');
     let family = fields.next()?;
-    if family == "UNKNOWN" {
-        return Some(peer);
-    }
     let source: IpAddr = fields.next()?.parse().ok()?;
     let destination: IpAddr = fields.next()?.parse().ok()?;
     match (family, source, destination) {
@@ -166,7 +169,10 @@ fn parse_port(port: &str) -> Option<u16> {
 
 fn parse_v2(family: u8, payload: &[u8], peer: SocketAddr) -> Option<SocketAddr> {
     let (client, mut tlvs) = match family {
-        0x00 => (peer, payload),
+        0x00 => return Some(peer),
+        0x12 => (peer, payload.get(12..)?),
+        0x22 => (peer, payload.get(36..)?),
+        0x31 | 0x32 => (peer, payload.get(216..)?),
         0x11 => {
             let (addresses, tlvs) = payload.split_first_chunk::<12>()?;
             let ip = IpAddr::from(*addresses.first_chunk::<4>()?);
@@ -218,6 +224,37 @@ mod tests {
         );
         assert_eq!(protocol.redacted_cidrs(), Some("[REDACTED]"));
         Ok(())
+    }
+
+    #[test]
+    fn unknown_v1_ignores_the_suffix_after_the_exact_token() {
+        let peer = ([127, 0, 0, 1], 50).into();
+        for line in [&b"PROXY UNKNOWN\r\n"[..], b"PROXY UNKNOWN \t\xff\r\n"] {
+            assert_eq!(parse_v1(line, peer), Some(peer));
+        }
+        for line in [&b"PROXY UNKNOWNX \t\r\n"[..], b"PROXY UNKNOWN \t\n"] {
+            assert_eq!(parse_v1(line, peer), None);
+        }
+    }
+
+    #[test]
+    fn defined_unsupported_v2_transports_use_the_tcp_peer() {
+        let peer = ([127, 0, 0, 1], 50).into();
+        let addresses = [0xff; 216];
+        for (protocol, address_len) in [(0x12, 12), (0x22, 36), (0x31, 216), (0x32, 216)] {
+            assert_eq!(
+                parse_v2(protocol, &addresses[..address_len], peer),
+                Some(peer)
+            );
+            assert_eq!(
+                parse_v2(protocol, &addresses[..address_len - 1], peer),
+                None
+            );
+        }
+        assert_eq!(parse_v2(0x00, &addresses, peer), Some(peer));
+        for protocol in [0x13, 0x20, 0x41, 0xff] {
+            assert_eq!(parse_v2(protocol, &addresses, peer), None);
+        }
     }
 
     #[test]

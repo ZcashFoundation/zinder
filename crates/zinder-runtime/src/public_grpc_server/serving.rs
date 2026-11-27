@@ -370,7 +370,7 @@ impl Connections {
         ResponseBody: http_body::Body<Data = Bytes> + Send + 'static,
         ResponseBody::Error: Into<axum::BoxError>,
     {
-        let proxy_header = if self.proxy_protocol.enabled() {
+        let proxy_header = if self.proxy_protocol.is_enabled() {
             if !self.proxy_protocol.trusts(peer.ip()) {
                 return;
             }

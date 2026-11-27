@@ -347,3 +347,60 @@ fn legacy_transactions_raw_blob_policy_fails_closed() -> eyre::Result<()> {
     assert!(stderr.contains("transactions"), "{stderr}");
     Ok(())
 }
+
+#[test]
+fn combined_explorer_rejects_a_query_listener_requiring_proxy_protocol() -> eyre::Result<()> {
+    let sandbox = TempDir::new()?;
+    let base = format!(
+        "[network]\nname = \"zcash-regtest\"\n[storage]\ndata_dir = \"{}\"\n[node]\njson_rpc_addr = \"http://127.0.0.1:18232\"\n",
+        sandbox.path().display()
+    );
+    let config = write_test_config(sandbox.path(), &base)?;
+    let config = config
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("non-UTF-8 path"))?;
+    let allowlist = "192.0.2.10/32";
+
+    let env_rejected = zinder_command(&[
+        "serve",
+        "--print-config",
+        "--preset",
+        "explorer",
+        "--config",
+        config,
+    ])
+    .env("ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS", allowlist)
+    .output()?;
+    std::fs::write(
+        config,
+        format!("{base}\n[query]\nproxy_protocol_trusted_cidrs = \"{allowlist}\"\n"),
+    )?;
+    let file_rejected = zinder_command(&[
+        "config", "validate", "--preset", "explorer", "--config", config,
+    ])
+    .output()?;
+    for rejected in [env_rejected, file_rejected] {
+        assert!(!rejected.status.success());
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains("incompatible with the combined explorer preset"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("ZINDER_QUERY__PROXY_PROTOCOL_TRUSTED_CIDRS"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains(allowlist));
+    }
+
+    let wallet = zinder_command(&[
+        "config", "validate", "--preset", "wallet", "--config", config,
+    ])
+    .output()?;
+    assert!(
+        wallet.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wallet.stderr)
+    );
+    Ok(())
+}
