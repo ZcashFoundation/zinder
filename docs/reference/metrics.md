@@ -446,7 +446,7 @@ it as the writer commits.
 | `zinder_wallet_serving_pair_publisher_teardown_duration_seconds` | histogram | `status` | Time to close a retired pair. |
 | `zinder_wallet_serving_pair_publisher_candidate_prepared_total` | counter | `kind` | Candidates prepared: `cold` for a new slot, `recycled` for a reused one. More than four `cold` means refreshes keep failing. |
 | `zinder_wallet_serving_pair_publisher_open_generations` | gauge | | Pair slots holding open stores, at most four. |
-| `zinder_wallet_serving_pair_publisher_retained_pairs` | gauge | | Replaced pairs kept for one minute for pinned reads. |
+| `zinder_wallet_serving_pair_publisher_retained_pairs` | gauge | | Replaced pairs retained for epoch pins. Native query defaults to 60 seconds and accepts 60 to 300 seconds within the four-generation limit. |
 | `zinder_wallet_serving_pair_publisher_pinned_retired_pairs` | gauge | | Retired pairs that requests still hold. |
 | `zinder_wallet_serving_pair_publisher_generation_wait_total` | counter | `reason` | Refreshes that published nothing because every slot was taken: `retention_window` or `in_flight_requests`. |
 | `zinder_wallet_serving_pair_publisher_generation_wait_duration_seconds` | histogram | `reason`, `outcome` | Elapsed time from the first blocked slot check to the first observation of a free slot (`available`), a different reason (`reason_changed`), or a failed or unnecessary refresh or shutdown (`interrupted`). Repeated checks with the same reason share one observation. |

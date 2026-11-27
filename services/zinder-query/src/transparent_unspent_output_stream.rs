@@ -796,6 +796,115 @@ mod tests {
         Ok(())
     }
 
+    const FINAL_SCRIPT_PUB_KEY: &[u8] = &[0x53];
+
+    #[tokio::test]
+    async fn native_batch_pages_addresses_once_and_bounds_read_ahead() -> Result<(), Box<dyn Error>>
+    {
+        let page_capacity = usize::from(super::TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE.get());
+        let first_count = 3 * page_capacity + 7;
+        let fixture = CountedPair::with_batch(first_count, None)?;
+        let (mut stream, _ingest) = fixture.open_batch().await?;
+        assert_batch_epoch(&fixture, &mut stream).await?;
+
+        let first = next_output(&mut stream).await?;
+        assert_eq!(first.block_height, 2);
+        assert_eq!(first.address_script_hash, fixture.address.as_bytes());
+        fixture.wait_for_page_reads(3).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fixture.page_reads(), 3);
+        assert_eq!(
+            first.outpoint.ok_or("missing first outpoint")?.output_index,
+            0
+        );
+        for expected_index in 1..u32::try_from(first_count)? {
+            let output = next_output(&mut stream).await?;
+            assert_eq!(output.block_height, 2);
+            assert_eq!(output.address_script_hash, fixture.address.as_bytes());
+            assert_eq!(
+                output.outpoint.ok_or("missing outpoint")?.output_index,
+                expected_index
+            );
+        }
+        let final_output = next_output(&mut stream).await?;
+        assert_eq!(
+            final_output.address_script_hash,
+            TransparentAddressScriptHash::of_script_pub_key(FINAL_SCRIPT_PUB_KEY).as_bytes()
+        );
+        assert_eq!(final_output.block_height, 2);
+        assert!(stream.next().await.is_none());
+        assert_eq!(fixture.page_reads(), 6);
+        fixture.wait_until_released().await
+    }
+
+    #[tokio::test]
+    async fn dropping_a_native_batch_at_an_address_boundary_releases_its_pair()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = CountedPair::with_batch(1, Some(Arc::new(tokio::sync::Notify::new())))?;
+        let (mut stream, _ingest) = fixture.open_batch().await?;
+        assert_batch_epoch(&fixture, &mut stream).await?;
+        next_output(&mut stream).await?;
+        fixture.wait_for_page_reads(3).await?;
+        drop(stream);
+        fixture.wait_until_released().await
+    }
+
+    #[tokio::test]
+    async fn revoking_a_native_batch_at_an_address_boundary_releases_its_pair()
+    -> Result<(), Box<dyn Error>> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fixture = CountedPair::with_batch(1, Some(Arc::clone(&gate)))?;
+        let (mut stream, _ingest) = fixture.open_batch().await?;
+        assert_batch_epoch(&fixture, &mut stream).await?;
+        next_output(&mut stream).await?;
+        fixture.wait_for_page_reads(3).await?;
+
+        assert!(fixture.pair.revoke_reads());
+        gate.notify_one();
+        fixture.wait_until_released().await?;
+        let error = stream
+            .next()
+            .await
+            .ok_or("expected terminal status")?
+            .err()
+            .ok_or("received output after revocation")?;
+        let details = tonic_types::StatusExt::get_error_details(&error);
+        assert_eq!(
+            details.error_info().map(|error| error.reason.as_str()),
+            Some(zinder_proto::v1::ops::ErrorReason::ChainEpochPinUnavailable.as_str_name())
+        );
+        assert!(stream.next().await.is_none());
+        Ok(())
+    }
+
+    type NativeBatchStream = <crate::WalletQueryGrpcAdapter<WalletServingQuery<(), crate::AdmittedIngestControl>>
+        as zinder_proto::v1::wallet::wallet_query_server::WalletQuery>::TransparentAddressesUnspentOutputsStream;
+
+    async fn assert_batch_epoch(
+        fixture: &CountedPair,
+        stream: &mut NativeBatchStream,
+    ) -> Result<(), Box<dyn Error>> {
+        use zinder_proto::v1::wallet::transparent_unspent_outputs_chunk::Body;
+        let header = stream.next().await.ok_or("missing stream header")??;
+        assert_eq!(
+            header.body,
+            Some(Body::Header(zinder_store::chain_view_message(
+                fixture.pair.chain_epoch()
+            )))
+        );
+        Ok(())
+    }
+
+    async fn next_output(
+        stream: &mut NativeBatchStream,
+    ) -> Result<zinder_proto::v1::wallet::TransparentUnspentOutput, Box<dyn Error>> {
+        use zinder_proto::v1::wallet::transparent_unspent_outputs_chunk::Body;
+        let Some(Body::Item(output)) = stream.next().await.ok_or("missing output")??.body else {
+            return Err("expected an output after the chain view".into());
+        };
+        Ok(output)
+    }
+
     fn page_size() -> usize {
         usize::from(TEST_PAGE_SIZE.get())
     }
@@ -814,7 +923,6 @@ mod tests {
 
     impl CountedPair {
         fn with_outputs(output_count: usize) -> Result<Self, Box<dyn Error>> {
-            let activations = sample_regtest_upgrade_activations();
             let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
             let block = chain
                 .block_at(BlockHeight::new(1))
@@ -833,7 +941,43 @@ mod tests {
                     block.hash,
                 ));
             }
-            let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+            Self::with_chain(&chain, None)
+        }
+
+        fn with_batch(
+            first_count: usize,
+            final_read_gate: Option<Arc<tokio::sync::Notify>>,
+        ) -> Result<Self, Box<dyn Error>> {
+            let mut chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+            let early = chain.blocks()[0].clone();
+            let selected = chain.blocks()[1].clone();
+            let addresses = [
+                (SCRIPT_PUB_KEY, early, 1, 0x11),
+                (SCRIPT_PUB_KEY, selected.clone(), first_count, 0x22),
+                (FINAL_SCRIPT_PUB_KEY, selected, 1, 0x33),
+            ];
+            for (script, block, count, tx_tag) in addresses {
+                for index in 0..u32::try_from(count)? {
+                    chain = chain.with_address_output_index(TransparentUnspentOutput::new(
+                        TransparentAddressScriptHash::of_script_pub_key(script),
+                        script.to_vec(),
+                        TransparentOutPoint::new(TransactionId::from_bytes([tx_tag; 32]), index),
+                        1000,
+                        block.height,
+                        block.hash,
+                    ));
+                }
+            }
+            Self::with_chain(&chain, final_read_gate)
+        }
+
+        fn with_chain(
+            chain: &ChainFixture,
+            final_read_gate: Option<Arc<tokio::sync::Notify>>,
+        ) -> Result<Self, Box<dyn Error>> {
+            let activations = sample_regtest_upgrade_activations();
+            let address = TransparentAddressScriptHash::of_script_pub_key(SCRIPT_PUB_KEY);
+            let mut store = WalletServingStoreFixture::from_chain(chain, &activations)?;
             let (canonical, wallet) = store.take_readers()?;
             let page_reads = Arc::new(AtomicUsize::new(0));
             let page_sizes = Arc::new(Mutex::new(Vec::new()));
@@ -841,6 +985,7 @@ mod tests {
                 inner: Arc::new(RocksDbWalletReader::new(wallet)),
                 page_reads: Arc::clone(&page_reads),
                 page_sizes: Arc::clone(&page_sizes),
+                final_read_gate,
             };
             let pair = Arc::new(WalletServingReadPair::new(
                 Arc::new(RocksDbCanonicalReader::new(canonical)?),
@@ -857,6 +1002,41 @@ mod tests {
                 page_sizes,
                 _store: store,
             })
+        }
+
+        async fn open_batch(
+            &self,
+        ) -> Result<(NativeBatchStream, zinder_testkit::IngestControlFixture), Box<dyn Error>>
+        {
+            use crate::{AdmittedIngestControl, WalletEndpointMetadata, WalletQueryGrpcAdapter};
+            use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery};
+            let ingest = zinder_testkit::IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+            let admitted =
+                AdmittedIngestControl::connect(ingest.endpoint(), None, Network::ZcashRegtest)
+                    .await?;
+            let query =
+                WalletServingQuery::from_admitted_native_serving_pair(self.slot.clone(), admitted);
+            let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
+            let empty = TransparentAddressScriptHash::of_script_pub_key(OTHER_SCRIPT_PUB_KEY);
+            let last = TransparentAddressScriptHash::of_script_pub_key(FINAL_SCRIPT_PUB_KEY);
+            let addresses = [self.address, empty, self.address, last, last]
+                .into_iter()
+                .map(|address| wallet::AddressLookup {
+                    selector: Some(wallet::address_lookup::Selector::ScriptHash(
+                        address.as_bytes().to_vec(),
+                    )),
+                })
+                .collect();
+            let response = adapter
+                .transparent_addresses_unspent_outputs(tonic::Request::new(
+                    wallet::TransparentAddressesUnspentOutputsRequest {
+                        addresses,
+                        start_height: 2,
+                        at_epoch_id: Some(self.pair.chain_epoch().id.value()),
+                    },
+                ))
+                .await?;
+            Ok((response.into_inner(), ingest))
         }
 
         async fn open_on_demand(&self) -> Result<TransparentAddressUnspentOutputs, QueryError> {
@@ -952,6 +1132,7 @@ mod tests {
         inner: Arc<dyn WalletProjectionReader>,
         page_reads: Arc<AtomicUsize>,
         page_sizes: Arc<Mutex<Vec<u16>>>,
+        final_read_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[async_trait::async_trait]
@@ -973,6 +1154,12 @@ mod tests {
         ) -> Result<WalletAddressUnspentOutputsPage, StorageReadError> {
             self.page_reads.fetch_add(1, Ordering::AcqRel);
             self.page_sizes.lock().push(page_size.get());
+            if address_script_hash
+                == TransparentAddressScriptHash::of_script_pub_key(FINAL_SCRIPT_PUB_KEY)
+                && let Some(gate) = &self.final_read_gate
+            {
+                gate.notified().await;
+            }
             self.inner
                 .address_unspent_outputs_page_from_height(
                     address_script_hash,

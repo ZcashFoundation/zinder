@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::Instrument as _;
 use zinder_core::{
     BlockHeight, BlockHeightRange, ChainEpochId, CompactBlockArtifact, CompactBlockNullifiers,
-    CompactPool,
+    CompactPool, CompactTransactionNullifiers,
 };
 use zinder_store::{
     EncodedCompactBlockOutput, EncodedCompactBlockPayload, EncodedCompactBlockRangeRequest,
@@ -55,6 +55,7 @@ pub(crate) struct CompactRangePage<Block> {
 }
 
 pub(crate) async fn open<Block, Read, PageFuture>(
+    operation: &'static str,
     slot: WalletServingPairSlot,
     first: CompactRangeRead,
     at_epoch_id: Option<ChainEpochId>,
@@ -71,7 +72,7 @@ where
 {
     let requested_blocks = Some(first.range.into_iter().len());
     let stream_slot = CompactBlockStreamSlot::current();
-    serving_read::record("compact_blocks_in_range", requested_blocks, async {
+    serving_read::record(operation, requested_blocks, async {
         validate_block_range(first.range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
         let first_read_slot = stream_slot.clone();
         let first_pair_slot = slot.clone();
@@ -235,9 +236,14 @@ pub(crate) async fn read_nullifiers(
         .await
         .map_err(QueryError::canonical_read)?;
     let Some(encoded) = encoded else {
-        return Err(QueryError::CompactBlockPayloadMalformed {
-            height: read.range.start,
-            reason: "a nonempty compact range returned no blocks".to_owned(),
+        let page = read_blocks(pair, read).await?;
+        return Ok(CompactRangePage {
+            last_height: page.last_height,
+            blocks: page
+                .blocks
+                .into_iter()
+                .map(|block| project_nullifiers(block, selection))
+                .collect(),
         });
     };
     let EncodedCompactBlockPayload::Blocks(blocks) = encoded.payload else {
@@ -261,4 +267,58 @@ pub(crate) async fn read_nullifiers(
         blocks,
         last_height: Some(encoded.last_link.height),
     })
+}
+
+fn project_nullifiers(
+    block: CompactBlockArtifact,
+    selection: ShieldedProjectionSelection,
+) -> CompactBlockNullifiers {
+    let block = block.into_parts();
+    let transactions = block
+        .transactions
+        .into_iter()
+        .filter_map(|tx| {
+            let sapling_nullifiers: Vec<_> = tx
+                .data
+                .sapling_spends
+                .into_iter()
+                .filter(|_| selection.sapling)
+                .map(|spend| spend.nullifier)
+                .collect();
+            let orchard_nullifiers: Vec<_> = tx
+                .data
+                .orchard_actions
+                .into_iter()
+                .filter(|_| selection.orchard)
+                .map(|action| action.nullifier)
+                .collect();
+            let ironwood_nullifiers: Vec<_> = tx
+                .data
+                .ironwood_actions
+                .into_iter()
+                .filter(|_| selection.ironwood)
+                .map(|action| action.nullifier)
+                .collect();
+            if sapling_nullifiers.is_empty()
+                && orchard_nullifiers.is_empty()
+                && ironwood_nullifiers.is_empty()
+            {
+                return None;
+            }
+            Some(CompactTransactionNullifiers {
+                index: tx.index,
+                transaction_id: tx.transaction_id,
+                sapling_nullifiers,
+                orchard_nullifiers,
+                ironwood_nullifiers,
+            })
+        })
+        .collect();
+    CompactBlockNullifiers {
+        height: block.block_id.height,
+        block_hash: block.block_id.hash,
+        previous_block_hash: block.previous_block_hash,
+        time: block.time,
+        transactions,
+    }
 }
