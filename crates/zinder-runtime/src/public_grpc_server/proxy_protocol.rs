@@ -105,8 +105,9 @@ async fn read_preface(stream: &mut TcpStream, peer: SocketAddr) -> io::Result<So
             line[0] = b'P';
             for end in 2..=line.len() {
                 line[end - 1] = stream.read_u8().await?;
-                if line[end - 1] == b'\n' {
-                    return parse_v1(&line[..end], peer).ok_or_else(invalid_header);
+                let preface = &line[..end];
+                if preface.ends_with(b"\r\n") {
+                    return parse_v1(preface, peer).ok_or_else(invalid_header);
                 }
             }
             Err(invalid_header())
@@ -280,13 +281,14 @@ mod tests {
         for (preface, source) in [
             (
                 &b"PROXY TCP4 192.0.2.9 192.0.2.10 5000 443\r\n"[..],
-                "192.0.2.9:5000",
+                Some("192.0.2.9:5000"),
             ),
             (
                 &b"PROXY TCP6 2001:db8::1 2001:db8::2 5000 443\r\n"[..],
-                "[2001:db8::1]:5000",
+                Some("[2001:db8::1]:5000"),
             ),
-            (&binary, "[2001:db8::1]:5000"),
+            (b"PROXY UNKNOWN ignored\nmore ignored bytes\r\n", None),
+            (&binary, Some("[2001:db8::1]:5000")),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let mut client = TcpStream::connect(listener.local_addr()?).await?;
@@ -301,7 +303,8 @@ mod tests {
             let (written, address) =
                 tokio::join!(write_preface, read_client(&mut peer_stream, peer));
             written?;
-            assert_eq!(address?, source.parse()?);
+            let expected = source.map(str::parse).transpose()?.unwrap_or(peer);
+            assert_eq!(address?, expected);
             let mut http_prefix = [0; 3];
             peer_stream.read_exact(&mut http_prefix).await?;
             assert_eq!(&http_prefix, b"PRI");
@@ -312,17 +315,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn incomplete_preface_times_out_and_oversized_v2_is_refused() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let mut client = TcpStream::connect(listener.local_addr()?).await?;
-        let (mut peer_stream, peer) = listener.accept().await?;
-        client.write_all(b"PROXY TCP4").await?;
-        let ((), outcome) = tokio::join!(
-            tokio::time::sleep(HEADER_TIMEOUT),
-            read_client(&mut peer_stream, peer)
-        );
-        assert_eq!(
-            outcome.map_err(|error| error.kind()),
-            Err(io::ErrorKind::TimedOut)
-        );
+        for preface in [&b"PROXY TCP4"[..], b"PROXY UNKNOWN ignored\n"] {
+            let mut client = TcpStream::connect(listener.local_addr()?).await?;
+            let (mut peer_stream, peer) = listener.accept().await?;
+            client.write_all(preface).await?;
+            let ((), outcome) = tokio::join!(
+                tokio::time::sleep(HEADER_TIMEOUT),
+                read_client(&mut peer_stream, peer)
+            );
+            assert_eq!(
+                outcome.map_err(|error| error.kind()),
+                Err(io::ErrorKind::TimedOut)
+            );
+        }
 
         let mut client = TcpStream::connect(listener.local_addr()?).await?;
         let (mut peer_stream, peer) = listener.accept().await?;

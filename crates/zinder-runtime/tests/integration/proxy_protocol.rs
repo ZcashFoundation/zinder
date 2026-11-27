@@ -6,7 +6,7 @@ use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
 };
-use tonic::transport::Endpoint;
+use tonic::transport::{Channel, Endpoint};
 use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
 use tower::service_fn;
 use zinder_runtime::{ClientAddressSource, GrpcProxyProtocol, public_grpc_server};
@@ -117,19 +117,24 @@ async fn verify_preface_slots() -> Result<()> {
         }
 
         let mut first = pending.remove(0);
-        match completion {
-            PrefaceCompletion::Valid => complete_preface_and_check_health(address, first).await?,
+        let established = match completion {
+            PrefaceCompletion::Valid => {
+                Some(complete_preface_and_check_health(address, first).await?)
+            }
             PrefaceCompletion::Invalid => {
                 first.write_all(b"INVALID\r\n").await?;
                 expect_connection_closed(&mut first).await?;
+                None
             }
             PrefaceCompletion::TimedOut => {
                 tokio::time::advance(Duration::from_secs(2)).await;
                 expect_connection_closed(&mut first).await?;
+                None
             }
-        }
+        };
         let replacement = connect_with_incomplete_preface(address).await?;
-        complete_preface_and_check_health(address, replacement).await?;
+        drop(complete_preface_and_check_health(address, replacement).await?);
+        drop(established);
 
         if matches!(
             completion,
@@ -153,7 +158,7 @@ async fn connect_with_incomplete_preface(address: SocketAddr) -> io::Result<TcpS
 async fn complete_preface_and_check_health(
     address: SocketAddr,
     mut stream: TcpStream,
-) -> Result<()> {
+) -> Result<Channel> {
     stream.write_all(b"UNKNOWN\r\n").await?;
     let mut stream = Some(stream);
     let channel = Endpoint::from_shared(format!("http://{address}"))?
@@ -166,10 +171,10 @@ async fn complete_preface_and_check_health(
             )
         }))
         .await?;
-    HealthClient::new(channel)
+    HealthClient::new(channel.clone())
         .check(HealthCheckRequest::default())
         .await?;
-    Ok(())
+    Ok(channel)
 }
 
 fn assert_pending(stream: &TcpStream) {
