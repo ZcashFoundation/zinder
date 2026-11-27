@@ -87,7 +87,8 @@ pub use construction_manifest::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CanonicalConstructionManifestBinding,
 };
 pub use displaced_archive::{
-    DisplacedBlockCursor, DisplacedBlockPage, DisplacedFinalRootPage, DisplacedFinalRootSearch,
+    ArchivedDisplacedBlockSummary, DisplacedBlockCursor, DisplacedBlockPage,
+    DisplacedBlockSummaryPage, DisplacedFinalRootPage, DisplacedFinalRootSearch,
     DisplacedRootCursor,
 };
 pub use event_lifecycle::{

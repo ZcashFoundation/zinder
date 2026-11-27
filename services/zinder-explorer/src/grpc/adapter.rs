@@ -529,7 +529,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             query_transaction_detail(
                 &mut client,
                 TransactionDetailContext {
-                    canonical_store: self.canonical_store.as_ref(),
+                    include_intrinsic_value_balances: self.canonical_store.is_some(),
                     materialized_view_store: self.materialized_view_store.as_ref(),
                     network_upgrade_activations: &network_upgrade_activations,
                     upstream_observation_cache: &self.upstream_observation_cache,

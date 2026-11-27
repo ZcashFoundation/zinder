@@ -2,14 +2,14 @@
 
 use std::{collections::BTreeMap, num::NonZeroU32};
 
-use rust_rocksdb::{ReadOptions, WriteBatch};
+use rust_rocksdb::{DB, ReadOptions, WriteBatch, WriteOptions};
 use zinder_core::{
-    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockHeightRange, BlockId,
-    CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
-    ChainEpochId, DisplacedBlock, DisplacedBlockArchiveCoverage, DisplacedBlockCoinbaseOutput,
+    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
+    BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
+    DisplacedBlock, DisplacedBlockArchiveCoverage, DisplacedBlockCoinbaseOutput,
     DisplacedRootArchiveCoverage, DisplacedRootCandidate, FinalNoteCommitmentRoot,
-    SerializedBytesDigest, ShieldedProtocol, UnixTimestampMillis, decode_canonical_block_replay,
-    encode_canonical_block_replay,
+    SerializedBytesDigest, ShieldedProtocol, TransactionId, UnixTimestampMillis,
+    decode_canonical_block_replay, encode_canonical_block_replay,
 };
 
 use super::{
@@ -66,6 +66,15 @@ struct ArchiveRecord {
     displacement_epoch: ChainEpochId,
     displaced_at: UnixTimestampMillis,
     raw_block_bytes: Option<Vec<u8>>,
+    final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BorrowedArchiveRecord<'a> {
+    replay_bytes: &'a [u8],
+    displacement_epoch: ChainEpochId,
+    displaced_at: UnixTimestampMillis,
+    raw_block_bytes: Option<&'a [u8]>,
     final_note_commitment_roots: Option<BlockFinalNoteCommitmentRoots>,
 }
 
@@ -393,6 +402,36 @@ impl DisplacedBlockCursor {
     }
 }
 
+/// Summary facts retained when a canonical block is displaced, omitting raw block bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchivedDisplacedBlockSummary {
+    /// Stable identity of the displaced block.
+    pub block_hash: BlockHash,
+    /// Complete header facts visible immediately before displacement.
+    pub header: BlockHeaderArtifact,
+    /// Transaction identifiers in block order.
+    pub transaction_ids: Vec<TransactionId>,
+    /// Transparent payout outputs from the coinbase transaction, in output order.
+    pub coinbase_outputs: Vec<DisplacedBlockCoinbaseOutput>,
+    /// Chain event that displaced this block.
+    pub displacement_event_sequence: u64,
+    /// Epoch made visible by the displacement event.
+    pub displacement_epoch: ChainEpochId,
+    /// Wall-clock time of the displacement epoch.
+    pub displaced_at: UnixTimestampMillis,
+}
+
+/// Bounded newest-first displaced-block summary page without retained raw payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisplacedBlockSummaryPage {
+    /// Archived block summaries in descending `(event sequence, height)` order.
+    pub blocks: Vec<ArchivedDisplacedBlockSummary>,
+    /// Whether at least one older archive row remains.
+    pub has_more: bool,
+    /// Cursor for requesting rows strictly older than this page.
+    pub next_cursor: Option<DisplacedBlockCursor>,
+}
+
 /// Bounded newest-first displaced-block history page.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisplacedBlockPage {
@@ -435,30 +474,62 @@ pub struct DisplacedFinalRootPage {
     pub coverage: Option<DisplacedRootArchiveCoverage>,
     /// True when the result reflects complete coverage of the active archive.
     pub scan_complete: bool,
+    /// Number of index entries or archive blocks inspected while producing this page.
+    pub scanned_work: usize,
 }
 
 trait DisplacedArchiveRead {
-    fn archive_db(&self) -> &rust_rocksdb::DB;
+    fn archive_db(&self) -> &DB;
     fn archive_reorg_window_blocks(&self) -> u32;
+    fn cached_legacy_unavailable_count(
+        &self,
+        latest_event_sequence: u64,
+        compute: &mut dyn FnMut() -> Result<u64, CanonicalStoreError>,
+    ) -> Result<u64, CanonicalStoreError>;
 }
 
 impl DisplacedArchiveRead for RocksDbCanonicalStore {
-    fn archive_db(&self) -> &rust_rocksdb::DB {
+    fn archive_db(&self) -> &DB {
         &self.bounded_open.db
     }
 
     fn archive_reorg_window_blocks(&self) -> u32 {
         self.reorg_policy().reorg_window_blocks()
+    }
+
+    fn cached_legacy_unavailable_count(
+        &self,
+        _latest_event_sequence: u64,
+        compute: &mut dyn FnMut() -> Result<u64, CanonicalStoreError>,
+    ) -> Result<u64, CanonicalStoreError> {
+        compute()
     }
 }
 
 impl DisplacedArchiveRead for RocksDbCanonicalSecondary {
-    fn archive_db(&self) -> &rust_rocksdb::DB {
+    fn archive_db(&self) -> &DB {
         &self.bounded_open.db
     }
 
     fn archive_reorg_window_blocks(&self) -> u32 {
         self.reorg_policy().reorg_window_blocks()
+    }
+
+    fn cached_legacy_unavailable_count(
+        &self,
+        latest_event_sequence: u64,
+        compute: &mut dyn FnMut() -> Result<u64, CanonicalStoreError>,
+    ) -> Result<u64, CanonicalStoreError> {
+        let cached = *self.legacy_root_unavailable_count.lock();
+        if let Some((cached_sequence, unavailable_count)) = cached
+            && cached_sequence == latest_event_sequence
+        {
+            return Ok(unavailable_count);
+        }
+        let unavailable_count = compute()?;
+        *self.legacy_root_unavailable_count.lock() =
+            Some((latest_event_sequence, unavailable_count));
+        Ok(unavailable_count)
     }
 }
 
@@ -472,6 +543,15 @@ macro_rules! impl_displaced_archive_reads {
                 limit: NonZeroU32,
             ) -> Result<DisplacedBlockPage, CanonicalStoreError> {
                 read_displaced_block_page(self, after, limit)
+            }
+
+            /// Reads a bounded newest-first summary page without copying retained raw block bytes.
+            pub fn displaced_block_summary_page(
+                &self,
+                after: Option<&DisplacedBlockCursor>,
+                limit: NonZeroU32,
+            ) -> Result<DisplacedBlockSummaryPage, CanonicalStoreError> {
+                read_displaced_block_summary_page(self, after, limit)
             }
 
             /// Reads up to `limit` archived blocks in newest event/height order.
@@ -536,11 +616,66 @@ macro_rules! impl_displaced_archive_reads {
 impl_displaced_archive_reads!(RocksDbCanonicalStore);
 impl_displaced_archive_reads!(RocksDbCanonicalSecondary);
 
+struct ValidatedArchiveRecord<'a> {
+    position: ArchivePosition,
+    header: BlockHeaderArtifact,
+    transaction_ids: Vec<TransactionId>,
+    coinbase_outputs: Vec<DisplacedBlockCoinbaseOutput>,
+    record: BorrowedArchiveRecord<'a>,
+}
+
 fn read_displaced_block_page(
     store: &impl DisplacedArchiveRead,
     after: Option<&DisplacedBlockCursor>,
     limit: NonZeroU32,
 ) -> Result<DisplacedBlockPage, CanonicalStoreError> {
+    let (blocks, has_more, next_cursor) =
+        read_displaced_page_entries(store, after, limit, derive_displaced_block, |block| {
+            DisplacedBlockCursor::from_position(
+                block.displacement_event_sequence,
+                block.header.height,
+                block.block_hash,
+            )
+        })?;
+    Ok(DisplacedBlockPage {
+        blocks,
+        has_more,
+        next_cursor,
+    })
+}
+
+fn read_displaced_block_summary_page(
+    store: &impl DisplacedArchiveRead,
+    after: Option<&DisplacedBlockCursor>,
+    limit: NonZeroU32,
+) -> Result<DisplacedBlockSummaryPage, CanonicalStoreError> {
+    let (blocks, has_more, next_cursor) = read_displaced_page_entries(
+        store,
+        after,
+        limit,
+        |validated| derive_displaced_summary(&validated),
+        |block| {
+            DisplacedBlockCursor::from_position(
+                block.displacement_event_sequence,
+                block.header.height,
+                block.block_hash,
+            )
+        },
+    )?;
+    Ok(DisplacedBlockSummaryPage {
+        blocks,
+        has_more,
+        next_cursor,
+    })
+}
+
+fn read_displaced_page_entries<Entry>(
+    store: &impl DisplacedArchiveRead,
+    after: Option<&DisplacedBlockCursor>,
+    limit: NonZeroU32,
+    build_entry: impl Fn(ValidatedArchiveRecord<'_>) -> Entry,
+    cursor_for: impl Fn(&Entry) -> DisplacedBlockCursor,
+) -> Result<(Vec<Entry>, bool, Option<DisplacedBlockCursor>), CanonicalStoreError> {
     let max_blocks = checked_public_limit(limit)?;
     if read_archive_state(store)?.is_none() {
         if after.is_some() {
@@ -548,7 +683,7 @@ fn read_displaced_block_page(
                 "archive cursor cannot resolve in an empty archive",
             ));
         }
-        return Ok(empty_archive_page());
+        return Ok((Vec::new(), false, None));
     }
 
     let family = archive_family(store)?;
@@ -561,20 +696,17 @@ fn read_displaced_block_page(
     let requested_with_lookahead = max_blocks.checked_add(1).ok_or_else(|| {
         CanonicalStoreError::displaced_archive("archive page lookahead overflowed")
     })?;
-    let mut blocks = Vec::with_capacity(requested_with_lookahead);
-    while rows.valid() && blocks.len() < requested_with_lookahead {
+    let mut entries = Vec::with_capacity(requested_with_lookahead);
+    while rows.valid() && entries.len() < requested_with_lookahead {
         let Some((key, encoded_record)) = rows.item() else {
             break;
         };
         if key.first() != Some(&ORDER_KEY_TAG) {
             break;
         }
-        blocks.push(decode_and_validate_record_cached(
-            store,
-            key,
-            encoded_record,
-            &mut context_cache,
-        )?);
+        let validated =
+            decode_and_validate_borrowed_cached(store, key, encoded_record, &mut context_cache)?;
+        entries.push(build_entry(validated));
         rows.prev();
     }
     rows.status()
@@ -582,24 +714,10 @@ fn read_displaced_block_page(
             operation: "displaced archive page iteration",
             source,
         })?;
-    let has_more = blocks.len() > max_blocks;
-    blocks.truncate(max_blocks);
-    let next_cursor = has_more
-        .then(|| {
-            blocks.last().map(|block| {
-                DisplacedBlockCursor::from_position(
-                    block.displacement_event_sequence,
-                    block.header.height,
-                    block.block_hash,
-                )
-            })
-        })
-        .flatten();
-    Ok(DisplacedBlockPage {
-        blocks,
-        has_more,
-        next_cursor,
-    })
+    let has_more = entries.len() > max_blocks;
+    entries.truncate(max_blocks);
+    let next_cursor = has_more.then(|| entries.last().map(&cursor_for)).flatten();
+    Ok((entries, has_more, next_cursor))
 }
 
 fn seek_displaced_page_start(
@@ -759,6 +877,7 @@ const fn empty_root_page() -> DisplacedFinalRootPage {
         next_cursor: None,
         coverage: None,
         scan_complete: false,
+        scanned_work: 0,
     }
 }
 
@@ -879,6 +998,7 @@ fn search_displaced_roots_indexed(
 
     let lookahead = query.limit.saturating_add(1);
     let mut matches = Vec::with_capacity(lookahead.min(64));
+    let mut rows_scanned = 0_usize;
     while rows.valid() && matches.len() < lookahead {
         let Some((key, encoded_val)) = rows.item() else {
             break;
@@ -889,6 +1009,7 @@ fn search_displaced_roots_indexed(
         let Some(candidate) = decode_matching_root_index_row(key, encoded_val, query.root)? else {
             break;
         };
+        rows_scanned = rows_scanned.saturating_add(1);
         matches.push(candidate);
         rows.next();
     }
@@ -914,6 +1035,7 @@ fn search_displaced_roots_indexed(
             root_artifact_unavailable_count: unavailable_count,
         }),
         scan_complete: true,
+        scanned_work: rows_scanned,
     })
 }
 
@@ -954,6 +1076,8 @@ fn search_displaced_roots_fallback(
     state: ArchiveState,
     query: RootSearchQuery<'_>,
 ) -> Result<DisplacedFinalRootPage, CanonicalStoreError> {
+    let archive_unavailable_count =
+        legacy_archive_unavailable_count(store, state.latest_event_sequence)?;
     let family = archive_family(store)?;
     let mut options = ReadOptions::default();
     options.fill_cache(false);
@@ -962,12 +1086,12 @@ fn search_displaced_roots_fallback(
     let lookahead = query.limit.saturating_add(1);
     let mut matches = Vec::with_capacity(lookahead.min(64));
     let mut blocks_scanned = 0_usize;
-    let mut unavailable_count = 0_u64;
+    let mut unused_unavailable = 0_u64;
     let mut last_scanned_position = seek_fallback_initial_position(
         store,
         query,
         (&mut rows, &mut context_cache),
-        (&mut unavailable_count, &mut matches),
+        (&mut unused_unavailable, &mut matches),
     )?;
 
     while rows.valid()
@@ -981,16 +1105,17 @@ fn search_displaced_roots_fallback(
             break;
         }
         let position = decode_order_key(key)?;
-        let block =
-            decode_and_validate_record_cached(store, key, encoded_record, &mut context_cache)?;
+        let validated =
+            decode_and_validate_borrowed_cached(store, key, encoded_record, &mut context_cache)?;
         blocks_scanned = blocks_scanned.saturating_add(1);
         last_scanned_position = Some(position);
         append_matching_displaced_roots(
-            &block,
-            query.root,
-            lookahead,
-            None,
-            (&mut unavailable_count, &mut matches),
+            validated.record.final_note_commitment_roots,
+            position,
+            validated.record.displacement_epoch,
+            validated.header.block_time,
+            (query.root, lookahead, None),
+            (&mut unused_unavailable, &mut matches),
         );
         rows.prev();
     }
@@ -1009,16 +1134,59 @@ fn search_displaced_roots_fallback(
             more_blocks_remain,
             last_scanned_position,
             blocks_scanned,
-            unavailable_count,
+            archive_unavailable_count,
         ),
     ))
+}
+
+fn legacy_archive_unavailable_count(
+    store: &impl DisplacedArchiveRead,
+    latest_event_sequence: u64,
+) -> Result<u64, CanonicalStoreError> {
+    store.cached_legacy_unavailable_count(latest_event_sequence, &mut || {
+        count_archive_unavailable_roots(store)
+    })
+}
+
+fn count_archive_unavailable_roots(
+    store: &impl DisplacedArchiveRead,
+) -> Result<u64, CanonicalStoreError> {
+    let family = archive_family(store)?;
+    let mut options = ReadOptions::default();
+    options.fill_cache(false);
+    let mut rows = store.archive_db().raw_iterator_cf_opt(&family, options);
+    rows.seek([ORDER_KEY_TAG]);
+    let mut unavailable_count = 0_u64;
+    while rows.valid() {
+        let Some((key, encoded_record)) = rows.item() else {
+            break;
+        };
+        if key.first() != Some(&ORDER_KEY_TAG) {
+            break;
+        }
+        if decode_borrowed_archive_record(encoded_record)?
+            .final_note_commitment_roots
+            .is_none()
+        {
+            unavailable_count = unavailable_count.checked_add(1).ok_or_else(|| {
+                CanonicalStoreError::displaced_archive("archive unavailable-root count exceeds u64")
+            })?;
+        }
+        rows.next();
+    }
+    rows.status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "displaced archive unavailable-root scan",
+            source,
+        })?;
+    Ok(unavailable_count)
 }
 
 fn seek_fallback_initial_position(
     store: &impl DisplacedArchiveRead,
     query: RootSearchQuery<'_>,
     iter: (
-        &mut rust_rocksdb::DBRawIteratorWithThreadMode<'_, rust_rocksdb::DB>,
+        &mut rust_rocksdb::DBRawIteratorWithThreadMode<'_, DB>,
         &mut Option<ArchiveEventContext>,
     ),
     match_state: (&mut u64, &mut Vec<DisplacedRootCandidate>),
@@ -1030,19 +1198,21 @@ fn seek_fallback_initial_position(
     };
     let anchor_block = seek_fallback_root_cursor(store, cursor, rows, context_cache)?;
     let lookahead = query.limit.saturating_add(1);
+    let anchor_pos = ArchivePosition {
+        event_sequence: cursor.event_sequence,
+        height: cursor.height,
+        block_hash: cursor.block_hash,
+    };
     let last_pos = cursor.protocol.map(|after_proto| {
         append_matching_displaced_roots(
-            &anchor_block,
-            query.root,
-            lookahead,
-            Some(after_proto),
+            anchor_block.final_note_commitment_roots,
+            anchor_pos,
+            anchor_block.displacement_epoch,
+            anchor_block.header.block_time,
+            (query.root, lookahead, Some(after_proto)),
             match_state,
         );
-        ArchivePosition {
-            event_sequence: cursor.event_sequence,
-            height: cursor.height,
-            block_hash: cursor.block_hash,
-        }
+        anchor_pos
     });
     rows.prev();
     Ok(last_pos)
@@ -1059,8 +1229,13 @@ fn finalize_fallback_root_page(
         u64,
     ),
 ) -> DisplacedFinalRootPage {
-    let (mut matches, more_blocks_remain, last_scanned_position, blocks_scanned, unavailable_count) =
-        page_parts;
+    let (
+        mut matches,
+        more_blocks_remain,
+        last_scanned_position,
+        blocks_scanned,
+        archive_unavailable_count,
+    ) = page_parts;
     let (has_more, next_cursor) = if matches.len() > query.limit {
         matches.truncate(query.limit);
         (true, matches.last().map(cursor_for_candidate))
@@ -1078,17 +1253,18 @@ fn finalize_fallback_root_page(
             activation_event_sequence: state.coverage.activation_event_sequence,
             activation_epoch: state.coverage.activation_epoch,
             activated_at: state.coverage.activated_at,
-            captured_block_count: u64::try_from(blocks_scanned).unwrap_or(u64::MAX),
-            root_artifact_unavailable_count: unavailable_count,
+            captured_block_count: state.block_count,
+            root_artifact_unavailable_count: archive_unavailable_count,
         }),
         scan_complete,
+        scanned_work: blocks_scanned,
     }
 }
 
 fn seek_fallback_root_cursor(
     store: &impl DisplacedArchiveRead,
     cursor: &DisplacedRootCursor,
-    rows: &mut rust_rocksdb::DBRawIteratorWithThreadMode<'_, rust_rocksdb::DB>,
+    rows: &mut rust_rocksdb::DBRawIteratorWithThreadMode<'_, DB>,
     context_cache: &mut Option<ArchiveEventContext>,
 ) -> Result<DisplacedBlock, CanonicalStoreError> {
     let key = encode_order_key(ArchivePosition {
@@ -1107,15 +1283,21 @@ fn seek_fallback_root_cursor(
     Ok(block)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "match helper inspects only decoded root metadata without allocating a DisplacedBlock"
+)]
 fn append_matching_displaced_roots(
-    block: &DisplacedBlock,
-    target_root: FinalNoteCommitmentRoot,
-    max_matches: usize,
-    after_protocol: Option<ShieldedProtocol>,
+    maybe_roots: Option<BlockFinalNoteCommitmentRoots>,
+    position: ArchivePosition,
+    displacement_epoch: ChainEpochId,
+    block_time: i64,
+    filter: (FinalNoteCommitmentRoot, usize, Option<ShieldedProtocol>),
     state: (&mut u64, &mut Vec<DisplacedRootCandidate>),
 ) {
+    let (target_root, max_matches, after_protocol) = filter;
     let (root_artifact_unavailable_count, matches) = state;
-    let Some(roots) = block.final_note_commitment_roots else {
+    let Some(roots) = maybe_roots else {
         if after_protocol.is_none() {
             *root_artifact_unavailable_count = root_artifact_unavailable_count.saturating_add(1);
         }
@@ -1134,12 +1316,12 @@ fn append_matching_displaced_roots(
         }
         if root == Some(target_root) {
             matches.push(DisplacedRootCandidate {
-                block_id: BlockId::new(block.header.height, block.block_hash),
+                block_id: BlockId::new(position.height, position.block_hash),
                 protocol,
                 root: target_root,
-                displacement_event_sequence: block.displacement_event_sequence,
-                displacement_epoch: block.displacement_epoch,
-                block_time_unix_seconds: block.header.block_time,
+                displacement_event_sequence: position.event_sequence,
+                displacement_epoch,
+                block_time_unix_seconds: block_time,
             });
         }
     }
@@ -1298,6 +1480,110 @@ fn validate_root_index_state(
     Ok(())
 }
 
+/// Populates missing `[0x04]`/`[0x05]` root-index rows once for upgraded ready primaries.
+pub(super) fn backfill_displaced_root_index_if_absent(db: &DB) -> Result<(), CanonicalStoreError> {
+    let Some(encoded_state) =
+        read_exact_db_row(db, &STATE_KEY, "reorg archive backfill state read")?
+    else {
+        return Ok(());
+    };
+    if read_exact_db_row(
+        db,
+        &ROOT_UNAVAILABLE_STATE_KEY,
+        "reorg archive root-unavailable backfill check",
+    )?
+    .is_some()
+    {
+        return Ok(());
+    }
+    let state = decode_archive_state(&encoded_state)?;
+    let rows = collect_backfill_root_rows(db)?;
+    write_backfill_root_rows_and_verify(db, &rows)?;
+    validate_root_index_state(db, state.block_count)
+}
+
+type StagedArchiveRows = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn collect_backfill_root_rows(db: &DB) -> Result<StagedArchiveRows, CanonicalStoreError> {
+    let family = db
+        .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
+        .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
+    let mut read_opts = ReadOptions::default();
+    read_opts.fill_cache(false);
+    let mut rows_iter = db.raw_iterator_cf_opt(&family, read_opts);
+    rows_iter.seek([ORDER_KEY_TAG]);
+
+    let mut unavailable_count = 0_u64;
+    let mut staged = Vec::new();
+    while rows_iter.valid() {
+        let Some((key, encoded_record)) = rows_iter.item() else {
+            break;
+        };
+        if key.first() != Some(&ORDER_KEY_TAG) {
+            break;
+        }
+        let position = decode_order_key(key)?;
+        let borrowed = decode_borrowed_archive_record(encoded_record)?;
+        let replay = decode_canonical_block_replay(borrowed.replay_bytes).map_err(|source| {
+            CanonicalStoreError::displaced_archive(format!(
+                "archive canonical replay is invalid during backfill: {source}"
+            ))
+        })?;
+        append_root_index_rows(
+            RootIndexWriteInput {
+                position,
+                displacement_epoch: borrowed.displacement_epoch,
+                block_time: replay.facts().block_header.block_time,
+                roots: borrowed.final_note_commitment_roots,
+            },
+            &mut unavailable_count,
+            &mut staged,
+        )?;
+        rows_iter.next();
+    }
+    rows_iter
+        .status()
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "displaced archive root-index backfill scan",
+            source,
+        })?;
+    staged.push((
+        ROOT_UNAVAILABLE_STATE_KEY.to_vec(),
+        encode_root_unavailable_state(unavailable_count).to_vec(),
+    ));
+    Ok(staged)
+}
+
+fn write_backfill_root_rows_and_verify(
+    db: &DB,
+    rows: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(), CanonicalStoreError> {
+    let family = db
+        .cf_handle(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)
+        .ok_or_else(|| CanonicalStoreError::displaced_archive("archive column family is absent"))?;
+    let mut batch = WriteBatch::default();
+    for (key, encoded) in rows {
+        batch.put_cf(&family, key, encoded);
+    }
+    let mut write_opts = WriteOptions::default();
+    write_opts.disable_wal(false);
+    write_opts.set_sync(true);
+    db.write_opt(&batch, &write_opts)
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "displaced archive root-index backfill write",
+            source,
+        })?;
+    for (key, expected) in rows {
+        let observed = read_exact_db_row(db, key, "displaced archive backfill readback")?;
+        if observed.as_deref() != Some(expected.as_slice()) {
+            return Err(CanonicalStoreError::displaced_archive(
+                "archive root-index backfill row differs after synced write",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_latest_event_rows(
     db: &rust_rocksdb::DB,
     context: ArchiveEventContext,
@@ -1420,14 +1706,6 @@ fn archive_has_any_row(db: &rust_rocksdb::DB) -> Result<bool, CanonicalStoreErro
             source,
         })?;
     Ok(has_row)
-}
-
-fn empty_archive_page() -> DisplacedBlockPage {
-    DisplacedBlockPage {
-        blocks: Vec::new(),
-        has_more: false,
-        next_cursor: None,
-    }
 }
 
 fn checked_public_limit(limit: NonZeroU32) -> Result<usize, CanonicalStoreError> {
@@ -1713,6 +1991,16 @@ fn decode_and_validate_record_cached(
     encoded: &[u8],
     context_cache: &mut Option<ArchiveEventContext>,
 ) -> Result<DisplacedBlock, CanonicalStoreError> {
+    decode_and_validate_borrowed_cached(store, key, encoded, context_cache)
+        .map(derive_displaced_block)
+}
+
+fn decode_and_validate_borrowed_cached<'a>(
+    store: &impl DisplacedArchiveRead,
+    key: &[u8],
+    encoded: &'a [u8],
+    context_cache: &mut Option<ArchiveEventContext>,
+) -> Result<ValidatedArchiveRecord<'a>, CanonicalStoreError> {
     let position = decode_order_key(key)?;
     let context =
         if context_cache.is_some_and(|context| context.event_sequence == position.event_sequence) {
@@ -1725,7 +2013,7 @@ fn decode_and_validate_record_cached(
             *context_cache = Some(context);
             context
         };
-    decode_and_validate_record_with_context(key, encoded, context)
+    validate_borrowed_record_with_context(key, encoded, context)
 }
 
 fn decode_and_validate_record_with_context(
@@ -1733,14 +2021,22 @@ fn decode_and_validate_record_with_context(
     encoded: &[u8],
     context: ArchiveEventContext,
 ) -> Result<DisplacedBlock, CanonicalStoreError> {
+    validate_borrowed_record_with_context(key, encoded, context).map(derive_displaced_block)
+}
+
+fn validate_borrowed_record_with_context<'a>(
+    key: &[u8],
+    encoded: &'a [u8],
+    context: ArchiveEventContext,
+) -> Result<ValidatedArchiveRecord<'a>, CanonicalStoreError> {
     let position = decode_order_key(key)?;
     if position.event_sequence != context.event_sequence {
         return Err(CanonicalStoreError::displaced_archive(
             "archive row event does not match its cached event context",
         ));
     }
-    let record = decode_archive_record(encoded)?;
-    let replay = decode_canonical_block_replay(&record.replay_bytes).map_err(|source| {
+    let record = decode_borrowed_archive_record(encoded)?;
+    let replay = decode_canonical_block_replay(record.replay_bytes).map_err(|source| {
         CanonicalStoreError::displaced_archive(format!(
             "archive canonical replay is invalid: {source}"
         ))
@@ -1763,7 +2059,7 @@ fn decode_and_validate_record_with_context(
             "archive order key height or hash does not match canonical replay",
         ));
     }
-    if record.raw_block_bytes.as_ref().is_some_and(|raw| {
+    if record.raw_block_bytes.is_some_and(|raw| {
         SerializedBytesDigest::from_serialized_bytes(raw) != facts.serialized_bytes_digest
     }) {
         return Err(CanonicalStoreError::displaced_archive(
@@ -1786,14 +2082,14 @@ fn decode_and_validate_record_with_context(
             "archive row does not match its canonical reorg event and epoch",
         ));
     }
-    derive_displaced_block(position, record, facts)
+    extract_validated_archive_record(position, record, &replay.into_facts())
 }
 
-fn derive_displaced_block(
+fn extract_validated_archive_record<'a>(
     position: ArchivePosition,
-    record: ArchiveRecord,
-    facts: &CanonicalBlockFacts,
-) -> Result<DisplacedBlock, CanonicalStoreError> {
+    record: BorrowedArchiveRecord<'a>,
+    facts: &zinder_core::CanonicalBlockFacts,
+) -> Result<ValidatedArchiveRecord<'a>, CanonicalStoreError> {
     let transaction_ids = facts
         .transactions
         .iter()
@@ -1826,17 +2122,41 @@ fn derive_displaced_block(
             )
         })
         .collect();
-    Ok(DisplacedBlock {
-        block_hash: position.block_hash,
+    Ok(ValidatedArchiveRecord {
+        position,
         header: facts.block_header.clone(),
         transaction_ids,
         coinbase_outputs,
-        raw_block_bytes: record.raw_block_bytes,
-        final_note_commitment_roots: record.final_note_commitment_roots,
-        displacement_event_sequence: position.event_sequence,
-        displacement_epoch: record.displacement_epoch,
-        displaced_at: record.displaced_at,
+        record,
     })
+}
+
+fn derive_displaced_summary(
+    validated: &ValidatedArchiveRecord<'_>,
+) -> ArchivedDisplacedBlockSummary {
+    ArchivedDisplacedBlockSummary {
+        block_hash: validated.position.block_hash,
+        header: validated.header.clone(),
+        transaction_ids: validated.transaction_ids.clone(),
+        coinbase_outputs: validated.coinbase_outputs.clone(),
+        displacement_event_sequence: validated.position.event_sequence,
+        displacement_epoch: validated.record.displacement_epoch,
+        displaced_at: validated.record.displaced_at,
+    }
+}
+
+fn derive_displaced_block(validated: ValidatedArchiveRecord<'_>) -> DisplacedBlock {
+    DisplacedBlock {
+        block_hash: validated.position.block_hash,
+        header: validated.header,
+        transaction_ids: validated.transaction_ids,
+        coinbase_outputs: validated.coinbase_outputs,
+        raw_block_bytes: validated.record.raw_block_bytes.map(<[u8]>::to_vec),
+        final_note_commitment_roots: validated.record.final_note_commitment_roots,
+        displacement_event_sequence: validated.position.event_sequence,
+        displacement_epoch: validated.record.displacement_epoch,
+        displaced_at: validated.record.displaced_at,
+    }
 }
 
 fn archive_family(
@@ -2079,21 +2399,36 @@ fn encode_archive_record(record: &ArchiveRecord) -> Result<Vec<u8>, CanonicalSto
     Ok(encoded)
 }
 
-fn decode_archive_record(encoded: &[u8]) -> Result<ArchiveRecord, CanonicalStoreError> {
+fn decode_borrowed_archive_record(
+    encoded: &[u8],
+) -> Result<BorrowedArchiveRecord<'_>, CanonicalStoreError> {
     let mut decoder = ArchiveDecoder::new(encoded);
     decoder.require_version()?;
     let replay_length = usize::try_from(decoder.read_u32()?).map_err(|_| {
         CanonicalStoreError::displaced_archive("archive replay length exceeds usize")
     })?;
-    let replay_bytes = decoder.read_bytes(replay_length)?.to_vec();
-    let record = ArchiveRecord {
+    let replay_bytes = decoder.read_bytes(replay_length)?;
+    let record = BorrowedArchiveRecord {
         replay_bytes,
         displacement_epoch: ChainEpochId::new(decoder.read_u64()?),
         displaced_at: UnixTimestampMillis::new(decoder.read_u64()?),
-        raw_block_bytes: decoder.read_optional_bytes()?,
+        raw_block_bytes: decoder.read_optional_slice()?,
         final_note_commitment_roots: decoder.read_optional_roots()?,
     };
     decoder.require_end()?;
+    Ok(record)
+}
+
+#[cfg(test)]
+fn decode_archive_record(encoded: &[u8]) -> Result<ArchiveRecord, CanonicalStoreError> {
+    let borrowed = decode_borrowed_archive_record(encoded)?;
+    let record = ArchiveRecord {
+        replay_bytes: borrowed.replay_bytes.to_vec(),
+        displacement_epoch: borrowed.displacement_epoch,
+        displaced_at: borrowed.displaced_at,
+        raw_block_bytes: borrowed.raw_block_bytes.map(<[u8]>::to_vec),
+        final_note_commitment_roots: borrowed.final_note_commitment_roots,
+    };
     if encode_archive_record(&record)? != encoded {
         return Err(CanonicalStoreError::displaced_archive(
             "archive order value is not canonical bytes",
@@ -2199,14 +2534,14 @@ impl<'a> ArchiveDecoder<'a> {
         }
     }
 
-    fn read_optional_bytes(&mut self) -> Result<Option<Vec<u8>>, CanonicalStoreError> {
+    fn read_optional_slice(&mut self) -> Result<Option<&'a [u8]>, CanonicalStoreError> {
         if !self.read_presence()? {
             return Ok(None);
         }
         let length = usize::try_from(self.read_u32()?).map_err(|_| {
             CanonicalStoreError::displaced_archive("archive raw block length exceeds usize")
         })?;
-        Ok(Some(self.read_bytes(length)?.to_vec()))
+        Ok(Some(self.read_bytes(length)?))
     }
 
     fn read_optional_root(
@@ -2310,6 +2645,114 @@ pub(super) fn encode_test_archive_record(
         raw_block_bytes,
         final_note_commitment_roots,
     })
+}
+
+#[cfg(test)]
+type ExistingTestArchive = (
+    Vec<ArchiveEventContext>,
+    Vec<(ArchivePosition, ArchiveRecord)>,
+    Vec<Vec<u8>>,
+);
+
+#[cfg(test)]
+pub(super) fn reindex_test_archive_with_roots(
+    store: &RocksDbCanonicalStore,
+    roots_by_block: &[(BlockId, BlockFinalNoteCommitmentRoots)],
+) -> Result<(), CanonicalStoreError> {
+    let (mut contexts, records, all_keys) = read_existing_test_archive(store)?;
+    contexts.sort_by_key(|ctx| ctx.event_sequence);
+    let family = archive_family(store)?;
+    let mut clear_batch = WriteBatch::default();
+    for key in all_keys {
+        clear_batch.delete_cf(&family, key);
+    }
+    store
+        .bounded_open
+        .db
+        .write(&clear_batch)
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "clear test displaced archive",
+            source,
+        })?;
+    for ctx in contexts {
+        let mut blocks: Vec<CanonicalDisplacedBlock> = records
+            .iter()
+            .filter(|(pos, _)| pos.event_sequence == ctx.event_sequence)
+            .map(|(pos, rec)| {
+                let block_id = BlockId::new(pos.height, pos.block_hash);
+                let roots = roots_by_block
+                    .iter()
+                    .find_map(|(id, roots)| (*id == block_id).then_some(*roots));
+                CanonicalDisplacedBlock {
+                    block_id,
+                    replay_bytes: rec.replay_bytes.clone(),
+                    raw_block_bytes: rec.raw_block_bytes.clone(),
+                    final_note_commitment_roots: roots,
+                }
+            })
+            .collect();
+        blocks.sort_by_key(|block| block.block_id.height.value());
+        let prepared = PreparedDisplacedArchiveWrite::new(
+            store,
+            DisplacedArchiveEvent {
+                event_sequence: ctx.event_sequence,
+                displacement_epoch: ctx.displacement_epoch,
+                reverted_range: ctx.reverted_range,
+                displaced_at: ctx.displaced_at,
+            },
+            blocks,
+        )?;
+        let mut write_batch = WriteBatch::default();
+        prepared.put_into(store, &mut write_batch)?;
+        store
+            .bounded_open
+            .db
+            .write(&write_batch)
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "write reindexed test displaced archive",
+                source,
+            })?;
+    }
+    store
+        .bounded_open
+        .db
+        .flush_wal(true)
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "flush reindexed test displaced archive wal",
+            source,
+        })
+}
+
+#[cfg(test)]
+fn read_existing_test_archive(
+    store: &RocksDbCanonicalStore,
+) -> Result<ExistingTestArchive, CanonicalStoreError> {
+    let family = archive_family(store)?;
+    let mut contexts = Vec::new();
+    let mut records = Vec::new();
+    let mut all_keys = Vec::new();
+    for entry in store
+        .bounded_open
+        .db
+        .iterator_cf(&family, rust_rocksdb::IteratorMode::Start)
+    {
+        let (key, encoded) = entry.map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "iterate existing test displaced archive",
+            source,
+        })?;
+        all_keys.push(key.to_vec());
+        match key.first().copied() {
+            Some(EVENT_CONTEXT_KEY_TAG) => {
+                let seq = u64::from_be_bytes(read_array(&key, 1)?);
+                contexts.push(decode_event_context(&encoded, seq)?);
+            }
+            Some(ORDER_KEY_TAG) => {
+                records.push((decode_order_key(&key)?, decode_archive_record(&encoded)?));
+            }
+            _ => {}
+        }
+    }
+    Ok((contexts, records, all_keys))
 }
 
 #[cfg(test)]

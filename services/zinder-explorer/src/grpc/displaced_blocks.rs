@@ -20,7 +20,9 @@ use zinder_proto::v1::explorer::{
     DisplacedBlockHistoryEntry, DisplacedBlockHistoryRequest, DisplacedBlockHistoryResponse,
     DisplacedBlockSummary,
 };
-use zinder_store::{CanonicalStoreError, DisplacedBlockCursor, chain_epoch_message};
+use zinder_store::{
+    ArchivedDisplacedBlockSummary, CanonicalStoreError, DisplacedBlockCursor, chain_epoch_message,
+};
 
 use super::canonical_read::{
     SharedCanonicalSecondary, encode_canonical_counterpart, internal_canonical_error,
@@ -121,7 +123,7 @@ pub(crate) async fn query_displaced_block_detail(
 
     Ok(Response::new(DisplacedBlockDetailResponse {
         freshness: Some(freshness),
-        block: Some(encode_displaced_block_summary(&block)),
+        block: Some(encode_full_displaced_block_summary(&block)),
         current_canonical_block: counterpart,
         raw_block_bytes: block.raw_block_bytes,
         coverage,
@@ -144,7 +146,7 @@ fn read_displaced_history_page(
 ) -> Result<HistoryPageRead, Status> {
     let guard = store.read();
     let epoch = guard.chain_epoch().map_err(internal_canonical_error)?;
-    let page = match guard.displaced_block_page(after, limit) {
+    let page = match guard.displaced_block_summary_page(after, limit) {
         Ok(page) => page,
         Err(CanonicalStoreError::DisplacedArchiveInvalid { reason })
             if after.is_some() && reason.contains("archive cursor") =>
@@ -234,21 +236,55 @@ fn read_canonical_counterpart(
     encode_canonical_counterpart(&facts).map(Some)
 }
 
-fn encode_displaced_block_summary(block: &DisplacedBlock) -> DisplacedBlockSummary {
+struct DisplacedSummaryFields<'a> {
+    block_hash: BlockHash,
+    header: &'a zinder_core::BlockHeaderArtifact,
+    transaction_ids: &'a [zinder_core::TransactionId],
+    coinbase_outputs: &'a [zinder_core::DisplacedBlockCoinbaseOutput],
+    displacement_event_sequence: u64,
+    displacement_epoch_id: u64,
+    displaced_at_millis: u64,
+}
+
+fn encode_displaced_block_summary(block: &ArchivedDisplacedBlockSummary) -> DisplacedBlockSummary {
+    encode_displaced_summary_fields(&DisplacedSummaryFields {
+        block_hash: block.block_hash,
+        header: &block.header,
+        transaction_ids: &block.transaction_ids,
+        coinbase_outputs: &block.coinbase_outputs,
+        displacement_event_sequence: block.displacement_event_sequence,
+        displacement_epoch_id: block.displacement_epoch.value(),
+        displaced_at_millis: block.displaced_at.value(),
+    })
+}
+
+fn encode_full_displaced_block_summary(block: &DisplacedBlock) -> DisplacedBlockSummary {
+    encode_displaced_summary_fields(&DisplacedSummaryFields {
+        block_hash: block.block_hash,
+        header: &block.header,
+        transaction_ids: &block.transaction_ids,
+        coinbase_outputs: &block.coinbase_outputs,
+        displacement_event_sequence: block.displacement_event_sequence,
+        displacement_epoch_id: block.displacement_epoch.value(),
+        displaced_at_millis: block.displaced_at.value(),
+    })
+}
+
+fn encode_displaced_summary_fields(fields: &DisplacedSummaryFields<'_>) -> DisplacedBlockSummary {
     DisplacedBlockSummary {
-        block_height: block.header.height.value(),
-        block_hash: encode_rpc_block_hash_hex(block.block_hash),
-        previous_block_hash: encode_rpc_block_hash_hex(block.header.parent_hash),
-        block_time_unix_seconds: block.header.block_time,
-        total_size_bytes: block.header.block_size_bytes,
-        difficulty_bits: block.header.bits,
-        transaction_ids: block
+        block_height: fields.header.height.value(),
+        block_hash: encode_rpc_block_hash_hex(fields.block_hash),
+        previous_block_hash: encode_rpc_block_hash_hex(fields.header.parent_hash),
+        block_time_unix_seconds: fields.header.block_time,
+        total_size_bytes: fields.header.block_size_bytes,
+        difficulty_bits: fields.header.bits,
+        transaction_ids: fields
             .transaction_ids
             .iter()
             .copied()
             .map(encode_rpc_transaction_id_hex)
             .collect(),
-        coinbase_outputs: block
+        coinbase_outputs: fields
             .coinbase_outputs
             .iter()
             .map(|output| DisplacedBlockCoinbaseOutput {
@@ -257,9 +293,9 @@ fn encode_displaced_block_summary(block: &DisplacedBlock) -> DisplacedBlockSumma
                 script_pub_key: output.script_pub_key.clone(),
             })
             .collect(),
-        displacement_event_sequence: block.displacement_event_sequence,
-        displacement_epoch_id: block.displacement_epoch.value(),
-        displaced_at_millis: block.displaced_at.value(),
+        displacement_event_sequence: fields.displacement_event_sequence,
+        displacement_epoch_id: fields.displacement_epoch_id,
+        displaced_at_millis: fields.displaced_at_millis,
     }
 }
 

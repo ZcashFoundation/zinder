@@ -19,14 +19,16 @@ use super::{
     },
     block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     control::encode_ready_store_control_with_revisions,
+    displaced_archive::reindex_test_archive_with_roots,
     live_replacement_tests::{
         canonical_block, open_store, open_store_with_retention, published_store,
-        published_store_with_retention, replacement_block,
+        published_store_with_retention, replacement_block, replacement_block_with_retention,
     },
-    publication::{encode_live_append_event, encode_live_chain_epoch},
+    publication::{column_family, encode_live_append_event, encode_live_chain_epoch},
     rocksdb::{
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
-        CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY, STORE_CONTROL_KEY,
+        CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
+        DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY, validate_open_store_control,
     },
 };
@@ -2205,5 +2207,317 @@ fn canonical_secondary_pages_displaced_root_index_without_scanning_full_archive(
     assert_eq!(coverage.captured_block_count, 1);
     assert_eq!(coverage.root_artifact_unavailable_count, 1);
     drop(store);
+    Ok(())
+}
+
+fn replace_suffix(
+    store: RocksDbCanonicalStore,
+    activations: &NetworkUpgradeActivations,
+    blocks: Vec<crate::CanonicalReplacementBlock>,
+    timestamp_millis: u64,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    let fence = store.event_fence();
+    let (next, _) = store.commit_live_replacement(
+        crate::CanonicalLiveReplacement::new(
+            fence,
+            blocks,
+            UnixTimestampMillis::new(timestamp_millis),
+        ),
+        activations,
+    )?;
+    Ok(next)
+}
+
+fn assert_displaced_summaries_match(
+    secondary: &RocksDbCanonicalSecondary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ten = NonZeroU32::new(10).ok_or("nonzero limit")?;
+    let full_page = secondary.displaced_block_page(None, ten)?;
+    let summary_page = secondary.displaced_block_summary_page(None, ten)?;
+    assert_eq!(full_page.blocks.len(), 3);
+    assert!(
+        full_page
+            .blocks
+            .iter()
+            .all(|block| block.raw_block_bytes.is_some())
+    );
+    assert_eq!(summary_page.blocks.len(), full_page.blocks.len());
+    assert_eq!(summary_page.has_more, full_page.has_more);
+    assert_eq!(
+        summary_page.blocks[0].block_hash,
+        BlockHash::from_bytes([0x44; 32])
+    );
+    for (summary, full) in summary_page.blocks.iter().zip(full_page.blocks.iter()) {
+        assert_eq!(summary.block_hash, full.block_hash);
+        assert_eq!(summary.header, full.header);
+        assert_eq!(summary.transaction_ids, full.transaction_ids);
+        assert_eq!(summary.coinbase_outputs, full.coinbase_outputs);
+        assert_eq!(
+            summary.displacement_event_sequence,
+            full.displacement_event_sequence
+        );
+        assert_eq!(summary.displacement_epoch, full.displacement_epoch);
+        assert_eq!(summary.displaced_at, full.displaced_at);
+    }
+    Ok(())
+}
+
+fn replace_heights_3_and_4(
+    store: RocksDbCanonicalStore,
+    activations: &NetworkUpgradeActivations,
+    retention: RawBlobRetention,
+    timestamp_millis: u64,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    replace_suffix(
+        store,
+        activations,
+        vec![
+            crate::CanonicalReplacementBlock::new(
+                replacement_block_with_retention(
+                    BlockHeight::new(3),
+                    [0x33; 32],
+                    [2; 32],
+                    133,
+                    retention,
+                )?,
+                Vec::new(),
+            ),
+            crate::CanonicalReplacementBlock::new(
+                replacement_block_with_retention(
+                    BlockHeight::new(4),
+                    [0x44; 32],
+                    [0x33; 32],
+                    144,
+                    retention,
+                )?,
+                Vec::new(),
+            ),
+        ],
+        timestamp_millis,
+    )
+}
+
+#[test]
+fn canonical_secondary_indexes_populated_displaced_roots_and_streams_summaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    use zinder_core::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, ShieldedProtocol};
+
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let shared = FinalNoteCommitmentRoot::from_bytes([0xA1; 32]);
+    let other = FinalNoteCommitmentRoot::from_bytes([0xB2; 32]);
+    let store = published_store_with_retention(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+        RawBlobRetention::All,
+    )?;
+    let mut secondary = open_secondary(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        RawBlobRetention::All,
+    )??;
+
+    let store = replace_heights_3_and_4(
+        store,
+        &activations,
+        RawBlobRetention::All,
+        1_750_000_000_010,
+    )?;
+    let store = replace_suffix(
+        store,
+        &activations,
+        vec![crate::CanonicalReplacementBlock::new(
+            replacement_block_with_retention(
+                BlockHeight::new(4),
+                [0x55; 32],
+                [0x33; 32],
+                155,
+                RawBlobRetention::All,
+            )?,
+            Vec::new(),
+        )],
+        1_750_000_000_020,
+    )?;
+    let b4 = BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32]));
+    let b44 = BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([0x44; 32]));
+    reindex_test_archive_with_roots(
+        &store,
+        &[
+            (
+                b4,
+                BlockFinalNoteCommitmentRoots::new(
+                    b4.height,
+                    b4.hash,
+                    Some(shared),
+                    Some(shared),
+                    Some(other),
+                ),
+            ),
+            (
+                b44,
+                BlockFinalNoteCommitmentRoots::new(b44.height, b44.hash, Some(shared), None, None),
+            ),
+        ],
+    )?;
+
+    assert!(secondary.try_catch_up()?.advanced());
+    assert_displaced_summaries_match(&secondary)?;
+
+    let cold_reopen = open_secondary(
+        &store_path,
+        temporary.path().join("secondary-reopen"),
+        &activations,
+        RawBlobRetention::All,
+    )??;
+    assert_indexed_root_pages(
+        &cold_reopen,
+        shared,
+        ShieldedProtocol::Sapling,
+        ShieldedProtocol::Orchard,
+    )?;
+    drop(store);
+    Ok(())
+}
+
+fn assert_indexed_root_pages(
+    secondary: &RocksDbCanonicalSecondary,
+    shared: zinder_core::FinalNoteCommitmentRoot,
+    sapling: zinder_core::ShieldedProtocol,
+    orchard: zinder_core::ShieldedProtocol,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let one = NonZeroU32::new(1).ok_or("nonzero limit")?;
+    let p1 = secondary.search_displaced_final_note_commitment_roots_page(shared, None, one)?;
+    assert!(p1.has_more && p1.scan_complete && p1.matches.len() == 1);
+    assert_eq!(
+        p1.matches[0].block_id.hash,
+        BlockHash::from_bytes([0x44; 32])
+    );
+    assert_eq!(p1.matches[0].protocol, sapling);
+
+    let p2 = secondary.search_displaced_final_note_commitment_roots_page(
+        shared,
+        p1.next_cursor.as_ref(),
+        one,
+    )?;
+    assert!(p2.has_more);
+    assert_eq!(p2.matches[0].block_id.hash, BlockHash::from_bytes([4; 32]));
+    assert_eq!(p2.matches[0].protocol, sapling);
+
+    let p3 = secondary.search_displaced_final_note_commitment_roots_page(
+        shared,
+        p2.next_cursor.as_ref(),
+        one,
+    )?;
+    assert!(!p3.has_more);
+    assert_eq!(p3.matches[0].block_id.hash, BlockHash::from_bytes([4; 32]));
+    assert_eq!(p3.matches[0].protocol, orchard);
+    let cov = p3.coverage.ok_or("missing indexed coverage")?;
+    assert_eq!(cov.captured_block_count, 3);
+    assert_eq!(cov.root_artifact_unavailable_count, 1);
+    Ok(())
+}
+
+fn strip_displaced_root_index_rows(
+    store: &RocksDbCanonicalStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rust_rocksdb::IteratorMode;
+
+    let archive_cf = column_family(&store.bounded_open.db, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY)?;
+    let mut keys_to_delete = Vec::new();
+    for entry in store
+        .bounded_open
+        .db
+        .iterator_cf(&archive_cf, IteratorMode::Start)
+    {
+        let (key, _) = entry?;
+        if key.first().is_some_and(|tag| *tag == 0x04 || *tag == 0x05) {
+            keys_to_delete.push(key.to_vec());
+        }
+    }
+    for key in keys_to_delete {
+        store.bounded_open.db.delete_cf(&archive_cf, &key)?;
+    }
+    store.bounded_open.db.flush_wal(true)?;
+    Ok(())
+}
+
+#[test]
+fn canonical_secondary_fallback_reports_archive_wide_counts_and_primary_reopen_backfills()
+-> Result<(), Box<dyn std::error::Error>> {
+    use zinder_core::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot};
+
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let matched_root = FinalNoteCommitmentRoot::from_bytes([0x7E; 32]);
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let store = replace_heights_3_and_4(
+        store,
+        &activations,
+        RawBlobRetention::Transactions,
+        1_750_000_000_010,
+    )?;
+    let b4 = BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32]));
+    reindex_test_archive_with_roots(
+        &store,
+        &[(
+            b4,
+            BlockFinalNoteCommitmentRoots::new(
+                b4.height,
+                b4.hash,
+                Some(matched_root),
+                Some(matched_root),
+                None,
+            ),
+        )],
+    )?;
+    strip_displaced_root_index_rows(&store)?;
+    drop(store);
+
+    let secondary = open_secondary(
+        &store_path,
+        temporary.path().join("secondary-legacy"),
+        &activations,
+        RawBlobRetention::Transactions,
+    )??;
+    let one = NonZeroU32::new(1).ok_or("nonzero limit")?;
+    let page =
+        secondary.search_displaced_final_note_commitment_roots_page(matched_root, None, one)?;
+    assert_eq!(page.matches.len(), 1);
+    assert_eq!(page.scanned_work, 1);
+    assert_eq!(
+        page.matches[0].block_id.hash,
+        BlockHash::from_bytes([4; 32])
+    );
+    assert!(page.has_more && !page.scan_complete);
+    let cov = page.coverage.ok_or("missing legacy coverage")?;
+    assert_eq!(cov.captured_block_count, 2);
+    assert_eq!(cov.root_artifact_unavailable_count, 1);
+
+    drop(secondary);
+    let _primary = open_store(&store_path, &activations, REORG_WINDOW)?;
+    let upgraded_sec = open_secondary(
+        &store_path,
+        temporary.path().join("secondary-upgraded"),
+        &activations,
+        RawBlobRetention::Transactions,
+    )??;
+    let two = NonZeroU32::new(2).ok_or("nonzero limit")?;
+    let indexed =
+        upgraded_sec.search_displaced_final_note_commitment_roots_page(matched_root, None, two)?;
+    assert_eq!(indexed.matches.len(), 2);
+    assert!(!indexed.has_more && indexed.scan_complete);
+    let indexed_cov = indexed.coverage.ok_or("missing backfilled coverage")?;
+    assert_eq!(indexed_cov.captured_block_count, 2);
+    assert_eq!(indexed_cov.root_artifact_unavailable_count, 1);
     Ok(())
 }

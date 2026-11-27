@@ -14,7 +14,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, transport::Server};
-use zebra_chain::serialization::ZcashDeserialize as _;
+use zebra_chain::serialization::{ZcashDeserialize as _, ZcashSerialize as _};
 use zebra_chain::transaction::Transaction as ZebraTransaction;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex};
 use zinder_core::{
@@ -267,7 +267,6 @@ fn make_spend_spec(
     prev_vout: u32,
     output_zat: u64,
     recipient_hash: [u8; 20],
-    intrinsic_balances: TransactionIntrinsicValueBalances,
 ) -> Result<BuiltTxSpec> {
     let raw_bytes = build_v1_spend_bytes(prev_txid, prev_vout, output_zat, recipient_hash)?;
     let txid = TransactionId::from_bytes(double_sha256(&raw_bytes));
@@ -294,12 +293,61 @@ fn make_spend_spec(
             unsupported_sections: Vec::new(),
         },
         serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&raw_bytes),
-        intrinsic_value_balances: intrinsic_balances,
+        intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
         transparent_inputs: vec![TransparentInputFact::new(
             0,
             TransparentOutPoint::new(prev_txid, prev_vout),
         )],
         transparent_outputs: vec![p2pkh_output_fact(0, output_zat, recipient_hash)],
+    };
+    Ok(BuiltTxSpec { raw_bytes, facts })
+}
+
+fn make_sprout_spend_spec(
+    outpoint: (TransactionId, u32),
+    output: (u64, [u8; 20]),
+    vpub_balances: (u64, u64),
+    height: BlockHeight,
+    activations: &NetworkUpgradeActivations,
+) -> Result<BuiltTxSpec> {
+    let (prev_txid, prev_vout) = outpoint;
+    let (output_zat, recipient_hash) = output;
+    let (vpub_old, vpub_new) = vpub_balances;
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../zinder-ingest/tests/fixtures/zcash-mainnet-sprout-block-396.json"
+    ))?;
+    let raw_block = hex::decode(
+        fixture
+            .get("raw_block_hex")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| eyre!("Mainnet block 396 fixture is missing raw_block_hex"))?,
+    )?;
+    let block = zebra_chain::block::Block::zcash_deserialize(&mut std::io::Cursor::new(raw_block))?;
+    let joinsplit_transaction = block
+        .transactions
+        .get(1)
+        .ok_or_else(|| eyre!("Mainnet block 396 has no JoinSplit transaction"))?
+        .zcash_serialize_to_vec()?;
+    let joinsplit_tail_start = joinsplit_transaction
+        .len()
+        .checked_sub(1 + 1_802 + 32 + 64)
+        .ok_or_else(|| eyre!("JoinSplit transaction is shorter than one description"))?;
+    let mut prefix = build_v1_spend_bytes(prev_txid, prev_vout, output_zat, recipient_hash)?;
+    prefix[..4].copy_from_slice(&2_u32.to_le_bytes());
+    let mut tail = joinsplit_transaction[joinsplit_tail_start..].to_vec();
+    tail[1..9].copy_from_slice(&vpub_old.to_le_bytes());
+    tail[9..17].copy_from_slice(&vpub_new.to_le_bytes());
+    let mut raw_bytes = prefix;
+    raw_bytes.extend_from_slice(&tail);
+
+    let parsed =
+        zinder_source::parse_transaction_public_fact_set(&raw_bytes, Some(height), activations)?;
+    let facts = CanonicalTransactionFacts {
+        public_facts: parsed.public_facts,
+        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&raw_bytes),
+        intrinsic_value_balances: parsed.intrinsic_value_balances,
+        transparent_inputs: parsed.transparent_inputs,
+        transparent_outputs: parsed.transparent_outputs,
     };
     Ok(BuiltTxSpec { raw_bytes, facts })
 }
@@ -786,12 +834,12 @@ fn commit_reorg_block2(
 )> {
     let b2_new_cb = make_coinbase_spec(2, 625_015_000, [0x22; 20])?;
     let tx_b2_new_cb_id = b2_new_cb.facts.public_facts.transaction_id;
-    let b2_spend = make_spend_spec(
-        baseline.tx_b1_cb_id,
-        0,
-        624_900_000,
-        [0x29; 20],
-        TransactionIntrinsicValueBalances::new(10_000, -25_000, -70_000, 0),
+    let b2_spend = make_sprout_spend_spec(
+        (baseline.tx_b1_cb_id, 0),
+        (624_900_000, [0x29; 20]),
+        (95_000, 10_000),
+        BlockHeight::new(2),
+        activations,
     )?;
     let tx_b2_spend_id = b2_spend.facts.public_facts.transaction_id;
     let block2_new = assemble_block(
@@ -829,19 +877,12 @@ fn commit_append_block3(
     tx_b2_spend_id: TransactionId,
 ) -> Result<(RocksDbCanonicalStore, TransactionId)> {
     let b3_cb = make_coinbase_spec(3, 625_007_000, [0x33; 20])?;
-    let b3_intra = make_spend_spec(
-        tx_b2_spend_id,
-        0,
-        624_895_000,
-        [0x3A; 20],
-        TransactionIntrinsicValueBalances::default(),
-    )?;
+    let b3_intra = make_spend_spec(tx_b2_spend_id, 0, 624_895_000, [0x3A; 20])?;
     let b3_intra_child = make_spend_spec(
         b3_intra.facts.public_facts.transaction_id,
         0,
         624_893_000,
         [0x3B; 20],
-        TransactionIntrinsicValueBalances::default(),
     )?;
     let tx_b3_intra_child_id = b3_intra_child.facts.public_facts.transaction_id;
     let block3 = assemble_block(
@@ -1328,9 +1369,9 @@ async fn assert_intrinsic_value_balances_rpcs(
     let balances = tx_detail
         .intrinsic_value_balances
         .ok_or_else(|| eyre!("TransactionDetail missing intrinsic_value_balances"))?;
-    assert_eq!(balances.sprout_zat, 10_000);
-    assert_eq!(balances.sapling_zat, -25_000);
-    assert_eq!(balances.orchard_zat, -70_000);
+    assert_eq!(balances.sprout_zat, -85_000);
+    assert_eq!(balances.sapling_zat, 0);
+    assert_eq!(balances.orchard_zat, 0);
     assert_eq!(balances.ironwood_zat, 0);
 
     let tx_history = client
@@ -1353,7 +1394,7 @@ async fn assert_intrinsic_value_balances_rpcs(
     let history_balances = matched_entry
         .intrinsic_value_balances
         .ok_or_else(|| eyre!("TransactionHistory missing intrinsic_value_balances"))?;
-    assert_eq!(history_balances.sapling_zat, -25_000);
+    assert_eq!(history_balances.sprout_zat, -85_000);
     assert_eq!(
         encode_rpc_transaction_id_hex(fixture.tx_b3_intra_child_id).len(),
         64

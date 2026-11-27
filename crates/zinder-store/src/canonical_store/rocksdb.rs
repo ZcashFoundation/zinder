@@ -643,6 +643,7 @@ impl RocksDbCanonicalStore {
             reorg_policy,
             &opened_ready_evidence,
         )?;
+        super::displaced_archive::backfill_displaced_root_index_if_absent(&bounded_open.db)?;
         Ok(Self {
             bounded_open,
             workload: opened_control.workload,

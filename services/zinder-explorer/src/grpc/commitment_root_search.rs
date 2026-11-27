@@ -29,6 +29,7 @@ use super::freshness::{
 
 const DEFAULT_COMMITMENT_ROOT_SEARCH_MATCHES: u32 = 64;
 const MAX_COMMITMENT_ROOT_SEARCH_MATCHES: u32 = 1024;
+const MAX_COMMITMENT_ROOT_SEARCH_SCANNED_CANDIDATES: usize = 4_096;
 
 /// Shared dependencies for `CommitmentRootSearch`.
 pub(crate) struct CommitmentRootSearchContext<'store> {
@@ -108,7 +109,8 @@ fn read_commitment_root_search_sync(
     let consumer_state = snapshot
         .consumer_state(COMMITMENT_ROOT_SEARCH_CONSUMER_NAME)
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let matches = collect_canonical_matches(secondary, &snapshot, epoch, root, limit)?;
+    let (matches, canonical_scan_complete) =
+        collect_canonical_matches(secondary, &snapshot, epoch, root, limit)?;
     drop(snapshot);
 
     let canonical_tip_hash = secondary
@@ -121,6 +123,7 @@ fn read_commitment_root_search_sync(
         backfill,
         consumer_state,
         canonical_tip_hash,
+        canonical_scan_complete,
     );
     let (displaced_matches, displaced_coverage) =
         read_displaced_matches(secondary, epoch, root, limit)?;
@@ -140,34 +143,61 @@ fn collect_canonical_matches(
     epoch: ChainEpoch,
     root: FinalNoteCommitmentRoot,
     limit: usize,
-) -> Result<Vec<CommitmentRootMatch>, Status> {
+) -> Result<(Vec<CommitmentRootMatch>, bool), Status> {
+    collect_canonical_matches_with(
+        (limit, MAX_COMMITMENT_ROOT_SEARCH_SCANNED_CANDIDATES),
+        |after, page_size| {
+            CommitmentRootSearchConsumer::search_snapshot_page(snapshot, root, after, page_size)
+                .map_err(|error| ExplorerError::internal(error.to_string()).into())
+        },
+        |batch, remaining| filter_canonical_matches(secondary, epoch, batch, remaining),
+    )
+}
+
+fn collect_canonical_matches_with<Entry, FetchBatch, FilterBatch>(
+    limits: (usize, usize),
+    mut fetch_batch: FetchBatch,
+    mut filter_batch: FilterBatch,
+) -> Result<(Vec<CommitmentRootMatch>, bool), Status>
+where
+    Entry: Copy,
+    FetchBatch: FnMut(Option<&Entry>, usize) -> Result<Vec<Entry>, Status>,
+    FilterBatch: FnMut(&[Entry], usize) -> Result<Vec<CommitmentRootMatch>, Status>,
+{
+    let (limit, max_scanned_candidates) = limits;
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
-    let page_size = limit.clamp(64, 256);
     let mut matches = Vec::with_capacity(limit);
     let mut after = None;
+    let mut total_scanned = 0_usize;
+    let mut scan_complete = true;
     loop {
-        let batch = CommitmentRootSearchConsumer::search_snapshot_page(
-            snapshot,
-            root,
-            after.as_ref(),
-            page_size,
-        )
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+        let remaining_budget = max_scanned_candidates.saturating_sub(total_scanned);
+        if remaining_budget == 0 {
+            scan_complete = false;
+            break;
+        }
+        let page_size = limit.clamp(64, 256).min(remaining_budget);
+        let batch = fetch_batch(after.as_ref(), page_size)?;
         if batch.is_empty() {
             break;
         }
         let exhausted = batch.len() < page_size;
         after = batch.last().copied();
+        total_scanned = total_scanned.saturating_add(batch.len());
         let remaining = limit.saturating_sub(matches.len());
-        let accepted = filter_canonical_matches(secondary, epoch, &batch, remaining)?;
+        let accepted = filter_batch(&batch, remaining)?;
         matches.extend(accepted);
         if matches.len() >= limit || exhausted {
             break;
         }
+        if total_scanned >= max_scanned_candidates {
+            scan_complete = false;
+            break;
+        }
     }
-    Ok(matches)
+    Ok((matches, scan_complete))
 }
 
 fn filter_canonical_matches(
@@ -205,12 +235,17 @@ fn filter_canonical_matches(
     Ok(matches)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "coverage helper combines epoch, view bounds, consumer state, tip check, and scan-budget status"
+)]
 fn build_canonical_coverage(
     secondary: &RocksDbCanonicalSecondary,
     epoch: ChainEpoch,
     backfill: Option<CommitmentRootBackfillCoverage>,
     consumer_state: Option<MaterializedViewState>,
     canonical_tip_hash: Option<BlockHash>,
+    scan_complete: bool,
 ) -> CommitmentRootSearchCoverage {
     let latest_indexed_height = consumer_state
         .map(|state| {
@@ -227,7 +262,8 @@ fn build_canonical_coverage(
     });
     let first_retained = secondary.history_bounds().first_available_height();
     let earliest_root_height = earliest_shielded_activation_height(secondary);
-    let canonical_history_complete = first_retained == BlockHeight::new(1)
+    let canonical_history_complete = scan_complete
+        && first_retained == BlockHeight::new(1)
         && mv_matches_canonical_epoch
         && earliest_root_height.is_some_and(|earliest_root| {
             epoch.visible_tip_height < earliest_root
@@ -263,6 +299,7 @@ struct DisplacedPageBatch<Cursor> {
     next_cursor: Option<Cursor>,
     coverage: Option<zinder_core::DisplacedRootArchiveCoverage>,
     scan_complete: bool,
+    scanned_work: usize,
 }
 
 fn read_displaced_matches(
@@ -280,7 +317,11 @@ fn read_displaced_matches(
     let page_limit_u32 = u32::try_from(limit.clamp(64, 256)).unwrap_or(256);
     let page_limit = NonZeroU32::new(page_limit_u32).unwrap_or(NonZeroU32::MIN);
     collect_displaced_matches_with(
-        (limit, page_limit),
+        (
+            limit,
+            page_limit,
+            MAX_COMMITMENT_ROOT_SEARCH_SCANNED_CANDIDATES,
+        ),
         epoch,
         |cursor, batch_limit| {
             let page = secondary
@@ -292,6 +333,7 @@ fn read_displaced_matches(
                 next_cursor: page.next_cursor,
                 coverage: page.coverage,
                 scan_complete: page.scan_complete,
+                scanned_work: page.scanned_work,
             })
         },
         |heights| {
@@ -303,7 +345,7 @@ fn read_displaced_matches(
 }
 
 fn collect_displaced_matches_with<Cursor, FetchPage, FetchHeaders>(
-    limits: (usize, NonZeroU32),
+    limits: (usize, NonZeroU32, usize),
     epoch: ChainEpoch,
     mut fetch_page: FetchPage,
     mut fetch_headers: FetchHeaders,
@@ -319,14 +361,16 @@ where
     FetchHeaders:
         FnMut(&[BlockHeight]) -> Result<Vec<Option<zinder_core::BlockHeaderArtifact>>, Status>,
 {
-    let (limit, page_limit) = limits;
+    let (limit, page_limit, max_scanned_work) = limits;
     let mut cursor = None;
     let mut seen = HashSet::with_capacity(limit);
     let mut matches = Vec::with_capacity(limit);
     let mut all_pages_complete = true;
+    let mut total_scanned_work = 0_usize;
 
     let archive_coverage = loop {
         let page = fetch_page(cursor.as_ref(), page_limit)?;
+        total_scanned_work = total_scanned_work.saturating_add(page.scanned_work);
         if !page.scan_complete {
             all_pages_complete = false;
         }
@@ -346,6 +390,10 @@ where
             )?;
         }
         if limit == 0 || matches.len() >= limit || !page.has_more {
+            break page.coverage;
+        }
+        if !page.scan_complete || total_scanned_work >= max_scanned_work {
+            all_pages_complete = false;
             break page.coverage;
         }
         cursor = page.next_cursor;
@@ -506,7 +554,7 @@ mod tests {
         let page_limit = NonZeroU32::new(2).ok_or("nonzero limit")?;
 
         let (matches, displaced_coverage) = collect_displaced_matches_with(
-            (2, page_limit),
+            (2, page_limit, 16),
             test_epoch(3),
             |cursor, _| match cursor {
                 None => Ok(DisplacedPageBatch {
@@ -515,6 +563,7 @@ mod tests {
                     next_cursor: Some(1_u32),
                     coverage: Some(cov),
                     scan_complete: true,
+                    scanned_work: 2,
                 }),
                 Some(1) => Ok(DisplacedPageBatch {
                     matches: vec![test_candidate(4, 0x44), test_candidate(5, 0x55)],
@@ -522,6 +571,7 @@ mod tests {
                     next_cursor: Some(2_u32),
                     coverage: Some(cov),
                     scan_complete: true,
+                    scanned_work: 2,
                 }),
                 Some(_) => Err(Status::internal("unexpected page beyond limit")),
             },
@@ -546,20 +596,74 @@ mod tests {
         let page_limit = NonZeroU32::new(2).ok_or("nonzero limit")?;
         let cov = sample_coverage();
         let (matches, displaced_coverage) = collect_displaced_matches_with(
-            (4, page_limit),
+            (4, page_limit, 16),
             test_epoch(3),
-            |_: Option<&u32>, _| {
-                Ok(DisplacedPageBatch {
+            |cursor, _| match cursor {
+                None => Ok(DisplacedPageBatch {
                     matches: vec![test_candidate(4, 0x44)],
-                    has_more: false,
-                    next_cursor: None,
+                    has_more: true,
+                    next_cursor: Some(1_u32),
                     coverage: Some(cov),
                     scan_complete: false,
-                })
+                    scanned_work: 16,
+                }),
+                Some(_) => Err(Status::internal(
+                    "incomplete fallback page must stop without fetching further pages",
+                )),
             },
             |heights| Ok(vec![None; heights.len()]),
         )?;
         assert_eq!(matches.len(), 1);
+        assert!(!displaced_coverage.captured_range_complete);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_search_stops_on_candidate_budget_exhaustion()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (matches, scan_complete) = collect_canonical_matches_with(
+            (2, 128),
+            |after, page_size| {
+                let start = after.copied().unwrap_or(0);
+                Ok((start..start + page_size).collect())
+            },
+            |_batch, _remaining| Ok(Vec::new()),
+        )?;
+        assert_eq!(
+            matches,
+            [] as [zinder_proto::v1::explorer::CommitmentRootMatch; 0]
+        );
+        assert!(!scan_complete);
+        Ok(())
+    }
+
+    #[test]
+    fn displaced_paging_stops_on_candidate_budget_exhaustion()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let page_limit = NonZeroU32::new(2).ok_or("nonzero limit")?;
+        let cov = sample_coverage();
+        let mut fetches = 0_usize;
+        let (matches, displaced_coverage) = collect_displaced_matches_with(
+            (2, page_limit, 4),
+            test_epoch(3),
+            |cursor, _| {
+                fetches += 1;
+                Ok(DisplacedPageBatch {
+                    matches: vec![test_candidate(2, 0x23), test_candidate(2, 0x23)],
+                    has_more: true,
+                    next_cursor: Some(cursor.copied().unwrap_or(0) + 1),
+                    coverage: Some(cov),
+                    scan_complete: true,
+                    scanned_work: 2,
+                })
+            },
+            |heights| Ok(vec![Some(test_header(2, 0x23)); heights.len()]),
+        )?;
+        assert_eq!(
+            matches,
+            [] as [zinder_proto::v1::explorer::CommitmentRootMatch; 0]
+        );
+        assert_eq!(fetches, 2);
         assert!(!displaced_coverage.captured_range_complete);
         Ok(())
     }
