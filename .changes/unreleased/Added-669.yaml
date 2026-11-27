@@ -1,0 +1,6 @@
+kind: added
+body: Ship the unified zinder CLI binary supervising role presets (light-wallet, wallet, explorer) and standalone zinder index, zinder run, snapshot, backup, config, and healthcheck subcommands with T=0 /healthz and aggregated /metrics.
+time: 2026-11-27T03:42:18Z
+custom:
+  Bump: minor
+  PR: "669"
