@@ -63,9 +63,8 @@ use zinder_runtime::{HttpListenerLimits, connect_zinder_grpc, serve_http};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreRequirements, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-    RocksDbResourceBudget, chain_epoch_message,
+    CanonicalStoreBuildPlan, CanonicalStoreRequirements, RawBlobRetention, RocksDbCanonicalBuilder,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget, chain_epoch_message,
 };
 use zinder_testkit::{
     IngestControlFixture, WalletServingStoreFixture,
@@ -675,6 +674,31 @@ fn build_final_note_roots(
     )
 }
 
+fn assemble_canonical_facts(
+    blueprint: &BlockBlueprint,
+    tx_facts: Vec<CanonicalTransactionFacts>,
+    block_len: u64,
+) -> CanonicalBlockFacts {
+    CanonicalBlockFacts {
+        block_header: BlockHeaderArtifact::new(
+            BlockHeight::new(blueprint.height),
+            BlockHash::from_bytes(blueprint.block_hash),
+            BlockHash::from_bytes(blueprint.parent_hash),
+            [0x03; 32],
+            [0x04; 32],
+            blueprint.block_time,
+            TEST_BITS,
+            [0x05; 32],
+            4,
+            block_len,
+        ),
+        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
+            &blueprint.raw_block_bytes,
+        ),
+        transactions: tx_facts,
+    }
+}
+
 fn assemble_block(
     mut blueprint: BlockBlueprint,
     activations: &NetworkUpgradeActivations,
@@ -697,27 +721,13 @@ fn assemble_block(
             ironwood_commitment_tree_size: committed.tip_metadata.ironwood_commitment_tree_size,
         },
     )?;
-    let block_len = u64::try_from(blueprint.raw_block_bytes.len())?;
     let txs = std::mem::take(&mut blueprint.txs);
     let split = split_tx_artifacts(height, block_hash, txs)?;
-    let facts = CanonicalBlockFacts {
-        block_header: BlockHeaderArtifact::new(
-            height,
-            block_hash,
-            parent_hash,
-            [0x03; 32],
-            [0x04; 32],
-            blueprint.block_time,
-            TEST_BITS,
-            [0x05; 32],
-            4,
-            block_len,
-        ),
-        serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
-            &blueprint.raw_block_bytes,
-        ),
-        transactions: split.facts,
-    };
+    blueprint
+        .raw_block_bytes
+        .extend(split.blobs.iter().flat_map(|b| &b.raw_transaction_bytes));
+    let block_len = u64::try_from(blueprint.raw_block_bytes.len())?;
+    let facts = assemble_canonical_facts(&blueprint, split.facts, block_len);
     let replay_envelope = encode_canonical_block_replay(
         &facts,
         CanonicalBlockReplayFormatVersion::V1,
@@ -734,7 +744,6 @@ fn assemble_block(
             block_time_u32,
             committed.frontiers,
         )),
-        block_final_note_commitment_roots: None,
         transaction_blobs: split.blobs,
         block_blob: Some(BlockBlobArtifact::new(
             height,
@@ -951,7 +960,6 @@ fn publish_baseline(
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         canonical_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?
@@ -1372,7 +1380,15 @@ async fn assert_cipherscan_analytics_and_uncles(
             &format!("{base}/api/search/anchor/{displaced_root_hex}"),
         )
         .await?;
-        assert_eq!(anchor_displaced["found"], json!(false));
+        assert_eq!(anchor_displaced["found"], json!(true));
+        assert_eq!(
+            anchor_displaced["canonical"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            anchor_displaced["orphaned"].as_array().map(Vec::len),
+            Some(1)
+        );
         assert_eq!(
             anchor_displaced["displacedCoverage"]["available"],
             json!(true)
@@ -1383,6 +1399,14 @@ async fn assert_cipherscan_analytics_and_uncles(
         );
         assert_eq!(
             anchor_displaced["displacedCoverage"]["rootArtifactUnavailableCount"],
+            json!(0)
+        );
+        assert_eq!(
+            anchor_displaced["displacedCoverage"]["capturedRangeComplete"],
+            json!(true)
+        );
+        assert_eq!(
+            anchor_displaced["displacedCoverage"]["returnedMatchCount"],
             json!(1)
         );
     }
@@ -1679,7 +1703,6 @@ fn publish_long_fee_chain_stores(
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         canonical_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?

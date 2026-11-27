@@ -90,7 +90,7 @@ fn spend_count(height: u32) -> usize {
 
 fn build_mixed_chain() -> Result<ChainFixture> {
     let mut chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(TOTAL_BLOCKS);
     let metadata = CompactChainMetadata {
         sapling_commitment_tree_size: 0,

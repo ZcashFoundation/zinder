@@ -840,22 +840,28 @@ pub struct RocksDbCanonicalFixtureSourceLoadSummary {
     pub block_header_count: u64,
     /// Hash-addressed block index rows.
     pub block_hash_index_count: u64,
-    /// Height-addressed semantic replay rows.
-    pub block_replay_count: u64,
-    /// Height-addressed compact block rows.
-    pub compact_block_count: u64,
+    /// Settled segment index rows persisted in `settled_segment_index`.
+    pub settled_segment_index_count: u64,
+    /// Unsealed live-tail block rows persisted in `live_tail_block`.
+    pub live_tail_block_count: u64,
     /// Transaction location rows.
     pub transaction_location_count: u64,
-    /// Retained raw transaction rows.
+    /// Retained raw transaction rows; none retention requires zero.
     pub transaction_blob_count: u64,
-    /// Raw block rows; wallet workload requires zero.
+    /// Raw block rows; none retention requires zero.
     pub block_blob_count: u64,
     /// Typed commitment-tree checkpoints, including the predecessor.
     pub tree_state_checkpoint_count: u64,
-    /// Per-block final-root rows; wallet workload requires zero.
-    pub block_final_note_commitment_roots_count: u64,
     /// Source-authenticated completed subtree roots.
     pub subtree_root_count: u64,
+    /// Logical semantic replay bytes across settled segments and live-tail blocks.
+    pub logical_replay_bytes: u64,
+    /// Settled segment index key-and-value bytes submitted to SST writers.
+    pub settled_segment_index_logical_bytes: u64,
+    /// Live-tail block key-and-value bytes submitted to SST writers.
+    pub live_tail_block_logical_bytes: u64,
+    /// Live-tail raw block key-and-value bytes submitted to SST writers.
+    pub live_tail_raw_block_logical_bytes: u64,
     /// Logical key-and-value bytes submitted to block SST writers.
     pub logical_bytes: u64,
     /// Physical bytes occupied by staged block SSTs.
@@ -886,8 +892,6 @@ pub struct RocksDbCanonicalFixtureEventFenceSummary {
 pub struct RocksDbCanonicalFixtureReadySummary {
     /// Exact boundary certified by this report section.
     pub scope: &'static str,
-    /// Persisted canonical workload.
-    pub workload: &'static str,
     /// First retained canonical block.
     pub first_retained_block: StorageLifecycleBlockId,
     /// Visible fixed canonical tip.
@@ -1125,8 +1129,6 @@ pub struct StorageLifecyclePhaseDurations {
 pub struct CanonicalStorageReadySummary {
     /// Exact boundary certified by this section.
     pub scope: &'static str,
-    /// Persisted workload contract.
-    pub workload: &'static str,
     /// First retained canonical block.
     pub first_retained_block: StorageLifecycleBlockId,
     /// Visible fixed canonical tip.
@@ -1684,12 +1686,20 @@ fn validate_canonical_fixture_source_load(
     if load.block_count == 0
         || load.block_header_count != load.block_count
         || load.block_hash_index_count != load.block_count
-        || load.block_replay_count != load.block_count
-        || load.compact_block_count != load.block_count
+        || load.logical_replay_bytes == 0
+        || (load.live_tail_block_count == 0 && load.settled_segment_index_count == 0)
+        || load.live_tail_block_count > load.block_count
+        || load.settled_segment_index_count
+            > load.block_count.saturating_sub(load.live_tail_block_count)
+        || (load.live_tail_block_count > 0 && load.live_tail_block_logical_bytes == 0)
+        || (load.settled_segment_index_count > 0 && load.settled_segment_index_logical_bytes == 0)
+        || (load.settled_segment_index_count == 0
+            && (load.settled_segment_index_logical_bytes != 0
+                || load.live_tail_block_count != load.block_count))
         || load.transaction_location_count != load.transaction_count
-        || load.transaction_blob_count != load.transaction_count
+        || load.transaction_blob_count != 0
         || load.block_blob_count != 0
-        || load.block_final_note_commitment_roots_count != 0
+        || load.live_tail_raw_block_logical_bytes != 0
         || Some(load.tree_state_checkpoint_count) != expected_checkpoint_count
         || load.logical_bytes == 0
         || load.sst_file_bytes == 0
@@ -1708,7 +1718,6 @@ fn validate_canonical_fixture_ready(
 ) -> Result<(), BenchError> {
     let fence = &ready.event_fence;
     if ready.scope != "canonical-fixture-ready"
-        || ready.workload != "wallet"
         || !ready.source_tip_checkpoint_authenticated
         || !ready.published_and_reopened_ready_match
         || !ready.reopened_ready_and_event_fence_match
@@ -3063,6 +3072,34 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
     }
 
     #[test]
+    fn canonical_fixture_report_rejects_impossible_settled_and_live_tail_partition()
+    -> Result<(), crate::BenchError> {
+        let make_report = |live_tail_block_count: u64,
+                           settled_segment_index_count: u64,
+                           settled_segment_index_logical_bytes: u64| {
+            let mut measurements = rocksdb_canonical_fixture_measurements();
+            measurements.source_load.live_tail_block_count = live_tail_block_count;
+            measurements.source_load.settled_segment_index_count = settled_segment_index_count;
+            measurements.source_load.settled_segment_index_logical_bytes =
+                settled_segment_index_logical_bytes;
+            build_rocksdb_canonical_fixture_replay_report(
+                fixture_summary(),
+                measurements,
+                Some(canonical_fixture_source_exposition()),
+            )
+        };
+
+        assert!(make_report(10, 1, 128).validate().is_err());
+        assert!(make_report(11, 0, 0).validate().is_err());
+        assert!(make_report(0, 0, 0).validate().is_err());
+        assert!(make_report(5, 1, 0).validate().is_err());
+        assert!(make_report(5, 0, 0).validate().is_err());
+        assert!(make_report(5, 6, 128).validate().is_err());
+        make_report(5, 1, 128).validate()?;
+        Ok(())
+    }
+
+    #[test]
     fn stage_duration_report_preserves_family_stage_and_status() {
         let samples = parse_prometheus_samples(
             "zinder_ingest_canonical_block_construction_stage_duration_seconds_count{stage=\"block_parse\",status=\"ok\"} 4\n\
@@ -3133,14 +3170,17 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
                 transaction_count: 20,
                 block_header_count: 10,
                 block_hash_index_count: 10,
-                block_replay_count: 10,
-                compact_block_count: 10,
+                settled_segment_index_count: 0,
+                live_tail_block_count: 10,
                 transaction_location_count: 20,
-                transaction_blob_count: 20,
+                transaction_blob_count: 0,
                 block_blob_count: 0,
                 tree_state_checkpoint_count: 11,
-                block_final_note_commitment_roots_count: 0,
                 subtree_root_count: 0,
+                logical_replay_bytes: 5_000,
+                settled_segment_index_logical_bytes: 0,
+                live_tail_block_logical_bytes: 10_000,
+                live_tail_raw_block_logical_bytes: 0,
                 logical_bytes: 20_000,
                 sst_file_bytes: 10_000,
                 sst_file_count: 8,
@@ -3149,7 +3189,6 @@ zinder_ingest_source_segment_response_payload_bytes_sum 1000\n",
             },
             canonical_ready: RocksDbCanonicalFixtureReadySummary {
                 scope: "canonical-fixture-ready",
-                workload: "wallet",
                 first_retained_block: first_block,
                 visible_tip: visible_tip.clone(),
                 visible_epoch_id: 1,
@@ -3340,7 +3379,6 @@ zinder_ingest_canonical_cross_block_wallet_reads_total 0\n"
             },
             canonical_storage_ready: super::CanonicalStorageReadySummary {
                 scope: "canonical-storage-ready",
-                workload: "wallet",
                 first_retained_block: first_block,
                 visible_tip: fixed_tip.clone(),
                 visible_epoch_id: 1,

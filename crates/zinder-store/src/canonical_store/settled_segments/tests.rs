@@ -2572,7 +2572,7 @@ fn assert_supplement_file_cap_presplit(modules: SettledSegmentModules) -> TestRe
             + SUPPLEMENT_CHUNK_INDEX_ENTRY_LEN
             + 64
             + SUPPLEMENT_ROW_INDEX_ENTRY_LEN
-            + 2_800,
+            + 4_400,
     )?;
     let config =
         SettledSegmentSealerConfig::new(Network::ZcashRegtest, TEST_SCHEMA_VERSION, modules)
@@ -2892,5 +2892,141 @@ fn manifest_uses_standardized_segments_manifest_json_filename() -> TestResult {
             .exists()
     );
     verify_pinned_manifest_and_segments(&snap_dir, false)?;
+    Ok(())
+}
+
+#[test]
+fn cleanup_unreferenced_segment_files_removes_orphans_and_keeps_admitted() -> TestResult {
+    use super::sealer::cleanup_unreferenced_segment_files;
+
+    let dir = TempDir::new()?;
+    assert_eq!(cleanup_unreferenced_segment_files(dir.path(), &[])?, 0);
+
+    let modules = SettledSegmentModules {
+        supplement: true,
+        raw_bodies: true,
+    };
+    let config =
+        SettledSegmentSealerConfig::new(Network::ZcashRegtest, TEST_SCHEMA_VERSION, modules)
+            .with_segment_blocks(2);
+    let mut sealer = SettledSegmentSealer::new(dir.path(), config, None)?;
+    assert_eq!(sealer.push_block(build_block_input(1, true))?, Vec::new());
+    let [entry_1] = <[_; 1]>::try_from(sealer.push_block(build_block_input(2, true))?)
+        .map_err(|_| "expected entry 1")?;
+    assert_eq!(sealer.push_block(build_block_input(3, true))?, Vec::new());
+    let [_entry_2] = <[_; 1]>::try_from(sealer.push_block(build_block_input(4, true))?)
+        .map_err(|_| "expected entry 2")?;
+
+    for kind in [
+        SettledSegmentKind::Shielded,
+        SettledSegmentKind::Supplement,
+        SettledSegmentKind::RawBlock,
+    ] {
+        let orphan = segment_dir_path(dir.path(), kind).join("orphan-file");
+        fs::write(orphan, b"stale")?;
+    }
+
+    let removed = cleanup_unreferenced_segment_files(dir.path(), std::slice::from_ref(&entry_1))?;
+    assert_eq!(removed, 6);
+    verify_pinned_segments(dir.path(), std::slice::from_ref(&entry_1), false)?;
+    assert_eq!(
+        fs::read_dir(segment_dir_path(dir.path(), SettledSegmentKind::Shielded))?.count(),
+        1
+    );
+
+    let nested = segment_dir_path(dir.path(), SettledSegmentKind::Shielded).join("nested");
+    fs::create_dir(nested)?;
+    assert!(
+        cleanup_unreferenced_segment_files(dir.path(), std::slice::from_ref(&entry_1)).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn bulk_sealer_seals_multiple_strides_in_parallel_preserving_order() -> TestResult {
+    use super::sealer::BulkSegmentSealer;
+
+    let modules = SettledSegmentModules {
+        supplement: true,
+        raw_bodies: true,
+    };
+    let config =
+        SettledSegmentSealerConfig::new(Network::ZcashRegtest, TEST_SCHEMA_VERSION, modules)
+            .with_segment_blocks(2);
+
+    let serial_dir = TempDir::new()?;
+    let mut serial = SettledSegmentSealer::new(serial_dir.path(), config, None)?;
+    let mut serial_entries = Vec::new();
+    for height in 1..=8_u32 {
+        serial_entries.extend(serial.push_block(build_block_input(height, true))?);
+    }
+
+    let bulk_dir = TempDir::new()?;
+    let mut bulk = BulkSegmentSealer::new_with_worker_count(bulk_dir.path(), config, None, 3)?;
+    assert!((2..=4).contains(&bulk.worker_count()));
+    let mut bulk_entries = Vec::new();
+    for height in 1..=8_u32 {
+        bulk_entries.extend(bulk.push_block(build_block_input(height, true))?);
+    }
+    bulk_entries.extend(bulk.finish()?);
+
+    assert_eq!(bulk_entries.len(), serial_entries.len());
+    assert_eq!(bulk_entries, serial_entries);
+    super::layout::validate_contiguous_index_entries(&bulk_entries)?;
+    verify_pinned_segments(bulk_dir.path(), &bulk_entries, false)?;
+    Ok(())
+}
+
+#[test]
+fn bulk_sealer_propagates_earliest_stride_error_deterministically() -> TestResult {
+    use super::{layout::format_segment_filename, sealer::BulkSegmentSealer};
+
+    let dir = TempDir::new()?;
+    let modules = SettledSegmentModules {
+        supplement: false,
+        raw_bodies: false,
+    };
+    let config =
+        SettledSegmentSealerConfig::new(Network::ZcashRegtest, TEST_SCHEMA_VERSION, modules)
+            .with_segment_blocks(2);
+
+    let mut bulk = BulkSegmentSealer::new_with_worker_count(dir.path(), config, None, 2)?;
+    let shielded_dir = segment_dir_path(dir.path(), SettledSegmentKind::Shielded);
+    let stride0_conflict = format_segment_filename(
+        SettledSegmentKind::Shielded,
+        BlockHeight::new(1),
+        BlockHeight::new(2),
+    )?;
+    let stride1_conflict = format_segment_filename(
+        SettledSegmentKind::Shielded,
+        BlockHeight::new(3),
+        BlockHeight::new(4),
+    )?;
+    fs::create_dir_all(shielded_dir.join(&stride0_conflict))?;
+    fs::create_dir_all(shielded_dir.join(&stride1_conflict))?;
+
+    let mut collected_err = None;
+    for height in 1..=4_u32 {
+        let padded = if height <= 2 {
+            build_padded_block_input(height, 16_384)?
+        } else {
+            build_block_input(height, false)
+        };
+        if let Err(err) = bulk.push_block(padded) {
+            collected_err = Some(err);
+            break;
+        }
+    }
+    let err = if let Some(err) = collected_err {
+        err
+    } else {
+        bulk.finish()
+            .err()
+            .ok_or("expected earliest stride collision error")?
+    };
+    assert!(
+        matches!(err, SettledSegmentsError::InvalidLayout(ref msg) if msg.contains(&stride0_conflict)),
+        "expected stride 0 conflict error for {stride0_conflict}, got: {err}"
+    );
     Ok(())
 }

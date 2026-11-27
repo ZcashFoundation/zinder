@@ -42,9 +42,8 @@ use zinder_source::{
     SourceChainSegmentLimits, SourceError,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    CanonicalSubtreeRootLoadCoverage, RawBlobRetention, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, RocksDbResourceBudget, TreeStateLookup,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalSubtreeRootLoadCoverage, RawBlobRetention,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget, TreeStateLookup,
 };
 use zinder_testkit::{completed_sapling_subtree_frontier, sample_regtest_upgrade_activations};
 
@@ -364,7 +363,7 @@ fn canonical_fixture_rocksdb_replay_config(
         request_timeout: construction.request_timeout,
         pipeline_limits: construction.pipeline_limits,
         resource_budget: RocksDbResourceBudget::for_local_tests(),
-        raw_blob_retention: RawBlobRetention::Transactions,
+        raw_blob_retention: RawBlobRetention::None,
         supported_reorg_depth: 1,
         source_segment_delay: Duration::ZERO,
         tree_state_checkpoint_coverage: TreeStateCheckpointCoverage::EveryBlock,
@@ -407,6 +406,32 @@ fn assert_canonical_fixture_load_evidence(
     assert_eq!(outcome.subtree_root_load_evidence.subtree_root_count, 0);
     assert!(outcome.source_tip_checkpoint_authenticated);
     assert_eq!(outcome.settled_tip, fixed_tip.block_id);
+    assert_eq!(outcome.block_load_evidence.settled_segment_index_count, 0);
+    assert_eq!(
+        outcome.block_load_evidence.live_tail_block_count,
+        outcome.block_load_evidence.block_count
+    );
+    assert!(outcome.block_load_evidence.logical_replay_bytes > 0);
+    assert_eq!(
+        outcome
+            .block_load_evidence
+            .settled_segment_index_logical_bytes,
+        0
+    );
+    assert!(outcome.block_load_evidence.live_tail_block_logical_bytes > 0);
+    assert_eq!(outcome.block_load_evidence.transaction_blob_count, 0);
+    assert_eq!(
+        outcome.block_load_evidence.transaction_blob_logical_bytes,
+        0
+    );
+    assert_eq!(outcome.block_load_evidence.block_blob_count, 0);
+    assert_eq!(outcome.block_load_evidence.block_blob_logical_bytes, 0);
+    assert_eq!(
+        outcome
+            .block_load_evidence
+            .live_tail_raw_block_logical_bytes,
+        0
+    );
 }
 
 fn assert_canonical_fixture_ready_evidence(
@@ -481,52 +506,29 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
     assert_eq!(report["report_format_version"], 1);
     assert_eq!(
         report["arm_execution_order"],
-        serde_json::json!(["transactions", "all"])
+        serde_json::json!(["none", "all"])
     );
-    assert_eq!(report["transactions"]["raw_blob_retention"], "transactions");
+    assert_eq!(report["none"]["raw_blob_retention"], "none");
     assert_eq!(report["all"]["raw_blob_retention"], "all");
     assert_eq!(
-        report["transactions"]["fixture_manifest_digest_sha256"],
+        report["none"]["fixture_manifest_digest_sha256"],
         report["all"]["fixture_manifest_digest_sha256"]
     );
     assert_eq!(
-        report["transactions"]["replay_plan_digest_sha256"],
+        report["none"]["replay_plan_digest_sha256"],
         report["all"]["replay_plan_digest_sha256"]
     );
     assert_eq!(
-        report["transactions"]["effective_limits"],
+        report["none"]["effective_limits"],
         report["all"]["effective_limits"]
     );
     assert_eq!(
-        report["transactions"]["logical_replay_identity"],
+        report["none"]["logical_replay_identity"],
         report["all"]["logical_replay_identity"]
     );
+    assert_raw_blob_retention_counts_and_v2_identity(report, fixture);
     assert_eq!(
-        report["transactions"]["logical_replay_identity"]["subtree_root_count"],
-        1
-    );
-    assert_eq!(
-        report["transactions"]["logical_replay_identity"]["subtree_root_coverage"],
-        "complete-prefix"
-    );
-    assert_eq!(
-        report["transactions"]["logical_replay_identity"]["subtree_root_sequence_digest_version"],
-        1
-    );
-    assert_eq!(
-        report["transactions"]["raw_blob_counts"]["transaction_blob_count"],
-        report["all"]["raw_blob_counts"]["transaction_blob_count"]
-    );
-    assert_eq!(
-        report["transactions"]["raw_blob_counts"]["block_blob_count"],
-        0
-    );
-    assert_eq!(
-        report["all"]["raw_blob_counts"]["block_blob_count"],
-        fixture.block_count
-    );
-    assert_eq!(
-        report["transactions"]["secondary_ready_matches_reopened_primary"].as_bool(),
+        report["none"]["secondary_ready_matches_reopened_primary"].as_bool(),
         Some(true)
     );
     assert_eq!(
@@ -534,7 +536,7 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
         Some(true)
     );
     assert!(
-        report["transactions"]["authenticated_replay_lifecycle_seconds"]
+        report["none"]["authenticated_replay_lifecycle_seconds"]
             .as_f64()
             .is_some_and(|seconds| seconds > 0.0)
     );
@@ -544,7 +546,7 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
             .is_some_and(|seconds| seconds > 0.0)
     );
     assert!(
-        report["transactions"]["authenticated_replay_lifecycle_blocks_per_second"]
+        report["none"]["authenticated_replay_lifecycle_blocks_per_second"]
             .as_f64()
             .is_some_and(|blocks_per_second| blocks_per_second > 0.0)
     );
@@ -552,6 +554,65 @@ fn assert_raw_blob_retention_comparison_report(report: &Value, fixture: &Fixture
         report["all"]["authenticated_replay_lifecycle_blocks_per_second"]
             .as_f64()
             .is_some_and(|blocks_per_second| blocks_per_second > 0.0)
+    );
+}
+
+fn assert_raw_blob_retention_counts_and_v2_identity(report: &Value, fixture: &FixtureManifest) {
+    let none_identity = &report["none"]["logical_replay_identity"];
+    let none_layout = &report["none"]["storage_layout_evidence"];
+    let all_layout = &report["all"]["storage_layout_evidence"];
+    assert_eq!(none_layout["settled_segment_index_count"], 0);
+    assert_eq!(none_layout["live_tail_block_count"], fixture.block_count);
+    assert_eq!(none_layout["settled_segment_index_logical_bytes"], 0);
+    assert!(
+        none_layout["live_tail_block_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(all_layout["settled_segment_index_count"], 0);
+    assert_eq!(all_layout["live_tail_block_count"], fixture.block_count);
+    assert_eq!(all_layout["settled_segment_index_logical_bytes"], 0);
+    assert!(
+        all_layout["live_tail_block_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        none_identity["logical_replay_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(none_identity["subtree_root_count"], 1);
+    assert_eq!(none_identity["subtree_root_coverage"], "complete-prefix");
+    assert_eq!(none_identity["subtree_root_sequence_digest_version"], 1);
+
+    let none_blobs = &report["none"]["raw_blob_counts"];
+    let all_blobs = &report["all"]["raw_blob_counts"];
+    assert_eq!(none_blobs["transaction_blob_count"], 0);
+    assert_eq!(none_blobs["transaction_blob_logical_bytes"], 0);
+    assert_eq!(none_blobs["block_blob_count"], 0);
+    assert_eq!(none_blobs["block_blob_logical_bytes"], 0);
+    assert_eq!(none_blobs["live_tail_raw_block_logical_bytes"], 0);
+    assert!(
+        all_blobs["transaction_blob_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        all_blobs["transaction_blob_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(all_blobs["block_blob_count"], fixture.block_count);
+    assert!(
+        all_blobs["block_blob_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        all_blobs["live_tail_raw_block_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
     );
 }
 
@@ -751,8 +812,7 @@ async fn canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold
     let primary = RocksDbCanonicalStore::open_ready(
         &canonical_store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -766,9 +826,7 @@ async fn canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold
         &canonical_store_path,
         &secondary_path,
         &activations,
-        zinder_store::CanonicalStoreRequirements::for_blob_retention(
-            RawBlobRetention::Transactions,
-        ),
+        zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -815,16 +873,11 @@ async fn canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_read
     }
 
     let report: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
-    assert_eq!(report["report_format_version"], 1);
     assert_eq!(
         report["measurement_kind"],
         "rocksdb-canonical-fixture-replay"
     );
-    assert_eq!(
-        report["resource_limits"]["tree_state_checkpoint_coverage"],
-        "cadence-and-tip"
-    );
-    assert_eq!(report["source_load"]["tree_state_checkpoint_count"], 2);
+    assert_cli_report_v2_coverage(&report, "cadence-and-tip", 2, 1);
     assert_eq!(
         report["prohibited_reads"]["historical_prevout_read_count"],
         0
@@ -834,6 +887,42 @@ async fn canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_read
         0
     );
     Ok(())
+}
+
+fn assert_unsealed_v2_source_load(source_load: &Value, expected_blocks: u64) {
+    assert_eq!(source_load["block_count"], expected_blocks);
+    assert_eq!(source_load["settled_segment_index_count"], 0);
+    assert_eq!(source_load["live_tail_block_count"], expected_blocks);
+    assert!(
+        source_load["logical_replay_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(source_load["settled_segment_index_logical_bytes"], 0);
+    assert!(
+        source_load["live_tail_block_logical_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(source_load["live_tail_raw_block_logical_bytes"], 0);
+}
+
+fn assert_cli_report_v2_coverage(
+    report: &Value,
+    expected_coverage: &str,
+    expected_checkpoints: u64,
+    expected_blocks: u64,
+) {
+    assert_eq!(report["report_format_version"], 1);
+    assert_eq!(
+        report["resource_limits"]["tree_state_checkpoint_coverage"],
+        expected_coverage
+    );
+    assert_eq!(
+        report["source_load"]["tree_state_checkpoint_count"],
+        expected_checkpoints
+    );
+    assert_unsealed_v2_source_load(&report["source_load"], expected_blocks);
 }
 
 fn coinbase_only_linked_block(
@@ -1063,21 +1152,12 @@ async fn canonical_fixture_replay_cli_defaults_to_cadence_and_tip_and_supports_e
         &output_directory.path().join("dense-report.json"),
         Some("every-block"),
     )?;
-    assert_eq!(dense_report["report_format_version"], 1);
-    assert_eq!(
-        dense_report["resource_limits"]["tree_state_checkpoint_coverage"],
-        "every-block"
-    );
-    assert_eq!(
-        dense_report["source_load"]["tree_state_checkpoint_count"],
-        5
-    );
+    assert_cli_report_v2_coverage(&dense_report, "every-block", 5, 4);
     let reopen = |path: &std::path::Path| -> Result<RocksDbCanonicalStore> {
         Ok(RocksDbCanonicalStore::open_ready(
             path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?)
@@ -1100,15 +1180,7 @@ async fn canonical_fixture_replay_cli_defaults_to_cadence_and_tip_and_supports_e
         &output_directory.path().join("sparse-report.json"),
         None,
     )?;
-    assert_eq!(sparse_report["report_format_version"], 1);
-    assert_eq!(
-        sparse_report["resource_limits"]["tree_state_checkpoint_coverage"],
-        "cadence-and-tip"
-    );
-    assert_eq!(
-        sparse_report["source_load"]["tree_state_checkpoint_count"],
-        2
-    );
+    assert_cli_report_v2_coverage(&sparse_report, "cadence-and-tip", 2, 4);
     let sparse_store = reopen(&sparse_store_path)?;
     for height in [602_u32, 606] {
         assert!(matches!(
@@ -1143,8 +1215,8 @@ async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_second
     )
     .await?;
     let output_directory = tempdir()?;
-    let transactions_canonical = output_directory.path().join("transactions-canonical");
-    let transactions_secondary = output_directory.path().join("transactions-secondary");
+    let none_canonical = output_directory.path().join("none-canonical");
+    let none_secondary = output_directory.path().join("none-secondary");
     let all_canonical = output_directory.path().join("all-canonical");
     let all_secondary = output_directory.path().join("all-secondary");
     let report_path = output_directory.path().join("comparison.json");
@@ -1153,10 +1225,10 @@ async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_second
         .arg("rocksdb-raw-blob-retention-comparison")
         .arg("--fixture")
         .arg(fixture.directory.path())
-        .arg("--transactions-canonical-store")
-        .arg(&transactions_canonical)
-        .arg("--transactions-secondary-root")
-        .arg(&transactions_secondary)
+        .arg("--none-canonical-store")
+        .arg(&none_canonical)
+        .arg("--none-secondary-root")
+        .arg(&none_secondary)
         .arg("--all-canonical-store")
         .arg(&all_canonical)
         .arg("--all-secondary-root")
@@ -1179,11 +1251,11 @@ async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_second
     let report: Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
     assert_raw_blob_retention_comparison_report(&report, &fixture.manifest);
     assert_eq!(
-        report["transactions"]["effective_limits"]["tree_state_checkpoint_coverage"],
+        report["none"]["effective_limits"]["tree_state_checkpoint_coverage"],
         "cadence-and-tip"
     );
-    assert!(transactions_canonical.is_dir());
-    assert!(transactions_secondary.is_dir());
+    assert!(none_canonical.is_dir());
+    assert!(none_secondary.is_dir());
     assert!(all_canonical.is_dir());
     assert!(all_secondary.is_dir());
     Ok(())
@@ -1247,8 +1319,7 @@ async fn canonical_fixture_rocksdb_replay_leaves_a_mismatched_tip_checkpoint_unp
     let open_error = RocksDbCanonicalStore::open_ready(
         &canonical_store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -1333,8 +1404,7 @@ async fn canonical_fixture_rocksdb_replay_leaves_manifest_digest_drift_unpublish
     let open_error = RocksDbCanonicalStore::open_ready(
         &canonical_store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(1)?,
         RocksDbResourceBudget::for_local_tests(),
     )

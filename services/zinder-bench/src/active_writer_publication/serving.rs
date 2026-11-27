@@ -603,8 +603,7 @@ impl TwoGenCanonicalPublisher {
         }
         let resources = SharedSecondaryResources::new(budget);
         let reorg_policy = CanonicalReorgPolicy::new(reorg_window_blocks)?;
-        let requirements =
-            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions);
+        let requirements = CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All);
 
         let mut secondaries = Vec::with_capacity(TWO_GENERATION_SLOTS);
         let mut io_modes = Vec::with_capacity(TWO_GENERATION_SLOTS);
@@ -1168,8 +1167,7 @@ fn open_wallet_slots(
     wal_resources: &SharedSecondaryResources,
 ) -> Result<OpenedWalletSlots, BenchError> {
     let reorg_policy = CanonicalReorgPolicy::new(cfg.reorg_window_blocks)?;
-    let requirements =
-        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions);
+    let requirements = CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All);
     let mut slots = Vec::with_capacity(WALLET_GENERATION_SLOTS);
     let mut canonical_io_modes = Vec::with_capacity(WALLET_GENERATION_SLOTS);
     let mut wallet_io_modes = Vec::with_capacity(WALLET_GENERATION_SLOTS);

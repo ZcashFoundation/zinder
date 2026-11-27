@@ -19,8 +19,8 @@ use zinder_bench::{BenchError, fixture::FixtureManifest};
 use zinder_core::NetworkUpgradeActivations;
 use zinder_query::RocksDbCanonicalReader;
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreReadyEvidence, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbCanonicalSecondary, RocksDbIoMode, RocksDbResourceBudget, RocksDbStatisticsLevel,
+    CanonicalReorgPolicy, CanonicalStoreReadyEvidence, RawBlobRetention, RocksDbCanonicalSecondary,
+    RocksDbIoMode, RocksDbResourceBudget, RocksDbStatisticsLevel,
 };
 
 use crate::build_provenance::BuildProvenance;
@@ -42,11 +42,8 @@ pub(crate) struct ReadStoreArgs {
     /// Persisted canonical replacement depth.
     #[arg(long, default_value_t = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS)]
     supported_reorg_depth: u32,
-    /// Workload persisted in the canonical store.
-    #[arg(long, default_value = "wallet", value_parser = parse_workload)]
-    workload: CanonicalStoreWorkload,
     /// Raw-blob retention persisted in the canonical store.
-    #[arg(long, default_value = "transactions", value_parser = crate::rocksdb_wallet_rebuild::parse_raw_blob_retention)]
+    #[arg(long, default_value = "none", value_parser = crate::rocksdb_wallet_rebuild::parse_raw_blob_retention)]
     raw_blob_retention: RawBlobRetention,
     /// Collect engine statistics at off, tickers, or full (including histograms).
     #[arg(long, default_value = "tickers", value_parser = parse_statistics_level)]
@@ -88,14 +85,6 @@ fn page_cache_eviction_label(evict_page_cache: bool) -> &'static str {
     }
 }
 
-fn parse_workload(text: &str) -> Result<CanonicalStoreWorkload, String> {
-    match text {
-        "wallet" => Ok(CanonicalStoreWorkload::Wallet),
-        "explorer" => Ok(CanonicalStoreWorkload::Explorer),
-        _ => Err("expected wallet or explorer".to_owned()),
-    }
-}
-
 fn parse_statistics_level(text: &str) -> Result<RocksDbStatisticsLevel, String> {
     RocksDbStatisticsLevel::parse(text).ok_or_else(|| "expected off, tickers, or full".to_owned())
 }
@@ -104,7 +93,6 @@ pub(crate) struct ReadStore {
     pub(crate) primary: PathBuf,
     pub(crate) secondary_root: PathBuf,
     pub(crate) activations: NetworkUpgradeActivations,
-    pub(crate) workload: CanonicalStoreWorkload,
     pub(crate) raw_blob_retention: RawBlobRetention,
     pub(crate) reorg_policy: CanonicalReorgPolicy,
     pub(crate) budget: RocksDbResourceBudget,
@@ -142,7 +130,6 @@ impl ReadStoreArgs {
             primary: primary.clone(),
             secondary_root,
             activations: manifest.activations_typed()?,
-            workload: self.workload,
             raw_blob_retention: self.raw_blob_retention,
             reorg_policy: CanonicalReorgPolicy::new(self.supported_reorg_depth)?,
             budget: RocksDbResourceBudget {
@@ -210,16 +197,7 @@ impl ReadStore {
             &self.primary,
             self.secondary_root.join(name),
             &self.activations,
-            if self.workload == CanonicalStoreWorkload::Explorer {
-                zinder_store::CanonicalStoreRequirements::new(&[
-                    zinder_store::CanonicalStoredData::FinalNoteCommitmentRoots,
-                ])
-                .with_blob_retention(self.raw_blob_retention)
-            } else {
-                zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                    self.raw_blob_retention,
-                )
-            },
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(self.raw_blob_retention),
             self.reorg_policy,
             self.budget,
         )?;
@@ -447,9 +425,7 @@ mod tests {
     };
     use zinder_core::{BlockHeight, BlockHeightRange, Network};
     use zinder_query::{CanonicalReader, RocksDbCanonicalReader, read_on_blocking_thread};
-    use zinder_store::{
-        CanonicalStoreWorkload, RawBlobRetention, RocksDbResourceBudget, RocksDbStatisticsLevel,
-    };
+    use zinder_store::{RawBlobRetention, RocksDbResourceBudget, RocksDbStatisticsLevel};
     use zinder_testkit::{CanonicalBaseline, CanonicalWriterFixture, ChainFixture};
 
     use super::{ReadCounters, ReadStore, measure, measure_reader, output_path};
@@ -475,7 +451,7 @@ mod tests {
     #[test]
     fn read_measurements_do_not_carry_counters_into_the_next_sample() -> eyre::Result<()> {
         let chain = ChainFixture::new(Network::ZcashRegtest)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .with_raw_blob_retention(RawBlobRetention::None)
             .extend_blocks(4);
         let activations = zinder_testkit::sample_regtest_upgrade_activations();
         let writer =
@@ -486,8 +462,7 @@ mod tests {
             primary: writer.canonical_primary_path().to_path_buf(),
             secondary_root: scratch.path().to_owned(),
             activations,
-            workload: CanonicalStoreWorkload::Wallet,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::None,
             reorg_policy: writer.canonical_primary()?.reorg_policy(),
             budget: RocksDbResourceBudget {
                 statistics_level: level,

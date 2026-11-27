@@ -1216,7 +1216,7 @@ fn build_live_appended_second_epoch_query() -> Result<(
 )> {
     let schedule = one_upgrade_per_height()?;
     let mut chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(2);
     let first_block = chain
         .block_at(BlockHeight::new(1))

@@ -69,7 +69,7 @@ async fn production_pair_serves_transparent_utxo_contract_and_support_signal() -
     let other_second_id = TransactionId::from_bytes([0x40; 32]);
     let at_floor_transaction_bytes = b"production-utxo-round-trip".to_vec();
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(2);
     let block_one = chain
         .block_at(BlockHeight::new(1))
@@ -230,7 +230,7 @@ async fn lightd_info_reports_the_writer_admitted_upgrade_across_its_activation()
 
     for tip in [3, 4] {
         let chain = ChainFixture::new(Network::ZcashRegtest)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .with_raw_blob_retention(RawBlobRetention::All)
             .extend_blocks(tip);
         let mut store_fixture = WalletServingStoreFixture::from_chain_after_admitted_live_append(
             &chain,
@@ -263,7 +263,7 @@ async fn lightd_info_reports_the_writer_admitted_upgrade_across_its_activation()
 async fn admitted_transparent_support_stays_immutable_through_readiness_recovery()
 -> eyre::Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(1);
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
@@ -366,7 +366,7 @@ async fn production_pair_drains_both_transparent_history_rpcs_across_native_page
     let script = address.script().as_raw_bytes().to_vec();
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(2);
     let block_one = chain
         .block_at(BlockHeight::new(1))
@@ -461,7 +461,7 @@ async fn taddress_history_resolves_open_and_oversized_ends_at_the_tip_like_light
     let script = address.script().as_raw_bytes().to_vec();
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
     let mut chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(2);
     for height in [1_u32, 2] {
         let block = chain
@@ -1045,7 +1045,7 @@ async fn address_utxos_merge_several_addresses_in_chain_order() -> eyre::Result<
     let second = transparent_address(0x42);
     let script = |address: &ZebraTransparentAddress| address.script().as_raw_bytes().to_vec();
     let mut chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(3);
     // (height, transaction, position in its block)
     let transactions = [(1, 1, 0), (1, 3, 1), (2, 2, 0), (3, 4, 0), (3, 5, 1)];
@@ -1157,7 +1157,7 @@ async fn production_pair_seeks_transparent_address_ranges_past_a_large_prefix() 
     let script = address.script().as_raw_bytes().to_vec();
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(2);
     let block_one = chain
         .block_at(BlockHeight::new(1))
@@ -1259,7 +1259,7 @@ async fn production_history_maps_a_missing_canonical_blob_to_not_found() -> eyre
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
     let transaction_id = TransactionId::from_bytes([0x32; 32]);
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(1);
     let block = chain
         .block_at(BlockHeight::new(1))
@@ -1322,7 +1322,7 @@ async fn production_history_maps_a_missing_canonical_blob_to_not_found() -> eyre
 async fn production_pair_get_block_range_outside_retained_history_keeps_lightwalletd_codes()
 -> eyre::Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(3);
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
@@ -1359,7 +1359,7 @@ async fn managed_history_serves_its_first_segment_when_tail_lengths_are_unavaila
     use zinder_compat_lightwalletd::{PublishedShieldedHistory, ShieldedCatalogPublisher};
 
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(3);
     let mut store =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
@@ -1544,7 +1544,7 @@ fn busy_addresses_fixture(
     utxo_count: u32,
 ) -> eyre::Result<(WalletServingStoreFixture, Vec<String>)> {
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(2);
     let block_two = chain
         .block_at(BlockHeight::new(2))
@@ -1594,7 +1594,7 @@ pub(super) fn many_utxo_fixture(
     let script = address.script().as_raw_bytes().to_vec();
     let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::All)
         .extend_blocks(2);
     let block_two = chain
         .block_at(BlockHeight::new(2))
@@ -2062,7 +2062,7 @@ async fn signed_catalog_extends_when_uncovered_tail_lengths_are_unavailable() ->
     use zinder_compat_lightwalletd::{PublishedShieldedHistory, ShieldedCatalogPublisher};
 
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(4);
     let mut store =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;

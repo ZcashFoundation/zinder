@@ -37,8 +37,7 @@ use zinder_source::{
     SourceChainSegment, SourceChainSegmentLimits, SourceError, SourceSubtreeRoots,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, RawBlobRetention, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, MockMempoolSource,
@@ -475,7 +474,7 @@ where
 {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(1);
     let tip_block = chain
         .source_block_at(BlockHeight::new(1))
@@ -494,8 +493,7 @@ where
     let canonical_primary = RocksDbCanonicalStore::open_ready(
         &canonical_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;

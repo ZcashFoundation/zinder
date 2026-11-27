@@ -19,19 +19,24 @@ use super::{
     block_load::{
         BLOCK_HEADER_VALUE_LEN, StoredTreeStateRoots, TRANSACTION_LOCATION_VALUE_LEN,
         decode_served_tree_state_checkpoint, decode_stored_tree_state_roots,
-        decode_tree_state_checkpoint, encode_block_position, encode_transaction_position,
-        encode_tree_state_checkpoint,
+        decode_tree_state_checkpoint, encode_block_position, encode_tree_state_checkpoint,
     },
     block_replay::validate_incremental_replay_range_bound,
+    live_tail::LiveTailBlockRecord,
     pool_presence_mismatch,
     publication::column_family,
     rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
-        CHAIN_EPOCH_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY,
-        TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
+        SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
     served_tree_state::ServedTreeState,
+    settled_segments::store_access::{
+        self, SegmentStoreContext, find_sealed_segment_in_slice, open_replay_segment_readers,
+        populate_raw_transaction_blobs_batch, read_compact_block_split, read_raw_block_split,
+        read_raw_blocks_in_range_split, read_raw_transaction_split,
+        reconstruct_segment_compact_range, resolve_settled_segment_for_height,
+    },
     subtree_load::{decode_subtree_root, encode_subtree_root_position},
     tree_state_replay::{
         TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome, refuse_unadmitted_activations,
@@ -39,8 +44,7 @@ use super::{
 };
 
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
-const COMPACT_BLOCK_MULTI_GET_BATCH_SIZE: usize = 1_024;
-const BLOCK_BLOB_MULTI_GET_BATCH_SIZE: usize = 1_024;
+const BLOCK_HEADER_BATCH_SIZE: usize = 1_024;
 const TREE_STATE_ROOTS_MULTI_GET_BATCH_SIZE: usize = 1_024;
 const SUBTREE_ROOT_PAGE_SIZE: usize = zinder_core::MAX_SUBTREE_ROOTS_PER_REQUEST as usize;
 
@@ -49,6 +53,8 @@ pub type LocatedTransactionBlob = (TransactionLocation, Option<TransactionBlobAr
 
 pub(super) trait CanonicalServingRead {
     fn serving_open(&self) -> &BoundedRocksDbOpen;
+    fn serving_context(&self) -> SegmentStoreContext<'_>;
+    fn serving_stored_set(&self) -> super::CanonicalStoredSet;
     fn serving_network(&self) -> Network;
     fn serving_build_plan(&self) -> &super::CanonicalStoreBuildPlan;
     fn serving_ready_evidence(&self) -> super::CanonicalStoreReadyEvidence;
@@ -63,6 +69,14 @@ pub(super) trait CanonicalServingRead {
 impl CanonicalServingRead for RocksDbCanonicalStore {
     fn serving_open(&self) -> &BoundedRocksDbOpen {
         &self.bounded_open
+    }
+
+    fn serving_context(&self) -> SegmentStoreContext<'_> {
+        self.segment_context()
+    }
+
+    fn serving_stored_set(&self) -> super::CanonicalStoredSet {
+        self.stored_set
     }
 
     fn serving_network(&self) -> Network {
@@ -98,6 +112,14 @@ impl CanonicalServingRead for RocksDbCanonicalStore {
 impl CanonicalServingRead for RocksDbCanonicalSecondary {
     fn serving_open(&self) -> &BoundedRocksDbOpen {
         &self.bounded_open
+    }
+
+    fn serving_context(&self) -> SegmentStoreContext<'_> {
+        self.segment_context()
+    }
+
+    fn serving_stored_set(&self) -> super::CanonicalStoredSet {
+        self.stored_set
     }
 
     fn serving_network(&self) -> Network {
@@ -204,7 +226,7 @@ macro_rules! impl_canonical_typed_reads {
                 &self,
                 height: BlockHeight,
             ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
-                read_compact_block_at(&self.bounded_open.db, height)
+                read_compact_block_at(self.serving_context(), height)
             }
 
             /// Reads an inclusive compact-block range in ascending height order.
@@ -697,17 +719,10 @@ fn read_block_hash_lookup(
 }
 
 pub(super) fn read_compact_block_at(
-    db: &DB,
+    ctx: SegmentStoreContext<'_>,
     height: BlockHeight,
 ) -> Result<Option<CompactBlockArtifact>, CanonicalStoreError> {
-    let family = column_family(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
-    db.get_cf(&family, encode_block_position(height))
-        .map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "compact block read",
-            source,
-        })?
-        .map(|encoded_compact_block| decode_compact_block_row(height, &encoded_compact_block))
-        .transpose()
+    read_compact_block_split(ctx, height)
 }
 
 fn read_compact_blocks_in_range(
@@ -715,15 +730,10 @@ fn read_compact_blocks_in_range(
     range: zinder_core::BlockHeightRange,
 ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
     let mut blocks = Vec::new();
-    visit_compact_block_batches(
-        store,
-        range,
-        COMPACT_BLOCK_MULTI_GET_BATCH_SIZE,
-        |compact_block| {
-            blocks.push(compact_block);
-            Ok(())
-        },
-    )?;
+    visit_compact_block_batches(store, range, BLOCK_HEADER_BATCH_SIZE, |compact_block| {
+        blocks.push(compact_block);
+        Ok(())
+    })?;
     Ok(blocks)
 }
 
@@ -743,6 +753,39 @@ pub enum HeightOrder {
 /// Most rows one batch of a byte-bounded compact-block read fetches.
 const BOUNDED_COMPACT_BLOCK_BATCH_SIZE: usize = 16;
 
+struct BoundedCompactReadState<'a, Row, F> {
+    max_bytes: usize,
+    kept_bytes: usize,
+    largest_row_bytes: usize,
+    blocks: Vec<Row>,
+    project: &'a F,
+}
+
+impl<Row, F> BoundedCompactReadState<'_, Row, F>
+where
+    F: Fn(CompactBlockArtifact, usize) -> Row,
+{
+    fn is_budget_spent(&self) -> bool {
+        !self.blocks.is_empty() && self.kept_bytes >= self.max_bytes
+    }
+
+    fn exceeds_budget(&self, candidate_bytes: usize) -> bool {
+        !self.blocks.is_empty()
+            && (self.kept_bytes >= self.max_bytes
+                || self.kept_bytes.saturating_add(candidate_bytes) > self.max_bytes)
+    }
+
+    fn try_push(&mut self, compact_block: CompactBlockArtifact, row_bytes: usize) -> bool {
+        if self.exceeds_budget(row_bytes) {
+            return false;
+        }
+        self.kept_bytes = self.kept_bytes.saturating_add(row_bytes);
+        self.largest_row_bytes = self.largest_row_bytes.max(row_bytes);
+        self.blocks.push((self.project)(compact_block, row_bytes));
+        true
+    }
+}
+
 fn read_compact_blocks_up_to<Row>(
     store: &impl CanonicalServingRead,
     range: BlockHeightRange,
@@ -759,41 +802,150 @@ fn read_compact_blocks_up_to<Row>(
         }
         .map(BlockHeight::new)
     };
-    let mut blocks = Vec::new();
-    let mut kept_bytes = 0_usize;
-    let mut largest_row_bytes = 0_usize;
-    let is_budget_spent =
-        |blocks: &[Row], kept_bytes: usize| !blocks.is_empty() && kept_bytes >= max_bytes;
-    'batches: while !is_budget_spent(&blocks, kept_bytes) {
-        let batch_len = bounded_batch_len(max_bytes.saturating_sub(kept_bytes), largest_row_bytes);
+    let mut state = BoundedCompactReadState {
+        max_bytes,
+        kept_bytes: 0,
+        largest_row_bytes: 0,
+        blocks: Vec::new(),
+        project: &project,
+    };
+    while !state.is_budget_spent() {
+        let batch_len = bounded_batch_len(
+            max_bytes.saturating_sub(state.kept_bytes),
+            state.largest_row_bytes,
+        );
         let batch = std::iter::from_fn(&mut next_height)
             .take(batch_len)
             .collect::<Vec<_>>();
         if batch.is_empty() {
             break;
         }
-        let rows = fetch_compact_block_rows(store, &batch)?;
-        for (height, row) in batch.iter().copied().zip(rows) {
-            if is_budget_spent(&blocks, kept_bytes) {
-                break 'batches;
-            }
-            let encoded_compact_block = present_compact_row(height, row)?;
-            let row_bytes = encoded_compact_block.len();
-            if !blocks.is_empty() && kept_bytes.saturating_add(row_bytes) > max_bytes {
-                break 'batches;
-            }
-            kept_bytes = kept_bytes.saturating_add(row_bytes);
-            largest_row_bytes = largest_row_bytes.max(row_bytes);
-            blocks.push(project(
-                decode_compact_block_row(height, &encoded_compact_block)?,
-                row_bytes,
-            ));
+        if !append_bounded_compact_batch(store.serving_context(), order, &batch, &mut state)? {
+            break;
         }
     }
     if order == HeightOrder::Descending {
-        blocks.reverse();
+        state.blocks.reverse();
     }
-    Ok(blocks)
+    Ok(state.blocks)
+}
+
+fn is_next_in_order(order: HeightOrder, previous: BlockHeight, next: BlockHeight) -> bool {
+    match order {
+        HeightOrder::Ascending => next.value() == previous.value() + 1,
+        HeightOrder::Descending => next.value() + 1 == previous.value(),
+    }
+}
+
+fn append_bounded_compact_batch<Row, F>(
+    ctx: SegmentStoreContext<'_>,
+    order: HeightOrder,
+    heights: &[BlockHeight],
+    state: &mut BoundedCompactReadState<'_, Row, F>,
+) -> Result<bool, CanonicalStoreError>
+where
+    F: Fn(CompactBlockArtifact, usize) -> Row,
+{
+    let mut cursor = 0;
+    while cursor < heights.len() && !state.is_budget_spent() {
+        let start = heights[cursor];
+        let segment = match ctx.sealed_segments {
+            Some(entries) => find_sealed_segment_in_slice(entries, start).cloned(),
+            None => resolve_settled_segment_for_height(ctx.db, None, start)?,
+        };
+        let mut run_end = cursor + 1;
+        if let Some(entry) = segment {
+            while run_end < heights.len()
+                && is_next_in_order(order, heights[run_end - 1], heights[run_end])
+                && heights[run_end] >= entry.start_height
+                && heights[run_end] <= entry.end_block.height
+            {
+                run_end += 1;
+            }
+            let end_in_order = heights[run_end - 1];
+            let range = match order {
+                HeightOrder::Ascending => BlockHeightRange::inclusive(start, end_in_order),
+                HeightOrder::Descending => BlockHeightRange::inclusive(end_in_order, start),
+            };
+            let readers = open_replay_segment_readers(ctx.db, ctx.segment_cache, &entry)?;
+            let mut blocks = reconstruct_segment_compact_range(&readers, range)?;
+            if order == HeightOrder::Descending {
+                blocks.reverse();
+            }
+            for compact_block in blocks {
+                let row_len =
+                    crate::proto_codec::encoded_compact_block_artifact_len(&compact_block);
+                if !state.try_push(compact_block, row_len) {
+                    return Ok(false);
+                }
+            }
+        } else {
+            while run_end < heights.len() {
+                let next_height = heights[run_end];
+                let in_settled = match ctx.sealed_segments {
+                    Some(entries) => find_sealed_segment_in_slice(entries, next_height).is_some(),
+                    None => {
+                        resolve_settled_segment_for_height(ctx.db, None, next_height)?.is_some()
+                    }
+                };
+                if in_settled {
+                    break;
+                }
+                run_end += 1;
+            }
+            if !append_live_tail_compact_bounded(ctx.db, order, &heights[cursor..run_end], state)? {
+                return Ok(false);
+            }
+        }
+        cursor = run_end;
+    }
+    Ok(!state.is_budget_spent())
+}
+
+fn append_live_tail_compact_bounded<Row, F>(
+    db: &DB,
+    order: HeightOrder,
+    run_heights: &[BlockHeight],
+    state: &mut BoundedCompactReadState<'_, Row, F>,
+) -> Result<bool, CanonicalStoreError>
+where
+    F: Fn(CompactBlockArtifact, usize) -> Row,
+{
+    let asc_heights = match order {
+        HeightOrder::Ascending => run_heights.to_vec(),
+        HeightOrder::Descending => run_heights.iter().copied().rev().collect(),
+    };
+    let rows = store_access::fetch_live_tail_batch_pinned(
+        db,
+        &asc_heights,
+        &store_access::verified_read_options(),
+    )?;
+    let mut pairs: Vec<_> = asc_heights.into_iter().zip(rows).collect();
+    if order == HeightOrder::Descending {
+        pairs.reverse();
+    }
+    for (height, row) in pairs {
+        if state.is_budget_spent() {
+            return Ok(false);
+        }
+        let slice = row?.ok_or_else(|| missing_compact_block_row(height))?;
+        let raw_exceeds_budget = state.exceeds_budget(slice.len());
+        let (compact_block, compact_len) =
+            match LiveTailBlockRecord::decode_compact_block_v1(&slice, height) {
+                Ok(decoded) => decoded,
+                Err(_) if raw_exceeds_budget => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+        if compact_block.height() != height {
+            return Err(CanonicalStoreError::publication(
+                "compact block row has the wrong height",
+            ));
+        }
+        if !state.try_push(compact_block, compact_len) {
+            return Ok(false);
+        }
+    }
+    Ok(!state.is_budget_spent())
 }
 
 /// Passes each compact block of `range` to `visit` in ascending height order,
@@ -831,10 +983,9 @@ fn visit_compact_block_batches(
         if batch.is_empty() {
             return Ok(());
         }
-        let rows = fetch_compact_block_rows(store, &batch)?;
-        for (height, row) in batch.iter().copied().zip(rows) {
-            let encoded_compact_block = present_compact_row(height, row)?;
-            visit(decode_compact_block_row(height, &encoded_compact_block)?)?;
+        let rows = fetch_compact_blocks_with_lengths(store.serving_context(), &batch)?;
+        for (compact_block, _) in rows {
+            visit(compact_block)?;
         }
     }
 }
@@ -901,71 +1052,83 @@ fn first_unretained_height(
     }
 }
 
-/// One fetched compact-block row: absent, present, or the lookup's failure.
-type CompactBlockRow<'db> = Result<Option<rust_rocksdb::DBPinnableSlice<'db>>, rust_rocksdb::Error>;
-
-/// Fetches the `compact_block` rows of one batch of heights with one multi-get,
-/// in batch order, reading no other family.
-fn fetch_compact_block_rows<'db>(
-    store: &'db impl CanonicalServingRead,
+fn fetch_compact_blocks_with_lengths(
+    ctx: SegmentStoreContext<'_>,
     heights: &[BlockHeight],
-) -> Result<Vec<CompactBlockRow<'db>>, CanonicalStoreError> {
-    let db = &store.serving_open().db;
-    let family = column_family(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
-    let keys = heights
-        .iter()
-        .copied()
-        .map(encode_block_position)
-        .collect::<Vec<_>>();
-    Ok(db.batched_multi_get_cf_slice(
-        &family,
-        keys.iter().map(<[u8; 4]>::as_slice),
-        heights.is_sorted(),
-    ))
-}
-
-/// Returns a fetched row, failing on its lookup error or, since the range was
-/// checked against retained history first, as store damage when it is absent.
-fn present_compact_row(
-    height: BlockHeight,
-    row: CompactBlockRow<'_>,
-) -> Result<rust_rocksdb::DBPinnableSlice<'_>, CanonicalStoreError> {
-    row.map_err(|source| CanonicalStoreError::RocksDbOperation {
-        operation: "compact block read",
-        source,
-    })?
-    .ok_or_else(|| missing_compact_block_row(height))
-}
-
-/// Decodes one compact-block row and checks it holds the block at its key's
-/// height.
-///
-/// The row is not checked against the `block_header` row: construction and
-/// every live transition write the two only after checking that they name the
-/// same block, so a serving read takes the compact block on its own.
-fn decode_compact_block_row(
-    height: BlockHeight,
-    encoded_compact_block: &[u8],
-) -> Result<CompactBlockArtifact, CanonicalStoreError> {
-    let compact_block =
-        crate::decode_compact_block_artifact(encoded_compact_block).map_err(|_| {
-            CanonicalStoreError::publication(format!(
-                "compact block at height {} is invalid",
-                height.value()
-            ))
-        })?;
-    if compact_block.height() != height {
-        return Err(CanonicalStoreError::publication(
-            "compact block row has the wrong height",
-        ));
+) -> Result<Vec<(CompactBlockArtifact, usize)>, CanonicalStoreError> {
+    if heights.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(compact_block)
+    let asc_heights = heights;
+    let mut out = Vec::with_capacity(asc_heights.len());
+    let mut cursor = 0;
+    while cursor < asc_heights.len() {
+        let start = asc_heights[cursor];
+        let segment = match ctx.sealed_segments {
+            Some(entries) => find_sealed_segment_in_slice(entries, start).cloned(),
+            None => resolve_settled_segment_for_height(ctx.db, None, start)?,
+        };
+        let mut run_end = cursor + 1;
+        if let Some(entry) = segment {
+            while run_end < asc_heights.len()
+                && asc_heights[run_end].value() == asc_heights[run_end - 1].value() + 1
+                && asc_heights[run_end] <= entry.end_block.height
+            {
+                run_end += 1;
+            }
+            let readers = open_replay_segment_readers(ctx.db, ctx.segment_cache, &entry)?;
+            let range = BlockHeightRange::inclusive(start, asc_heights[run_end - 1]);
+            for compact_block in reconstruct_segment_compact_range(&readers, range)? {
+                let row_len =
+                    crate::proto_codec::encoded_compact_block_artifact_len(&compact_block);
+                out.push((compact_block, row_len));
+            }
+        } else {
+            while run_end < asc_heights.len() {
+                let next_height = asc_heights[run_end];
+                let in_settled = match ctx.sealed_segments {
+                    Some(entries) => find_sealed_segment_in_slice(entries, next_height).is_some(),
+                    None => {
+                        resolve_settled_segment_for_height(ctx.db, None, next_height)?.is_some()
+                    }
+                };
+                if in_settled {
+                    break;
+                }
+                run_end += 1;
+            }
+            fetch_live_tail_compact_run(ctx.db, &asc_heights[cursor..run_end], &mut out)?;
+        }
+        cursor = run_end;
+    }
+    Ok(out)
+}
+
+fn fetch_live_tail_compact_run(
+    db: &DB,
+    heights: &[BlockHeight],
+    out: &mut Vec<(CompactBlockArtifact, usize)>,
+) -> Result<(), CanonicalStoreError> {
+    let rows = store_access::fetch_live_tail_batch_pinned(
+        db,
+        heights,
+        &store_access::verified_read_options(),
+    )?;
+    for (height, row) in heights.iter().copied().zip(rows) {
+        let slice = row?.ok_or_else(|| missing_compact_block_row(height))?;
+        let (compact_block, compact_len) =
+            LiveTailBlockRecord::decode_compact_block_v1(&slice, height)?;
+        if compact_block.height() != height {
+            return Err(CanonicalStoreError::publication(
+                "compact block row has the wrong height",
+            ));
+        }
+        out.push((compact_block, compact_len));
+    }
+    Ok(())
 }
 
 /// Reports a missing compact-block row at a height inside retained history.
-///
-/// Publication and live commits write a row for every retained height, so
-/// absence there is store damage.
 fn missing_compact_block_row(height: BlockHeight) -> CanonicalStoreError {
     CanonicalStoreError::publication(format!(
         "compact block at height {} is absent",
@@ -1066,50 +1229,15 @@ fn read_transaction_locations_and_blobs(
         return Ok(Vec::new());
     }
     let locations = read_transaction_locations(store, transaction_ids)?;
-    if !store
-        .serving_build_plan()
-        .raw_blob_retention()
-        .retains_transaction_blobs()
-    {
-        return Ok(locations
-            .into_iter()
-            .map(|location| location.map(|found| (found, None)))
-            .collect());
-    }
-    let mut ordered = locations
-        .iter()
-        .enumerate()
-        .filter_map(|(index, location)| {
-            let found = (*location)?;
-            Some((
-                encode_transaction_position(found.block_height, found.tx_index_in_block),
-                index,
-            ))
-        })
-        .collect::<Vec<_>>();
-    ordered.sort_unstable();
-    let family = column_family(&store.serving_open().db, TRANSACTION_BLOB_COLUMN_FAMILY)?;
-    let rows = store.serving_open().db.batched_multi_get_cf_slice(
-        &family,
-        ordered.iter().map(|(key, _)| key.as_slice()),
-        true,
-    );
-    let mut combined: Vec<Option<(TransactionLocation, Option<TransactionBlobArtifact>)>> =
-        locations
-            .into_iter()
-            .map(|location| location.map(|found| (found, None)))
-            .collect();
-    for ((_, index), row) in ordered.iter().zip(rows) {
-        let maybe_bytes = row.map_err(|source| CanonicalStoreError::RocksDbOperation {
-            operation: "transaction blob batch read",
-            source,
-        })?;
-        if let (Some(raw_bytes), Some(Some((location, blob_slot)))) =
-            (maybe_bytes, combined.get_mut(*index))
-        {
-            *blob_slot = Some(TransactionBlobArtifact::new(*location, raw_bytes.to_vec()));
-        }
-    }
+    let mut combined: Vec<Option<LocatedTransactionBlob>> = locations
+        .into_iter()
+        .map(|location| location.map(|found| (found, None)))
+        .collect();
+    populate_raw_transaction_blobs_batch(
+        store.serving_context(),
+        store.serving_stored_set(),
+        &mut combined,
+    )?;
     Ok(combined)
 }
 
@@ -1134,20 +1262,15 @@ fn read_transaction_blob(
 
 /// Reads the raw transaction at `location`, which the caller read from this
 /// store's location row.
-///
-/// Successful reads through one borrowed handle see the same canonical
-/// transaction mapping: a commit consumes the primary, and catching a
-/// secondary up borrows it mutably. Reading the location row again through the
-/// same borrow could not answer differently.
 fn read_located_transaction_blob(
     store: &impl CanonicalServingRead,
     location: TransactionLocation,
 ) -> Result<Option<TransactionBlobArtifact>, CanonicalStoreError> {
-    Ok(read_optional(
-        store,
-        TRANSACTION_BLOB_COLUMN_FAMILY,
-        &encode_transaction_position(location.block_height, location.tx_index_in_block),
-        "transaction blob read",
+    Ok(read_raw_transaction_split(
+        store.serving_context(),
+        store.serving_stored_set(),
+        location.block_height,
+        location.tx_index_in_block,
     )?
     .map(|raw_transaction_bytes| TransactionBlobArtifact::new(location, raw_transaction_bytes)))
 }
@@ -1156,85 +1279,67 @@ fn read_block_blob_at(
     store: &impl CanonicalServingRead,
     height: BlockHeight,
 ) -> Result<Option<BlockBlobArtifact>, CanonicalStoreError> {
-    read_block_blobs_in_range(store, BlockHeightRange::inclusive(height, height))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| CanonicalStoreError::publication("single-height block blob read is empty"))
+    let Some(raw_block_bytes) =
+        read_raw_block_split(store.serving_context(), store.serving_stored_set(), height)?
+    else {
+        return Ok(None);
+    };
+    let header = read_block_header_at(store, height)?.ok_or_else(|| {
+        CanonicalStoreError::publication(format!(
+            "retained block blob at height {} has no canonical header",
+            height.value()
+        ))
+    })?;
+    Ok(Some(BlockBlobArtifact::new(
+        height,
+        header.block_hash,
+        header.parent_hash,
+        raw_block_bytes,
+    )))
 }
 
 fn read_block_blobs_in_range(
     store: &impl CanonicalServingRead,
     range: BlockHeightRange,
 ) -> Result<Vec<Option<BlockBlobArtifact>>, CanonicalStoreError> {
-    let mut blobs = Vec::new();
-    let mut heights = Vec::with_capacity(BLOCK_BLOB_MULTI_GET_BATCH_SIZE);
-    for height in range {
-        heights.push(height);
-        if heights.len() == BLOCK_BLOB_MULTI_GET_BATCH_SIZE {
-            append_block_blob_batch(store, &heights, &mut blobs)?;
-            heights.clear();
-        }
+    if range.start > range.end {
+        return Ok(Vec::new());
     }
-    append_block_blob_batch(store, &heights, &mut blobs)?;
-    Ok(blobs)
-}
-
-fn append_block_blob_batch(
-    store: &impl CanonicalServingRead,
-    heights: &[BlockHeight],
-    blobs: &mut Vec<Option<BlockBlobArtifact>>,
-) -> Result<(), CanonicalStoreError> {
-    if heights.is_empty() {
-        return Ok(());
-    }
-    let block_blob_family = column_family(&store.serving_open().db, BLOCK_BLOB_COLUMN_FAMILY)?;
-    let header_family = column_family(&store.serving_open().db, BLOCK_HEADER_COLUMN_FAMILY)?;
-    let keys = heights
-        .iter()
-        .copied()
-        .map(encode_block_position)
+    let raw_blocks =
+        read_raw_blocks_in_range_split(store.serving_context(), store.serving_stored_set(), range)?;
+    let present_heights = range
+        .into_iter()
+        .zip(&raw_blocks)
+        .filter_map(|(height, maybe_bytes)| maybe_bytes.as_ref().map(|_| height))
         .collect::<Vec<_>>();
-    let mut inputs = Vec::with_capacity(keys.len().saturating_mul(2));
-    for key in &keys {
-        inputs.push((&block_blob_family, key.as_slice()));
-        inputs.push((&header_family, key.as_slice()));
+    if present_heights.is_empty() {
+        return Ok(vec![None; raw_blocks.len()]);
     }
-    let mut rows = store.serving_open().db.multi_get_cf(inputs).into_iter();
-
-    for height in heights {
-        let raw_block_bytes = rows
-            .next()
-            .ok_or_else(|| CanonicalStoreError::publication("block blob multi-get is truncated"))?
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "block blob range read",
-                source,
-            })?;
-        let encoded_header = rows
-            .next()
-            .ok_or_else(|| CanonicalStoreError::publication("block header multi-get is truncated"))?
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "block blob header range read",
-                source,
-            })?;
-        let Some(raw_block_bytes) = raw_block_bytes else {
-            blobs.push(None);
+    let mut present_headers = Vec::with_capacity(present_heights.len());
+    for chunk in present_heights.chunks(BLOCK_HEADER_BATCH_SIZE) {
+        present_headers.extend(read_block_headers_at(store, chunk)?);
+    }
+    let mut header_iter = present_headers.into_iter();
+    let mut out = Vec::with_capacity(raw_blocks.len());
+    for (height, maybe_bytes) in range.into_iter().zip(raw_blocks) {
+        let Some(raw_block_bytes) = maybe_bytes else {
+            out.push(None);
             continue;
         };
-        let encoded_header = encoded_header.ok_or_else(|| {
+        let header = header_iter.next().flatten().ok_or_else(|| {
             CanonicalStoreError::publication(format!(
                 "retained block blob at height {} has no canonical header",
                 height.value()
             ))
         })?;
-        let header = decode_block_header(*height, &encoded_header)?;
-        blobs.push(Some(BlockBlobArtifact::new(
-            *height,
+        out.push(Some(BlockBlobArtifact::new(
+            height,
             header.block_hash,
             header.parent_hash,
             raw_block_bytes,
         )));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Reads and revalidates the checkpoint stored at exactly `height` with one

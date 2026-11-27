@@ -46,10 +46,10 @@ use zinder_core::{BlockHeight, NetworkUpgradeActivations, ShieldedProtocol};
 use zinder_proto::{v1::ops::CanonicalStoreDamagedDetail, wire::canonical_store_damaged_detail};
 use zinder_runtime::{ReadinessCause, ReadinessState};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbResourceBudget, RocksDbTreeStateVerifier, TREE_STATE_CHECKPOINT_STRIDE,
-    TreeStateCheckpointMismatch, TreeStateCheckpointMismatchKind,
-    TreeStateCheckpointRowVerification, TreeStateCheckpointVerification,
+    CanonicalReorgPolicy, CanonicalStoreError, RawBlobRetention, RocksDbResourceBudget,
+    RocksDbTreeStateVerifier, TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointMismatch,
+    TreeStateCheckpointMismatchKind, TreeStateCheckpointRowVerification,
+    TreeStateCheckpointVerification,
 };
 
 use crate::{
@@ -252,8 +252,6 @@ pub struct TreeStateVerificationContext {
     pub secondary_path: PathBuf,
     /// Node-observed activations that decide which pools each row carries.
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    /// Workload the canonical store was built for.
-    pub workload: CanonicalStoreWorkload,
     /// Raw-blob retention the canonical store was built with.
     pub raw_blob_retention: RawBlobRetention,
     /// Reorg policy the canonical store was built with.
@@ -296,7 +294,6 @@ async fn run_tree_state_verification(
         canonical_primary_path: &context.canonical_primary_path,
         secondary_path: &context.secondary_path,
         network_upgrade_activations: &context.network_upgrade_activations,
-        workload: context.workload,
         raw_blob_retention: context.raw_blob_retention,
         reorg_policy: context.reorg_policy,
         resource_budget: context.resource_budget,

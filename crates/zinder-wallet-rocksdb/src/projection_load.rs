@@ -4184,13 +4184,11 @@ mod tests {
         use zinder_core::{
             ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
             CompactBlockArtifact, CompactChainMetadata, ConsensusBranchId,
-            NetworkUpgradeActivation, NetworkUpgradeActivations, TransactionBlobArtifact,
-            TransactionLocation, UnixTimestampMillis,
+            NetworkUpgradeActivation, NetworkUpgradeActivations, UnixTimestampMillis,
         };
         use zinder_store::{
             CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
-            CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention,
-            RocksDbCanonicalBuilder,
+            CanonicalStoreBuildPlan, RawBlobRetention, RocksDbCanonicalBuilder,
         };
         let activations_vec = [
             "Overwinter",
@@ -4229,12 +4227,11 @@ mod tests {
             &activations,
             0,
             tip,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(reorg_window)?,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -4254,22 +4251,6 @@ mod tests {
                     ironwood_commitment_tree_size: 0,
                 },
             );
-            let transaction_blobs = facts
-                .transactions
-                .iter()
-                .enumerate()
-                .map(|(tx_idx, transaction)| {
-                    TransactionBlobArtifact::new(
-                        TransactionLocation::new(
-                            transaction.public_facts.transaction_id,
-                            height,
-                            block_hash,
-                            u32::try_from(tx_idx).unwrap_or(u32::MAX),
-                        ),
-                        transaction.public_facts.transaction_id.as_bytes(),
-                    )
-                })
-                .collect();
             let tree_state_checkpoint = is_tip.then(|| {
                 CommitmentTreeCheckpoint::new(
                     BlockId::new(height, block_hash),
@@ -4288,8 +4269,7 @@ mod tests {
                 compact_block,
                 tip_metadata: ChainTipMetadata::new(0, 0, 0),
                 tree_state_checkpoint,
-                block_final_note_commitment_roots: None,
-                transaction_blobs,
+                transaction_blobs: Vec::new(),
                 block_blob: None,
             })
         });

@@ -1,18 +1,11 @@
 //! Lifecycle, manifest, snapshot, and lazy shared reader cache for
 //! canonical store settled segments (`ZSHRNG02`, `ZSTSUP01`, and `ZSBLKB01`).
 
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "settled_segments is staged before canonical builder and reader wiring"
-    )
-)]
-
 pub(crate) mod cache;
 pub(crate) mod layout;
 pub(crate) mod sealer;
 pub(crate) mod snapshot;
+pub(crate) mod store_access;
 #[cfg(test)]
 mod tests;
 
@@ -69,6 +62,14 @@ impl From<crate::segment_verity::SegmentVerityError> for SettledSegmentsError {
             crate::segment_verity::SegmentVerityError::DigestMismatch(reason) => {
                 Self::Integrity(reason)
             }
+        }
+    }
+}
+
+impl From<SettledSegmentsError> for super::CanonicalStoreError {
+    fn from(error: SettledSegmentsError) -> Self {
+        Self::SettledSegment {
+            reason: error.to_string(),
         }
     }
 }
@@ -161,11 +162,11 @@ impl<'a> ByteReader<'a> {
         })
     }
 
-    pub(in crate::canonical_store) fn read_len_prefixed_vec(
+    pub(in crate::canonical_store) fn read_len_prefixed_slice(
         &mut self,
         max_len: usize,
         field_label: &str,
-    ) -> Result<Vec<u8>, SettledSegmentsError> {
+    ) -> Result<&'a [u8], SettledSegmentsError> {
         let raw_len = self.read_u32_be(field_label)?;
         let byte_len = usize::try_from(raw_len).map_err(|_| {
             SettledSegmentsError::InvalidFormat(format!(
@@ -177,7 +178,15 @@ impl<'a> ByteReader<'a> {
                 "length {byte_len} for {field_label} exceeds limit {max_len}"
             )));
         }
-        Ok(self.read_slice(byte_len, field_label)?.to_vec())
+        self.read_slice(byte_len, field_label)
+    }
+
+    pub(in crate::canonical_store) fn read_len_prefixed_vec(
+        &mut self,
+        max_len: usize,
+        field_label: &str,
+    ) -> Result<Vec<u8>, SettledSegmentsError> {
+        Ok(self.read_len_prefixed_slice(max_len, field_label)?.to_vec())
     }
 
     pub(in crate::canonical_store) fn finish(

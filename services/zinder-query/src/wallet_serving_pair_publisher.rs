@@ -2903,9 +2903,9 @@ mod tests {
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
         CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreRequirements,
-        CanonicalStoreWorkload, EventStreamStartPosition, RawBlobRetention, ResourceGaugeThrottle,
-        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-        RocksDbResourceBudget, StreamCursorTokenV1, event_stream_start_message,
+        EventStreamStartPosition, RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalBuilder,
+        RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+        StreamCursorTokenV1, event_stream_start_message,
     };
     use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionSourcePosition};
     use zinder_wallet_rocksdb::{
@@ -4044,7 +4044,7 @@ mod tests {
             AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
                 .await?;
         let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             &admitted_ingest_control,
         );
         let admitted_capabilities = capabilities.clone();
@@ -4182,7 +4182,7 @@ mod tests {
         ])?);
         let activations = Arc::new(sample_regtest_upgrade_activations());
         let chain = ChainFixture::new(Network::ZcashRegtest)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .with_raw_blob_retention(RawBlobRetention::None)
             .extend_blocks(1);
         let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
         let (canonical, wallet) = store.take_readers()?;
@@ -5284,9 +5284,7 @@ mod tests {
                 .path()
                 .join("wallet-reconcile-canonical-secondary"),
             &upgraded,
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -6820,9 +6818,7 @@ mod tests {
                 .path()
                 .join("wallet-reconcile-canonical-secondary"),
             &activations,
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -7094,12 +7090,12 @@ mod tests {
         let first_height = BlockHeight::new(1);
         let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
         let all = chain.clone().with_raw_blob_retention(RawBlobRetention::All);
-        let transactions = chain.with_raw_blob_retention(RawBlobRetention::Transactions);
+        let unretained = chain.with_raw_blob_retention(RawBlobRetention::None);
         let baseline = |chain| CanonicalBaseline::new(chain).through(first_height);
         let bootstrap = CanonicalWriterFixture::publish(&baseline(&all), &activations)?;
         let mut replacement =
-            CanonicalWriterFixture::publish(&baseline(&transactions), &activations)?;
-        let replacement_fence = replacement.append_live_block(&transactions)?;
+            CanonicalWriterFixture::publish(&baseline(&unretained), &activations)?;
+        let replacement_fence = replacement.append_live_block(&unretained)?;
 
         let paths = TempDir::new()?;
         let original_wallet = paths.path().join("original-wallet");
@@ -7490,7 +7486,7 @@ mod tests {
             .published_generation
             .ok_or("bootstrap must record its published generation")?;
         let retained_sizes = generation_live_sst_bytes(&publisher, retained_generation)?;
-        assert!(retained_sizes.compact_block > 0.0);
+        assert!(retained_sizes.live_tail_block > 0.0);
         assert!(retained_sizes.wallet_utxo > 0.0);
 
         primaries.append_block()?;
@@ -7504,7 +7500,7 @@ mod tests {
             .ok_or("refresh must record its newest published generation")?;
         assert_ne!(newest_generation, retained_generation);
         let newest_sizes = generation_live_sst_bytes(&publisher, newest_generation)?;
-        assert!(newest_sizes.compact_block > retained_sizes.compact_block);
+        assert!(newest_sizes.live_tail_block > retained_sizes.live_tail_block);
         assert!(newest_sizes.wallet_utxo > retained_sizes.wallet_utxo);
         assert!(newest_sizes.wallet_reorg_undo > retained_sizes.wallet_reorg_undo);
 
@@ -7517,7 +7513,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct GenerationLiveSstBytes {
-        compact_block: f64,
+        live_tail_block: f64,
         wallet_utxo: f64,
         wallet_reorg_undo: f64,
     }
@@ -7531,10 +7527,10 @@ mod tests {
         else {
             return Err("selected generation must be published".into());
         };
-        let compact_block = readers
+        let live_tail_block = readers
             .canonical
-            .rocksdb_property_value_cf("compact_block", "rocksdb.live-sst-files-size")?
-            .ok_or("canonical secondary must report compact_block live SST size")?
+            .rocksdb_property_value_cf("live_tail_block", "rocksdb.live-sst-files-size")?
+            .ok_or("canonical secondary must report live_tail_block live SST size")?
             .parse::<f64>()?;
         let wallet_utxo = readers
             .wallet
@@ -7547,7 +7543,7 @@ mod tests {
             .ok_or("wallet secondary must report reorg_undo live SST size")?
             .parse::<f64>()?;
         Ok(GenerationLiveSstBytes {
-            compact_block,
+            live_tail_block,
             wallet_utxo,
             wallet_reorg_undo,
         })
@@ -7559,10 +7555,10 @@ mod tests {
         drop(primaries.writer.take_canonical_primary()?);
         {
             let (canonical_db, _) = open_raw_primary(primaries.writer.canonical_primary_path())?;
-            let compact_cf = canonical_db
-                .cf_handle("compact_block")
-                .ok_or("compact_block family must open")?;
-            canonical_db.flush_cf(&compact_cf)?;
+            let live_tail_cf = canonical_db
+                .cf_handle("live_tail_block")
+                .ok_or("live_tail_block family must open")?;
+            canonical_db.flush_cf(&live_tail_cf)?;
         }
         let (wallet_db, _) = open_raw_primary(&primaries.wallet_primary_path)?;
         let undo_cf = wallet_db
@@ -7584,9 +7580,9 @@ mod tests {
         for (store_role, cf, retained_bytes, newest_bytes) in [
             (
                 "canonical_secondary",
-                "compact_block",
-                retained.compact_block,
-                newest.compact_block,
+                "live_tail_block",
+                retained.live_tail_block,
+                newest.live_tail_block,
             ),
             (
                 "wallet_secondary",
@@ -8522,9 +8518,7 @@ mod tests {
             &canonical_primary_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -8945,7 +8939,7 @@ mod tests {
         Box<dyn std::error::Error>,
     > {
         let chain = ChainFixture::new(Network::ZcashRegtest)
-            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .with_raw_blob_retention(RawBlobRetention::None)
             .extend_blocks(block_count);
         let mut store =
             WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
@@ -9018,7 +9012,7 @@ mod tests {
             wallet_secondary_root,
             network: Network::ZcashRegtest,
             canonical_requirements: CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
+                RawBlobRetention::None,
             ),
             canonical_reorg_policy: CanonicalReorgPolicy::new(100)?,
             canonical_resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -9080,12 +9074,11 @@ mod tests {
         let tip = BlockId::new(tip_height, parent_hash);
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             canonical_primary_path,
-            CanonicalStoreWorkload::Wallet,
             CanonicalStoreBuildPlan::complete(
                 activations,
                 0,
                 tip,
-                RawBlobRetention::Transactions,
+                RawBlobRetention::None,
                 CanonicalReorgPolicy::new(100)?,
             )?,
             RocksDbResourceBudget::for_local_tests(),
@@ -9150,7 +9143,6 @@ mod tests {
                 height.value(),
                 CommitmentTreeFrontiers::default(),
             )),
-            block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
@@ -9333,7 +9325,7 @@ mod tests {
                 temporary.path().join("projector-canonical-secondary"),
                 &activations,
                 zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                    RawBlobRetention::Transactions,
+                    RawBlobRetention::None,
                 ),
                 CanonicalReorgPolicy::new(100)?,
                 RocksDbResourceBudget::for_local_tests(),
@@ -9419,8 +9411,7 @@ mod tests {
             self.canonical_primary = Some(RocksDbCanonicalStore::open_ready(
                 self.temporary.path().join("canonical-primary"),
                 &self.activations,
-                CanonicalStoreWorkload::Wallet,
-                RawBlobRetention::Transactions,
+                RawBlobRetention::None,
                 CanonicalReorgPolicy::new(100)?,
                 RocksDbResourceBudget::for_local_tests(),
             )?);

@@ -55,7 +55,6 @@ mod wallet_events;
 
 use std::{io, num::NonZeroU32, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zinder_core::{
@@ -130,9 +129,12 @@ pub use tree_state_verification::{
 pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
 /// Exact physical schema accepted by this canonical store implementation.
 ///
-/// Schema 1 binds the initial activation schedule and the effective reorg
-/// window in the control record. Store admission requires this exact layout.
-pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 1;
+/// Schema 2 binds the initial activation schedule, effective reorg window, and
+/// construction manifest in the control record, persisting settled history in
+/// external segment files (`settled_segment_index`) and unsealed tail blocks in
+/// `live_tail_block` and `live_tail_raw_block`. Store admission requires this
+/// exact layout.
+pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 2;
 /// Durable artifact schema version written by this binary.
 ///
 /// The current artifact contract includes structured compact blocks and shared
@@ -567,37 +569,6 @@ pub enum CanonicalStoreBuildError<SourceError> {
     /// Canonical storage construction failed.
     #[error(transparent)]
     Store(#[from] CanonicalStoreError),
-}
-
-/// Closed canonical data workload persisted before any data family is built.
-///
-/// Both workloads retain the semantic replay needed by projections. The
-/// selected workload fixes which optional explorer source artifacts must be
-/// complete. Raw block and transaction retention is an independent persisted
-/// [`RawBlobRetention`] contract.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CanonicalStoreWorkload {
-    /// Wallet APIs, including typed tree-state checkpoints and continuous
-    /// subtree roots.
-    ///
-    /// This workload omits per-block final roots, daily value-pool balances,
-    /// and other explorer-only source facts.
-    Wallet,
-    /// Wallet APIs plus per-block final roots, daily value-pool balances, and
-    /// other explorer-only source facts.
-    Explorer,
-}
-
-impl CanonicalStoreWorkload {
-    /// Returns the persisted configuration spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Wallet => "wallet",
-            Self::Explorer => "explorer",
-        }
-    }
 }
 
 /// Durable construction state of a canonical store.
@@ -1111,6 +1082,13 @@ pub enum CanonicalStoreError {
     /// A projection-build lease was used after its durable expiry.
     #[error("projection build lease has expired")]
     ProjectionBuildLeaseExpired,
+
+    /// A settled-segment or live-tail storage contract failed.
+    #[error("canonical settled-segment operation failed: {reason}")]
+    SettledSegment {
+        /// Exact invariant or I/O failure.
+        reason: String,
+    },
 }
 
 impl CanonicalStoreError {
@@ -1138,13 +1116,6 @@ impl CanonicalStoreError {
 
     fn block_replay_sequence(reason: impl Into<String>) -> Self {
         Self::BlockReplaySequenceInvalid {
-            reason: reason.into(),
-        }
-    }
-
-    fn block_replay_invalid(height: BlockHeight, reason: impl Into<String>) -> Self {
-        Self::BlockReplayInvalid {
-            height: height.value(),
             reason: reason.into(),
         }
     }
@@ -1294,7 +1265,7 @@ mod tests {
             &activations,
             1_234,
             build_tip,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )?;
         assert_eq!(plan.network(), network);
@@ -1336,7 +1307,7 @@ mod tests {
             &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
             0,
             BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )
         .err();
@@ -1363,7 +1334,7 @@ mod tests {
             &canopy_only_activations,
             0,
             build_tip,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )?;
 
@@ -1378,7 +1349,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(0), BlockHash::from_bytes([0; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )
         .err();
@@ -1403,7 +1374,7 @@ mod tests {
                 CommitmentTreeFrontiers::default(),
             ),
             BlockId::new(BlockHeight::new(u32::MAX), BlockHash::from_bytes([9; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )
         .err();
@@ -1423,7 +1394,7 @@ mod tests {
             &activations,
             CommitmentTreeCheckpoint::new(checkpoint, 1_234, checkpoint_frontiers.clone()),
             BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )?;
 
@@ -1442,7 +1413,7 @@ mod tests {
             network,
             network_upgrade_activations_fingerprint: activations
                 .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::All,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             history_bounds: zinder_core::CanonicalHistoryBounds::complete(),
             history_predecessor: CommitmentTreeCheckpoint::new(
@@ -1476,7 +1447,7 @@ mod tests {
                 &activations,
                 CommitmentTreeCheckpoint::new(genesis, 0, CommitmentTreeFrontiers::default(),),
                 BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
-                RawBlobRetention::Transactions,
+                RawBlobRetention::All,
                 CanonicalReorgPolicy::new(100)?,
             )
             .err(),
@@ -1489,7 +1460,7 @@ mod tests {
                 &activations,
                 CommitmentTreeCheckpoint::new(checkpoint, 0, CommitmentTreeFrontiers::default(),),
                 BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32])),
-                RawBlobRetention::Transactions,
+                RawBlobRetention::All,
                 CanonicalReorgPolicy::new(100)?,
             )
             .err(),

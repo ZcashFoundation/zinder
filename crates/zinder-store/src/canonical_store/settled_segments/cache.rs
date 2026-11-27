@@ -39,6 +39,7 @@ use super::{
 pub(crate) const DEFAULT_SETTLED_SEGMENT_READER_CACHE_CAPACITY: usize = 1_024;
 
 /// Bundle of shared authenticated readers for one settled segment stride.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct CachedSettledSegmentReaders {
     /// Authenticated `ZSHRNG02` shielded segment reader.
@@ -49,6 +50,7 @@ pub(crate) struct CachedSettledSegmentReaders {
     pub(crate) raw_block: Option<Arc<SettledRawBlockSegmentReader>>,
 }
 
+#[cfg(test)]
 impl fmt::Debug for CachedSettledSegmentReaders {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -400,24 +402,28 @@ impl SettledSegmentReaderCache {
     }
 
     /// Returns the configured maximum number of open segments held in the cache.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn capacity(&self) -> usize {
         self.max_open_segments
     }
 
     /// Returns the number of segments currently cached open.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().slots.len()
     }
 
     /// Returns `true` when zero segments are cached open.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.inner.lock().slots.is_empty()
     }
 
     /// Returns `true` if any module at `start_height` is currently cached.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn contains_start_height(&self, start_height: BlockHeight) -> bool {
         self.inner.lock().slots.contains_key(&start_height)
@@ -459,6 +465,7 @@ impl SettledSegmentReaderCache {
     }
 
     /// Evicts any cached readers for `start_height`, returning `true` if present.
+    #[cfg(test)]
     pub(crate) fn evict(&self, start_height: BlockHeight) -> bool {
         let mut guard = self.inner.lock();
         guard.generation = guard.generation.wrapping_add(1);
@@ -475,6 +482,7 @@ impl SettledSegmentReaderCache {
     }
 
     /// Drops all cached open readers.
+    #[cfg(test)]
     pub(crate) fn clear(&self) {
         let mut guard = self.inner.lock();
         guard.generation = guard.generation.wrapping_add(1);
@@ -543,6 +551,7 @@ impl SettledSegmentReaderCache {
 
     /// Opens or returns all enabled authenticated module readers for `entry`
     /// using the lazy singleflight path per enabled module.
+    #[cfg(test)]
     pub(crate) fn get_or_open(
         &self,
         entry: &SettledSegmentIndexEntry,
@@ -555,6 +564,49 @@ impl SettledSegmentReaderCache {
             supplement,
             raw_block,
         })
+    }
+
+    /// Inserts already-verified readers opened during cold admission so
+    /// subsequent replay validation reuses them without reopening segment files.
+    pub(crate) fn insert_verified_readers(
+        &self,
+        entry: &SettledSegmentIndexEntry,
+        shielded: Arc<SettledShieldedSegmentReader>,
+        supplement: Option<Arc<SettledSupplementSegmentReader>>,
+        raw_block: Option<Arc<SettledRawBlockSegmentReader>>,
+    ) -> Result<(), SettledSegmentsError> {
+        entry.validate()?;
+        let expected_pin = CacheIdentityPin::from_entry(entry);
+        let mut guard = self.inner.lock();
+        insert_module_into_slot(
+            &mut guard,
+            entry.start_height,
+            &expected_pin,
+            LoadedModuleReader::Shielded(shielded),
+            self.max_open_segments,
+        )
+        .map_err(|failure| failure.to_error())?;
+        if let Some(sup_reader) = supplement {
+            insert_module_into_slot(
+                &mut guard,
+                entry.start_height,
+                &expected_pin,
+                LoadedModuleReader::Supplement(sup_reader),
+                self.max_open_segments,
+            )
+            .map_err(|failure| failure.to_error())?;
+        }
+        if let Some(raw_reader) = raw_block {
+            insert_module_into_slot(
+                &mut guard,
+                entry.start_height,
+                &expected_pin,
+                LoadedModuleReader::RawBlock(raw_reader),
+                self.max_open_segments,
+            )
+            .map_err(|failure| failure.to_error())?;
+        }
+        Ok(())
     }
 
     fn verify_existing_slot_pin(

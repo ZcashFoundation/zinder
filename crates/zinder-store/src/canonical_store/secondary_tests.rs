@@ -10,14 +10,12 @@ use zinder_core::{
 use super::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
     CanonicalSequenceCheckpoint, CanonicalStoreError, CanonicalStoreReadyEvidence,
-    CanonicalStoreWorkload, ProjectionBuildLease, ProjectionBuildLeaseId,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, ServedTreeState, TreeStateLookup,
-    TreeStateReplayOutcome,
+    ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    ServedTreeState, TreeStateLookup, TreeStateReplayOutcome,
     block_load::{
         encode_block_hash_location, encode_block_header, encode_block_position,
         encode_tree_state_checkpoint,
     },
-    block_replay::BLOCK_REPLAY_COLUMN_FAMILY,
     control::encode_ready_store_control_with_revisions,
     displaced_archive::{
         backfill_test_root_index_with_batch_limit, reindex_test_archive_with_roots,
@@ -27,12 +25,13 @@ use super::{
         canonical_block, open_store, open_store_with_retention, published_store,
         published_store_with_retention, replacement_block, replacement_block_with_retention,
     },
+    live_tail::{LiveTailBlockRecord, LiveTailEncodeOptions},
     publication::{column_family, encode_live_append_event, encode_live_chain_epoch},
     rocksdb::{
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
-        CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-        DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
-        TREE_STATE_CHECKPOINT_COLUMN_FAMILY, validate_open_store_control,
+        CHAIN_EVENT_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY, STORE_CONTROL_KEY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+        validate_open_store_control,
     },
 };
 use crate::{
@@ -58,8 +57,7 @@ fn second_ready_primary_open_is_refused_while_the_first_owns_the_store()
     let error = RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -99,7 +97,7 @@ fn secondary_observes_a_live_append_only_after_explicit_catch_up()
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )??;
     let baseline_fence = secondary.event_fence();
     assert_eq!(baseline_fence, store.event_fence());
@@ -147,15 +145,15 @@ fn a_stale_secondary_reports_a_compacted_away_table_file_until_it_catches_up()
         BlockHeight::new(SPLIT_HEIGHTS),
         BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
     )?;
-    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     let mut secondary = open_secondary(
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )??;
 
-    compact_away_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    compact_away_table_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     let failures = (1..=SPLIT_HEIGHTS)
         .filter_map(|height| secondary.compact_block_at(BlockHeight::new(height)).err())
         .collect::<Vec<_>>();
@@ -174,7 +172,7 @@ fn a_stale_secondary_reports_a_compacted_away_table_file_until_it_catches_up()
     let family = secondary
         .bounded_open
         .db
-        .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
+        .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
         .ok_or("the family must exist")?;
     let scan_failure = secondary
         .bounded_open
@@ -225,8 +223,8 @@ fn a_bounded_read_its_first_block_fills_fetches_only_that_block()
         BlockHeight::new(SPLIT_HEIGHTS),
         BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
     )?;
-    split_rows_into_bottom_level_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
-    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_bottom_level_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     let mut stale = Vec::new();
     for (order, first) in [
         (HeightOrder::Ascending, BlockHeight::new(1)),
@@ -236,14 +234,14 @@ fn a_bounded_read_its_first_block_fills_fetches_only_that_block()
             &store_path,
             temporary.path().join(format!("{order:?}")),
             &activations,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
         )??;
         stale.push((secondary, order, first));
     }
 
     compact_away_rows_in(
         &store.bounded_open.db,
-        COMPACT_BLOCK_COLUMN_FAMILY,
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY,
         BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(SPLIT_HEIGHTS - 1)),
     )?;
     for (secondary, order, first) in &stale {
@@ -442,18 +440,18 @@ fn stale_secondary_over_kept_heights(
         BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
     )?;
     let db = &store.bounded_open.db;
-    split_rows_into_bottom_level_files(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
-    split_rows_into_table_files(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_bottom_level_files(db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     let secondary = open_secondary(
         &store_path,
         temporary.path().join("secondary"),
         activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )??;
 
     compact_away_rows_in(
         db,
-        COMPACT_BLOCK_COLUMN_FAMILY,
+        LIVE_TAIL_BLOCK_COLUMN_FAMILY,
         BlockHeightRange::inclusive(BlockHeight::new(KEPT_HEIGHTS + 1), split_heights().end),
     )?;
     let kept_end = kept_heights().end;
@@ -489,7 +487,7 @@ fn a_shared_block_cache_does_not_hide_a_compacted_away_table_file()
         BlockHeight::new(SPLIT_HEIGHTS),
         BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
     )?;
-    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     let block_cache = test_block_cache();
     let mut stale = open_secondary_on(
         &store_path,
@@ -513,7 +511,7 @@ fn a_shared_block_cache_does_not_hide_a_compacted_away_table_file()
     );
     let warmed_usage = block_cache.usage_bytes();
 
-    compact_away_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    compact_away_table_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     let failures = (1..=SPLIT_HEIGHTS)
         .filter_map(|height| stale.compact_block_at(BlockHeight::new(height)).err())
         .collect::<Vec<_>>();
@@ -530,7 +528,7 @@ fn a_shared_block_cache_does_not_hide_a_compacted_away_table_file()
     let family = stale
         .bounded_open
         .db
-        .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
+        .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
         .ok_or("the family must exist")?;
     let scan_failure = stale
         .bounded_open
@@ -590,12 +588,12 @@ fn secondaries_on_one_shared_block_cache_hold_one_copy_of_each_block()
     )??;
     assert_second_reads_only_cached_blocks(&first, &second, &block_cache, "bulk-built")?;
 
-    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     first.try_catch_up()?;
     second.try_catch_up()?;
     assert_second_reads_only_cached_blocks(&first, &second, &block_cache, "flushed")?;
 
-    compact_away_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    compact_away_table_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     first.try_catch_up()?;
     second.try_catch_up()?;
     assert_second_reads_only_cached_blocks(&first, &second, &block_cache, "compacted")?;
@@ -620,7 +618,7 @@ fn a_shared_block_cache_outlives_a_closed_secondary_without_keeping_its_pins()
         BlockHeight::new(SPLIT_HEIGHTS),
         BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
     )?;
-    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_table_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     let block_cache = test_block_cache();
 
     let closed = open_secondary_on(
@@ -707,14 +705,14 @@ fn a_corrupt_table_file_is_not_a_missing_table_file() -> Result<(), Box<dyn std:
         BlockHeight::new(4),
         BlockHeight::new(2),
     )?;
-    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    split_rows_into_bottom_level_files(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
     let secondary = open_secondary(
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )??;
-    let corrupted_height = BlockHeight::new(3);
+    let corrupted_height = BlockHeight::new(2);
     let corrupted_key = encode_block_position(corrupted_height);
     let corrupted_file = store
         .bounded_open
@@ -722,8 +720,7 @@ fn a_corrupt_table_file_is_not_a_missing_table_file() -> Result<(), Box<dyn std:
         .live_files()?
         .into_iter()
         .find(|file| {
-            file.column_family_name == COMPACT_BLOCK_COLUMN_FAMILY
-                && file.level == 0
+            file.column_family_name == LIVE_TAIL_BLOCK_COLUMN_FAMILY
                 && file.start_key.as_deref() == Some(corrupted_key.as_slice())
         })
         .map(|file| table_file_path(&file))
@@ -800,7 +797,7 @@ fn a_store_control_scan_reports_a_compacted_away_table_file_as_missing()
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )??;
 
     compact_away_table_files(&store.bounded_open.db, DEFAULT_COLUMN_FAMILY_NAME)?;
@@ -856,7 +853,7 @@ fn a_corrupt_store_control_row_refuses_admission() -> Result<(), Box<dyn std::er
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )?
     .err()
     .ok_or("a corrupt store-control row must refuse admission")?;
@@ -889,7 +886,7 @@ fn secondary_admission_rejects_another_network_activation_table()
         &store_path,
         temporary.path().join("secondary"),
         &mainnet_activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )?
     .err()
     .ok_or("a secondary for another network must be refused")?;
@@ -954,7 +951,7 @@ fn a_secondary_adopting_the_writer_schedule_refuses_another_network()
         &store_path,
         temporary.path().join("secondary"),
         Network::ZcashMainnet,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -988,7 +985,7 @@ fn secondary_and_reopened_primary_serve_the_last_durable_fence_after_the_primary
         &store_path,
         temporary.path().join("secondary"),
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )??;
     assert_eq!(secondary.event_fence(), final_fence);
     assert_eq!(secondary.chain_epoch()?, final_epoch);
@@ -1092,7 +1089,7 @@ fn open_adopting_secondary(
             store_path,
             secondary_path,
             Network::ZcashTestnet,
-            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
             CanonicalReorgPolicy::new(REORG_WINDOW)?,
             RocksDbResourceBudget::for_local_tests(),
         ),
@@ -1128,7 +1125,7 @@ fn open_secondary_on(
         store_path,
         secondary_path,
         activations,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbOpenResources::with_shared_block_cache(
             RocksDbResourceBudget::for_local_tests(),
@@ -1310,7 +1307,7 @@ fn walk_iterator(
 ) -> Result<(usize, Result<(), rust_rocksdb::Error>), Box<dyn std::error::Error>> {
     let db = &secondary.bounded_open.db;
     let family = db
-        .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
+        .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
         .ok_or("the family must exist")?;
     let mut read_options = rust_rocksdb::ReadOptions::default();
     read_options.set_iterate_lower_bound(encode_block_position(heights.start));
@@ -1462,7 +1459,6 @@ fn seed_multi_thousand_epoch_store(
     let mut checkpoints = std::collections::VecDeque::from(store.replay_tail.checkpoints());
     let mut current_ready = store.ready_evidence();
     let revisions = store.control_revisions();
-    let workload = store.workload();
     let build_plan = store.build_plan().clone();
     let cursor_auth_key = store.cursor_auth_key;
     let db = &store.bounded_open.db;
@@ -1487,17 +1483,19 @@ fn seed_multi_thousand_epoch_store(
                 height_key,
                 encode_block_header(&block.facts.block_header),
             );
+            let (encoded_tail, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+                &block.compact_block,
+                Some(block.facts.clone()),
+                LiveTailEncodeOptions {
+                    include_supplement: true,
+                    retain_canonical_facts: true,
+                },
+            )?;
             batch.put_cf(
-                &db.cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-                    .ok_or("block_replay absent")?,
+                &db.cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+                    .ok_or("live_tail_block absent")?,
                 height_key,
-                block.replay_envelope.as_bytes(),
-            );
-            batch.put_cf(
-                &db.cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
-                    .ok_or("compact_block absent")?,
-                height_key,
-                crate::encode_compact_block_artifact(&block.compact_block),
+                encoded_tail,
             );
             let hash_record =
                 encode_block_hash_location(block.facts.block_header.block_hash, height);
@@ -1589,7 +1587,6 @@ fn seed_multi_thousand_epoch_store(
         batch.put(
             STORE_CONTROL_KEY,
             encode_ready_store_control_with_revisions(
-                workload,
                 &build_plan,
                 cursor_auth_key,
                 &current_ready,
@@ -1601,8 +1598,7 @@ fn seed_multi_thousand_epoch_store(
             CHAIN_EPOCH_COLUMN_FAMILY,
             CHAIN_EVENT_COLUMN_FAMILY,
             BLOCK_HEADER_COLUMN_FAMILY,
-            BLOCK_REPLAY_COLUMN_FAMILY,
-            COMPACT_BLOCK_COLUMN_FAMILY,
+            LIVE_TAIL_BLOCK_COLUMN_FAMILY,
             TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
         ] {
             let handle = db.cf_handle(family_name).ok_or("family must exist")?;
@@ -2033,8 +2029,7 @@ fn warm_secondary_reopen_caches_permanent_reorg_archive_admission_reads()
     budget.statistics_level = RocksDbStatisticsLevel::Tickers;
     budget.preferred_io_mode = crate::RocksDbIoMode::Direct;
     let shared_resources = SharedSecondaryResources::new(budget);
-    let requirements =
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions);
+    let requirements = crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All);
     let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW)?;
 
     let cold_secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
@@ -2106,8 +2101,7 @@ fn canonical_secondary_reads_and_catches_up_displaced_archive_rows()
         BlockHeight::new(4),
         BlockHeight::new(2),
     )?;
-    let requirements =
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions);
+    let requirements = crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All);
     let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW)?;
     let mut secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
         &store_path,
@@ -2171,7 +2165,7 @@ fn canonical_secondary_reads_and_catches_up_displaced_archive_rows()
         .coverage
         .ok_or("expected displaced root coverage on secondary")?;
     assert_eq!(root_coverage.captured_block_count, 1);
-    assert_eq!(root_coverage.root_artifact_unavailable_count, 1);
+    assert_eq!(root_coverage.root_artifact_unavailable_count, 0);
     drop(store);
     Ok(())
 }
@@ -2188,8 +2182,7 @@ fn canonical_secondary_pages_displaced_root_index_without_scanning_full_archive(
         BlockHeight::new(4),
         BlockHeight::new(2),
     )?;
-    let requirements =
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions);
+    let requirements = crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All);
     let reorg_policy = CanonicalReorgPolicy::new(REORG_WINDOW)?;
     let mut secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
         &store_path,
@@ -2223,7 +2216,7 @@ fn canonical_secondary_pages_displaced_root_index_without_scanning_full_archive(
     assert!(root_page.scan_complete);
     let coverage = root_page.coverage.ok_or("expected root page coverage")?;
     assert_eq!(coverage.captured_block_count, 1);
-    assert_eq!(coverage.root_artifact_unavailable_count, 1);
+    assert_eq!(coverage.root_artifact_unavailable_count, 0);
     drop(store);
     Ok(())
 }
@@ -2526,7 +2519,7 @@ fn canonical_secondary_fallback_bounds_work_and_primary_reopen_backfills()
     let store = replace_heights_3_and_4(
         store,
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         1_750_000_000_010,
     )?;
     let b4 = BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32]));
@@ -2550,7 +2543,7 @@ fn canonical_secondary_fallback_bounds_work_and_primary_reopen_backfills()
         &store_path,
         temporary.path().join("secondary-legacy"),
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )??;
     let one = NonZeroU32::new(1).ok_or("nonzero limit")?;
     let page =
@@ -2577,7 +2570,7 @@ fn canonical_secondary_fallback_bounds_work_and_primary_reopen_backfills()
         &store_path,
         temporary.path().join("secondary-upgraded"),
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )??;
     let two = NonZeroU32::new(2).ok_or("nonzero limit")?;
     let indexed =
@@ -2626,7 +2619,7 @@ fn open_reindexed_archive_for_mutation(
     let store = replace_heights_3_and_4(
         store,
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         1_750_000_000_010,
     )?;
     reindex_test_archive_with_roots(&store, &staged_roots)?;
@@ -2721,7 +2714,7 @@ fn interrupted_batched_root_index_backfill_resumes_and_publishes_marker_last()
     let store = replace_heights_3_and_4(
         store,
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         1_750_000_000_010,
     )?;
     let b4_roots =
@@ -2737,7 +2730,7 @@ fn interrupted_batched_root_index_backfill_resumes_and_publishes_marker_last()
         &store_path,
         temporary.path().join("secondary-mid"),
         &activations,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
     )??;
     let one = NonZeroU32::new(1).ok_or("nonzero limit")?;
     let fallback_page =
@@ -2779,5 +2772,132 @@ fn interrupted_batched_root_index_backfill_resumes_and_publishes_marker_last()
         .ok_or("missing coverage after batched backfill")?;
     assert_eq!(cov.captured_block_count, 2);
     assert_eq!(cov.root_artifact_unavailable_count, 1);
+    Ok(())
+}
+
+fn synthetic_settled_entry(
+    start: u32,
+    end: u32,
+    sha_tag: u8,
+) -> super::settled_segments::layout::SettledSegmentIndexEntry {
+    use super::settled_segments::layout::{SettledSegmentIndexEntry, SettledSegmentModules};
+    use zinder_core::{
+        CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
+    };
+
+    let end_block = BlockId::new(
+        BlockHeight::new(end),
+        BlockHash::from_bytes([u8::try_from(end).unwrap_or(1); 32]),
+    );
+    let end_sequence_checkpoint = CanonicalSequenceCheckpoint::from_admitted_parts(
+        end_block,
+        u64::from(end),
+        CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+            u64::from(end),
+            [sha_tag; 32],
+        ),
+        u64::from(end) * 64,
+    );
+    SettledSegmentIndexEntry {
+        start_height: BlockHeight::new(start),
+        end_block,
+        modules: SettledSegmentModules {
+            supplement: false,
+            raw_bodies: false,
+        },
+        shielded_identity: crate::ShieldedSegmentIdentity {
+            network: Network::ZcashTestnet,
+            artifact_schema_version: crate::CURRENT_ARTIFACT_SCHEMA_VERSION.value(),
+            start_height: BlockHeight::new(start),
+            end_block,
+            sha256: [sha_tag; 32],
+            index_sha256: [sha_tag; 32],
+            fs_verity_sha256: None,
+        },
+        supplement_identity: None,
+        raw_block_identity: None,
+        end_sequence_checkpoint,
+    }
+}
+
+#[test]
+fn secondary_catch_up_rejects_non_trailing_segment_mutation_and_beyond_checkpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = seed_three_epoch_live_store(&store_path, &activations)?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &store_path,
+        temporary.path().join("secondary"),
+        Network::ZcashTestnet,
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
+        CanonicalReorgPolicy::new(REORG_WINDOW)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    let index_cf = column_family(
+        &store.bounded_open.db,
+        super::rocksdb::SETTLED_SEGMENT_INDEX_COLUMN_FAMILY,
+    )?;
+    let put_entry = |entry: &super::settled_segments::layout::SettledSegmentIndexEntry| -> Result<(), Box<dyn std::error::Error>> {
+        store.bounded_open.db.put_cf(
+            &index_cf,
+            zinder_core::wire::encode_height_key_ascending(entry.start_height),
+            entry.encode_v1()?,
+        )?;
+        Ok(())
+    };
+    let (entry1, entry2, entry3, beyond) = (
+        synthetic_settled_entry(1, 1, 1),
+        synthetic_settled_entry(2, 2, 2),
+        synthetic_settled_entry(3, 4, 3),
+        synthetic_settled_entry(5, 6, 4),
+    );
+    for entry in [&entry1, &entry2, &entry3, &beyond] {
+        put_entry(entry)?;
+    }
+    store.bounded_open.db.flush_wal(true)?;
+    let beyond_err = secondary.try_catch_up().err().ok_or("beyond checkpoint")?;
+    assert!(
+        beyond_err
+            .to_string()
+            .contains("exceeds READY settled checkpoint")
+    );
+
+    store.bounded_open.db.delete_cf(
+        &index_cf,
+        zinder_core::wire::encode_height_key_ascending(beyond.start_height),
+    )?;
+    store.bounded_open.db.flush_wal(true)?;
+    secondary.sealed_segments = vec![entry1.clone(), entry2.clone(), entry3];
+    secondary.try_catch_up()?;
+
+    put_entry(&synthetic_settled_entry(1, 1, 99))?;
+    store.bounded_open.db.flush_wal(true)?;
+    let mutate_err = secondary.try_catch_up().err().ok_or("mutated prefix")?;
+    assert!(mutate_err.to_string().contains("prefix mutated"));
+
+    put_entry(&entry1)?;
+    store.bounded_open.db.delete_cf(
+        &index_cf,
+        zinder_core::wire::encode_height_key_ascending(entry2.start_height),
+    )?;
+    store.bounded_open.db.flush_wal(true)?;
+    let delete_err = secondary.try_catch_up().err().ok_or("deleted interior")?;
+    assert!(matches!(
+        delete_err,
+        CanonicalStoreError::SettledSegment { .. }
+    ));
+
+    // Contiguous prefix replacement [1..=1, 2..=2] -> [1..=2] with unchanged trailing [3..=4].
+    put_entry(&synthetic_settled_entry(1, 2, 12))?;
+    store.bounded_open.db.flush_wal(true)?;
+    let merged_err = secondary
+        .try_catch_up()
+        .err()
+        .ok_or("merged contiguous prefix")?;
+    assert!(merged_err.to_string().contains("prefix mutated"));
     Ok(())
 }

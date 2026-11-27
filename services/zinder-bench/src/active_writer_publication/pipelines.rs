@@ -34,8 +34,8 @@ use zinder_query::{RocksDbCanonicalReader, StorageReadError};
 use zinder_runtime::{ComposedReadiness, Readiness};
 use zinder_store::{
     CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalReorgPolicy, CanonicalStoreError,
-    CanonicalStoreRequirements, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbIoMode,
+    CanonicalStoreRequirements, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbIoMode,
 };
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{
@@ -298,8 +298,7 @@ pub(crate) async fn pre_advance_quiescent_stores(
     let canonical = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &paths.canonical_dir,
         &chain.activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         reorg_policy,
         writer_budget(config.io_mode),
     )?;
@@ -329,7 +328,7 @@ pub(crate) async fn pre_advance_quiescent_stores(
         &paths.canonical_dir,
         &paths.publisher_sec_dir,
         chain.network,
-        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         reorg_policy,
         reader_budget(config.io_mode),
     )?;
@@ -549,8 +548,7 @@ fn open_active_canonical_store(
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &args.paths.canonical_dir,
         &args.chain.activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::All,
         reorg_policy,
         writer_budget(args.config.io_mode),
     )?;
@@ -816,7 +814,7 @@ fn spawn_projector_loop(
         &inputs.paths.canonical_dir,
         &inputs.paths.projector_sec_dir,
         inputs.chain.network,
-        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         reorg_policy,
         reader_budget(inputs.io_mode),
     )?;
@@ -1085,7 +1083,7 @@ fn spawn_publisher_loop(
         &inputs.paths.canonical_dir,
         &inputs.paths.publisher_sec_dir,
         inputs.chain.network,
-        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
         CanonicalReorgPolicy::new(inputs.chain.reorg_window_blocks)?,
         reader_budget(inputs.config.io_mode),
     )?;

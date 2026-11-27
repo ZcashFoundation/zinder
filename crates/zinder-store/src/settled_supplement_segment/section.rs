@@ -2,20 +2,21 @@
 //! `Tag 2` extensible canonical metadata) inside `ZSTSUP01` decompressed records.
 
 use zinder_core::{
-    BlockHeight, CanonicalBlockFacts, CanonicalTransactionFacts, CompactBlockArtifact,
-    CompactTransparentInput, CompactTransparentOutput, ConsensusBranchId, LockTime, PrivacyShape,
-    SerializedBytesDigest, TransactionComponentCounts, TransactionId,
-    TransactionIntrinsicValueBalances, TransactionPublicFacts, TransactionVersion,
+    BlockHeaderArtifact, BlockHeight, CanonicalBlockFacts, CanonicalTransactionFacts,
+    CompactBlockArtifact, CompactTransaction, CompactTransparentInput, CompactTransparentOutput,
+    ConsensusBranchId, LockTime, PrivacyShape, SerializedBytesDigest, TransactionComponentCounts,
+    TransactionId, TransactionIntrinsicValueBalances, TransactionPublicFacts, TransactionVersion,
+    TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
     UnsupportedSection,
     wire::{
-        decode_internal_auth_digest, decode_internal_block_hash, decode_internal_transaction_id,
-        decode_internal_wtxid, encode_internal_auth_digest, encode_internal_transaction_id,
-        encode_internal_wtxid,
+        decode_address_script_hash, decode_internal_auth_digest, decode_internal_block_hash,
+        decode_internal_transaction_id, decode_internal_wtxid, encode_address_script_hash,
+        encode_internal_auth_digest, encode_internal_transaction_id, encode_internal_wtxid,
     },
 };
 
 use super::{
-    SettledSupplementSegmentError,
+    SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES, SettledSupplementSegmentError,
     format::{
         ROW_FLAG_HAS_CANONICAL_METADATA, ROW_FLAG_HAS_TRANSPARENT, ROW_FLAG_HAS_WIDE_FEE,
         ROW_KNOWN_FLAGS,
@@ -31,6 +32,14 @@ const SECTION_TAG_OPTIONAL_MASK: u16 = 0x8000;
 const SECTION_VERSION_V1: u16 = 1;
 
 const EXT_TAG_OPTIONAL_MASK: u16 = 0x8000;
+const EXT_TAG_EXPLICIT_TRANSPARENT_FACTS: u16 = 0x0001;
+const EXPLICIT_TRANSPARENT_FACTS_VERSION_V1: u8 = 1;
+const EXPLICIT_INPUT_BYTES: usize = 4 + 32 + 4;
+const MIN_EXPLICIT_OUTPUT_BYTES: usize = 4 + 8 + 4 + 32;
+const MAX_EXPLICIT_TRANSPARENT_INPUTS: usize =
+    SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES / EXPLICIT_INPUT_BYTES;
+const MAX_EXPLICIT_TRANSPARENT_OUTPUTS: usize =
+    SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES / MIN_EXPLICIT_OUTPUT_BYTES;
 
 /// Compact transparent transaction supplement stored in `ZSTSUP01` Tag 1.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +79,19 @@ pub struct SupplementTxFeeAndBurn {
     pub burn_zat: Option<u64>,
 }
 
+/// Explicit transparent input and output facts stored in Tag-2 TLV `0x0001`.
+///
+/// Populated only when [`CanonicalTransactionFacts`] transparent inputs or
+/// outputs diverge from the compact Tag-1 derivation (for example synthetic
+/// script hashes, explicit coinbase sentinels, or omitted compact metadata).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExplicitTransparentFacts {
+    /// Ordered transparent input facts for the transaction.
+    pub transparent_inputs: Vec<TransparentInputFact>,
+    /// Ordered transparent output facts for the transaction.
+    pub transparent_outputs: Vec<TransparentOutputFact>,
+}
+
 /// Extensible per-transaction canonical supplement metadata stored in Tag 2.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalTransactionSupplement {
@@ -95,6 +117,8 @@ pub struct CanonicalTransactionSupplement {
     pub zip317_logical_actions: Option<u32>,
     /// Transaction-derived fee and burn amounts.
     pub fee_and_burn: SupplementTxFeeAndBurn,
+    /// Explicit transparent facts when divergent from Tag 1 (`None` on real blocks).
+    pub explicit_transparent_facts: Option<ExplicitTransparentFacts>,
 }
 
 /// Extensible per-block canonical supplement metadata stored in Tag 2.
@@ -108,7 +132,7 @@ pub struct CanonicalBlockSupplement {
 
 impl CanonicalBlockSupplement {
     /// Builds a [`CanonicalBlockSupplement`] from [`CanonicalBlockFacts`] and an
-    /// optional matching [`CompactBlockArtifact`] for `fee_zat` slots.
+    /// optional matching [`CompactBlockArtifact`] for `fee_zat` and Tag-1 matching.
     pub fn from_canonical_facts(
         facts: &CanonicalBlockFacts,
         compact_block: Option<&CompactBlockArtifact>,
@@ -123,10 +147,13 @@ impl CanonicalBlockSupplement {
                     "canonical transaction index exceeds u64".to_owned(),
                 )
             })?;
-            let fee_zat = advance_fee_lookup(compact_txs, &mut compact_cursor, tx_index);
+            let matched_compact_tx =
+                advance_compact_tx_lookup(compact_txs, &mut compact_cursor, tx_index);
             transactions.push(transaction_supplement_from_facts(
-                tx_index, tx_facts, fee_zat,
-            ));
+                tx_index,
+                tx_facts,
+                matched_compact_tx,
+            )?);
         }
         Ok(Self {
             serialized_bytes_digest: facts.serialized_bytes_digest,
@@ -137,7 +164,7 @@ impl CanonicalBlockSupplement {
 
 fn check_compact_facts_alignment(
     facts: &CanonicalBlockFacts,
-    compact_txs: &[zinder_core::CompactTransaction],
+    compact_txs: &[CompactTransaction],
 ) -> Result<(), SettledSupplementSegmentError> {
     for tx in compact_txs {
         let idx = usize::try_from(tx.index).map_err(|_| {
@@ -170,6 +197,131 @@ pub struct BlockSupplementRecord {
     pub canonical_metadata: Option<CanonicalBlockSupplement>,
 }
 
+/// Reconstructs exact [`CanonicalBlockFacts`] from a [`BlockHeaderArtifact`] and
+/// a decoded [`BlockSupplementRecord`].
+///
+/// Transactions carrying [`ExplicitTransparentFacts`] in Tag-2 TLV `0x0001` use
+/// those explicit inputs and outputs verbatim; all remaining transactions derive
+/// their transparent facts from matching Tag-1 entries by `tx_index`.
+pub fn reconstruct_canonical_block_facts(
+    block_header: BlockHeaderArtifact,
+    record: &BlockSupplementRecord,
+) -> Result<CanonicalBlockFacts, SettledSupplementSegmentError> {
+    let canonical = record.canonical_metadata.as_ref().ok_or_else(|| {
+        SettledSupplementSegmentError::PayloadIntegrity(
+            "supplement block record is missing Tag 2 canonical metadata".to_owned(),
+        )
+    })?;
+    ensure_strictly_ascending_transparent(&record.transparent_transactions)?;
+    let mut transactions = Vec::with_capacity(canonical.transactions.len());
+    let mut sup_cursor = 0_usize;
+    for (pos, tx_sup) in canonical.transactions.iter().enumerate() {
+        let expected_idx = u64::try_from(pos).map_err(|_| {
+            SettledSupplementSegmentError::InvalidFormat(
+                "canonical transaction index exceeds u64".to_owned(),
+            )
+        })?;
+        if tx_sup.tx_index != expected_idx {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(format!(
+                "Tag 2 transaction index {} disagrees with canonical position {expected_idx}",
+                tx_sup.tx_index
+            )));
+        }
+        if tx_sup.public_facts.orchard_anchor != tx_sup.shielded_anchors.orchard {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "Tag 2 public_facts.orchard_anchor disagrees with shielded_anchors".to_owned(),
+            ));
+        }
+        let matched_sup = match_transparent_supplement_tx(
+            &record.transparent_transactions,
+            &mut sup_cursor,
+            tx_sup.tx_index,
+        )?;
+        if let Some(sup_tx) = matched_sup
+            && sup_tx.transaction_id != tx_sup.public_facts.transaction_id
+        {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "Tag 1 and Tag 2 disagree on transaction_id".to_owned(),
+            ));
+        }
+        transactions.push(reconstruct_tx_facts(tx_sup, matched_sup)?);
+    }
+    if sup_cursor != record.transparent_transactions.len() {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "Tag 1 contains transparent transaction missing from Tag 2 canonical metadata"
+                .to_owned(),
+        ));
+    }
+    Ok(CanonicalBlockFacts {
+        block_header,
+        serialized_bytes_digest: canonical.serialized_bytes_digest,
+        transactions,
+    })
+}
+
+fn ensure_strictly_ascending_transparent(
+    transparent: &[CompactTransparentSupplementTx],
+) -> Result<(), SettledSupplementSegmentError> {
+    if transparent
+        .windows(2)
+        .any(|pair| pair[0].index >= pair[1].index)
+    {
+        return Err(SettledSupplementSegmentError::InvalidFormat(
+            "Tag 1 transparent supplement transactions must be strictly ascending by index"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn match_transparent_supplement_tx<'a>(
+    transparent: &'a [CompactTransparentSupplementTx],
+    sup_cursor: &mut usize,
+    tx_index: u64,
+) -> Result<Option<&'a CompactTransparentSupplementTx>, SettledSupplementSegmentError> {
+    let Some(sup_tx) = transparent.get(*sup_cursor) else {
+        return Ok(None);
+    };
+    if sup_tx.index < tx_index {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "Tag 1 transparent transaction index precedes Tag 2 canonical metadata".to_owned(),
+        ));
+    }
+    if sup_tx.index == tx_index {
+        *sup_cursor += 1;
+        Ok(Some(sup_tx))
+    } else {
+        Ok(None)
+    }
+}
+
+fn reconstruct_tx_facts(
+    tx_sup: &CanonicalTransactionSupplement,
+    matched_sup: Option<&CompactTransparentSupplementTx>,
+) -> Result<CanonicalTransactionFacts, SettledSupplementSegmentError> {
+    let (transparent_inputs, transparent_outputs) =
+        if let Some(explicit) = &tx_sup.explicit_transparent_facts {
+            (
+                explicit.transparent_inputs.clone(),
+                explicit.transparent_outputs.clone(),
+            )
+        } else if let Some(sup_tx) = matched_sup {
+            (
+                derive_transparent_input_facts(&sup_tx.transparent_inputs)?,
+                derive_transparent_output_facts(&sup_tx.transparent_outputs)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+    Ok(CanonicalTransactionFacts {
+        public_facts: tx_sup.public_facts.clone(),
+        serialized_bytes_digest: tx_sup.serialized_bytes_digest,
+        intrinsic_value_balances: tx_sup.intrinsic_value_balances,
+        transparent_inputs,
+        transparent_outputs,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BlockEnvelopeIdentity {
     pub(crate) height: BlockHeight,
@@ -178,16 +330,16 @@ pub(crate) struct BlockEnvelopeIdentity {
     pub(crate) block_time: u32,
 }
 
-fn advance_fee_lookup(
-    compact_txs: &[zinder_core::CompactTransaction],
+fn advance_compact_tx_lookup<'a>(
+    compact_txs: &'a [CompactTransaction],
     cursor: &mut usize,
     tx_index: u64,
-) -> Option<u64> {
+) -> Option<&'a CompactTransaction> {
     while *cursor < compact_txs.len() && compact_txs[*cursor].index < tx_index {
         *cursor += 1;
     }
     if *cursor < compact_txs.len() && compact_txs[*cursor].index == tx_index {
-        compact_txs[*cursor].data.fee_zat
+        Some(&compact_txs[*cursor])
     } else {
         None
     }
@@ -251,12 +403,40 @@ fn exact_zip317_logical_actions_from_facts(tx_facts: &CanonicalTransactionFacts)
     )
 }
 
+fn compact_tx_parts(
+    compact_tx: &CompactTransaction,
+) -> (
+    Option<u64>,
+    &[CompactTransparentInput],
+    &[CompactTransparentOutput],
+) {
+    (
+        compact_tx.data.fee_zat,
+        compact_tx.data.transparent_inputs.as_slice(),
+        compact_tx.data.transparent_outputs.as_slice(),
+    )
+}
+
 fn transaction_supplement_from_facts(
     tx_index: u64,
     tx_facts: &CanonicalTransactionFacts,
-    fee_zat: Option<u64>,
-) -> CanonicalTransactionSupplement {
-    CanonicalTransactionSupplement {
+    matched_compact_tx: Option<&CompactTransaction>,
+) -> Result<CanonicalTransactionSupplement, SettledSupplementSegmentError> {
+    let (fee_zat, compact_inputs, compact_outputs) =
+        matched_compact_tx.map_or((None, &[][..], &[][..]), compact_tx_parts);
+    let inputs_match =
+        matches_derived_transparent_inputs(&tx_facts.transparent_inputs, compact_inputs)?;
+    let matches_tag1 = inputs_match
+        && matches_derived_transparent_outputs(&tx_facts.transparent_outputs, compact_outputs)?;
+    let explicit_transparent_facts = if matches_tag1 {
+        None
+    } else {
+        Some(ExplicitTransparentFacts {
+            transparent_inputs: tx_facts.transparent_inputs.clone(),
+            transparent_outputs: tx_facts.transparent_outputs.clone(),
+        })
+    };
+    Ok(CanonicalTransactionSupplement {
         tx_index,
         public_facts: tx_facts.public_facts.clone(),
         serialized_bytes_digest: tx_facts.serialized_bytes_digest,
@@ -271,7 +451,97 @@ fn transaction_supplement_from_facts(
             fee_zat,
             burn_zat: None,
         },
+        explicit_transparent_facts,
+    })
+}
+
+fn matches_derived_transparent_inputs(
+    facts_inputs: &[TransparentInputFact],
+    compact_inputs: &[CompactTransparentInput],
+) -> Result<bool, SettledSupplementSegmentError> {
+    if facts_inputs.len() != compact_inputs.len() {
+        return Ok(false);
     }
+    for (idx, (fact_in, compact_in)) in facts_inputs.iter().zip(compact_inputs).enumerate() {
+        let expected_index = u32::try_from(idx).map_err(|_| {
+            SettledSupplementSegmentError::InvalidFormat(
+                "transparent input index exceeds u32".to_owned(),
+            )
+        })?;
+        if fact_in.input_index != expected_index
+            || fact_in.spent_outpoint.transaction_id != compact_in.previous_transaction_id
+            || fact_in.spent_outpoint.output_index != compact_in.previous_output_index
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn matches_derived_transparent_outputs(
+    facts_outputs: &[TransparentOutputFact],
+    compact_outputs: &[CompactTransparentOutput],
+) -> Result<bool, SettledSupplementSegmentError> {
+    if facts_outputs.len() != compact_outputs.len() {
+        return Ok(false);
+    }
+    for (idx, (fact_out, compact_out)) in facts_outputs.iter().zip(compact_outputs).enumerate() {
+        let expected_index = u32::try_from(idx).map_err(|_| {
+            SettledSupplementSegmentError::InvalidFormat(
+                "transparent output index exceeds u32".to_owned(),
+            )
+        })?;
+        if fact_out.output_index != expected_index
+            || fact_out.value_zat != compact_out.value_zat
+            || fact_out.script_pub_key != compact_out.script_pub_key
+            || fact_out.address_script_hash
+                != TransparentAddressScriptHash::of_script_pub_key(&compact_out.script_pub_key)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn derive_transparent_input_facts(
+    compact_inputs: &[CompactTransparentInput],
+) -> Result<Vec<TransparentInputFact>, SettledSupplementSegmentError> {
+    let mut derived = Vec::with_capacity(compact_inputs.len());
+    for (idx, compact_in) in compact_inputs.iter().enumerate() {
+        let input_index = u32::try_from(idx).map_err(|_| {
+            SettledSupplementSegmentError::InvalidFormat(
+                "transparent input index exceeds u32".to_owned(),
+            )
+        })?;
+        derived.push(TransparentInputFact::new(
+            input_index,
+            TransparentOutPoint::new(
+                compact_in.previous_transaction_id,
+                compact_in.previous_output_index,
+            ),
+        ));
+    }
+    Ok(derived)
+}
+
+fn derive_transparent_output_facts(
+    compact_outputs: &[CompactTransparentOutput],
+) -> Result<Vec<TransparentOutputFact>, SettledSupplementSegmentError> {
+    let mut derived = Vec::with_capacity(compact_outputs.len());
+    for (idx, compact_out) in compact_outputs.iter().enumerate() {
+        let output_index = u32::try_from(idx).map_err(|_| {
+            SettledSupplementSegmentError::InvalidFormat(
+                "transparent output index exceeds u32".to_owned(),
+            )
+        })?;
+        derived.push(TransparentOutputFact::new(
+            output_index,
+            compact_out.value_zat,
+            compact_out.script_pub_key.clone(),
+            TransparentAddressScriptHash::of_script_pub_key(&compact_out.script_pub_key),
+        ));
+    }
+    Ok(derived)
 }
 
 pub(crate) fn transparent_supplement_from_compact(
@@ -748,8 +1018,88 @@ fn encode_tag2_tx(
     encode_optional_u32(out, tx.zip317_logical_actions);
     encode_optional_u64(out, tx.fee_and_burn.fee_zat);
     encode_optional_u64(out, tx.fee_and_burn.burn_zat);
-    out.extend_from_slice(&0_u16.to_be_bytes());
+    encode_tag2_tx_ext_tlvs(out, tx.explicit_transparent_facts.as_ref())
+}
+
+fn encode_tag2_tx_ext_tlvs(
+    out: &mut Vec<u8>,
+    explicit_transparent: Option<&ExplicitTransparentFacts>,
+) -> Result<(), SettledSupplementSegmentError> {
+    let Some(explicit) = explicit_transparent else {
+        out.extend_from_slice(&0_u16.to_be_bytes());
+        return Ok(());
+    };
+    let payload = encode_explicit_transparent_facts(explicit)?;
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        SettledSupplementSegmentError::InvalidFormat(
+            "Tag 2 explicit transparent facts TLV exceeds u32".to_owned(),
+        )
+    })?;
+    out.extend_from_slice(&1_u16.to_be_bytes());
+    out.extend_from_slice(&EXT_TAG_EXPLICIT_TRANSPARENT_FACTS.to_be_bytes());
+    out.extend_from_slice(&payload_len.to_be_bytes());
+    out.extend_from_slice(&payload);
     Ok(())
+}
+
+fn encode_explicit_transparent_facts(
+    explicit: &ExplicitTransparentFacts,
+) -> Result<Vec<u8>, SettledSupplementSegmentError> {
+    if explicit.transparent_inputs.len() > MAX_EXPLICIT_TRANSPARENT_INPUTS {
+        return Err(SettledSupplementSegmentError::InvalidFormat(
+            "Tag 2 explicit transparent input count exceeds bounds".to_owned(),
+        ));
+    }
+    if explicit.transparent_outputs.len() > MAX_EXPLICIT_TRANSPARENT_OUTPUTS {
+        return Err(SettledSupplementSegmentError::InvalidFormat(
+            "Tag 2 explicit transparent output count exceeds bounds".to_owned(),
+        ));
+    }
+    let input_count = u32::try_from(explicit.transparent_inputs.len()).map_err(|_| {
+        SettledSupplementSegmentError::InvalidFormat(
+            "Tag 2 explicit transparent input count overflow".to_owned(),
+        )
+    })?;
+    let output_count = u32::try_from(explicit.transparent_outputs.len()).map_err(|_| {
+        SettledSupplementSegmentError::InvalidFormat(
+            "Tag 2 explicit transparent output count overflow".to_owned(),
+        )
+    })?;
+    let input_bytes = explicit
+        .transparent_inputs
+        .len()
+        .saturating_mul(EXPLICIT_INPUT_BYTES);
+    let output_bytes = explicit
+        .transparent_outputs
+        .len()
+        .saturating_mul(MIN_EXPLICIT_OUTPUT_BYTES);
+    let capacity = 9_usize
+        .saturating_add(input_bytes)
+        .saturating_add(output_bytes);
+    let mut out = Vec::with_capacity(capacity);
+    out.push(EXPLICIT_TRANSPARENT_FACTS_VERSION_V1);
+    out.extend_from_slice(&input_count.to_be_bytes());
+    for tx_in in &explicit.transparent_inputs {
+        out.extend_from_slice(&tx_in.input_index.to_be_bytes());
+        out.extend_from_slice(&encode_internal_transaction_id(
+            tx_in.spent_outpoint.transaction_id,
+        ));
+        out.extend_from_slice(&tx_in.spent_outpoint.output_index.to_be_bytes());
+    }
+    out.extend_from_slice(&output_count.to_be_bytes());
+    for tx_out in &explicit.transparent_outputs {
+        out.extend_from_slice(&tx_out.output_index.to_be_bytes());
+        out.extend_from_slice(&tx_out.value_zat.to_be_bytes());
+        let script_len = u32::try_from(tx_out.script_pub_key.len()).map_err(|_| {
+            SettledSupplementSegmentError::InvalidFormat(
+                "Tag 2 explicit scriptPubKey length overflow".to_owned(),
+            )
+        })?;
+        out.extend_from_slice(&script_len.to_be_bytes());
+        out.extend_from_slice(&tx_out.script_pub_key);
+        out.extend_from_slice(&encode_address_script_hash(tx_out.address_script_hash));
+    }
+    Ok(out)
 }
 
 fn encode_public_facts(
@@ -930,7 +1280,7 @@ fn decode_tag2_tx(
         fee_zat: read_optional_u64(cursor, "Tag 2 fee_zat")?,
         burn_zat: read_optional_u64(cursor, "Tag 2 burn_zat")?,
     };
-    skip_ext_tlvs(cursor, "Tag 2 tx")?;
+    let explicit_transparent_facts = decode_tag2_tx_ext_tlvs(cursor)?;
     Ok(CanonicalTransactionSupplement {
         tx_index,
         public_facts,
@@ -939,7 +1289,143 @@ fn decode_tag2_tx(
         shielded_anchors,
         zip317_logical_actions,
         fee_and_burn,
+        explicit_transparent_facts,
     })
+}
+
+fn decode_tag2_tx_ext_tlvs(
+    cursor: &mut &[u8],
+) -> Result<Option<ExplicitTransparentFacts>, SettledSupplementSegmentError> {
+    let count = usize::from(read_u16(cursor, "ext TLV count")?);
+    let min_ext_bytes = 6_usize;
+    if count > cursor.len() / min_ext_bytes {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "Tag 2 tx ext TLV count exceeds remaining bytes".to_owned(),
+        ));
+    }
+    let mut explicit_transparent = None;
+    for _ in 0..count {
+        let ext_tag = read_u16(cursor, "ext TLV tag")?;
+        let ext_len = usize::try_from(read_u32(cursor, "ext TLV length")?).map_err(|_| {
+            SettledSupplementSegmentError::PayloadIntegrity("ext TLV length overflow".to_owned())
+        })?;
+        let ext_payload = take_slice(cursor, ext_len, "ext TLV payload")?;
+        match ext_tag {
+            EXT_TAG_EXPLICIT_TRANSPARENT_FACTS => {
+                if explicit_transparent.is_some() {
+                    return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                        "duplicate Tag 2 tx explicit transparent facts TLV".to_owned(),
+                    ));
+                }
+                explicit_transparent = Some(decode_explicit_transparent_facts(ext_payload)?);
+            }
+            unknown if (unknown & EXT_TAG_OPTIONAL_MASK) != 0 => {}
+            mandatory => {
+                return Err(SettledSupplementSegmentError::PayloadIntegrity(format!(
+                    "unknown mandatory Tag 2 tx extension tag {mandatory}"
+                )));
+            }
+        }
+    }
+    Ok(explicit_transparent)
+}
+
+fn decode_explicit_transparent_facts(
+    payload: &[u8],
+) -> Result<ExplicitTransparentFacts, SettledSupplementSegmentError> {
+    let mut cursor = payload;
+    let version = read_u8(&mut cursor, "Tag 2 explicit transparent facts version")?;
+    if version != EXPLICIT_TRANSPARENT_FACTS_VERSION_V1 {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(format!(
+            "unsupported Tag 2 explicit transparent facts version {version}"
+        )));
+    }
+    let transparent_inputs = decode_explicit_transparent_inputs(&mut cursor)?;
+    let transparent_outputs = decode_explicit_transparent_outputs(&mut cursor)?;
+    reject_trailing_bytes(cursor, "Tag 2 explicit transparent facts")?;
+    Ok(ExplicitTransparentFacts {
+        transparent_inputs,
+        transparent_outputs,
+    })
+}
+
+fn decode_explicit_transparent_inputs(
+    cursor: &mut &[u8],
+) -> Result<Vec<TransparentInputFact>, SettledSupplementSegmentError> {
+    let raw_count = read_u32(cursor, "Tag 2 explicit transparent input count")?;
+    let count = usize::try_from(raw_count).map_err(|_| {
+        SettledSupplementSegmentError::PayloadIntegrity(
+            "Tag 2 explicit transparent input count overflow".to_owned(),
+        )
+    })?;
+    if count > MAX_EXPLICIT_TRANSPARENT_INPUTS || count > cursor.len() / EXPLICIT_INPUT_BYTES {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "Tag 2 explicit transparent input count exceeds bounds".to_owned(),
+        ));
+    }
+    let mut inputs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let input_index = read_u32(cursor, "Tag 2 explicit input_index")?;
+        let prev_bytes = read_array::<32>(cursor, "Tag 2 explicit prevout_txid")?;
+        let transaction_id = decode_internal_transaction_id(&prev_bytes).map_err(|err| {
+            SettledSupplementSegmentError::PayloadIntegrity(format!(
+                "invalid Tag 2 explicit prevout_txid: {err}"
+            ))
+        })?;
+        let output_index = read_u32(cursor, "Tag 2 explicit prevout_index")?;
+        inputs.push(TransparentInputFact::new(
+            input_index,
+            TransparentOutPoint::new(transaction_id, output_index),
+        ));
+    }
+    Ok(inputs)
+}
+
+fn decode_explicit_transparent_outputs(
+    cursor: &mut &[u8],
+) -> Result<Vec<TransparentOutputFact>, SettledSupplementSegmentError> {
+    let raw_count = read_u32(cursor, "Tag 2 explicit transparent output count")?;
+    let count = usize::try_from(raw_count).map_err(|_| {
+        SettledSupplementSegmentError::PayloadIntegrity(
+            "Tag 2 explicit transparent output count overflow".to_owned(),
+        )
+    })?;
+    if count > MAX_EXPLICIT_TRANSPARENT_OUTPUTS || count > cursor.len() / MIN_EXPLICIT_OUTPUT_BYTES
+    {
+        return Err(SettledSupplementSegmentError::PayloadIntegrity(
+            "Tag 2 explicit transparent output count exceeds bounds".to_owned(),
+        ));
+    }
+    let mut outputs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let output_index = read_u32(cursor, "Tag 2 explicit output_index")?;
+        let amount_zat = read_u64(cursor, "Tag 2 explicit value_zat")?;
+        let raw_script_len = read_u32(cursor, "Tag 2 explicit script_pub_key length")?;
+        let script_len = usize::try_from(raw_script_len).map_err(|_| {
+            SettledSupplementSegmentError::PayloadIntegrity(
+                "Tag 2 explicit script_pub_key length overflow".to_owned(),
+            )
+        })?;
+        if script_len > SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES {
+            return Err(SettledSupplementSegmentError::PayloadIntegrity(
+                "Tag 2 explicit script_pub_key length exceeds block bound".to_owned(),
+            ));
+        }
+        let script_slice = take_slice(cursor, script_len, "Tag 2 explicit script_pub_key")?;
+        let hash_bytes = read_array::<32>(cursor, "Tag 2 explicit address_script_hash")?;
+        let address_script_hash = decode_address_script_hash(&hash_bytes).map_err(|err| {
+            SettledSupplementSegmentError::PayloadIntegrity(format!(
+                "invalid Tag 2 explicit address_script_hash: {err}"
+            ))
+        })?;
+        outputs.push(TransparentOutputFact::new(
+            output_index,
+            amount_zat,
+            script_slice.to_vec(),
+            address_script_hash,
+        ));
+    }
+    Ok(outputs)
 }
 
 fn decode_public_facts(

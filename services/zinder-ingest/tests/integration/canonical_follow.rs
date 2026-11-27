@@ -40,9 +40,9 @@ use zinder_source::{
     SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
 };
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, MempoolEvent, MempoolEventEnvelope, MempoolEventRetentionConfig,
-    MempoolEventRetentionStepBudget, RocksDbCanonicalBuilder, RocksDbResourceBudget,
+    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan, MempoolEvent,
+    MempoolEventEnvelope, MempoolEventRetentionConfig, MempoolEventRetentionStepBudget,
+    RocksDbCanonicalBuilder, RocksDbResourceBudget,
 };
 use zinder_testkit::{frontier_of_size, sample_regtest_upgrade_activations};
 
@@ -495,12 +495,11 @@ async fn canonical_follower_settles_from_local_header_without_historical_source_
             .block_time_seconds
             .saturating_sub(1),
         build_tip,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         &store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -632,8 +631,7 @@ async fn canonical_follower_cancellation_after_reorg_preparation_preserves_origi
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -745,8 +743,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -875,8 +872,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1401,8 +1397,7 @@ async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise
     let store = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1464,8 +1459,7 @@ async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise
     let error = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )
@@ -1507,8 +1501,7 @@ async fn halt_during_a_raised_window_ramp_reports_the_covered_depth()
     let store = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &store_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1652,8 +1645,7 @@ async fn follow_fork_with_replacement_budget(
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         temporary.path().join("canonical"),
         activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(3)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -2591,8 +2583,7 @@ async fn append_against_tree_states(
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         &store_path,
         activations,
-        CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -2797,8 +2788,7 @@ async fn a_subtree_root_that_contradicts_the_derived_root_for_the_same_block_fai
         let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
             &store_path,
             &siblings.activations,
-            CanonicalStoreWorkload::Wallet,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3201,12 +3191,11 @@ impl InterleavedSubtreeChains {
                 .fetch_block_at(BlockHeight::new(4))
                 .await
                 .map(|block| BlockId::new(block.height, block.hash))?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(2)?,
         )?;
         let builder = RocksDbCanonicalBuilder::create_fresh(
             store_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3425,12 +3414,11 @@ async fn publish_subtree_boundary_store(
         &siblings.activations,
         siblings.predecessor.clone(),
         block_id(&published, build_tip_height)?,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(2)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -3651,12 +3639,11 @@ pub(super) async fn publish_parseable_store(
             .block_time_seconds
             .saturating_sub(1),
         block_id(blocks, build_tip.value())?,
-        zinder_store::RawBlobRetention::Transactions,
+        zinder_store::RawBlobRetention::None,
         CanonicalReorgPolicy::new(reorg_window_blocks)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -3698,7 +3685,7 @@ pub(super) fn parseable_multi_block_chain()
         prepare_canonical_block(
             &block,
             &sample_regtest_upgrade_activations(),
-            RawBlobPolicy::Transactions,
+            RawBlobPolicy::None,
         )?;
         parent_hash = block.hash;
         blocks.insert(height, block);
@@ -3744,7 +3731,7 @@ pub(super) fn forked_parseable_chain(
         prepare_canonical_block(
             &block,
             &sample_regtest_upgrade_activations(),
-            RawBlobPolicy::Transactions,
+            RawBlobPolicy::None,
         )?;
         parent_hash = block.hash;
         blocks.insert(height, block);

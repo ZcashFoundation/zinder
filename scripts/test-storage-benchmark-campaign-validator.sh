@@ -994,7 +994,7 @@ write_lifecycle_evidence() {
       },
       contracts: {
         canonical_store_identity: "canonical",
-        canonical_store_schema_version: 1,
+        canonical_store_schema_version: 2,
         wallet_store_identity: "wallet",
         wallet_store_schema_version: 1,
         wallet_projection_schema_version: 1,
@@ -1048,7 +1048,6 @@ write_lifecycle_evidence() {
       canonical_storage_ready: (
         {
           scope: "canonical-storage-ready",
-          workload: "wallet",
           first_retained_block: {height: 1, hash_hex: ("d" * 64)},
           visible_tip: {height: 205, hash_hex: ("c" * 64)},
           visible_epoch_id: 1,
@@ -1310,6 +1309,7 @@ expect_lifecycle_rejected() {
     fail "lifecycle report $name was accepted"
   fi
 }
+expect_lifecycle_rejected wrong-canonical-store-schema '.contracts.canonical_store_schema_version = 1'
 expect_lifecycle_rejected wrong-store-schema '.contracts.wallet_store_schema_version = 2'
 expect_lifecycle_rejected wrong-commitment-scheme '.wallet_storage_ready.utxo_summary.commitment_scheme = "lthash16"'
 expect_lifecycle_rejected wrong-projection-schema '.contracts.wallet_projection_schema_version = 2'

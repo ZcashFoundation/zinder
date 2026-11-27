@@ -348,7 +348,7 @@ fn open_secondary(
         store_path,
         secondary_path,
         &activations,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)

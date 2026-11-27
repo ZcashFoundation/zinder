@@ -16,8 +16,8 @@ use zinder_source::{NodeSource, SourceError};
 use zinder_store::{
     CanonicalActivationSchedule, CanonicalBaselinePublication, CanonicalReadyStoreSummary,
     CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
-    CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbCanonicalStore, RocksDbResourceBudget, TreeStateCheckpointSelection,
+    CanonicalStoreError, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
+    RocksDbResourceBudget, TreeStateCheckpointSelection,
 };
 
 use crate::{
@@ -319,7 +319,6 @@ fn open_existing_store(
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &config.storage_path,
         network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
@@ -355,7 +354,6 @@ fn recover_staged_store(
     match RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         staging_path,
         network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
@@ -367,7 +365,6 @@ fn recover_staged_store(
             let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
                 &config.storage_path,
                 network_upgrade_activations,
-                CanonicalStoreWorkload::Wallet,
                 config.raw_blob_retention,
                 CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
                 config.resource_budget,
@@ -515,7 +512,6 @@ where
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &config.storage_path,
         network_upgrade_activations,
-        CanonicalStoreWorkload::Wallet,
         config.raw_blob_retention,
         CanonicalReorgPolicy::new(config.reorg_window_blocks)?,
         config.resource_budget,
@@ -541,12 +537,8 @@ fn create_fresh_canonical_builder(
     build_plan: CanonicalStoreBuildPlan,
     config: &CanonicalWriterConfig,
 ) -> Result<RocksDbCanonicalBuilder, CanonicalStoreError> {
-    let builder = RocksDbCanonicalBuilder::create_fresh(
-        staging_path,
-        CanonicalStoreWorkload::Wallet,
-        build_plan,
-        config.resource_budget,
-    )?;
+    let builder =
+        RocksDbCanonicalBuilder::create_fresh(staging_path, build_plan, config.resource_budget)?;
     if let Some(selection) = config.tree_state_checkpoint_selection {
         builder.with_tree_state_checkpoint_selection(selection)
     } else {
@@ -801,12 +793,12 @@ mod tests {
     use async_trait::async_trait;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight, BlockId,
-        CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion,
-        ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
-        CommitmentTreeFrontiers, CommitmentTreeFrontiersError, CompactBlockArtifact,
-        CompactChainMetadata, ConsensusBranchId, Network, NetworkUpgradeActivation,
-        NetworkUpgradeActivations, SerializedBytesDigest, ShieldedProtocol, UnixTimestampMillis,
+        BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, CanonicalBlockFacts,
+        CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
+        CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers,
+        CommitmentTreeFrontiersError, CompactBlockArtifact, CompactChainMetadata,
+        ConsensusBranchId, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+        SerializedBytesDigest, ShieldedProtocol, UnixTimestampMillis,
         encode_canonical_block_replay,
     };
     use zinder_source::{
@@ -822,9 +814,9 @@ mod tests {
     };
     use crate::{CanonicalConstructionConfig, CanonicalFollowConfig};
     use zinder_store::{
-        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
-        CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-        RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy, RawBlobRetention,
+        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+        RocksDbResourceBudget,
     };
 
     #[derive(Clone)]
@@ -960,9 +952,7 @@ mod tests {
             &store_path,
             temporary.path().join("canonical-secondary"),
             &extended,
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(1)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1006,7 +996,7 @@ mod tests {
                 temporary.path().join("initial-secondary"),
                 &zebra_seven,
                 zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                    RawBlobRetention::Transactions,
+                    RawBlobRetention::None,
                 ),
                 CanonicalReorgPolicy::new(1)?,
                 RocksDbResourceBudget::for_local_tests(),
@@ -1098,7 +1088,7 @@ mod tests {
                         .join(format!("secondary-{}", reader_table.activations().len())),
                     reader_table,
                     zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                        RawBlobRetention::Transactions,
+                        RawBlobRetention::None,
                     ),
                     CanonicalReorgPolicy::new(1)?,
                     RocksDbResourceBudget::for_local_tests(),
@@ -1272,12 +1262,11 @@ mod tests {
                 test_frontiers(activations, parent.height)?,
             ),
             build_tip,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(1)?,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1310,7 +1299,7 @@ mod tests {
                 Arc::new(activations.clone()),
             ),
             checkpoint_height: None,
-            raw_blob_retention: RawBlobRetention::Transactions,
+            raw_blob_retention: RawBlobRetention::None,
             reorg_window_blocks: 1,
             tree_state_checkpoint_selection: None,
             follow: CanonicalFollowConfig {
@@ -1337,12 +1326,11 @@ mod tests {
             activations,
             1_700_000_000,
             build_tip,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             reorg_policy,
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1421,7 +1409,6 @@ mod tests {
             replay_envelope,
             tip_metadata: ChainTipMetadata::new(0, 0, 0),
             tree_state_checkpoint,
-            block_final_note_commitment_roots: None::<BlockFinalNoteCommitmentRoots>,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
@@ -1490,7 +1477,7 @@ mod tests {
                 Arc::new(activations.clone()),
             ),
             checkpoint_height: Some(BlockHeight::new(0)),
-            raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            raw_blob_retention: zinder_store::RawBlobRetention::None,
             reorg_window_blocks: 100,
             tree_state_checkpoint_selection: None,
             follow: CanonicalFollowConfig {

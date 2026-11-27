@@ -307,7 +307,7 @@ def provision(args, directory):
             service['command'] = ['index'] if name == 'index' else ['serve', '--readers-only']
             service['environment'].pop('ZINDER_DEPLOYMENT__PROFILE', None)
             service['environment'].pop('ZINDER_STORAGE__FULL_BLOCKS', None)
-            service['environment']['ZINDER_STORAGE__RAW_BLOB_POLICY'] = 'transactions'
+            service['environment']['ZINDER_STORAGE__RAW_BLOB_POLICY'] = 'none'
         if name == 'serve':
             service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__DIRECTORY', None)
             service['environment'].pop('ZINDER_COMPAT__SHIELDED_HISTORY__PUBLISHER_KEY', None)
@@ -382,7 +382,7 @@ def main():
     parser.add_argument('--revision', help='expected full candidate commit, verified through every /healthz')
     parser.add_argument('--bin-dir', type=Path, help='optional built or released binaries to mount over runtime images')
     parser.add_argument('--node-config', type=Path, default=ROOT / 'deploy/zebra/regtest.toml')
-    parser.add_argument('--raw-blob-policy', choices=['transactions', 'all'], default='transactions')
+    parser.add_argument('--raw-blob-policy', choices=['none', 'all'], default='none')
     parser.add_argument('--tip', type=int, default=150, help='initial or absolute requested mining height')
     parser.add_argument('--timeout', type=int, default=180)
     args = parser.parse_args()

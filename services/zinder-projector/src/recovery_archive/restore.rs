@@ -129,41 +129,22 @@ pub fn restore_private_backup(
 }
 
 fn sync_store_tree(directory: &Path) -> Result<(), RecoveryArchiveError> {
-    let entries =
-        fs::read_dir(directory).map_err(|source| RecoveryArchiveError::io(directory, source))?;
-    for entry in entries {
-        let entry = entry.map_err(|source| RecoveryArchiveError::io(directory, source))?;
-        let path = entry.path();
-        let kind = entry
-            .file_type()
-            .map_err(|source| RecoveryArchiveError::io(&path, source))?;
-        if kind.is_dir() {
-            sync_store_tree(&path)?;
-        } else {
-            require_contract(
-                kind.is_file(),
-                "restored canonical store contains a special file",
-            )?;
-            fs::File::open(&path)
-                .and_then(|file| file.sync_all())
-                .map_err(|source| RecoveryArchiveError::io(&path, source))?;
-        }
-    }
-    sync_directory(directory)
+    super::sync_canonical_directory(directory, Path::new(CANONICAL_CHECKPOINT_DIRECTORY_NAME))
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, RecoveryArchiveError> {
     std::path::absolute(path).map_err(|source| RecoveryArchiveError::io(path, source))
 }
 
-fn prepare_deployment_directory(pair: &Path) -> Result<(), RecoveryArchiveError> {
+pub(super) fn prepare_deployment_directory(pair: &Path) -> Result<(), RecoveryArchiveError> {
     for (checkpoint, store) in [
         (CANONICAL_CHECKPOINT_DIRECTORY_NAME, "canonical"),
         (WALLET_CHECKPOINT_DIRECTORY_NAME, "wallet"),
     ] {
+        let source = pair.join(checkpoint);
+        super::verify_directory_nofollow(&source, "restored store directory")?;
         let store = pair.join(store);
-        fs::rename(pair.join(checkpoint), &store)
-            .map_err(|source| RecoveryArchiveError::io(&store, source))?;
+        fs::rename(&source, &store).map_err(|error| RecoveryArchiveError::io(&store, error))?;
         sync_directory(&store)?;
     }
     for name in [
@@ -171,6 +152,7 @@ fn prepare_deployment_directory(pair: &Path) -> Result<(), RecoveryArchiveError>
         RECOVERY_ARCHIVE_MANIFEST_FILE_NAME,
     ] {
         let path = pair.join(name);
+        super::require_regular_file(&path, "staged recovery manifest")?;
         fs::remove_file(&path).map_err(|source| RecoveryArchiveError::io(&path, source))?;
     }
     sync_directory(pair)
@@ -338,7 +320,10 @@ mod tests {
             staging
                 .join("backup")
                 .join(CANONICAL_CHECKPOINT_DIRECTORY_NAME)
-                .join("canonical-construction-manifest.v1.json"),
+                .join(format!(
+                    "canonical-construction-manifest.v{}.json",
+                    zinder_store::CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
+                )),
         )?;
         let archive = root.join("backup");
         assert!(
@@ -577,20 +562,12 @@ mod tests {
         writer.append_live_block(&chain)?;
         let path = writer.canonical_primary_path().to_path_buf();
         let policy = writer.canonical_primary()?.reorg_policy();
-        let workload = writer.canonical_primary()?.workload();
         let retention = writer.canonical_primary()?.raw_blob_retention();
         let mut serving = writer.into_serving_store_fixture()?;
         let (reader, _wallet) = serving.take_readers()?;
         let budget = RocksDbResourceBudget::for_local_tests();
         let open_owner = |path: &Path| {
-            RocksDbCanonicalStore::open_ready(
-                path,
-                &activations,
-                workload,
-                retention,
-                policy,
-                budget,
-            )
+            RocksDbCanonicalStore::open_ready(path, &activations, retention, policy, budget)
         };
         let mut owner = open_owner(&path)?;
         let now = UnixTimestampMillis::new(100);
@@ -704,6 +681,155 @@ mod tests {
         ));
         assert_eq!(fs::read_dir(&archive)?.count(), 0);
         assert_eq!(fs::read_dir(&destination)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sync_store_tree_supports_nested_segments_and_rejects_bad_entries() -> eyre::Result<()> {
+        let temporary = TempDir::new()?;
+        let canonical = temporary.path().join("canonical");
+        let shielded = canonical.join("segments").join("shielded");
+        let supplement = canonical.join("segments").join("supplement");
+        let raw_block = canonical.join("segments").join("raw_block");
+        fs::create_dir_all(&shielded)?;
+        fs::create_dir_all(&supplement)?;
+        fs::create_dir_all(&raw_block)?;
+        fs::write(canonical.join("CURRENT"), b"MANIFEST-000001\n")?;
+        fs::write(
+            canonical.join(zinder_store::SEGMENTS_MANIFEST_FILE_NAME),
+            b"{}",
+        )?;
+        fs::write(shielded.join("0000000001-0000004096.zshrng02"), b"shielded")?;
+        fs::write(
+            supplement.join("0000000001-0000004096.zstsup01"),
+            b"supplement",
+        )?;
+        fs::write(
+            raw_block.join("0000000001-0000004096.zsblkb01"),
+            b"raw_block",
+        )?;
+        sync_store_tree(&canonical)?;
+
+        let staging = canonical.join("segments").join(".staging");
+        fs::create_dir(&staging)?;
+        assert!(sync_store_tree(&canonical).is_err());
+        fs::remove_dir(&staging)?;
+
+        let wrong_ext = shielded.join("0000000001-0000004096.zstsup01");
+        fs::write(&wrong_ext, b"wrong")?;
+        assert!(sync_store_tree(&canonical).is_err());
+        fs::remove_file(&wrong_ext)?;
+
+        #[cfg(unix)]
+        {
+            let target = temporary.path().join("outside");
+            fs::write(&target, b"outside")?;
+            let link = shielded.join("0000004097-0000008192.zshrng02");
+            std::os::unix::fs::symlink(&target, &link)?;
+            assert!(sync_store_tree(&canonical).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn backup_verify_and_restore_reject_staging_wrong_ext_symlinks_and_wallet_subdirs()
+    -> eyre::Result<()> {
+        let validation_budget = RecoveryValidationBudget::default();
+        let temporary = TempDir::new()?;
+        let root = temporary.path();
+        let network = Network::ZcashRegtest;
+        let (staging, capture_digest) = capture_fixture(root)?;
+        let staged_backup = staging.join("backup");
+        let archive = root.join("backup");
+        assert_export_rejects_disallowed_tree(
+            &staging,
+            &staged_backup,
+            &archive,
+            network,
+            &capture_digest,
+        )?;
+        let digest = export_private_backup(
+            &staging,
+            &archive,
+            network,
+            &capture_digest,
+            validation_budget,
+        )?;
+        verify_private_backup(&archive, network, &digest, validation_budget)?;
+        assert_sealed_archive_rejects_disallowed_tree(&archive, root, network, &digest)
+    }
+
+    fn assert_export_rejects_disallowed_tree(
+        staging: &Path,
+        staged_backup: &Path,
+        archive: &Path,
+        network: Network,
+        capture_digest: &[u8; 32],
+    ) -> eyre::Result<()> {
+        let budget = RecoveryValidationBudget::default();
+        let canonical = staged_backup.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME);
+        let staging_dir = canonical.join("segments").join(".staging");
+        fs::create_dir_all(&staging_dir)?;
+        assert!(export_private_backup(staging, archive, network, capture_digest, budget).is_err());
+        assert!(!archive.exists());
+        fs::remove_dir_all(canonical.join("segments"))?;
+
+        let wallet_sub = staged_backup
+            .join(WALLET_CHECKPOINT_DIRECTORY_NAME)
+            .join("sub");
+        fs::create_dir(&wallet_sub)?;
+        assert!(export_private_backup(staging, archive, network, capture_digest, budget).is_err());
+        assert!(!archive.exists());
+        fs::remove_dir(&wallet_sub)?;
+        Ok(())
+    }
+
+    fn assert_sealed_archive_rejects_disallowed_tree(
+        archive: &Path,
+        root: &Path,
+        network: Network,
+        digest: &[u8; 32],
+    ) -> eyre::Result<()> {
+        let budget = RecoveryValidationBudget::default();
+        let canonical = archive.join(CANONICAL_CHECKPOINT_DIRECTORY_NAME);
+        let shielded = canonical.join("segments").join("shielded");
+        fs::create_dir_all(&shielded)?;
+        let wrong_ext = shielded.join("0000000001-0000004096.zstsup01");
+        fs::write(&wrong_ext, b"wrong")?;
+        let dest = root.join("refused-wrong-ext");
+        assert!(verify_private_backup(archive, network, digest, budget).is_err());
+        assert!(restore_private_backup(archive, &dest, network, digest, budget).is_err());
+        assert!(!dest.exists());
+        fs::remove_file(&wrong_ext)?;
+
+        let staging_dir = canonical.join("segments").join(".staging");
+        fs::create_dir(&staging_dir)?;
+        let dest_staging = root.join("refused-staging");
+        assert!(verify_private_backup(archive, network, digest, budget).is_err());
+        assert!(restore_private_backup(archive, &dest_staging, network, digest, budget).is_err());
+        assert!(!dest_staging.exists());
+        fs::remove_dir(&staging_dir)?;
+
+        let wallet_sub = archive.join(WALLET_CHECKPOINT_DIRECTORY_NAME).join("sub");
+        fs::create_dir(&wallet_sub)?;
+        let dest_wallet = root.join("refused-wallet");
+        assert!(verify_private_backup(archive, network, digest, budget).is_err());
+        assert!(restore_private_backup(archive, &dest_wallet, network, digest, budget).is_err());
+        assert!(!dest_wallet.exists());
+        fs::remove_dir(&wallet_sub)?;
+
+        #[cfg(unix)]
+        {
+            let target = root.join("outside");
+            fs::write(&target, b"outside")?;
+            let link = shielded.join("0000000001-0000004096.zshrng02");
+            std::os::unix::fs::symlink(&target, &link)?;
+            let dest_link = root.join("refused-link");
+            assert!(verify_private_backup(archive, network, digest, budget).is_err());
+            assert!(restore_private_backup(archive, &dest_link, network, digest, budget).is_err());
+            assert!(!dest_link.exists());
+            fs::remove_file(&link)?;
+        }
         Ok(())
     }
 }

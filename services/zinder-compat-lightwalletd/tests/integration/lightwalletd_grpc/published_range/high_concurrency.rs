@@ -30,7 +30,7 @@ const SEGMENT_SPAN: u32 = 700;
 
 fn build_chain_with_spends(total: u32, spends_at: fn(u32) -> usize) -> Result<ChainFixture> {
     let mut chain = ChainFixture::new(NETWORK)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(total);
     let metadata = CompactChainMetadata {
         sapling_commitment_tree_size: 0,

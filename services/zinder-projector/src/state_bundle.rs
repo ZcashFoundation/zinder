@@ -29,8 +29,7 @@ use zinder_proto::{
 };
 use zinder_store::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CANONICAL_STORE_IDENTITY,
-    CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbResourceBudget,
+    CANONICAL_STORE_SCHEMA_VERSION, RawBlobRetention, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_STORE_IDENTITY, WalletCanonicalSourceIdentity,
@@ -43,9 +42,9 @@ use zinder_wallet_rocksdb::{
 /// Exact bundle identity admitted by this release.
 pub const STATE_BUNDLE_IDENTITY: &str = "state-bundle";
 /// Exact state-bundle manifest format admitted by this release.
-pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 1;
+pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 2;
 /// Only certified physical topology represented by a state bundle.
-pub const STATE_BUNDLE_TOPOLOGY: &str = "rocksdb-single-host";
+pub const STATE_BUNDLE_TOPOLOGY: &str = "rocksdb";
 /// Fixed canonical checkpoint directory within a bundle.
 pub const CANONICAL_CHECKPOINT_DIRECTORY_NAME: &str = "canonical.rocksdb";
 /// Fixed wallet checkpoint directory within a bundle.
@@ -434,11 +433,11 @@ impl StateBundleManifest {
         )?;
         require_manifest_value(
             self.format_version == STATE_BUNDLE_FORMAT_VERSION,
-            "state bundle format version must be 1",
+            "state bundle format version must be 2",
         )?;
         require_manifest_value(
             self.topology == STATE_BUNDLE_TOPOLOGY,
-            "topology must be exactly rocksdb-single-host",
+            "topology must be exactly rocksdb",
         )?;
         validate_candidate_id(&self.candidate_id)?;
         let network = parse_network(&self.network).ok_or_else(|| {
@@ -630,7 +629,6 @@ struct CanonicalAdmission {
     store_identity: String,
     schema_version: u16,
     network: Network,
-    workload: CanonicalStoreWorkload,
     build_plan: CanonicalBuildPlanAdmission,
     effective_reorg_window_blocks: Option<u32>,
     admitted_schedule: AdmittedScheduleIdentity,
@@ -805,8 +803,8 @@ fn decode_checkpoint_response(
         "canonical checkpoint schema is unsupported",
     )?;
     require_manifest_value(
-        response.workload == CanonicalStoreWorkload::Wallet.as_str(),
-        "canonical checkpoint workload must be wallet",
+        response.workload.is_empty(),
+        "canonical checkpoint workload field must be empty in schema v2",
     )?;
     require_manifest_value(
         !response.database_identity.is_empty() && response.database_identity.len() <= 256,
@@ -999,7 +997,6 @@ fn assemble_canonical_admission(
         store_identity,
         schema_version,
         network,
-        workload: CanonicalStoreWorkload::Wallet,
         build_plan,
         effective_reorg_window_blocks: None,
         admitted_schedule,
@@ -1174,7 +1171,6 @@ struct CanonicalCheckpointManifest {
     database_identity_sha256: String,
     construction_manifest_version: u16,
     construction_manifest_sha256: String,
-    workload: String,
     cold_admitted: bool,
     build_plan: CanonicalBuildPlanManifest,
     /// Reorg window the checkpoint enforces when a canonical writer raised it
@@ -1201,7 +1197,6 @@ impl CanonicalCheckpointManifest {
             database_identity_sha256: canonical.database_identity_sha256.clone(),
             construction_manifest_version: canonical.construction_manifest_version,
             construction_manifest_sha256: hex::encode(canonical.construction_manifest_sha256),
-            workload: canonical.workload.as_str().to_owned(),
             cold_admitted: true,
             build_plan: CanonicalBuildPlanManifest::from_admitted(&canonical.build_plan),
             effective_reorg_window_blocks: canonical.effective_reorg_window_blocks,
@@ -1246,10 +1241,6 @@ impl CanonicalCheckpointManifest {
         validate_lower_hex_32(
             &self.construction_manifest_sha256,
             "canonical construction-manifest SHA-256",
-        )?;
-        require_manifest_value(
-            self.workload == CanonicalStoreWorkload::Wallet.as_str(),
-            "canonical checkpoint workload must be wallet",
         )?;
         require_manifest_value(
             self.cold_admitted,
@@ -2168,7 +2159,6 @@ pub(crate) mod tests {
         CanonicalOwnerCheckpointBuildPlanEvidence, CanonicalOwnerCheckpointReadyEvidence,
         CanonicalWriterFence, CreateCanonicalOwnerCheckpointResponse,
     };
-    use zinder_store::CanonicalStoreWorkload;
     use zinder_wallet_projection::{
         WalletCanonicalSourceIdentity, WalletProjectionAccumulator, WalletProjectionDigest,
         WalletProjectionEventCursor, WalletProjectionFamilyRowCounts,
@@ -2228,7 +2218,9 @@ pub(crate) mod tests {
         assert_eq!(admitted, manifest);
         assert_eq!(admitted.identity, STATE_BUNDLE_IDENTITY);
         assert_eq!(admitted.format_version, STATE_BUNDLE_FORMAT_VERSION);
+        assert_eq!(admitted.format_version, 2);
         assert_eq!(admitted.topology, STATE_BUNDLE_TOPOLOGY);
+        assert_eq!(admitted.topology, "rocksdb");
         assert_eq!(admitted.fence.chain_epoch_id(), 7);
         assert_eq!(admitted.fence.chain_event_sequence(), 7);
         Ok(())
@@ -2348,18 +2340,26 @@ pub(crate) mod tests {
             &sample_wallet_admission(7)?,
         )?;
         let valid = serde_json::to_value(manifest)?;
+        let unsupported_canonical_schema_version = CANONICAL_STORE_SCHEMA_VERSION
+            .checked_add(1)
+            .ok_or("canonical schema test version overflow")?;
         let unsupported_construction_manifest_version =
             CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
                 .checked_add(1)
                 .ok_or("construction manifest test version overflow")?;
-        let mutations: [(&str, Value); 21] = [
+        let mutations: [(&str, Value); 23] = [
             ("/identity", Value::String("state_bundle".to_owned())),
             ("/format_version", Value::from(0)),
-            ("/format_version", Value::from(2)),
+            ("/format_version", Value::from(1)),
+            ("/format_version", Value::from(3)),
             ("/topology", Value::String("mixed-runtime".to_owned())),
+            ("/topology", Value::String("rocksdb-single-host".to_owned())),
             ("/candidate_id", Value::String("../outside".to_owned())),
             ("/network", Value::String("mainnet".to_owned())),
-            ("/canonical_checkpoint/schema_version", Value::from(3)),
+            (
+                "/canonical_checkpoint/schema_version",
+                Value::from(unsupported_canonical_schema_version),
+            ),
             (
                 "/canonical_checkpoint/database_identity_sha256",
                 Value::String("not-a-sha256".to_owned()),
@@ -2406,18 +2406,62 @@ pub(crate) mod tests {
             ),
         ];
 
+        assert_manifest_mutations_rejected(&valid, &mutations)
+    }
+
+    fn assert_manifest_mutations_rejected(
+        valid: &Value,
+        mutations: &[(&str, Value)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         for (pointer, replacement) in mutations {
             let mut corrupted = valid.clone();
             let field = corrupted
                 .pointer_mut(pointer)
                 .ok_or("test mutation pointer must resolve")?;
-            *field = replacement;
+            *field = replacement.clone();
             let rejected = serde_json::from_value::<StateBundleManifest>(corrupted)
                 .map_or(true, |decoded| {
                     decoded.validate(Network::ZcashRegtest).is_err()
                 });
             assert!(rejected, "corruption at {pointer} was admitted");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn v1_format_and_legacy_topology_are_rejected_with_v2_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = sample_manifest()?;
+        let valid = serde_json::to_value(manifest)?;
+
+        let mut legacy_format = valid.clone();
+        *legacy_format
+            .pointer_mut("/format_version")
+            .ok_or("format_version pointer must resolve")? = Value::from(1);
+        let format_error = serde_json::from_value::<StateBundleManifest>(legacy_format)?
+            .validate(Network::ZcashRegtest)
+            .err()
+            .ok_or("v1 state bundle format was admitted")?
+            .to_string();
+        assert!(
+            format_error.contains("format version must be 2"),
+            "{format_error}"
+        );
+
+        let mut legacy_topology = valid;
+        *legacy_topology
+            .pointer_mut("/topology")
+            .ok_or("topology pointer must resolve")? =
+            Value::String("rocksdb-single-host".to_owned());
+        let topology_error = serde_json::from_value::<StateBundleManifest>(legacy_topology)?
+            .validate(Network::ZcashRegtest)
+            .err()
+            .ok_or("legacy topology was admitted")?
+            .to_string();
+        assert!(
+            topology_error.contains("topology must be exactly rocksdb"),
+            "{topology_error}"
+        );
         Ok(())
     }
 
@@ -2500,7 +2544,7 @@ pub(crate) mod tests {
         response: &CreateCanonicalOwnerCheckpointResponse,
     ) {
         let mut wrong_schema = response.clone();
-        wrong_schema.schema_version = 3;
+        wrong_schema.schema_version = u32::from(CANONICAL_STORE_SCHEMA_VERSION).saturating_add(1);
         assert!(CanonicalCheckpointAdmissionEvidence::try_from(wrong_schema).is_err());
 
         let mut missing_ready = response.clone();
@@ -2713,12 +2757,11 @@ pub(crate) mod tests {
             store_identity: CANONICAL_STORE_IDENTITY.to_owned(),
             schema_version: CANONICAL_STORE_SCHEMA_VERSION,
             network: Network::ZcashRegtest,
-            workload: CanonicalStoreWorkload::Wallet,
             effective_reorg_window_blocks: None,
             build_plan: CanonicalBuildPlanAdmission {
                 activation_fingerprint_version: 1,
                 activation_fingerprint: activation_fingerprint.as_bytes(),
-                raw_blob_retention: RawBlobRetention::Transactions,
+                raw_blob_retention: RawBlobRetention::None,
                 reorg_window_blocks: 100,
                 history_preceding_checkpoint: None,
                 history_predecessor: CanonicalHistoryPredecessorAdmission {
@@ -2760,7 +2803,7 @@ pub(crate) mod tests {
             database_identity: b"sample-canonical-database-identity".to_vec(),
             store_identity: canonical.store_identity.clone(),
             schema_version: u32::from(canonical.schema_version),
-            workload: canonical.workload.as_str().to_owned(),
+            workload: String::new(),
             network_name: network_name(canonical.network).to_owned(),
             effective_reorg_window_blocks: None,
             network_upgrade_schedule: Some(

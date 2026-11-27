@@ -13,8 +13,8 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, TreeStateCheckpointSelection,
+    CanonicalReorgPolicy, CanonicalStoreError, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    TreeStateCheckpointSelection,
     block_load::{encode_block_position, encode_tree_state_checkpoint},
     live_replacement_tests::published_store,
     publication::column_family,
@@ -139,7 +139,6 @@ fn stored_roots_stay_aligned_and_reject_damage_across_two_batches() -> TestResul
     let store = RocksDbCanonicalStore::open_ready(
         &path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
         RawBlobRetention::None,
         CanonicalReorgPolicy::new(window)?,
         RocksDbResourceBudget::for_local_tests(),
@@ -479,7 +478,7 @@ fn open_secondary(
         temporary.path().join("canonical"),
         temporary.path().join("canonical-secondary"),
         &activations()?,
-        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+        crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
         CanonicalReorgPolicy::new(2)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)

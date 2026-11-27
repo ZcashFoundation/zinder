@@ -51,8 +51,8 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalStoreError, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_testkit::{
     LogCapture, P2pkhSpendArgs, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
@@ -680,13 +680,16 @@ async fn dense_checkpoints_hydrate_final_roots_without_reading_compact_blocks()
     let expected = independent_final_roots(&blocks, &activations)?;
     let full_range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(DENSE_TIP));
 
-    // Delete compact_block rows for heights 1..=5 while keeping every stored
-    // tree_state_checkpoint row (and tip height 6's compact block for admission).
+    // Corrupt compact_block payloads for heights 1..=5 while keeping canonical_facts
+    // and every stored tree_state_checkpoint row (and tip height 6 untouched).
     let mut dense = CanonicalHarness::dense_chain(blocks.clone(), &activations).await?;
-    dense.delete_rows("compact_block", &[1, 2, 3, 4, 5])?;
-    assert_eq!(
-        dense.secondary().compact_block_at(BlockHeight::new(2))?,
-        None
+    dense.corrupt_live_tail_shielded_payload(&[1, 2, 3, 4, 5])?;
+    assert!(
+        dense
+            .secondary()
+            .compact_block_at(BlockHeight::new(2))
+            .is_err(),
+        "corrupt live-tail shielded payload must fail compact block read"
     );
     assert!(matches!(
         dense
@@ -695,15 +698,16 @@ async fn dense_checkpoints_hydrate_final_roots_without_reading_compact_blocks()
                 BlockHeight::new(1),
                 BlockHeight::new(5)
             )),
-        Err(CanonicalStoreError::PublicationRefused { .. })
+        Err(CanonicalStoreError::SettledSegment { .. }
+            | CanonicalStoreError::PublicationRefused { .. })
     ));
     assert_roots_match_expected(dense.secondary(), &activations, full_range, &expected)?;
 
-    // Mixed case: remove compact_block only at checkpointed heights (1, 2, 4)
+    // Mixed case: corrupt live-tail compact payloads only at checkpointed heights (1, 2, 4)
     // and remove checkpoints at uncheckpointed heights (3, 5). Hydration must
     // skip compact blocks for 1, 2, 4, 6 and replay only gaps 3..=3 and 5..=5.
     let mut mixed = CanonicalHarness::dense_chain(blocks, &activations).await?;
-    mixed.delete_rows("compact_block", &[1, 2, 4])?;
+    mixed.corrupt_live_tail_shielded_payload(&[1, 2, 4])?;
     mixed.delete_rows("tree_state_checkpoint", &[3, 5])?;
     assert_roots_match_expected(mixed.secondary(), &activations, full_range, &expected)?;
     Ok(())
@@ -1075,7 +1079,7 @@ impl CanonicalHarness {
             &sample_regtest_upgrade_activations(),
             first_block.block_time_seconds.saturating_sub(1),
             block_id(&blocks, CHAIN_TIP_HEIGHT)?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         Self::publish(blocks, build_plan).await
@@ -1094,7 +1098,7 @@ impl CanonicalHarness {
                 sapling_only_frontiers()?,
             ),
             block_id(&blocks, CHAIN_TIP_HEIGHT)?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         Self::publish(blocks, build_plan).await
@@ -1112,7 +1116,7 @@ impl CanonicalHarness {
             &sample_regtest_upgrade_activations(),
             first_block.block_time_seconds.saturating_sub(1),
             block_id(&blocks, CHAIN_TIP_HEIGHT)?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         Self::publish_settled_at(blocks, build_plan, FORK_PARENT_HEIGHT).await
@@ -1158,7 +1162,7 @@ impl CanonicalHarness {
             activations,
             first_block.block_time_seconds.saturating_sub(1),
             block_id(&blocks, tip_height)?,
-            zinder_store::RawBlobRetention::Transactions,
+            zinder_store::RawBlobRetention::None,
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         )?;
         Self::publish_settled_with_activations(blocks, build_plan, tip_height, activations).await
@@ -1201,7 +1205,7 @@ impl CanonicalHarness {
             temporary.path().join("canonical-secondary"),
             activations,
             zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                zinder_store::RawBlobRetention::Transactions,
+                zinder_store::RawBlobRetention::None,
             ),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
@@ -1236,14 +1240,73 @@ impl CanonicalHarness {
             }
             db.flush_cf(&handle)?;
         }
+        self.reopen_secondary(&primary_path, &activations, family)
+    }
+
+    fn corrupt_live_tail_shielded_payload(
+        &mut self,
+        heights: &[u32],
+    ) -> Result<(), Box<dyn Error>> {
+        use sha2::Digest as _;
+
+        let primary_path = self.temporary.path().join("canonical");
+        let activations = self
+            .secondary
+            .network_upgrade_activations()
+            .cloned()
+            .unwrap_or_else(sample_regtest_upgrade_activations);
+        self.store = None;
+        {
+            let options = rust_rocksdb::Options::default();
+            let column_families = rust_rocksdb::DB::list_cf(&options, &primary_path)?;
+            let db = rust_rocksdb::DB::open_cf(&options, &primary_path, &column_families)?;
+            let handle = db
+                .cf_handle("live_tail_block")
+                .ok_or("missing column family live_tail_block")?;
+            for height in heights {
+                let key = height.to_be_bytes();
+                let encoded = db
+                    .get_cf(&handle, key)?
+                    .ok_or_else(|| format!("missing live_tail_block row {height}"))?;
+                let body = encoded
+                    .get(..encoded.len().saturating_sub(32))
+                    .ok_or("live_tail_block row missing trailer")?;
+                let len_bytes: [u8; 4] = body
+                    .get(85..89)
+                    .ok_or("live_tail_block row missing shielded length")?
+                    .try_into()?;
+                let old_len = usize::try_from(u32::from_be_bytes(len_bytes))?;
+                let suffix = body
+                    .get(89 + old_len..)
+                    .ok_or("live_tail_block shielded payload truncated")?;
+                let mut updated = Vec::with_capacity(body.len() + 32);
+                updated.extend_from_slice(&body[..85]);
+                updated.extend_from_slice(&3_u32.to_be_bytes());
+                updated.extend_from_slice(&[0xff; 3]);
+                updated.extend_from_slice(suffix);
+                let digest = sha2::Sha256::digest(&updated);
+                updated.extend_from_slice(&digest);
+                db.put_cf(&handle, key, updated)?;
+            }
+            db.flush_cf(&handle)?;
+        }
+        self.reopen_secondary(&primary_path, &activations, "corrupt_shielded")
+    }
+
+    fn reopen_secondary(
+        &mut self,
+        primary_path: &Path,
+        activations: &NetworkUpgradeActivations,
+        suffix: &str,
+    ) -> Result<(), Box<dyn Error>> {
         self.secondary = RocksDbCanonicalSecondary::open_ready(
-            &primary_path,
+            primary_path,
             self.temporary
                 .path()
-                .join(format!("canonical-secondary-after-{family}")),
-            &activations,
+                .join(format!("canonical-secondary-after-{suffix}")),
+            activations,
             zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                zinder_store::RawBlobRetention::Transactions,
+                zinder_store::RawBlobRetention::None,
             ),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
@@ -1319,7 +1382,7 @@ impl CanonicalHarness {
             self.temporary.path().join(secondary_name),
             &sample_regtest_upgrade_activations(),
             zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                zinder_store::RawBlobRetention::Transactions,
+                zinder_store::RawBlobRetention::None,
             ),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
@@ -1362,7 +1425,6 @@ async fn build_canonical_store_with_activations(
     let activations = Arc::new(activations.clone());
     let builder = RocksDbCanonicalBuilder::create_fresh(
         store_path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1614,7 +1676,7 @@ fn source_block_facts(source_block: &SourceBlock) -> Result<CanonicalBlockFacts,
     Ok(prepare_canonical_block(
         source_block,
         &sample_regtest_upgrade_activations(),
-        RawBlobPolicy::Transactions,
+        RawBlobPolicy::None,
     )?
     .facts)
 }

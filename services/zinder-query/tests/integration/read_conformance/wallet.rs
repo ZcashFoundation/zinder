@@ -439,7 +439,7 @@ impl WalletChain {
 /// outputs.
 fn wallet_chain() -> eyre::Result<WalletChain> {
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(2);
     let block_one = fixture_block(&chain, 1)?;
     let block_two = fixture_block(&chain, 2)?;

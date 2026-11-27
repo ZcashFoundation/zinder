@@ -202,8 +202,8 @@ fn delete_compact_block_row(
     let families = rust_rocksdb::DB::list_cf(&options, canonical_primary_path)?;
     let db = rust_rocksdb::DB::open_cf(&options, canonical_primary_path, &families)?;
     let family = db
-        .cf_handle("compact_block")
-        .ok_or_else(|| eyre!("the canonical primary has no compact-block family"))?;
+        .cf_handle("live_tail_block")
+        .ok_or_else(|| eyre!("the canonical primary has no live-tail-block family"))?;
     db.delete_cf(&family, encode_height_key_ascending(height))?;
     db.flush_cf(&family)?;
     Ok(())

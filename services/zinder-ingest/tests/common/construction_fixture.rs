@@ -137,9 +137,8 @@ pub(crate) fn pool_commitments_with_activations(
     source_block: &SourceBlock,
     activations: &NetworkUpgradeActivations,
 ) -> Result<PoolCommitments, DynError> {
-    let compact_block =
-        prepare_canonical_block(source_block, activations, RawBlobPolicy::Transactions)?
-            .partial_compact_block;
+    let compact_block = prepare_canonical_block(source_block, activations, RawBlobPolicy::None)?
+        .partial_compact_block;
     let mut commitments = PoolCommitments::default();
     for transaction in compact_block.transactions() {
         commitments.sapling.extend(
@@ -591,7 +590,7 @@ pub(crate) fn held_construction_writer_config(
             activations,
         ),
         checkpoint_height: None,
-        raw_blob_retention: RawBlobRetention::Transactions,
+        raw_blob_retention: RawBlobRetention::None,
         reorg_window_blocks: 100,
         tree_state_checkpoint_selection: None,
         follow: CanonicalFollowConfig {

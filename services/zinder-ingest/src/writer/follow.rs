@@ -1504,7 +1504,7 @@ fn prepare_live_block(
         positioned.tip_metadata,
     )?;
     Ok(PreparedLiveBlock {
-        block: canonical_build_block(positioned, Some(derived_checkpoint), None),
+        block: canonical_build_block(positioned, Some(derived_checkpoint)),
         block_id,
         subtree_root_ranges,
         derived_subtree_roots: accumulator

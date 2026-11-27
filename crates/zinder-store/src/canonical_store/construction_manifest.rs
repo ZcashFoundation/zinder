@@ -23,23 +23,23 @@ use zinder_rocksdb_bulk_load::{
 
 use super::{
     CanonicalBlockLoadEvidence, CanonicalStoreBuildPlan, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CanonicalStoreReadyEvidence,
     block_load::CanonicalStagedSstEvidence,
     subtree_load::{CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence},
 };
 
 /// Fixed sidecar name copied with every owner-created canonical checkpoint.
 pub(super) const CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME: &str =
-    "canonical-construction-manifest.v1.json";
+    "canonical-construction-manifest.v2.json";
 /// Exact immutable construction-manifest format accepted by this release.
-pub const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 1;
+pub const CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION: u16 = 2;
 const MAX_CONSTRUCTION_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const CONSTRUCTION_MANIFEST_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.file.v1\0";
+    b"zinder.canonical.construction-manifest.file.v2\0";
 const CONSTRUCTION_BUILD_PLAN_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.build-plan.v1\0";
+    b"zinder.canonical.construction-manifest.build-plan.v2\0";
 const CONSTRUCTION_CHECKPOINT_DIGEST_DOMAIN: &[u8] =
-    b"zinder.canonical.construction-manifest.checkpoint.v1\0";
+    b"zinder.canonical.construction-manifest.checkpoint.v2\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CanonicalConstructionProofProvenance {
@@ -132,7 +132,6 @@ impl CanonicalConstructionFamilyEvidenceAccumulator {
 pub(super) struct CanonicalConstructionManifestDraft {
     evidence_provenance: CanonicalConstructionProofProvenance,
     build_plan: CanonicalStoreBuildPlan,
-    workload: CanonicalStoreWorkload,
     source_checkpoint: CommitmentTreeCheckpoint,
     block_evidence: CanonicalBlockLoadEvidence,
     subtree_evidence: CanonicalSubtreeRootLoadEvidence,
@@ -142,7 +141,6 @@ pub(super) struct CanonicalConstructionManifestDraft {
 
 pub(super) struct CanonicalConstructionManifestInputs {
     pub(super) build_plan: CanonicalStoreBuildPlan,
-    pub(super) workload: CanonicalStoreWorkload,
     pub(super) source_checkpoint: CommitmentTreeCheckpoint,
     pub(super) block_evidence: CanonicalBlockLoadEvidence,
     pub(super) subtree_evidence: CanonicalSubtreeRootLoadEvidence,
@@ -178,7 +176,6 @@ impl CanonicalConstructionManifestDraft {
         Ok(Self {
             evidence_provenance,
             build_plan: inputs.build_plan,
-            workload: inputs.workload,
             source_checkpoint: inputs.source_checkpoint,
             block_evidence: inputs.block_evidence,
             subtree_evidence: inputs.subtree_evidence,
@@ -214,7 +211,6 @@ pub(super) fn read_construction_manifest_binding(
 pub(super) fn validate_ready_construction_manifest(
     store_path: &Path,
     ready: &CanonicalStoreReadyEvidence,
-    workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
 ) -> Result<CanonicalSubtreeRootLoadCoverage, CanonicalStoreError> {
     let (manifest, bytes) = read_construction_manifest(store_path)?;
@@ -230,7 +226,7 @@ pub(super) fn validate_ready_construction_manifest(
             "construction manifest version or digest differs from READY",
         ));
     }
-    validate_manifest_control_identity(store_path, &manifest, workload, build_plan)?;
+    validate_manifest_control_identity(store_path, &manifest, build_plan)?;
     Ok(manifest.subtree_evidence.coverage)
 }
 
@@ -253,31 +249,20 @@ fn read_construction_manifest(
 fn validate_manifest_control_identity(
     store_path: &Path,
     manifest: &PersistedConstructionManifest,
-    workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
 ) -> Result<(), CanonicalStoreError> {
-    validate_manifest_control_parts(
-        store_path,
-        manifest.workload,
-        &manifest.build_plan,
-        workload,
-        build_plan,
-    )
+    validate_manifest_control_parts(store_path, &manifest.build_plan, build_plan)
 }
 
 fn validate_manifest_control_parts(
     store_path: &Path,
-    manifest_workload: CanonicalStoreWorkload,
     manifest_build_plan: &PersistedBuildPlan,
-    control_workload: CanonicalStoreWorkload,
     control_build_plan: &CanonicalStoreBuildPlan,
 ) -> Result<(), CanonicalStoreError> {
-    if manifest_workload != control_workload
-        || *manifest_build_plan != PersistedBuildPlan::from_plan(control_build_plan)
-    {
+    if *manifest_build_plan != PersistedBuildPlan::from_plan(control_build_plan) {
         return Err(CanonicalStoreError::admission(
             store_path,
-            "construction manifest workload or build plan differs from store control",
+            "construction manifest build plan differs from store control",
         ));
     }
     Ok(())
@@ -444,7 +429,6 @@ fn manifest_digest(bytes: &[u8]) -> [u8; 32] {
 struct PersistedConstructionManifest {
     format_version: u16,
     evidence_provenance: String,
-    workload: CanonicalStoreWorkload,
     build_plan: PersistedBuildPlan,
     source_tip_checkpoint: PersistedCheckpoint,
     block_evidence: PersistedBlockEvidence,
@@ -465,7 +449,6 @@ impl PersistedConstructionManifest {
         let manifest = Self {
             format_version: CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
             evidence_provenance: draft.evidence_provenance.as_str().to_owned(),
-            workload: draft.workload,
             build_plan: PersistedBuildPlan::from_plan(&draft.build_plan),
             source_tip_checkpoint: PersistedCheckpoint::from_checkpoint(&draft.source_checkpoint),
             block_evidence,
@@ -525,7 +508,6 @@ impl PersistedConstructionManifest {
         }
         validate_persisted_family_coverage(&self.family_evidence)?;
         let stored_set = super::CanonicalStoredSet::new(
-            self.workload,
             self.build_plan.raw_blob_retention,
             BlockHeight::new(self.build_plan.first_available_height),
         );
@@ -746,6 +728,10 @@ impl PersistedBlockId {
 struct PersistedBlockEvidence {
     block_count: u64,
     transaction_count: u64,
+    settled_segment_index_count: u64,
+    live_tail_block_count: u64,
+    live_tail_raw_block_count: u64,
+    logical_replay_bytes: u64,
     logical_bytes: u64,
     replay_format_version: u32,
     block_digest_version: u16,
@@ -759,6 +745,10 @@ impl PersistedBlockEvidence {
         Self {
             block_count: evidence.block_count,
             transaction_count: evidence.transaction_count,
+            settled_segment_index_count: evidence.settled_segment_index_count,
+            live_tail_block_count: evidence.live_tail_block_count,
+            live_tail_raw_block_count: evidence.live_tail_raw_block_count,
+            logical_replay_bytes: evidence.logical_replay_bytes,
             logical_bytes: evidence.logical_bytes,
             replay_format_version: evidence.replay_format_version.value(),
             block_digest_version: evidence.block_digest_version.value(),
@@ -990,9 +980,9 @@ fn validate_persisted_source_evidence(
     subtree_evidence: &PersistedSubtreeEvidence,
 ) -> Result<(), CanonicalStoreError> {
     use super::rocksdb::{
-        BLOCK_BLOB_COLUMN_FAMILY, BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY,
-        COMPACT_BLOCK_COLUMN_FAMILY, SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
-        TRANSACTION_LOCATION_COLUMN_FAMILY,
+        BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, LIVE_TAIL_BLOCK_COLUMN_FAMILY,
+        LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY, SETTLED_SEGMENT_INDEX_COLUMN_FAMILY,
+        SUBTREE_ROOT_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
     };
 
     let by_name = families
@@ -1004,13 +994,12 @@ fn validate_persisted_source_evidence(
             CanonicalStoreError::publication("construction manifest family evidence is absent")
         })
     };
-    let replay = require(super::block_replay::BLOCK_REPLAY_COLUMN_FAMILY)?;
     let header = require(BLOCK_HEADER_COLUMN_FAMILY)?;
     let block_hash = require(BLOCK_HASH_INDEX_COLUMN_FAMILY)?;
-    let compact = require(COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let live_tail = require(LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    let live_tail_raw = require(LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY)?;
+    let segment_index = require(SETTLED_SEGMENT_INDEX_COLUMN_FAMILY)?;
     let transaction_location = require(TRANSACTION_LOCATION_COLUMN_FAMILY)?;
-    let transaction_blob = require(TRANSACTION_BLOB_COLUMN_FAMILY)?;
-    let block_blob = require(BLOCK_BLOB_COLUMN_FAMILY)?;
     let subtree = require(SUBTREE_ROOT_COLUMN_FAMILY)?;
     let staged_logical_bytes =
         canonical_staged_sst_families()
@@ -1024,25 +1013,19 @@ fn validate_persisted_source_evidence(
                         )
                     })
             })?;
-    let expected_transaction_blob_count =
-        if stored_set.contains(super::CanonicalStoredData::TransactionBodies) {
-            block_evidence.transaction_count
+    let expected_live_tail_raw_count =
+        if stored_set.contains(super::CanonicalStoredData::BlockBodies) {
+            block_evidence.live_tail_block_count
         } else {
             0
         };
-    let expected_block_blob_count = if stored_set.contains(super::CanonicalStoredData::BlockBodies)
-    {
-        block_evidence.block_count
-    } else {
-        0
-    };
-    if replay.row_count != block_evidence.block_count
-        || header.row_count != block_evidence.block_count
+    if header.row_count != block_evidence.block_count
         || block_hash.row_count != block_evidence.block_count
-        || compact.row_count != block_evidence.block_count
+        || segment_index.row_count != block_evidence.settled_segment_index_count
+        || live_tail.row_count != block_evidence.live_tail_block_count
+        || live_tail_raw.row_count != expected_live_tail_raw_count
+        || live_tail_raw.row_count != block_evidence.live_tail_raw_block_count
         || transaction_location.row_count != block_evidence.transaction_count
-        || transaction_blob.row_count != expected_transaction_blob_count
-        || block_blob.row_count != expected_block_blob_count
         || staged_logical_bytes != block_evidence.logical_bytes
         || subtree.row_count != subtree_evidence.subtree_root_count
         || subtree.logical_bytes != subtree_evidence.subtree_root_logical_bytes
@@ -1272,61 +1255,32 @@ mod tests {
     fn manifest_and_control_reject_raw_blob_retention_tampering_in_both_directions_without_rewrite()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
-        let transactions_plan = test_build_plan(crate::RawBlobRetention::Transactions)?;
+        let none_plan = test_build_plan(crate::RawBlobRetention::None)?;
         let all_plan = test_build_plan(crate::RawBlobRetention::All)?;
-        let persisted_transactions = PersistedBuildPlan::from_plan(&transactions_plan);
+        let persisted_none = PersistedBuildPlan::from_plan(&none_plan);
         let persisted_all = PersistedBuildPlan::from_plan(&all_plan);
-        let original_transactions = persisted_transactions.clone();
+        let original_none = persisted_none.clone();
         let original_all = persisted_all.clone();
 
-        for (manifest_plan, control_plan) in [
-            (&persisted_transactions, &all_plan),
-            (&persisted_all, &transactions_plan),
-        ] {
-            let error = validate_manifest_control_parts(
-                temporary.path(),
-                CanonicalStoreWorkload::Wallet,
-                manifest_plan,
-                CanonicalStoreWorkload::Wallet,
-                control_plan,
-            )
-            .err()
-            .ok_or("manifest/control raw-blob retention mismatch must fail closed")?;
+        for (manifest_plan, control_plan) in
+            [(&persisted_none, &all_plan), (&persisted_all, &none_plan)]
+        {
+            let error =
+                validate_manifest_control_parts(temporary.path(), manifest_plan, control_plan)
+                    .err()
+                    .ok_or("manifest/control raw-blob retention mismatch must fail closed")?;
             assert!(error.to_string().contains("differs from store control"));
         }
 
-        assert_eq!(persisted_transactions, original_transactions);
+        assert_eq!(persisted_none, original_none);
         assert_eq!(persisted_all, original_all);
-        Ok(())
-    }
-
-    #[test]
-    fn manifest_and_control_compare_typed_workload_identity()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
-        let build_plan = test_build_plan(crate::RawBlobRetention::Transactions)?;
-        let persisted_plan = PersistedBuildPlan::from_plan(&build_plan);
-
-        assert!(
-            validate_manifest_control_parts(
-                temporary.path(),
-                CanonicalStoreWorkload::Explorer,
-                &persisted_plan,
-                CanonicalStoreWorkload::Wallet,
-                &build_plan,
-            )
-            .is_err()
-        );
         Ok(())
     }
 
     #[test]
     fn manifest_refuses_rows_outside_the_construction_stored_set()
     -> Result<(), Box<dyn std::error::Error>> {
-        use super::super::rocksdb::{
-            BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-            CHAIN_EVENT_COLUMN_FAMILY, TRANSACTION_BLOB_COLUMN_FAMILY,
-        };
+        use super::super::rocksdb::{CHAIN_EVENT_COLUMN_FAMILY, LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY};
 
         let temporary = TempDir::new()?;
         let path = temporary.path().join("canonical");
@@ -1337,12 +1291,7 @@ mod tests {
             BlockHeight::new(2),
             crate::RawBlobRetention::None,
         )?;
-        for name in [
-            BLOCK_BLOB_COLUMN_FAMILY,
-            BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-            TRANSACTION_BLOB_COLUMN_FAMILY,
-            CHAIN_EVENT_COLUMN_FAMILY,
-        ] {
+        for name in [LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY, CHAIN_EVENT_COLUMN_FAMILY] {
             let (mut manifest, _) = read_construction_manifest(&path)?;
             let family = manifest
                 .family_evidence

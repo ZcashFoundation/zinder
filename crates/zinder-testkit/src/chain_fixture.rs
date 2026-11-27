@@ -569,10 +569,10 @@ impl ChainFixture {
 
     /// Sets the raw consensus-blob contract for artifacts built by this fixture.
     ///
-    /// `None` omits every blob, `Transactions` includes each available
-    /// transaction blob, and `All` also includes every block blob. Store
-    /// admission rejects a transaction-retaining fixture when any attached
-    /// transaction row lacks its raw bytes.
+    /// `None` omits every raw consensus blob and `All` retains full block bytes
+    /// alongside zero-copy transaction slices. Store admission rejects an `All`
+    /// fixture when any attached transaction row lacks matching raw bytes inside
+    /// its block's trailing consensus transaction sequence.
     #[must_use]
     pub const fn with_raw_blob_retention(mut self, retention: RawBlobRetention) -> Self {
         self.raw_blob_retention = retention;
@@ -660,7 +660,32 @@ impl ChainFixture {
     /// Attaches canonical transaction rows to this fixture's commit set.
     #[must_use]
     pub fn with_transaction_rows(mut self, transaction_rows: FixtureTransactionRows) -> Self {
+        let block_height = transaction_rows.location.block_height;
+        let block_hash = transaction_rows.location.block_hash;
         self.transaction_rows.push(transaction_rows);
+        if let Some(block) = self
+            .blocks
+            .iter_mut()
+            .find(|candidate| candidate.height == block_height && candidate.hash == block_hash)
+        {
+            let mut raw_block_bytes =
+                format!("zinder-testkit-block-{}", block.height.value()).into_bytes();
+            let mut block_txs = self
+                .transaction_rows
+                .iter()
+                .filter(|row| {
+                    row.location.block_height == block_height
+                        && row.location.block_hash == block_hash
+                })
+                .collect::<Vec<_>>();
+            block_txs.sort_by_key(|row| row.location.tx_index_in_block);
+            for tx_row in block_txs {
+                if let Some(blob) = &tx_row.blob {
+                    raw_block_bytes.extend_from_slice(&blob.raw_transaction_bytes);
+                }
+            }
+            block.raw_block_bytes = raw_block_bytes;
+        }
         self
     }
 

@@ -785,10 +785,7 @@ fn wallet_serving_print_config_marks_coverage() -> Result<(), Box<dyn Error>> {
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("coverage = \"wallet-serving\""), "{stdout}");
     assert!(stdout.contains("explorer_views = false"), "{stdout}");
-    assert!(
-        stdout.contains("raw_blob_policy = \"transactions\""),
-        "{stdout}"
-    );
+    assert!(stdout.contains("raw_blob_policy = \"none\""), "{stdout}");
 
     Ok(())
 }
@@ -950,21 +947,83 @@ fn explorer_views_reject_positive_checkpoint_before_storage_mutation() -> Result
 }
 
 #[test]
-fn wallet_serving_rejects_no_transaction_blob_retention() -> Result<(), Box<dyn Error>> {
+fn wallet_serving_allows_default_none_retention_and_rejects_legacy_transactions()
+-> Result<(), Box<dyn Error>> {
     assert_ingest_cli_rejects(
         |root| {
             Ok(
                 wallet_serving_ingest_config_toml(&root.join("wallet-serving-store"))?.replacen(
                     "[storage]\n",
-                    "[storage]\nraw_blob_policy = \"none\"\n",
+                    "[storage]\nraw_blob_policy = \"transactions\"\n",
                     1,
                 ),
             )
         },
         &[],
         &[],
-        "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"",
+        "does not have variant constructor transactions",
     )
+}
+
+fn assert_profile_print_and_conflict(
+    config_path: &Path,
+    profile: &str,
+    full_blocks: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let mut command = zinder_ingest_command();
+    command
+        .args(["--print-config", "--config", path_str(config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", profile);
+    if let Some(full_blocks) = full_blocks {
+        command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+    }
+    let output = command.output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("[deployment]"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("profile = \"{profile}\"")),
+        "{stdout}"
+    );
+    if full_blocks == Some("true") {
+        assert!(stdout.contains("full_blocks = true"), "{stdout}");
+    }
+    assert!(!stdout.contains("coverage ="), "{stdout}");
+    assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
+    assert!(!stdout.contains("explorer_views ="), "{stdout}");
+
+    let conflicting_policy = if full_blocks == Some("true") {
+        "none"
+    } else {
+        "all"
+    };
+    let mut conflict_command = zinder_ingest_command();
+    conflict_command
+        .args(["--print-config", "--config", path_str(config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+        .env("ZINDER_STORAGE__RAW_BLOB_POLICY", conflicting_policy);
+    if let Some(full_blocks) = full_blocks {
+        conflict_command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+    }
+    let conflict = conflict_command.output()?;
+    assert!(!conflict.status.success(), "{conflict:?}");
+    assert!(String::from_utf8(conflict.stderr)?.contains("remove conflicting overrides"));
+
+    let legacy_transactions = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(config_path)?])
+        .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+        .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+        .output()?;
+    assert!(
+        !legacy_transactions.status.success(),
+        "{legacy_transactions:?}"
+    );
+    assert!(
+        String::from_utf8(legacy_transactions.stderr)?
+            .contains("does not have variant constructor transactions")
+    );
+    Ok(())
 }
 
 #[test]
@@ -982,36 +1041,7 @@ fn deployment_profiles_render_and_reject_conflicting_retention() -> Result<(), B
         ("wallet", Some("true")),
         ("explorer", None),
     ] {
-        let mut command = zinder_ingest_command();
-        command
-            .args(["--print-config", "--config", path_str(&config_path)?])
-            .env("ZINDER_DEPLOYMENT__PROFILE", profile);
-        if let Some(full_blocks) = full_blocks {
-            command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
-        }
-        let output = command.output()?;
-
-        assert!(output.status.success(), "{output:?}");
-        let stdout = String::from_utf8(output.stdout)?;
-        assert!(stdout.contains("[deployment]"), "{stdout}");
-        assert!(
-            stdout.contains(&format!("profile = \"{profile}\"")),
-            "{stdout}"
-        );
-        if full_blocks == Some("true") {
-            assert!(stdout.contains("full_blocks = true"), "{stdout}");
-        }
-        assert!(!stdout.contains("coverage ="), "{stdout}");
-        assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
-        assert!(!stdout.contains("explorer_views ="), "{stdout}");
-
-        let conflict = zinder_ingest_command()
-            .args(["--print-config", "--config", path_str(&config_path)?])
-            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
-            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
-            .output()?;
-        assert!(!conflict.status.success(), "{conflict:?}");
-        assert!(String::from_utf8(conflict.stderr)?.contains("remove conflicting overrides"));
+        assert_profile_print_and_conflict(&config_path, profile, full_blocks)?;
     }
 
     // Wallet/light-wallet presets allow opting in to explorer_views = true, while
@@ -1538,11 +1568,106 @@ fn run_wallet_serving_ingest_print_config(
     Ok(command.output()?)
 }
 
-fn assert_single_volume_legacy_transactions_print_config(
+fn assert_single_volume_legacy_transactions_fails_closed(
     temporary_root: &Path,
+    config_path: &Path,
     store_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    let wallet_serving_ingest_config = temporary_root.join("wallet-serving-ingest.toml");
+    let rejected = run_wallet_serving_ingest_print_config(
+        temporary_root,
+        config_path,
+        store_path,
+        Some("transactions"),
+        None,
+    )?;
+    assert!(!rejected.status.success(), "{rejected:?}");
+    let stderr = String::from_utf8(rejected.stderr)?;
+    assert!(
+        stderr.contains("does not have variant constructor transactions"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+async fn assert_binary_retention_mismatch_rejected(
+    source: &crate::common::construction_fixture::MultiBlockConstructionSource,
+    activations: &std::sync::Arc<zinder_core::NetworkUpgradeActivations>,
+    none_config: &zinder_ingest::CanonicalWriterConfig,
+    readiness: &zinder_runtime::ComposedReadiness,
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::{Arc, atomic::Ordering};
+    use tokio_util::sync::CancellationToken;
+    use zinder_ingest::{CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store};
+    use zinder_store::{CanonicalStoreError, RawBlobRetention};
+
+    let initial_store = admit_canonical_store(
+        source,
+        Arc::clone(activations),
+        none_config,
+        readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(initial_store.raw_blob_retention(), RawBlobRetention::None);
+    let construction_requests = source.chain_segment_requests.load(Ordering::SeqCst);
+    drop(initial_store);
+
+    let full_blocks_config = CanonicalWriterConfig {
+        raw_blob_retention: RawBlobRetention::All,
+        ..none_config.clone()
+    };
+    let rejected = admit_canonical_store(
+        source,
+        Arc::clone(activations),
+        &full_blocks_config,
+        readiness,
+        &CancellationToken::new(),
+    )
+    .await
+    .err()
+    .ok_or("full_blocks = true must reject reopening a none-retention store")?;
+    assert!(
+        matches!(
+            &rejected,
+            CanonicalWriterError::Store(CanonicalStoreError::AdmissionRefused { reason, .. })
+                if reason.contains("raw blob retention")
+                    && reason.contains("none")
+                    && reason.contains("all")
+        ),
+        "{rejected}"
+    );
+
+    let reopened = admit_canonical_store(
+        source,
+        Arc::clone(activations),
+        none_config,
+        readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(reopened.raw_blob_retention(), RawBlobRetention::None);
+    assert_eq!(
+        source.chain_segment_requests.load(Ordering::SeqCst),
+        construction_requests
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_transactions_policy_fails_closed_and_binary_retention_mismatch_is_refused()
+-> Result<(), Box<dyn Error>> {
+    use std::sync::Arc;
+    use zinder_runtime::{ComposedReadiness, Readiness};
+
+    use crate::common::construction_fixture::{
+        MultiBlockConstructionSource, multi_block_writer_config, regtest_activations,
+    };
+
+    let activations = regtest_activations();
+    let source =
+        MultiBlockConstructionSource::build_with_transactions(2, &activations, |_| Ok(Vec::new()))?;
+    let directory = tempdir()?;
+    let wallet_serving_ingest_config = directory.path().join("wallet-serving-ingest.toml");
     fs::write(
         &wallet_serving_ingest_config,
         concat!(
@@ -1555,119 +1680,23 @@ fn assert_single_volume_legacy_transactions_print_config(
             "checkpoint_bearer_token_path = \"/var/run/zinder-checkpoint/checkpoint.token\"\n",
         ),
     )?;
-    let printed = run_wallet_serving_ingest_print_config(
-        temporary_root,
-        &wallet_serving_ingest_config,
-        store_path,
-        Some("transactions"),
-        None,
-    )?;
-    assert!(printed.status.success(), "{printed:?}");
-    let stdout = String::from_utf8(printed.stdout)?;
-    assert!(
-        stdout.contains("raw_blob_policy = \"transactions\""),
-        "{stdout}"
-    );
-    assert!(stdout.contains("coverage = \"wallet-serving\""), "{stdout}");
-    assert!(!stdout.contains("[deployment]"), "{stdout}");
-
-    let conflicting = run_wallet_serving_ingest_print_config(
-        temporary_root,
-        &wallet_serving_ingest_config,
-        store_path,
-        Some("transactions"),
-        Some("wallet"),
-    )?;
-    assert!(!conflicting.status.success(), "{conflicting:?}");
-    assert!(String::from_utf8(conflicting.stderr)?.contains("remove conflicting overrides"));
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_transactions_single_volume_override_reopens_pre_change_store()
--> Result<(), Box<dyn Error>> {
-    use std::sync::{Arc, atomic::Ordering};
-
-    use tokio_util::sync::CancellationToken;
-    use zinder_ingest::{CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store};
-    use zinder_runtime::{ComposedReadiness, Readiness};
-    use zinder_store::{CanonicalStoreError, RawBlobRetention};
-
-    use crate::common::construction_fixture::{
-        MultiBlockConstructionSource, multi_block_writer_config, regtest_activations,
-    };
-
-    let activations = regtest_activations();
-    let source =
-        MultiBlockConstructionSource::build_with_transactions(2, &activations, |_| Ok(Vec::new()))?;
-    let directory = tempdir()?;
     let store_path = directory.path().join("canonical");
-    let legacy_config =
+    assert_single_volume_legacy_transactions_fails_closed(
+        directory.path(),
+        &wallet_serving_ingest_config,
+        &store_path,
+    )?;
+
+    let none_config =
         multi_block_writer_config(store_path.clone(), Arc::clone(&activations), false);
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
-    let initial_store = admit_canonical_store(
+    Box::pin(assert_binary_retention_mismatch_rejected(
         &source,
-        Arc::clone(&activations),
-        &legacy_config,
+        &activations,
+        &none_config,
         &readiness,
-        &CancellationToken::new(),
-    )
-    .await?;
-    assert_eq!(
-        initial_store.raw_blob_retention(),
-        RawBlobRetention::Transactions
-    );
-    let construction_requests = source.chain_segment_requests.load(Ordering::SeqCst);
-    drop(initial_store);
-
-    // The single-volume image's default `wallet` profile (`raw_blob_policy = "none"`)
-    // must fail writer admission against a pre-change `transactions` store.
-    let wallet_profile_config = CanonicalWriterConfig {
-        raw_blob_retention: RawBlobRetention::None,
-        ..legacy_config.clone()
-    };
-    let rejected = admit_canonical_store(
-        &source,
-        Arc::clone(&activations),
-        &wallet_profile_config,
-        &readiness,
-        &CancellationToken::new(),
-    )
+    ))
     .await
-    .err()
-    .ok_or("default wallet profile must reject reopening a pre-change transactions store")?;
-    assert!(
-        matches!(
-            &rejected,
-            CanonicalWriterError::Store(CanonicalStoreError::AdmissionRefused { reason, .. })
-                if reason.contains("raw blob retention")
-                    && reason.contains("transactions")
-                    && reason.contains("none")
-        ),
-        "{rejected}"
-    );
-
-    // Leaving ZINDER_DEPLOYMENT__PROFILE unset when ZINDER_STORAGE__RAW_BLOB_POLICY=transactions
-    // resolves cleanly and reopens without rebuild.
-    assert_single_volume_legacy_transactions_print_config(directory.path(), &store_path)?;
-
-    let reopened = admit_canonical_store(
-        &source,
-        Arc::clone(&activations),
-        &legacy_config,
-        &readiness,
-        &CancellationToken::new(),
-    )
-    .await?;
-    assert_eq!(
-        reopened.raw_blob_retention(),
-        RawBlobRetention::Transactions
-    );
-    assert_eq!(
-        source.chain_segment_requests.load(Ordering::SeqCst),
-        construction_requests
-    );
-    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

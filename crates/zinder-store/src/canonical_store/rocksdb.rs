@@ -19,10 +19,9 @@ use crate::{
 
 use super::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildState,
-    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    CanonicalSubtreeRootLoadCoverage,
+    CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalSubtreeRootLoadCoverage,
     activation_schedule::CanonicalActivationSchedule,
-    block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, CanonicalReplayScan},
+    block_replay::CanonicalReplayScan,
     construction_manifest::{
         copy_construction_manifest, read_construction_manifest_binding,
         validate_ready_construction_manifest,
@@ -40,6 +39,16 @@ use super::{
     },
     publication::{read_chain_epoch_tips, validate_ready_publication},
     replay_tail::AuthenticatedReplayTail,
+    settled_segments::{
+        cache::SettledSegmentReaderCache,
+        layout::SettledSegmentIndexEntry,
+        sealer::{cleanup_stale_staging_files, cleanup_unreferenced_segment_files},
+        snapshot::{snapshot_pinned_segments, verify_pinned_segments_into_cache},
+        store_access::{
+            SegmentStoreContext, read_all_settled_segment_entries, segment_modules_for_stored_set,
+            sync_segments_manifest_from_db, verify_cold_segments_and_manifest,
+        },
+    },
     stored_set::{CANONICAL_DATA_COLUMN_FAMILIES, validate_exact_column_families},
 };
 
@@ -104,8 +113,6 @@ pub struct CanonicalOwnerCheckpointEvidence {
     pub store_identity: &'static str,
     /// Exact physical schema admitted from the checkpoint.
     pub schema_version: u16,
-    /// Immutable workload admitted from the checkpoint.
-    pub workload: CanonicalStoreWorkload,
     /// Complete canonical construction identity admitted from the checkpoint.
     pub build_plan: super::CanonicalStoreBuildPlan,
     /// Persisted READY evidence read from the cold-opened checkpoint.
@@ -126,7 +133,6 @@ pub struct CanonicalOwnerCheckpointEvidence {
 /// [`RocksDbCanonicalStore::cold_admit_owner_checkpoint`].
 #[derive(Clone, Debug)]
 pub struct CanonicalOwnerCheckpointAdmission {
-    workload: CanonicalStoreWorkload,
     build_plan: super::CanonicalStoreBuildPlan,
     database_identity: Vec<u8>,
     activation_schedule: Option<CanonicalActivationSchedule>,
@@ -136,19 +142,16 @@ pub struct CanonicalOwnerCheckpointAdmission {
 pub(super) const STORE_CONTROL_KEY: &[u8] = b"store_control";
 pub(super) const BLOCK_HEADER_COLUMN_FAMILY: &str = "block_header";
 pub(super) const BLOCK_HASH_INDEX_COLUMN_FAMILY: &str = "block_hash_index";
-pub(super) const DAILY_VALUE_POOL_BALANCE_COLUMN_FAMILY: &str = "daily_value_pool_balance";
 pub(super) const TRANSACTION_LOCATION_COLUMN_FAMILY: &str = "transaction_location";
-pub(super) const COMPACT_BLOCK_COLUMN_FAMILY: &str = "compact_block";
+pub(super) const LIVE_TAIL_BLOCK_COLUMN_FAMILY: &str = "live_tail_block";
+pub(super) const LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY: &str = "live_tail_raw_block";
+pub(super) const SETTLED_SEGMENT_INDEX_COLUMN_FAMILY: &str = "settled_segment_index";
 pub(super) const TREE_STATE_CHECKPOINT_COLUMN_FAMILY: &str = "tree_state_checkpoint";
-pub(super) const BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY: &str =
-    "block_final_note_commitment_roots";
 pub(super) const SUBTREE_ROOT_COLUMN_FAMILY: &str = "subtree_root";
 pub(super) const CHAIN_EPOCH_COLUMN_FAMILY: &str = "chain_epoch";
 pub(super) const CHAIN_EVENT_COLUMN_FAMILY: &str = "chain_event";
 pub(super) const MEMPOOL_EVENT_COLUMN_FAMILY: &str = "mempool_event";
 pub(super) const DISPLACED_BLOCK_FACTS_COLUMN_FAMILY: &str = "displaced_block_facts";
-pub(super) const BLOCK_BLOB_COLUMN_FAMILY: &str = "block_blob";
-pub(super) const TRANSACTION_BLOB_COLUMN_FAMILY: &str = "transaction_blob";
 
 #[derive(Clone)]
 pub(super) struct CanonicalStoreAdmissionExpectation {
@@ -161,7 +164,7 @@ pub(super) struct CanonicalStoreAdmissionExpectation {
 
 #[derive(Clone)]
 pub(super) enum StoredDataAdmission {
-    Exact(CanonicalStoreWorkload, RawBlobRetention),
+    Exact(RawBlobRetention),
     Minimum(super::CanonicalStoreRequirements),
 }
 
@@ -222,7 +225,6 @@ impl CanonicalStoreAdmissionExpectation {
     /// window, which equals the construction window until a writer raise.
     pub(super) fn from_build_plan(
         build_plan: &super::CanonicalStoreBuildPlan,
-        workload: CanonicalStoreWorkload,
         effective_reorg_policy: super::CanonicalReorgPolicy,
     ) -> Self {
         Self {
@@ -231,7 +233,7 @@ impl CanonicalStoreAdmissionExpectation {
                 build_plan.network_upgrade_activations_fingerprint(),
             ),
             allow_schedule_update: false,
-            stored_data: StoredDataAdmission::Exact(workload, build_plan.raw_blob_retention()),
+            stored_data: StoredDataAdmission::Exact(build_plan.raw_blob_retention()),
             reorg_policy: ReorgPolicyAdmission::Exact(effective_reorg_policy),
         }
     }
@@ -266,7 +268,6 @@ impl CanonicalStoreAdmissionExpectation {
 /// This serving type cannot represent or reopen an unpublished BUILDING store.
 pub struct RocksDbCanonicalStore {
     pub(super) bounded_open: BoundedRocksDbOpen,
-    pub(super) workload: CanonicalStoreWorkload,
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
@@ -285,6 +286,10 @@ pub struct RocksDbCanonicalStore {
     /// Unsettled replay rows this handle has authenticated, extended by each
     /// committed transition.
     pub(super) replay_tail: AuthenticatedReplayTail,
+    /// Bounded LRU cache of verified settled-segment readers rooted at this store.
+    pub(super) segment_cache: Arc<SettledSegmentReaderCache>,
+    /// Contiguous ascending settled-segment entries cached in memory for `O(log N)` routing.
+    pub(super) sealed_segments: Vec<SettledSegmentIndexEntry>,
 }
 
 impl RocksDbCanonicalStore {
@@ -294,18 +299,18 @@ impl RocksDbCanonicalStore {
     )]
     pub(super) fn from_published(
         bounded_open: BoundedRocksDbOpen,
-        workload: CanonicalStoreWorkload,
         build_plan: super::CanonicalStoreBuildPlan,
         cursor_auth_key: [u8; 32],
         ready_evidence: &CanonicalStoreReadyEvidence,
         subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
         activation_schedule: CanonicalActivationSchedule,
         replay_tail: AuthenticatedReplayTail,
+        sealed_segments: Vec<SettledSegmentIndexEntry>,
+        segment_cache: Arc<SettledSegmentReaderCache>,
     ) -> Self {
-        let stored_set = build_plan.admitted_stored_set(workload, subtree_root_coverage);
+        let stored_set = build_plan.admitted_stored_set(subtree_root_coverage);
         Self {
             bounded_open,
-            workload,
             build_plan,
             cursor_auth_key,
             ready_evidence: *ready_evidence,
@@ -315,6 +320,16 @@ impl RocksDbCanonicalStore {
             activation_schedule: Some(activation_schedule),
             revised_reorg_policy: None,
             replay_tail,
+            segment_cache,
+            sealed_segments,
+        }
+    }
+
+    pub(super) fn segment_context(&self) -> SegmentStoreContext<'_> {
+        SegmentStoreContext {
+            db: &self.bounded_open.db,
+            segment_cache: Some(&self.segment_cache),
+            sealed_segments: Some(&self.sealed_segments),
         }
     }
 
@@ -322,17 +337,12 @@ impl RocksDbCanonicalStore {
     ///
     /// Admission validates the complete column-family set, singleton control
     /// key, identity, schema, exact baseline or admitted network-upgrade table,
-    /// workload, raw-blob retention, canonical reorg policy, source range,
+    /// raw-blob retention, canonical reorg policy, source range,
     /// construction manifest identity, and readiness evidence before opening a
     /// writer that cannot create data families.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "primary admission keeps the filesystem identity and every immutable canonical contract explicit"
-    )]
     pub fn open_ready(
         path: impl AsRef<Path>,
         expected_network_upgrade_activations: &NetworkUpgradeActivations,
-        expected_workload: CanonicalStoreWorkload,
         expected_raw_blob_retention: RawBlobRetention,
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resource_budget: RocksDbResourceBudget,
@@ -340,7 +350,7 @@ impl RocksDbCanonicalStore {
         let path = path.as_ref();
         let expectation = CanonicalStoreAdmissionExpectation::from_activations(
             expected_network_upgrade_activations,
-            StoredDataAdmission::Exact(expected_workload, expected_raw_blob_retention),
+            StoredDataAdmission::Exact(expected_raw_blob_retention),
             expected_reorg_policy,
         );
         Self::open_ready_with_expectation(path, &expectation, resource_budget)
@@ -353,21 +363,16 @@ impl RocksDbCanonicalStore {
     /// A raise is a monotonic store revision: the settled tip does not move,
     /// so the replaceable suffix grows to the new window as blocks arrive.
     /// A smaller window than the persisted effective one is refused.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "writer admission preserves the existing explicit immutable-store options"
-    )]
     pub fn open_ready_with_network_upgrade_schedule(
         path: impl AsRef<Path>,
         observed_activations: &NetworkUpgradeActivations,
-        expected_workload: CanonicalStoreWorkload,
         expected_raw_blob_retention: RawBlobRetention,
         reorg_policy: super::CanonicalReorgPolicy,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
         let expectation = CanonicalStoreAdmissionExpectation::from_activations(
             observed_activations,
-            StoredDataAdmission::Exact(expected_workload, expected_raw_blob_retention),
+            StoredDataAdmission::Exact(expected_raw_blob_retention),
             reorg_policy,
         )
         .allowing_schedule_update()
@@ -545,7 +550,6 @@ impl RocksDbCanonicalStore {
     ) -> Result<DecodedStoreControl, CanonicalStoreError> {
         let path = self.bounded_open.db.path();
         let encoded_control = encode_ready_store_control_with_revisions(
-            self.workload,
             &self.build_plan,
             self.cursor_auth_key,
             &self.ready_evidence,
@@ -565,11 +569,7 @@ impl RocksDbCanonicalStore {
         validate_open_store_control(
             &self.bounded_open.db,
             path,
-            &CanonicalStoreAdmissionExpectation::from_build_plan(
-                &self.build_plan,
-                self.workload,
-                reorg_policy,
-            ),
+            &CanonicalStoreAdmissionExpectation::from_build_plan(&self.build_plan, reorg_policy),
         )
     }
 
@@ -578,11 +578,25 @@ impl RocksDbCanonicalStore {
         expectation: &CanonicalStoreAdmissionExpectation,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
+        Self::open_ready_with_mode(
+            path,
+            expectation,
+            resource_budget,
+            PrimarySegmentOpenMode::HealPrimary,
+        )
+    }
+
+    fn open_ready_with_mode(
+        path: &Path,
+        expectation: &CanonicalStoreAdmissionExpectation,
+        resource_budget: RocksDbResourceBudget,
+        mode: PrimarySegmentOpenMode,
+    ) -> Result<Self, CanonicalStoreError> {
         validate_resource_budget(resource_budget)?;
         let store_path = canonical_store_path(path)?;
         let (admitted_database_identity, admitted_control, admitted_subtree_root_coverage) =
             admit_existing_store(&store_path, expectation, resource_budget)?;
-        let (CanonicalStoreBuildState::Ready(admitted_ready_evidence), Some(subtree_root_coverage)) =
+        let (CanonicalStoreBuildState::Ready(_), Some(subtree_root_coverage)) =
             (admitted_control.build_state, admitted_subtree_root_coverage)
         else {
             return Err(CanonicalStoreError::StoreNotReady { path: store_path });
@@ -596,57 +610,46 @@ impl RocksDbCanonicalStore {
             operation: "open ready",
             source,
         })?;
-        let opened_database_identity = bounded_open.db.get_db_identity().map_err(|source| {
-            CanonicalStoreError::RocksDbOperation {
-                operation: "database identity read",
-                source,
-            }
-        })?;
-        if opened_database_identity != admitted_database_identity {
-            return Err(CanonicalStoreError::admission(
-                &store_path,
-                "database identity changed during admission",
-            ));
-        }
-        let opened_control =
-            validate_open_store_control(&bounded_open.db, &store_path, expectation)?;
-        validate_mempool_lifecycle_admission(
+        let opened_control = verify_opened_primary_control(
             &bounded_open.db,
-            opened_control.network,
-            opened_control.cursor_auth_key,
+            &store_path,
+            expectation,
+            &admitted_database_identity,
+            &admitted_control,
         )?;
-        if opened_control != admitted_control {
-            return Err(CanonicalStoreError::admission(
-                &store_path,
-                "store control changed during admission",
-            ));
-        }
         let CanonicalStoreBuildState::Ready(opened_ready_evidence) = opened_control.build_state
         else {
             return Err(CanonicalStoreError::StoreNotReady { path: store_path });
         };
-        if opened_ready_evidence != admitted_ready_evidence {
-            return Err(CanonicalStoreError::admission(
-                &store_path,
-                "ready evidence changed during admission",
-            ));
-        }
         let activation_schedule =
             read_admitted_schedule(&bounded_open.db, &store_path, &opened_control)?;
         let reorg_policy = opened_control.effective_reorg_policy();
         let build_plan = opened_control.build_plan;
-        let stored_set =
-            build_plan.admitted_stored_set(opened_control.workload, subtree_root_coverage);
-        let replay_tail = validate_ready_publication(
-            &bounded_open.db,
-            &build_plan,
-            reorg_policy,
-            &opened_ready_evidence,
-        )?;
+        let stored_set = build_plan.admitted_stored_set(subtree_root_coverage);
+        let (sealed_segments, segment_cache) = match mode {
+            PrimarySegmentOpenMode::HealPrimary => cleanup_primary_segments_and_build_cache(
+                &store_path,
+                &bounded_open.db,
+                build_plan.network(),
+                stored_set,
+            )?,
+            PrimarySegmentOpenMode::VerifyImmutableCold => verify_cold_segments_and_manifest(
+                &store_path,
+                &bounded_open.db,
+                build_plan.network(),
+                stored_set,
+            )?,
+        };
+        let ctx = SegmentStoreContext {
+            db: &bounded_open.db,
+            segment_cache: Some(&segment_cache),
+            sealed_segments: Some(&sealed_segments),
+        };
+        let replay_tail =
+            validate_ready_publication(ctx, &build_plan, reorg_policy, &opened_ready_evidence)?;
         super::displaced_archive::backfill_displaced_root_index_if_absent(&bounded_open.db)?;
         Ok(Self {
             bounded_open,
-            workload: opened_control.workload,
             build_plan,
             cursor_auth_key: opened_control.cursor_auth_key,
             ready_evidence: opened_ready_evidence,
@@ -656,6 +659,8 @@ impl RocksDbCanonicalStore {
             activation_schedule,
             revised_reorg_policy: opened_control.revised_reorg_policy,
             replay_tail,
+            segment_cache,
+            sealed_segments,
         })
     }
 
@@ -703,6 +708,7 @@ impl RocksDbCanonicalStore {
             }
         })?;
         copy_construction_manifest(self.bounded_open.db.path(), target)?;
+        snapshot_pinned_segments(self.bounded_open.db.path(), target, &self.sealed_segments)?;
         Ok(admission)
     }
 
@@ -726,7 +732,6 @@ impl RocksDbCanonicalStore {
             }
         })?;
         Ok(CanonicalOwnerCheckpointAdmission {
-            workload: self.workload,
             build_plan: self.build_plan.clone(),
             database_identity,
             activation_schedule: self.activation_schedule.clone(),
@@ -748,11 +753,14 @@ impl RocksDbCanonicalStore {
         let target = target.as_ref();
         let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
             &admission.build_plan,
-            admission.workload,
             admission.reorg_policy,
         );
-        let cold_checkpoint =
-            Self::open_ready_with_expectation(target, &expectation, admission_resource_budget)?;
+        let cold_checkpoint = Self::open_ready_with_mode(
+            target,
+            &expectation,
+            admission_resource_budget,
+            PrimarySegmentOpenMode::VerifyImmutableCold,
+        )?;
         let cold_database_identity =
             cold_checkpoint
                 .bounded_open
@@ -778,7 +786,6 @@ impl RocksDbCanonicalStore {
             database_identity: cold_database_identity,
             store_identity: CANONICAL_STORE_IDENTITY,
             schema_version: CANONICAL_STORE_SCHEMA_VERSION,
-            workload: cold_checkpoint.workload,
             build_plan: cold_checkpoint.build_plan.clone(),
             ready_evidence: cold_checkpoint.ready_evidence,
             reorg_policy: cold_checkpoint.reorg_policy(),
@@ -798,27 +805,34 @@ impl RocksDbCanonicalStore {
         let opened = open_canonical_admission_probe(target, budget)?;
         let expectation = CanonicalStoreAdmissionExpectation::adopting_writer_schedule(
             network,
-            StoredDataAdmission::Exact(CanonicalStoreWorkload::Wallet, retention),
+            StoredDataAdmission::Exact(retention),
             reorg_policy,
         );
-        let (database_identity, control, _) = admit_open_store(target, &opened.db, &expectation)?;
-        let CanonicalStoreBuildState::Ready(ready_evidence) = control.build_state else {
+        let (database_identity, control, subtree_root_coverage) =
+            admit_open_store(target, &opened.db, &expectation)?;
+        let (CanonicalStoreBuildState::Ready(ready_evidence), Some(subtree_root_coverage)) =
+            (control.build_state, subtree_root_coverage)
+        else {
             return Err(CanonicalStoreError::StoreNotReady {
                 path: target.to_path_buf(),
             });
         };
-        validate_ready_publication(
-            &opened.db,
-            &control.build_plan,
-            reorg_policy,
-            &ready_evidence,
-        )?;
+        let stored_set = control
+            .build_plan
+            .admitted_stored_set(subtree_root_coverage);
+        let (sealed_segments, segment_cache) =
+            verify_cold_segments_and_manifest(target, &opened.db, control.network, stored_set)?;
+        let ctx = SegmentStoreContext {
+            db: &opened.db,
+            segment_cache: Some(&segment_cache),
+            sealed_segments: Some(&sealed_segments),
+        };
+        validate_ready_publication(ctx, &control.build_plan, reorg_policy, &ready_evidence)?;
         let activation_schedule = read_admitted_schedule(&opened.db, target, &control)?;
         Ok(CanonicalOwnerCheckpointEvidence {
             database_identity,
             store_identity: CANONICAL_STORE_IDENTITY,
             schema_version: CANONICAL_STORE_SCHEMA_VERSION,
-            workload: control.workload,
             build_plan: control.build_plan,
             ready_evidence,
             reorg_policy,
@@ -835,13 +849,13 @@ impl RocksDbCanonicalStore {
     ) -> Result<(), CanonicalStoreError> {
         let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
             &checkpoint.build_plan,
-            checkpoint.workload,
             checkpoint.reorg_policy,
         );
-        let store = Self::open_ready_with_expectation(
+        let store = Self::open_ready_with_mode(
             target,
             &expectation,
             RocksDbResourceBudget::read_only_probe_defaults(),
+            PrimarySegmentOpenMode::VerifyImmutableCold,
         )?;
         let identity = store.bounded_open.db.get_db_identity().map_err(|source| {
             CanonicalStoreError::CheckpointFailed {
@@ -964,12 +978,6 @@ impl RocksDbCanonicalStore {
             .map(CanonicalActivationSchedule::binding)
     }
 
-    /// Returns the immutable canonical workload persisted by the store.
-    #[must_use]
-    pub const fn workload(&self) -> CanonicalStoreWorkload {
-        self.workload
-    }
-
     /// Returns the retained block data and historical floor.
     #[must_use]
     pub const fn stored_set(&self) -> super::CanonicalStoredSet {
@@ -1020,14 +1028,14 @@ impl RocksDbCanonicalStore {
     /// replay row, and verifies the final count, tip, and ordered sequence digest
     /// against the READY record before it terminates successfully.
     pub fn scan_canonical_replay(&self) -> Result<CanonicalReplayScan<'_>, CanonicalStoreError> {
-        CanonicalReplayScan::new(&self.bounded_open.db, &self.ready_evidence)
+        CanonicalReplayScan::new(self.segment_context(), &self.ready_evidence)
     }
 
     /// Returns a `Sync` slice source for concurrent height-bounded replay scans
     /// against this admitted READY fence.
     #[must_use]
-    pub const fn canonical_replay_slice_source(&self) -> super::CanonicalReplaySliceSource<'_> {
-        super::CanonicalReplaySliceSource::new(&self.bounded_open.db, &self.ready_evidence)
+    pub fn canonical_replay_slice_source(&self) -> super::CanonicalReplaySliceSource<'_> {
+        super::CanonicalReplaySliceSource::new(self.segment_context(), &self.ready_evidence)
     }
 
     /// Publishes throttled resource gauges for the canonical writer.
@@ -1137,12 +1145,9 @@ impl CanonicalColumnFamilyOptions {
 
     pub(super) fn for_family(&self, name: &str) -> &Options {
         match name {
-            BLOCK_REPLAY_COLUMN_FAMILY
-            | COMPACT_BLOCK_COLUMN_FAMILY
-            | TREE_STATE_CHECKPOINT_COLUMN_FAMILY
-            | TRANSACTION_BLOB_COLUMN_FAMILY
-            | BLOCK_BLOB_COLUMN_FAMILY
-            | DISPLACED_BLOCK_FACTS_COLUMN_FAMILY => &self.cold,
+            TREE_STATE_CHECKPOINT_COLUMN_FAMILY
+            | DISPLACED_BLOCK_FACTS_COLUMN_FAMILY
+            | LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY => &self.cold,
             BLOCK_HASH_INDEX_COLUMN_FAMILY | TRANSACTION_LOCATION_COLUMN_FAMILY => {
                 &self.uncompressed
             }
@@ -1150,6 +1155,81 @@ impl CanonicalColumnFamilyOptions {
             _ => &self.hot,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimarySegmentOpenMode {
+    HealPrimary,
+    VerifyImmutableCold,
+}
+
+fn verify_opened_primary_control(
+    db: &DB,
+    store_path: &Path,
+    expectation: &CanonicalStoreAdmissionExpectation,
+    admitted_database_identity: &[u8],
+    admitted_control: &DecodedStoreControl,
+) -> Result<DecodedStoreControl, CanonicalStoreError> {
+    let opened_database_identity =
+        db.get_db_identity()
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "opened database identity read",
+                source,
+            })?;
+    if opened_database_identity.as_slice() != admitted_database_identity {
+        return Err(CanonicalStoreError::admission(
+            store_path,
+            "store database identity changed before opening primary",
+        ));
+    }
+    let opened_control = validate_open_store_control(db, store_path, expectation)?;
+    validate_mempool_lifecycle_admission(
+        db,
+        opened_control.network,
+        opened_control.cursor_auth_key,
+    )?;
+    if opened_control != *admitted_control {
+        return Err(CanonicalStoreError::admission(
+            store_path,
+            "store control state changed before opening primary",
+        ));
+    }
+    Ok(opened_control)
+}
+
+fn cleanup_primary_segments_and_build_cache(
+    store_path: &Path,
+    db: &DB,
+    network: Network,
+    stored_set: super::CanonicalStoredSet,
+) -> Result<
+    (
+        Vec<SettledSegmentIndexEntry>,
+        Arc<SettledSegmentReaderCache>,
+    ),
+    CanonicalStoreError,
+> {
+    cleanup_stale_staging_files(store_path)?;
+    let entries = read_all_settled_segment_entries(db)?;
+    let expected_modules = segment_modules_for_stored_set(stored_set);
+    for entry in &entries {
+        if entry.modules != expected_modules {
+            return Err(CanonicalStoreError::SettledSegment {
+                reason: format!(
+                    "settled segment {}-{} modules {:?} do not match admitted modules {:?}",
+                    entry.start_height.value(),
+                    entry.end_block.height.value(),
+                    entry.modules,
+                    expected_modules
+                ),
+            });
+        }
+    }
+    cleanup_unreferenced_segment_files(store_path, &entries)?;
+    let cache = SettledSegmentReaderCache::with_default_capacity(store_path, false)?;
+    verify_pinned_segments_into_cache(store_path, &entries, false, &cache)?;
+    let _ = sync_segments_manifest_from_db(db, network)?;
+    Ok((entries, cache))
 }
 
 fn canonical_data_options(block_cache: &Cache, resource_budget: RocksDbResourceBudget) -> Options {
@@ -1204,7 +1284,6 @@ pub(super) fn create_fresh_directory(path: &Path) -> Result<(), CanonicalStoreEr
 
 pub(super) fn initialize_store_identity(
     path: &Path,
-    workload: CanonicalStoreWorkload,
     build_plan: &super::CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
     resource_budget: RocksDbResourceBudget,
@@ -1219,7 +1298,7 @@ pub(super) fn initialize_store_identity(
         source,
     })?;
     let mut batch = WriteBatch::default();
-    let encoded_control = encode_building_store_control(workload, build_plan, cursor_auth_key)
+    let encoded_control = encode_building_store_control(build_plan, cursor_auth_key)
         .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
     batch.put(STORE_CONTROL_KEY, encoded_control);
     let mut options = WriteOptions::default();
@@ -1280,7 +1359,6 @@ fn admit_open_store(
         CanonicalStoreBuildState::Ready(ready) => Some(validate_ready_construction_manifest(
             path,
             &ready,
-            control.workload,
             &control.build_plan,
         )?),
         CanonicalStoreBuildState::Building => None,
@@ -1297,19 +1375,9 @@ fn validate_stored_data(
     expectation: &CanonicalStoreAdmissionExpectation,
     persisted: &DecodedStoreControl,
 ) -> Result<(), CanonicalStoreError> {
-    let StoredDataAdmission::Exact(workload, retention) = expectation.stored_data else {
+    let StoredDataAdmission::Exact(retention) = expectation.stored_data else {
         return Ok(());
     };
-    if persisted.workload != workload {
-        return Err(CanonicalStoreError::admission(
-            path,
-            format!(
-                "persisted workload {} does not equal requested workload {}",
-                persisted.workload.as_str(),
-                workload.as_str()
-            ),
-        ));
-    }
     if persisted.build_plan.raw_blob_retention() != retention {
         return Err(CanonicalStoreError::admission(
             path,
@@ -1555,28 +1623,19 @@ mod tests {
             ),
             (BLOCK_HEADER_COLUMN_FAMILY, DBCompressionType::Lz4, None),
             (SUBTREE_ROOT_COLUMN_FAMILY, DBCompressionType::Lz4, None),
+            (LIVE_TAIL_BLOCK_COLUMN_FAMILY, DBCompressionType::Lz4, None),
             (
-                BLOCK_REPLAY_COLUMN_FAMILY,
+                SETTLED_SEGMENT_INDEX_COLUMN_FAMILY,
                 DBCompressionType::Lz4,
-                Some(DBCompressionType::Zstd),
+                None,
             ),
             (
-                COMPACT_BLOCK_COLUMN_FAMILY,
+                LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY,
                 DBCompressionType::Lz4,
                 Some(DBCompressionType::Zstd),
             ),
             (
                 TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-                DBCompressionType::Lz4,
-                Some(DBCompressionType::Zstd),
-            ),
-            (
-                TRANSACTION_BLOB_COLUMN_FAMILY,
-                DBCompressionType::Lz4,
-                Some(DBCompressionType::Zstd),
-            ),
-            (
-                BLOCK_BLOB_COLUMN_FAMILY,
                 DBCompressionType::Lz4,
                 Some(DBCompressionType::Zstd),
             ),
@@ -1614,56 +1673,43 @@ mod tests {
     }
 
     #[test]
-    fn v7_physical_inventory_is_exact_for_every_construction_policy()
+    fn v2_physical_inventory_is_exact_for_every_construction_policy()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let activations = super::super::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let mut expected = [
-            "block_blob",
-            "block_final_note_commitment_roots",
             "block_hash_index",
             "block_header",
-            "block_replay",
             "chain_epoch",
             "chain_event",
-            "compact_block",
-            "daily_value_pool_balance",
             "default",
             "displaced_block_facts",
+            "live_tail_block",
+            "live_tail_raw_block",
             "mempool_event",
+            "settled_segment_index",
             "subtree_root",
-            "transaction_blob",
             "transaction_location",
             "tree_state_checkpoint",
         ];
         expected.sort_unstable();
-        for workload in [
-            CanonicalStoreWorkload::Wallet,
-            CanonicalStoreWorkload::Explorer,
-        ] {
-            for retention in [
-                RawBlobRetention::None,
-                RawBlobRetention::Transactions,
-                RawBlobRetention::All,
-            ] {
-                let path = temporary.path().join(format!("{workload:?}-{retention}"));
-                let build_plan = CanonicalStoreBuildPlan::complete(
-                    &activations,
-                    0,
-                    BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
-                    retention,
-                    CanonicalReorgPolicy::new(100)?,
-                )?;
-                drop(RocksDbCanonicalBuilder::create_fresh(
-                    &path,
-                    workload,
-                    build_plan,
-                    RocksDbResourceBudget::for_local_tests(),
-                )?);
-                let mut observed = DB::list_cf(&Options::default(), &path)?;
-                observed.sort_unstable();
-                assert_eq!(observed, expected, "{workload:?} / {retention}");
-            }
+        for retention in [RawBlobRetention::None, RawBlobRetention::All] {
+            let path = temporary.path().join(format!("{retention}"));
+            let build_plan = CanonicalStoreBuildPlan::complete(
+                &activations,
+                0,
+                BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+                retention,
+                CanonicalReorgPolicy::new(100)?,
+            )?;
+            drop(RocksDbCanonicalBuilder::create_fresh(
+                &path,
+                build_plan,
+                RocksDbResourceBudget::for_local_tests(),
+            )?);
+            let mut observed = DB::list_cf(&Options::default(), &path)?;
+            observed.sort_unstable();
+            assert_eq!(observed, expected, "{retention}");
         }
         Ok(())
     }
@@ -1674,7 +1720,6 @@ mod tests {
         let path = temporary.path().join("canonical");
         let store = RocksDbCanonicalBuilder::create_fresh(
             &path,
-            CanonicalStoreWorkload::Explorer,
             complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1685,7 +1730,6 @@ mod tests {
             store.network_upgrade_activations_fingerprint(),
             testnet_activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
         );
-        assert_eq!(store.workload(), CanonicalStoreWorkload::Explorer);
         assert_eq!(
             store.build_plan().history_bounds(),
             CanonicalHistoryBounds::complete()
@@ -1695,8 +1739,7 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             &path,
             &testnet_activations,
-            CanonicalStoreWorkload::Explorer,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1711,8 +1754,7 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             &path,
             &mainnet_activations,
-            CanonicalStoreWorkload::Explorer,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1727,14 +1769,17 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             &path,
             &testnet_activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
-        .ok_or("workload mismatch should be rejected")?;
-        assert!(error.to_string().contains("persisted workload explorer"));
+        .ok_or("retention mismatch should be rejected")?;
+        assert!(
+            error
+                .to_string()
+                .contains("persisted raw blob retention all")
+        );
         assert_eq!(read_control(&path)?, control_before);
         Ok(())
     }
@@ -1745,7 +1790,6 @@ mod tests {
         let path = temporary.path().join("activation-mismatch");
         let store = RocksDbCanonicalBuilder::create_fresh(
             &path,
-            CanonicalStoreWorkload::Explorer,
             complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1771,8 +1815,7 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             &path,
             &shifted_activations,
-            CanonicalStoreWorkload::Explorer,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1800,8 +1843,7 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             &path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Explorer,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1829,7 +1871,6 @@ mod tests {
         let path = temporary.path().join("wrong-schema-version");
         let store = RocksDbCanonicalBuilder::create_fresh(
             &path,
-            CanonicalStoreWorkload::Explorer,
             complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1847,8 +1888,7 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             &path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Explorer,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1857,7 +1897,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("schema version 7 does not equal required version 1"),
+                .contains("schema version 7 does not equal required version 2"),
             "{error}"
         );
         assert_eq!(read_control(&path)?, control);
@@ -1871,7 +1911,6 @@ mod tests {
         let path = temporary.path().join("missing-family");
         let store = RocksDbCanonicalBuilder::create_fresh(
             &path,
-            CanonicalStoreWorkload::Explorer,
             complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1879,15 +1918,14 @@ mod tests {
 
         let column_families = DB::list_cf(&Options::default(), &path)?;
         let db = DB::open_cf(&Options::default(), &path, &column_families)?;
-        db.drop_cf(TRANSACTION_BLOB_COLUMN_FAMILY)?;
+        db.drop_cf(LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY)?;
         drop(db);
-        let families_without_transaction_blobs = DB::list_cf(&Options::default(), &path)?;
+        let families_without_raw_blocks = DB::list_cf(&Options::default(), &path)?;
 
         let error = RocksDbCanonicalStore::open_ready(
             &path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Explorer,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1899,12 +1937,12 @@ mod tests {
         ));
         assert_eq!(
             DB::list_cf(&Options::default(), &path)?,
-            families_without_transaction_blobs
+            families_without_raw_blocks
         );
         assert!(
-            !families_without_transaction_blobs
+            !families_without_raw_blocks
                 .iter()
-                .any(|family| family == TRANSACTION_BLOB_COLUMN_FAMILY)
+                .any(|family| family == LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY)
         );
         Ok(())
     }
@@ -1922,14 +1960,13 @@ mod tests {
         let broken_path = temporary.path().join("missing-family-summary");
         let store = RocksDbCanonicalBuilder::create_fresh(
             &broken_path,
-            CanonicalStoreWorkload::Explorer,
             complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         drop(store);
         let column_families = DB::list_cf(&Options::default(), &broken_path)?;
         let db = DB::open_cf(&Options::default(), &broken_path, &column_families)?;
-        db.drop_cf(TRANSACTION_BLOB_COLUMN_FAMILY)?;
+        db.drop_cf(LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY)?;
         drop(db);
 
         let error = RocksDbCanonicalStore::read_ready_summary(&broken_path)
@@ -1945,7 +1982,7 @@ mod tests {
     #[test]
     fn contract_identity_and_schema_are_exact() {
         assert_eq!(CANONICAL_STORE_IDENTITY, "canonical");
-        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 1);
+        assert_eq!(CANONICAL_STORE_SCHEMA_VERSION, 2);
     }
 
     fn read_control(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -1962,7 +1999,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )?)
     }
@@ -1982,7 +2019,7 @@ mod tests {
             CHAIN_EPOCH_COLUMN_FAMILY,
             CHAIN_EVENT_COLUMN_FAMILY,
             BLOCK_HEADER_COLUMN_FAMILY,
-            COMPACT_BLOCK_COLUMN_FAMILY,
+            LIVE_TAIL_BLOCK_COLUMN_FAMILY,
         ] {
             let family = store
                 .bounded_open
@@ -1996,7 +2033,7 @@ mod tests {
             (BLOCK_HASH_INDEX_COLUMN_FAMILY, 5, true),
             (TRANSACTION_LOCATION_COLUMN_FAMILY, 5, true),
             (BLOCK_HEADER_COLUMN_FAMILY, 5, false),
-            (COMPACT_BLOCK_COLUMN_FAMILY, 5, false),
+            (LIVE_TAIL_BLOCK_COLUMN_FAMILY, 5, false),
             (DEFAULT_COLUMN_FAMILY_NAME, 1, false),
         ] {
             assert_filter_table_properties(
@@ -2025,7 +2062,7 @@ mod tests {
             &store_path,
             temporary.path().join("secondary"),
             &activations,
-            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
             CanonicalReorgPolicy::new(2)?,
             RocksDbOpenResources::with_shared_block_cache(
                 RocksDbResourceBudget::for_local_tests(),
@@ -2078,8 +2115,7 @@ mod tests {
         let store = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2087,7 +2123,7 @@ mod tests {
             &store_path,
             temporary.path().join("secondary"),
             &activations,
-            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2156,8 +2192,7 @@ mod tests {
         let store = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::All,
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2165,7 +2200,7 @@ mod tests {
             &store_path,
             temporary.path().join("secondary"),
             Network::ZcashTestnet,
-            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+            CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::All),
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2336,11 +2371,8 @@ mod tests {
             .into_iter()
             .map(|name| {
                 let cf_options = match name {
-                    BLOCK_REPLAY_COLUMN_FAMILY
-                    | COMPACT_BLOCK_COLUMN_FAMILY
+                    LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY
                     | TREE_STATE_CHECKPOINT_COLUMN_FAMILY
-                    | TRANSACTION_BLOB_COLUMN_FAMILY
-                    | BLOCK_BLOB_COLUMN_FAMILY
                     | DISPLACED_BLOCK_FACTS_COLUMN_FAMILY => cold.clone(),
                     BLOCK_HASH_INDEX_COLUMN_FAMILY | TRANSACTION_LOCATION_COLUMN_FAMILY => {
                         uncompressed.clone()

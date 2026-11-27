@@ -23,25 +23,25 @@ use super::super::CanonicalSequenceCheckpoint;
 use super::{ByteReader, SettledSegmentsError, VerifiedDir, reject_unsafe_component};
 
 /// Top-level directory name under `<store_root>` storing external settled segments.
-pub(crate) const SEGMENTS_DIR_NAME: &str = "segments";
+pub const SEGMENTS_DIR_NAME: &str = "segments";
 /// Staging directory name under `<store_root>/segments` holding in-flight files.
-pub(crate) const SEGMENTS_STAGING_DIR_NAME: &str = ".staging";
+pub const SEGMENTS_STAGING_DIR_NAME: &str = ".staging";
 /// Directory name storing `ZSHRNG02` shielded segment files.
-pub(crate) const SHIELDED_SEGMENT_DIR: &str = "shielded";
+pub const SHIELDED_SEGMENT_DIR: &str = "shielded";
 /// Directory name storing `ZSTSUP01` supplement segment files.
-pub(crate) const SUPPLEMENT_SEGMENT_DIR: &str = "supplement";
+pub const SUPPLEMENT_SEGMENT_DIR: &str = "supplement";
 /// Directory name storing `ZSBLKB01` raw-block segment files.
-pub(crate) const RAW_BLOCK_SEGMENT_DIR: &str = "raw_block";
+pub const RAW_BLOCK_SEGMENT_DIR: &str = "raw_block";
 
 /// Canonical filename extension for `ZSHRNG02` segments.
-pub(crate) const SHIELDED_SEGMENT_EXT: &str = "zshrng02";
+pub const SHIELDED_SEGMENT_EXT: &str = "zshrng02";
 /// Canonical filename extension for `ZSTSUP01` segments.
-pub(crate) const SUPPLEMENT_SEGMENT_EXT: &str = "zstsup01";
+pub const SUPPLEMENT_SEGMENT_EXT: &str = "zstsup01";
 /// Canonical filename extension for `ZSBLKB01` segments.
-pub(crate) const RAW_BLOCK_SEGMENT_EXT: &str = "zsblkb01";
+pub const RAW_BLOCK_SEGMENT_EXT: &str = "zsblkb01";
 
 /// Filename of the atomic JSON manifest enumerating pinned settled segments.
-pub(crate) const SEGMENTS_MANIFEST_FILE_NAME: &str = "segments-manifest.json";
+pub const SEGMENTS_MANIFEST_FILE_NAME: &str = "segments-manifest.json";
 /// Schema version recorded in [`CanonicalSegmentsManifest`].
 pub(crate) const CANONICAL_SEGMENTS_MANIFEST_SCHEMA_VERSION: u32 = 2;
 /// Binary format version of encoded [`SettledSegmentIndexEntry`] records.
@@ -127,6 +127,7 @@ pub(crate) fn segments_root_dir(store_root: &Path) -> PathBuf {
 }
 
 /// Returns `<store_root>/segments/.staging`.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn segment_staging_dir_path(store_root: &Path) -> PathBuf {
     segments_root_dir(store_root).join(SEGMENTS_STAGING_DIR_NAME)
@@ -165,6 +166,7 @@ pub(crate) fn aligned_segment_end_height(
 }
 
 /// Returns `true` when `height` is an aligned settled segment boundary for `segment_blocks`.
+#[cfg(test)]
 #[must_use]
 pub(crate) const fn is_aligned_segment_end_height(
     height: BlockHeight,
@@ -246,6 +248,21 @@ pub(crate) fn parse_segment_filename(
     Ok((BlockHeight::new(start_val), BlockHeight::new(end_val)))
 }
 
+/// Returns `true` when `file_name` is a canonical settled segment filename for `subdir`.
+#[must_use]
+pub fn validate_settled_segment_filename(subdir: &str, file_name: &str) -> bool {
+    let kind = if subdir == SettledSegmentKind::Shielded.subdir_name() {
+        SettledSegmentKind::Shielded
+    } else if subdir == SettledSegmentKind::Supplement.subdir_name() {
+        SettledSegmentKind::Supplement
+    } else if subdir == SettledSegmentKind::RawBlock.subdir_name() {
+        SettledSegmentKind::RawBlock
+    } else {
+        return false;
+    };
+    parse_segment_filename(kind, file_name).is_ok()
+}
+
 /// Builds the full path `<store_root>/segments/<dir>/<start:010>-<end:010>.<ext>`.
 pub(crate) fn segment_file_path(
     store_root: &Path,
@@ -258,6 +275,7 @@ pub(crate) fn segment_file_path(
 }
 
 /// Concrete external segment file paths for one [`SettledSegmentIndexEntry`].
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SettledSegmentFilePaths {
     /// Always-present `ZSHRNG02` file path.
@@ -268,6 +286,7 @@ pub(crate) struct SettledSegmentFilePaths {
     pub(crate) raw_block: Option<PathBuf>,
 }
 
+#[cfg(test)]
 impl SettledSegmentFilePaths {
     /// Resolves and validates external file paths for `entry` under `store_root`.
     pub(crate) fn for_entry(
@@ -625,7 +644,6 @@ pub(crate) fn read_segments_manifest(
 }
 
 /// Atomically writes and fsyncs `<store_root>/segments-manifest.json`.
-#[cfg(test)]
 pub(crate) fn write_segments_manifest_atomic(
     store_root: &Path,
     manifest: &CanonicalSegmentsManifest,

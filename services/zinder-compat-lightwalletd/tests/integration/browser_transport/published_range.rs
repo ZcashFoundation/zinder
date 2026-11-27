@@ -315,7 +315,7 @@ async fn a_signed_extension_is_retried_when_the_serving_secondary_catches_up() -
     let (private, public) = signing_keys(directory)?;
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(4)
-        .with_raw_blob_retention(zinder_store::RawBlobRetention::Transactions);
+        .with_raw_blob_retention(zinder_store::RawBlobRetention::None);
     let mut fixture = canonical_fixture(&chain)?;
     let (canonical, _) = fixture.take_readers()?;
     let reader = RocksDbCanonicalReader::new(canonical)?;

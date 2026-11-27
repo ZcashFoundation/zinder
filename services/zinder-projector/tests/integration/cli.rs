@@ -270,10 +270,7 @@ fn print_config_renders_the_complete_fail_closed_contract() -> eyre::Result<()> 
         )),
         "{stdout}"
     );
-    assert!(
-        stdout.contains("raw_blob_policy = \"transactions\""),
-        "{stdout}"
-    );
+    assert!(stdout.contains("raw_blob_policy = \"none\""), "{stdout}");
     assert!(stdout.contains("[wallet]"), "{stdout}");
     assert!(
         stdout.contains(&format!("path = {:?}", wallet_path.display().to_string())),
@@ -623,11 +620,29 @@ fn wallet_profiles_supply_omitted_retention_and_round_trip_printed_config() -> e
         assert!(round_trip.status.success(), "{round_trip:?}");
         assert_eq!(String::from_utf8(round_trip.stdout)?, rendered);
 
+        let conflicting_policy = if full_blocks == Some("true") {
+            "none"
+        } else {
+            "all"
+        };
         let conflict = initial()
-            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", conflicting_policy)
             .output()?;
         assert!(!conflict.status.success(), "{conflict:?}");
         assert!(String::from_utf8(conflict.stderr)?.contains("storage.raw_blob_policy"));
+
+        let legacy_transactions = initial()
+            .env("ZINDER_STORAGE__RAW_BLOB_POLICY", "transactions")
+            .output()?;
+        assert!(
+            !legacy_transactions.status.success(),
+            "{legacy_transactions:?}"
+        );
+        let legacy_stderr = String::from_utf8(legacy_transactions.stderr)?;
+        assert!(
+            legacy_stderr.contains("does not have variant constructor transactions"),
+            "{legacy_stderr}"
+        );
     }
     Ok(())
 }

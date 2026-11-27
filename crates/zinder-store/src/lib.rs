@@ -24,6 +24,11 @@ mod settled_supplement_segment;
 mod store_error;
 
 pub use block_hash_index::BlockHashLookup;
+pub use canonical_store::settled_segments::layout::{
+    RAW_BLOCK_SEGMENT_DIR, RAW_BLOCK_SEGMENT_EXT, SEGMENTS_DIR_NAME, SEGMENTS_MANIFEST_FILE_NAME,
+    SEGMENTS_STAGING_DIR_NAME, SHIELDED_SEGMENT_DIR, SHIELDED_SEGMENT_EXT, SUPPLEMENT_SEGMENT_DIR,
+    SUPPLEMENT_SEGMENT_EXT, validate_settled_segment_filename,
+};
 pub use canonical_store::{
     ArchivedDisplacedBlockSummary, CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CURRENT_ARTIFACT_SCHEMA_VERSION,
@@ -38,10 +43,10 @@ pub use canonical_store::{
     CanonicalReplaySliceSource, CanonicalRetainedEvent, CanonicalSecondaryCatchupOutcome,
     CanonicalSequenceCheckpoint, CanonicalStoreBuildError, CanonicalStoreBuildPlan,
     CanonicalStoreBuildPlanError, CanonicalStoreBuildState, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreRequirements, CanonicalStoreWorkload,
-    CanonicalStoredData, CanonicalStoredSet, CanonicalSubtreeRootLoadCoverage,
-    CanonicalSubtreeRootLoadEvidence, DEFAULT_REORG_WINDOW_BLOCKS, DensifiedTreeStateStride,
-    DisplacedBlockCursor, DisplacedBlockPage, DisplacedBlockSummaryPage, DisplacedFinalRootPage,
+    CanonicalStoreReadyEvidence, CanonicalStoreRequirements, CanonicalStoredData,
+    CanonicalStoredSet, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
+    DEFAULT_REORG_WINDOW_BLOCKS, DensifiedTreeStateStride, DisplacedBlockCursor,
+    DisplacedBlockPage, DisplacedBlockSummaryPage, DisplacedFinalRootPage,
     DisplacedFinalRootSearch, DisplacedRootCursor, HeightOrder, InadmissibleActivationSchedule,
     LocatedTransactionBlob, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
     MAX_TREE_STATE_STRIDE_SCAN_READS, ObservedCanonicalReplaySequence,
@@ -121,15 +126,16 @@ pub use settled_shielded_segment::{
 pub use settled_supplement_segment::{
     BlockSupplementRecord, CanonicalBlockSupplement, CanonicalTransactionSupplement,
     CompactBlockSpliceSelection, CompactTransparentSupplementTx,
-    DEFAULT_SETTLED_SUPPLEMENT_SEGMENT_MAX_BYTES, SETTLED_SUPPLEMENT_DEFAULT_CHUNK_BLOCKS,
-    SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS, SETTLED_SUPPLEMENT_SEGMENT_MAGIC,
-    SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES, SettledSupplementSegmentError,
-    SettledSupplementSegmentIndex, SettledSupplementSegmentOpenOptions,
-    SettledSupplementSegmentReader, SettledSupplementSegmentWriteOptions,
-    SettledSupplementSegmentWriter, SupplementChunkReadStep, SupplementCompressionCodec,
-    SupplementRangePlan, SupplementRowIndexSlice, SupplementSegmentHeader,
-    SupplementSegmentIdentity, SupplementShieldedAnchors, SupplementSpliceChunkStep,
-    SupplementSplicePlan, SupplementTxFeeAndBurn, VerifiedSupplementRowIndexSlice,
+    DEFAULT_SETTLED_SUPPLEMENT_SEGMENT_MAX_BYTES, ExplicitTransparentFacts,
+    SETTLED_SUPPLEMENT_DEFAULT_CHUNK_BLOCKS, SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS,
+    SETTLED_SUPPLEMENT_SEGMENT_MAGIC, SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+    SettledSupplementSegmentError, SettledSupplementSegmentIndex,
+    SettledSupplementSegmentOpenOptions, SettledSupplementSegmentReader,
+    SettledSupplementSegmentWriteOptions, SettledSupplementSegmentWriter, SupplementChunkReadStep,
+    SupplementCompressionCodec, SupplementRangePlan, SupplementRowIndexSlice,
+    SupplementSegmentHeader, SupplementSegmentIdentity, SupplementShieldedAnchors,
+    SupplementSpliceChunkStep, SupplementSplicePlan, SupplementTxFeeAndBurn,
+    VerifiedSupplementRowIndexSlice, reconstruct_canonical_block_facts,
     reconstruct_compact_block_artifact, splice_compact_block_wire,
 };
 pub use store_error::{ArtifactFamily, StorageKey, StoreError};

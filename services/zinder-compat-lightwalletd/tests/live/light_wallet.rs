@@ -26,7 +26,7 @@ async fn methods_match_wallet_serving_at_the_same_fence() -> Result<()> {
     let Some(policy) = optional_env("ZINDER_TEST_LIGHT_WALLET_RAW_BLOB_POLICY")? else {
         return Ok(());
     };
-    assert!(matches!(policy.as_str(), "none" | "transactions"));
+    assert!(matches!(policy.as_str(), "none" | "all"));
     let node_stopped = std::env::var("ZINDER_TEST_LIGHT_WALLET_NODE_STOPPED")?.parse::<bool>()?;
     let (mut candidate, mut wallet) = open_parity_clients()
         .await?

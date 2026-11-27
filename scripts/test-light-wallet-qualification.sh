@@ -145,17 +145,17 @@ run_tests() {
       --profile=ci-live --run-ignored=all --retries 0 --test-threads 1 -E "$filter"
 }
 
-declare -A ports=([none]=19100 [transactions]=19110) compat_pids
-for policy in none transactions; do
+declare -A ports=([none]=19100 [all]=19110) compat_pids
+for policy in none all; do
   start_candidate "$policy" "${ports[$policy]}"
 done
-for policy in none transactions; do
+for policy in none all; do
   run_tests "$policy" "${ports[$policy]}" false
 done
 
 # All three wallet endpoints observe the same signed spend before the node is stopped.
 broadcast='test(accepted_send_transaction_surfaces_in_non_empty_mempool_methods)'
-ZINDER_TEST_LIGHT_WALLET_RETAINED_ADDR="http://127.0.0.1:$((ports[transactions] + 2))" \
+ZINDER_TEST_LIGHT_WALLET_RETAINED_ADDR="http://127.0.0.1:$((ports[all] + 2))" \
   run_tests none "${ports[none]}" false "$wallet_url" "$broadcast"
 
 restart_node=true
@@ -164,7 +164,7 @@ if curl "${rpc_args[@]}" "$rpc_url" >/dev/null 2>&1; then
   echo "the selected Regtest RPC still answers after stopping $container" >&2
   exit 1
 fi
-for policy in none transactions; do
+for policy in none all; do
   wait_ready "${compat_pids[$policy]}" "$((ports[$policy] + 3))" true
   run_tests "$policy" "${ports[$policy]}" true
 done

@@ -30,8 +30,8 @@ use zinder_query::{
 };
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, DensifiedTreeStateStride,
-    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalStoreError, DensifiedTreeStateStride, RawBlobRetention,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
     TreeStateCheckpointSelection, TreeStateStrideCommit,
 };
 use zinder_testkit::{
@@ -640,7 +640,6 @@ async fn every_runtime_admits_and_serves_a_densified_store() -> eyre::Result<()>
     let primary = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &primary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
         RawBlobRetention::None,
         CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
@@ -709,7 +708,6 @@ async fn opening_the_secondary_leaves_the_async_runtime_free() -> eyre::Result<(
             canonical_primary_path: primary_path,
             secondary_path: root.path().join("secondary"),
             network_upgrade_activations: Arc::new(sample_regtest_upgrade_activations()),
-            workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -751,7 +749,6 @@ async fn the_pass_opens_its_secondary_only_once_historical_work_may_run() -> eyr
             canonical_primary_path: harness.primary_path()?,
             secondary_path: secondary_path.clone(),
             network_upgrade_activations: Arc::new(harness.activations.clone()),
-            workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -799,7 +796,6 @@ async fn replays_the_writer_did_not_commit_are_charged_against_the_rate() -> eyr
             canonical_primary_path: harness.primary_path()?,
             secondary_path: next_secondary_path(harness.secondary_root.path()),
             network_upgrade_activations: Arc::new(harness.activations.clone()),
-            workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -883,7 +879,6 @@ async fn the_following_writer_commits_strides_from_its_command_queue() -> eyre::
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &primary_path,
         &activations,
-        CanonicalStoreWorkload::Wallet,
         RawBlobRetention::None,
         CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
@@ -1164,7 +1159,6 @@ impl Harness {
                 canonical_primary_path: self.primary_path()?,
                 secondary_path: next_secondary_path(self.secondary_root.path()),
                 network_upgrade_activations: Arc::new(self.activations.clone()),
-                workload: CanonicalStoreWorkload::Wallet,
                 raw_blob_retention: RawBlobRetention::None,
                 reorg_policy: CanonicalReorgPolicy::new(TEST_REORG_WINDOW)?,
                 resource_budget: RocksDbResourceBudget::for_local_tests(),

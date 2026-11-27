@@ -29,7 +29,7 @@ use zinder_query::{
 use zinder_runtime::{ComposedReadiness, Readiness};
 use zinder_source::{MempoolSourceEntry, NodeSource};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, MempoolEvent, MempoolEventRetentionConfig,
+    CanonicalReorgPolicy, MempoolEvent, MempoolEventRetentionConfig,
     MempoolEventRetentionStepBudget, RawBlobRetention, RocksDbCanonicalStore,
     RocksDbResourceBudget,
 };
@@ -197,8 +197,7 @@ impl WalletFixture {
         Ok(RocksDbCanonicalStore::open_ready(
             path,
             &self.activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(4)?,
             RocksDbResourceBudget::for_local_tests(),
         )?)

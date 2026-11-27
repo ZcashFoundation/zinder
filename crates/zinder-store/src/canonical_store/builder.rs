@@ -7,7 +7,7 @@ use crate::{
 };
 
 use super::{
-    CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalStoreBuildError, CanonicalStoreBuildPlan, CanonicalStoreError,
     TreeStateCheckpointSelection,
     activation_schedule::admits_activation_table,
     block_load::{
@@ -36,7 +36,6 @@ pub struct RocksDbCanonicalBuilder {
     pub(super) bounded_open: BoundedRocksDbOpen,
     pub(super) resource_budget: RocksDbResourceBudget,
     pub(super) network: Network,
-    pub(super) workload: CanonicalStoreWorkload,
     pub(super) build_plan: CanonicalStoreBuildPlan,
     pub(super) tree_state_checkpoint_coverage: TreeStateCheckpointCoverage,
     pub(super) construction_activations: Option<NetworkUpgradeActivations>,
@@ -53,12 +52,11 @@ pub struct RocksDbCanonicalBuilder {
 impl RocksDbCanonicalBuilder {
     /// Creates an unpublished canonical store at a path that does not exist.
     ///
-    /// Identity, schema version, network, workload, raw-blob retention, source
+    /// Identity, schema version, network, raw-blob retention, source
     /// range, and cursor authentication material are synced before any data
     /// family is created.
     pub fn create_fresh(
         path: impl AsRef<std::path::Path>,
-        workload: CanonicalStoreWorkload,
         build_plan: CanonicalStoreBuildPlan,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
@@ -70,13 +68,7 @@ impl RocksDbCanonicalBuilder {
             .map_err(|source| CanonicalStoreError::EntropyUnavailable { source })?;
         create_fresh_directory(path)?;
         let store_path = canonical_store_path(path)?;
-        initialize_store_identity(
-            path,
-            workload,
-            &build_plan,
-            cursor_auth_key,
-            resource_budget,
-        )?;
+        initialize_store_identity(path, &build_plan, cursor_auth_key, resource_budget)?;
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Primary { path },
             resource_budget,
@@ -91,7 +83,6 @@ impl RocksDbCanonicalBuilder {
             bounded_open,
             resource_budget,
             network,
-            workload,
             build_plan,
             tree_state_checkpoint_coverage: TreeStateCheckpointCoverage::CadenceAndTip,
             construction_activations: None,
@@ -131,16 +122,10 @@ impl RocksDbCanonicalBuilder {
         self.network
     }
 
-    /// Returns the immutable consumer workload persisted by this build.
-    #[must_use]
-    pub const fn workload(&self) -> CanonicalStoreWorkload {
-        self.workload
-    }
-
     /// Returns the retained block data and historical floor.
     #[must_use]
     pub const fn stored_set(&self) -> super::CanonicalStoredSet {
-        self.build_plan.stored_set(self.workload)
+        self.build_plan.stored_set()
     }
 
     /// Returns the immutable raw-blob retention persisted by this build.
@@ -252,9 +237,9 @@ impl RocksDbCanonicalBuilder {
             CanonicalColumnFamilyOptions::new(&self.bounded_open.block_cache, self.resource_budget);
         let prepared = match write_canonical_block_ssts(
             CanonicalBlockSstConfig {
+                store_path: &self.store_path,
                 staging_path: staging.path(),
                 options: &sst_options,
-                workload: self.workload,
                 build_plan: &self.build_plan,
                 network_upgrade_activations,
                 tree_state_checkpoint_coverage: self.tree_state_checkpoint_coverage,
@@ -499,21 +484,23 @@ mod tests {
             canonical_block_families_are_empty, encode_block_position,
             validate_compact_block_payload,
         },
-        block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, validate_persisted_block_replays},
+        block_replay::validate_persisted_block_replays,
         control::{decode_store_control, encode_ready_store_control_with_revisions},
         displaced_archive::{
             encode_test_archive_record, encode_test_archive_state, encode_test_event_context,
             encode_test_hash_pointer_rows, encode_test_order_key,
         },
         live_replacement_tests::replacement_block,
+        live_tail::{LiveTailBlockRecord, LiveTailEncodeOptions, LiveTailRawBlock},
         note_commitment_trees_tests::NoteCommitmentTrees,
         publication::{encode_live_chain_epoch, encode_live_event},
         rocksdb::{
             BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
-            CHAIN_EVENT_COLUMN_FAMILY, COMPACT_BLOCK_COLUMN_FAMILY,
-            DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, STORE_CONTROL_KEY,
+            CHAIN_EVENT_COLUMN_FAMILY, DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
+            LIVE_TAIL_BLOCK_COLUMN_FAMILY, LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY, STORE_CONTROL_KEY,
             TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
         },
+        settled_segments::store_access::SegmentStoreContext,
         stored_set::CANONICAL_DATA_COLUMN_FAMILIES,
     };
     use crate::{
@@ -536,7 +523,6 @@ mod tests {
         let temporary = TempDir::new()?;
         let error = RocksDbCanonicalBuilder::create_fresh(
             temporary.path(),
-            CanonicalStoreWorkload::Wallet,
             complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -590,8 +576,9 @@ mod tests {
         assert_eq!(evidence.block_count, 2);
         assert_eq!(evidence.block_header_count, 2);
         assert_eq!(evidence.block_hash_index_count, 2);
-        assert_eq!(evidence.block_replay_count, 2);
-        assert_eq!(evidence.compact_block_count, 2);
+        assert_eq!(evidence.settled_segment_index_count, 0);
+        assert_eq!(evidence.live_tail_block_count, 2);
+        assert_eq!(evidence.live_tail_raw_block_count, 0);
         assert_eq!(evidence.transaction_location_count, 0);
         assert_eq!(evidence.transaction_blob_count, 0);
         assert_eq!(evidence.block_blob_count, 0);
@@ -608,7 +595,6 @@ mod tests {
         let activations = testnet_activations()?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
-            CanonicalStoreWorkload::Wallet,
             complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?
@@ -647,12 +633,11 @@ mod tests {
             &activations,
             predecessor,
             BlockId::new(BlockHeight::new(40), BlockHash::from_bytes([40; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?
@@ -691,7 +676,6 @@ mod tests {
         let activations = testnet_activations()?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
-            CanonicalStoreWorkload::Wallet,
             complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?
@@ -720,7 +704,6 @@ mod tests {
         let activations = testnet_activations()?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
-            CanonicalStoreWorkload::Wallet,
             complete_build_plan()?,
             RocksDbResourceBudget::for_local_tests(),
         )?
@@ -919,7 +902,7 @@ mod tests {
         };
         for (step, family) in [
             ("sst_finish", BLOCK_HEADER_COLUMN_FAMILY),
-            ("sst_finish", COMPACT_BLOCK_COLUMN_FAMILY),
+            ("sst_finish", LIVE_TAIL_BLOCK_COLUMN_FAMILY),
             ("sort_merge", BLOCK_HASH_INDEX_COLUMN_FAMILY),
             ("sort_merge", TRANSACTION_LOCATION_COLUMN_FAMILY),
             ("ingest", BLOCK_HEADER_COLUMN_FAMILY),
@@ -1025,34 +1008,13 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
         .ok_or("failed validation must leave the store BUILDING")?;
         assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn explorer_publication_waits_for_required_daily_family_evidence()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = TempDir::new()?;
-        let store = RocksDbCanonicalBuilder::create_fresh(
-            temporary.path().join("explorer"),
-            CanonicalStoreWorkload::Explorer,
-            complete_build_plan()?,
-            RocksDbResourceBudget::for_local_tests(),
-        )?;
-
-        let error = store
-            .prepare_cold_certified_publication()
-            .err()
-            .ok_or("explorer READY must require daily value-pool evidence")?;
-
-        assert!(error.to_string().contains("daily value-pool evidence"));
         Ok(())
     }
 
@@ -1072,7 +1034,7 @@ mod tests {
 
         assert_ready_construction_manifest_binding(&store_path, &published)?;
         let manifest =
-            fs::read_to_string(store_path.join("canonical-construction-manifest.v1.json"))?;
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v2.json"))?;
         assert!(manifest.contains("\"evidence_provenance\":\"cold-certification\""));
 
         assert_eq!(published.ready_evidence().visible_epoch.value(), 1);
@@ -1095,8 +1057,7 @@ mod tests {
         let mismatch = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(101)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1111,8 +1072,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1158,7 +1118,6 @@ mod tests {
         )?;
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -1203,21 +1162,19 @@ mod tests {
         let mismatch = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
         .err()
         .ok_or("raw blob retention mismatch must fail closed")?;
         assert!(mismatch.to_string().contains(
-            "persisted raw blob retention all does not equal requested raw blob retention transactions"
+            "persisted raw blob retention all does not equal requested raw blob retention none"
         ));
 
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
             RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
@@ -1269,8 +1226,8 @@ mod tests {
             let family = store
                 .bounded_open
                 .db
-                .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
-                .ok_or("compact-block family is absent")?;
+                .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+                .ok_or("live-tail-block family is absent")?;
             store.bounded_open.db.delete_cf(
                 &family,
                 crate::canonical_store::block_load::encode_block_position(BlockHeight::new(
@@ -1361,12 +1318,20 @@ mod tests {
         let family = store
             .bounded_open
             .db
-            .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
-            .ok_or("compact-block family is absent")?;
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("live-tail-block family is absent")?;
+        let (encoded_stray, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+            &stray,
+            None,
+            LiveTailEncodeOptions {
+                include_supplement: true,
+                retain_canonical_facts: false,
+            },
+        )?;
         store.bounded_open.db.put_cf(
             &family,
             crate::canonical_store::block_load::encode_block_position(stray_height),
-            crate::encode_compact_block_artifact(&stray),
+            encoded_stray,
         )?;
         drop(family);
         assert_eq!(
@@ -1597,8 +1562,8 @@ mod tests {
         let family = store
             .bounded_open
             .db
-            .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
-            .ok_or("compact-block family is absent")?;
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("live-tail-block family is absent")?;
         store.bounded_open.db.delete_cf(
             &family,
             crate::canonical_store::block_load::encode_block_position(BlockHeight::new(2)),
@@ -1657,7 +1622,7 @@ mod tests {
                 .contains("zinder_store_canonical_publication_family_scan")
         );
         let manifest =
-            fs::read_to_string(store_path.join("canonical-construction-manifest.v1.json"))?;
+            fs::read_to_string(store_path.join("canonical-construction-manifest.v2.json"))?;
         assert!(manifest.contains("\"evidence_provenance\":\"trusted-fresh-writer\""));
         assert_eq!(published.ready_evidence().visible_block_count, 2);
         assert_eq!(
@@ -1688,7 +1653,7 @@ mod tests {
         let binding = published.ready_evidence().construction_manifest_sha256;
         drop(published);
 
-        let manifest_path = store_path.join("canonical-construction-manifest.v1.json");
+        let manifest_path = store_path.join("canonical-construction-manifest.v2.json");
         std::fs::remove_file(&manifest_path)?;
         std::fs::write(
             store_path.join("canonical-construction-manifest.v4.json"),
@@ -1699,8 +1664,7 @@ mod tests {
         let missing = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1709,15 +1673,14 @@ mod tests {
         assert!(
             missing
                 .to_string()
-                .contains("canonical-construction-manifest.v1.json")
+                .contains("canonical-construction-manifest.v2.json")
         );
 
         std::fs::write(&manifest_path, b"{}")?;
         let tampered = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1728,7 +1691,7 @@ mod tests {
             &store_path,
             temporary.path().join("canonical-secondary"),
             &activations,
-            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -1740,6 +1703,89 @@ mod tests {
                 .contains("construction manifest")
         );
         assert_ne!(binding, [0; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn primary_reopen_heals_segments_staging_and_manifest_while_cold_checkpoint_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated =
+            complete_loaded_builder(&store_path)?.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            zinder_core::UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let mut published = validated.publish_baseline(publication)?;
+        let checkpoint_path = temporary.path().join("checkpoint");
+        let admission = published.create_owner_checkpoint_physical(&checkpoint_path)?;
+        drop(published);
+
+        // Cold admission must fail closed without mutating the checkpoint when
+        // segments-manifest.json is missing or stray .staging/orphan files exist.
+        fs::remove_file(checkpoint_path.join(crate::SEGMENTS_MANIFEST_FILE_NAME))?;
+        let cp_staging = checkpoint_path
+            .join(crate::SEGMENTS_DIR_NAME)
+            .join(crate::SEGMENTS_STAGING_DIR_NAME);
+        let cp_shielded = checkpoint_path
+            .join(crate::SEGMENTS_DIR_NAME)
+            .join(crate::SHIELDED_SEGMENT_DIR);
+        fs::create_dir_all(&cp_staging)?;
+        fs::create_dir_all(&cp_shielded)?;
+        let cp_staging_file = cp_staging.join("orphan.tmp");
+        let cp_orphan_file = cp_shielded.join("0000000001-0000004096.zshrng02");
+        fs::write(&cp_staging_file, b"partial")?;
+        fs::write(&cp_orphan_file, b"orphan")?;
+        assert!(
+            RocksDbCanonicalStore::cold_admit_owner_checkpoint(
+                &checkpoint_path,
+                &admission,
+                RocksDbResourceBudget::for_local_tests(),
+            )
+            .is_err()
+        );
+        assert!(cp_staging_file.exists());
+        assert!(cp_orphan_file.exists());
+        assert!(
+            !checkpoint_path
+                .join(crate::SEGMENTS_MANIFEST_FILE_NAME)
+                .exists()
+        );
+
+        // Primary reopen (HealPrimary) cleans .staging and orphan segment files
+        // and regenerates segments-manifest.json.
+        fs::remove_file(store_path.join(crate::SEGMENTS_MANIFEST_FILE_NAME))?;
+        let primary_staging = store_path
+            .join(crate::SEGMENTS_DIR_NAME)
+            .join(crate::SEGMENTS_STAGING_DIR_NAME);
+        let primary_shielded = store_path
+            .join(crate::SEGMENTS_DIR_NAME)
+            .join(crate::SHIELDED_SEGMENT_DIR);
+        fs::create_dir_all(&primary_staging)?;
+        fs::create_dir_all(&primary_shielded)?;
+        let primary_staging_file = primary_staging.join("orphan.tmp");
+        let primary_orphan_file = primary_shielded.join("0000000001-0000004096.zshrng02");
+        fs::write(&primary_staging_file, b"partial")?;
+        fs::write(&primary_orphan_file, b"orphan")?;
+
+        let mut reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &testnet_activations()?,
+            RawBlobRetention::None,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert!(!primary_staging_file.exists());
+        assert!(!primary_orphan_file.exists());
+        assert!(
+            store_path
+                .join(crate::SEGMENTS_MANIFEST_FILE_NAME)
+                .is_file()
+        );
+
+        let healed_cp = temporary.path().join("healed-checkpoint");
+        reopened.create_owner_checkpoint(&healed_cp, RocksDbResourceBudget::for_local_tests())?;
         Ok(())
     }
 
@@ -1784,7 +1830,7 @@ mod tests {
         assert_eq!(newest.coinbase_outputs[0].output_index, 0);
         assert_eq!(newest.coinbase_outputs[0].value_zat, 42);
         assert_eq!(newest.coinbase_outputs[0].script_pub_key, vec![0x51]);
-        assert_eq!(newest.raw_block_bytes, Some(vec![6, 7, 8]));
+        assert_eq!(newest.raw_block_bytes, Some(vec![6, 7, 8, 1, 2, 3, 4, 5]));
         assert_eq!(
             newest
                 .final_note_commitment_roots
@@ -2087,8 +2133,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2116,8 +2161,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2183,7 +2227,7 @@ mod tests {
             &store_path,
             temporary.path().join("canonical-secondary"),
             &baseline,
-            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::Transactions),
+            crate::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2212,8 +2256,7 @@ mod tests {
         let mut store = RocksDbCanonicalStore::open_ready(
             &store_path,
             &extended,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2301,8 +2344,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &revised,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2341,8 +2383,7 @@ mod tests {
         let before = RocksDbCanonicalStore::open_ready(
             &store_path,
             &baseline,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2362,8 +2403,7 @@ mod tests {
         let after = RocksDbCanonicalStore::open_ready(
             &store_path,
             &baseline,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2465,8 +2505,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2556,8 +2595,7 @@ mod tests {
                 RocksDbCanonicalStore::open_ready(
                     &store_path,
                     &activations,
-                    CanonicalStoreWorkload::Wallet,
-                    RawBlobRetention::Transactions,
+                    RawBlobRetention::None,
                     CanonicalReorgPolicy::new(2)?,
                     RocksDbResourceBudget::for_local_tests(),
                 )
@@ -2592,8 +2630,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2631,8 +2668,7 @@ mod tests {
         let store = RocksDbCanonicalStore::open_ready(
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2666,8 +2702,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2724,8 +2759,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2793,8 +2827,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2851,8 +2884,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &store_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2911,8 +2943,7 @@ mod tests {
         let _store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
             child.store_path(),
             &extended,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2935,8 +2966,7 @@ mod tests {
         let before = RocksDbCanonicalStore::open_ready(
             &before_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2952,8 +2982,7 @@ mod tests {
         let after = RocksDbCanonicalStore::open_ready(
             &after_path,
             &activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -2975,8 +3004,8 @@ mod tests {
         let replay_family = store
             .bounded_open
             .db
-            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-            .ok_or("block replay family should exist")?;
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("live_tail_block family should exist")?;
         store.bounded_open.db.put_cf(
             &replay_family,
             zinder_core::wire::encode_height_key_ascending(BlockHeight::new(1)),
@@ -2991,13 +3020,13 @@ mod tests {
 
         assert!(matches!(
             error,
-            CanonicalStoreError::BlockReplayInvalid { height: 1, .. }
+            CanonicalStoreError::SettledSegment { .. }
+                | CanonicalStoreError::BlockReplayInvalid { height: 1, .. }
         ));
         let error = RocksDbCanonicalStore::open_ready(
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -3299,8 +3328,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             &committed_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3350,8 +3378,7 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -3396,7 +3423,6 @@ mod tests {
         db.put(
             STORE_CONTROL_KEY,
             encode_ready_store_control_with_revisions(
-                decoded_control.workload,
                 &decoded_control.build_plan,
                 decoded_control.cursor_auth_key,
                 &wrong_evidence,
@@ -3409,8 +3435,7 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -3449,8 +3474,7 @@ mod tests {
         RocksDbCanonicalStore::open_ready(
             &store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3471,9 +3495,9 @@ mod tests {
             RawBlobRetention::All,
             CanonicalReorgPolicy::new(100)?,
         )?;
+        let stored_set = build_plan.stored_set();
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
-            CanonicalStoreWorkload::Explorer,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3483,10 +3507,20 @@ mod tests {
             Network::ZcashTestnet.genesis_hash().as_bytes(),
         );
         add_tree_state_checkpoint(&mut block)?;
-        let expected_block_replay_logical_bytes =
-            4_u64 + u64::try_from(block.replay_envelope.as_bytes().len())?;
-        let expected_compact_block_logical_bytes = 4_u64
-            + u64::try_from(zinder_proto::wire::encode_compact_block(&block.compact_block).len())?;
+        let expected_split = crate::canonical_store::settled_segments::store_access::encode_split_live_tail_from_build_block(
+            &block,
+            stored_set,
+        )?;
+        let expected_live_tail_block_logical_bytes =
+            4_u64 + u64::try_from(expected_split.block_bytes.len())?;
+        let expected_live_tail_raw_block_logical_bytes = 4_u64
+            + u64::try_from(
+                expected_split
+                    .raw_block_bytes
+                    .as_ref()
+                    .ok_or("raw tail must be present under All")?
+                    .len(),
+            )?;
 
         let evidence = store.bulk_load_blocks(
             &testnet_activations()?,
@@ -3495,28 +3529,27 @@ mod tests {
 
         assert_eq!(evidence.block_header_logical_bytes, 4 + 184);
         assert_eq!(evidence.block_hash_index_logical_bytes, 32 + 4);
+        assert_eq!(evidence.settled_segment_index_logical_bytes, 0);
         assert_eq!(
-            evidence.block_replay_logical_bytes,
-            expected_block_replay_logical_bytes
+            evidence.live_tail_block_logical_bytes,
+            expected_live_tail_block_logical_bytes
         );
         assert_eq!(
-            evidence.compact_block_logical_bytes,
-            expected_compact_block_logical_bytes
+            evidence.live_tail_raw_block_logical_bytes,
+            expected_live_tail_raw_block_logical_bytes
         );
         assert_eq!(evidence.transaction_location_logical_bytes, 32 + 72);
         assert_eq!(evidence.transaction_blob_logical_bytes, 8 + 5);
-        assert_eq!(evidence.block_blob_logical_bytes, 4 + 3);
+        assert_eq!(evidence.block_blob_logical_bytes, 4 + 8);
         assert!(evidence.tree_state_checkpoint_logical_bytes > 0);
         let checked_family_logical_bytes = [
             evidence.block_header_logical_bytes,
             evidence.block_hash_index_logical_bytes,
-            evidence.block_replay_logical_bytes,
-            evidence.compact_block_logical_bytes,
+            evidence.settled_segment_index_logical_bytes,
+            evidence.live_tail_block_logical_bytes,
+            evidence.live_tail_raw_block_logical_bytes,
             evidence.transaction_location_logical_bytes,
-            evidence.transaction_blob_logical_bytes,
-            evidence.block_blob_logical_bytes,
             evidence.tree_state_checkpoint_logical_bytes,
-            evidence.block_final_note_commitment_roots_logical_bytes,
         ]
         .into_iter()
         .try_fold(0_u64, u64::checked_add)
@@ -3533,30 +3566,22 @@ mod tests {
     fn bulk_load_stores_reference_encodings_and_fact_digests()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::canonical_store::{
-            block_load::{
-                encode_block_final_note_commitment_roots, encode_block_position,
-                encode_tree_state_checkpoint,
-            },
-            rocksdb::{
-                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
-                TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
-            },
+            block_load::{encode_block_position, encode_tree_state_checkpoint},
+            rocksdb::TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+            settled_segments::store_access::encode_split_live_tail_from_build_block,
         };
 
         let temporary = TempDir::new()?;
         let mut store = explorer_all_blobs_builder(&temporary.path().join("canonical"))?;
+        let stored_set = store.build_plan.stored_set();
         let reference = explorer_block_with_every_family()?;
-        let roots = reference
-            .block_final_note_commitment_roots
-            .ok_or("reference block must carry final roots")?;
-        let expected_compact = zinder_proto::wire::encode_compact_block(&reference.compact_block);
+        let expected_split = encode_split_live_tail_from_build_block(&reference, stored_set)?;
         let checkpoint = reference
             .tree_state_checkpoint
             .as_ref()
             .ok_or("reference block must carry a checkpoint")?;
         let expected_checkpoint =
             encode_tree_state_checkpoint(checkpoint.block_time_seconds, &checkpoint.frontiers);
-        let expected_roots = encode_block_final_note_commitment_roots(&roots);
         let mut expected_sequence_digest = CanonicalBlockFactsSequenceDigestBuilder::new(
             CanonicalBlockFactsSequenceDigestVersion::V1,
         );
@@ -3574,25 +3599,37 @@ mod tests {
             let handle = db.cf_handle(family).ok_or("column family is absent")?;
             Ok(db.get_cf(&handle, height_key)?)
         };
+        let stored_live_tail =
+            stored(LIVE_TAIL_BLOCK_COLUMN_FAMILY)?.ok_or("live_tail_block row must exist")?;
+        assert_eq!(stored_live_tail, expected_split.block_bytes);
+        let (decoded_compact, _) =
+            LiveTailBlockRecord::decode_compact_block_v1(&stored_live_tail, BlockHeight::new(1))?;
+        assert_eq!(decoded_compact, reference.compact_block);
+        let stored_live_raw = stored(LIVE_TAIL_RAW_BLOCK_COLUMN_FAMILY)?
+            .ok_or("live_tail_raw_block row must exist")?;
         assert_eq!(
-            stored(COMPACT_BLOCK_COLUMN_FAMILY)?,
-            Some(expected_compact.clone())
+            Some(stored_live_raw.clone()),
+            expected_split.raw_block_bytes
+        );
+        let decoded_raw = LiveTailRawBlock::decode_v1(&stored_live_raw)?;
+        assert_eq!(
+            decoded_raw.raw_block_bytes,
+            reference
+                .block_blob
+                .ok_or("reference block must carry raw_block_bytes")?
+                .raw_block_bytes
         );
         assert_eq!(
             stored(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?,
             Some(expected_checkpoint.clone())
         );
         assert_eq!(
-            stored(BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY)?,
-            Some(expected_roots.clone())
+            evidence.live_tail_block_logical_bytes,
+            4 + u64::try_from(expected_split.block_bytes.len())?
         );
         assert_eq!(
-            evidence.compact_block_logical_bytes,
-            4 + u64::try_from(expected_compact.len())?
-        );
-        assert_eq!(
-            evidence.block_final_note_commitment_roots_logical_bytes,
-            4 + u64::try_from(expected_roots.len())?
+            evidence.live_tail_raw_block_logical_bytes,
+            4 + u64::try_from(stored_live_raw.len())?
         );
         let predecessor = store.build_plan.history_predecessor();
         let predecessor_checkpoint =
@@ -3652,14 +3689,13 @@ mod tests {
         )?;
         Ok(RocksDbCanonicalBuilder::create_fresh(
             store_path,
-            CanonicalStoreWorkload::Explorer,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?)
     }
 
-    /// Block 1 with raw blobs, a tip checkpoint, and final roots, so it
-    /// stages a row in every block family.
+    /// Block 1 with raw blobs and a tip checkpoint, so it
+    /// stages a row in every active live-tail family.
     fn explorer_block_with_every_family()
     -> Result<crate::CanonicalBuildBlock, Box<dyn std::error::Error>> {
         let mut block = canonical_build_block_with_raw_blobs(
@@ -3668,13 +3704,6 @@ mod tests {
             Network::ZcashTestnet.genesis_hash().as_bytes(),
         );
         add_tree_state_checkpoint(&mut block)?;
-        block.block_final_note_commitment_roots = Some(BlockFinalNoteCommitmentRoots::new(
-            BlockHeight::new(1),
-            BlockHash::from_bytes([1; 32]),
-            Some(FinalNoteCommitmentRoot::from_bytes([31; 32])),
-            None,
-            Some(FinalNoteCommitmentRoot::from_bytes([33; 32])),
-        ));
         Ok(block)
     }
 
@@ -3694,7 +3723,6 @@ mod tests {
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3731,12 +3759,11 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([2; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             &store_path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -3917,8 +3944,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_load_blocks_rejects_missing_tip_checkpoint_and_wallet_roots()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn bulk_load_blocks_rejects_missing_tip_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let activations =
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
@@ -3927,12 +3953,11 @@ mod tests {
         let missing_checkpoint_path = temporary.path().join("missing-checkpoint");
         let mut missing_checkpoint_store = RocksDbCanonicalBuilder::create_fresh(
             &missing_checkpoint_path,
-            CanonicalStoreWorkload::Wallet,
             CanonicalStoreBuildPlan::complete(
                 &activations,
                 0,
                 tip,
-                RawBlobRetention::Transactions,
+                RawBlobRetention::None,
                 CanonicalReorgPolicy::new(100)?,
             )?,
             RocksDbResourceBudget::for_local_tests(),
@@ -3953,42 +3978,6 @@ mod tests {
             error,
             CanonicalStoreBuildError::Store(CanonicalStoreError::BlockLoadSequenceInvalid { .. })
         ));
-
-        let wallet_roots_path = temporary.path().join("wallet-roots");
-        let mut wallet_roots_store = RocksDbCanonicalBuilder::create_fresh(
-            &wallet_roots_path,
-            CanonicalStoreWorkload::Wallet,
-            CanonicalStoreBuildPlan::complete(
-                &activations,
-                0,
-                tip,
-                RawBlobRetention::Transactions,
-                CanonicalReorgPolicy::new(100)?,
-            )?,
-            RocksDbResourceBudget::for_local_tests(),
-        )?;
-        let mut wallet_roots = canonical_build_block(
-            BlockHeight::new(1),
-            [1; 32],
-            Network::ZcashTestnet.genesis_hash().as_bytes(),
-        );
-        add_tree_state_checkpoint(&mut wallet_roots)?;
-        wallet_roots.block_final_note_commitment_roots =
-            Some(zinder_core::BlockFinalNoteCommitmentRoots::unavailable(
-                BlockHeight::new(1),
-                BlockHash::from_bytes([1; 32]),
-            ));
-        let error = wallet_roots_store
-            .bulk_load_blocks(
-                &testnet_activations()?,
-                vec![Ok::<_, std::io::Error>(wallet_roots)],
-            )
-            .err()
-            .ok_or("wallet workload roots must be rejected")?;
-        assert!(matches!(
-            error,
-            CanonicalStoreBuildError::Store(CanonicalStoreError::BlockLoadSequenceInvalid { .. })
-        ));
         Ok(())
     }
 
@@ -3997,25 +3986,39 @@ mod tests {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
         let store = create_building_store(&store_path, CanonicalHistoryBounds::complete())?;
-        let block_replay = store
+        let live_tail_family = store
             .bounded_open
             .db
-            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-            .ok_or("block replay family should exist")?;
-        let replay = replay(BlockHeight::new(1), [1; 32], [0; 32]);
-        store.bounded_open.db.put_cf(
-            &block_replay,
-            zinder_core::wire::encode_height_key_ascending(BlockHeight::new(2)),
-            replay.as_bytes(),
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("live_tail_block family should exist")?;
+        let build_block = canonical_build_block(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        let (encoded_live_tail, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+            &build_block.compact_block,
+            Some(build_block.facts),
+            LiveTailEncodeOptions {
+                include_supplement: true,
+                retain_canonical_facts: true,
+            },
         )?;
+        store.bounded_open.db.put_cf(
+            &live_tail_family,
+            zinder_core::wire::encode_height_key_ascending(BlockHeight::new(2)),
+            encoded_live_tail,
+        )?;
+        drop(live_tail_family);
 
-        let error = validate_persisted_block_replays(&store.bounded_open.db)
-            .err()
-            .ok_or("a miskeyed replay must be rejected")?;
-        assert!(matches!(
-            error,
-            CanonicalStoreError::BlockReplayInvalid { height: 2, .. }
-        ));
+        let error = validate_persisted_block_replays(SegmentStoreContext {
+            db: &store.bounded_open.db,
+            segment_cache: None,
+            sealed_segments: None,
+        })
+        .err()
+        .ok_or("a miskeyed replay must be rejected")?;
+        assert!(matches!(error, CanonicalStoreError::SettledSegment { .. }));
         Ok(())
     }
 
@@ -4024,20 +4027,37 @@ mod tests {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
         let store = create_building_store(&store_path, CanonicalHistoryBounds::complete())?;
-        let block_replay = store
+        let live_tail_family = store
             .bounded_open
             .db
-            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-            .ok_or("block replay family should exist")?;
-        let replay = replay(BlockHeight::new(1), [1; 32], [0; 32]);
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("live_tail_block family should exist")?;
+        let build_block = canonical_build_block(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        let (encoded_live_tail, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+            &build_block.compact_block,
+            Some(build_block.facts),
+            LiveTailEncodeOptions {
+                include_supplement: true,
+                retain_canonical_facts: true,
+            },
+        )?;
         store
             .bounded_open
             .db
-            .put_cf(&block_replay, b"bad", replay.as_bytes())?;
+            .put_cf(&live_tail_family, b"bad", encoded_live_tail)?;
+        drop(live_tail_family);
 
-        let error = validate_persisted_block_replays(&store.bounded_open.db)
-            .err()
-            .ok_or("a malformed replay key must be rejected")?;
+        let error = validate_persisted_block_replays(SegmentStoreContext {
+            db: &store.bounded_open.db,
+            segment_cache: None,
+            sealed_segments: None,
+        })
+        .err()
+        .ok_or("a malformed replay key must be rejected")?;
         assert!(matches!(
             error,
             CanonicalStoreError::BlockReplayKeyInvalid { .. }
@@ -4051,30 +4071,40 @@ mod tests {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
         let store = create_building_store(&store_path, CanonicalHistoryBounds::complete())?;
-        let block_replay = store
+        let live_tail_family = store
             .bounded_open
             .db
-            .cf_handle(BLOCK_REPLAY_COLUMN_FAMILY)
-            .ok_or("block replay family should exist")?;
-        let replay = replay(BlockHeight::new(1), [1; 32], [0; 32]);
-        let mut encoded = replay.into_bytes();
-        if !encoded.starts_with(&[0x08, 0x01]) {
-            return Err("the version-1 replay fixture has an unexpected envelope prefix".into());
-        }
-        encoded[1] = 0x02;
-        store.bounded_open.db.put_cf(
-            &block_replay,
-            zinder_core::wire::encode_height_key_ascending(BlockHeight::new(1)),
-            encoded,
+            .cf_handle(LIVE_TAIL_BLOCK_COLUMN_FAMILY)
+            .ok_or("live_tail_block family should exist")?;
+        let build_block = canonical_build_block(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        let (mut encoded_live_tail, _) = LiveTailBlockRecord::encode_from_compact_block_v1(
+            &build_block.compact_block,
+            Some(build_block.facts),
+            LiveTailEncodeOptions {
+                include_supplement: true,
+                retain_canonical_facts: true,
+            },
         )?;
+        encoded_live_tail[8] = 0x02;
+        store.bounded_open.db.put_cf(
+            &live_tail_family,
+            zinder_core::wire::encode_height_key_ascending(BlockHeight::new(1)),
+            encoded_live_tail,
+        )?;
+        drop(live_tail_family);
 
-        let error = validate_persisted_block_replays(&store.bounded_open.db)
-            .err()
-            .ok_or("a non-version-one replay must be rejected")?;
-        assert!(matches!(
-            error,
-            CanonicalStoreError::BlockReplayInvalid { height: 1, .. }
-        ));
+        let error = validate_persisted_block_replays(SegmentStoreContext {
+            db: &store.bounded_open.db,
+            segment_cache: None,
+            sealed_segments: None,
+        })
+        .err()
+        .ok_or("a non-version-one replay must be rejected")?;
+        assert!(matches!(error, CanonicalStoreError::SettledSegment { .. }));
         Ok(())
     }
 
@@ -4099,14 +4129,13 @@ mod tests {
                         )?,
                     ),
                     BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([10; 32])),
-                    RawBlobRetention::Transactions,
+                    RawBlobRetention::None,
                     CanonicalReorgPolicy::new(100)?,
                 )?
             }
         };
         Ok(RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?)
@@ -4129,7 +4158,7 @@ mod tests {
         );
         assert!(
             store_path
-                .join("canonical-construction-manifest.v1.json")
+                .join("canonical-construction-manifest.v2.json")
                 .is_file()
         );
         let manifest_binding =
@@ -4183,7 +4212,6 @@ mod tests {
         let build_tip_byte = u8::try_from(build_tip_height.value())?;
         let mut store = RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             complete_build_plan_through(build_tip_height, reorg_window_blocks)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -4210,8 +4238,7 @@ mod tests {
         let error = RocksDbCanonicalStore::open_ready(
             store_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )
@@ -4251,7 +4278,7 @@ mod tests {
             &activations,
             0,
             BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(100)?,
         )?)
     }
@@ -4272,8 +4299,7 @@ mod tests {
         let reopened = RocksDbCanonicalStore::open_ready(
             store_path,
             activations,
-            CanonicalStoreWorkload::Wallet,
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(2)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -4331,7 +4357,6 @@ mod tests {
         db.put(
             STORE_CONTROL_KEY,
             encode_ready_store_control_with_revisions(
-                decoded.workload,
                 &decoded.build_plan,
                 decoded.cursor_auth_key,
                 &evidence,
@@ -4459,7 +4484,6 @@ mod tests {
             replay_envelope,
             tip_metadata: ChainTipMetadata::new(0, 0, 0),
             tree_state_checkpoint: None,
-            block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
@@ -4473,7 +4497,7 @@ mod tests {
     ) -> crate::CanonicalBuildBlock {
         let mut block = canonical_build_block(height, block_hash, parent_hash);
         let raw_transaction_bytes = vec![1, 2, 3, 4, 5];
-        let raw_block_bytes = vec![6, 7, 8];
+        let raw_block_bytes = vec![6, 7, 8, 1, 2, 3, 4, 5];
         let transaction_id = TransactionId::from_bytes([9; 32]);
         block.facts.transactions.push(CanonicalTransactionFacts {
             public_facts: TransactionPublicFacts {
@@ -4792,7 +4816,7 @@ mod tests {
                 build_tip_height,
                 BlockHash::from_bytes([build_tip_byte; 32]),
             ),
-            RawBlobRetention::Transactions,
+            RawBlobRetention::None,
             CanonicalReorgPolicy::new(reorg_window_blocks)?,
         )?)
     }
@@ -4803,7 +4827,6 @@ mod tests {
     ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
         Ok(RocksDbCanonicalBuilder::create_fresh(
             path,
-            CanonicalStoreWorkload::Wallet,
             complete_build_plan_through(build_tip_height, 100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?)
@@ -4857,6 +4880,8 @@ mod tests {
             let tag = u8::try_from(height)?;
             let hash = [tag; 32];
             let mut block = replacement_block(BlockHeight::new(height), hash, parent, tag)?;
+            block.transaction_blobs.clear();
+            block.block_blob = None;
             trees.append_block(&mut block)?;
             block.tree_state_checkpoint = checkpoint_heights
                 .contains(&height)

@@ -16,30 +16,34 @@ use sha2::{Digest as _, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 use zinder_core::{
     AuthDigest, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
-    CanonicalBlockFacts, CanonicalTransactionFacts, CompactBlockArtifact, CompactChainMetadata,
-    CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransaction,
-    CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, ConsensusBranchId,
-    LockTime, Network, PrivacyShape, SerializedBytesDigest, TransactionComponentCounts,
-    TransactionId, TransactionIntrinsicValueBalances, TransactionPublicFacts, TransactionVersion,
+    CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalTransactionFacts,
+    CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput, CompactSaplingSpend,
+    CompactShieldedAction, CompactTransaction, CompactTransactionData, CompactTransparentInput,
+    CompactTransparentOutput, ConsensusBranchId, LockTime, Network, PrivacyShape,
+    SerializedBytesDigest, TransactionComponentCounts, TransactionId,
+    TransactionIntrinsicValueBalances, TransactionPublicFacts, TransactionVersion,
     TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
     UnsupportedSection, Wtxid,
-    wire::{encode_internal_block_hash, encode_internal_transaction_id},
+    wire::{
+        encode_address_script_hash, encode_internal_block_hash, encode_internal_transaction_id,
+    },
 };
 use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
 
 use super::{
-    SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS, SETTLED_SUPPLEMENT_SEGMENT_MAGIC,
-    SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES, SettledSupplementSegmentError,
-    SettledSupplementSegmentIndex, SettledSupplementSegmentOpenOptions,
-    SettledSupplementSegmentReader, SettledSupplementSegmentWriteOptions,
-    SettledSupplementSegmentWriter, SupplementCompressionCodec, SupplementRowIndexSlice,
-    SupplementSegmentIdentity,
+    ExplicitTransparentFacts, SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS,
+    SETTLED_SUPPLEMENT_SEGMENT_MAGIC, SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES,
+    SettledSupplementSegmentError, SettledSupplementSegmentIndex,
+    SettledSupplementSegmentOpenOptions, SettledSupplementSegmentReader,
+    SettledSupplementSegmentWriteOptions, SettledSupplementSegmentWriter,
+    SupplementCompressionCodec, SupplementRowIndexSlice, SupplementSegmentIdentity,
     format::{
         CHUNK_INDEX_ENTRY_LEN, CompactSupplementRow, DecodedChunkIndexEntry, DecodedRowIndexEntry,
         HEADER_LEN, INDEX_PAGE_ROWS, IndexedChunk, ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN,
         VALIDATION_INVALID, max_chunk_bytes, max_compressed_chunk_bytes,
     },
     reader::validate_indices,
+    reconstruct_canonical_block_facts,
     section::{
         BlockEnvelopeIdentity, BlockSupplementRecord, CanonicalBlockSupplement,
         CanonicalTransactionSupplement, CompactTransparentSupplementTx, SupplementShieldedAnchors,
@@ -408,6 +412,39 @@ fn placeholder_tx_tuple(pos: usize) -> TxFactsSummary {
     )
 }
 
+fn derive_test_inputs(tx: &CompactTransaction) -> Vec<TransparentInputFact> {
+    tx.data
+        .transparent_inputs
+        .iter()
+        .enumerate()
+        .map(|(idx, tx_in)| {
+            TransparentInputFact::new(
+                u32::try_from(idx).unwrap_or(0),
+                TransparentOutPoint::new(
+                    tx_in.previous_transaction_id,
+                    tx_in.previous_output_index,
+                ),
+            )
+        })
+        .collect()
+}
+
+fn derive_test_outputs(tx: &CompactTransaction) -> Vec<TransparentOutputFact> {
+    tx.data
+        .transparent_outputs
+        .iter()
+        .enumerate()
+        .map(|(idx, tx_out)| {
+            TransparentOutputFact::new(
+                u32::try_from(idx).unwrap_or(0),
+                tx_out.value_zat,
+                tx_out.script_pub_key.clone(),
+                TransparentAddressScriptHash::of_script_pub_key(&tx_out.script_pub_key),
+            )
+        })
+        .collect()
+}
+
 fn make_tx_facts(
     block_height: BlockHeight,
     pos: usize,
@@ -415,6 +452,10 @@ fn make_tx_facts(
 ) -> CanonicalTransactionFacts {
     let (transaction_id, counts, orchard_bal, orchard_anchor, ironwood_bal, privacy_shape) =
         maybe_tx.map_or_else(|| placeholder_tx_tuple(pos), present_tx_tuple);
+    let (transparent_inputs, transparent_outputs) = maybe_tx.map_or_else(
+        || (Vec::new(), Vec::new()),
+        |tx| (derive_test_inputs(tx), derive_test_outputs(tx)),
+    );
     CanonicalTransactionFacts {
         public_facts: TransactionPublicFacts {
             transaction_id,
@@ -435,8 +476,8 @@ fn make_tx_facts(
         },
         serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[0x33; 16]),
         intrinsic_value_balances: TransactionIntrinsicValueBalances::new(0, -10, 50_000, 0),
-        transparent_inputs: Vec::new(),
-        transparent_outputs: Vec::new(),
+        transparent_inputs,
+        transparent_outputs,
     }
 }
 
@@ -3808,5 +3849,658 @@ fn rejected_first_record_allows_retry_with_corrected_prev_hash() -> TestOutcome 
         reader.read_block(BlockHeight::new(501))?,
         empty_supplement_record()
     );
+    Ok(())
+}
+
+fn expected_public_facts_len(facts: &TransactionPublicFacts) -> usize {
+    let version_len = match facts.version {
+        TransactionVersion::V1
+        | TransactionVersion::V2
+        | TransactionVersion::V3
+        | TransactionVersion::V4
+        | TransactionVersion::V5
+        | TransactionVersion::V6 => 1,
+        TransactionVersion::Unsupported {
+            version_group_id, ..
+        } => 5 + usize::from(version_group_id.is_some()) * 4,
+    };
+    let lock_len = match facts.lock_time {
+        LockTime::Unlocked => 1,
+        LockTime::Height(_) => 5,
+        LockTime::UnixSeconds(_) => 9,
+    };
+    32 + (1 + usize::from(facts.auth_digest.is_some()) * 32)
+        + (1 + usize::from(facts.wtxid.is_some()) * 64)
+        + version_len
+        + (1 + usize::from(facts.consensus_branch_id.is_some()) * 4)
+        + lock_len
+        + (1 + usize::from(facts.expiry_height.is_some()) * 4)
+        + 4
+        + 28
+        + (1 + usize::from(facts.orchard_value_balance_zat.is_some()) * 8)
+        + (1 + usize::from(facts.ironwood_value_balance_zat.is_some()) * 8)
+        + 1
+        + 1
+        + 4
+        + facts.unsupported_sections.len()
+}
+
+fn expected_legacy_tag2_payload_len(canonical: &CanonicalBlockSupplement) -> usize {
+    let mut total = 32 + 4 + 2;
+    for tx in &canonical.transactions {
+        let anchors_count = usize::from(tx.shielded_anchors.orchard.is_some())
+            + usize::from(tx.shielded_anchors.ironwood.is_some())
+            + usize::from(tx.shielded_anchors.sapling.is_some());
+        let fee_burn_count = usize::from(tx.fee_and_burn.fee_zat.is_some())
+            + usize::from(tx.fee_and_burn.burn_zat.is_some());
+        total += 8
+            + expected_public_facts_len(&tx.public_facts)
+            + 32
+            + 32
+            + (3 + anchors_count * 32)
+            + (1 + usize::from(tx.zip317_logical_actions.is_some()) * 4)
+            + (2 + fee_burn_count * 8)
+            + 2;
+    }
+    total
+}
+
+fn assert_tag2_zero_extra_bytes(
+    block: &CompactBlockArtifact,
+    canonical: &CanonicalBlockSupplement,
+) -> TestOutcome {
+    let env = BlockEnvelopeIdentity {
+        height: block.height(),
+        block_hash_wire: encode_internal_block_hash(block.block_hash()),
+        prev_hash_wire: encode_internal_block_hash(block.previous_block_hash()),
+        block_time: block.time(),
+    };
+    let record = BlockSupplementRecord {
+        transparent_transactions: transparent_supplement_from_compact(block),
+        canonical_metadata: Some(canonical.clone()),
+    };
+    let (encoded, _) = encode_block_record(env, &record)?;
+    let tag1_len = usize::try_from(u32::from_be_bytes(encoded[79..83].try_into()?))?;
+    let tag2_hdr_off = 74 + 9 + tag1_len;
+    let tag2_payload_len = usize::try_from(u32::from_be_bytes(
+        encoded[tag2_hdr_off + 5..tag2_hdr_off + 9].try_into()?,
+    ))?;
+    assert_eq!(encoded.len(), tag2_hdr_off + 9 + tag2_payload_len);
+    assert_eq!(
+        tag2_payload_len,
+        expected_legacy_tag2_payload_len(canonical)
+    );
+    if !canonical.transactions.is_empty() {
+        assert_eq!(&encoded[encoded.len() - 4..], &[0_u8, 0, 0, 0]);
+    }
+    Ok(())
+}
+
+fn real_coinbase_and_spend_block(
+    height: u32,
+) -> TestOutcome<(CompactBlockArtifact, CanonicalBlockFacts)> {
+    let coinbase = CompactTransaction {
+        index: 0,
+        transaction_id: det_txid(70),
+        data: CompactTransactionData {
+            fee_zat: None,
+            transparent_outputs: vec![t_out(312_500_000, 0x71), t_out(0, 0x72)],
+            ..CompactTransactionData::default()
+        },
+    };
+    let spend = CompactTransaction {
+        index: 1,
+        transaction_id: det_txid(71),
+        data: CompactTransactionData {
+            fee_zat: Some(10_000),
+            transparent_inputs: vec![t_in(31, 0), t_in(32, 3)],
+            transparent_outputs: vec![t_out(25_000, 0x73)],
+            ..CompactTransactionData::default()
+        },
+    };
+    let block = CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(height), det_block_hash(height)),
+        det_block_hash(height - 1),
+        1_735_000_000 + height,
+        vec![coinbase, spend],
+        make_meta(height),
+    )?;
+    let mut facts = make_canonical_facts(&block);
+    facts.transactions[0]
+        .public_facts
+        .counts
+        .transparent_input_count = 1;
+    facts.transactions[0].public_facts.privacy_shape = PrivacyShape::Coinbase;
+    facts.transactions[1].public_facts.privacy_shape = PrivacyShape::TransparentOnly;
+    Ok((block, facts))
+}
+
+#[test]
+fn real_shaped_blocks_roundtrip_canonical_facts_with_zero_extra_tag2_bytes() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let corpus = build_rich_corpus(1_200)?;
+    let mut pairs: Vec<(CompactBlockArtifact, CanonicalBlockFacts)> = corpus
+        .into_iter()
+        .map(|block| {
+            let facts = make_canonical_facts(&block);
+            (block, facts)
+        })
+        .collect();
+    pairs.push(real_coinbase_and_spend_block(1_207)?);
+
+    let first = &pairs[0].0;
+    let last = &pairs[pairs.len() - 1].0;
+    let seg_path = dir.path().join("real_shaped.zstsup01");
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &seg_path,
+        SupplementSegmentIdentity::span(
+            Network::ZcashMainnet,
+            1,
+            first.height(),
+            BlockId::new(last.height(), last.block_hash()),
+        ),
+        SettledSupplementSegmentWriteOptions {
+            codec: SupplementCompressionCodec::Zstd,
+            chunk_blocks: 3,
+        },
+    )?;
+    for (block, facts) in &pairs {
+        let sup = CanonicalBlockSupplement::from_canonical_facts(facts, Some(block))?;
+        assert!(
+            sup.transactions
+                .iter()
+                .all(|tx| tx.explicit_transparent_facts.is_none())
+        );
+        assert_tag2_zero_extra_bytes(block, &sup)?;
+        writer.push(block, Some(facts))?;
+    }
+    let seg_id = writer.finish()?;
+    let reader = SettledSupplementSegmentReader::open(
+        &seg_path,
+        &seg_id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+
+    for (block, facts) in &pairs {
+        let record = reader.read_block(block.height())?;
+        assert!(record.canonical_metadata.as_ref().is_some_and(|meta| {
+            meta.transactions
+                .iter()
+                .all(|tx| tx.explicit_transparent_facts.is_none())
+        }));
+        let reconstructed = reconstruct_canonical_block_facts(facts.block_header.clone(), &record)?;
+        assert_eq!(&reconstructed, facts);
+        assert_eq!(
+            reconstructed.digest(CanonicalBlockFactsDigestVersion::V1),
+            facts.digest(CanonicalBlockFactsDigestVersion::V1)
+        );
+    }
+    Ok(())
+}
+
+fn build_divergent_sentinel_and_hash_block(
+    height: u32,
+) -> TestOutcome<(CompactBlockArtifact, CanonicalBlockFacts)> {
+    let coinbase = CompactTransaction {
+        index: 0,
+        transaction_id: det_txid(80),
+        data: CompactTransactionData {
+            fee_zat: None,
+            transparent_outputs: vec![t_out(312_500_000, 0x81)],
+            ..CompactTransactionData::default()
+        },
+    };
+    let synthetic_tx = CompactTransaction {
+        index: 1,
+        transaction_id: det_txid(81),
+        data: CompactTransactionData {
+            fee_zat: Some(5_000),
+            transparent_inputs: vec![t_in(41, 0)],
+            transparent_outputs: vec![t_out(75_000, 0x82)],
+            ..CompactTransactionData::default()
+        },
+    };
+    let matching_tx = CompactTransaction {
+        index: 2,
+        transaction_id: det_txid(82),
+        data: CompactTransactionData {
+            fee_zat: Some(2_500),
+            transparent_inputs: vec![t_in(42, 1)],
+            transparent_outputs: vec![t_out(20_000, 0x83)],
+            ..CompactTransactionData::default()
+        },
+    };
+    let block = CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(height), det_block_hash(height)),
+        det_block_hash(height - 1),
+        1_735_000_000 + height,
+        vec![coinbase, synthetic_tx, matching_tx],
+        make_meta(height),
+    )?;
+    let mut facts = make_canonical_facts(&block);
+    facts.transactions[0].transparent_inputs = vec![TransparentInputFact::new(
+        0,
+        TransparentOutPoint::COINBASE_SENTINEL,
+    )];
+    facts.transactions[1].transparent_inputs[0].input_index = 4;
+    facts.transactions[1].transparent_outputs = vec![TransparentOutputFact::new(
+        9,
+        75_000,
+        vec![0x76, 0xa9, 0x14, 0x82, 0x88, 0xac],
+        TransparentAddressScriptHash::from_bytes([0x72; 32]),
+    )];
+    Ok((block, facts))
+}
+
+fn build_divergent_omitted_and_cleared_block(
+    height: u32,
+) -> TestOutcome<(CompactBlockArtifact, CanonicalBlockFacts)> {
+    let tx1 = CompactTransaction {
+        index: 1,
+        transaction_id: det_txid(84),
+        data: CompactTransactionData {
+            fee_zat: Some(1_000),
+            transparent_outputs: vec![t_out(15_000, 0x85)],
+            ..CompactTransactionData::default()
+        },
+    };
+    let block = CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(height), det_block_hash(height)),
+        det_block_hash(height - 1),
+        1_735_000_000 + height,
+        vec![tx1],
+        make_meta(height),
+    )?;
+    let mut facts = make_canonical_facts(&block);
+    facts.transactions[0].transparent_inputs = vec![TransparentInputFact::new(
+        0,
+        TransparentOutPoint::new(det_txid(86), 2),
+    )];
+    facts.transactions[0].transparent_outputs = vec![TransparentOutputFact::new(
+        0,
+        90_000,
+        vec![0x51],
+        TransparentAddressScriptHash::of_script_pub_key(&[0x51]),
+    )];
+    facts.transactions[1].transparent_inputs.clear();
+    facts.transactions[1].transparent_outputs.clear();
+    Ok((block, facts))
+}
+
+#[test]
+fn divergent_blocks_roundtrip_canonical_facts_via_explicit_tlv() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let (block0, facts0) = build_divergent_sentinel_and_hash_block(1_300)?;
+    let (block1, facts1) = build_divergent_omitted_and_cleared_block(1_301)?;
+    let seg_path = dir.path().join("divergent.zstsup01");
+    let mut writer = SettledSupplementSegmentWriter::create(
+        &seg_path,
+        SupplementSegmentIdentity::span(
+            Network::ZcashMainnet,
+            1,
+            block0.height(),
+            BlockId::new(block1.height(), block1.block_hash()),
+        ),
+        SettledSupplementSegmentWriteOptions {
+            codec: SupplementCompressionCodec::Zstd,
+            chunk_blocks: 1,
+        },
+    )?;
+    writer.push(&block0, Some(&facts0))?;
+    writer.push(&block1, Some(&facts1))?;
+    let seg_id = writer.finish()?;
+    let reader = SettledSupplementSegmentReader::open(
+        &seg_path,
+        &seg_id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+
+    let rec0 = reader.read_block(block0.height())?;
+    let meta0 = rec0
+        .canonical_metadata
+        .as_ref()
+        .ok_or("missing block0 tag2")?;
+    assert!(meta0.transactions[0].explicit_transparent_facts.is_some());
+    assert!(meta0.transactions[1].explicit_transparent_facts.is_some());
+    assert!(meta0.transactions[2].explicit_transparent_facts.is_none());
+
+    let rec1 = reader.read_block(block1.height())?;
+    let meta1 = rec1
+        .canonical_metadata
+        .as_ref()
+        .ok_or("missing block1 tag2")?;
+    assert!(meta1.transactions[0].explicit_transparent_facts.is_some());
+    assert!(meta1.transactions[1].explicit_transparent_facts.is_some());
+
+    for (facts, record) in [(&facts0, &rec0), (&facts1, &rec1)] {
+        let reconstructed = reconstruct_canonical_block_facts(facts.block_header.clone(), record)?;
+        assert_eq!(&reconstructed, facts);
+        assert_eq!(
+            reconstructed.digest(CanonicalBlockFactsDigestVersion::V1),
+            facts.digest(CanonicalBlockFactsDigestVersion::V1)
+        );
+    }
+
+    let no_compact_meta = CanonicalBlockSupplement::from_canonical_facts(&facts0, None)?;
+    assert!(
+        no_compact_meta
+            .transactions
+            .iter()
+            .all(|tx| tx.explicit_transparent_facts.is_some())
+    );
+    let pure_tag2_record = BlockSupplementRecord {
+        transparent_transactions: Vec::new(),
+        canonical_metadata: Some(no_compact_meta),
+    };
+    let reconstructed_pure =
+        reconstruct_canonical_block_facts(facts0.block_header.clone(), &pure_tag2_record)?;
+    assert_eq!(reconstructed_pure, facts0);
+    assert_eq!(
+        reconstructed_pure.digest(CanonicalBlockFactsDigestVersion::V1),
+        facts0.digest(CanonicalBlockFactsDigestVersion::V1)
+    );
+    Ok(())
+}
+
+fn build_valid_explicit_tlv_payload(script_hash: TransparentAddressScriptHash) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(1);
+    payload.extend_from_slice(&1_u32.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&encode_internal_transaction_id(
+        TransparentOutPoint::COINBASE_SENTINEL.transaction_id,
+    ));
+    payload.extend_from_slice(
+        &TransparentOutPoint::COINBASE_SENTINEL
+            .output_index
+            .to_be_bytes(),
+    );
+    payload.extend_from_slice(&1_u32.to_be_bytes());
+    payload.extend_from_slice(&2_u32.to_be_bytes());
+    payload.extend_from_slice(&50_000_u64.to_be_bytes());
+    payload.extend_from_slice(&3_u32.to_be_bytes());
+    payload.extend_from_slice(&[0x76, 0xa9, 0x14]);
+    payload.extend_from_slice(&encode_address_script_hash(script_hash));
+    payload
+}
+
+fn replace_single_tx_ext_tlvs(base_row: &[u8], tlvs: &[(u16, &[u8])]) -> TestOutcome<Vec<u8>> {
+    let env_hdr_len = 74;
+    let tag1_len = u32::from_be_bytes(base_row[env_hdr_len + 5..env_hdr_len + 9].try_into()?);
+    let tag2_hdr_off = env_hdr_len + 9 + usize::try_from(tag1_len)?;
+    let tag2_len = u32::from_be_bytes(base_row[tag2_hdr_off + 5..tag2_hdr_off + 9].try_into()?);
+    let mut out = base_row[..base_row.len() - 4].to_vec();
+    let old_len = out.len();
+    out.extend_from_slice(&u16::try_from(tlvs.len())?.to_be_bytes());
+    for (ext_tag, ext_payload) in tlvs {
+        out.extend_from_slice(&ext_tag.to_be_bytes());
+        out.extend_from_slice(&u32::try_from(ext_payload.len())?.to_be_bytes());
+        out.extend_from_slice(ext_payload);
+    }
+    let added = out.len() - old_len - 2;
+    out.extend_from_slice(&0_u16.to_be_bytes());
+    let new_tag2_len = u32::try_from(usize::try_from(tag2_len)? + added)?;
+    out[tag2_hdr_off + 5..tag2_hdr_off + 9].copy_from_slice(&new_tag2_len.to_be_bytes());
+    Ok(out)
+}
+
+fn read_single_row_block(
+    dir: &Path,
+    label: &str,
+    block: &CompactBlockArtifact,
+    row_bytes: &[u8],
+) -> TestOutcome<Result<BlockSupplementRecord, SettledSupplementSegmentError>> {
+    let (seg_bytes, seg_id) = rebuild_single_row_segment(block, row_bytes)?;
+    let seg_path = dir.join(format!("{label}.zstsup01"));
+    fs::write(&seg_path, &seg_bytes)?;
+    let reader = SettledSupplementSegmentReader::open(
+        &seg_path,
+        &seg_id,
+        SettledSupplementSegmentOpenOptions::default(),
+    )?;
+    Ok(reader.read_block(block.height()))
+}
+
+#[test]
+fn tag2_explicit_transparent_tlv_rejects_malformed_truncated_trailing_and_duplicate() -> TestOutcome
+{
+    let dir = TempDir::new()?;
+    let block = CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(82), det_block_hash(82)),
+        det_block_hash(81),
+        1_735_000_082,
+        vec![CompactTransaction {
+            index: 0,
+            transaction_id: det_txid(91),
+            data: CompactTransactionData {
+                fee_zat: Some(1_000),
+                sapling_outputs: vec![sapling_output(0x44)],
+                ..CompactTransactionData::default()
+            },
+        }],
+        make_meta(82),
+    )?;
+    let facts = make_canonical_facts(&block);
+    let base_record = BlockSupplementRecord {
+        transparent_transactions: Vec::new(),
+        canonical_metadata: Some(CanonicalBlockSupplement::from_canonical_facts(
+            &facts,
+            Some(&block),
+        )?),
+    };
+    let (seg_bytes, _id) = build_synthetic_segment_bytes(
+        82,
+        &[(block.clone(), base_record)],
+        SupplementCompressionCodec::None,
+        16,
+    )?;
+    let header = SegmentHeader::decode_unchecked(seg_bytes[..HEADER_LEN].try_into()?)?;
+    let base_row = seg_bytes[HEADER_LEN..usize::try_from(header.chunk_index_offset)?].to_vec();
+
+    let custom_hash = TransparentAddressScriptHash::from_bytes([0xAB; 32]);
+    let valid_tlv = build_valid_explicit_tlv_payload(custom_hash);
+    let with_opt_row =
+        replace_single_tx_ext_tlvs(&base_row, &[(0x0001, &valid_tlv), (0x8002, &[0xCA, 0xFE])])?;
+    let valid_rec = read_single_row_block(dir.path(), "valid_opt", &block, &with_opt_row)??;
+    let valid_meta = valid_rec.canonical_metadata.ok_or("missing tag2")?;
+    assert_eq!(
+        valid_meta.transactions[0].explicit_transparent_facts,
+        Some(ExplicitTransparentFacts {
+            transparent_inputs: vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            transparent_outputs: vec![TransparentOutputFact::new(
+                2,
+                50_000,
+                vec![0x76, 0xa9, 0x14],
+                custom_hash,
+            )],
+        })
+    );
+
+    assert_explicit_tlv_rejections(dir.path(), &block, &base_row, &valid_tlv)?;
+    Ok(())
+}
+
+fn assert_explicit_tlv_rejections(
+    dir: &Path,
+    block: &CompactBlockArtifact,
+    base_row: &[u8],
+    valid_tlv: &[u8],
+) -> TestOutcome {
+    struct ExtTlvRejectionCase<'a> {
+        label: &'a str,
+        tlvs: &'a [(u16, &'a [u8])],
+    }
+
+    for bad_ver in [0_u8, 2_u8] {
+        let mut bad = valid_tlv.to_vec();
+        bad[0] = bad_ver;
+        let row = replace_single_tx_ext_tlvs(base_row, &[(0x0001, &bad)])?;
+        let outcome = read_single_row_block(dir, &format!("ver_{bad_ver}"), block, &row)?;
+        assert!(matches!(
+            outcome,
+            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+        ));
+    }
+
+    for cut in 0..valid_tlv.len() {
+        let row = replace_single_tx_ext_tlvs(base_row, &[(0x0001, &valid_tlv[..cut])])?;
+        let outcome = read_single_row_block(dir, &format!("trunc_{cut}"), block, &row)?;
+        assert!(matches!(
+            outcome,
+            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+        ));
+    }
+
+    let mut trailing = valid_tlv.to_vec();
+    trailing.push(0x00);
+    let trailing_row = replace_single_tx_ext_tlvs(base_row, &[(0x0001, &trailing)])?;
+    assert!(matches!(
+        read_single_row_block(dir, "trailing", block, &trailing_row)?,
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+
+    let bad_inputs_count = [1_u8, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+    let bad_outputs_count = [1_u8, 0, 0, 0, 0, 0x00, 0x01, 0x86, 0xA0, 0, 0];
+    let bad_cases = [
+        ExtTlvRejectionCase {
+            label: "in_count",
+            tlvs: &[(0x0001, &bad_inputs_count[..])],
+        },
+        ExtTlvRejectionCase {
+            label: "out_count",
+            tlvs: &[(0x0001, &bad_outputs_count[..])],
+        },
+        ExtTlvRejectionCase {
+            label: "dup_tlv",
+            tlvs: &[(0x0001, valid_tlv), (0x0001, valid_tlv)],
+        },
+        ExtTlvRejectionCase {
+            label: "mand_unknown",
+            tlvs: &[(0x0002, &[0x01_u8, 0x02][..])],
+        },
+    ];
+    for ExtTlvRejectionCase { label, tlvs } in bad_cases {
+        let row = replace_single_tx_ext_tlvs(base_row, tlvs)?;
+        assert!(matches!(
+            read_single_row_block(dir, label, block, &row)?,
+            Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+        ));
+    }
+    Ok(())
+}
+
+fn assert_reconstruct_rejects_integrity(
+    header: &BlockHeaderArtifact,
+    transparent_transactions: Vec<CompactTransparentSupplementTx>,
+    canonical_metadata: Option<CanonicalBlockSupplement>,
+) {
+    assert!(matches!(
+        reconstruct_canonical_block_facts(
+            header.clone(),
+            &BlockSupplementRecord {
+                transparent_transactions,
+                canonical_metadata,
+            },
+        ),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
+}
+
+#[test]
+fn reconstruct_canonical_block_facts_rejects_inconsistent_records() -> TestOutcome {
+    let (block, facts) = build_divergent_sentinel_and_hash_block(1_400)?;
+    let base_meta = CanonicalBlockSupplement::from_canonical_facts(&facts, Some(&block))?;
+    let header = facts.block_header;
+    let base_sup = transparent_supplement_from_compact(&block);
+
+    assert_reconstruct_rejects_integrity(&header, base_sup.clone(), None);
+
+    let mut extra_sup = base_sup.clone();
+    extra_sup.push(CompactTransparentSupplementTx {
+        index: 99,
+        transaction_id: det_txid(250),
+        fee_zat: Some(0),
+        transparent_inputs: Vec::new(),
+        transparent_outputs: vec![t_out(1, 0x01)],
+    });
+    assert_reconstruct_rejects_integrity(&header, extra_sup, Some(base_meta.clone()));
+
+    let mut mismatch_sup = base_sup.clone();
+    mismatch_sup[0].transaction_id = det_txid(251);
+    assert_reconstruct_rejects_integrity(&header, mismatch_sup, Some(base_meta.clone()));
+
+    let mut gap_meta = base_meta.clone();
+    let second = CanonicalTransactionSupplement {
+        tx_index: 5,
+        ..gap_meta.transactions[1].clone()
+    };
+    gap_meta.transactions = vec![gap_meta.transactions[0].clone(), second];
+    assert_reconstruct_rejects_integrity(&header, Vec::new(), Some(gap_meta));
+
+    let mut unordered_sup = base_sup;
+    unordered_sup.swap(0, 1);
+    assert!(matches!(
+        reconstruct_canonical_block_facts(
+            header,
+            &BlockSupplementRecord {
+                transparent_transactions: unordered_sup,
+                canonical_metadata: Some(base_meta),
+            },
+        ),
+        Err(SettledSupplementSegmentError::InvalidFormat(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn reconstruct_preserves_transparent_only_fee_above_u32_while_wire_splice_rejects() -> TestOutcome {
+    let height = BlockHeight::new(1_401);
+    let block = CompactBlockArtifact::new(
+        BlockId::new(height, det_block_hash(height.value())),
+        det_block_hash(height.value() - 1),
+        1_700_001_401,
+        vec![CompactTransaction {
+            index: 0,
+            transaction_id: det_txid(201),
+            data: CompactTransactionData {
+                fee_zat: Some(u64::from(u32::MAX) + 1),
+                transparent_outputs: vec![t_out(1, 0x51)],
+                ..Default::default()
+            },
+        }],
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 0,
+        },
+    )?;
+    let empty_shielded = CompactBlockArtifact::new(
+        BlockId::new(height, block.block_hash()),
+        block.previous_block_hash(),
+        block.time(),
+        Vec::new(),
+        block.chain_metadata(),
+    )?;
+    let shielded = prost_compact_block(
+        &empty_shielded,
+        CompactBlockSpliceSelection::DEFAULT_SHIELDED,
+    )?;
+    let sup = BlockSupplementRecord {
+        transparent_transactions: transparent_supplement_from_compact(&block),
+        canonical_metadata: None,
+    };
+    let reconstructed = reconstruct_compact_block_artifact(&shielded.payload(), &sup)?;
+    assert_eq!(reconstructed, block);
+    assert!(matches!(
+        splice_compact_block_wire(
+            &shielded.payload(),
+            &sup.transparent_transactions,
+            CompactBlockSpliceSelection::FULL_BLOCK,
+        ),
+        Err(SettledSupplementSegmentError::PayloadIntegrity(_))
+    ));
     Ok(())
 }

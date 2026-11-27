@@ -41,9 +41,8 @@ use zinder_source::{NodeSource as _, ZebraJsonRpcSource, ZebraJsonRpcSourceOptio
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
-    TREE_STATE_CHECKPOINT_STRIDE,
+    CanonicalStoreBuildPlan, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE,
 };
 use zinder_testkit::{
     ChainFixture, FixtureTransactionRows, encode_fixture_block_replay_with_raw_block,
@@ -217,7 +216,7 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
     }
     fs::create_dir_all(&evidence_root)?;
     let source_before = inventory(&canonical_path)?;
-    let source_manifest = canonical_path.join("canonical-construction-manifest.v1.json");
+    let source_manifest = canonical_path.join("canonical-construction-manifest.v2.json");
     let source_manifest_before = sha256_file(&source_manifest)?;
 
     let source = ZebraJsonRpcSource::with_options(
@@ -790,7 +789,6 @@ fn build_reorg_process_primary(
     )?;
     let mut builder = RocksDbCanonicalBuilder::create_fresh(
         path,
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -883,7 +881,6 @@ fn canonical_build_blocks(
             compact_block,
             tip_metadata: ChainTipMetadata::empty(),
             tree_state_checkpoint,
-            block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
         });

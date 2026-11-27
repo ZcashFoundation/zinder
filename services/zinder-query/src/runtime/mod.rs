@@ -56,7 +56,7 @@ pub struct Cli {
     /// Canonical raw-blob retention expected from the writer.
     #[arg(
         long = "raw-blob-policy",
-        value_parser = ["none", "transactions", "all"]
+        value_parser = ["none", "all"]
     )]
     pub raw_blob_policy: Option<String>,
     /// Wallet primary path replicated only through an immutable secondary.

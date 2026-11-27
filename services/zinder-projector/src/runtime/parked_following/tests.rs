@@ -688,9 +688,7 @@ impl ParkFixture {
             &canonical_path,
             root.join("canonical-secondary"),
             &zinder_testkit::sample_regtest_upgrade_activations(),
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;
@@ -756,7 +754,7 @@ fn park_config(
         canonical_path: root.join("canonical"),
         canonical_secondary_path: root.join("canonical-secondary"),
         storage_full_blocks: None,
-        expected_canonical_raw_blob_retention: RawBlobRetention::Transactions,
+        expected_canonical_raw_blob_retention: RawBlobRetention::None,
         wallet_path: root.join("wallet"),
         canonical_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),
         wallet_rocksdb_budget: RocksDbResourceBudget::for_local_tests(),

@@ -38,7 +38,7 @@ async fn backup_receipt_verifies_and_restores_the_owner_checkpoint_offline() -> 
     fs::create_dir(&staging)?;
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(NETWORK)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(2);
     let mut writer =
         CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;

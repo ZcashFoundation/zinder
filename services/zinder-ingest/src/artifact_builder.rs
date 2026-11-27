@@ -42,8 +42,6 @@ const COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN: usize = 52;
 pub enum RawBlobPolicy {
     /// Write no raw block or transaction blobs.
     None,
-    /// Write raw transaction blobs only.
-    Transactions,
     /// Write both raw block blobs and raw transaction blobs.
     All,
 }
@@ -61,7 +59,6 @@ impl RawBlobPolicy {
     pub const fn to_retention(self) -> RawBlobRetention {
         match self {
             Self::None => RawBlobRetention::None,
-            Self::Transactions => RawBlobRetention::Transactions,
             Self::All => RawBlobRetention::All,
         }
     }
@@ -71,7 +68,6 @@ impl From<RawBlobRetention> for RawBlobPolicy {
     fn from(retention: RawBlobRetention) -> Self {
         match retention {
             RawBlobRetention::None => Self::None,
-            RawBlobRetention::Transactions => Self::Transactions,
             RawBlobRetention::All => Self::All,
         }
     }
@@ -1046,24 +1042,15 @@ mod tests {
         let source_block = regtest_fixture_block()?;
         let activations = sample_regtest_upgrade_activations();
         let no_blobs = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::None)?;
-        let transaction_blobs =
-            prepare_canonical_block(&source_block, &activations, RawBlobPolicy::Transactions)?;
         let all_blobs = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::All)?;
 
-        assert_eq!(no_blobs.facts, transaction_blobs.facts);
         assert_eq!(no_blobs.facts, all_blobs.facts);
-        assert_eq!(no_blobs.replay_envelope, transaction_blobs.replay_envelope);
         assert_eq!(no_blobs.replay_envelope, all_blobs.replay_envelope);
 
         assert!(no_blobs.retained_raw_blobs.block_blob.is_none());
         assert_eq!(
             no_blobs.retained_raw_blobs.transaction_blobs,
             [] as [zinder_core::TransactionBlobArtifact; 0]
-        );
-        assert!(transaction_blobs.retained_raw_blobs.block_blob.is_none());
-        assert_eq!(
-            transaction_blobs.retained_raw_blobs.transaction_blobs.len(),
-            transaction_blobs.facts.transactions.len()
         );
         assert!(all_blobs.retained_raw_blobs.block_blob.is_some());
         assert_eq!(

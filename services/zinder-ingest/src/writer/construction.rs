@@ -37,9 +37,9 @@ use zinder_core::{
 use zinder_source::{NodeSource, SourceBlock, SourceKnownTip};
 use zinder_store::{
     CanonicalBlockLoadEvidence, CanonicalBuildBlock, CanonicalBuildSubtreeRoot,
-    CanonicalStoreBuildError, CanonicalStoreError, CanonicalStoreWorkload,
-    CanonicalSubtreeRootLoadEvidence, RawBlobRetention, RocksDbCanonicalBuilder,
-    TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
+    CanonicalStoreBuildError, CanonicalStoreError, CanonicalSubtreeRootLoadEvidence,
+    RawBlobRetention, RocksDbCanonicalBuilder, TREE_STATE_CHECKPOINT_STRIDE,
+    TreeStateCheckpointSelection,
 };
 
 use crate::{
@@ -54,7 +54,7 @@ use progress::ConstructionProgress;
 use source_fetch::{
     CanonicalSourceFetchConfig, SourceBlockChunk, SourceSegmentSizer, build_source_block_stream,
 };
-use tree_hashing::{GuardedBuildBlock, PipelinedBuildBlocks, TreeHashers, final_roots};
+use tree_hashing::{GuardedBuildBlock, PipelinedBuildBlocks, TreeHashers};
 
 const CANONICAL_PREPARE_MEMORY_UNIT_BYTES: u64 = 1_024;
 const CANONICAL_PREPARE_RAW_BLOCK_MULTIPLIER: u64 = 16;
@@ -1260,7 +1260,6 @@ fn run_block_loader(
         height: predecessor.block_id.height,
         source,
     })?;
-    let workload = builder.workload();
     let build_tip_height = builder.build_plan().build_tip().height;
     let build_blocks = CanonicalBuildBlockReceiver {
         receiver: block_receiver,
@@ -1271,13 +1270,12 @@ fn run_block_loader(
         running_tree_sizes: CommitmentTreeSizes::from_tip_metadata(predecessor_tip_metadata),
         commitment_tree_accumulator,
         derived_subtree_roots: Vec::new(),
-        workload,
         build_tip_height,
         checkpoint_selection: receiver_config.checkpoint_selection,
         checkpoint_tree_sizes: predecessor_tip_metadata,
         cancel: receiver_config.cancel,
         loader_stop: receiver_config.loader_stop,
-        stage_timers: BlockLoaderStageTimers::register(workload),
+        stage_timers: BlockLoaderStageTimers::register(),
         tree_hashers,
         in_flight_store_height: None,
         progress: None,
@@ -1364,7 +1362,6 @@ struct CanonicalBuildBlockReceiver {
     running_tree_sizes: CommitmentTreeSizes,
     commitment_tree_accumulator: CommitmentTreeAccumulator,
     derived_subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
-    workload: CanonicalStoreWorkload,
     build_tip_height: BlockHeight,
     checkpoint_selection: Option<TreeStateCheckpointSelection>,
     checkpoint_tree_sizes: ChainTipMetadata,
@@ -1386,9 +1383,8 @@ struct CanonicalBuildBlockReceiver {
 /// Every stage named `tree_hashing_*` records commitment-tree hashing wall
 /// time on the tree-staging thread (or on the loader thread when
 /// `tree_hashing_workers == 1`): `tree_hashing_append` measures batch or
-/// per-block tree appends, `tree_hashing_checkpoint` measures pool frontier
-/// cross-checks, and `tree_hashing_final_roots` measures any remaining final
-/// root derivations for explorer builds.
+/// per-block tree appends and `tree_hashing_checkpoint` measures pool frontier
+/// cross-checks.
 struct BlockLoaderStageTimers {
     receive_wait: Histogram,
     commitment_extract: Histogram,
@@ -1398,12 +1394,10 @@ struct BlockLoaderStageTimers {
     tree_append_ironwood: Histogram,
     position: Histogram,
     tree_hashing_checkpoint: Histogram,
-    /// Present only for the explorer workload, the one that derives final roots.
-    tree_hashing_final_roots: Option<Histogram>,
 }
 
 impl BlockLoaderStageTimers {
-    fn register(workload: CanonicalStoreWorkload) -> Self {
+    fn register() -> Self {
         let stage = |stage: &'static str| metrics::histogram!(BLOCK_LOAD_STAGE_DURATION_METRIC, "stage" => stage);
         let pool_timer = |pool: &'static str| metrics::histogram!(TREE_APPEND_POOL_DURATION_METRIC, "pool" => pool);
         Self {
@@ -1415,9 +1409,6 @@ impl BlockLoaderStageTimers {
             tree_append_ironwood: pool_timer("ironwood"),
             position: stage("position"),
             tree_hashing_checkpoint: stage("tree_hashing_checkpoint"),
-            tree_hashing_final_roots: workload
-                .derives_final_roots()
-                .then(|| stage("tree_hashing_final_roots")),
         }
     }
 
@@ -1747,13 +1738,8 @@ impl CanonicalBuildBlockReceiver {
                 .tree_hashing_checkpoint
                 .record(positioned_at.elapsed());
         }
-        let block_final_note_commitment_roots = self.block_final_note_commitment_roots(block_hash);
         Ok(GuardedBuildBlock {
-            block: canonical_build_block(
-                positioned,
-                tree_state_checkpoint,
-                block_final_note_commitment_roots,
-            ),
+            block: canonical_build_block(positioned, tree_state_checkpoint),
             memory_permit,
         })
     }
@@ -1770,16 +1756,13 @@ impl CanonicalBuildBlockReceiver {
             mut checkpoints,
             checkpoint_error,
         } = self.derive_batch_checkpoints(&positioned_entries);
-        let final_roots_list =
-            self.derive_batch_final_roots(&positioned_entries[..valid_prefix_len]);
-        for ((entry, checkpoint), block_roots) in positioned_entries
+        for (entry, checkpoint) in positioned_entries
             .into_iter()
             .take(valid_prefix_len)
             .zip(checkpoints.drain(..valid_prefix_len))
-            .zip(final_roots_list)
         {
             self.ready.push_back(Ok(GuardedBuildBlock {
-                block: canonical_build_block(entry.positioned, checkpoint, block_roots),
+                block: canonical_build_block(entry.positioned, checkpoint),
                 memory_permit: entry.memory_permit,
             }));
         }
@@ -1938,41 +1921,6 @@ impl CanonicalBuildBlockReceiver {
         }
     }
 
-    fn derive_batch_final_roots(
-        &self,
-        entries: &[PositionedBatchEntry],
-    ) -> Vec<Option<zinder_core::BlockFinalNoteCommitmentRoots>> {
-        if !self.workload.derives_final_roots() || entries.is_empty() {
-            return vec![None; entries.len()];
-        }
-        let started_at = Instant::now();
-        let unwarmed: Vec<&CommitmentTreeSnapshot> = entries
-            .iter()
-            .filter(|entry| !entry.checkpoint_required)
-            .map(|entry| &entry.snapshot)
-            .collect();
-        if !unwarmed.is_empty() {
-            if let Some(tree_hashers) = &self.tree_hashers {
-                tree_hashers.install(|| CommitmentTreeSnapshot::warm_final_roots_batch(&unwarmed));
-            } else {
-                CommitmentTreeSnapshot::warm_final_roots_batch(&unwarmed);
-            }
-        }
-        let roots: Vec<_> = entries
-            .iter()
-            .map(|entry| {
-                final_roots(
-                    &entry.snapshot,
-                    entry.positioned.facts.block_header.block_hash,
-                )
-            })
-            .collect();
-        if let Some(timer) = &self.stage_timers.tree_hashing_final_roots {
-            timer.record(started_at.elapsed());
-        }
-        roots
-    }
-
     /// Positions an appended block against the accumulator's current tip sizes.
     fn position_block(
         &mut self,
@@ -2058,12 +2006,7 @@ impl CanonicalBuildBlockReceiver {
                 .tree_hashing_checkpoint
                 .record(positioned_at.elapsed());
         }
-        let block_final_note_commitment_roots = self.block_final_note_commitment_roots(block_hash);
-        Ok(canonical_build_block(
-            positioned,
-            tree_state_checkpoint,
-            block_final_note_commitment_roots,
-        ))
+        Ok(canonical_build_block(positioned, tree_state_checkpoint))
     }
 
     /// Appends the block's note commitments to the trees and collects the
@@ -2117,26 +2060,6 @@ impl CanonicalBuildBlockReceiver {
             .tree_hashing_append
             .record(started_at.elapsed());
         Ok(())
-    }
-
-    /// Derives the explorer workload's per-block final roots, omitting a
-    /// block before any pool activates.
-    fn block_final_note_commitment_roots(
-        &mut self,
-        block_hash: zinder_core::BlockHash,
-    ) -> Option<zinder_core::BlockFinalNoteCommitmentRoots> {
-        if !self.workload.derives_final_roots() {
-            return None;
-        }
-        let started_at = Instant::now();
-        let roots = self
-            .commitment_tree_accumulator
-            .final_note_commitment_roots(block_hash);
-        if let Some(timer) = &self.stage_timers.tree_hashing_final_roots {
-            timer.record(started_at.elapsed());
-        }
-        (roots.sapling.is_some() || roots.orchard.is_some() || roots.ironwood.is_some())
-            .then_some(roots)
     }
 }
 
@@ -2215,7 +2138,6 @@ fn compact_commitment_bytes(
 pub(crate) fn canonical_build_block(
     positioned: PositionedCanonicalBlock,
     tree_state_checkpoint: Option<CommitmentTreeCheckpoint>,
-    block_final_note_commitment_roots: Option<zinder_core::BlockFinalNoteCommitmentRoots>,
 ) -> CanonicalBuildBlock {
     let PositionedCanonicalBlock {
         facts,
@@ -2234,7 +2156,6 @@ pub(crate) fn canonical_build_block(
         compact_block,
         tip_metadata,
         tree_state_checkpoint,
-        block_final_note_commitment_roots,
         transaction_blobs,
         block_blob,
     }
@@ -2285,31 +2206,8 @@ fn memory_permits_for_block(raw_block_capacity: usize, available_permits: u32) -
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BlockLoaderStageTimers, CanonicalPipelineLimits, CanonicalPipelineLimitsError,
-        CanonicalStoreWorkload,
-    };
+    use super::{CanonicalPipelineLimits, CanonicalPipelineLimitsError};
     use std::num::{NonZeroU32, NonZeroU64};
-
-    #[test]
-    fn only_an_explorer_loader_registers_a_final_roots_timer() {
-        let registered_stages = |workload| {
-            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-            let handle = recorder.handle();
-            let timers = metrics::with_local_recorder(&recorder, || {
-                BlockLoaderStageTimers::register(workload)
-            });
-            (timers.tree_hashing_final_roots.is_some(), handle.render())
-        };
-
-        let (wallet_timer, wallet_series) = registered_stages(CanonicalStoreWorkload::Wallet);
-        let (explorer_timer, explorer_series) = registered_stages(CanonicalStoreWorkload::Explorer);
-
-        assert!(!wallet_timer);
-        assert!(!wallet_series.contains("tree_hashing_final_roots"));
-        assert!(explorer_timer);
-        assert!(explorer_series.contains("tree_hashing_final_roots"));
-    }
 
     const MIB: u64 = 1_024 * 1_024;
 
@@ -2863,15 +2761,12 @@ mod tests {
             ),
             commitment_tree_accumulator,
             derived_subtree_roots: Vec::new(),
-            workload: zinder_store::CanonicalStoreWorkload::Wallet,
             build_tip_height: zinder_core::BlockHeight::new(tip_height),
             checkpoint_selection: None,
             checkpoint_tree_sizes: zinder_core::ChainTipMetadata::default(),
             cancel,
             loader_stop,
-            stage_timers: BlockLoaderStageTimers::register(
-                zinder_store::CanonicalStoreWorkload::Wallet,
-            ),
+            stage_timers: super::BlockLoaderStageTimers::register(),
             tree_hashers,
             in_flight_store_height: None,
             progress: Some(super::ConstructionProgress::start(&build_plan, None)),

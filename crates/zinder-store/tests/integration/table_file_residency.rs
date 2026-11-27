@@ -202,7 +202,8 @@ fn canonical_secondary_retains_table_readers_without_reopening_files_across_pass
     let primary_path = writer.canonical_primary_path().to_path_buf();
     drop(writer);
 
-    split_family_into_bottom_level_ssts(&primary_path, "compact_block")?;
+    split_family_into_bottom_level_ssts(&primary_path, "live_tail_block")?;
+    split_family_into_bottom_level_ssts(&primary_path, "block_header")?;
 
     let secondary_dirs = TempDir::new()?;
     let legacy_reader_bytes = measure_legacy_128_open_file_churn(
@@ -231,8 +232,8 @@ fn canonical_secondary_retains_table_readers_without_reopening_files_across_pass
             "{label}: retaining all table readers ({reader_bytes}) must exceed evicted legacy residency ({legacy_reader_bytes})"
         );
         assert!(
-            reader_bytes < 1024 * 1024,
-            "{label}: table_reader_bytes ({reader_bytes}) must stay well under 1 MiB"
+            reader_bytes < 2 * 1024 * 1024,
+            "{label}: table_reader_bytes ({reader_bytes}) must stay well under 2 MiB"
         );
     }
     Ok(())

@@ -2,9 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use zinder_core::CanonicalHistoryBounds;
-use zinder_store::{
-    CanonicalStoreRequirements, CanonicalStoreWorkload, CanonicalStoredSet, RawBlobRetention,
-};
+use zinder_store::{CanonicalStoreRequirements, CanonicalStoredSet, RawBlobRetention};
 
 /// Selects a coordinated consumer preset across standalone runtimes.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -44,7 +42,6 @@ impl DeploymentProfile {
     #[must_use]
     pub const fn canonical_stored_set(self) -> CanonicalStoredSet {
         CanonicalStoredSet::for_history(
-            CanonicalStoreWorkload::Wallet,
             self.raw_blob_retention(),
             CanonicalHistoryBounds::complete(),
         )
@@ -233,7 +230,6 @@ mod tests {
                 stored_set.first_height(CanonicalStoredData::BlockHistory),
                 Some(BlockHeight::new(1))
             );
-            assert!(!stored_set.contains(CanonicalStoredData::FinalNoteCommitmentRoots));
             assert_eq!(
                 profile.resolve_raw_blob_retention_with_full_blocks(Some(true), None)?,
                 RawBlobRetention::All
@@ -276,10 +272,7 @@ mod tests {
         let writer =
             CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
         let primary = writer.canonical_primary()?;
-        assert_eq!(
-            primary.build_plan().stored_set(primary.workload()),
-            stored_set
-        );
+        assert_eq!(primary.build_plan().stored_set(), stored_set);
         let directory = tempfile::tempdir()?;
         let reader = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
             writer.canonical_primary_path(),

@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, DensifiedTreeStateStride,
+    CanonicalReorgPolicy, CanonicalStoreError, DensifiedTreeStateStride,
     MAX_TREE_STATE_STRIDE_SCAN_READS, RawBlobRetention, RocksDbCanonicalSecondary,
     RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
     TreeStateStride, TreeStateStrideCommit,
@@ -180,8 +180,6 @@ pub struct TreeStateDensificationContext<Writer> {
     pub secondary_path: PathBuf,
     /// Node-observed activations used to admit the store and replay strides.
     pub network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    /// Workload the canonical store was built for.
-    pub workload: CanonicalStoreWorkload,
     /// Raw-blob retention the canonical store was built with.
     pub raw_blob_retention: RawBlobRetention,
     /// Reorg policy the canonical store was built with.
@@ -222,7 +220,6 @@ async fn run_tree_state_densification<Writer: TreeStateStrideWriter>(
         canonical_primary_path: &context.canonical_primary_path,
         secondary_path: &context.secondary_path,
         network_upgrade_activations: &context.network_upgrade_activations,
-        workload: context.workload,
         raw_blob_retention: context.raw_blob_retention,
         reorg_policy: context.reorg_policy,
         resource_budget: context.resource_budget,

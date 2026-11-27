@@ -34,7 +34,6 @@ async fn publishes_only_after_attestation_and_rotates_cursor_key() -> TestResult
         .clone();
     let config = || EdgeSnapshotStoreConfig {
         activations: &activations,
-        workload: source.workload(),
         raw_blob_retention: source.raw_blob_retention(),
         reorg_policy: source.reorg_policy(),
         required_first_available_height: BlockHeight::new(u32::MAX),
@@ -118,7 +117,6 @@ fn admitted_source() -> TestResult<(CanonicalWriterFixture, RocksDbCanonicalStor
     let store = RocksDbCanonicalStore::open_ready(
         fixture.canonical_primary_path(),
         &activations,
-        CanonicalStoreWorkload::Wallet,
         RawBlobRetention::None,
         reorg_policy,
         RocksDbResourceBudget::for_local_tests(),
@@ -172,7 +170,6 @@ fn signature_and_paths_are_strict() -> TestResult {
             network_id: Network::ZcashRegtest.id(),
             genesis_hash: Network::ZcashRegtest.genesis_hash().as_bytes(),
             activation_fingerprint: [0; 32],
-            workload: CanonicalStoreWorkload::Wallet,
             raw_blob_retention: RawBlobRetention::None,
             reorg_window_blocks: 2,
             history_floor: block(),
@@ -183,6 +180,7 @@ fn signature_and_paths_are_strict() -> TestResult {
             "CURRENT",
             "MANIFEST-00001",
             CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME,
+            crate::SEGMENTS_MANIFEST_FILE_NAME,
         ]
         .into_iter()
         .map(|file| SnapshotFile {
@@ -327,7 +325,6 @@ fn incompatible_local_manifest_refuses_before_any_payload_is_copied() -> TestRes
     let activations = NetworkUpgradeActivations::new(Network::ZcashRegtest, Vec::new())?;
     let config = EdgeSnapshotStoreConfig {
         activations: &activations,
-        workload: source.workload(),
         raw_blob_retention: source.raw_blob_retention(),
         reorg_policy: source.reorg_policy(),
         required_first_available_height: BlockHeight::new(u32::MAX),
@@ -491,7 +488,6 @@ fn set_publisher_cursor_keys(
         db.put(
             STORE_CONTROL_KEY,
             encode_ready_store_control_with_revisions(
-                control.workload,
                 &control.build_plan,
                 key,
                 &source.ready_evidence(),
@@ -735,7 +731,6 @@ async fn substituted_directories_are_refused_after_attestation() -> TestResult {
         let unadmitted = replacement.join("unadmitted");
         let config = EdgeSnapshotStoreConfig {
             activations,
-            workload: source.workload(),
             raw_blob_retention: source.raw_blob_retention(),
             reorg_policy: source.reorg_policy(),
             required_first_available_height: BlockHeight::new(u32::MAX),

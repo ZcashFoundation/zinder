@@ -101,7 +101,7 @@ pub(crate) struct ReplayStoreArgs {
     /// Raw-blob retention persisted in the canonical store.
     #[arg(
         long = "raw-blob-retention",
-        default_value = "transactions",
+        default_value = "none",
         value_parser = crate::rocksdb_wallet_rebuild::parse_raw_blob_retention
     )]
     raw_blob_retention: RawBlobRetention,

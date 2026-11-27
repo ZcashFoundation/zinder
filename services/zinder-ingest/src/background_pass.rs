@@ -11,7 +11,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use zinder_core::NetworkUpgradeActivations;
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreRequirements, RawBlobRetention,
     RocksDbCanonicalSecondary, RocksDbResourceBudget, RocksDbTreeStateVerifier,
 };
 
@@ -26,7 +26,6 @@ pub(crate) struct BackgroundSecondary<'pass> {
     pub(crate) canonical_primary_path: &'pass Path,
     pub(crate) secondary_path: &'pass Path,
     pub(crate) network_upgrade_activations: &'pass Arc<NetworkUpgradeActivations>,
-    pub(crate) workload: CanonicalStoreWorkload,
     pub(crate) raw_blob_retention: RawBlobRetention,
     pub(crate) reorg_policy: CanonicalReorgPolicy,
     pub(crate) resource_budget: RocksDbResourceBudget,
@@ -44,16 +43,7 @@ impl BackgroundSecondaryHandle for RocksDbCanonicalSecondary {
             &opening.primary_path,
             &opening.secondary_path,
             &opening.activations,
-            if opening.workload == CanonicalStoreWorkload::Explorer {
-                zinder_store::CanonicalStoreRequirements::new(&[
-                    zinder_store::CanonicalStoredData::FinalNoteCommitmentRoots,
-                ])
-                .with_blob_retention(opening.raw_blob_retention)
-            } else {
-                zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                    opening.raw_blob_retention,
-                )
-            },
+            CanonicalStoreRequirements::for_blob_retention(opening.raw_blob_retention),
             opening.reorg_policy,
             opening.resource_budget,
         )
@@ -79,7 +69,6 @@ pub(crate) struct SecondaryOpening {
     primary_path: PathBuf,
     secondary_path: PathBuf,
     activations: Arc<NetworkUpgradeActivations>,
-    workload: CanonicalStoreWorkload,
     raw_blob_retention: RawBlobRetention,
     reorg_policy: CanonicalReorgPolicy,
     resource_budget: RocksDbResourceBudget,
@@ -132,7 +121,6 @@ impl BackgroundSecondary<'_> {
             primary_path: self.canonical_primary_path.to_path_buf(),
             secondary_path: self.secondary_path.to_path_buf(),
             activations: Arc::clone(self.network_upgrade_activations),
-            workload: self.workload,
             raw_blob_retention: self.raw_blob_retention,
             reorg_policy: self.reorg_policy,
             resource_budget: self.resource_budget,

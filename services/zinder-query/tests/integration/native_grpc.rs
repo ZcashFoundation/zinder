@@ -1139,12 +1139,8 @@ async fn native_serving_pair_capabilities_and_calls_follow_raw_blob_retention() 
 {
     for (retention, minimum) in [
         (RawBlobRetention::None, RawBlobRetention::None),
-        (
-            RawBlobRetention::Transactions,
-            RawBlobRetention::Transactions,
-        ),
         (RawBlobRetention::All, RawBlobRetention::All),
-        (RawBlobRetention::All, RawBlobRetention::Transactions),
+        (RawBlobRetention::All, RawBlobRetention::None),
     ] {
         assert_native_retention_case(retention, minimum).await?;
     }
@@ -1161,7 +1157,6 @@ async fn assert_native_retention_case(
 ) -> eyre::Result<()> {
     let (expect_transaction_bytes, expect_full_blocks) = match raw_blob_retention {
         RawBlobRetention::None => (false, false),
-        RawBlobRetention::Transactions => (true, false),
         RawBlobRetention::All => (true, true),
     };
     let mined_transaction_id = TransactionId::from_bytes([0x78; 32]);
@@ -1187,18 +1182,23 @@ async fn assert_native_retention_case(
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(raw_blob_retention)
         .extend_blocks(1);
-    let block = chain
+    let pre_tx_block = chain
         .blocks()
         .first()
         .cloned()
         .ok_or_else(|| eyre!("retention fixture omitted its canonical block"))?;
     let chain = chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
         mined_transaction_id,
-        block.height,
-        block.hash,
+        pre_tx_block.height,
+        pre_tx_block.hash,
         0,
         mined_raw_transaction_bytes.clone(),
     ));
+    let block = chain
+        .blocks()
+        .first()
+        .cloned()
+        .ok_or_else(|| eyre!("retention fixture omitted its canonical block"))?;
     let mut writer =
         CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
     let mut store_fixture = writer.serving_store_fixture()?;
@@ -2038,7 +2038,7 @@ async fn native_serving_adapter_with_ingest_control(
     ingest_control: StaticIngestControl,
 ) -> eyre::Result<NativeServingAdapterFixture> {
     let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .with_raw_blob_retention(RawBlobRetention::None)
         .extend_blocks(1);
     let store_fixture =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;

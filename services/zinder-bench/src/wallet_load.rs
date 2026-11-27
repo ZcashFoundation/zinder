@@ -886,7 +886,7 @@ mod tests {
             let activations = sample_regtest_upgrade_activations();
             let chain = with_note_commitments(
                 &ChainFixture::new(Network::ZcashRegtest)
-                    .with_raw_blob_retention(RawBlobRetention::Transactions)
+                    .with_raw_blob_retention(RawBlobRetention::All)
                     .extend_blocks(250),
                 &activations,
             )?;

@@ -128,7 +128,7 @@ pub(crate) async fn single_block_reads_answer_retained_heights_and_absence<H: Re
 }
 
 pub(crate) async fn compact_block_ranges_answer_their_ends<H: ReaderHarness>() -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions);
+    let chain = chain(RawBlobRetention::None);
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
 
     let blocks = reader.compact_blocks_in_range(range(1, TIP)).await?;
@@ -156,7 +156,7 @@ pub(crate) async fn compact_block_ranges_answer_their_ends<H: ReaderHarness>() -
 
 pub(crate) async fn byte_bounded_ranges_keep_whole_blocks_from_the_first_end<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions);
+    let chain = chain(RawBlobRetention::None);
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
     let whole = range(1, TIP);
 
@@ -196,9 +196,9 @@ pub(crate) async fn block_blob_reads_follow_raw_blob_retention<H: ReaderHarness>
         assert_eq!(blob.as_ref(), Some(&expected), "height {height}");
     }
 
-    let unretained = chain(RawBlobRetention::Transactions);
+    let unretained = chain(RawBlobRetention::None);
     let reader = published::<H>(&CanonicalBaseline::new(&unretained))?;
-    assert_eq!(reader.raw_blob_retention(), RawBlobRetention::Transactions);
+    assert_eq!(reader.raw_blob_retention(), RawBlobRetention::None);
     assert_eq!(reader.block_blob_at(BlockHeight::new(1)).await?, None);
     assert!(
         reader
@@ -212,7 +212,7 @@ pub(crate) async fn block_blob_reads_follow_raw_blob_retention<H: ReaderHarness>
 
 pub(crate) async fn mined_transactions_are_found_or_proven_absent<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (chain, mined) = chain_with_mined_transaction(RawBlobRetention::Transactions)?;
+    let (chain, mined) = chain_with_mined_transaction(RawBlobRetention::All)?;
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
     let block = fixture_block(&chain, MINED_HEIGHT)?;
 
@@ -261,7 +261,7 @@ pub(crate) async fn mined_transactions_are_found_or_proven_absent<H: ReaderHarne
 
 pub(crate) async fn transaction_bytes_name_the_missing_artifact<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (chain, _) = chain_with_mined_transaction(RawBlobRetention::Transactions)?;
+    let (chain, _) = chain_with_mined_transaction(RawBlobRetention::All)?;
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
     assert_transaction_unavailable(
         reader.transaction_blob_by_id(never_mined()).await,
@@ -280,7 +280,7 @@ pub(crate) async fn transaction_bytes_name_the_missing_artifact<H: ReaderHarness
 
 pub(crate) async fn a_checkpointed_store_cannot_prove_an_absence<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions);
+    let chain = chain(RawBlobRetention::None);
     let floor = BlockHeight::new(2);
     let reader = published::<H>(&CanonicalBaseline::new(&chain).with_history_floor(floor))?;
 
@@ -309,7 +309,7 @@ pub(crate) async fn a_checkpointed_store_cannot_prove_an_absence<H: ReaderHarnes
 }
 
 pub(crate) async fn tree_states_are_stored_or_replayed<H: ReaderHarness>() -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions);
+    let chain = chain(RawBlobRetention::None);
     let reader = published::<H>(&CanonicalBaseline::new(&chain))?;
     let tip = block_id(&chain, TIP)?;
 
@@ -363,7 +363,7 @@ pub(crate) async fn tree_states_are_stored_or_replayed<H: ReaderHarness>() -> ey
 pub(crate) async fn a_replay_reads_its_own_seed_not_one_built_outside_it<H: ReaderHarness>()
 -> eyre::Result<()> {
     let activations = sample_regtest_upgrade_activations();
-    let chain = with_note_commitments(&chain(RawBlobRetention::Transactions), &activations)?;
+    let chain = with_note_commitments(&chain(RawBlobRetention::None), &activations)?;
     let floor = BlockHeight::new(2);
     let mut harness = H::publish(
         &CanonicalBaseline::new(&chain).with_history_floor(floor),
@@ -665,7 +665,7 @@ pub(crate) async fn chain_event_starts_resolve_to_a_resume_position<H: ReaderHar
 
 pub(crate) async fn the_settled_stream_commits_each_newly_settled_range<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions).extend_blocks(2);
+    let chain = chain(RawBlobRetention::None).extend_blocks(2);
     let mut harness = H::publish(
         &CanonicalBaseline::new(&chain)
             .with_history_floor(BlockHeight::new(1))
@@ -830,7 +830,7 @@ pub(crate) async fn pruned_and_malformed_chain_event_cursors_are_refused<H: Read
 
 pub(crate) async fn a_reader_keeps_its_fence_while_the_writer_appends<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let chain = chain(RawBlobRetention::Transactions).extend_blocks(1);
+    let chain = chain(RawBlobRetention::None).extend_blocks(1);
     let baseline_tip = BlockHeight::new(TIP);
     let mut harness = H::publish(
         &CanonicalBaseline::new(&chain).through(baseline_tip),
@@ -876,7 +876,7 @@ pub(crate) async fn a_reader_keeps_its_fence_while_the_writer_appends<H: ReaderH
 
 pub(crate) async fn a_reorg_replaces_blocks_only_for_readers_opened_after_it<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (chain, mined) = chain_with_mined_transaction(RawBlobRetention::Transactions)?;
+    let (chain, mined) = chain_with_mined_transaction(RawBlobRetention::All)?;
     let replaced_height = BlockHeight::new(MINED_HEIGHT);
     // The writer archives each block a reorg displaces, which must start
     // with a coinbase.
@@ -976,7 +976,7 @@ async fn assert_hashes_resolve_on_their_own_chain(
 
 pub(crate) async fn a_reorg_is_served_as_a_visible_chain_event<H: ReaderHarness>()
 -> eyre::Result<()> {
-    let (chain, _) = chain_with_mined_transaction(RawBlobRetention::Transactions)?;
+    let (chain, _) = chain_with_mined_transaction(RawBlobRetention::All)?;
     let replaced_height = BlockHeight::new(MINED_HEIGHT);
     let chain = with_coinbases(chain, MINED_HEIGHT + 1..=TIP)?;
     let replacement_chain = chain.fork_at(replaced_height)?.extend_blocks(1);
@@ -1072,7 +1072,7 @@ fn published<H: ReaderHarness>(baseline: &CanonicalBaseline<'_>) -> eyre::Result
 
 /// Publishes a [`TIP`]-block baseline and appends `appended` live blocks.
 fn appended<H: ReaderHarness>(appended: u32) -> eyre::Result<(H, ChainFixture)> {
-    let chain = chain(RawBlobRetention::Transactions).extend_blocks(appended);
+    let chain = chain(RawBlobRetention::None).extend_blocks(appended);
     let mut harness = H::publish(
         &CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP)),
         &sample_regtest_upgrade_activations(),

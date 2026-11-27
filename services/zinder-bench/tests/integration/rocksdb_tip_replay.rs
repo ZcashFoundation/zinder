@@ -45,9 +45,9 @@ use zinder_source::{
     SourceError,
 };
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, RocksDbResourceBudget,
+    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan, RawBlobRetention,
+    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
+    RocksDbResourceBudget,
 };
 use zinder_testkit::{
     P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey,
@@ -214,12 +214,11 @@ async fn publish_canonical(
         &inputs.activations,
         first_block.block_time_seconds.saturating_sub(1),
         tip,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
     )?;
     let builder = RocksDbCanonicalBuilder::create_fresh(
         inputs.canonical_store(),
-        CanonicalStoreWorkload::Wallet,
         build_plan,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -460,8 +459,7 @@ fn rebuilt_wallet_digest(inputs: &TipReplayInputs, canonical_store: &Path) -> Re
     let canonical = RocksDbCanonicalStore::open_ready(
         canonical_store,
         &inputs.activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::Transactions,
+        RawBlobRetention::None,
         CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
         RocksDbResourceBudget::for_local_tests(),
     )?;
@@ -1209,9 +1207,7 @@ impl SpendLinks {
                 .path()
                 .join(format!("{name}-links-secondary")),
             &inputs.activations,
-            zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                RawBlobRetention::Transactions,
-            ),
+            zinder_store::CanonicalStoreRequirements::for_blob_retention(RawBlobRetention::None),
             CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
