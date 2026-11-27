@@ -13,11 +13,14 @@ mod grpc_status;
 mod kv;
 mod mempool_event;
 mod mempool_event_store;
+mod positional_source;
 mod proto_codec;
 mod raw_blob_retention;
 mod rocksdb_resource_budget;
+mod segment_verity;
 mod settled_raw_block_segment;
 mod settled_shielded_segment;
+mod settled_supplement_segment;
 mod store_error;
 
 pub use block_hash_index::BlockHashLookup;
@@ -82,6 +85,7 @@ pub use mempool_event_store::{
     MempoolEventRetentionConfig, MempoolEventRetentionReport, MempoolEventRetentionStepBudget,
     MempoolEventRetentionStepOutcome, MempoolEventRetentionStepStop,
 };
+pub use positional_source::{ByteRange, PositionalByteSource};
 pub use proto_codec::{
     ChainEventEncodeError, MempoolDecodeError, block_tip_message, chain_epoch_from_message,
     chain_epoch_message, chain_event_envelope_message, chain_event_stream_family_from_message,
@@ -100,10 +104,29 @@ pub use settled_raw_block_segment::{
     SettledRawBlockSegmentWriter,
 };
 pub use settled_shielded_segment::{
-    PoolPresenceMask, SEGMENT_FLAG_RESERVED_SHIFTED_EPK, SETTLED_SHIELDED_SEGMENT_MAGIC,
+    BoundedShieldedRangePlan, DEFAULT_SETTLED_SHIELDED_SEGMENT_MAX_SLAB_BYTES, PoolPresenceMask,
+    SEGMENT_FLAG_RESERVED_SHIFTED_EPK, SETTLED_SHIELDED_SEGMENT_MAGIC,
     SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES, SettledShieldedSegmentError,
-    SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader, SettledShieldedSegmentWriter,
-    ShieldedProjectionSelection, ShieldedSegmentIdentity, is_passthrough_shielded_block_wire,
-    project_shielded_block_wire, project_shielded_block_wire_with_scratch,
+    SettledShieldedSegmentIndex, SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader,
+    SettledShieldedSegmentWriter, ShieldedBatchReadRequest, ShieldedBoundedBatchReadRequest,
+    ShieldedFetchedSlab, ShieldedIndexSlice, ShieldedProjectionSelection, ShieldedRangeByteBudget,
+    ShieldedRangePlan, ShieldedReadScratch, ShieldedReadStep, ShieldedSegmentHeader,
+    ShieldedSegmentIdentity, ShieldedSlabDecodeRequest, VerifiedShieldedIndexSlice,
+    is_passthrough_shielded_block_wire, project_shielded_block_wire,
+    project_shielded_block_wire_with_scratch,
+};
+pub use settled_supplement_segment::{
+    BlockSupplementRecord, CanonicalBlockSupplement, CanonicalTransactionSupplement,
+    CompactBlockSpliceSelection, CompactTransparentSupplementTx,
+    DEFAULT_SETTLED_SUPPLEMENT_SEGMENT_MAX_BYTES, SETTLED_SUPPLEMENT_DEFAULT_CHUNK_BLOCKS,
+    SETTLED_SUPPLEMENT_MAX_CHUNK_BLOCKS, SETTLED_SUPPLEMENT_SEGMENT_MAGIC,
+    SETTLED_SUPPLEMENT_SEGMENT_MAX_BLOCK_BYTES, SettledSupplementSegmentError,
+    SettledSupplementSegmentIndex, SettledSupplementSegmentOpenOptions,
+    SettledSupplementSegmentReader, SettledSupplementSegmentWriteOptions,
+    SettledSupplementSegmentWriter, SupplementChunkReadStep, SupplementCompressionCodec,
+    SupplementRangePlan, SupplementRowIndexSlice, SupplementSegmentHeader,
+    SupplementSegmentIdentity, SupplementShieldedAnchors, SupplementSpliceChunkStep,
+    SupplementSplicePlan, SupplementTxFeeAndBurn, VerifiedSupplementRowIndexSlice,
+    reconstruct_compact_block_artifact, splice_compact_block_wire,
 };
 pub use store_error::{ArtifactFamily, StorageKey, StoreError};

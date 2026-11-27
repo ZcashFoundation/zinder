@@ -1,10 +1,16 @@
 use std::{
+    collections::VecDeque,
     fs::{self, OpenOptions},
-    io::{Seek, SeekFrom, Write},
+    future::{Future, poll_fn},
+    io::{self, Seek, SeekFrom, Write},
     path::Path,
-    sync::atomic::Ordering,
+    pin::{Pin, pin},
+    sync::Arc,
+    task::{Context, Poll},
 };
 
+use bytes::Bytes;
+use parking_lot::Mutex;
 use prost::{
     Message,
     encoding::{WireType, encode_key, encode_varint},
@@ -18,18 +24,30 @@ use zinder_core::{
     TransactionId,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
-use zinder_proto::compat::lightwalletd::{self, EncodedBlock};
+use zinder_proto::compat::lightwalletd::{
+    self, BoundedChunkRetention, EncodedBlock, EncodedBlockBatcher, EncodedBlockFrame,
+    EncodedBlockFrameStream, EncodedBlockRange, EncodedBlockRangeStream,
+    compact_tx_streamer_client::CompactTxStreamerClient,
+    compact_tx_streamer_server::{CompactTxStreamer, CompactTxStreamerServer},
+};
 
-use crate::HeightOrder;
+use crate::{
+    HeightOrder,
+    positional_source::{ByteRange, PositionalByteSource},
+};
 
 use super::{
-    PoolPresenceMask, SEGMENT_FLAG_RESERVED_SHIFTED_EPK,
+    BoundedShieldedRangePlan, PoolPresenceMask, SEGMENT_FLAG_RESERVED_SHIFTED_EPK,
     SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES, SettledShieldedSegmentError,
-    SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader, SettledShieldedSegmentWriter,
-    ShieldedProjectionSelection, ShieldedSegmentIdentity,
+    SettledShieldedSegmentIndex, SettledShieldedSegmentOpenOptions, SettledShieldedSegmentReader,
+    SettledShieldedSegmentWriter, ShieldedBatchReadRequest, ShieldedBoundedBatchReadRequest,
+    ShieldedFetchedSlab, ShieldedIndexSlice, ShieldedProjectionSelection, ShieldedRangeByteBudget,
+    ShieldedReadScratch, ShieldedSegmentHeader, ShieldedSegmentIdentity, ShieldedSlabDecodeRequest,
+    VerifiedShieldedIndexSlice,
     format::{
-        DecodedRowIndexEntry, FRAME_PREFIX_LEN, FRAME_PREFIX_U32, HEADER_LEN, IndexedBlock,
-        ROW_INDEX_ENTRY_LEN, SegmentHeader, TRAILER_LEN, VALIDATION_INVALID,
+        CompactShieldedRow, DecodedRowIndexEntry, FRAME_PREFIX_LEN, FRAME_PREFIX_U32, HEADER_LEN,
+        INDEX_PAGE_ROWS, LARGE_ROW_ISOLATION_MIN_BYTES, REPACKED_SHORT_BATCH_BYTES,
+        ROW_INDEX_ENTRY_LEN, SLAB_TARGET_BYTES, TRAILER_LEN, VALIDATION_INVALID,
         VALIDATION_UNVALIDATED, VALIDATION_VALID, encode_frame_prefix,
     },
     is_passthrough_shielded_block_wire, project_shielded_block_wire,
@@ -408,14 +426,22 @@ fn write_segment(
     Ok((target, identity))
 }
 
-fn recompute_portable_sha256(bytes: &[u8]) -> [u8; 32] {
+fn recompute_portable_digests(bytes: &[u8]) -> TestOutcome<([u8; 32], [u8; 32])> {
     let body_end = bytes.len() - TRAILER_LEN;
-    Sha256::digest(&bytes[..body_end]).into()
+    let header_bytes: &[u8; HEADER_LEN] = bytes[..HEADER_LEN].try_into()?;
+    let index_offset =
+        usize::try_from(ShieldedSegmentHeader::decode_unchecked(header_bytes)?.index_offset())?;
+    let trailer: [u8; 32] = Sha256::digest(&bytes[..body_end]).into();
+    let mut index_digest = Sha256::new();
+    index_digest.update(header_bytes);
+    index_digest.update(&bytes[index_offset..body_end]);
+    index_digest.update(trailer);
+    Ok((trailer, index_digest.finalize().into()))
 }
 
 #[test]
-fn indexed_block_row_stays_within_48_bytes() {
-    assert!(std::mem::size_of::<IndexedBlock>() <= 48);
+fn indexed_block_row_stays_12_bytes() {
+    assert_eq!(std::mem::size_of::<CompactShieldedRow>(), 12);
 }
 
 fn assert_blocks_match_expected(
@@ -647,7 +673,6 @@ fn corrupt_and_open(
     original: &[u8],
     identity: ShieldedSegmentIdentity,
     mutator: &dyn Fn(&mut Vec<u8>),
-    expected_sha: [u8; 32],
 ) -> SettledShieldedSegmentError {
     let mut mutated = original.to_vec();
     mutator(&mut mutated);
@@ -655,9 +680,10 @@ fn corrupt_and_open(
     if let Err(err) = fs::write(&tampered_path, &mutated) {
         return SettledShieldedSegmentError::Io(err);
     }
-    let mut altered_identity = identity;
-    altered_identity.sha256 = expected_sha;
-    altered_identity.fs_verity_sha256 = None;
+    let altered_identity = ShieldedSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
     match SettledShieldedSegmentReader::open(
         &tampered_path,
         &altered_identity,
@@ -668,6 +694,18 @@ fn corrupt_and_open(
     }
 }
 
+fn pin_with_digests(
+    base: ShieldedSegmentIdentity,
+    mutated: &[u8],
+) -> TestOutcome<ShieldedSegmentIdentity> {
+    let (sha256, index_sha256) = recompute_portable_digests(mutated)?;
+    Ok(ShieldedSegmentIdentity {
+        sha256,
+        index_sha256,
+        ..base
+    })
+}
+
 #[test]
 fn reader_fails_closed_on_tampered_header_and_index() -> TestOutcome {
     let dir = TempDir::new()?;
@@ -676,64 +714,82 @@ fn reader_fails_closed_on_tampered_header_and_index() -> TestOutcome {
     let original = fs::read(&path)?;
     let index_offset = usize::try_from(u64::from_be_bytes(original[96..104].try_into()?))?;
 
-    assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| buf[0] ^= 0xff,
-            identity.sha256
-        ),
-        SettledShieldedSegmentError::InvalidFormat(_)
-    ));
-    assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| buf[14..16].copy_from_slice(&SEGMENT_FLAG_RESERVED_SHIFTED_EPK.to_be_bytes()),
-            identity.sha256
-        ),
-        SettledShieldedSegmentError::InvalidFormat(_)
-    ));
-    assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| buf[120] = 1,
-            identity.sha256
-        ),
-        SettledShieldedSegmentError::InvalidFormat(_)
-    ));
+    for mutator in [
+        (&|buf: &mut Vec<u8>| buf[0] ^= 0xff) as &dyn Fn(&mut Vec<u8>),
+        &|buf| buf[14..16].copy_from_slice(&SEGMENT_FLAG_RESERVED_SHIFTED_EPK.to_be_bytes()),
+        &|buf| buf[120] = 1,
+    ] {
+        assert!(matches!(
+            corrupt_and_open(dir.path(), &original, identity, mutator),
+            SettledShieldedSegmentError::InvalidFormat(_)
+        ));
+    }
 
-    let mut index_reserved = original.clone();
-    index_reserved[index_offset + 78] = 1;
-    let index_reserved_sha = recompute_portable_sha256(&index_reserved);
-    assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| buf[index_offset + 78] = 1,
-            index_reserved_sha
-        ),
-        SettledShieldedSegmentError::InvalidFormat(_)
-    ));
+    for (offset, byte_val) in [
+        (index_offset + 78, 1_u8),
+        (index_offset + 77, 0x02),
+        (index_offset + 76, 0x80),
+    ] {
+        let mut mutated = original.clone();
+        mutated[offset] = byte_val;
+        let pin = pin_with_digests(identity, &mutated)?;
+        assert!(matches!(
+            corrupt_and_open(dir.path(), &original, pin, &|buf| {
+                buf[offset] = byte_val;
+                let end = buf.len() - TRAILER_LEN;
+                buf[end..].copy_from_slice(&pin.sha256);
+            }),
+            SettledShieldedSegmentError::InvalidFormat(_)
+        ));
+    }
+    Ok(())
+}
 
-    let mut bad_pool_bits = original.clone();
-    bad_pool_bits[index_offset + 76] = 0x80;
-    let bad_pool_sha = recompute_portable_sha256(&bad_pool_bits);
-    assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| buf[index_offset + 76] = 0x80,
-            bad_pool_sha
-        ),
-        SettledShieldedSegmentError::InvalidFormat(_)
-    ));
+fn assert_corrupt_slab_rejected(
+    dir: &Path,
+    name: &str,
+    tampered: &[u8],
+    portable_id: &ShieldedSegmentIdentity,
+    expect_integrity: bool,
+) -> TestOutcome {
+    let tampered_path = dir.join(name);
+    fs::write(&tampered_path, tampered)?;
+    let full_err = SettledShieldedSegmentReader::open(
+        &tampered_path,
+        portable_id,
+        SettledShieldedSegmentOpenOptions {
+            require_fs_verity: false,
+            verify_full_payload: true,
+        },
+    );
+    let cold_reader = SettledShieldedSegmentReader::open(
+        &tampered_path,
+        portable_id,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let read_err = cold_reader.read_default_range(
+        BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1)),
+        HeightOrder::Ascending,
+    );
+    if expect_integrity {
+        assert!(matches!(
+            full_err,
+            Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+        ));
+        assert!(matches!(
+            read_err,
+            Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+        ));
+    } else {
+        assert!(matches!(
+            full_err,
+            Err(SettledShieldedSegmentError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            read_err,
+            Err(SettledShieldedSegmentError::InvalidFormat(_))
+        ));
+    }
     Ok(())
 }
 
@@ -744,71 +800,71 @@ fn reader_fails_closed_on_tampered_slab_and_trailer() -> TestOutcome {
     let (path, identity) = write_segment(dir.path(), "tamper-slab", &blocks)?;
     let original = fs::read(&path)?;
     let index_offset = usize::try_from(u64::from_be_bytes(original[96..104].try_into()?))?;
+    let portable_id = ShieldedSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+
+    let mut bad_prefix = original.clone();
+    bad_prefix[HEADER_LEN] = 1;
+    assert_corrupt_slab_rejected(
+        dir.path(),
+        "bad-slab-prefix",
+        &bad_prefix,
+        &portable_id,
+        false,
+    )?;
+
+    let mut bad_slab_payload = original.clone();
+    bad_slab_payload[HEADER_LEN + 10] ^= 0x01;
+    assert_corrupt_slab_rejected(
+        dir.path(),
+        "bad-slab-payload",
+        &bad_slab_payload,
+        &portable_id,
+        true,
+    )?;
 
     assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| buf[HEADER_LEN] = 1,
-            identity.sha256
-        ),
-        SettledShieldedSegmentError::InvalidFormat(_)
-    ));
-    assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| buf[HEADER_LEN + 10] ^= 0x01,
-            identity.sha256
-        ),
+        corrupt_and_open(dir.path(), &original, identity, &|buf| {
+            let last = buf.len() - 1;
+            buf[last] ^= 0x01;
+        }),
         SettledShieldedSegmentError::PayloadIntegrity(_)
     ));
     assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| {
-                let last = buf.len() - 1;
-                buf[last] ^= 0x01;
-            },
-            identity.sha256
-        ),
+        corrupt_and_open(dir.path(), &original, identity, &|buf| buf
+            [index_offset + ROW_INDEX_ENTRY_LEN] ^=
+            0x01),
         SettledShieldedSegmentError::PayloadIntegrity(_)
     ));
 
-    // Unrecomputed interior index hash tamper fails whole-file authentication on open.
+    let mut stale_idx_pin = original.clone();
+    stale_idx_pin[index_offset + ROW_INDEX_ENTRY_LEN] ^= 0x01;
+    let (recomputed_sha, _) = recompute_portable_digests(&stale_idx_pin)?;
+    let stale_id = ShieldedSegmentIdentity {
+        sha256: recomputed_sha,
+        ..identity
+    };
     assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| buf[index_offset + ROW_INDEX_ENTRY_LEN] ^= 0x01,
-            identity.sha256
-        ),
+        corrupt_and_open(dir.path(), &original, stale_id, &|buf| {
+            buf[index_offset + ROW_INDEX_ENTRY_LEN] ^= 0x01;
+            let end = buf.len() - TRAILER_LEN;
+            buf[end..].copy_from_slice(&recomputed_sha);
+        }),
         SettledShieldedSegmentError::PayloadIntegrity(_)
     ));
 
-    // Corrupted final row hash with matching trailer fails last-row linkage check on open.
     let last_row_offset = index_offset + (blocks.len() - 1) * ROW_INDEX_ENTRY_LEN;
     let mut bad_last_hash = original.clone();
     bad_last_hash[last_row_offset] ^= 0x01;
-    let bad_last_hash_sha = recompute_portable_sha256(&bad_last_hash);
+    let last_pin = pin_with_digests(identity, &bad_last_hash)?;
     assert!(matches!(
-        corrupt_and_open(
-            dir.path(),
-            &original,
-            identity,
-            &|buf| {
-                buf[last_row_offset] ^= 0x01;
-                let end = buf.len() - TRAILER_LEN;
-                let trailer: [u8; 32] = Sha256::digest(&buf[..end]).into();
-                buf[end..].copy_from_slice(&trailer);
-            },
-            bad_last_hash_sha
-        ),
+        corrupt_and_open(dir.path(), &original, last_pin, &|buf| {
+            buf[last_row_offset] ^= 0x01;
+            let end = buf.len() - TRAILER_LEN;
+            buf[end..].copy_from_slice(&last_pin.sha256);
+        }),
         SettledShieldedSegmentError::ChainLinkage(_)
     ));
     Ok(())
@@ -823,13 +879,14 @@ fn reader_rejects_mismatched_interior_row_hash_on_read_and_caches_invalid_state(
     let index_offset = usize::try_from(u64::from_be_bytes(mutated[96..104].try_into()?))?;
     // Corrupt Orchard-only block height = 3 (row index 2), which has no Sapling bits.
     mutated[index_offset + 2 * ROW_INDEX_ENTRY_LEN] ^= 0x01;
-    let forged_sha = recompute_portable_sha256(&mutated);
+    let (forged_sha, forged_index_sha) = recompute_portable_digests(&mutated)?;
     let body_end = mutated.len() - TRAILER_LEN;
     mutated[body_end..].copy_from_slice(&forged_sha);
     let forged_path = dir.path().join("forged-interior");
     fs::write(&forged_path, &mutated)?;
     let forged_identity = ShieldedSegmentIdentity {
         sha256: forged_sha,
+        index_sha256: forged_index_sha,
         fs_verity_sha256: None,
         ..identity
     };
@@ -892,6 +949,7 @@ fn reader_detects_post_admission_tamper_verity_guard_and_transparent_wire() -> T
         &portable_identity,
         SettledShieldedSegmentOpenOptions {
             require_fs_verity: true,
+            ..SettledShieldedSegmentOpenOptions::default()
         },
     );
     assert!(matches!(
@@ -946,7 +1004,7 @@ fn validate_entries_rejects_oversized_frame_on_protected_path() -> TestOutcome {
     let max_frame = FRAME_PREFIX_U32 + max_payload;
     let last_hash_wire = encode_internal_block_hash(block_hash(1));
     let header_len_u64 = u64::try_from(HEADER_LEN)?;
-    let header = SegmentHeader {
+    let header = ShieldedSegmentHeader {
         network_tag: TEST_NETWORK.id(),
         artifact_schema_version: TEST_SCHEMA,
         segment_flags: 0,
@@ -964,17 +1022,18 @@ fn validate_entries_rejects_oversized_frame_on_protected_path() -> TestOutcome {
         slab_rel_offset: 0,
         native_bytes: 128,
         pool_presence: PoolPresenceMask::EMPTY,
+        row_flags: 0,
     };
 
-    let exact_max_rows = validate_entries(&[entry], max_frame, &header, None)?;
+    let exact_max_rows = validate_entries(&[entry], max_frame, &header)?;
     assert_eq!(exact_max_rows.len(), 1);
 
     assert!(matches!(
-        validate_entries(&[entry], max_frame + 1, &header, None),
+        validate_entries(&[entry], max_frame + 1, &header),
         Err(SettledShieldedSegmentError::InvalidFormat(_))
     ));
     assert!(matches!(
-        validate_entries(&[entry], u32::MAX, &header, None),
+        validate_entries(&[entry], u32::MAX, &header),
         Err(SettledShieldedSegmentError::InvalidFormat(_))
     ));
     Ok(())
@@ -1045,7 +1104,7 @@ fn open_raw_portable_segment_with_presence(
     let first_prev_hash_wire = encode_internal_block_hash(block_hash(0));
     let end_id = BlockId::new(BlockHeight::new(1), block_hash(1));
     let last_block_hash_wire = encode_internal_block_hash(end_id.hash);
-    let header = SegmentHeader {
+    let header = ShieldedSegmentHeader {
         network_tag: TEST_NETWORK.id(),
         artifact_schema_version: TEST_SCHEMA,
         segment_flags: 0,
@@ -1063,6 +1122,7 @@ fn open_raw_portable_segment_with_presence(
         slab_rel_offset: 0,
         native_bytes: 128,
         pool_presence,
+        row_flags: 0,
     };
     let mut segment_bytes = Vec::with_capacity(
         HEADER_LEN + FRAME_PREFIX_LEN + payload.len() + ROW_INDEX_ENTRY_LEN + TRAILER_LEN,
@@ -1073,11 +1133,13 @@ fn open_raw_portable_segment_with_presence(
     segment_bytes.extend_from_slice(&entry.encode());
     let trailer: [u8; TRAILER_LEN] = Sha256::digest(&segment_bytes).into();
     segment_bytes.extend_from_slice(&trailer);
+    let (_, index_sha256) = recompute_portable_digests(&segment_bytes)?;
 
     let file_path = dir.join(name);
     fs::write(&file_path, &segment_bytes)?;
     let identity = ShieldedSegmentIdentity {
         sha256: trailer,
+        index_sha256,
         ..ShieldedSegmentIdentity::span(TEST_NETWORK, TEST_SCHEMA, BlockHeight::new(1), end_id)
     };
     Ok(SettledShieldedSegmentReader::open(
@@ -1270,26 +1332,18 @@ fn indexed_block_mark_valid_preserves_invalid_state() {
         slab_rel_offset: 0,
         native_bytes: 64,
         pool_presence: PoolPresenceMask::EMPTY,
+        row_flags: 0,
     };
 
-    let valid_row = IndexedBlock::from_entry(&entry);
-    assert_eq!(
-        valid_row.validation_state.load(Ordering::Acquire),
-        VALIDATION_UNVALIDATED
-    );
+    let valid_row = CompactShieldedRow::from_entry(&entry);
+    assert_eq!(valid_row.validation_state(), VALIDATION_UNVALIDATED);
     valid_row.mark_valid();
-    assert_eq!(
-        valid_row.validation_state.load(Ordering::Acquire),
-        VALIDATION_VALID
-    );
+    assert_eq!(valid_row.validation_state(), VALIDATION_VALID);
 
-    let invalid_row = IndexedBlock::from_entry(&entry);
+    let invalid_row = CompactShieldedRow::from_entry(&entry);
     invalid_row.mark_invalid();
     invalid_row.mark_valid();
-    assert_eq!(
-        invalid_row.validation_state.load(Ordering::Acquire),
-        VALIDATION_INVALID
-    );
+    assert_eq!(invalid_row.validation_state(), VALIDATION_INVALID);
 }
 
 #[test]
@@ -1364,13 +1418,14 @@ fn open_forged_pool_presence_segment(
     let mut mutated = fs::read(&src_path)?;
     let index_offset = usize::try_from(u64::from_be_bytes(mutated[96..104].try_into()?))?;
     mutated[index_offset + row_idx * ROW_INDEX_ENTRY_LEN + 76] = forged_mask.bits();
-    let forged_sha = recompute_portable_sha256(&mutated);
+    let (forged_sha, forged_index_sha) = recompute_portable_digests(&mutated)?;
     let body_end = mutated.len() - TRAILER_LEN;
     mutated[body_end..].copy_from_slice(&forged_sha);
     let forged_path = dir.join(name);
     fs::write(&forged_path, &mutated)?;
     let forged_identity = ShieldedSegmentIdentity {
         sha256: forged_sha,
+        index_sha256: forged_index_sha,
         fs_verity_sha256: None,
         ..identity
     };
@@ -1387,6 +1442,9 @@ fn reader_rejects_empty_pool_presence_mask_for_orchard_block() -> TestOutcome {
     let blocks = mixed_fixture_blocks()?;
     let range_3 = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(3));
 
+    // With O(index) open, full validation (via verify_full_payload or read_default_range) detects the
+    // forged index mask against the protobuf wire payload and latches sticky VALIDATION_INVALID so
+    // subsequent DEFAULT_NULLIFIERS reads also fail closed.
     let reader_first = open_forged_pool_presence_segment(
         dir.path(),
         "empty-mask-first",
@@ -1394,6 +1452,10 @@ fn reader_rejects_empty_pool_presence_mask_for_orchard_block() -> TestOutcome {
         2,
         PoolPresenceMask::EMPTY,
     )?;
+    assert!(matches!(
+        reader_first.verify_full_payload(),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
     assert!(matches!(
         reader_first.read_projected_range(
             range_3,
@@ -1514,13 +1576,14 @@ fn reader_rejects_mismatched_block_time_on_consecutive_unmatched_nullifier_reads
     let index_offset = usize::try_from(u64::from_be_bytes(mutated[96..104].try_into()?))?;
     // Mutate Orchard-only height = 3 (row index 2) indexed block_time (bytes 64..68).
     mutated[index_offset + 2 * ROW_INDEX_ENTRY_LEN + 67] ^= 0x01;
-    let forged_sha = recompute_portable_sha256(&mutated);
+    let (forged_sha, forged_index_sha) = recompute_portable_digests(&mutated)?;
     let body_end = mutated.len() - TRAILER_LEN;
     mutated[body_end..].copy_from_slice(&forged_sha);
     let forged_path = dir.path().join("forged-block-time");
     fs::write(&forged_path, &mutated)?;
     let forged_identity = ShieldedSegmentIdentity {
         sha256: forged_sha,
+        index_sha256: forged_index_sha,
         fs_verity_sha256: None,
         ..identity
     };
@@ -1530,6 +1593,10 @@ fn reader_rejects_mismatched_block_time_on_consecutive_unmatched_nullifier_reads
         SettledShieldedSegmentOpenOptions::default(),
     )?;
     let range_3 = BlockHeightRange::inclusive(BlockHeight::new(3), BlockHeight::new(3));
+    assert!(matches!(
+        reader.read_default_range(range_3, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
     let sapling_nullifiers = ShieldedProjectionSelection::new(true, false, false, true);
     assert!(matches!(
         reader.read_projected_range(range_3, HeightOrder::Ascending, sapling_nullifiers),
@@ -1638,6 +1705,1232 @@ fn passthrough_wire_check_matches_full_projection_and_rejects_corrupt_tags() -> 
     assert!(!is_passthrough_shielded_block_wire(&[], orchard_nf)?);
     assert!(matches!(
         is_passthrough_shielded_block_wire(&[0x10, 0x80], orchard_nf),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn writer_push_with_supplement_marks_wide_fees_for_reconstruction_only() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let wide_block = CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(10), block_hash(10)),
+        block_hash(9),
+        1_700_000_010,
+        vec![make_tx(
+            0,
+            10,
+            CompactTransactionData {
+                fee_zat: Some(u64::from(u32::MAX) + 42),
+                orchard_actions: vec![shielded_action(0x41)],
+                ..CompactTransactionData::default()
+            },
+        )],
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 10,
+            orchard_commitment_tree_size: 20,
+            ironwood_commitment_tree_size: 30,
+        },
+    )?;
+    let span = ShieldedSegmentIdentity::span(
+        TEST_NETWORK,
+        TEST_SCHEMA,
+        wide_block.height(),
+        BlockId::new(wide_block.height(), wide_block.block_hash()),
+    );
+    let reject_path = dir.path().join("reject-wide.zshrng02");
+    let mut strict_writer = SettledShieldedSegmentWriter::create(
+        &reject_path,
+        NamedTempFile::new_in(dir.path())?,
+        span,
+    )?;
+    assert!(matches!(
+        strict_writer.push(&wide_block, 512),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+
+    let sup_path = dir.path().join("wide-sup.zshrng02");
+    let mut sup_writer =
+        SettledShieldedSegmentWriter::create(&sup_path, NamedTempFile::new_in(dir.path())?, span)?;
+    sup_writer.push_with_supplement(&wide_block, 512)?;
+    let identity = sup_writer.finish()?;
+
+    let reader = SettledShieldedSegmentReader::open(
+        &sup_path,
+        &identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let range = BlockHeightRange::inclusive(wide_block.height(), wide_block.height());
+    assert!(matches!(
+        reader.read_default_range(range, HeightOrder::Ascending),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader.read_projected_range(
+            range,
+            HeightOrder::Ascending,
+            ShieldedProjectionSelection::DEFAULT_NULLIFIERS
+        ),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    let reconstructed_frames =
+        reader.read_default_range_for_reconstruction(range, HeightOrder::Ascending)?;
+    assert_eq!(reconstructed_frames.len(), 1);
+    let decoded = lightwalletd::CompactBlock::decode(reconstructed_frames[0].payload().as_ref())?;
+    assert_eq!(decoded.vtx.len(), 1);
+    assert_eq!(decoded.vtx[0].fee, 0);
+    Ok(())
+}
+
+#[test]
+fn writer_push_rejects_omitted_transparent_and_componentless_wide_fees() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let wide_fee = Some(u64::from(u32::MAX) + 1);
+    let metadata = CompactChainMetadata {
+        sapling_commitment_tree_size: 0,
+        orchard_commitment_tree_size: 0,
+        ironwood_commitment_tree_size: 0,
+    };
+    let build_omitted = |seed: u8, tx_scan: CompactTransactionData| {
+        let h = u32::from(seed);
+        CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(h), block_hash(h)),
+            block_hash(h - 1),
+            1_700_000_000 + h,
+            vec![make_tx(0, seed, tx_scan)],
+            metadata,
+        )
+    };
+    let transparent_block = build_omitted(
+        11,
+        CompactTransactionData {
+            fee_zat: wide_fee,
+            transparent_outputs: vec![CompactTransparentOutput {
+                value_zat: 1_000,
+                script_pub_key: vec![0x51],
+            }],
+            ..CompactTransactionData::default()
+        },
+    )?;
+    let componentless_block = build_omitted(
+        12,
+        CompactTransactionData {
+            fee_zat: wide_fee,
+            ..CompactTransactionData::default()
+        },
+    )?;
+    for (idx, blk) in [&transparent_block, &componentless_block]
+        .iter()
+        .enumerate()
+    {
+        let span = ShieldedSegmentIdentity::span(
+            TEST_NETWORK,
+            TEST_SCHEMA,
+            blk.height(),
+            BlockId::new(blk.height(), blk.block_hash()),
+        );
+        let mut writer = SettledShieldedSegmentWriter::create(
+            &dir.path().join(format!("strict-{idx}.zshrng02")),
+            NamedTempFile::new_in(dir.path())?,
+            span,
+        )?;
+        assert!(matches!(
+            writer.push(blk, 256),
+            Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+        ));
+    }
+    let sup_path = dir.path().join("transparent-wide-sup.zshrng02");
+    let sup_span = ShieldedSegmentIdentity::span(
+        TEST_NETWORK,
+        TEST_SCHEMA,
+        transparent_block.height(),
+        BlockId::new(transparent_block.height(), transparent_block.block_hash()),
+    );
+    let mut sup_writer = SettledShieldedSegmentWriter::create(
+        &sup_path,
+        NamedTempFile::new_in(dir.path())?,
+        sup_span,
+    )?;
+    sup_writer.push_with_supplement(&transparent_block, 256)?;
+    let identity = sup_writer.finish()?;
+    let reader = SettledShieldedSegmentReader::open(
+        &sup_path,
+        &identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let frames = reader.read_default_range(
+        BlockHeightRange::inclusive(transparent_block.height(), transparent_block.height()),
+        HeightOrder::Ascending,
+    )?;
+    assert_eq!(frames.len(), 1);
+    Ok(())
+}
+
+struct CountingByteSource {
+    bytes: Bytes,
+    reads: Mutex<Vec<ByteRange>>,
+}
+
+impl CountingByteSource {
+    fn new(bytes: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: Bytes::from(bytes),
+            reads: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn take_reads(&self) -> Vec<ByteRange> {
+        std::mem::take(&mut *self.reads.lock())
+    }
+}
+
+impl PositionalByteSource for CountingByteSource {
+    fn total_len(&self) -> io::Result<u64> {
+        self.bytes.total_len()
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.reads.lock().push(ByteRange::new(offset, buf.len()));
+        self.bytes.read_exact_at(offset, buf)
+    }
+
+    fn read_vec_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.reads.lock().push(ByteRange::new(offset, len));
+        self.bytes.read_vec_at(offset, len)
+    }
+}
+
+struct QueueStream<T>(VecDeque<Result<T, tonic::Status>>);
+
+impl<T: Unpin> tonic::codegen::tokio_stream::Stream for QueueStream<T> {
+    type Item = Result<T, tonic::Status>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.get_mut().0.pop_front())
+    }
+}
+
+struct MockEncodedStreamer {
+    use_frames: bool,
+    blocks: Vec<EncodedBlock>,
+    frames: Vec<EncodedBlockFrame>,
+}
+
+#[tonic::async_trait]
+impl EncodedBlockRange for MockEncodedStreamer {
+    fn supports_encoded_frames(&self) -> bool {
+        self.use_frames
+    }
+
+    async fn get_encoded_block_range(
+        &self,
+        _request: tonic::Request<lightwalletd::BlockRange>,
+    ) -> Result<tonic::Response<EncodedBlockRangeStream>, tonic::Status> {
+        let queued: VecDeque<_> = self.blocks.iter().cloned().map(Ok).collect();
+        Ok(tonic::Response::new(Box::pin(QueueStream(queued))))
+    }
+
+    async fn get_encoded_block_range_frames(
+        &self,
+        _request: tonic::Request<lightwalletd::BlockRange>,
+    ) -> Result<tonic::Response<EncodedBlockFrameStream>, tonic::Status> {
+        let queued: VecDeque<_> = self.frames.iter().cloned().map(Ok).collect();
+        Ok(tonic::Response::new(Box::pin(QueueStream(queued))))
+    }
+}
+
+#[tonic::async_trait]
+impl CompactTxStreamer for MockEncodedStreamer {
+    type GetBlockRangeStream = tonic::codegen::BoxStream<lightwalletd::CompactBlock>;
+    type GetBlockRangeNullifiersStream = tonic::codegen::BoxStream<lightwalletd::CompactBlock>;
+    type GetTaddressTxidsStream = tonic::codegen::BoxStream<lightwalletd::RawTransaction>;
+    type GetTaddressTransactionsStream = tonic::codegen::BoxStream<lightwalletd::RawTransaction>;
+    type GetMempoolTxStream = tonic::codegen::BoxStream<lightwalletd::CompactTx>;
+    type GetMempoolStreamStream = tonic::codegen::BoxStream<lightwalletd::RawTransaction>;
+    type GetSubtreeRootsStream = tonic::codegen::BoxStream<lightwalletd::SubtreeRoot>;
+    type GetAddressUtxosStreamStream =
+        tonic::codegen::BoxStream<lightwalletd::GetAddressUtxosReply>;
+
+    fn encoded_block_range(&self) -> Option<&dyn EncodedBlockRange> {
+        Some(self)
+    }
+
+    async fn get_latest_block(
+        &self,
+        _request: tonic::Request<lightwalletd::ChainSpec>,
+    ) -> Result<tonic::Response<lightwalletd::BlockId>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_block(
+        &self,
+        _request: tonic::Request<lightwalletd::BlockId>,
+    ) -> Result<tonic::Response<lightwalletd::CompactBlock>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_block_nullifiers(
+        &self,
+        _request: tonic::Request<lightwalletd::BlockId>,
+    ) -> Result<tonic::Response<lightwalletd::CompactBlock>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_block_range(
+        &self,
+        _request: tonic::Request<lightwalletd::BlockRange>,
+    ) -> Result<tonic::Response<Self::GetBlockRangeStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_block_range_nullifiers(
+        &self,
+        _request: tonic::Request<lightwalletd::BlockRange>,
+    ) -> Result<tonic::Response<Self::GetBlockRangeNullifiersStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_transaction(
+        &self,
+        _request: tonic::Request<lightwalletd::TxFilter>,
+    ) -> Result<tonic::Response<lightwalletd::RawTransaction>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn send_transaction(
+        &self,
+        _request: tonic::Request<lightwalletd::RawTransaction>,
+    ) -> Result<tonic::Response<lightwalletd::SendResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_taddress_txids(
+        &self,
+        _request: tonic::Request<lightwalletd::TransparentAddressBlockFilter>,
+    ) -> Result<tonic::Response<Self::GetTaddressTxidsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_taddress_transactions(
+        &self,
+        _request: tonic::Request<lightwalletd::TransparentAddressBlockFilter>,
+    ) -> Result<tonic::Response<Self::GetTaddressTransactionsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_taddress_balance(
+        &self,
+        _request: tonic::Request<lightwalletd::AddressList>,
+    ) -> Result<tonic::Response<lightwalletd::Balance>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_taddress_balance_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<lightwalletd::Address>>,
+    ) -> Result<tonic::Response<lightwalletd::Balance>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_mempool_tx(
+        &self,
+        _request: tonic::Request<lightwalletd::GetMempoolTxRequest>,
+    ) -> Result<tonic::Response<Self::GetMempoolTxStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_mempool_stream(
+        &self,
+        _request: tonic::Request<lightwalletd::Empty>,
+    ) -> Result<tonic::Response<Self::GetMempoolStreamStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_tree_state(
+        &self,
+        _request: tonic::Request<lightwalletd::BlockId>,
+    ) -> Result<tonic::Response<lightwalletd::TreeState>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_latest_tree_state(
+        &self,
+        _request: tonic::Request<lightwalletd::Empty>,
+    ) -> Result<tonic::Response<lightwalletd::TreeState>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_subtree_roots(
+        &self,
+        _request: tonic::Request<lightwalletd::GetSubtreeRootsArg>,
+    ) -> Result<tonic::Response<Self::GetSubtreeRootsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_address_utxos(
+        &self,
+        _request: tonic::Request<lightwalletd::GetAddressUtxosArg>,
+    ) -> Result<tonic::Response<lightwalletd::GetAddressUtxosReplyList>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_address_utxos_stream(
+        &self,
+        _request: tonic::Request<lightwalletd::GetAddressUtxosArg>,
+    ) -> Result<tonic::Response<Self::GetAddressUtxosStreamStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_lightd_info(
+        &self,
+        _request: tonic::Request<lightwalletd::Empty>,
+    ) -> Result<tonic::Response<lightwalletd::LightdInfo>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn get_standard_fee(
+        &self,
+        _request: tonic::Request<lightwalletd::Empty>,
+    ) -> Result<tonic::Response<lightwalletd::StandardFee>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+
+    async fn ping(
+        &self,
+        _request: tonic::Request<lightwalletd::Duration>,
+    ) -> Result<tonic::Response<lightwalletd::PingResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+}
+
+#[derive(Default)]
+struct CapturedServerResponse {
+    has_bounded_retention: bool,
+    frames: Vec<Bytes>,
+}
+
+struct CaptureServerService {
+    server: CompactTxStreamerServer<MockEncodedStreamer>,
+    captured: Arc<Mutex<Option<CapturedServerResponse>>>,
+}
+
+impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>>
+    for CaptureServerService
+{
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
+    type Error = tonic::Status;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+        let mut inner = self.server.clone();
+        let captured = Arc::clone(&self.captured);
+        Box::pin(async move {
+            let response = tonic::codegen::Service::call(&mut inner, request)
+                .await
+                .map_err(|_| tonic::Status::internal("infallible server error"))?;
+            let has_bounded_retention = response
+                .extensions()
+                .get::<BoundedChunkRetention>()
+                .is_some();
+            let (parts, body) = response.into_parts();
+            let mut body = pin!(body);
+            let mut data_frames = Vec::new();
+            while let Some(frame_outcome) =
+                poll_fn(|cx| tonic::codegen::Body::poll_frame(body.as_mut(), cx)).await
+            {
+                let frame = frame_outcome?;
+                if let Ok(chunk) = frame.into_data() {
+                    data_frames.push(chunk);
+                }
+            }
+            *captured.lock() = Some(CapturedServerResponse {
+                has_bounded_retention,
+                frames: data_frames,
+            });
+            Ok(tonic::codegen::http::Response::from_parts(
+                parts,
+                tonic::body::Body::empty(),
+            ))
+        })
+    }
+}
+
+fn serve_encoded_range(streamer: MockEncodedStreamer) -> TestOutcome<CapturedServerResponse> {
+    let captured = Arc::new(Mutex::new(None));
+    let svc = CaptureServerService {
+        server: CompactTxStreamerServer::new(streamer),
+        captured: Arc::clone(&captured),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    runtime.block_on(async move {
+        let mut client = CompactTxStreamerClient::new(svc);
+        let _ignored = client
+            .get_block_range(tonic::Request::new(lightwalletd::BlockRange::default()))
+            .await;
+    });
+    captured
+        .lock()
+        .take()
+        .ok_or_else(|| "missing captured HTTP response".into())
+}
+
+fn decode_wire_messages_from_frames(frame_chunks: &[Bytes]) -> TestOutcome<Vec<EncodedBlock>> {
+    let combined = frame_chunks.concat();
+    let mut offset = 0_usize;
+    let mut messages = Vec::new();
+    while offset < combined.len() {
+        let raw_len: [u8; 4] = combined[offset + 1..offset + FRAME_PREFIX_LEN].try_into()?;
+        let payload_len = usize::try_from(u32::from_be_bytes(raw_len))?;
+        let end = offset + FRAME_PREFIX_LEN + payload_len;
+        messages.push(EncodedBlock::from_length_prefixed(Bytes::copy_from_slice(
+            &combined[offset..end],
+        ))?);
+        offset = end;
+    }
+    Ok(messages)
+}
+
+#[test]
+fn cold_open_source_reads_header_and_index_only_without_touching_slab() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = mixed_fixture_blocks()?;
+    let (path, identity) = write_segment(dir.path(), "cold-open.zshrng02", &blocks)?;
+    let raw = fs::read(&path)?;
+    let header_bytes: &[u8; HEADER_LEN] = raw[..HEADER_LEN].try_into()?;
+    let portable_id = ShieldedSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+    let header =
+        ShieldedSegmentHeader::decode(header_bytes, &portable_id, u64::try_from(raw.len())?)?;
+    let expected_idx_range = header.index_and_trailer_range()?;
+
+    let source = CountingByteSource::new(raw.clone());
+    assert!(matches!(
+        SettledShieldedSegmentReader::open_source(
+            Arc::clone(&source),
+            &portable_id,
+            SettledShieldedSegmentOpenOptions {
+                require_fs_verity: true,
+                verify_full_payload: false,
+            },
+        ),
+        Err(SettledShieldedSegmentError::FsVerityRequired)
+    ));
+    assert_eq!(source.take_reads(), Vec::new());
+
+    let reader = SettledShieldedSegmentReader::open_source(
+        Arc::clone(&source),
+        &portable_id,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let reads = source.take_reads();
+    assert_eq!(
+        reads,
+        vec![ByteRange::new(0, HEADER_LEN), expected_idx_range]
+    );
+    assert_eq!(reader.block_count(), blocks.len());
+
+    let full_source = CountingByteSource::new(raw);
+    let _full = SettledShieldedSegmentReader::open_source(
+        Arc::clone(&full_source),
+        &portable_id,
+        SettledShieldedSegmentOpenOptions {
+            require_fs_verity: false,
+            verify_full_payload: true,
+        },
+    )?;
+    let full_reads = full_source.take_reads();
+    let idx_reads = full_reads
+        .iter()
+        .filter(|span| **span == expected_idx_range)
+        .count();
+    assert_eq!(
+        idx_reads, 1,
+        "verify_full_payload must reuse initial index read"
+    );
+    Ok(())
+}
+
+fn assert_no_slab_reads(reads: &[ByteRange], index_offset: u64) {
+    let slab_end = index_offset;
+    for span in reads {
+        let start = span.offset;
+        let end = span.end().unwrap_or(u64::MAX);
+        assert!(
+            end <= HEADER_LEN as u64 || start >= slab_end,
+            "unexpected Slab 0 read at {span:?} (index_offset={index_offset})"
+        );
+    }
+}
+
+fn build_skip_slab_fixture() -> TestOutcome<Vec<CompactBlockArtifact>> {
+    let empty_meta = CompactChainMetadata {
+        sapling_commitment_tree_size: 10,
+        orchard_commitment_tree_size: 20,
+        ironwood_commitment_tree_size: 30,
+    };
+    let mut blocks = Vec::new();
+    for h in 1..=3_u32 {
+        blocks.push(CompactBlockArtifact::empty(
+            BlockId::new(BlockHeight::new(h), block_hash(h)),
+            block_hash(h - 1),
+            1_700_000_000 + h,
+            empty_meta,
+        ));
+    }
+    let sapling_block = CompactBlockArtifact::new(
+        BlockId::new(BlockHeight::new(4), block_hash(4)),
+        block_hash(3),
+        1_700_000_004,
+        vec![make_tx(
+            0,
+            40,
+            CompactTransactionData {
+                fee_zat: Some(1_000),
+                sapling_spends: vec![sapling_spend(0x41)],
+                sapling_outputs: vec![sapling_output(0x42)],
+                ..CompactTransactionData::default()
+            },
+        )],
+        empty_meta,
+    )?;
+    blocks.push(sapling_block);
+    Ok(blocks)
+}
+
+#[test]
+fn cold_nullifier_can_skip_slab_reads_zero_slab_bytes() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = build_skip_slab_fixture()?;
+    let (path, identity) = write_segment(dir.path(), "skip-slab.zshrng02", &blocks)?;
+    let portable_id = ShieldedSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+    let source = CountingByteSource::new(fs::read(&path)?);
+    let reader = SettledShieldedSegmentReader::open_source(
+        Arc::clone(&source),
+        &portable_id,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let _open_reads = source.take_reads();
+    let index_offset = reader.index().index_offset();
+
+    let empty_range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(3));
+    let empty_actual = reader.read_projected_range(
+        empty_range,
+        HeightOrder::Ascending,
+        ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+    )?;
+    assert_no_slab_reads(&source.take_reads(), index_offset);
+    let empty_expected: Vec<_> = blocks[..3]
+        .iter()
+        .map(|blk| reference_encode_block(blk, ShieldedProjectionSelection::DEFAULT_NULLIFIERS))
+        .collect::<TestOutcome<Vec<_>>>()?;
+    assert_blocks_match_expected(
+        &empty_actual,
+        &empty_expected,
+        ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+        HeightOrder::Ascending,
+    );
+
+    let orchard_nf = ShieldedProjectionSelection::new(false, true, false, true);
+    let sapling_range = BlockHeightRange::inclusive(BlockHeight::new(4), BlockHeight::new(4));
+    let skipped = reader.read_projected_range(sapling_range, HeightOrder::Ascending, orchard_nf)?;
+    assert_no_slab_reads(&source.take_reads(), index_offset);
+    assert_blocks_match_expected(
+        &skipped,
+        &[reference_encode_block(&blocks[3], orchard_nf)?],
+        orchard_nf,
+        HeightOrder::Ascending,
+    );
+
+    let mut scratch = ShieldedReadScratch::default();
+    let mut batcher = EncodedBlockBatcher::new(true);
+    reader.append_projected_frames(
+        ShieldedBatchReadRequest {
+            range: empty_range,
+            order: HeightOrder::Ascending,
+            selection: ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+            enforce_wire_fee_limit: true,
+        },
+        &mut scratch,
+        &mut batcher,
+    )?;
+    assert_no_slab_reads(&source.take_reads(), index_offset);
+    let served = serve_encoded_range(MockEncodedStreamer {
+        use_frames: true,
+        blocks: Vec::new(),
+        frames: batcher.finish(),
+    })?;
+    assert_blocks_match_expected(
+        &decode_wire_messages_from_frames(&served.frames)?,
+        &empty_expected,
+        ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+        HeightOrder::Ascending,
+    );
+    Ok(())
+}
+
+#[test]
+fn warm_kernel_verified_index_plans_zero_index_reads() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = mixed_fixture_blocks()?;
+    let (path, identity) = write_segment(dir.path(), "warm-kernel.zshrng02", &blocks)?;
+    let raw = fs::read(&path)?;
+    let header_bytes: &[u8; HEADER_LEN] = raw[..HEADER_LEN].try_into()?;
+    let total_len = u64::try_from(raw.len())?;
+    let header = ShieldedSegmentHeader::decode(header_bytes, &identity, total_len)?;
+    let idx_range = header.index_and_trailer_range()?;
+    let idx_start = usize::try_from(idx_range.offset)?;
+    let index = SettledShieldedSegmentIndex::decode_index(
+        header_bytes,
+        &raw[idx_start..],
+        &identity,
+        total_len,
+        true,
+    )?;
+
+    let full_range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6));
+    let cold_plan =
+        index.plan_block_range(full_range, ShieldedProjectionSelection::DEFAULT_SHIELDED)?;
+    let cold_idx_span = cold_plan
+        .needed_index_byte_range()
+        .ok_or("cold plan should request index bytes")?;
+    let slice_start = usize::try_from(cold_idx_span.offset)?;
+    let verified = index.authenticate_index_slice(ShieldedIndexSlice::new(
+        cold_idx_span.offset,
+        &raw[slice_start..slice_start + cold_idx_span.len],
+    ))?;
+    for step in cold_plan.steps() {
+        let slab_bytes = step
+            .slab_byte_range()
+            .map(|span| {
+                let start = usize::try_from(span.offset)?;
+                Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(
+                    raw[start..start + span.len].to_vec(),
+                )
+            })
+            .transpose()?;
+        let _ = index.verify_and_decode_slab(
+            step,
+            ShieldedFetchedSlab::new(slab_bytes, Some(verified)),
+            ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            HeightOrder::Ascending,
+        )?;
+    }
+
+    let warm_plan =
+        index.plan_block_range(full_range, ShieldedProjectionSelection::DEFAULT_SHIELDED)?;
+    assert_eq!(warm_plan.needed_index_byte_range(), None);
+    for step in warm_plan.steps() {
+        assert_eq!(step.index_byte_range(), None);
+        let slab_bytes = step
+            .slab_byte_range()
+            .map(|span| {
+                let start = usize::try_from(span.offset)?;
+                Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(
+                    raw[start..start + span.len].to_vec(),
+                )
+            })
+            .transpose()?;
+        let warm_blocks = index.verify_and_decode_slab(
+            step,
+            ShieldedFetchedSlab::new(slab_bytes, None),
+            ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            HeightOrder::Ascending,
+        )?;
+        assert_eq!(warm_blocks.len(), step.row_range().len());
+    }
+    Ok(())
+}
+
+fn decode_via_sans_io_plans(
+    index: &SettledShieldedSegmentIndex,
+    raw: &[u8],
+    selection: ShieldedProjectionSelection,
+    order: HeightOrder,
+) -> TestOutcome<Vec<EncodedBlock>> {
+    let range = BlockHeightRange::inclusive(
+        index.identity().start_height,
+        index.identity().end_block.height,
+    );
+    let plan = index.plan_block_range(range, selection)?;
+    let verified = plan
+        .needed_index_byte_range()
+        .map(|span| {
+            let start = usize::try_from(span.offset)?;
+            Ok::<VerifiedShieldedIndexSlice<'_>, Box<dyn std::error::Error + Send + Sync>>(
+                index.authenticate_index_slice(ShieldedIndexSlice::new(
+                    span.offset,
+                    &raw[start..start + span.len],
+                ))?,
+            )
+        })
+        .transpose()?;
+    let mut batcher = EncodedBlockBatcher::new(true);
+    let mut scratch = ShieldedReadScratch::default();
+    let mut via_blocks = Vec::new();
+    let steps_iter: Vec<_> = match order {
+        HeightOrder::Ascending => plan.steps().iter().collect(),
+        HeightOrder::Descending => plan.steps().iter().rev().collect(),
+    };
+    for step in steps_iter {
+        let slab_bytes = step
+            .slab_byte_range()
+            .map(|span| {
+                let start = usize::try_from(span.offset)?;
+                Ok::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(
+                    raw[start..start + span.len].to_vec(),
+                )
+            })
+            .transpose()?;
+        via_blocks.extend(index.verify_and_decode_slab(
+            step,
+            ShieldedFetchedSlab::new(slab_bytes.clone(), verified),
+            selection,
+            order,
+        )?);
+        index.verify_and_decode_slab_into_batcher(
+            ShieldedSlabDecodeRequest {
+                step,
+                fetched: ShieldedFetchedSlab::new(slab_bytes, verified),
+                selection,
+                order,
+            },
+            &mut scratch,
+            &mut batcher,
+        )?;
+    }
+    let served = serve_encoded_range(MockEncodedStreamer {
+        use_frames: true,
+        blocks: Vec::new(),
+        frames: batcher.finish(),
+    })?;
+    assert!(served.has_bounded_retention);
+    assert_blocks_match_expected(
+        &decode_wire_messages_from_frames(&served.frames)?,
+        &via_blocks,
+        selection,
+        order,
+    );
+    Ok(via_blocks)
+}
+
+#[test]
+fn sans_io_byte_range_roundtrip_without_file_io() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = mixed_fixture_blocks()?;
+    let (path, identity) = write_segment(dir.path(), "sans-io.zshrng02", &blocks)?;
+    let raw = fs::read(&path)?;
+    let header_bytes: &[u8; HEADER_LEN] = raw[..HEADER_LEN].try_into()?;
+    let total_len = u64::try_from(raw.len())?;
+    let header = ShieldedSegmentHeader::decode(header_bytes, &identity, total_len)?;
+    let idx_range = header.index_and_trailer_range()?;
+    let idx_start = usize::try_from(idx_range.offset)?;
+    let index = SettledShieldedSegmentIndex::decode_index(
+        header_bytes,
+        &raw[idx_start..idx_start + idx_range.len],
+        &identity,
+        total_len,
+        false,
+    )?;
+
+    for block in &blocks {
+        let hash_range = index.block_hash_byte_range(block.height())?;
+        let start = usize::try_from(hash_range.offset)?;
+        let decoded_hash = index.decode_block_hash_from_slice(
+            block.height(),
+            ShieldedIndexSlice::new(hash_range.offset, &raw[start..start + hash_range.len]),
+        )?;
+        assert_eq!(decoded_hash, block.block_hash());
+    }
+
+    let bounded = index
+        .plan_bounded_block_range(
+            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(6)),
+            HeightOrder::Ascending,
+            ShieldedRangeByteBudget {
+                max_bytes: 2_500,
+                allow_oversized_first: true,
+                enforce_wire_fee_limit: true,
+            },
+            ShieldedProjectionSelection::DEFAULT_SHIELDED,
+        )?
+        .ok_or("expected bounded plan")?;
+    assert!(bounded.kept_blocks >= 1);
+    assert!(bounded.kept_native_bytes > 0);
+    assert_eq!(bounded.lowest_height, BlockHeight::new(1));
+
+    let selections = [
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+        ShieldedProjectionSelection::new(true, false, false, false),
+        ShieldedProjectionSelection::new(false, true, false, false),
+        ShieldedProjectionSelection::DEFAULT_NULLIFIERS,
+    ];
+    for selection in selections {
+        for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+            let actual = decode_via_sans_io_plans(&index, &raw, selection, order)?;
+            let mut expected: Vec<_> = blocks
+                .iter()
+                .map(|blk| reference_encode_block(blk, selection))
+                .collect::<TestOutcome<Vec<_>>>()?;
+            if order == HeightOrder::Descending {
+                expected.reverse();
+            }
+            assert_blocks_match_expected(&actual, &expected, selection, order);
+        }
+    }
+    Ok(())
+}
+
+fn build_slab_and_large_row_corpus() -> TestOutcome<Vec<CompactBlockArtifact>> {
+    let meta = CompactChainMetadata {
+        sapling_commitment_tree_size: 100,
+        orchard_commitment_tree_size: 200,
+        ironwood_commitment_tree_size: 0,
+    };
+    let mut blocks = Vec::with_capacity(72);
+    for raw_height in 1..=72_u32 {
+        let action_count = if raw_height == 61 { 280 } else { 62 };
+        let seed = u8::try_from(raw_height)?;
+        let tx = make_tx(
+            0,
+            seed,
+            CompactTransactionData {
+                fee_zat: Some(1_000),
+                orchard_actions: vec![shielded_action(seed); action_count],
+                ..CompactTransactionData::default()
+            },
+        );
+        blocks.push(CompactBlockArtifact::new(
+            BlockId::new(BlockHeight::new(raw_height), block_hash(raw_height)),
+            block_hash(raw_height - 1),
+            1_700_000_000 + raw_height,
+            vec![tx],
+            meta,
+        )?);
+    }
+    Ok(blocks)
+}
+
+fn assert_repacked_short_batches_bounded(blocks: &[EncodedBlock], large_idx: usize) {
+    assert!(blocks[large_idx].as_length_prefixed().is_unique());
+    for group in [&blocks[..large_idx], &blocks[large_idx + 1..]] {
+        let mut cursor = 0_usize;
+        while cursor < group.len() {
+            let batch_start = group[cursor].as_length_prefixed().as_ptr() as usize;
+            let mut max_end = batch_start + group[cursor].as_length_prefixed().len();
+            let mut next = cursor + 1;
+            while next < group.len() {
+                let ptr = group[next].as_length_prefixed().as_ptr() as usize;
+                let end = ptr + group[next].as_length_prefixed().len();
+                if ptr >= batch_start
+                    && end.saturating_sub(batch_start) <= REPACKED_SHORT_BATCH_BYTES
+                {
+                    max_end = max_end.max(end);
+                    next += 1;
+                } else {
+                    break;
+                }
+            }
+            assert!(
+                max_end - batch_start <= REPACKED_SHORT_BATCH_BYTES,
+                "repacked batch span exceeded 32 KiB: {}",
+                max_end - batch_start
+            );
+            cursor = next;
+        }
+    }
+}
+
+#[test]
+fn slab_target_512kib_and_large_row_isolation_and_repacking() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = build_slab_and_large_row_corpus()?;
+    let (path, identity) = write_segment(dir.path(), "slab-isolation.zshrng02", &blocks)?;
+    let reader = SettledShieldedSegmentReader::open(
+        &path,
+        &identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let full_range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(72));
+    let plan = reader
+        .index()
+        .plan_block_range(full_range, ShieldedProjectionSelection::DEFAULT_SHIELDED)?;
+
+    let isolated_steps: Vec<_> = plan
+        .steps()
+        .iter()
+        .filter(|step| step.is_isolated_large_row())
+        .collect();
+    assert_eq!(isolated_steps.len(), 1);
+    assert_eq!(isolated_steps[0].row_range(), 60..61);
+    let isolated_len = isolated_steps[0]
+        .slab_byte_range()
+        .ok_or("isolated step missing slab range")?
+        .len;
+    assert!(isolated_len >= LARGE_ROW_ISOLATION_MIN_BYTES);
+
+    assert!(
+        plan.steps()
+            .iter()
+            .filter(|step| step.row_range().end <= 60)
+            .count()
+            >= 2
+    );
+    for step in plan.steps() {
+        if !step.is_isolated_large_row() {
+            let slab_len = step
+                .slab_byte_range()
+                .ok_or("short step missing slab range")?
+                .len;
+            assert!(slab_len <= SLAB_TARGET_BYTES);
+        }
+    }
+
+    let read_blocks = reader.read_projected_range(
+        full_range,
+        HeightOrder::Ascending,
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+    )?;
+    assert_eq!(read_blocks[60].as_length_prefixed().len(), isolated_len);
+    assert_repacked_short_batches_bounded(&read_blocks, 60);
+
+    let expected: Vec<_> = blocks
+        .iter()
+        .map(|blk| reference_encode_block(blk, ShieldedProjectionSelection::DEFAULT_SHIELDED))
+        .collect::<TestOutcome<Vec<_>>>()?;
+    assert_blocks_match_expected(
+        &read_blocks,
+        &expected,
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+        HeightOrder::Ascending,
+    );
+    Ok(())
+}
+
+fn verify_streamed_batcher_order(
+    reader: &SettledShieldedSegmentReader,
+    blocks: &[CompactBlockArtifact],
+    full_range: BlockHeightRange,
+    large_frame_len: usize,
+    order: HeightOrder,
+) -> TestOutcome {
+    let mut scratch = ShieldedReadScratch::default();
+    let mut batcher = EncodedBlockBatcher::new(true);
+    reader.append_projected_frames(
+        ShieldedBatchReadRequest {
+            range: full_range,
+            order,
+            selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            enforce_wire_fee_limit: true,
+        },
+        &mut scratch,
+        &mut batcher,
+    )?;
+    let served = serve_encoded_range(MockEncodedStreamer {
+        use_frames: true,
+        blocks: Vec::new(),
+        frames: batcher.finish(),
+    })?;
+    assert!(served.has_bounded_retention);
+    assert!(served.frames[0].len() >= 8 * 1024 && served.frames[0].len() < 32 * 1024);
+    assert!(
+        served
+            .frames
+            .iter()
+            .any(|frame| frame.len() == large_frame_len)
+    );
+    let mut expected: Vec<_> = blocks
+        .iter()
+        .map(|blk| reference_encode_block(blk, ShieldedProjectionSelection::DEFAULT_SHIELDED))
+        .collect::<TestOutcome<Vec<_>>>()?;
+    if order == HeightOrder::Descending {
+        expected.reverse();
+    }
+    assert_blocks_match_expected(
+        &decode_wire_messages_from_frames(&served.frames)?,
+        &expected,
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+        order,
+    );
+    Ok(())
+}
+
+#[test]
+fn append_projected_frames_emits_8kib_32kib_and_zero_copy_large_frames() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = build_slab_and_large_row_corpus()?;
+    let (path, identity) = write_segment(dir.path(), "batcher-frames.zshrng02", &blocks)?;
+    let reader = SettledShieldedSegmentReader::open(
+        &path,
+        &identity,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+    let full_range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(72));
+    let large_frame_len =
+        reference_encode_block(&blocks[60], ShieldedProjectionSelection::DEFAULT_SHIELDED)?
+            .as_length_prefixed()
+            .len();
+
+    for order in [HeightOrder::Ascending, HeightOrder::Descending] {
+        verify_streamed_batcher_order(&reader, &blocks, full_range, large_frame_len, order)?;
+    }
+
+    let mut scratch = ShieldedReadScratch::default();
+    let mut bounded_batcher = EncodedBlockBatcher::new(true);
+    let bounded_plan: BoundedShieldedRangePlan = reader
+        .append_bounded_projected_frames(
+            ShieldedBoundedBatchReadRequest {
+                range: full_range,
+                order: HeightOrder::Ascending,
+                budget: ShieldedRangeByteBudget {
+                    max_bytes: 5_000,
+                    allow_oversized_first: true,
+                    enforce_wire_fee_limit: true,
+                },
+                selection: ShieldedProjectionSelection::DEFAULT_SHIELDED,
+            },
+            &mut scratch,
+            &mut bounded_batcher,
+        )?
+        .ok_or("expected bounded plan from reader")?;
+    assert!(bounded_plan.kept_blocks >= 1);
+    let bounded_served = serve_encoded_range(MockEncodedStreamer {
+        use_frames: true,
+        blocks: Vec::new(),
+        frames: bounded_batcher.finish(),
+    })?;
+    assert_eq!(
+        decode_wire_messages_from_frames(&bounded_served.frames)?.len(),
+        bounded_plan.kept_blocks
+    );
+
+    let direct_blocks = reader.read_projected_range(
+        full_range,
+        HeightOrder::Ascending,
+        ShieldedProjectionSelection::DEFAULT_SHIELDED,
+    )?;
+    let expected_large_ptr = direct_blocks[60].as_length_prefixed().as_ptr();
+    let direct_served = serve_encoded_range(MockEncodedStreamer {
+        use_frames: false,
+        blocks: direct_blocks,
+        frames: Vec::new(),
+    })?;
+    assert!(direct_served.has_bounded_retention);
+    assert!(
+        direct_served
+            .frames
+            .iter()
+            .any(|frame| frame.as_ptr() == expected_large_ptr),
+        "isolated >= 32 KiB block must pass through HTTP body zero-copy"
+    );
+    Ok(())
+}
+
+#[test]
+fn compact_4096_block_heap_metadata_budget() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let meta = CompactChainMetadata {
+        sapling_commitment_tree_size: 500,
+        orchard_commitment_tree_size: 1_000,
+        ironwood_commitment_tree_size: 0,
+    };
+    let mut blocks = Vec::with_capacity(4_096);
+    for raw_height in 1..=4_096_u32 {
+        let block = if raw_height % 4 == 0 {
+            single_orchard_block(raw_height, u8::try_from(raw_height % 251)?, 1)?
+        } else {
+            CompactBlockArtifact::empty(
+                BlockId::new(BlockHeight::new(raw_height), block_hash(raw_height)),
+                block_hash(raw_height - 1),
+                1_700_000_000 + raw_height,
+                meta,
+            )
+        };
+        blocks.push(block);
+    }
+    let (path, identity) = write_segment(dir.path(), "heap-4096.zshrng02", &blocks)?;
+    let raw = fs::read(&path)?;
+    let header_bytes: &[u8; HEADER_LEN] = raw[..HEADER_LEN].try_into()?;
+    let total_len = u64::try_from(raw.len())?;
+    let header = ShieldedSegmentHeader::decode(header_bytes, &identity, total_len)?;
+    let idx_start = usize::try_from(header.index_offset())?;
+
+    let kernel_index = SettledShieldedSegmentIndex::decode_index(
+        header_bytes,
+        &raw[idx_start..],
+        &identity,
+        total_len,
+        true,
+    )?;
+    assert_eq!(kernel_index.heap_metadata_bytes(), 4_096 * 12);
+
+    let portable_index = SettledShieldedSegmentIndex::decode_index(
+        header_bytes,
+        &raw[idx_start..],
+        &identity,
+        total_len,
+        false,
+    )?;
+    let expected_pages = 4_096_usize.div_ceil(INDEX_PAGE_ROWS);
+    assert_eq!(
+        portable_index.heap_metadata_bytes(),
+        4_096 * 12 + expected_pages * 32
+    );
+    assert!(portable_index.heap_metadata_bytes() <= 4_096 * 13);
+    Ok(())
+}
+
+#[test]
+fn portable_post_admission_index_page_tamper_fails_closed_and_latches_invalid() -> TestOutcome {
+    let dir = TempDir::new()?;
+    let blocks = mixed_fixture_blocks()?;
+    let (path, identity) = write_segment(dir.path(), "portable-idx-tamper.zshrng02", &blocks)?;
+    let portable_path = dir.path().join("portable-idx-copy.zshrng02");
+    let original = fs::read(&path)?;
+    fs::write(&portable_path, &original)?;
+    let portable_id = ShieldedSegmentIdentity {
+        fs_verity_sha256: None,
+        ..identity
+    };
+    let reader = SettledShieldedSegmentReader::open(
+        &portable_path,
+        &portable_id,
+        SettledShieldedSegmentOpenOptions::default(),
+    )?;
+
+    let tamper_pos = usize::try_from(reader.index().index_offset())? + 10;
+    let mut flip_file = OpenOptions::new().write(true).open(&portable_path)?;
+    flip_file.seek(SeekFrom::Start(u64::try_from(tamper_pos)?))?;
+    flip_file.write_all(&[original[tamper_pos] ^ 0x55])?;
+    flip_file.sync_all()?;
+    drop(flip_file);
+
+    assert!(matches!(
+        reader.block_hash_at(BlockHeight::new(1)),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+
+    let mut restore_file = OpenOptions::new().write(true).open(&portable_path)?;
+    restore_file.seek(SeekFrom::Start(u64::try_from(tamper_pos)?))?;
+    restore_file.write_all(&[original[tamper_pos]])?;
+    restore_file.sync_all()?;
+    drop(restore_file);
+
+    let range_1 = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1));
+    assert!(matches!(
+        reader.block_hash_at(BlockHeight::new(1)),
+        Err(SettledShieldedSegmentError::PayloadIntegrity(_))
+    ));
+    assert!(matches!(
+        reader.read_default_range(range_1, HeightOrder::Ascending),
         Err(SettledShieldedSegmentError::PayloadIntegrity(_))
     ));
     Ok(())

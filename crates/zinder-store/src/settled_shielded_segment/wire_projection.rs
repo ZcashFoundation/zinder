@@ -51,30 +51,45 @@ const CHAIN_METADATA_TAG_IRONWOOD_TREE_SIZE: u32 = 3;
 
 const EMPTY_CHAIN_METADATA_WIRE: [u8; 2] = [0x42, 0x00];
 
+/// Encoded `DEFAULT_RANGE` protobuf payload and row-flag metadata for one block.
+pub(super) struct EncodedShieldedBlock {
+    pub(super) payload: Vec<u8>,
+    pub(super) pool_presence: PoolPresenceMask,
+    pub(super) has_unrepresentable_wire_fee: bool,
+}
+
 /// Encodes one canonical [`CompactBlockArtifact`] into the `Slab 0`
-/// `DEFAULT_RANGE` protobuf payload and computes its [`PoolPresenceMask`].
-pub(super) fn encode_default_shielded_block(
+/// `DEFAULT_RANGE` protobuf payload, tracking wide fees when supplement-backed.
+pub(super) fn encode_default_shielded_block_with_options(
     block: &CompactBlockArtifact,
-) -> Result<(Vec<u8>, PoolPresenceMask), SettledShieldedSegmentError> {
+    allow_wide_fee_in_supplement: bool,
+) -> Result<EncodedShieldedBlock, SettledShieldedSegmentError> {
     let mut presence = PoolPresenceMask::EMPTY;
     let mut vtx = Vec::new();
+    let mut has_unrepresentable_wire_fee = false;
     for tx in block.transactions() {
         let scan = &tx.data;
-        let fee = scan
-            .fee_zat
-            .map(u32::try_from)
-            .transpose()
-            .map_err(|_| {
-                SettledShieldedSegmentError::PayloadIntegrity(
-                    "compact transaction fee exceeds u32".to_owned(),
-                )
-            })?
-            .unwrap_or_default();
+        let wire_fee = match scan.fee_zat {
+            Some(fee_zat) => match u32::try_from(fee_zat) {
+                Ok(fee) => Some(fee),
+                Err(_) if allow_wide_fee_in_supplement => None,
+                Err(_) => {
+                    return Err(SettledShieldedSegmentError::PayloadIntegrity(
+                        "compact transaction fee exceeds u32".to_owned(),
+                    ));
+                }
+            },
+            None => Some(0),
+        };
         let tx_mask = transaction_pool_mask(scan);
         presence = presence.union(tx_mask);
         if tx_mask.is_empty() {
             continue;
         }
+        let fee = wire_fee.unwrap_or_else(|| {
+            has_unrepresentable_wire_fee = true;
+            0
+        });
         vtx.push(lightwalletd::CompactTx {
             index: tx.index,
             txid: encode_internal_transaction_id(tx.transaction_id).to_vec(),
@@ -109,20 +124,22 @@ pub(super) fn encode_default_shielded_block(
             max_bytes: SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
         });
     }
-    Ok((payload, presence))
+    Ok(EncodedShieldedBlock {
+        payload,
+        pool_presence: presence,
+        has_unrepresentable_wire_fee,
+    })
 }
 
-/// Appends one empty nullifier-only gRPC-framed `CompactBlock` straight from
-/// the 48-byte in-memory row index without reading `Slab 0`.
-pub(super) fn synthesize_empty_nullifier_block(
+/// Appends one empty nullifier-only protobuf `CompactBlock` payload (without
+/// gRPC framing) straight from row metadata without reading `Slab 0`.
+pub(super) fn synthesize_empty_nullifier_payload(
     height: BlockHeight,
     block_hash_wire: &[u8; 32],
     prev_hash_wire: &[u8; 32],
     block_time: u32,
     out: &mut Vec<u8>,
-) -> Result<(), SettledShieldedSegmentError> {
-    let frame_start = out.len();
-    out.resize(frame_start + FRAME_PREFIX_LEN, 0);
+) {
     if height.value() != 0 {
         encode_key(COMPACT_BLOCK_TAG_HEIGHT, WireType::Varint, out);
         encode_varint(u64::from(height.value()), out);
@@ -136,6 +153,20 @@ pub(super) fn synthesize_empty_nullifier_block(
         encode_varint(u64::from(block_time), out);
     }
     out.extend_from_slice(&EMPTY_CHAIN_METADATA_WIRE);
+}
+
+/// Appends one empty nullifier-only gRPC-framed `CompactBlock` straight from
+/// row metadata without reading `Slab 0`.
+pub(super) fn synthesize_empty_nullifier_block(
+    height: BlockHeight,
+    block_hash_wire: &[u8; 32],
+    prev_hash_wire: &[u8; 32],
+    block_time: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), SettledShieldedSegmentError> {
+    let frame_start = out.len();
+    out.resize(frame_start + FRAME_PREFIX_LEN, 0);
+    synthesize_empty_nullifier_payload(height, block_hash_wire, prev_hash_wire, block_time, out);
     patch_frame_prefix(out, frame_start)
 }
 

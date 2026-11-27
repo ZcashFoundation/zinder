@@ -1,9 +1,11 @@
-//! Binary framing, header, and row index definitions for `ZSHRNG02`.
+//! Binary framing, header, and compact row-index definitions for `ZSHRNG02`.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use zinder_core::{BlockHeight, BlockId, wire::encode_internal_block_hash};
-use zinder_proto::compat::lightwalletd::EncodedBlock;
+use zinder_proto::compat::lightwalletd::{BoundedChunkRetention, EncodedBlock};
+
+use crate::positional_source::ByteRange;
 
 use super::{
     PoolPresenceMask, SETTLED_SHIELDED_SEGMENT_MAGIC, SETTLED_SHIELDED_SEGMENT_MAX_PAYLOAD_BYTES,
@@ -11,24 +13,32 @@ use super::{
 };
 
 pub(super) const HEADER_LEN: usize = 128;
-pub(super) const FRAME_PREFIX_LEN: usize = EncodedBlock::PREFIX_LEN;
+pub(crate) const FRAME_PREFIX_LEN: usize = EncodedBlock::PREFIX_LEN;
 pub(super) const FRAME_PREFIX_U32: u32 = 5;
 pub(super) const ROW_INDEX_ENTRY_LEN: usize = 80;
 pub(super) const TRAILER_LEN: usize = 32;
 pub(super) const MAX_SLAB_BYTES: u64 = u32::MAX as u64;
-pub(super) const SLAB_TARGET_BYTES: usize = 64 * 1024;
+/// Default sealed shielded segment `Slab 0` byte cap (`256 MiB`) matching `PostgreSQL` `BYTEA` bounds.
+pub const DEFAULT_MAX_SLAB_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const SLAB_TARGET_BYTES: usize = BoundedChunkRetention::MAX_ALLOCATION_BYTES;
+pub(super) const LARGE_ROW_ISOLATION_MIN_BYTES: usize = EncodedBlock::LARGE_MESSAGE_MIN_BYTES;
+pub(super) const REPACKED_SHORT_BATCH_BYTES: usize = EncodedBlock::LARGE_MESSAGE_MIN_BYTES;
 pub(super) const STAGING_CHUNK: usize = 256 * 1024;
+pub(super) const INDEX_PAGE_ROWS: usize = 64;
 
 const _: () = assert!(FRAME_PREFIX_LEN == FRAME_PREFIX_U32 as usize);
-const _: () = assert!(std::mem::size_of::<IndexedBlock>() <= 48);
+const _: () = assert!(std::mem::size_of::<CompactShieldedRow>() == 12);
 
 pub(super) const VALIDATION_UNVALIDATED: u8 = 0;
 pub(super) const VALIDATION_VALID: u8 = 1;
 pub(super) const VALIDATION_INVALID: u8 = 2;
 
-/// Fixed 128-byte header of one `ZSHRNG02` segment.
+pub(super) const ROW_FLAG_UNREPRESENTABLE_WIRE_FEE: u8 = 0x01;
+pub(super) const ROW_KNOWN_FLAGS: u8 = ROW_FLAG_UNREPRESENTABLE_WIRE_FEE;
+
+/// Fixed 128-byte header of one `ZSHRNG02` settled shielded segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct SegmentHeader {
+pub struct ShieldedSegmentHeader {
     pub(super) network_tag: u32,
     pub(super) artifact_schema_version: u16,
     pub(super) segment_flags: u16,
@@ -40,7 +50,25 @@ pub(super) struct SegmentHeader {
     pub(super) index_offset: u64,
 }
 
-impl SegmentHeader {
+impl ShieldedSegmentHeader {
+    /// Decodes a `128`-byte `ZSHRNG02` header and verifies its structural fields,
+    /// segment `expected` identity, and total byte length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError::InvalidFormat`] or
+    /// [`SettledShieldedSegmentError::ChainLinkage`] if magic, flags, offsets,
+    /// identity pins, or total length disagree.
+    pub fn decode(
+        bytes: &[u8; HEADER_LEN],
+        expected: &ShieldedSegmentIdentity,
+        total_len: u64,
+    ) -> Result<Self, SettledShieldedSegmentError> {
+        let header = Self::decode_unchecked(bytes)?;
+        header.matches_identity(expected, total_len)?;
+        Ok(header)
+    }
+
     pub(super) fn encode(self) -> [u8; HEADER_LEN] {
         let mut header = [0_u8; HEADER_LEN];
         header[..8].copy_from_slice(SETTLED_SHIELDED_SEGMENT_MAGIC);
@@ -56,7 +84,9 @@ impl SegmentHeader {
         header
     }
 
-    pub(super) fn decode(bytes: &[u8; HEADER_LEN]) -> Result<Self, SettledShieldedSegmentError> {
+    pub(super) fn decode_unchecked(
+        bytes: &[u8; HEADER_LEN],
+    ) -> Result<Self, SettledShieldedSegmentError> {
         if &bytes[..8] != SETTLED_SHIELDED_SEGMENT_MAGIC {
             return Err(SettledShieldedSegmentError::InvalidFormat(
                 "shielded segment magic mismatch".to_owned(),
@@ -82,7 +112,37 @@ impl SegmentHeader {
         Ok(header)
     }
 
-    pub(super) fn slab_len(self) -> Result<u32, SettledShieldedSegmentError> {
+    /// Returns the first covered height encoded in the header.
+    #[must_use]
+    pub const fn start_height(self) -> BlockHeight {
+        BlockHeight::new(self.start_height)
+    }
+
+    /// Returns the number of blocks covered by this segment.
+    #[must_use]
+    pub const fn block_count(self) -> u32 {
+        self.block_count
+    }
+
+    /// Returns the byte offset of `Slab 0`.
+    #[must_use]
+    pub const fn slab_offset(self) -> u64 {
+        self.slab_offset
+    }
+
+    /// Returns the byte offset where the `80`-byte row index begins.
+    #[must_use]
+    pub const fn index_offset(self) -> u64 {
+        self.index_offset
+    }
+
+    /// Returns the byte length of `Slab 0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError::InvalidFormat`] if the index
+    /// offset precedes `Slab 0` or the span exceeds `u32::MAX`.
+    pub fn slab_len(self) -> Result<u32, SettledShieldedSegmentError> {
         let len = self
             .index_offset
             .checked_sub(self.slab_offset)
@@ -96,6 +156,24 @@ impl SegmentHeader {
                 "shielded segment slab exceeds u32 offset space".to_owned(),
             )
         })
+    }
+
+    /// Returns the exact [`ByteRange`] spanning the on-disk row index and trailing
+    /// `32`-byte SHA-256 trailer (`[index_offset .. total_len)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettledShieldedSegmentError::InvalidFormat`] if the range size
+    /// overflows `usize`.
+    pub fn index_and_trailer_range(self) -> Result<ByteRange, SettledShieldedSegmentError> {
+        let index_bytes = usize::try_from(self.block_count)
+            .ok()
+            .and_then(|count| count.checked_mul(ROW_INDEX_ENTRY_LEN))
+            .and_then(|bytes| bytes.checked_add(TRAILER_LEN))
+            .ok_or_else(|| {
+                SettledShieldedSegmentError::InvalidFormat("segment index size overflow".to_owned())
+            })?;
+        Ok(ByteRange::new(self.index_offset, index_bytes))
     }
 
     pub(super) fn matches_identity(
@@ -124,7 +202,9 @@ impl SegmentHeader {
     }
 }
 
-fn validate_header_fields(header: &SegmentHeader) -> Result<(), SettledShieldedSegmentError> {
+fn validate_header_fields(
+    header: &ShieldedSegmentHeader,
+) -> Result<(), SettledShieldedSegmentError> {
     if header.segment_flags != 0 {
         return Err(SettledShieldedSegmentError::InvalidFormat(format!(
             "unsupported shielded segment flags {:#06x}",
@@ -142,6 +222,7 @@ fn validate_header_fields(header: &SegmentHeader) -> Result<(), SettledShieldedS
         ));
     }
     header.slab_len()?;
+    expected_total_file_len(header.index_offset, header.block_count)?;
     Ok(())
 }
 
@@ -162,7 +243,7 @@ pub(super) fn expected_total_file_len(
         })
 }
 
-/// Decoded 80-byte on-disk index record for one block.
+/// Decoded `80`-byte on-disk index record for one block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DecodedRowIndexEntry {
     pub(super) block_hash_wire: [u8; 32],
@@ -171,6 +252,7 @@ pub(super) struct DecodedRowIndexEntry {
     pub(super) slab_rel_offset: u32,
     pub(super) native_bytes: u32,
     pub(super) pool_presence: PoolPresenceMask,
+    pub(super) row_flags: u8,
 }
 
 impl DecodedRowIndexEntry {
@@ -182,16 +264,23 @@ impl DecodedRowIndexEntry {
         encoded[68..72].copy_from_slice(&self.slab_rel_offset.to_be_bytes());
         encoded[72..76].copy_from_slice(&self.native_bytes.to_be_bytes());
         encoded[76] = self.pool_presence.bits();
+        encoded[77] = self.row_flags;
         encoded
     }
 
     pub(super) fn decode(
         raw: &[u8; ROW_INDEX_ENTRY_LEN],
     ) -> Result<Self, SettledShieldedSegmentError> {
-        if raw[77..80] != [0_u8; 3] {
+        if raw[78..80] != [0_u8; 2] {
             return Err(SettledShieldedSegmentError::InvalidFormat(
                 "row index entry reserved bytes are non-zero".to_owned(),
             ));
+        }
+        let row_flags = raw[77];
+        if (row_flags & !ROW_KNOWN_FLAGS) != 0 {
+            return Err(SettledShieldedSegmentError::InvalidFormat(format!(
+                "row index entry has unsupported flags {row_flags:#04x}"
+            )));
         }
         let pool_presence = PoolPresenceMask::from_bits(raw[76]).ok_or_else(|| {
             SettledShieldedSegmentError::InvalidFormat(format!(
@@ -206,30 +295,38 @@ impl DecodedRowIndexEntry {
             slab_rel_offset: read_u32_be(&raw[68..72])?,
             native_bytes: read_u32_be(&raw[72..76])?,
             pool_presence,
+            row_flags,
         })
     }
 }
 
-/// Compact 48-byte in-memory per-block row index retained by [`super::SettledShieldedSegmentReader`].
-pub(super) struct IndexedBlock {
-    pub(super) block_hash_wire: [u8; 32],
-    pub(super) block_time: u32,
+/// Compact `12`-byte in-memory per-block row descriptor retained by
+/// [`super::SettledShieldedSegmentIndex`].
+pub(super) struct CompactShieldedRow {
     pub(super) slab_rel_offset: u32,
     pub(super) native_bytes: u32,
     pub(super) pool_presence: PoolPresenceMask,
+    pub(super) row_flags: u8,
     pub(super) validation_state: AtomicU8,
 }
 
-impl IndexedBlock {
+impl CompactShieldedRow {
     pub(super) fn from_entry(entry: &DecodedRowIndexEntry) -> Self {
         Self {
-            block_hash_wire: entry.block_hash_wire,
-            block_time: entry.block_time,
             slab_rel_offset: entry.slab_rel_offset,
             native_bytes: entry.native_bytes,
             pool_presence: entry.pool_presence,
+            row_flags: entry.row_flags,
             validation_state: AtomicU8::new(VALIDATION_UNVALIDATED),
         }
+    }
+
+    pub(super) const fn has_unrepresentable_wire_fee(&self) -> bool {
+        (self.row_flags & ROW_FLAG_UNREPRESENTABLE_WIRE_FEE) != 0
+    }
+
+    pub(super) fn validation_state(&self) -> u8 {
+        self.validation_state.load(Ordering::Acquire)
     }
 
     pub(super) fn mark_valid(&self) {
@@ -314,7 +411,7 @@ pub(super) fn check_contiguous_block(
 }
 
 pub(super) fn frame_span(
-    rows: &[IndexedBlock],
+    rows: &[CompactShieldedRow],
     slab_len: u32,
     row_idx: usize,
 ) -> Result<(u32, u32), SettledShieldedSegmentError> {
@@ -352,28 +449,28 @@ pub(super) fn validate_payload_limit(
     Ok(())
 }
 
-fn read_u16_be(slice: &[u8]) -> Result<u16, SettledShieldedSegmentError> {
+pub(super) fn read_u16_be(slice: &[u8]) -> Result<u16, SettledShieldedSegmentError> {
     let bytes: [u8; 2] = slice.try_into().map_err(|_| {
         SettledShieldedSegmentError::InvalidFormat("truncated u16 field".to_owned())
     })?;
     Ok(u16::from_be_bytes(bytes))
 }
 
-fn read_u32_be(slice: &[u8]) -> Result<u32, SettledShieldedSegmentError> {
+pub(super) fn read_u32_be(slice: &[u8]) -> Result<u32, SettledShieldedSegmentError> {
     let bytes: [u8; 4] = slice.try_into().map_err(|_| {
         SettledShieldedSegmentError::InvalidFormat("truncated u32 field".to_owned())
     })?;
     Ok(u32::from_be_bytes(bytes))
 }
 
-fn read_u64_be(slice: &[u8]) -> Result<u64, SettledShieldedSegmentError> {
+pub(super) fn read_u64_be(slice: &[u8]) -> Result<u64, SettledShieldedSegmentError> {
     let bytes: [u8; 8] = slice.try_into().map_err(|_| {
         SettledShieldedSegmentError::InvalidFormat("truncated u64 field".to_owned())
     })?;
     Ok(u64::from_be_bytes(bytes))
 }
 
-fn read_hash32(slice: &[u8]) -> Result<[u8; 32], SettledShieldedSegmentError> {
+pub(super) fn read_hash32(slice: &[u8]) -> Result<[u8; 32], SettledShieldedSegmentError> {
     slice.try_into().map_err(|_| {
         SettledShieldedSegmentError::InvalidFormat("truncated 32-byte hash field".to_owned())
     })
