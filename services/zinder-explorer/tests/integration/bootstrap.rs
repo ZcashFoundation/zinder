@@ -14,7 +14,10 @@ use prost::Message as _;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Channel, Endpoint};
+use tonic::{
+    codec::CompressionEncoding,
+    transport::{Channel, Endpoint},
+};
 use zinder_core::{
     BlockHeight, BlockId, ChainEpoch, Network, TransactionId, TransparentAddressScriptHash,
     explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
@@ -39,9 +42,9 @@ use zinder_proto::capabilities::{
 use zinder_proto::v1::explorer::{
     BlockActivityDistributionRequest, BlockSummariesInRangeRequest, BlockSummary,
     BlockSummaryRecord, ChainReorgHistoryRequest, MempoolEventCountsRequest,
-    OverviewSnapshotRequest, OverviewSnapshotResponse, ServerInfoRequest, TransactionDetailRequest,
-    TransparentAddressDeltasRecord, TransparentAddressDeltasRequest, TransparentDeltaKind,
-    UnavailableReason, explorer_query_client::ExplorerQueryClient,
+    OverviewSnapshotRequest, OverviewSnapshotResponse, SearchRequest, ServerInfoRequest,
+    TransactionDetailRequest, TransparentAddressDeltasRecord, TransparentAddressDeltasRequest,
+    TransparentDeltaKind, UnavailableReason, explorer_query_client::ExplorerQueryClient,
 };
 use zinder_proto::v1::ops::ErrorReason;
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
@@ -50,6 +53,7 @@ use zinder_query::{
     AdmittedIngestControl, RocksDbCanonicalReader, RocksDbWalletReader, WalletEndpointMetadata,
     WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
+use zinder_runtime::{BearerToken, BearerTokenClientInterceptor, MAX_DECODING_MESSAGE_BYTES};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
@@ -1060,23 +1064,8 @@ fn assert_overview_wallet_fields_from_production_endpoint(
 #[tokio::test]
 async fn explorer_query_bearer_token_rejects_unauthenticated_clients() -> Result<()> {
     use std::str::FromStr as _;
-    use zinder_runtime::{BearerToken, BearerTokenClientInterceptor};
 
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let server_addr = listener.local_addr()?;
-    let server_token =
-        BearerToken::from_str("expected").map_err(|error| eyre!("token parse: {error}"))?;
-    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: Network::ZcashRegtest,
-    })
-    .with_bearer_token(server_token.clone());
-    let server_handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-
+    let (server_addr, server_token, server_handle) = spawn_authenticated_explorer().await?;
     let unauthenticated_channel = await_with_retry(server_addr).await?;
     let mut unauthenticated_client = ExplorerQueryClient::new(unauthenticated_channel);
     let unauthenticated_outcome = unauthenticated_client
@@ -1124,6 +1113,73 @@ async fn explorer_query_bearer_token_rejects_unauthenticated_clients() -> Result
     server_handle.abort();
     let _ = server_handle.await;
     Ok(())
+}
+
+#[tokio::test]
+async fn authenticated_explorer_round_trips_compression_and_bounds_decompressed_requests()
+-> Result<()> {
+    let (server_addr, server_token, server_handle) = spawn_authenticated_explorer().await?;
+    let channel = await_with_retry(server_addr).await?;
+    let interceptor = BearerTokenClientInterceptor::new(Some(&server_token))?;
+    let identity = ExplorerQueryClient::with_interceptor(channel, interceptor);
+    let expected = identity
+        .clone()
+        .server_info(ServerInfoRequest {})
+        .await?
+        .into_inner();
+
+    for encoding in [CompressionEncoding::Gzip, CompressionEncoding::Zstd] {
+        let mut client = identity
+            .clone()
+            .send_compressed(encoding)
+            .accept_compressed(encoding);
+        let response = client.server_info(ServerInfoRequest {}).await?;
+        let negotiated_encoding = response
+            .metadata()
+            .get("grpc-encoding")
+            .ok_or_else(|| eyre!("missing response encoding"))?
+            .to_str()?;
+        assert_eq!(negotiated_encoding, encoding.to_string());
+        assert_eq!(response.into_inner(), expected);
+
+        let refusal = client
+            .search(SearchRequest {
+                query: "0".repeat(MAX_DECODING_MESSAGE_BYTES + 1),
+            })
+            .await
+            .err()
+            .ok_or_else(|| eyre!("oversized compressed search was accepted"))?;
+        assert_eq!(refusal.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            refusal.message().contains("message size limit"),
+            "{refusal}"
+        );
+    }
+
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+async fn spawn_authenticated_explorer() -> Result<(SocketAddr, BearerToken, ServerHandle)> {
+    use std::str::FromStr as _;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let server_addr = listener.local_addr()?;
+    let server_token =
+        BearerToken::from_str("expected").map_err(|error| eyre!("token parse: {error}"))?;
+    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
+        network: Network::ZcashRegtest,
+    })
+    .with_bearer_token(server_token.clone());
+    let server_handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+
+    Ok((server_addr, server_token, server_handle))
 }
 
 async fn await_with_retry(addr: std::net::SocketAddr) -> Result<Channel> {

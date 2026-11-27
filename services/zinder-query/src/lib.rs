@@ -1897,7 +1897,7 @@ mod error_reason_tests {
     }
 
     #[test]
-    fn node_rate_limited_maps_to_retryable_unavailable_with_its_own_reason() {
+    fn node_rate_limited_maps_to_retryable_unavailable_with_its_own_reason() -> eyre::Result<()> {
         let error = QueryError::Node(SourceError::NodeRateLimited {
             operation: "getrawtransaction",
         });
@@ -1909,6 +1909,14 @@ mod error_reason_tests {
                 .map(|error_info| error_info.reason),
             Some("NODE_RATE_LIMITED".to_owned())
         );
+        let delay_ms = status
+            .metadata()
+            .get("grpc-retry-pushback-ms")
+            .ok_or_else(|| eyre::eyre!("missing retry pushback"))?
+            .to_str()?
+            .parse::<i32>()?;
+        assert!((500..=1500).contains(&delay_ms));
+        Ok(())
     }
 }
 
