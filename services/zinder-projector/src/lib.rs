@@ -19,3 +19,6 @@ pub mod state_bundle;
 
 /// Sealed, fixed-layout recovery artifact packaging and byte admission.
 pub mod recovery_archive;
+
+/// Reusable runtime entrypoints, configuration, and backup CLI helpers.
+pub mod runtime;

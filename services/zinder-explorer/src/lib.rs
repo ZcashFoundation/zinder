@@ -8,6 +8,7 @@
 //! `docs/architecture/materialized-view-plane.md` for the materialized-view store this crate reads.
 
 mod grpc;
+pub mod runtime;
 
 pub use grpc::{
     EXPLORER_QUERY_FIELD_LIMITS, ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings,

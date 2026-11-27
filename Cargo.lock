@@ -6161,6 +6161,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "zinder"
+version = "0.27.0"
+dependencies = [
+ "axum",
+ "clap",
+ "eyre",
+ "getrandom 0.4.3",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "metrics",
+ "parking_lot 0.13.0",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "zinder-compat-cipherscan",
+ "zinder-compat-lightwalletd",
+ "zinder-core",
+ "zinder-explorer",
+ "zinder-ingest",
+ "zinder-projector",
+ "zinder-query",
+ "zinder-runtime",
+ "zinder-testkit",
+]
+
+[[package]]
 name = "zinder-bench"
 version = "0.27.0"
 dependencies = [

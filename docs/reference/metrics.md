@@ -119,6 +119,8 @@ Other signals that need attention when they keep rising:
 | `zinder_readiness_replica_lag_chain_epochs` | gauge | `service`, `network` | Lag of a current `replica_lagging` or `serving_pair_stale` cause, otherwise 0. |
 | `zinder_readiness_served_epoch_age_seconds` | gauge | `service`, `network` | Wallet-serving readers: seconds since the writer committed the served chain state. |
 | `zinder_materialized_view_identity_info` | gauge | `service`, `network`, `identity` | 1 for each Explorer view store identity the runtime admitted. |
+| `zinder_supervisor_ready` | gauge | `mode`, `preset`, `network` | 1 when the `zinder serve` or `zinder index` supervisor's required roles are all ready. |
+| `zinder_supervisor_role_ready` | gauge | `role`, `network` | 1 when the supervised role reports ready on its loopback `/readyz`, 0 otherwise. |
 | `zinder_startup_phase_duration_seconds` | histogram | `phase`, `outcome` | Duration of each [startup phase](../architecture/service-operations.md). |
 
 Process gauges use scrape target labels. An unavailable kernel field is absent.

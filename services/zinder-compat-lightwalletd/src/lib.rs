@@ -24,6 +24,7 @@ pub use published_range::{
     PublicationConcurrency, PublishedShieldedHistory, ShieldedCatalogPublisher,
 };
 mod request_limits;
+pub mod runtime;
 mod stale_tip;
 mod tip_wait;
 

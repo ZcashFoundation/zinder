@@ -8,6 +8,7 @@
 mod blend_check;
 mod market_price;
 mod mining_pools;
+pub mod runtime;
 
 pub use market_price::MarketPriceInitializationError;
 
