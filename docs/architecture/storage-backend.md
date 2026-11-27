@@ -121,8 +121,8 @@ presplit deterministically):
   per-block row index (block hash, `payload_sha256`, `block_time`, slab offset,
   `native_bytes` budget, `PoolPresenceMask` distinguishing Sapling spends from Sapling
   outputs plus Orchard and Ironwood, and row flags — with wire frame lengths derived
-  by `frame_span` from adjacent slab offsets or the slab end), and a 32-byte whole-body SHA-256 trailer. Cold
-  admission validates `index_sha256` in one positioned read (`O(index)`),
+  by `frame_span` from adjacent slab offsets or the slab end), and a 32-byte whole-body SHA-256 trailer. Reader
+  opening validates `index_sha256` in one positioned read (`O(index)`),
   retaining `12 B/block` compact rows (`+ 0.5 B/block` 64-row page digests when
   not backed by kernel `fs-verity`). Sans-I/O `ByteRange` planning groups short
   rows (`< 32 KiB`) into `512 KiB` slabs, isolates large rows (`>= 32 KiB`), skips
@@ -134,8 +134,8 @@ presplit deterministically):
   tagged sections: Tag `1` compact transparent supplement (`tx.index`, `txid`,
   `fee_zat`, `vin`, `vout`) and Tag `2` extensible canonical block/tx metadata
   (ZIP 229/258/248/226/270/272 fields, explicit anchors,
-  `zip317_logical_actions`, `paid_fee`, and `burn_zat`), with `O(index)` cold
-  `index_sha256` verification and sans-I/O `ByteRange` planning. Together with
+  `zip317_logical_actions`, `paid_fee`, and `burn_zat`), with `O(index)`
+  `index_sha256` reader opening and sans-I/O `ByteRange` planning. Together with
   `ZSHRNG02` `Slab 0`, `splice_compact_block_wire` yields byte-identical
   transparent-inclusive `CompactBlock` frames and
   `reconstruct_compact_block_artifact` / `reconstruct_canonical_block_facts`
@@ -145,8 +145,8 @@ presplit deterministically):
   single-copy full consensus block vault storing each block once (`Zstd` level 3
   or uncompressed), a flat `40`-byte per-transaction slice table `(tx_offset,
   tx_len, tx_sha256)` read on demand without retaining an in-memory tx vector, a
-  `128`-byte per-block row index, and a 32-byte trailer, with `O(index)` cold
-  `index_sha256` admission and sans-I/O `ByteRange` planning. Setting
+  `128`-byte per-block row index, and a 32-byte trailer, with `O(index)`
+  `index_sha256` reader opening and sans-I/O `ByteRange` planning. Setting
   `storage.full_blocks = true` (`storage.raw_blob_policy = "all"`) enables
   `ZSBLKB01` + `live_tail_raw_block` with one copy of full block bytes instead
   of separate transaction and block blob copies.
@@ -155,6 +155,14 @@ presplit deterministically):
 `1,024` entries) keyed by `(start_height, SettledSegmentKind)` with miss
 singleflight deduplication. Opening `ZSHRNG02` never touches `ZSTSUP01` or
 `ZSBLKB01`, and opening `ZSTSUP01` never touches `ZSBLKB01`.
+
+During cold store admission (`verify_pinned_segments_into_cache`), storage
+admission checks `kernel_verified()` on each pinned `ZSHRNG02`, `ZSTSUP01`, and
+`ZSBLKB01` segment reader. Cold admission stays `O(index)` only when kernel
+`fs-verity` verification confirms the file digest; when kernel `fs-verity` is
+not active on the segment files, cold admission falls back to full-payload
+verification (`verify_full_payload`) across all three segment formats before
+admitting the store.
 
 ### Canonical read path
 
