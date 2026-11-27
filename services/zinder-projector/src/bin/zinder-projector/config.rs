@@ -1,6 +1,8 @@
 //! Configuration loading for the `zinder-projector` binary.
 
 use std::{
+    fs::{File, OpenOptions},
+    io::{ErrorKind, Write as _},
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU64},
     path::{Component, Path, PathBuf},
@@ -14,19 +16,19 @@ use zinder_runtime::{
     BearerToken, ConfigError, ConfigLoader, DeploymentProfile, DeploymentSection, DeploymentToml,
     IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml, OpsSection,
     OpsServerError, OpsToml, ProjectorControlSection, ProjectorControlToml,
-    RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, SecuritySection, SecurityToml,
-    StorageRoleSection, guard_optional_serving_bind, require_field, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_ingest_control_reader,
-    resolve_ops_listen_addr, resolve_projector_control,
-    resolve_wallet_projection_writer_rocksdb_budget, section_defaults::DEFAULT_CANONICAL_PATH,
+    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
+    RuntimeService, SecuritySection, SecurityToml, StorageRoleSection, derive_canonical_path,
+    derive_canonical_secondary_path, derive_wallet_path, guard_optional_serving_bind,
+    require_field, resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
+    resolve_ingest_control_reader, resolve_manual_raw_blob_retention, resolve_ops_listen_addr,
+    resolve_projector_control_with_data_dir, resolve_wallet_projection_writer_rocksdb_budget,
+    section_defaults::DEFAULT_DATA_DIR, validate_optional_data_dir,
 };
 use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
 use zinder_wallet_rocksdb::{MAX_ACCUMULATOR_HASHING_WORKERS, RocksDbWalletBuildOptions};
 
 const DEFAULT_CANONICAL_SECONDARY_PATH: &str = "/var/lib/zinder/projector/canonical-secondary";
 const DEFAULT_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::Transactions;
-const DEFAULT_WALLET_PATH: &str = "/var/lib/zinder/wallet";
-pub(crate) const DEFAULT_OPS_LISTEN_ADDR: &str = "127.0.0.1:9110";
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 const DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS: u64 = 30;
 /// ADR-0004 permits at most two hours for wallet construction after canonical.
@@ -53,14 +55,16 @@ const MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES: u64 =
 pub(crate) struct ProjectorConfig {
     pub(crate) profile: Option<DeploymentProfile>,
     pub(crate) network: Network,
+    pub(crate) storage_data_dir: Option<PathBuf>,
     pub(crate) canonical_path: PathBuf,
     pub(crate) canonical_secondary_path: PathBuf,
+    pub(crate) storage_full_blocks: Option<bool>,
     pub(crate) expected_canonical_raw_blob_retention: RawBlobRetention,
     pub(crate) wallet_path: PathBuf,
     pub(crate) canonical_rocksdb_budget: RocksDbResourceBudget,
     pub(crate) wallet_rocksdb_budget: RocksDbResourceBudget,
     pub(crate) reorg_window_blocks: u32,
-    pub(crate) build_owner: [u8; 16],
+    pub(crate) build_owner: Option<[u8; 16]>,
     pub(crate) lease_duration: Duration,
     pub(crate) fence_convergence_timeout: Duration,
     pub(crate) build: ProjectorBuildConfig,
@@ -71,6 +75,18 @@ pub(crate) struct ProjectorConfig {
     pub(crate) projector_control: zinder_runtime::ResolvedProjectorControl,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) allow_public_bind: bool,
+}
+
+impl ProjectorConfig {
+    /// Returns canonical store requirements derived from deployment profile and raw-blob policy.
+    #[must_use]
+    pub(crate) fn canonical_requirements(&self) -> zinder_store::CanonicalStoreRequirements {
+        let requirements = self.profile.map_or_else(
+            zinder_store::CanonicalStoreRequirements::default,
+            DeploymentProfile::canonical_requirement,
+        );
+        requirements.with_blob_retention(self.expected_canonical_raw_blob_retention)
+    }
 }
 
 /// Bounded resources for one fixed-tip wallet construction.
@@ -351,11 +367,16 @@ pub(crate) fn load_backup_config(
             || name.starts_with("ZINDER_NETWORK_")
             || name == "ZINDER_PROJECTOR_CONTROL"
             || name.starts_with("ZINDER_PROJECTOR_CONTROL_")
+            || name == "ZINDER_STORAGE__DATA_DIR"
     });
     let raw = load_raw_projector_config(config_path, overrides, capture_settings)?;
+    let storage_data_dir = validate_optional_data_dir(raw.storage.data_dir)?;
     Ok((
         raw.network.resolve()?,
-        resolve_projector_control(raw.projector_control)?,
+        resolve_projector_control_with_data_dir(
+            raw.projector_control,
+            storage_data_dir.as_deref(),
+        )?,
     ))
 }
 
@@ -411,12 +432,6 @@ fn load_raw_projector_config(
 
 fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {
     ConfigLoader::new()
-        .with_default("storage.canonical_path", DEFAULT_CANONICAL_PATH)?
-        .with_default(
-            "storage.canonical_secondary_path",
-            DEFAULT_CANONICAL_SECONDARY_PATH,
-        )?
-        .with_default("wallet.path", DEFAULT_WALLET_PATH)?
         .with_default("projector.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
             "projector.fence_convergence_timeout_seconds",
@@ -446,7 +461,7 @@ fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {
             "projector.follow.max_transition_logical_bytes",
             DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES,
         )?
-        .with_default("ops.listen_addr", DEFAULT_OPS_LISTEN_ADDR)?
+        .with_ops_section(RuntimeService::Projector)?
         .with_default("ingest_control.addr", "http://127.0.0.1:9100")?
         .with_security_section()
 }
@@ -475,9 +490,11 @@ struct ProjectorRawConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ProjectorStorageSection {
+    data_dir: Option<PathBuf>,
     canonical_path: Option<PathBuf>,
     canonical_secondary_path: Option<PathBuf>,
     raw_blob_policy: Option<RawBlobRetention>,
+    full_blocks: Option<bool>,
     canonical: StorageRoleSection,
 }
 
@@ -516,18 +533,65 @@ struct ProjectorFollowSection {
     max_transition_logical_bytes: Option<u64>,
 }
 
-fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, ProjectorError> {
+fn non_blank_path_or(
+    explicit: Option<PathBuf>,
+    field: &'static str,
+    fallback: impl FnOnce() -> PathBuf,
+) -> Result<PathBuf, ConfigError> {
+    match explicit {
+        Some(path) => {
+            if path.to_string_lossy().trim().is_empty() {
+                return Err(ConfigError::invalid(format!("{field} must not be blank")));
+            }
+            Ok(path)
+        }
+        None => Ok(fallback()),
+    }
+}
+
+fn resolve_projector_paths(
+    storage: &mut ProjectorStorageSection,
+    wallet_path: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf, PathBuf), ConfigError> {
+    storage.data_dir = validate_optional_data_dir(storage.data_dir.take())?;
+    let data_dir = storage.data_dir.as_deref();
+    let effective_root = data_dir.unwrap_or_else(|| Path::new(DEFAULT_DATA_DIR));
+    let canonical_path = non_blank_path_or(
+        storage.canonical_path.take(),
+        "storage.canonical_path",
+        || derive_canonical_path(effective_root),
+    )?;
+    let canonical_secondary_path = non_blank_path_or(
+        storage.canonical_secondary_path.take(),
+        "storage.canonical_secondary_path",
+        || {
+            data_dir.map_or_else(
+                || PathBuf::from(DEFAULT_CANONICAL_SECONDARY_PATH),
+                |dir| derive_canonical_secondary_path(dir, "projector"),
+            )
+        },
+    )?;
+    let wallet_path = non_blank_path_or(wallet_path, "wallet.path", || {
+        derive_wallet_path(effective_root)
+    })?;
+    require_distinct_paths(&canonical_path, &canonical_secondary_path, &wallet_path)?;
+    Ok((canonical_path, canonical_secondary_path, wallet_path))
+}
+
+fn resolve_projector_config(
+    mut raw: ProjectorRawConfig,
+) -> Result<ProjectorConfig, ProjectorError> {
     let profile = raw.deployment.profile;
     let network = raw.network.resolve()?;
-    let canonical_path = require_field(raw.storage.canonical_path, "storage.canonical_path")?;
-    let canonical_secondary_path = require_field(
-        raw.storage.canonical_secondary_path,
-        "storage.canonical_secondary_path",
+    let (canonical_path, canonical_secondary_path, wallet_path) =
+        resolve_projector_paths(&mut raw.storage, raw.wallet.path)?;
+    let storage_data_dir = raw.storage.data_dir;
+    let storage_full_blocks = raw.storage.full_blocks;
+    let expected_canonical_raw_blob_retention = resolve_expected_raw_blob_retention(
+        profile,
+        storage_full_blocks,
+        raw.storage.raw_blob_policy,
     )?;
-    let expected_canonical_raw_blob_retention =
-        resolve_expected_raw_blob_retention(profile, raw.storage.raw_blob_policy)?;
-    let wallet_path = require_field(raw.wallet.path, "wallet.path")?;
-    require_distinct_paths(&canonical_path, &canonical_secondary_path, &wallet_path)?;
     let canonical_rocksdb_budget =
         resolve_canonical_reader_rocksdb_budget(raw.storage.canonical.rocksdb)?;
     let wallet_rocksdb_budget =
@@ -536,9 +600,11 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
         raw.projector.reorg_window_blocks,
         "projector.reorg_window_blocks",
     )?;
-    let build_owner_encoded =
-        require_field(raw.projector.build_owner_hex, "projector.build_owner_hex")?;
-    let build_owner = parse_build_owner(&build_owner_encoded)?;
+    let owner_path = persisted_build_owner_path(&wallet_path)?;
+    let build_owner = match raw.projector.build_owner_hex {
+        Some(encoded) => Some(parse_build_owner(&encoded)?),
+        None => read_persisted_build_owner(&owner_path)?,
+    };
     let lease_duration_seconds = require_minimum_u64(
         raw.projector.lease_duration_seconds,
         "projector.lease_duration_seconds",
@@ -551,7 +617,10 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
     let build = resolve_build_config(&raw.projector.build)?;
     let follow = resolve_follow_config(&raw.projector.follow)?;
     let ingest_control = resolve_ingest_control_reader(raw.ingest_control)?;
-    let projector_control = resolve_projector_control(raw.projector_control)?;
+    let projector_control = resolve_projector_control_with_data_dir(
+        raw.projector_control,
+        storage_data_dir.as_deref(),
+    )?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
     let allow_public_bind = resolve_allow_public_bind(raw.security)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
@@ -559,8 +628,10 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
     Ok(ProjectorConfig {
         profile,
         network,
+        storage_data_dir,
         canonical_path,
         canonical_secondary_path,
+        storage_full_blocks,
         expected_canonical_raw_blob_retention,
         wallet_path,
         canonical_rocksdb_budget,
@@ -582,17 +653,19 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
 
 fn resolve_expected_raw_blob_retention(
     profile: Option<DeploymentProfile>,
+    full_blocks: Option<bool>,
     configured: Option<RawBlobRetention>,
 ) -> Result<RawBlobRetention, ConfigError> {
     let Some(profile) = profile else {
-        return Ok(configured.unwrap_or(DEFAULT_RAW_BLOB_RETENTION));
+        return Ok(resolve_manual_raw_blob_retention(full_blocks, configured)?
+            .unwrap_or(DEFAULT_RAW_BLOB_RETENTION));
     };
     if matches!(profile, DeploymentProfile::LightWallet) {
         return Err(ConfigError::invalid(
             "deployment.profile = \"light-wallet\" runs no wallet projector; the light-wallet deployment serves node-backed reads without a wallet projection",
         ));
     }
-    profile.resolve_raw_blob_retention(configured)
+    profile.resolve_raw_blob_retention_with_full_blocks(full_blocks, configured)
 }
 
 fn resolve_build_config(raw: &ProjectorBuildSection) -> Result<ProjectorBuildConfig, ConfigError> {
@@ -711,6 +784,170 @@ fn normalized_storage_path_identity(path: &Path) -> Result<PathBuf, ConfigError>
     Ok(normalized)
 }
 
+pub(crate) fn ensure_build_owner(config: &mut ProjectorConfig) -> Result<[u8; 16], ProjectorError> {
+    if let Some(owner) = config.build_owner {
+        return Ok(owner);
+    }
+    let owner_path = persisted_build_owner_path(&config.wallet_path)?;
+    if let Some(existing) = read_persisted_build_owner(&owner_path)? {
+        config.build_owner = Some(existing);
+        return Ok(existing);
+    }
+    if let Some(parent) = owner_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dir_all_and_sync(parent)?;
+    }
+    let mut generated = [0_u8; 16];
+    getrandom::fill(&mut generated)?;
+    let persisted = persist_new_build_owner(&owner_path, generated)?;
+    config.build_owner = Some(persisted);
+    Ok(persisted)
+}
+
+fn sync_directory(directory: &Path) -> Result<(), ConfigError> {
+    File::open(directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| {
+            ConfigError::invalid(format!(
+                "could not sync directory {}: {error}",
+                directory.display()
+            ))
+        })
+}
+
+fn create_dir_all_and_sync(directory: &Path) -> Result<(), ConfigError> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(directory);
+    while let Some(path) = cursor {
+        if path.as_os_str().is_empty() || path.exists() {
+            break;
+        }
+        missing.push(path.to_path_buf());
+        cursor = path.parent();
+    }
+    missing.reverse();
+    for dir in missing {
+        let created = match std::fs::create_dir(&dir) {
+            Ok(()) => true,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(ConfigError::invalid(format!(
+                    "could not create persisted build-owner directory {}: {error}",
+                    dir.display()
+                )));
+            }
+        };
+        if created
+            && let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty())
+        {
+            sync_directory(parent)?;
+        }
+        sync_directory(&dir)?;
+    }
+    Ok(())
+}
+
+fn persisted_build_owner_path(wallet_path: &Path) -> Result<PathBuf, ConfigError> {
+    let Some(wallet_name) = wallet_path.file_name().and_then(|name| name.to_str()) else {
+        return Err(ConfigError::invalid(format!(
+            "wallet.path {} must end in a directory name so projector can store its build-owner file beside it",
+            wallet_path.display()
+        )));
+    };
+    let parent = wallet_path.parent().unwrap_or_else(|| Path::new(""));
+    Ok(parent.join(format!("{wallet_name}.build-owner")))
+}
+
+fn read_persisted_build_owner(owner_path: &Path) -> Result<Option<[u8; 16]>, ConfigError> {
+    match std::fs::read_to_string(owner_path) {
+        Ok(contents) => parse_build_owner(contents.trim())
+            .map(Some)
+            .map_err(|_| {
+                ConfigError::invalid(format!(
+                    "persisted projector build-owner file {} must contain exactly 32 hexadecimal characters",
+                    owner_path.display()
+                ))
+            }),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ConfigError::invalid(format!(
+            "could not read persisted projector build-owner file {}: {error}",
+            owner_path.display()
+        ))),
+    }
+}
+
+fn persist_new_build_owner(
+    owner_path: &Path,
+    generated: [u8; 16],
+) -> Result<[u8; 16], ConfigError> {
+    let encoded = encode_hex(generated);
+    let temp_name = format!(
+        ".{}.{encoded}.tmp",
+        owner_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("build-owner")
+    );
+    let temp_path = owner_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(temp_name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut temp_file = options.open(&temp_path).map_err(|error| {
+        ConfigError::invalid(format!(
+            "could not create temporary build-owner file {}: {error}",
+            temp_path.display()
+        ))
+    })?;
+    if let Err(error) = temp_file
+        .write_all(encoded.as_bytes())
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(ConfigError::invalid(format!(
+            "could not write temporary build-owner file {}: {error}",
+            temp_path.display()
+        )));
+    }
+    drop(temp_file);
+    let parent = owner_path
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let link_outcome = std::fs::hard_link(&temp_path, owner_path);
+    if link_outcome.is_ok() {
+        sync_directory(parent)?;
+    }
+    let _ = std::fs::remove_file(&temp_path);
+    match link_outcome {
+        Ok(()) => {
+            sync_directory(parent)?;
+            Ok(generated)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            sync_directory(parent)?;
+            read_persisted_build_owner(owner_path)?.ok_or_else(|| {
+                ConfigError::invalid(format!(
+                    "persisted projector build-owner file {} disappeared during creation race",
+                    owner_path.display()
+                ))
+            })
+        }
+        Err(error) => Err(ConfigError::invalid(format!(
+            "could not persist projector build-owner file {}: {error}",
+            owner_path.display()
+        ))),
+    }
+}
+
 fn parse_build_owner(encoded: &str) -> Result<[u8; 16], ConfigError> {
     if encoded.len() != 32 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ConfigError::invalid(
@@ -784,8 +1021,10 @@ struct ProjectorConfigToml {
 impl ProjectorConfigToml {
     fn from_config(config: &ProjectorConfig) -> Self {
         let storage = ProjectorStorageToml {
+            data_dir: config.storage_data_dir.clone(),
             canonical_path: config.canonical_path.clone(),
             canonical_secondary_path: config.canonical_secondary_path.clone(),
+            full_blocks: config.storage_full_blocks,
             raw_blob_policy: config
                 .profile
                 .is_none()
@@ -802,21 +1041,18 @@ impl ProjectorConfigToml {
             },
             projector: ProjectorToml {
                 reorg_window_blocks: config.reorg_window_blocks,
-                build_owner_hex: encode_hex(config.build_owner),
+                build_owner_hex: config.build_owner.map(encode_hex),
                 lease_duration_seconds: config.lease_duration.as_secs(),
                 fence_convergence_timeout_seconds: config.fence_convergence_timeout.as_secs(),
                 build: ProjectorBuildToml::from(config.build),
                 follow: ProjectorFollowToml::from(config.follow),
             },
-            ingest_control: IngestControlReaderToml::from_resolved(
-                config.ingest_control_addr.clone(),
-                config.ingest_control_bearer_token_path.as_deref(),
-            ),
-            projector_control: ProjectorControlToml::from_resolved(
-                config.projector_control.listen_addr,
-                config.projector_control.bearer_token_path.as_deref(),
-                &config.projector_control.checkpoint_staging_root,
-            ),
+            ingest_control: IngestControlReaderToml::from_reader(&ResolvedIngestControlReader {
+                addr: config.ingest_control_addr.clone(),
+                bearer_token_path: config.ingest_control_bearer_token_path.clone(),
+                bearer_token: config.ingest_control_bearer_token.clone(),
+            }),
+            projector_control: ProjectorControlToml::from_control(&config.projector_control),
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
         }
@@ -825,8 +1061,12 @@ impl ProjectorConfigToml {
 
 #[derive(Serialize)]
 struct ProjectorStorageToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_dir: Option<PathBuf>,
     canonical_path: PathBuf,
     canonical_secondary_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    full_blocks: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_blob_policy: Option<RawBlobRetention>,
     canonical: ProjectorStorageRoleToml,
@@ -854,7 +1094,8 @@ impl ProjectorStorageRoleToml {
 #[derive(Serialize)]
 struct ProjectorToml {
     reorg_window_blocks: u32,
-    build_owner_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_owner_hex: Option<String>,
     lease_duration_seconds: u64,
     fence_convergence_timeout_seconds: u64,
     build: ProjectorBuildToml,
@@ -1128,6 +1369,71 @@ mod tests {
             .and_then(std::error::Error::source)
             .ok_or("canonical secondary open failure should preserve nested RocksDB source")?;
         assert_eq!(nested_source.to_string(), rocks_message);
+        Ok(())
+    }
+
+    #[test]
+    fn optional_build_owner_persists_once_and_does_not_write_before_ensure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let wallet_path = root.path().join("nested/state/wallet");
+        let owner_path = super::persisted_build_owner_path(&wallet_path)?;
+        assert!(!owner_path.exists());
+        assert_eq!(super::read_persisted_build_owner(&owner_path)?, None);
+
+        let mut config = super::ProjectorConfig {
+            profile: None,
+            network: zinder_core::Network::ZcashRegtest,
+            storage_data_dir: Some(root.path().to_path_buf()),
+            canonical_path: root.path().join("canonical"),
+            canonical_secondary_path: root.path().join("canonical-secondary/projector"),
+            storage_full_blocks: None,
+            expected_canonical_raw_blob_retention: zinder_store::RawBlobRetention::Transactions,
+            wallet_path,
+            canonical_rocksdb_budget:
+                zinder_store::RocksDbResourceBudget::canonical_reader_defaults(),
+            wallet_rocksdb_budget:
+                zinder_store::RocksDbResourceBudget::wallet_projection_writer_defaults(),
+            reorg_window_blocks: 100,
+            build_owner: None,
+            lease_duration: std::time::Duration::from_secs(14_400),
+            fence_convergence_timeout: std::time::Duration::from_secs(30),
+            build: super::ProjectorBuildConfig {
+                max_outpoint_sort_memory_bytes: 1024,
+                max_secondary_sort_memory_bytes_per_sorter: 1024,
+                max_temporary_file_bytes_per_sorter: 1024,
+                sst_target_logical_bytes: 1024,
+                max_accounted_reorg_undo_bytes: 1024,
+                accumulator_hashing_workers: std::num::NonZeroU32::MIN,
+            },
+            follow: super::ProjectorFollowConfig {
+                max_transition_logical_bytes: std::num::NonZeroU64::MIN,
+            },
+            ingest_control_addr: "http://127.0.0.1:9100".to_owned(),
+            ingest_control_bearer_token_path: None,
+            ingest_control_bearer_token: None,
+            projector_control: zinder_runtime::ResolvedProjectorControl {
+                listen_addr: None,
+                bearer_token_path: None,
+                bearer_token: None,
+                checkpoint_staging_root: root.path().join("staging"),
+            },
+            ops_listen_addr: None,
+            allow_public_bind: false,
+        };
+        let first_owner = super::ensure_build_owner(&mut config)?;
+        assert!(owner_path.exists());
+        assert_eq!(config.build_owner, Some(first_owner));
+
+        let mut restarted = super::ProjectorConfig {
+            build_owner: super::read_persisted_build_owner(&owner_path)?,
+            ..config
+        };
+        let second_owner = super::ensure_build_owner(&mut restarted)?;
+        assert_eq!(first_owner, second_owner);
+
+        std::fs::write(&owner_path, "not-hex")?;
+        assert!(super::read_persisted_build_owner(&owner_path).is_err());
         Ok(())
     }
 }

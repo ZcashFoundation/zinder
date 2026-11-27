@@ -10,8 +10,8 @@ use zinder_runtime::{
     BearerToken, BearerTokenConnectError, BearerTokenError, ConfigError, ConfigLoader,
     InvalidZinderGrpcEndpoint, NetworkSection, NetworkToml, OpsSection, OpsServerError, OpsToml,
     RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
-    load_bearer_token, parse_socket_addr, require_field, resolve_allow_public_bind,
-    resolve_ops_listen_addr, validate_zinder_grpc_endpoint,
+    parse_socket_addr, require_field, resolve_allow_public_bind, resolve_ops_listen_addr,
+    resolve_optional_bearer_token, validate_zinder_grpc_endpoint,
 };
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9070";
@@ -151,7 +151,7 @@ struct CipherscanRawConfig {
     security: SecuritySection,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CipherscanSection {
     listen_addr: Option<String>,
@@ -160,6 +160,28 @@ struct CipherscanSection {
     current_price_endpoint: Option<String>,
     historical_price_endpoint_template: Option<String>,
     bearer_token_path: Option<PathBuf>,
+    bearer_token: Option<String>,
+}
+
+impl std::fmt::Debug for CipherscanSection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CipherscanSection")
+            .field("listen_addr", &self.listen_addr)
+            .field("explorer_query_endpoint", &self.explorer_query_endpoint)
+            .field("wallet_query_endpoint", &self.wallet_query_endpoint)
+            .field("current_price_endpoint", &self.current_price_endpoint)
+            .field(
+                "historical_price_endpoint_template",
+                &self.historical_price_endpoint_template,
+            )
+            .field("bearer_token_path", &self.bearer_token_path)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -179,6 +201,8 @@ struct CipherscanToml {
     historical_price_endpoint_template: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     bearer_token_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bearer_token: Option<&'static str>,
 }
 
 impl CipherscanConfigToml {
@@ -200,6 +224,8 @@ impl CipherscanConfigToml {
                     .bearer_token_path
                     .as_ref()
                     .map(|path| path.display().to_string()),
+                bearer_token: (config.bearer_token.is_some() && config.bearer_token_path.is_none())
+                    .then_some("[REDACTED]"),
             },
         }
     }
@@ -246,7 +272,12 @@ fn resolve_cipherscan_config(
         historical_price_endpoint_template,
     )?;
     let bearer_token_path = raw.cipherscan.bearer_token_path;
-    let bearer_token = load_bearer_token(bearer_token_path.as_deref())?;
+    let bearer_token = resolve_optional_bearer_token(
+        bearer_token_path.as_deref(),
+        raw.cipherscan.bearer_token.as_deref(),
+        "cipherscan.bearer_token_path",
+        "cipherscan.bearer_token",
+    )?;
 
     Ok(CipherscanConfig {
         network,
@@ -263,10 +294,46 @@ fn resolve_cipherscan_config(
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_WALLET_QUERY_ENDPOINT;
+    use super::{
+        CipherscanConfigError, CipherscanConfigOverrides, DEFAULT_WALLET_QUERY_ENDPOINT,
+        cipherscan_config_toml, load_cipherscan_config,
+    };
 
     #[test]
     fn wallet_query_default_uses_the_native_query_listener() {
         assert_eq!(DEFAULT_WALLET_QUERY_ENDPOINT, "http://127.0.0.1:9102");
+    }
+
+    #[test]
+    fn inline_bearer_token_is_redacted_and_conflicts_with_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = tempfile::tempdir()?;
+        let config_path = scratch.path().join("cipherscan.toml");
+        std::fs::write(
+            &config_path,
+            "[network]\nname = \"zcash-regtest\"\n\n[cipherscan]\nbearer_token = \"cipherscan-inline-secret\"\n",
+        )?;
+        let resolved = load_cipherscan_config(
+            Some(config_path.clone()),
+            CipherscanConfigOverrides::default(),
+        )?;
+        let rendered = cipherscan_config_toml(&resolved)?;
+        assert!(
+            rendered.contains("bearer_token = \"[REDACTED]\""),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("cipherscan-inline-secret"), "{rendered}");
+
+        let token_path = scratch.path().join("tok");
+        std::fs::write(&token_path, "file-secret\n")?;
+        let conflict = load_cipherscan_config(
+            Some(config_path),
+            CipherscanConfigOverrides {
+                bearer_token_path: Some(token_path),
+                ..CipherscanConfigOverrides::default()
+            },
+        );
+        assert!(matches!(conflict, Err(CipherscanConfigError::Config(_))));
+        Ok(())
     }
 }

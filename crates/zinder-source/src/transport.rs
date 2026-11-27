@@ -30,11 +30,14 @@ use arc_swap::ArcSwap;
 use futures_util::future::BoxFuture;
 use jsonrpsee::http_client::{HeaderMap, HttpClient, HttpClientBuilder, RpcServiceBuilder};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+use secrecy::ExposeSecret as _;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use crate::{NodeIndexerTls, SourceError, SourceFailureClass, ZebraIndexerSourceTarget};
+use crate::{
+    IndexerTlsMaterial, NodeIndexerTls, SourceError, SourceFailureClass, ZebraIndexerSourceTarget,
+};
 
 /// Consecutive transport-class failures that trigger a
 /// [`ResilientClient`] rebuild.
@@ -250,16 +253,16 @@ fn zebra_indexer_tls_config(
     handshake_timeout: Duration,
 ) -> Result<ClientTlsConfig, ZebraTransportError> {
     let mut config = ClientTlsConfig::new().timeout(handshake_timeout);
-    config = match tls.and_then(|tls| tls.ca_cert_path.as_deref()) {
-        Some(ca_cert_path) => config.ca_certificate(Certificate::from_pem(read_pem_certificates(
-            ca_cert_path,
+    config = match tls.and_then(|tls| tls.ca_cert.as_ref()) {
+        Some(ca_cert) => config.ca_certificate(Certificate::from_pem(load_pem_certificates(
+            ca_cert,
             "CA certificate",
         )?)),
         None => config.with_native_roots(),
     };
     if let Some(identity) = tls.and_then(|tls| tls.client_identity.as_ref()) {
-        let cert_chain = read_pem_certificates(&identity.cert_path, "client certificate")?;
-        let key = read_pem_private_key(&identity.key_path)?;
+        let cert_chain = load_pem_certificates(&identity.cert, "client certificate")?;
+        let key = load_pem_private_key(&identity.key)?;
         config = config.identity(Identity::from_pem(cert_chain, key));
     }
     if let Some(server_name) = tls.and_then(|tls| tls.server_name.as_ref()) {
@@ -268,39 +271,68 @@ fn zebra_indexer_tls_config(
     Ok(config)
 }
 
-/// Reads a PEM file that must hold at least one certificate.
+/// Reads and validates a PEM certificate chain from file or inline material.
 ///
-/// tonic skips unparsable entries, so a file without certificates would
+/// tonic skips unparsable entries, so material without certificates would
 /// otherwise yield an empty trust store or chain without an error.
-fn read_pem_certificates(path: &Path, role: &'static str) -> Result<Vec<u8>, ZebraTransportError> {
-    let pem = read_tls_file(path, role)?;
-    let mut certificate_count = 0_usize;
-    for certificate in CertificateDer::pem_slice_iter(&pem) {
-        certificate.map_err(|error| tls_material_unreadable(path, role, error.to_string()))?;
-        certificate_count = certificate_count.saturating_add(1);
-    }
-    if certificate_count == 0 {
-        return Err(tls_material_unreadable(
-            path,
-            role,
-            "contains no PEM certificate",
-        ));
-    }
+fn load_pem_certificates(
+    material: &IndexerTlsMaterial,
+    role: &'static str,
+) -> Result<Vec<u8>, ZebraTransportError> {
+    let pem = match material {
+        IndexerTlsMaterial::File(path) => read_tls_file(path, role)?,
+        IndexerTlsMaterial::Inline(secret) => secret.expose_secret().as_bytes().to_vec(),
+    };
+    validate_pem_certificates(&pem).map_err(|reason| tls_material_error(material, role, reason))?;
     Ok(pem)
 }
 
-fn read_pem_private_key(path: &Path) -> Result<Vec<u8>, ZebraTransportError> {
+fn load_pem_private_key(material: &IndexerTlsMaterial) -> Result<Vec<u8>, ZebraTransportError> {
     const ROLE: &str = "client key";
-    let pem = read_tls_file(path, ROLE)?;
-    PrivateKeyDer::from_pem_slice(&pem).map_err(|error| {
-        let reason = if matches!(error, rustls_pki_types::pem::Error::NoItemsFound) {
-            "contains no PEM private key".to_owned()
-        } else {
-            error.to_string()
-        };
-        tls_material_unreadable(path, ROLE, reason)
-    })?;
+    let pem = match material {
+        IndexerTlsMaterial::File(path) => read_tls_file(path, ROLE)?,
+        IndexerTlsMaterial::Inline(secret) => secret.expose_secret().as_bytes().to_vec(),
+    };
+    validate_pem_private_key(&pem).map_err(|reason| tls_material_error(material, ROLE, reason))?;
     Ok(pem)
+}
+
+fn validate_pem_certificates(pem: &[u8]) -> Result<(), String> {
+    let mut certificate_count = 0_usize;
+    for certificate in CertificateDer::pem_slice_iter(pem) {
+        certificate.map_err(|error| error.to_string())?;
+        certificate_count = certificate_count.saturating_add(1);
+    }
+    if certificate_count == 0 {
+        return Err("contains no PEM certificate".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_pem_private_key(pem: &[u8]) -> Result<(), String> {
+    PrivateKeyDer::from_pem_slice(pem)
+        .map(|_| ())
+        .map_err(|error| {
+            if matches!(error, rustls_pki_types::pem::Error::NoItemsFound) {
+                "contains no PEM private key".to_owned()
+            } else {
+                error.to_string()
+            }
+        })
+}
+
+fn tls_material_error(
+    material: &IndexerTlsMaterial,
+    role: &'static str,
+    reason: impl Into<String>,
+) -> ZebraTransportError {
+    match material {
+        IndexerTlsMaterial::File(path) => tls_material_unreadable(path, role, reason),
+        IndexerTlsMaterial::Inline(_) => ZebraTransportError::TlsConfigRejected(format!(
+            "indexer TLS inline {role} is unusable: {}",
+            reason.into()
+        )),
+    }
 }
 
 fn read_tls_file(path: &Path, role: &'static str) -> Result<Vec<u8>, ZebraTransportError> {

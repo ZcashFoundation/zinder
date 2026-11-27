@@ -83,10 +83,10 @@ recurrence_min_answered_episode_seconds=60
 # define. The `env_var_contract` tests of each service hold these lists to the
 # loaders. The `wallet_serving` settings configure this entrypoint and reach
 # no process.
-ingest_config_paths="deployment network ops node node_fallbacks security ingest_control ingest retention storage.path storage.canonical storage.materialized_views storage.raw_blob_policy"
-projector_config_paths="deployment network ops security ingest_control projector projector_control storage.canonical_path storage.canonical_secondary_path storage.canonical storage.raw_blob_policy wallet.path wallet.rocksdb"
-query_config_paths="deployment network ops node node_fallbacks security ingest_control query wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
-compat_config_paths="deployment network ops node node_fallbacks security ingest_control compat wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
+ingest_config_paths="deployment network ops node node_fallbacks security ingest_control ingest retention storage.data_dir storage.path storage.canonical storage.materialized_views storage.full_blocks storage.raw_blob_policy"
+projector_config_paths="deployment network ops security ingest_control projector projector_control storage.data_dir storage.canonical_path storage.canonical_secondary_path storage.canonical storage.full_blocks storage.raw_blob_policy wallet.path wallet.rocksdb"
+query_config_paths="deployment network ops node node_fallbacks security ingest_control query wallet storage.data_dir storage.path storage.secondary_path storage.canonical storage.full_blocks storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
+compat_config_paths="deployment network ops node node_fallbacks security ingest_control compat wallet storage.data_dir storage.path storage.secondary_path storage.canonical storage.full_blocks storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
 entrypoint_config_paths="wallet_serving.canonical_construction_deadline_seconds wallet_serving.wallet_construction_deadline_seconds wallet_serving.lightwalletd"
 
 ingest_ops_addr="127.0.0.1:9105"

@@ -111,7 +111,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Coordinates the [deployment profile](#deployment-profiles).",
+        description: "Coordinates the consumer preset (`light-wallet`, `wallet`, or `explorer`; defaults to `wallet` when configuring a preset; deprecated `wallet-archive` aliases `wallet` with `storage.full_blocks = true`). Combine with `ZINDER_STORAGE__FULL_BLOCKS=true` to retain full raw blocks. See [deployment profiles](#deployment-profiles).",
     },
     EnvVarDoc {
         name: "ZINDER_NETWORK__NAME",
@@ -169,31 +169,47 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "PEM CA bundle that verifies the indexer's server certificate instead of the \
-                      system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Read \
-                      at startup and whenever an indexer stream reconnects.",
+        description: "Path to the PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`. Read at startup and whenever an indexer stream reconnects.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM",
+        toml_path: "node.indexer_tls.ca_cert_pem",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: true,
+        description: "Inline PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`. Redacted in `--print-config` and structured logs.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH",
         toml_path: "node.indexer_tls.client_cert_path",
         used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH is set"),
+        requirement: Requirement::ConditionalOn("indexer client key is configured"),
         sensitive: false,
-        description: "PEM client certificate chain presented to an indexer that requires mutual \
-                      TLS. Set together with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`.",
+        description: "Path to the PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with a client private key. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM",
+        toml_path: "node.indexer_tls.client_cert_pem",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::ConditionalOn("indexer client key is configured"),
+        sensitive: true,
+        description: "Inline PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with a client private key. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`. Redacted in `--print-config` and structured logs.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
         toml_path: "node.indexer_tls.client_key_path",
         used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn(
-            "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH is set",
-        ),
+        requirement: Requirement::ConditionalOn("indexer client certificate is configured"),
         sensitive: false,
-        description: "Path to the PEM private key for the indexer client certificate. The path is \
-                      shown in `--print-config`; the key is read at startup and whenever an \
-                      indexer stream reconnects. The `*_PEM` variables that the single-volume \
-                      image entrypoints convert into these files are refused by the binaries.",
+        description: "Path to the PEM private key for the indexer client certificate. The path is shown in `--print-config`; the key is read at startup and whenever an indexer stream reconnects. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
+        toml_path: "node.indexer_tls.client_key_pem",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::ConditionalOn("indexer client certificate is configured"),
+        sensitive: true,
+        description: "Inline PEM private key for the indexer client certificate. Mutually exclusive with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`. Redacted in `--print-config` and structured logs.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_TLS__SERVER_NAME",
@@ -439,27 +455,51 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file.",
+        description: "Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`, for fallback endpoint `<N>`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PEM",
+        toml_path: "node_fallbacks.<N>.indexer_tls.ca_cert_pem",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: true,
+        description: "Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`, for fallback endpoint `<N>`.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH",
         toml_path: "node_fallbacks.<N>.indexer_tls.client_cert_path",
         used_by: &["zinder-ingest"],
-        requirement: Requirement::ConditionalOn(
-            "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH is set",
-        ),
+        requirement: Requirement::ConditionalOn("fallback indexer client key is configured"),
         sensitive: false,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file.",
+        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, for fallback endpoint `<N>`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PEM",
+        toml_path: "node_fallbacks.<N>.indexer_tls.client_cert_pem",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::ConditionalOn("fallback indexer client key is configured"),
+        sensitive: true,
+        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`, for fallback endpoint `<N>`.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH",
         toml_path: "node_fallbacks.<N>.indexer_tls.client_key_path",
         used_by: &["zinder-ingest"],
         requirement: Requirement::ConditionalOn(
-            "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH is set",
+            "fallback indexer client certificate is configured",
         ),
         sensitive: false,
-        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file.",
+        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`, for fallback endpoint `<N>`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PEM",
+        toml_path: "node_fallbacks.<N>.indexer_tls.client_key_pem",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::ConditionalOn(
+            "fallback indexer client certificate is configured",
+        ),
+        sensitive: true,
+        description: "Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`, for fallback endpoint `<N>`.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__SERVER_NAME",
@@ -719,10 +759,20 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::ConditionalOn("ingest enforces auth"),
         sensitive: false,
-        description: "Path to the shared-secret bearer token the IngestControl endpoint enforces \
-                      on every request (ADR-0011). The writer reads it to verify; the readers \
-                      read the same file to present. File-only by policy; inline secrets are \
-                      rejected at config load.",
+        description: "Path to the shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0011). Mutually exclusive with `ZINDER_INGEST_CONTROL__BEARER_TOKEN`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST_CONTROL__BEARER_TOKEN",
+        toml_path: "ingest_control.bearer_token",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
+        requirement: Requirement::ConditionalOn("ingest enforces auth"),
+        sensitive: true,
+        description: "Inline shared-secret bearer token the IngestControl endpoint enforces on every request (ADR-0011). Mutually exclusive with `ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST_CONTROL__CHECKPOINT_STAGING_ROOT",
@@ -735,6 +785,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       canonical checkpoint at `<root>/<candidate-id>/canonical.rocksdb`; \
                       production mounts this path from a dedicated staging volume into ingest \
                       and projector only, never query or compatibility. Defaults to \
+                      `<storage.data_dir>/checkpoints` when `storage.data_dir` is set, or \
                       `/var/lib/zinder/checkpoints`.",
     },
     EnvVarDoc {
@@ -743,10 +794,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::ConditionalOn("canonical checkpoint capture is enabled"),
         sensitive: false,
-        description: "Path to the separate method-level token required by \
-                      CanonicalControl.CreateOwnerCheckpoint and ReadmitOwnerCheckpoint. Mount \
-                      this file only into ingest and projector; query and compatibility must not \
-                      receive it.",
+        description: "Path to the separate method-level token required by CanonicalControl.CreateOwnerCheckpoint and ReadmitOwnerCheckpoint. Mutually exclusive with `ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN",
+        toml_path: "ingest_control.checkpoint_bearer_token",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::ConditionalOn("canonical checkpoint capture is enabled"),
+        sensitive: true,
+        description: "Inline separate method-level token required by CanonicalControl.CreateOwnerCheckpoint and ReadmitOwnerCheckpoint. Mutually exclusive with `ZINDER_INGEST_CONTROL__CHECKPOINT_BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR_CONTROL__LISTEN_ADDR",
@@ -756,7 +812,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Loopback-only private ProjectorControl gRPC endpoint for coherent capture. \
                       Empty or unset disables it; an enabled endpoint requires \
-                      projector_control.bearer_token_path.",
+                      projector_control.bearer_token_path or projector_control.bearer_token.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH",
@@ -764,9 +820,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-projector"],
         requirement: Requirement::ConditionalOn("projector control is enabled"),
         sensitive: false,
-        description: "Path to the token required by ProjectorControl and presented as the \
-                      canonical checkpoint capability. Mount it only into projector and ingest; \
-                      query and compatibility never read it.",
+        description: "Path to the token required by ProjectorControl and presented as the canonical checkpoint capability. Mutually exclusive with `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN",
+        toml_path: "projector_control.bearer_token",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::ConditionalOn("projector control is enabled"),
+        sensitive: true,
+        description: "Inline token required by ProjectorControl and presented as the canonical checkpoint capability. Mutually exclusive with `ZINDER_PROJECTOR_CONTROL__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR_CONTROL__CHECKPOINT_STAGING_ROOT",
@@ -775,7 +837,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Shared candidate root whose realpath must match \
-                      ingest_control.checkpoint_staging_root. The projector sends only a SHA-256 \
+                      ingest_control.checkpoint_staging_root (defaults to \
+                      `<storage.data_dir>/checkpoints` when `storage.data_dir` is set, or \
+                      `/var/lib/zinder/checkpoints`). The projector sends only a SHA-256 \
                       root binding to canonical control, never a path.",
     },
     EnvVarDoc {
@@ -787,14 +851,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
-        requirement: Requirement::ConditionalOn(
-            "running zinder-query or zinder-compat-lightwalletd",
-        ),
+        requirement: Requirement::Optional,
         sensitive: false,
-        description: "Canonical RocksDB store directory. Defaults to `/var/lib/zinder/canonical` \
-                      for ingest and Explorer. Ingest writes the primary store here. Explorer \
-                      locates its materialized-view store beneath this directory. Query and \
-                      lightwalletd open the canonical store as a secondary.",
+        description: "Canonical RocksDB store directory. Defaults to `<storage.data_dir>/canonical` or `/var/lib/zinder/canonical` unless explicit secondary paths omit it. Ingest writes the primary store here; Explorer locates its materialized-view store beneath this directory; query and lightwalletd open the canonical store as a secondary.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__SECONDARY_PATH",
@@ -804,10 +863,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
-        requirement: Requirement::Required,
+        requirement: Requirement::Optional,
         sensitive: false,
-        description: "Process-unique RocksDB secondary metadata directory. Never share this path \
-                      across reader processes.",
+        description: "Process-unique RocksDB secondary metadata directory. Defaults under `storage.data_dir` (`<data_dir>/canonical-secondary/<service>` or `<data_dir>/explorer`) or `/var/lib/zinder` when all storage paths are omitted; required when explicit storage paths omit it. Never share this path across reader processes.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS",
@@ -856,8 +914,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-projector"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Canonical primary RocksDB path the projector opens as a read-only \
-                      secondary. Defaults to `/var/lib/zinder/canonical`.",
+        description: "Canonical primary RocksDB path the projector opens as a read-only secondary. Defaults to `<storage.data_dir>/canonical` or `/var/lib/zinder/canonical`.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL_SECONDARY_PATH",
@@ -865,9 +922,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-projector"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Projector-local RocksDB secondary metadata directory for canonical \
-                      reads. Defaults to `/var/lib/zinder/projector/canonical-secondary`; never \
-                      share it with another process.",
+        description: "Projector-local RocksDB secondary metadata directory for canonical reads. Defaults to `<storage.data_dir>/canonical-secondary/projector` when `storage.data_dir` is set, or `/var/lib/zinder/projector/canonical-secondary`; never share it with another process.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__PATH",
@@ -877,20 +932,17 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-query",
             "zinder-compat-lightwalletd",
         ],
-        requirement: Requirement::ConditionalOn("running a wallet-serving reader"),
+        requirement: Requirement::Optional,
         sensitive: false,
-        description: "Wallet-projection RocksDB primary path. The projector owns it as the \
-                      primary writer and defaults to `/var/lib/zinder/wallet`; both serving \
-                      runtimes open it as a read-only secondary and require an explicit path.",
+        description: "Wallet-projection RocksDB primary path. Defaults to `<storage.data_dir>/wallet` or `/var/lib/zinder/wallet` unless explicit storage paths omit it; the projector owns it as primary writer and serving runtimes open it as read-only secondary.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__SECONDARY_PATH",
         toml_path: "wallet.secondary_path",
         used_by: &["zinder-query", "zinder-compat-lightwalletd"],
-        requirement: Requirement::Required,
+        requirement: Requirement::Optional,
         sensitive: false,
-        description: "Wallet-serving reader root for immutable wallet-secondary generations. \
-                      Must be distinct from every primary and canonical-secondary path.",
+        description: "Wallet-serving reader root for immutable wallet-secondary generations. Defaults to `<storage.data_dir>/wallet-secondary/<service>` or `/var/lib/zinder/wallet-secondary/<service>` when all storage paths are omitted; required when explicit storage paths omit it. Must be distinct from every primary and canonical-secondary path.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES",
@@ -1545,11 +1597,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Requests the bundled Explorer materialized views. Defaults to `false`. \
-                      `true` requires genesis-complete canonical history or the authenticated \
-                      `checkpoint_height = 0`. Without a profile, `--print-config` shows the request. \
-                      The light-wallet profile disables the views and omits this field. \
-                      Admission evidence appears after the Explorer store opens successfully.",
+        description: "Requests the bundled Explorer materialized views. Defaults to `false`, or `true` under `deployment.profile = \"explorer\"`. `true` requires genesis-complete canonical history or the authenticated `checkpoint_height = 0`, and may be combined with `wallet` or `light-wallet`. `--print-config` shows the setting unless implied by `deployment.profile`. Admission evidence appears after the Explorer store opens successfully.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES",
@@ -1564,6 +1612,33 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       is available. Defaults to 10737418240 (10 GiB); `0` disables the guard.",
     },
     EnvVarDoc {
+        name: "ZINDER_STORAGE__DATA_DIR",
+        toml_path: "storage.data_dir",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+            "zinder-explorer",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Base storage directory from which unset canonical, wallet, and explorer paths are derived (`<data_dir>/canonical`, `<data_dir>/canonical-secondary/<service>`, `<data_dir>/wallet`, `<data_dir>/wallet-secondary/<service>`, and `<data_dir>/explorer`). Defaults to `/var/lib/zinder` when neither `storage.data_dir` nor explicit storage paths are configured. Explicit paths take precedence.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__FULL_BLOCKS",
+        toml_path: "storage.full_blocks",
+        used_by: &[
+            "zinder-ingest",
+            "zinder-projector",
+            "zinder-query",
+            "zinder-compat-lightwalletd",
+        ],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Opts any deployment preset (`light-wallet`, `wallet`, or `explorer`) or manual storage configuration into retaining full serialized blocks (`storage.raw_blob_policy = \"all\"`).",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__RAW_BLOB_POLICY",
         toml_path: "storage.raw_blob_policy",
         used_by: &[
@@ -1574,11 +1649,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "The raw-blob policy accepts `none`, `transactions`, or `all`. The ingest writer defaults to `none` for \
-                      explicit coverage and `transactions` for wallet-serving coverage. Wallet-serving ingest accepts \
-                      `none` with `light-wallet` or `wallet`. Projector, query, and compatibility readers use the value as \
-                      a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an \
-                      existing canonical store requires a rebuild.",
+        description: "The raw-blob policy accepts `none`, `transactions`, or `all`. The ingest writer defaults to `none` for explicit coverage and `transactions` for wallet-serving coverage. Consumer presets default to `none` (or `all` when `storage.full_blocks = true`). Projector, query, and compatibility readers use the value as a minimum retention requirement. Full-block serving requires `all`. Changing the retention of an existing canonical store requires a rebuild.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__REORG_WINDOW_BLOCKS",
@@ -1636,12 +1707,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         name: "ZINDER_PROJECTOR__BUILD_OWNER_HEX",
         toml_path: "projector.build_owner_hex",
         used_by: &["zinder-projector"],
-        requirement: Requirement::Required,
+        requirement: Requirement::Optional,
         sensitive: false,
-        description: "Stable 16-byte wallet-build lease owner encoded as exactly 32 hexadecimal \
-                      characters. A restart with the same value reclaims its own construction \
-                      leases immediately. Use a distinct value for each concurrently provisioned \
-                      lane.",
+        description: "Stable 16-byte wallet-build lease owner encoded as 32 hexadecimal characters. When unset, `zinder-projector` reads a persisted `<wallet_path>.build-owner` file if present, or generates a cryptographic random 16-byte owner once at startup (never during `--print-config`) and persists it atomically beside `wallet.path`.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__LEASE_DURATION_SECONDS",
@@ -2087,8 +2155,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Path to the shared-secret bearer token the ExplorerQuery endpoint enforces \
-                      on cross-service explorer-plane reads (ADR-0011).",
+        description: "Path to the shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0011). Mutually exclusive with `ZINDER_EXPLORER__BEARER_TOKEN`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_EXPLORER__BEARER_TOKEN",
+        toml_path: "explorer.bearer_token",
+        used_by: &["zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: true,
+        description: "Inline shared-secret bearer token the ExplorerQuery endpoint enforces on cross-service explorer-plane reads (ADR-0011). Mutually exclusive with `ZINDER_EXPLORER__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs.",
     },
     EnvVarDoc {
         name: "ZINDER_EXPLORER__LISTEN_ADDR",
@@ -2172,8 +2247,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-cipherscan"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Path to the shared-secret bearer token the adapter presents to both the \
-                      ExplorerQuery and WalletQuery endpoints (ADR-0011). Unset sends no token.",
+        description: "Path to the shared-secret bearer token the adapter presents to both the ExplorerQuery and WalletQuery endpoints (ADR-0011). Mutually exclusive with `ZINDER_CIPHERSCAN__BEARER_TOKEN`. Unset sends no token.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_CIPHERSCAN__BEARER_TOKEN",
+        toml_path: "cipherscan.bearer_token",
+        used_by: &["zinder-compat-cipherscan"],
+        requirement: Requirement::Optional,
+        sensitive: true,
+        description: "Inline shared-secret bearer token the adapter presents to both the ExplorerQuery and WalletQuery endpoints (ADR-0011). Mutually exclusive with `ZINDER_CIPHERSCAN__BEARER_TOKEN_PATH`. Redacted in `--print-config` and structured logs.",
     },
 ];
 

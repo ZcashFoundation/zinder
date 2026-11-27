@@ -93,8 +93,8 @@ pub use composed_readiness::{ComposedReadiness, ReadinessInput};
 pub use config::{
     ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeFallbacksToml,
     NodeHealthToml, NodeIndexerTlsToml, NodeToml, ZinderEnvironmentSource, duration_as_millis_u64,
-    load_bearer_token, parse_socket_addr, require_field, zinder_environment_source,
-    zinder_environment_source_from_map,
+    load_bearer_token, parse_socket_addr, require_field, resolve_optional_bearer_token,
+    zinder_environment_source, zinder_environment_source_from_map,
 };
 pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,
@@ -159,14 +159,17 @@ pub use sections::{
     ResolvedSecondaryStorage, RetentionSection, RetentionToml, RocksDbResourceBudgetSection,
     RocksDbResourceBudgetToml, RuntimeService, SecondaryStorageSection, SecondaryStorageToml,
     SecuritySection, SecurityToml, StorageRoleSection, StorageRoleToml,
-    defaults as section_defaults, resolve_allow_public_bind,
+    defaults as section_defaults, derive_canonical_path, derive_canonical_secondary_path,
+    derive_checkpoints_path, derive_explorer_secondary_path, derive_wallet_path,
+    derive_wallet_secondary_path, resolve_allow_public_bind,
     resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
     resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_reader,
-    resolve_ingest_control_writer, resolve_materialized_view_reader_rocksdb_budget,
+    resolve_ingest_control_writer, resolve_ingest_control_writer_with_data_dir,
+    resolve_manual_raw_blob_retention, resolve_materialized_view_reader_rocksdb_budget,
     resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr,
-    resolve_projector_control, resolve_retention, resolve_secondary_storage,
-    resolve_wallet_projection_reader_rocksdb_budget,
-    resolve_wallet_projection_writer_rocksdb_budget,
+    resolve_projector_control, resolve_projector_control_with_data_dir, resolve_retention,
+    resolve_secondary_storage, resolve_wallet_projection_reader_rocksdb_budget,
+    resolve_wallet_projection_writer_rocksdb_budget, validate_optional_data_dir,
 };
 pub use startup_phase::{StartupPhase, StartupPhaseGuard};
 pub use transport::{

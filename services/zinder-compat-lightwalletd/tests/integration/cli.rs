@@ -493,13 +493,73 @@ fn compatibility_serving_rejects_unapproved_aliases() -> eyre::Result<()> {
 }
 
 #[test]
-fn missing_storage_path_is_rejected_before_binding() -> eyre::Result<()> {
-    let output = zinder_compat_command()
+fn omitted_paths_default_from_data_dir_and_partial_explicit_paths_require_storage_path()
+-> eyre::Result<()> {
+    let default_output = zinder_compat_command()
         .args(["--print-config", "--network", "zcash-regtest"])
         .output()?;
+    assert!(default_output.status.success(), "{default_output:?}");
+    let default_stdout = String::from_utf8(default_output.stdout)?;
+    assert!(
+        default_stdout.contains("path = \"/var/lib/zinder/canonical\""),
+        "{default_stdout}"
+    );
+    assert!(
+        default_stdout.contains(
+            "secondary_path = \"/var/lib/zinder/canonical-secondary/compat-lightwalletd\""
+        ),
+        "{default_stdout}"
+    );
+    assert!(
+        default_stdout.contains("path = \"/var/lib/zinder/wallet\""),
+        "{default_stdout}"
+    );
+    assert!(
+        default_stdout
+            .contains("secondary_path = \"/var/lib/zinder/wallet-secondary/compat-lightwalletd\""),
+        "{default_stdout}"
+    );
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr)?;
+    let temporary = tempdir()?;
+    let derived_root = temporary.path().join("custom-root");
+    let derived_output = zinder_compat_command()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .env("ZINDER_STORAGE__DATA_DIR", &derived_root)
+        .output()?;
+    assert!(derived_output.status.success(), "{derived_output:?}");
+    let derived_stdout = String::from_utf8(derived_output.stdout)?;
+    assert!(
+        derived_stdout.contains(&format!(
+            "path = \"{}\"",
+            derived_root.join("canonical").display()
+        )),
+        "{derived_stdout}"
+    );
+    assert!(
+        derived_stdout.contains(&format!(
+            "secondary_path = \"{}\"",
+            derived_root
+                .join("canonical-secondary/compat-lightwalletd")
+                .display()
+        )),
+        "{derived_stdout}"
+    );
+
+    let partial_output = zinder_compat_command()
+        .args([
+            "--print-config",
+            "--network",
+            "zcash-regtest",
+            "--canonical-secondary-root",
+            path_str(&temporary.path().join("explicit-secondary"))?,
+            "--wallet-primary-path",
+            path_str(&temporary.path().join("explicit-wallet"))?,
+            "--wallet-secondary-root",
+            path_str(&temporary.path().join("explicit-wallet-secondary"))?,
+        ])
+        .output()?;
+    assert!(!partial_output.status.success());
+    let stderr = String::from_utf8(partial_output.stderr)?;
     assert!(
         stderr.contains("missing configuration field: storage.path"),
         "{stderr}"
@@ -1147,17 +1207,33 @@ fn nested_or_lexically_aliased_storage_roots_are_rejected_before_binding() -> ey
 }
 
 #[test]
-fn ingest_only_section_is_rejected() -> eyre::Result<()> {
+fn sibling_ingest_section_is_tolerated_and_unknown_section_is_rejected() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("compat-sibling.toml");
+    let config = compat_config_with_ingest_section_toml(
+        &tempdir.path().join("compat-sibling-store"),
+        &tempdir.path().join("compat-sibling-secondary"),
+        &tempdir.path().join("compat-sibling-wallet"),
+    )?;
+    fs::write(&config_path, &config)?;
+    let tolerated = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+    assert!(tolerated.status.success(), "{tolerated:?}");
+
     assert_compat_cli_rejects(
         |root| {
-            compat_config_with_ingest_section_toml(
-                &root.join("compat-node-source-store"),
-                &root.join("compat-node-source-secondary"),
-                &root.join("compat-node-source-wallet"),
-            )
+            Ok(format!(
+                "{}\n[injest]\nsource = \"zebra-json-rpc\"\n",
+                compat_config_toml(
+                    &root.join("compat-typo-store"),
+                    &root.join("compat-typo-secondary"),
+                    &root.join("compat-typo-wallet"),
+                )?
+            ))
         },
         &[],
-        "unknown field `ingest`",
+        "unknown field `injest`",
     )
 }
 
@@ -1385,9 +1461,10 @@ async fn wallet_profiles_refuse_checkpointed_canonical_history() -> eyre::Result
     let network = Network::ZcashRegtest;
     let control = IngestControlFixture::spawn(network).await?;
     let activations = sample_regtest_upgrade_activations();
-    for (profile, retention) in [
-        ("wallet", RawBlobRetention::None),
-        ("wallet-archive", RawBlobRetention::All),
+    for (profile, full_blocks, retention) in [
+        ("wallet", None, RawBlobRetention::None),
+        ("wallet", Some("true"), RawBlobRetention::All),
+        ("explorer", Some("true"), RawBlobRetention::All),
     ] {
         let chain = ChainFixture::new(network)
             .with_raw_blob_retention(retention)
@@ -1399,32 +1476,33 @@ async fn wallet_profiles_refuse_checkpointed_canonical_history() -> eyre::Result
             .reorg_policy()
             .reorg_window_blocks();
         let directory = tempfile::tempdir()?;
-        let output = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"))
-                .env_clear()
-                .env("ZINDER_DEPLOYMENT__PROFILE", profile)
-                .env("ZINDER_NETWORK__NAME", "zcash-regtest")
-                .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
-                .env(
-                    "ZINDER_STORAGE__SECONDARY_PATH",
-                    directory.path().join("canonical-secondary"),
-                )
-                .env("ZINDER_WALLET__PATH", directory.path().join("wallet"))
-                .env(
-                    "ZINDER_WALLET__SECONDARY_PATH",
-                    directory.path().join("wallet-secondary"),
-                )
-                .env("ZINDER_INGEST_CONTROL__ADDR", control.endpoint())
-                .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:1")
-                .env(
-                    "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
-                    reorg_window.to_string(),
-                )
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await??;
+        let mut command =
+            tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"));
+        command
+            .env_clear()
+            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+            .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+            .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+            .env(
+                "ZINDER_STORAGE__SECONDARY_PATH",
+                directory.path().join("canonical-secondary"),
+            )
+            .env("ZINDER_WALLET__PATH", directory.path().join("wallet"))
+            .env(
+                "ZINDER_WALLET__SECONDARY_PATH",
+                directory.path().join("wallet-secondary"),
+            )
+            .env("ZINDER_INGEST_CONTROL__ADDR", control.endpoint())
+            .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:1")
+            .env(
+                "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
+                reorg_window.to_string(),
+            )
+            .kill_on_drop(true);
+        if let Some(full_blocks) = full_blocks {
+            command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output()).await??;
         assert!(!output.status.success(), "{profile} unexpectedly started");
         let stderr = String::from_utf8(output.stderr)?;
         assert!(
@@ -1433,5 +1511,22 @@ async fn wallet_profiles_refuse_checkpointed_canonical_history() -> eyre::Result
         );
     }
     control.shutdown().await?;
+    Ok(())
+}
+
+#[test]
+fn inline_ingest_control_bearer_token_is_accepted_and_redacted() -> eyre::Result<()> {
+    let default_output = zinder_compat_command()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .env(
+            "ZINDER_INGEST_CONTROL__BEARER_TOKEN",
+            "compat-inline-secret",
+        )
+        .env("ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS", "100")
+        .output()?;
+    assert!(default_output.status.success(), "{default_output:?}");
+    let stdout = String::from_utf8(default_output.stdout)?;
+    assert!(stdout.contains("bearer_token = \"[REDACTED]\""), "{stdout}");
+    assert!(!stdout.contains("compat-inline-secret"), "{stdout}");
     Ok(())
 }

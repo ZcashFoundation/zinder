@@ -32,8 +32,8 @@ use zinder_proto::external::zebra_indexer_rpc::{
     indexer_server::{Indexer, IndexerServer},
 };
 use zinder_source::{
-    NodeIndexerTls, ZebraIndexerChainTipSource, ZebraIndexerSourceTarget, ZebraTransportError,
-    validate_zebra_indexer_endpoint,
+    IndexerTlsMaterial, NodeIndexerTls, ZebraIndexerChainTipSource, ZebraIndexerSourceTarget,
+    ZebraTransportError, validate_zebra_indexer_endpoint,
 };
 
 const TIP_HEIGHT: u32 = 42;
@@ -444,6 +444,71 @@ fn tls_settings_on_plaintext_url_are_rejected() -> Result<()> {
     assert!(matches!(
         validate_zebra_indexer_endpoint(&target),
         Err(ZebraTransportError::TlsConfigRejected(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn inline_mutual_tls_identity_streams_chain_tip_notifications() -> Result<()> {
+    let pki = TestPki::generate()?;
+    let indexer = start_mutual_tls_indexer(&pki).await?;
+    let tls = NodeIndexerTls::new()
+        .with_ca_cert_pem(fs::read_to_string(pki.ca_cert())?)
+        .with_client_identity_pem(
+            fs::read_to_string(pki.path("client.pem"))?,
+            fs::read_to_string(pki.path("client.key"))?,
+        );
+    let target = ZebraIndexerSourceTarget::new(indexer.endpoint_url.clone()).with_tls(tls);
+
+    validate_zebra_indexer_endpoint(&target)?;
+    assert_eq!(first_tip(target).await?, TIP_HEIGHT);
+    assert_eq!(indexer.served_calls.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_file_and_inline_client_identity_streams_chain_tip_notifications() -> Result<()> {
+    let pki = TestPki::generate()?;
+    let indexer = start_mutual_tls_indexer(&pki).await?;
+    let tls = NodeIndexerTls::new()
+        .with_ca_cert_path(pki.ca_cert())
+        .with_client_identity_sources(
+            IndexerTlsMaterial::File(pki.path("client.pem")),
+            IndexerTlsMaterial::Inline(fs::read_to_string(pki.path("client.key"))?.into()),
+        );
+    let target = ZebraIndexerSourceTarget::new(indexer.endpoint_url.clone()).with_tls(tls);
+
+    validate_zebra_indexer_endpoint(&target)?;
+    assert_eq!(first_tip(target).await?, TIP_HEIGHT);
+    Ok(())
+}
+
+#[test]
+fn invalid_inline_pem_is_rejected_without_leaking_material() -> Result<()> {
+    let pki = TestPki::generate()?;
+    let key_only = fs::read_to_string(pki.path("client.key"))?;
+    let bad_ca = ZebraIndexerSourceTarget::new("https://127.0.0.1:8230")
+        .with_tls(NodeIndexerTls::new().with_ca_cert_pem(key_only));
+    let error = validate_zebra_indexer_endpoint(&bad_ca).err();
+    assert!(matches!(
+        &error,
+        Some(ZebraTransportError::TlsConfigRejected(reason))
+            if reason.contains("contains no PEM certificate") && !reason.contains("PRIVATE KEY")
+    ));
+
+    let bad_key = ZebraIndexerSourceTarget::new("https://127.0.0.1:8230").with_tls(
+        NodeIndexerTls::new()
+            .with_ca_cert_path(pki.ca_cert())
+            .with_client_identity_pem(
+                fs::read_to_string(pki.path("client.pem"))?,
+                fs::read_to_string(pki.path("client.pem"))?,
+            ),
+    );
+    let key_error = validate_zebra_indexer_endpoint(&bad_key).err();
+    assert!(matches!(
+        &key_error,
+        Some(ZebraTransportError::TlsConfigRejected(reason))
+            if reason.contains("contains no PEM private key") && !reason.contains("CERTIFICATE")
     ));
     Ok(())
 }

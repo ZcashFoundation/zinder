@@ -1,4 +1,4 @@
-//! Shared-secret bearer-token authentication for private gRPC control planes.
+//! Shared-secret bearer-token authentication for private gRPC endpoints.
 //!
 //! The `IngestControl` gRPC service exposes mempool state and chain events
 //! to colocated projector and native query processes.
@@ -8,9 +8,9 @@
 //!
 //! - [`BearerToken`] wraps the secret string in [`secrecy::SecretString`]
 //!   so it never appears in logs, debug output, or panic messages.
-//! - The token is loaded from a file path at startup; environment-variable
-//!   sourcing is intentionally not supported because env vars leak into
-//!   process listings and debugger snapshots.
+//! - The token can be loaded from a file path at startup (`*_path`) or
+//!   injected inline (e.g. from `ZINDER_*` environment variables in 12-factor
+//!   deployments); `--print-config` redacts secret material to `[REDACTED]`.
 //! - Server-side validation uses constant-time comparison so a remote
 //!   attacker cannot extract the token through timing analysis.
 //! - [`BearerTokenServerInterceptor`] and

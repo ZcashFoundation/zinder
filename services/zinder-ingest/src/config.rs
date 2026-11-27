@@ -6,7 +6,7 @@
 use std::{
     net::SocketAddr,
     num::{NonZeroU32, NonZeroU64},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -26,17 +26,19 @@ use zinder_runtime::{
     IngestControlSection, IngestControlWriterToml, NetworkSection, NetworkToml, NodeFallbacksToml,
     NodeToml, OpsSection, OpsServerError, OpsToml, ResolvedIngestControlWriter, ResolvedRetention,
     RetentionSection, RetentionToml, RuntimeService, SecuritySection, SecurityToml,
-    StorageRoleSection, StorageRoleToml, duration_as_millis_u64, guard_optional_serving_bind,
-    require_field, resolve_allow_public_bind, resolve_canonical_writer_rocksdb_budget,
-    resolve_ingest_control_writer, resolve_materialized_view_writer_rocksdb_budget,
-    resolve_ops_listen_addr, resolve_retention, section_defaults::DEFAULT_CANONICAL_PATH,
+    StorageRoleSection, StorageRoleToml, derive_canonical_path, duration_as_millis_u64,
+    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
+    resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer_with_data_dir,
+    resolve_manual_raw_blob_retention, resolve_materialized_view_writer_rocksdb_budget,
+    resolve_ops_listen_addr, resolve_retention, section_defaults::DEFAULT_DATA_DIR,
+    validate_optional_data_dir,
 };
 use zinder_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
     MempoolSourceAdmissionLimits, NodeFallbackSections, NodeSection, NodeTarget,
     ZebraIndexerSourceTarget,
 };
-use zinder_store::TreeStateCheckpointSelection;
+use zinder_store::{RawBlobRetention, TreeStateCheckpointSelection};
 
 use crate::cli::parse::{parse_node_source, parse_poll_interval_ms, parse_reorg_window_blocks};
 
@@ -51,6 +53,8 @@ const DEFAULT_RAW_BLOB_POLICY: RawBlobPolicy = RawBlobPolicy::None;
 #[derive(Debug)]
 pub(crate) struct IngestCommandConfig {
     profile: Option<DeploymentProfile>,
+    pub(crate) storage_data_dir: Option<PathBuf>,
+    pub(crate) storage_full_blocks: Option<bool>,
     pub(crate) runtime_config: IngestRuntimeConfig,
     pub(crate) coverage: IngestCoverage,
     pub(crate) explorer_views: bool,
@@ -154,7 +158,6 @@ pub(crate) fn load_ingest_config(
     overrides: IngestConfigOverrides,
 ) -> Result<IngestCommandConfig, IngestConfigError> {
     let raw_config: IngestConfig = ConfigLoader::new()
-        .with_default("storage.path", DEFAULT_CANONICAL_PATH)?
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
             "ingest.explorer_views_min_free_bytes",
@@ -291,10 +294,12 @@ struct IngestConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct IngestPrimaryStorageSection {
+    data_dir: Option<PathBuf>,
     path: Option<PathBuf>,
     canonical: StorageRoleSection,
     materialized_views: StorageRoleSection,
     raw_blob_policy: Option<RawBlobPolicy>,
+    full_blocks: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -304,8 +309,8 @@ struct IngestSection {
     /// `zebra-indexer-grpc`).
     source: Option<String>,
     /// Whether the complete bundled Explorer materialized-view workload is
-    /// requested. Omitted values remain false for every coverage.
-    explorer_views: bool,
+    /// requested. Omitted values remain false unless `deployment.profile = "explorer"`.
+    explorer_views: Option<bool>,
     /// Available bytes on the store volume below which Explorer view replay
     /// pauses. Zero disables the guard.
     explorer_views_min_free_bytes: Option<u64>,
@@ -520,7 +525,7 @@ fn resolve_ingest_config(
         node_response_byte_range(&node_target, &node_fallbacks);
     let coverage = config.ingest.run_overrides.coverage.unwrap_or_default();
     let explorer_views = resolve_explorer_views(
-        config.ingest.explorer_views,
+        config.ingest.explorer_views.unwrap_or(false),
         config.ingest.run_overrides.checkpoint_height,
     )?;
     let mut densification = config.ingest.tree_state_densification;
@@ -548,7 +553,19 @@ fn resolve_ingest_config(
     let node_source = parse_node_source(&node_source_text)?;
     validate_node_source_targets(node_source, &node_target, &node_fallbacks)?;
     let configured_raw_blob_policy = config.storage.raw_blob_policy;
-    let storage_path = require_field(config.storage.path, "storage.path")?;
+    let storage_data_dir = validate_optional_data_dir(config.storage.data_dir)?;
+    let storage_full_blocks = config.storage.full_blocks;
+    let storage_path = if let Some(path) = config.storage.path {
+        if path.to_string_lossy().trim().is_empty() {
+            return Err(ConfigError::invalid("storage.path must not be blank").into());
+        }
+        path
+    } else {
+        let root = storage_data_dir
+            .as_deref()
+            .unwrap_or_else(|| Path::new(DEFAULT_DATA_DIR));
+        derive_canonical_path(root)
+    };
     let canonical_rocksdb_budget =
         resolve_canonical_writer_rocksdb_budget(config.storage.canonical.rocksdb)?;
     let materialized_view_rocksdb_budget =
@@ -668,6 +685,7 @@ fn resolve_ingest_config(
     let raw_blob_policy = resolve_raw_blob_policy(
         config.deployment.profile,
         coverage,
+        storage_full_blocks,
         configured_raw_blob_policy,
     )?;
     let explorer_views_min_free_bytes = require_field(
@@ -691,7 +709,10 @@ fn resolve_ingest_config(
         checkpoint_bearer_token: ingest_control_checkpoint_bearer_token,
         checkpoint_bearer_token_path: ingest_control_checkpoint_bearer_token_path,
         checkpoint_staging_root: ingest_control_checkpoint_staging_root,
-    } = resolve_ingest_control_writer(config.ingest_control)?;
+    } = resolve_ingest_control_writer_with_data_dir(
+        config.ingest_control,
+        storage_data_dir.as_deref(),
+    )?;
     let retention = resolve_retention(config.retention)?;
     let tree_state_verification =
         resolve_tree_state_verification(config.ingest.tree_state_verification)?;
@@ -750,6 +771,8 @@ fn resolve_ingest_config(
 
     Ok(IngestCommandConfig {
         profile: config.deployment.profile,
+        storage_data_dir,
+        storage_full_blocks,
         runtime_config,
         coverage,
         explorer_views,
@@ -850,34 +873,62 @@ fn guard_ingest_control_bearer_token(
 ) -> Result<(), ConfigError> {
     if listen_addr.is_some_and(|address| !address.ip().is_loopback()) && bearer_token.is_none() {
         return Err(ConfigError::invalid(
-            "ingest_control.listen_addr outside loopback requires ingest_control.bearer_token_path",
+            "ingest_control.listen_addr outside loopback requires ingest_control.bearer_token_path or ingest_control.bearer_token",
         ));
     }
     Ok(())
+}
+
+fn raw_blob_retention_from_policy(policy: RawBlobPolicy) -> RawBlobRetention {
+    match policy {
+        RawBlobPolicy::None => RawBlobRetention::None,
+        RawBlobPolicy::Transactions => RawBlobRetention::Transactions,
+        RawBlobPolicy::All => RawBlobRetention::All,
+    }
 }
 
 fn apply_deployment_profile(config: &mut IngestConfig) -> Result<(), ConfigError> {
     let Some(profile) = config.deployment.profile else {
         return Ok(());
     };
-    let raw_blob_policy = RawBlobPolicy::from(profile.raw_blob_retention());
+    let raw_blob_policy = RawBlobPolicy::from(
+        profile
+            .resolve_raw_blob_retention_with_full_blocks(
+                config.storage.full_blocks,
+                config
+                    .storage
+                    .raw_blob_policy
+                    .map(raw_blob_retention_from_policy),
+            )
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("remove conflicting overrides") {
+                    error
+                } else {
+                    ConfigError::invalid(format!("{message}; remove conflicting overrides"))
+                }
+            })?,
+    );
+    if profile == DeploymentProfile::Explorer && config.ingest.explorer_views == Some(false) {
+        return Err(ConfigError::invalid(
+            "deployment.profile = \"explorer\" requires ingest.explorer_views = true; remove ingest.explorer_views or choose a wallet profile",
+        ));
+    }
     let conflicting_coverage = config
         .ingest
         .run_overrides
         .coverage
         .is_some_and(|coverage| coverage != IngestCoverage::WalletServing);
-    let conflicting_retention = config
-        .storage
-        .raw_blob_policy
-        .is_some_and(|policy| policy != raw_blob_policy);
-    if config.ingest.explorer_views || conflicting_coverage || conflicting_retention {
+    if conflicting_coverage {
         return Err(ConfigError::invalid(format!(
-            "deployment.profile = \"{}\" requires wallet-serving coverage, raw_blob_policy = \"{}\", and Explorer views disabled. To select this profile, remove conflicting overrides",
+            "deployment.profile = \"{}\" requires wallet-serving coverage. To select this profile, remove conflicting ingest.run_overrides.coverage",
             profile.as_str(),
-            raw_blob_policy.as_kebab_case(),
         )));
     }
     config.ingest.run_overrides.coverage = Some(IngestCoverage::WalletServing);
+    if profile == DeploymentProfile::Explorer {
+        config.ingest.explorer_views.get_or_insert(true);
+    }
     config.storage.raw_blob_policy = Some(raw_blob_policy);
     Ok(())
 }
@@ -885,20 +936,22 @@ fn apply_deployment_profile(config: &mut IngestConfig) -> Result<(), ConfigError
 fn resolve_raw_blob_policy(
     profile: Option<DeploymentProfile>,
     coverage: IngestCoverage,
+    full_blocks: Option<bool>,
     configured_policy: Option<RawBlobPolicy>,
 ) -> Result<RawBlobPolicy, ConfigError> {
-    match (coverage, configured_policy) {
+    if profile.is_some() {
+        return Ok(configured_policy.unwrap_or(RawBlobPolicy::Transactions));
+    }
+    let resolved_retention = resolve_manual_raw_blob_retention(
+        full_blocks,
+        configured_policy.map(raw_blob_retention_from_policy),
+    )?;
+    let resolved_policy = resolved_retention.map(RawBlobPolicy::from);
+    match (coverage, resolved_policy) {
         (IngestCoverage::WalletServing, None) => Ok(RawBlobPolicy::Transactions),
-        (IngestCoverage::WalletServing, Some(RawBlobPolicy::None))
-            if !matches!(
-                profile,
-                Some(DeploymentProfile::LightWallet | DeploymentProfile::Wallet)
-            ) =>
-        {
-            Err(ConfigError::invalid(
-                "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
-            ))
-        }
+        (IngestCoverage::WalletServing, Some(RawBlobPolicy::None)) => Err(ConfigError::invalid(
+            "ingest.run_overrides.coverage = \"wallet-serving\" requires storage.raw_blob_policy = \"transactions\" or \"all\"; remove storage.raw_blob_policy to use \"transactions\"",
+        )),
         (_, Some(raw_blob_policy)) => Ok(raw_blob_policy),
         (_, None) => Ok(DEFAULT_RAW_BLOB_POLICY),
     }
@@ -935,7 +988,12 @@ impl RedactedIngestConfigToml {
             node: NodeToml::from_node_target(&runtime_config.node),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&runtime_config.node_fallbacks),
             storage: IngestStorageToml {
+                data_dir: config
+                    .storage_data_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 path: runtime_config.storage_path.display().to_string(),
+                full_blocks: config.storage_full_blocks,
                 raw_blob_policy: config
                     .profile
                     .is_none()
@@ -947,7 +1005,9 @@ impl RedactedIngestConfigToml {
             },
             ingest: IngestToml {
                 source: node_source_name(runtime_config.node_source),
-                explorer_views: config.profile.is_none().then_some(config.explorer_views),
+                explorer_views: (config.profile != Some(DeploymentProfile::Explorer)
+                    && (config.profile.is_none() || config.explorer_views))
+                    .then_some(config.explorer_views),
                 explorer_views_min_free_bytes: config.explorer_views_min_free_bytes,
                 reorg_window_blocks: runtime_config.reorg_window_blocks,
                 phase_classification: IngestPhaseClassificationToml {
@@ -1032,14 +1092,16 @@ impl RedactedIngestConfigToml {
                     max_rows_per_second: config.tree_state_verification.max_rows_per_second.get(),
                 },
             },
-            ingest_control: IngestControlWriterToml::from_resolved(
-                config.ingest_control_listen_addr,
-                config.ingest_control_bearer_token_path.as_deref(),
-                config
+            ingest_control: IngestControlWriterToml::from_writer(&ResolvedIngestControlWriter {
+                listen_addr: config.ingest_control_listen_addr,
+                bearer_token_path: config.ingest_control_bearer_token_path.clone(),
+                bearer_token: config.ingest_control_bearer_token.clone(),
+                checkpoint_bearer_token_path: config
                     .ingest_control_checkpoint_bearer_token_path
-                    .as_deref(),
-                &config.ingest_control_checkpoint_staging_root,
-            ),
+                    .clone(),
+                checkpoint_bearer_token: config.ingest_control_checkpoint_bearer_token.clone(),
+                checkpoint_staging_root: config.ingest_control_checkpoint_staging_root.clone(),
+            }),
             retention: RetentionToml::from_resolved(config.retention),
         }
     }
@@ -1108,7 +1170,11 @@ struct IngestMempoolToml {
 
 #[derive(Serialize)]
 struct IngestStorageToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_dir: Option<String>,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    full_blocks: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_blob_policy: Option<RawBlobPolicy>,
     canonical: StorageRoleToml,
@@ -1162,7 +1228,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("outside loopback requires ingest_control.bearer_token_path")
+                .contains("outside loopback requires ingest_control.bearer_token_path or ingest_control.bearer_token")
         );
         assert!(guard_ingest_control_bearer_token(
             Some(SocketAddr::from(([127, 0, 0, 1], 8240))),

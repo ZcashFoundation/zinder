@@ -11,11 +11,10 @@
 //!
 //! Secret hygiene is handled at emit time rather than at load time. Secrets
 //! pass through this loader unchanged; redaction happens in
-//! [`NodeAuthToml::from_node_auth`] (used by `--print-config`) and in the
-//! manual `Debug` impls on [`zinder_source::NodeAuth`] and
-//! [`crate::auth::BearerToken`]. Per-surface file-only constraints (see
-//! [ADR-0011](../../../docs/adrs/0011-ingest-control-transport-security.md))
-//! remain enforced at their respective config types.
+//! [`NodeAuthToml::from_node_auth`] and [`NodeIndexerTlsToml::from_node_indexer_tls`]
+//! (used by `--print-config`), in the `[REDACTED]` placeholders for inline bearer
+//! tokens, and in the manual `Debug` impls on [`zinder_source::NodeAuth`],
+//! [`zinder_source::IndexerTlsMaterial`], and [`crate::auth::BearerToken`].
 
 use std::{
     collections::HashMap,
@@ -33,7 +32,8 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_core::wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name};
 use zinder_source::{
-    NodeAuth, NodeConfigError, NodeHealthConfig, NodeIndexerTls, NodeTarget, redact_endpoint_url,
+    IndexerTlsMaterial, NodeAuth, NodeConfigError, NodeHealthConfig, NodeIndexerTls, NodeTarget,
+    redact_endpoint_url,
 };
 
 use crate::auth::{BearerToken, BearerTokenError};
@@ -44,31 +44,90 @@ use crate::sections::{
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
-const PRIMARY_NODE_ENV_PREFIX: &str = "ZINDER_NODE__";
-const FALLBACK_NODE_ENV_PREFIX: &str = "ZINDER_NODE_FALLBACKS__";
-
-/// Entrypoint-only indexer TLS variables that carry PEM text, each paired with
-/// the file-path variable a binary accepts instead.
-///
-/// Only the single-volume image entrypoints accept them; they turn the value
-/// into a file and pass the binary the matching `_PATH` variable instead. The
-/// list mirrors `indexer_tls_primary_pem_variables` in
-/// `deploy/materialize-indexer-tls`.
-/// The same names under `ZINDER_NODE_FALLBACKS__<N>__` are refused too.
-const ENTRYPOINT_PEM_ENV_VARS: &[(&str, &str)] = &[
-    (
-        "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM",
-        "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
-    ),
-    (
-        "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM",
-        "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH",
-    ),
-    (
-        "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
-        "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
-    ),
+const HISTORY_PUBLISHER_LEAF_PATHS: &[&str] = &[
+    "history_publisher.enabled",
+    "history_publisher.directory",
+    "history_publisher.signing_key",
+    "history_publisher.first_height",
+    "history_publisher.segment_blocks",
+    "history_publisher.workers",
+    "history_publisher.follow_interval_secs",
 ];
+
+const fn sibling_sections_for_service(service: RuntimeService) -> &'static [&'static str] {
+    match service {
+        RuntimeService::Ingest => &[
+            "projector",
+            "query",
+            "compat",
+            "explorer",
+            "cipherscan",
+            "projector_control",
+            "wallet",
+            "history_publisher",
+        ],
+        RuntimeService::Projector => &[
+            "ingest",
+            "query",
+            "compat",
+            "explorer",
+            "cipherscan",
+            "retention",
+            "history_publisher",
+            "node",
+            "node_fallbacks",
+        ],
+        RuntimeService::Query => &[
+            "ingest",
+            "projector",
+            "compat",
+            "explorer",
+            "cipherscan",
+            "projector_control",
+            "retention",
+            "history_publisher",
+        ],
+        RuntimeService::CompatLightwalletd => &[
+            "ingest",
+            "projector",
+            "query",
+            "explorer",
+            "cipherscan",
+            "projector_control",
+            "retention",
+            "history_publisher",
+        ],
+        RuntimeService::Explorer => &[
+            "deployment",
+            "ingest",
+            "projector",
+            "query",
+            "compat",
+            "cipherscan",
+            "ingest_control",
+            "projector_control",
+            "wallet",
+            "retention",
+            "history_publisher",
+        ],
+        RuntimeService::CompatCipherscan => &[
+            "deployment",
+            "storage",
+            "node",
+            "node_fallbacks",
+            "ingest",
+            "projector",
+            "query",
+            "compat",
+            "explorer",
+            "ingest_control",
+            "projector_control",
+            "wallet",
+            "retention",
+            "history_publisher",
+        ],
+    }
+}
 
 /// Error returned while resolving Zinder service configuration from defaults,
 /// file, environment, and CLI overrides.
@@ -133,23 +192,6 @@ pub enum ConfigError {
         /// Suggested corrected env var name. `None` when the heuristic
         /// cannot confidently propose an alternative.
         suggested_name: Option<String>,
-    },
-
-    /// The operator passed PEM text through an environment variable that
-    /// only the single-volume image entrypoints accept. Zinder binaries read
-    /// TLS material from files only.
-    #[error(
-        "environment variable `{original_name}` carries PEM text, which Zinder binaries do not \
-         read from the environment. Only the zinder-canonical-runtime, zinder-wallet-serving, and \
-         zinder-wallet-serving-explorer image entrypoints accept it, by writing the value to a \
-         file. Elsewhere, mount the PEM \
-         file and set `{path_name}` to its path."
-    )]
-    EntrypointOnlyEnvVar {
-        /// Original `ZINDER_…` name as set by the operator.
-        original_name: String,
-        /// The file-path variable the binary accepts instead.
-        path_name: String,
     },
 }
 
@@ -219,6 +261,7 @@ impl From<NodeConfigError> for ConfigError {
             NodeConfigError::IndexerTlsWithoutIndexerAddr
             | NodeConfigError::IndexerTlsRequiresHttps
             | NodeConfigError::IndexerTlsClientIdentityIncomplete
+            | NodeConfigError::IndexerTlsPathAndPemConflict { .. }
             | NodeConfigError::Fallback { .. }
             | NodeConfigError::FallbackPositionMissing { .. }
             | NodeConfigError::FallbacksWithoutPrimary => Self::invalid(error.to_string()),
@@ -264,29 +307,173 @@ pub fn zinder_environment_source_from_map<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
+    filtered_zinder_environment_source(collect_zinder_env_entries(env_iter), None)
+}
+
+fn collect_zinder_env_entries<I>(env_iter: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    env_iter
+        .into_iter()
+        .filter_map(|(variable, env_value)| {
+            if TEST_ENV_PREFIXES
+                .iter()
+                .any(|test_prefix| variable.starts_with(test_prefix))
+            {
+                return None;
+            }
+            let env_key = variable.strip_prefix(ENV_PREFIX)?;
+            Some((env_key.to_owned(), env_value))
+        })
+        .collect()
+}
+
+fn top_level_segment(config_path: &str) -> &str {
+    config_path
+        .split_once('.')
+        .map_or(config_path, |(section, _)| section)
+}
+
+fn is_positive_position_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('0')
+        && segment.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn config_path_matches_doc_pattern(config_path: &str, pattern: &str) -> bool {
+    let mut path_segments = config_path.split('.');
+    let mut pattern_segments = pattern.split('.');
+    loop {
+        match (path_segments.next(), pattern_segments.next()) {
+            (None, None) => return true,
+            (Some(actual), Some("<N>")) => {
+                if !is_positive_position_segment(actual) {
+                    return false;
+                }
+            }
+            (Some(actual), Some(expected)) => {
+                if actual != expected {
+                    return false;
+                }
+            }
+            (None, Some(_)) | (Some(_), None) => return false,
+        }
+    }
+}
+
+fn is_known_zinder_leaf_path(config_path: &str) -> bool {
+    HISTORY_PUBLISHER_LEAF_PATHS.contains(&config_path)
+        || crate::env_var_docs::ENVIRONMENT_VARIABLES
+            .iter()
+            .any(|doc| config_path_matches_doc_pattern(config_path, doc.toml_path))
+}
+
+fn is_unconsumed_shared_path(service: RuntimeService, config_path: &str) -> bool {
+    match service {
+        RuntimeService::Ingest => matches!(
+            config_path,
+            "storage.canonical_path"
+                | "storage.canonical_secondary_path"
+                | "storage.secondary_path"
+                | "storage.initial_catchup_timeout_ms"
+                | "storage.secondary_catchup_interval_ms"
+                | "storage.secondary_replica_lag_threshold_chain_epochs"
+                | "storage.serving_pair_staleness_ceiling_ms"
+        ),
+        RuntimeService::Projector => {
+            matches!(
+                config_path,
+                "storage.path"
+                    | "storage.secondary_path"
+                    | "storage.initial_catchup_timeout_ms"
+                    | "storage.secondary_catchup_interval_ms"
+                    | "storage.secondary_replica_lag_threshold_chain_epochs"
+                    | "storage.serving_pair_staleness_ceiling_ms"
+                    | "wallet.secondary_path"
+            ) || config_path.starts_with("storage.materialized_views.")
+        }
+        RuntimeService::Query | RuntimeService::CompatLightwalletd => {
+            matches!(
+                config_path,
+                "storage.canonical_path" | "storage.canonical_secondary_path"
+            ) || config_path.starts_with("storage.materialized_views.")
+        }
+        RuntimeService::Explorer => matches!(
+            config_path,
+            "storage.canonical_path"
+                | "storage.canonical_secondary_path"
+                | "storage.raw_blob_policy"
+                | "storage.serving_pair_staleness_ceiling_ms"
+        ),
+        RuntimeService::CompatCipherscan => false,
+    }
+}
+
+fn is_unconsumed_known_path_for_service(service: RuntimeService, config_path: &str) -> bool {
+    if !is_known_zinder_leaf_path(config_path) {
+        return false;
+    }
+    sibling_sections_for_service(service).contains(&top_level_segment(config_path))
+        || is_unconsumed_shared_path(service, config_path)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut previous_row: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current_row = vec![0_usize; right_chars.len() + 1];
+    for (left_idx, left_char) in left.chars().enumerate() {
+        current_row[0] = left_idx + 1;
+        for (right_idx, right_char) in right_chars.iter().enumerate() {
+            let cost = usize::from(left_char != *right_char);
+            current_row[right_idx + 1] = (current_row[right_idx] + 1)
+                .min(previous_row[right_idx + 1] + 1)
+                .min(previous_row[right_idx] + cost);
+        }
+        std::mem::swap(&mut previous_row, &mut current_row);
+    }
+    previous_row[right_chars.len()]
+}
+
+fn suggest_known_env_var(rejected_key: &str) -> Option<String> {
+    let section = top_level_segment(rejected_key);
+    crate::env_var_docs::ENVIRONMENT_VARIABLES
+        .iter()
+        .filter(|doc| top_level_segment(doc.toml_path) == section)
+        .filter_map(|doc| {
+            let distance = edit_distance(rejected_key, doc.toml_path);
+            (distance <= 3).then_some((distance, doc.name))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, name)| name.to_owned())
+}
+
+fn filtered_zinder_environment_source(
+    entries: Vec<(String, String)>,
+    service: Option<RuntimeService>,
+) -> Result<ZinderEnvironmentSource, ConfigError> {
     let mut filtered_env = HashMap::new();
     let mut reverse_index = HashMap::new();
 
-    for (variable, env_value) in env_iter {
-        if TEST_ENV_PREFIXES
-            .iter()
-            .any(|test_prefix| variable.starts_with(test_prefix))
-        {
-            continue;
+    for (env_key, env_value) in entries {
+        let config_key = env_key_to_config_key(&env_key);
+        let original_name = format!("{ENV_PREFIX}{env_key}");
+        if let Some(runtime_service) = service {
+            if is_unconsumed_known_path_for_service(runtime_service, &config_key) {
+                continue;
+            }
+            if sibling_sections_for_service(runtime_service)
+                .contains(&top_level_segment(&config_key))
+            {
+                return Err(ConfigError::RejectedEnvVar {
+                    original_name,
+                    suggested_name: suggest_known_env_var(&config_key),
+                    rejected_key: config_key,
+                });
+            }
         }
-
-        let Some(env_key) = variable.strip_prefix(ENV_PREFIX) else {
-            continue;
-        };
-        if let Some(path_name) = entrypoint_pem_path_name(&variable) {
-            return Err(ConfigError::EntrypointOnlyEnvVar {
-                original_name: variable,
-                path_name,
-            });
-        }
-
-        reverse_index.insert(env_key_to_config_key(env_key), variable.clone());
-        filtered_env.insert(env_key.to_owned(), env_value);
+        reverse_index.insert(config_key, original_name);
+        filtered_env.insert(env_key, env_value);
     }
 
     let source = Environment::default()
@@ -298,37 +485,6 @@ where
         source,
         reverse_index,
     })
-}
-
-/// Returns the `_PATH` variable that replaces `variable` when `variable` is an
-/// entrypoint-only indexer TLS PEM variable, of `[node]` or of a
-/// `[node_fallbacks.N]` table.
-fn entrypoint_pem_path_name(variable: &str) -> Option<String> {
-    if let Some((_, path_name)) = ENTRYPOINT_PEM_ENV_VARS
-        .iter()
-        .find(|(pem_name, _)| *pem_name == variable)
-    {
-        return Some((*path_name).to_owned());
-    }
-    let (position, node_variable_suffix) = variable
-        .strip_prefix(FALLBACK_NODE_ENV_PREFIX)?
-        .split_once("__")?;
-    if position.is_empty() || !position.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let primary_name = format!("{PRIMARY_NODE_ENV_PREFIX}{node_variable_suffix}");
-    let primary_path_name = entrypoint_pem_path_name_of_primary(&primary_name)?;
-    let path_suffix = primary_path_name.strip_prefix(PRIMARY_NODE_ENV_PREFIX)?;
-    Some(format!(
-        "{FALLBACK_NODE_ENV_PREFIX}{position}__{path_suffix}"
-    ))
-}
-
-fn entrypoint_pem_path_name_of_primary(variable: &str) -> Option<&'static str> {
-    ENTRYPOINT_PEM_ENV_VARS
-        .iter()
-        .find(|(pem_name, _)| *pem_name == variable)
-        .map(|(_, path_name)| *path_name)
 }
 
 /// Mirrors how `config-rs` transforms an env-var key (post-`ZINDER_`
@@ -380,9 +536,30 @@ pub fn parse_socket_addr(field: &str, text: &str) -> Result<SocketAddr, ConfigEr
 /// Returns `Ok(None)` when no path is supplied, so callers can express the
 /// "optional secret" shape without branching on the inner result.
 pub fn load_bearer_token(path: Option<&Path>) -> Result<Option<BearerToken>, ConfigError> {
-    path.map(BearerToken::from_file)
-        .transpose()
-        .map_err(|source: BearerTokenError| ConfigError::invalid(source.to_string()))
+    resolve_optional_bearer_token(path, None, "bearer_token_path", "bearer_token")
+}
+
+/// Resolves an optional [`BearerToken`] from either a file path (`*_path`) or
+/// an inline secret (`*`), rejecting simultaneous use of both.
+pub fn resolve_optional_bearer_token(
+    path: Option<&Path>,
+    inline: Option<&str>,
+    path_field: &str,
+    inline_field: &str,
+) -> Result<Option<BearerToken>, ConfigError> {
+    match (path, inline) {
+        (Some(_), Some(_)) => Err(ConfigError::invalid(format!(
+            "{path_field} and {inline_field} are mutually exclusive"
+        ))),
+        (Some(file_path), None) => BearerToken::from_file(file_path)
+            .map(Some)
+            .map_err(|source: BearerTokenError| ConfigError::invalid(source.to_string())),
+        (None, Some(secret_text)) => secret_text
+            .parse::<BearerToken>()
+            .map(Some)
+            .map_err(|source: BearerTokenError| ConfigError::invalid(source.to_string())),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Raw `[network]` config section shared by every Zinder service binary.
@@ -406,6 +583,11 @@ impl NetworkSection {
     }
 }
 
+enum LoaderSource {
+    File(PathBuf),
+    Env(Vec<(String, String)>),
+}
+
 /// Fluent layered configuration loader.
 ///
 /// Encapsulates the canonical Zinder precedence: `defaults -> file ->
@@ -416,7 +598,8 @@ impl NetworkSection {
 #[must_use]
 pub struct ConfigLoader {
     builder: ConfigBuilder<DefaultState>,
-    env_reverse_index: Option<HashMap<String, String>>,
+    sources: Vec<LoaderSource>,
+    service: Option<RuntimeService>,
 }
 
 impl ConfigLoader {
@@ -424,8 +607,16 @@ impl ConfigLoader {
     pub fn new() -> Self {
         Self {
             builder: Config::builder(),
-            env_reverse_index: None,
+            sources: Vec::new(),
+            service: None,
         }
+    }
+
+    /// Configures known-sibling-section tolerance for `service` without
+    /// altering `[ops]` defaults.
+    pub fn with_service_sibling_tolerance(mut self, service: RuntimeService) -> Self {
+        self.service = Some(service);
+        self
     }
 
     /// Records a default for `key`. Defaults sit at the lowest precedence
@@ -445,9 +636,7 @@ impl ConfigLoader {
     /// is unchanged; when `Some`, the file is required to exist.
     pub fn with_file(mut self, path: Option<PathBuf>) -> Self {
         if let Some(path) = path {
-            self.builder = self
-                .builder
-                .add_source(File::from(path).format(FileFormat::Toml).required(true));
+            self.sources.push(LoaderSource::File(path));
         }
         self
     }
@@ -455,13 +644,12 @@ impl ConfigLoader {
     /// Adds the standard Zinder environment source from the process
     /// environment.
     ///
-    /// Strips `ZINDER_TEST_*` prefixes, refuses to start on any renamed env
-    /// var, and stores the env-key reverse index used by [`Self::load`] to
-    /// translate serde "unknown field" errors back to the env var that
-    /// caused them.
+    /// Strips `ZINDER_TEST_*` prefixes and filters known sibling-component
+    /// sections when scoped to a [`RuntimeService`], while preserving the
+    /// env-key reverse index used by [`Self::load`] to translate serde
+    /// "unknown field" errors back to the env var that caused them.
     pub fn with_zinder_env(self) -> Result<Self, ConfigError> {
-        let env_source = zinder_environment_source()?;
-        Ok(self.attach_zinder_env_source(env_source))
+        self.with_zinder_env_from_map(std::env::vars())
     }
 
     /// Adds a Zinder environment source built from an explicit iterator of
@@ -470,32 +658,26 @@ impl ConfigLoader {
     /// Use in tests that want deterministic env input without mutating the
     /// global process environment. Behavior is otherwise identical to
     /// [`Self::with_zinder_env`].
-    pub fn with_zinder_env_from_map<I>(self, env_iter: I) -> Result<Self, ConfigError>
+    pub fn with_zinder_env_from_map<I>(mut self, env_iter: I) -> Result<Self, ConfigError>
     where
         I: IntoIterator<Item = (String, String)>,
     {
-        let env_source = zinder_environment_source_from_map(env_iter)?;
-        Ok(self.attach_zinder_env_source(env_source))
-    }
-
-    fn attach_zinder_env_source(mut self, env_source: ZinderEnvironmentSource) -> Self {
-        self.builder = self.builder.add_source(env_source.source);
-        self.env_reverse_index = Some(merge_reverse_index(
-            self.env_reverse_index,
-            env_source.reverse_index,
-        ));
-        self
+        self.sources
+            .push(LoaderSource::Env(collect_zinder_env_entries(env_iter)));
+        Ok(self)
     }
 
     /// Wires the shared `[ops]` section with the per-service default
-    /// operational listen address.
+    /// operational listen address, and enables known-sibling-section tolerance
+    /// for `service`.
     ///
     /// Every service binary calls this exactly once so the on-by-default
     /// policy applies uniformly: a binary started without any TOML or env
     /// override binds the loopback default for its service. Operators opt
     /// out by setting `ops.listen_addr = ""` (or
     /// `ZINDER_OPS__LISTEN_ADDR=` to the empty string).
-    pub fn with_ops_section(self, service: RuntimeService) -> Result<Self, ConfigError> {
+    pub fn with_ops_section(mut self, service: RuntimeService) -> Result<Self, ConfigError> {
+        self.service = Some(service);
         self.with_default("ops.listen_addr", default_ops_listen_addr(service))
     }
 
@@ -556,11 +738,24 @@ impl ConfigLoader {
     /// with the original `ZINDER_…` name and a suggested correction.
     /// Otherwise returns [`ConfigError::Load`] wrapping the underlying
     /// `config-rs` error.
-    pub fn load<T>(self) -> Result<T, ConfigError>
+    pub fn load<T>(mut self) -> Result<T, ConfigError>
     where
         T: DeserializeOwned,
     {
-        let reverse_index = self.env_reverse_index;
+        let mut reverse_index: Option<HashMap<String, String>> = None;
+        for source in self.sources {
+            match source {
+                LoaderSource::File(path) => {
+                    self.builder = add_filtered_toml_file(self.builder, path, self.service)?;
+                }
+                LoaderSource::Env(entries) => {
+                    let env_source = filtered_zinder_environment_source(entries, self.service)?;
+                    self.builder = self.builder.add_source(env_source.source);
+                    reverse_index =
+                        Some(merge_reverse_index(reverse_index, env_source.reverse_index));
+                }
+            }
+        }
         let built = self.builder.build().map_err(|inner| {
             ConfigError::from_inner_with_env_diagnostics(inner, reverse_index.as_ref())
         })?;
@@ -568,6 +763,70 @@ impl ConfigLoader {
             ConfigError::from_inner_with_env_diagnostics(inner, reverse_index.as_ref())
         })
     }
+}
+
+fn add_filtered_toml_file(
+    builder: ConfigBuilder<DefaultState>,
+    path: PathBuf,
+    service: Option<RuntimeService>,
+) -> Result<ConfigBuilder<DefaultState>, ConfigError> {
+    if let Some(runtime_service) = service
+        && let Ok(raw_toml) = std::fs::read_to_string(&path)
+        && let Ok(mut table) = toml::from_str::<toml::Table>(&raw_toml)
+    {
+        prune_toml_table(&mut table, "", runtime_service)?;
+        let filtered_toml = toml::to_string(&table)
+            .map_err(|source| ConfigError::load(InnerConfigError::Foreign(Box::new(source))))?;
+        return Ok(builder.add_source(File::from_str(&filtered_toml, FileFormat::Toml)));
+    }
+    Ok(builder.add_source(File::from(path).format(FileFormat::Toml).required(true)))
+}
+
+fn prune_toml_table(
+    table: &mut toml::Table,
+    prefix: &str,
+    service: RuntimeService,
+) -> Result<bool, ConfigError> {
+    let keys: Vec<String> = table.keys().cloned().collect();
+    let mut removed_any = false;
+    for key in keys {
+        let field_path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        let is_table = matches!(table.get(&key), Some(toml::Value::Table(_)));
+        if is_table {
+            let should_remove_empty =
+                if let Some(toml::Value::Table(subtable)) = table.get_mut(&key) {
+                    let child_removed = prune_toml_table(subtable, &field_path, service)?;
+                    subtable.is_empty()
+                        && (child_removed
+                            || sibling_sections_for_service(service).contains(&field_path.as_str()))
+                } else {
+                    false
+                };
+            if should_remove_empty {
+                let _removed = table.remove(&key);
+                removed_any = true;
+            }
+            continue;
+        }
+        if is_unconsumed_known_path_for_service(service, &field_path) {
+            let _removed = table.remove(&key);
+            removed_any = true;
+        } else if sibling_sections_for_service(service).contains(&top_level_segment(&field_path)) {
+            let suffix = if prefix.is_empty() {
+                String::new()
+            } else {
+                format!(" for key `{prefix}`")
+            };
+            return Err(ConfigError::load(InnerConfigError::Message(format!(
+                "unknown field `{key}`{suffix}"
+            ))));
+        }
+    }
+    Ok(removed_any)
 }
 
 fn merge_reverse_index(
@@ -688,19 +947,28 @@ impl NodeHealthToml {
 
 /// TOML projection of `[node.indexer_tls]` for `--print-config`.
 ///
-/// Shows paths and the server name. The files' contents are never loaded into
-/// configuration.
+/// File paths are rendered directly; inline PEM values are redacted to
+/// `[REDACTED]` so secret material is never emitted.
 #[derive(Debug, Serialize)]
 pub struct NodeIndexerTlsToml {
-    /// PEM CA bundle path, when set.
+    /// PEM CA bundle path, when configured from a file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_cert_path: Option<String>,
-    /// PEM client certificate chain path, when set.
+    /// Redacted placeholder when an inline PEM CA bundle is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_cert_pem: Option<&'static str>,
+    /// PEM client certificate chain path, when configured from a file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_cert_path: Option<String>,
-    /// PEM client private key path, when set.
+    /// Redacted placeholder when an inline PEM client certificate is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cert_pem: Option<&'static str>,
+    /// PEM client private key path, when configured from a file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_key_path: Option<String>,
+    /// Redacted placeholder when an inline PEM client private key is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_key_pem: Option<&'static str>,
     /// Name verified against the indexer certificate, when set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_name: Option<String>,
@@ -710,21 +978,30 @@ impl NodeIndexerTlsToml {
     /// Builds a [`NodeIndexerTlsToml`] from resolved [`NodeIndexerTls`].
     #[must_use]
     pub fn from_node_indexer_tls(tls: &NodeIndexerTls) -> Self {
+        let (ca_cert_path, ca_cert_pem) = split_tls_material_toml(tls.ca_cert.as_ref());
+        let (client_cert_path, client_cert_pem) =
+            split_tls_material_toml(tls.client_identity.as_ref().map(|identity| &identity.cert));
+        let (client_key_path, client_key_pem) =
+            split_tls_material_toml(tls.client_identity.as_ref().map(|identity| &identity.key));
         Self {
-            ca_cert_path: tls
-                .ca_cert_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            client_cert_path: tls
-                .client_identity
-                .as_ref()
-                .map(|identity| identity.cert_path.display().to_string()),
-            client_key_path: tls
-                .client_identity
-                .as_ref()
-                .map(|identity| identity.key_path.display().to_string()),
+            ca_cert_path,
+            ca_cert_pem,
+            client_cert_path,
+            client_cert_pem,
+            client_key_path,
+            client_key_pem,
             server_name: tls.server_name.clone(),
         }
+    }
+}
+
+fn split_tls_material_toml(
+    material: Option<&IndexerTlsMaterial>,
+) -> (Option<String>, Option<&'static str>) {
+    match material {
+        Some(IndexerTlsMaterial::File(path)) => (Some(path.display().to_string()), None),
+        Some(IndexerTlsMaterial::Inline(_)) => (None, Some("[REDACTED]")),
+        None => (None, None),
     }
 }
 
@@ -932,41 +1209,303 @@ mod tests {
     }
 
     #[test]
-    fn indexer_tls_pem_variables_name_the_accepting_images_and_path_variable() {
+    fn indexer_tls_inline_pems_reach_loader_and_print_config_redacts_them()
+    -> Result<(), ConfigError> {
         for material in ["CA_CERT", "CLIENT_CERT", "CLIENT_KEY"] {
-            let pem_value = "-----BEGIN PRIVATE KEY-----\nsecret-material\n";
-            let outcome = zinder_environment_source_from_map([(
-                format!("ZINDER_NODE__INDEXER_TLS__{material}_PEM"),
-                pem_value.to_owned(),
-            )]);
-
-            let expected_path_name = format!("ZINDER_NODE__INDEXER_TLS__{material}_PATH");
-            let error = outcome.err();
-            assert!(matches!(
-                &error,
-                Some(ConfigError::EntrypointOnlyEnvVar { path_name, .. })
-                    if *path_name == expected_path_name
-            ));
-            let message = error.map_or_default(|error| error.to_string());
-            assert!(message.contains("zinder-canonical-runtime"));
-            assert!(message.contains("zinder-wallet-serving"));
-            assert!(message.contains(&expected_path_name));
-            assert!(!message.contains("secret-material"));
+            let variable = format!("ZINDER_NODE__INDEXER_TLS__{material}_PEM");
+            let expected_key = format!("node.indexer_tls.{}_pem", material.to_ascii_lowercase());
+            let env_source = zinder_environment_source_from_map([(
+                variable.clone(),
+                "-----BEGIN PRIVATE KEY-----\nsecret-material\n".to_owned(),
+            )])?;
+            assert_eq!(env_source.reverse_index.get(&expected_key), Some(&variable));
         }
+        let target = NodeTarget::new(
+            Network::ZcashRegtest,
+            "http://127.0.0.1:18232".to_owned(),
+            NodeAuth::None,
+            Duration::from_secs(30),
+            std::num::NonZeroU64::MIN,
+        )
+        .with_indexer_grpc_addr(Some("https://zakura:8230".to_owned()))
+        .with_indexer_tls(Some(
+            NodeIndexerTls::new()
+                .with_ca_cert_pem("ca-secret-material")
+                .with_client_identity_pem("client-cert-secret", "client-key-secret"),
+        ));
+
+        let rendered = toml::to_string(&NodeToml::from_node_target(&target))
+            .map_err(|source| ConfigError::Render { source })?;
+        for secret in [
+            "ca-secret-material",
+            "client-cert-secret",
+            "client-key-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        assert!(
+            rendered.contains("ca_cert_pem = \"[REDACTED]\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("client_cert_pem = \"[REDACTED]\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("client_key_pem = \"[REDACTED]\""),
+            "{rendered}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn fallback_indexer_tls_pem_variables_name_their_path_variable() {
-        let outcome = zinder_environment_source_from_map([(
+    fn fallback_indexer_tls_pem_variables_reach_the_loader() -> Result<(), ConfigError> {
+        let env_source = zinder_environment_source_from_map([(
             "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PEM".to_owned(),
             "-----BEGIN PRIVATE KEY-----\nsecret-material\n".to_owned(),
-        )]);
+        )])?;
 
+        assert_eq!(
+            env_source
+                .reverse_index
+                .get("node_fallbacks.2.indexer_tls.client_key_pem")
+                .map(String::as_str),
+            Some("ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PEM")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_loader_tolerates_sibling_sections_while_rejecting_unknown_fields()
+    -> Result<(), ConfigError> {
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct ProbeConfig {
+            network: NetworkSection,
+            ops: crate::sections::OpsSection,
+        }
+
+        let dir = tempfile::tempdir().map_err(|err| ConfigError::invalid(err.to_string()))?;
+        let toml_path = dir.path().join("shared.toml");
+        std::fs::write(
+            &toml_path,
+            "[network]\nname = \"zcash-regtest\"\n[ingest]\nsource = \"zebra-json-rpc\"\n[explorer]\nlisten_addr = \"127.0.0.1:9068\"\n",
+        )
+        .map_err(|err| ConfigError::invalid(err.to_string()))?;
+
+        let loaded: ProbeConfig = ConfigLoader::new()
+            .with_ops_section(RuntimeService::CompatCipherscan)?
+            .with_file(Some(toml_path.clone()))
+            .with_zinder_env_from_map([
+                (
+                    "ZINDER_QUERY__LISTEN_ADDR".to_owned(),
+                    "127.0.0.1:9102".to_owned(),
+                ),
+                ("ZINDER_WALLET__PATH".to_owned(), "/tmp/wallet".to_owned()),
+                (
+                    "ZINDER_STORAGE__DATA_DIR".to_owned(),
+                    "/tmp/data".to_owned(),
+                ),
+            ])?
+            .load()?;
+        assert_eq!(loaded.network.name.as_deref(), Some("zcash-regtest"));
+
+        let typo = ConfigLoader::new()
+            .with_ops_section(RuntimeService::CompatCipherscan)?
+            .with_file(Some(toml_path))
+            .with_zinder_env_from_map([("ZINDER_INJEST__SOURCE".to_owned(), "x".to_owned())])?
+            .load::<ProbeConfig>();
+        assert!(typo.is_err());
+
+        let token_conflict = resolve_optional_bearer_token(
+            Some(Path::new("/tmp/token")),
+            Some("inline-token"),
+            "test.bearer_token_path",
+            "test.bearer_token",
+        );
+        assert!(token_conflict.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_sibling_typos_fail_closed_for_env_and_toml() -> Result<(), ConfigError> {
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct ProbeConfig {
+            network: NetworkSection,
+            ops: crate::sections::OpsSection,
+        }
+
+        let dir = tempfile::tempdir().map_err(|err| ConfigError::invalid(err.to_string()))?;
+        let nested_env_typo = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_zinder_env_from_map([(
+                "ZINDER_QUERY__LISTEN_ADRR".to_owned(),
+                "127.0.0.1:9102".to_owned(),
+            )])?
+            .load::<ProbeConfig>();
         assert!(matches!(
-            outcome.err(),
-            Some(ConfigError::EntrypointOnlyEnvVar { path_name, .. })
-                if path_name == "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PATH"
+            nested_env_typo,
+            Err(ConfigError::RejectedEnvVar {
+                ref original_name,
+                ref suggested_name,
+                ..
+            }) if original_name == "ZINDER_QUERY__LISTEN_ADRR"
+                && suggested_name.as_deref() == Some("ZINDER_QUERY__LISTEN_ADDR")
         ));
+
+        let nested_toml_typo_path = dir.path().join("nested_typo.toml");
+        std::fs::write(
+            &nested_toml_typo_path,
+            "[network]\nname = \"zcash-regtest\"\n[query]\nlisten_adrr = \"127.0.0.1:9102\"\n",
+        )
+        .map_err(|err| ConfigError::invalid(err.to_string()))?;
+        let nested_toml_typo = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_file(Some(nested_toml_typo_path))
+            .load::<ProbeConfig>();
+        assert!(nested_toml_typo.is_err());
+        Ok(())
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedIngestStorageProbe {
+        data_dir: Option<PathBuf>,
+        path: Option<PathBuf>,
+        raw_blob_policy: Option<String>,
+        full_blocks: Option<bool>,
+        canonical: crate::sections::StorageRoleSection,
+        materialized_views: crate::sections::StorageRoleSection,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedProjectorStorageProbe {
+        data_dir: Option<PathBuf>,
+        canonical_path: Option<PathBuf>,
+        canonical_secondary_path: Option<PathBuf>,
+        canonical: crate::sections::StorageRoleSection,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedQueryProbeConfig {
+        network: NetworkSection,
+        ops: crate::sections::OpsSection,
+        storage: crate::sections::CanonicalSecondaryStorageSection,
+        wallet: toml::Table,
+        query: toml::Table,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedProjectorProbeConfig {
+        network: NetworkSection,
+        ops: crate::sections::OpsSection,
+        storage: SharedProjectorStorageProbe,
+        wallet: toml::Table,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    struct SharedIngestProbeConfig {
+        network: NetworkSection,
+        ops: crate::sections::OpsSection,
+        storage: SharedIngestStorageProbe,
+    }
+
+    #[test]
+    fn shared_sections_tolerate_unconsumed_fields_across_services() -> Result<(), ConfigError> {
+        let dir = tempfile::tempdir().map_err(|err| ConfigError::invalid(err.to_string()))?;
+        let shared_toml_path = dir.path().join("all_services_shared.toml");
+        std::fs::write(
+            &shared_toml_path,
+            concat!(
+                "[network]\nname = \"zcash-regtest\"\n",
+                "[storage]\n",
+                "data_dir = \"/var/lib/zinder\"\n",
+                "path = \"/var/lib/zinder/canonical\"\n",
+                "canonical_path = \"/var/lib/zinder/canonical\"\n",
+                "secondary_path = \"/var/lib/zinder/sec\"\n",
+                "canonical_secondary_path = \"/var/lib/zinder/psec\"\n",
+                "materialized_views.rocksdb.block_cache_bytes = 67108864\n",
+                "[wallet]\n",
+                "path = \"/var/lib/zinder/wallet\"\n",
+                "secondary_path = \"/var/lib/zinder/wsec\"\n",
+                "[query]\nlisten_addr = \"127.0.0.1:9102\"\n",
+            ),
+        )
+        .map_err(|err| ConfigError::invalid(err.to_string()))?;
+
+        let shared_env = [
+            (
+                "ZINDER_STORAGE__CANONICAL_PATH".to_owned(),
+                "/env/canonical".to_owned(),
+            ),
+            (
+                "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES".to_owned(),
+                "128".to_owned(),
+            ),
+            (
+                "ZINDER_WALLET__SECONDARY_PATH".to_owned(),
+                "/env/wsec".to_owned(),
+            ),
+        ];
+        let loaded_query: SharedQueryProbeConfig = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Query)?
+            .with_file(Some(shared_toml_path.clone()))
+            .with_zinder_env_from_map(shared_env.clone())?
+            .load()?;
+        assert_eq!(loaded_query.network.name.as_deref(), Some("zcash-regtest"));
+
+        let loaded_projector: SharedProjectorProbeConfig = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Projector)?
+            .with_file(Some(shared_toml_path.clone()))
+            .with_zinder_env_from_map(shared_env.clone())?
+            .load()?;
+        assert_eq!(
+            loaded_projector.network.name.as_deref(),
+            Some("zcash-regtest")
+        );
+
+        let loaded_ingest: SharedIngestProbeConfig = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_file(Some(shared_toml_path))
+            .with_zinder_env_from_map(shared_env)?
+            .load()?;
+        assert_eq!(loaded_ingest.network.name.as_deref(), Some("zcash-regtest"));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_sections_reject_misspelled_fields() -> Result<(), ConfigError> {
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        struct SharedProbeConfig {
+            network: NetworkSection,
+            ops: crate::sections::OpsSection,
+            storage: crate::sections::CanonicalSecondaryStorageSection,
+        }
+
+        let shared_typo = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Query)?
+            .with_zinder_env_from_map([(
+                "ZINDER_STORAGE__CANONICL_PATH".to_owned(),
+                "/typo".to_owned(),
+            )])?
+            .load::<SharedProbeConfig>();
+        assert!(shared_typo.is_err());
+
+        let wallet_typo = ConfigLoader::new()
+            .with_ops_section(RuntimeService::Ingest)?
+            .with_zinder_env_from_map([(
+                "ZINDER_WALLET__SECONDRY_PATH".to_owned(),
+                "/typo".to_owned(),
+            )])?
+            .load::<SharedProbeConfig>();
+        assert!(wallet_typo.is_err());
+        Ok(())
     }
 
     #[test]

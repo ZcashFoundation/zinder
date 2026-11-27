@@ -216,13 +216,17 @@ fn print_config(cli: Cli) -> ExitCode {
 async fn run_projector(cli: Cli) -> Result<(), ProjectorError> {
     let load_config = StartupPhase::LoadConfig.start();
     let config_path = cli.config_path.clone();
-    let config = match config::load_projector_config(config_path, cli.into()) {
+    let mut config = match config::load_projector_config(config_path, cli.into()) {
         Ok(config) => config,
         Err(error) => {
             load_config.fail(&error);
             return Err(error);
         }
     };
+    if let Err(error) = config::ensure_build_owner(&mut config) {
+        load_config.fail(&error);
+        return Err(error);
+    }
     let ops_server = OpsServer {
         service_name: PROJECTOR_SERVICE_NAME,
         service_version: env!("CARGO_PKG_VERSION"),
@@ -435,8 +439,11 @@ async fn project_wallet(
     let initial_now = UnixTimestampMillis::now();
     let initial_expiry = lease_expiry(initial_now, config.lease_duration);
     let canonical_cursor = CanonicalEventCursor::at(canonical_ready.visible_event_sequence)?;
+    let build_owner = config.build_owner.ok_or_else(|| {
+        zinder_runtime::ConfigError::invalid("projector build owner must be resolved before build")
+    })?;
     let canonical_lease = CanonicalRetentionLease::new(
-        config.build_owner,
+        build_owner,
         canonical_ready.visible_epoch.value(),
         canonical_cursor.as_bytes().to_vec(),
         initial_expiry,
@@ -444,7 +451,7 @@ async fn project_wallet(
     let canonical_lease = canonical_control.acquire(canonical_lease).await?;
     let canonical_lease_for_recovery = canonical_lease.clone();
     let wallet_lease_request = WalletProjectionBuildLeaseRequest::new(
-        WalletProjectionBuildOwner::from_bytes(config.build_owner),
+        WalletProjectionBuildOwner::from_bytes(build_owner),
         expected_wallet_source,
         WalletProjectionRetainedEventAnchor::new(canonical_ready.visible_event_sequence),
         initial_expiry,
@@ -1338,6 +1345,11 @@ fn open_resumable_wallet(
             Ok(Some(wallet))
         }
         Err(zinder_wallet_rocksdb::RocksDbWalletError::StoreNotReady { .. }) => {
+            let build_owner = config.build_owner.ok_or_else(|| {
+                zinder_runtime::ConfigError::invalid(
+                    "projector build owner must be resolved before discarding unpublished wallet build",
+                )
+            })?;
             // A crashed build still holds its lease under this owner, which
             // may discard it at once; another owner must wait for the lease
             // to expire.
@@ -1347,7 +1359,7 @@ fn open_resumable_wallet(
                 config.wallet_rocksdb_budget,
             )?
             .discard_unpublished(
-                WalletProjectionBuildOwner::from_bytes(config.build_owner),
+                WalletProjectionBuildOwner::from_bytes(build_owner),
                 UnixTimestampMillis::now(),
             )?;
             tracing::info!(
@@ -1835,14 +1847,7 @@ fn open_canonical_secondary(
         &config.canonical_path,
         &config.canonical_secondary_path,
         config.network,
-        config.profile.map_or_else(
-            || {
-                zinder_store::CanonicalStoreRequirements::for_blob_retention(
-                    config.expected_canonical_raw_blob_retention,
-                )
-            },
-            zinder_runtime::DeploymentProfile::canonical_requirement,
-        ),
+        config.canonical_requirements(),
         reorg_policy,
         config.canonical_rocksdb_budget,
     )
@@ -2552,7 +2557,10 @@ fn wallet_row_count(counts: zinder_wallet_projection::WalletProjectionFamilyRowC
     reason = "the container runtime records the healthcheck's stderr as its failure reason"
 )]
 fn run_healthcheck(healthcheck: &OpsHealthcheckArgs, config_path: Option<&Path>) -> ExitCode {
-    match healthcheck.run(config_path, config::DEFAULT_OPS_LISTEN_ADDR) {
+    let default_listen_addr = zinder_runtime::section_defaults::default_ops_listen_addr(
+        zinder_runtime::RuntimeService::Projector,
+    );
+    match healthcheck.run(config_path, default_listen_addr) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{}: healthcheck failed: {error}", env!("CARGO_BIN_NAME"));
@@ -3921,6 +3929,54 @@ mod tests {
             message.contains(&missing_primary.display().to_string()),
             "{message}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn full_blocks_profiles_reject_canonical_store_without_block_blobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let canonical_path = temporary.path().join("canonical");
+        let reorg_policy = CanonicalReorgPolicy::new(3)?;
+        let _canonical = publish_test_canonical_store(&canonical_path, reorg_policy)?;
+
+        for profile in ["wallet", "explorer"] {
+            let secondary_path = temporary.path().join(format!("secondary-{profile}"));
+            let wallet_path = temporary.path().join(format!("wallet-{profile}"));
+            let cfg = super::config::load_projector_config_with_env(
+                None,
+                super::config::ProjectorConfigOverrides {
+                    network: Some("zcash-regtest".to_owned()),
+                    canonical_path: Some(canonical_path.clone()),
+                    canonical_secondary_path: Some(secondary_path),
+                    wallet_path: Some(wallet_path),
+                    reorg_window_blocks: Some(3),
+                    build_owner_hex: Some("00112233445566778899aabbccddeeff".to_owned()),
+                    lease_duration_seconds: Some(14_400),
+                    ..Default::default()
+                },
+                [
+                    ("ZINDER_DEPLOYMENT__PROFILE".to_owned(), profile.to_owned()),
+                    ("ZINDER_STORAGE__FULL_BLOCKS".to_owned(), "true".to_owned()),
+                ],
+            )?;
+            assert_eq!(
+                cfg.expected_canonical_raw_blob_retention,
+                zinder_store::RawBlobRetention::All
+            );
+            let Err(open_err) =
+                super::open_canonical_secondary(&cfg, reorg_policy, &CancellationToken::new())
+            else {
+                return Err(format!(
+                    "profile {profile} with full_blocks = true must reject store without block blobs"
+                )
+                .into());
+            };
+            assert!(matches!(
+                open_err,
+                ProjectorError::CanonicalSecondaryOpen { .. }
+            ));
+        }
         Ok(())
     }
 }

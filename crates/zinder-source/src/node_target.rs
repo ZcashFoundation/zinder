@@ -15,9 +15,12 @@
 //! | `ZINDER_NETWORK` | resolved separately (each binary owns its `[network]`) |
 //! | `ZINDER_NODE__JSON_RPC_ADDR` | [`NodeTarget::json_rpc_addr`] |
 //! | `ZINDER_NODE__INDEXER_GRPC_ADDR` | [`NodeTarget::indexer_grpc_addr`] |
-//! | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | [`NodeIndexerTls::ca_cert_path`] |
-//! | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | [`NodeIndexerClientIdentity::cert_path`] |
-//! | `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` | [`NodeIndexerClientIdentity::key_path`] |
+//! | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | [`NodeIndexerTls::ca_cert`] (file path) |
+//! | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM` | [`NodeIndexerTls::ca_cert`] (inline PEM) |
+//! | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | [`NodeIndexerClientIdentity::cert`] (file path) |
+//! | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM` | [`NodeIndexerClientIdentity::cert`] (inline PEM) |
+//! | `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` | [`NodeIndexerClientIdentity::key`] (file path) |
+//! | `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM` | [`NodeIndexerClientIdentity::key`] (inline PEM) |
 //! | `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` | [`NodeIndexerTls::server_name`] |
 //! | `ZINDER_NODE__AUTH__METHOD` | `none` / `basic` / `cookie` |
 //! | `ZINDER_NODE__AUTH__USERNAME` | Basic-auth username |
@@ -29,12 +32,13 @@
 //! | `ZINDER_NODE__MAX_CONCURRENT_REQUESTS` | [`NodeTarget::max_concurrent_requests`] |
 //!
 //! Cookie credentials may be supplied either by file path or inline (but not
-//! both). Inline credentials let `PaaS`-style deployments inject the secret
-//! directly through the environment without writing a shim that materializes
-//! a cookie file.
+//! both). Indexer TLS certificates and private keys may likewise be supplied
+//! either by file path or inline as PEM text (but not both for the same
+//! credential). Inline credentials let `PaaS`-style deployments inject the
+//! secret directly through the environment without writing a shim that
+//! materializes secret files.
 //!
-//! Indexer TLS material is accepted only as file paths. The indexer URL scheme
-//! decides whether the channel uses TLS; see
+//! The indexer URL scheme decides whether the channel uses TLS; see
 //! [ADR-0007](../../../docs/adrs/0007-node-failure-recovery-and-transport-policy.md).
 
 use std::{
@@ -45,7 +49,7 @@ use std::{
     time::Duration,
 };
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, MapAccess, Visitor},
@@ -359,10 +363,13 @@ impl NodeTarget {
             indexer_tls: NodeIndexerTlsSection {
                 ca_cert_path: read_optional("ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH")
                     .map(PathBuf::from),
+                ca_cert_pem: read_optional("ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM"),
                 client_cert_path: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH")
                     .map(PathBuf::from),
+                client_cert_pem: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM"),
                 client_key_path: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH")
                     .map(PathBuf::from),
+                client_key_pem: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM"),
                 server_name: read_optional("ZINDER_NODE__INDEXER_TLS__SERVER_NAME"),
             },
             request_timeout_secs: read_optional_parsed::<u64>(
@@ -518,35 +525,105 @@ impl<'de> Visitor<'de> for NodeFallbackSectionsVisitor {
 
 /// Raw `[node.indexer_tls]` config section.
 ///
-/// Every field holds a path or a name, never key material. Empty or
-/// whitespace-only fields count as absent, so an environment that sets a
-/// variable to the empty string leaves the field unset.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// Empty or whitespace-only fields count as absent, so an environment that sets a
+/// variable to the empty string leaves the field unset. Each credential accepts
+/// either a file path (`*_path`) or inline PEM text (`*_pem`), never both.
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeIndexerTlsSection {
-    /// PEM CA bundle that verifies the indexer's server certificate. Omit to
-    /// use the system roots.
+    /// PEM CA bundle file path that verifies the indexer's server certificate.
+    /// Omit both this and [`Self::ca_cert_pem`] to use the system roots.
     pub ca_cert_path: Option<PathBuf>,
-    /// PEM client certificate chain presented to the indexer. Set together
-    /// with [`Self::client_key_path`].
+    /// Inline PEM CA bundle that verifies the indexer's server certificate.
+    /// Mutually exclusive with [`Self::ca_cert_path`].
+    pub ca_cert_pem: Option<String>,
+    /// PEM client certificate chain file path presented to the indexer.
+    /// Mutually exclusive with [`Self::client_cert_pem`].
     pub client_cert_path: Option<PathBuf>,
-    /// PEM private key for [`Self::client_cert_path`].
+    /// Inline PEM client certificate chain presented to the indexer.
+    /// Mutually exclusive with [`Self::client_cert_path`].
+    pub client_cert_pem: Option<String>,
+    /// PEM private key file path for the client certificate.
+    /// Mutually exclusive with [`Self::client_key_pem`].
     pub client_key_path: Option<PathBuf>,
+    /// Inline PEM private key for the client certificate.
+    /// Mutually exclusive with [`Self::client_key_path`].
+    pub client_key_pem: Option<String>,
     /// Name verified against the indexer's certificate when it differs from
     /// the URL host.
     pub server_name: Option<String>,
 }
 
+impl fmt::Debug for NodeIndexerTlsSection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NodeIndexerTlsSection")
+            .field("ca_cert_path", &self.ca_cert_path)
+            .field(
+                "ca_cert_pem",
+                &self.ca_cert_pem.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("client_cert_path", &self.client_cert_path)
+            .field(
+                "client_cert_pem",
+                &self.client_cert_pem.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("client_key_path", &self.client_key_path)
+            .field(
+                "client_key_pem",
+                &self.client_key_pem.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("server_name", &self.server_name)
+            .finish()
+    }
+}
+
+/// Source of PEM-encoded TLS material for the Zebra indexer gRPC channel.
+#[derive(Clone)]
+pub enum IndexerTlsMaterial {
+    /// Path to a PEM file on disk, re-read on every connection setup.
+    File(PathBuf),
+    /// Inline PEM-encoded material kept in memory only and redacted in logs and
+    /// debug output.
+    Inline(SecretString),
+}
+
+impl fmt::Debug for IndexerTlsMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File(path) => formatter.debug_tuple("File").field(path).finish(),
+            Self::Inline(_) => formatter
+                .debug_tuple("Inline")
+                .field(&"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+impl PartialEq for IndexerTlsMaterial {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::File(left), Self::File(right)) => left == right,
+            (Self::Inline(left), Self::Inline(right)) => {
+                left.expose_secret() == right.expose_secret()
+            }
+            (Self::File(_), Self::Inline(_)) | (Self::Inline(_), Self::File(_)) => false,
+        }
+    }
+}
+
+impl Eq for IndexerTlsMaterial {}
+
 /// Resolved `[node.indexer_tls]` configuration.
 ///
-/// Holds file paths only. The transport reads the files each time it builds
-/// an indexer channel, so key bytes never live in configuration values.
+/// Supports either file paths (re-read on each channel build) or inline PEM
+/// secrets kept in memory with redacted `Debug` formatting.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NodeIndexerTls {
     /// PEM CA bundle that verifies the indexer's server certificate. `None`
     /// uses the system roots.
-    pub ca_cert_path: Option<PathBuf>,
+    pub ca_cert: Option<IndexerTlsMaterial>,
     /// Client identity presented to the indexer. `None` presents none.
     pub client_identity: Option<NodeIndexerClientIdentity>,
     /// Name verified against the indexer's certificate instead of the URL
@@ -566,7 +643,15 @@ impl NodeIndexerTls {
     /// instead of the system roots.
     #[must_use]
     pub fn with_ca_cert_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.ca_cert_path = Some(path.into());
+        self.ca_cert = Some(IndexerTlsMaterial::File(path.into()));
+        self
+    }
+
+    /// Verifies the indexer's certificate against an inline PEM CA bundle
+    /// instead of the system roots.
+    #[must_use]
+    pub fn with_ca_cert_pem(mut self, pem: impl Into<String>) -> Self {
+        self.ca_cert = Some(IndexerTlsMaterial::Inline(SecretString::from(pem.into())));
         self
     }
 
@@ -579,9 +664,35 @@ impl NodeIndexerTls {
         key_path: impl Into<PathBuf>,
     ) -> Self {
         self.client_identity = Some(NodeIndexerClientIdentity {
-            cert_path: cert_path.into(),
-            key_path: key_path.into(),
+            cert: IndexerTlsMaterial::File(cert_path.into()),
+            key: IndexerTlsMaterial::File(key_path.into()),
         });
+        self
+    }
+
+    /// Presents an inline PEM certificate chain and inline PEM private key.
+    #[must_use]
+    pub fn with_client_identity_pem(
+        mut self,
+        cert_pem: impl Into<String>,
+        key_pem: impl Into<String>,
+    ) -> Self {
+        self.client_identity = Some(NodeIndexerClientIdentity {
+            cert: IndexerTlsMaterial::Inline(SecretString::from(cert_pem.into())),
+            key: IndexerTlsMaterial::Inline(SecretString::from(key_pem.into())),
+        });
+        self
+    }
+
+    /// Presents a client certificate and private key from independent file or
+    /// inline sources.
+    #[must_use]
+    pub fn with_client_identity_sources(
+        mut self,
+        cert: IndexerTlsMaterial,
+        key: IndexerTlsMaterial,
+    ) -> Self {
+        self.client_identity = Some(NodeIndexerClientIdentity { cert, key });
         self
     }
 
@@ -594,14 +705,14 @@ impl NodeIndexerTls {
     }
 }
 
-/// Client certificate and key paths for indexer mutual TLS.
+/// Client certificate and key sources for indexer mutual TLS.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeIndexerClientIdentity {
     /// PEM client certificate chain, leaf first.
-    pub cert_path: PathBuf,
+    pub cert: IndexerTlsMaterial,
     /// PEM private key for the leaf certificate.
-    pub key_path: PathBuf,
+    pub key: IndexerTlsMaterial,
 }
 
 /// Raw `[node.health]` config section.
@@ -626,7 +737,7 @@ pub struct NodeHealthSection {
 }
 
 /// Raw `[node.auth]` config section.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeAuthSection {
     /// Auth method: `none`, `basic`, or `cookie`. Defaults to `none`.
@@ -641,6 +752,19 @@ pub struct NodeAuthSection {
     /// the secret as a configuration value. Mutually exclusive with
     /// [`Self::path`].
     pub cookie: Option<String>,
+}
+
+impl fmt::Debug for NodeAuthSection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NodeAuthSection")
+            .field("method", &self.method)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("path", &self.path)
+            .field("cookie", &self.cookie.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 /// Error returned while resolving node configuration.
@@ -687,11 +811,20 @@ pub enum NodeConfigError {
     )]
     IndexerTlsRequiresHttps,
 
-    /// Only one of the client certificate and client key paths is set.
+    /// Only one of the client certificate and client key credentials is set.
     #[error(
-        "node.indexer_tls.client_cert_path and node.indexer_tls.client_key_path must be set together"
+        "node.indexer_tls client certificate and client key (path or PEM) must be set together"
     )]
     IndexerTlsClientIdentityIncomplete,
+
+    /// Both `*_path` and `*_pem` were set for the same indexer TLS credential.
+    #[error(
+        "node.indexer_tls.{field}_path and node.indexer_tls.{field}_pem are mutually exclusive"
+    )]
+    IndexerTlsPathAndPemConflict {
+        /// Credential stem (`ca_cert`, `client_cert`, or `client_key`).
+        field: &'static str,
+    },
 
     /// A `[node_fallbacks.N]` table is invalid.
     #[error("[node_fallbacks.{position}] (fields as in [node]): {source}")]
@@ -771,19 +904,38 @@ fn resolve_node_health(
     }))
 }
 
+fn resolve_tls_material(
+    path: Option<PathBuf>,
+    pem: Option<String>,
+    field: &'static str,
+) -> Result<Option<IndexerTlsMaterial>, NodeConfigError> {
+    match (nonempty_path(path), nonempty_optional(pem)) {
+        (Some(_), Some(_)) => Err(NodeConfigError::IndexerTlsPathAndPemConflict { field }),
+        (Some(file_path), None) => Ok(Some(IndexerTlsMaterial::File(file_path))),
+        (None, Some(inline_pem)) => Ok(Some(IndexerTlsMaterial::Inline(SecretString::from(
+            inline_pem,
+        )))),
+        (None, None) => Ok(None),
+    }
+}
+
 fn resolve_node_indexer_tls(
     indexer_grpc_addr: Option<&str>,
     section: NodeIndexerTlsSection,
 ) -> Result<Option<NodeIndexerTls>, NodeConfigError> {
-    let ca_cert_path = nonempty_path(section.ca_cert_path);
-    let client_cert_path = nonempty_path(section.client_cert_path);
-    let client_key_path = nonempty_path(section.client_key_path);
+    let ca_cert = resolve_tls_material(section.ca_cert_path, section.ca_cert_pem, "ca_cert")?;
+    let client_cert = resolve_tls_material(
+        section.client_cert_path,
+        section.client_cert_pem,
+        "client_cert",
+    )?;
+    let client_key = resolve_tls_material(
+        section.client_key_path,
+        section.client_key_pem,
+        "client_key",
+    )?;
     let server_name = nonempty_optional(section.server_name);
-    if ca_cert_path.is_none()
-        && client_cert_path.is_none()
-        && client_key_path.is_none()
-        && server_name.is_none()
-    {
+    if ca_cert.is_none() && client_cert.is_none() && client_key.is_none() && server_name.is_none() {
         return Ok(None);
     }
 
@@ -792,11 +944,8 @@ fn resolve_node_indexer_tls(
     if !uses_tls_scheme(indexer_grpc_addr) {
         return Err(NodeConfigError::IndexerTlsRequiresHttps);
     }
-    let client_identity = match (client_cert_path, client_key_path) {
-        (Some(cert_path), Some(key_path)) => Some(NodeIndexerClientIdentity {
-            cert_path,
-            key_path,
-        }),
+    let client_identity = match (client_cert, client_key) {
+        (Some(cert), Some(key)) => Some(NodeIndexerClientIdentity { cert, key }),
         (None, None) => None,
         (Some(_), None) | (None, Some(_)) => {
             return Err(NodeConfigError::IndexerTlsClientIdentityIncomplete);
@@ -804,7 +953,7 @@ fn resolve_node_indexer_tls(
     };
 
     Ok(Some(NodeIndexerTls {
-        ca_cert_path,
+        ca_cert,
         client_identity,
         server_name,
     }))
@@ -1120,6 +1269,7 @@ mod tests {
             client_cert_path: Some(PathBuf::from("/run/secrets/indexer-client.pem")),
             client_key_path: Some(PathBuf::from("/run/secrets/indexer-client.key")),
             server_name: Some("zakura.internal".to_owned()),
+            ..NodeIndexerTlsSection::default()
         }
     }
 
@@ -1160,6 +1310,125 @@ mod tests {
                     .with_server_name("zakura.internal")
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tls_section_resolves_inline_pems_and_mixed_sources() -> Result<(), NodeConfigError> {
+        let section = NodeIndexerTlsSection {
+            ca_cert_pem: Some(
+                "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n".to_owned(),
+            ),
+            client_cert_path: Some(PathBuf::from("/run/secrets/indexer-client.pem")),
+            client_key_pem: Some(
+                "-----BEGIN PRIVATE KEY-----\nclient-key\n-----END PRIVATE KEY-----\n".to_owned(),
+            ),
+            server_name: Some("zakura.internal".to_owned()),
+            ..NodeIndexerTlsSection::default()
+        };
+        let target = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            indexer_tls_section(Some("https://zakura:8230"), section),
+        )?;
+
+        let expected = NodeIndexerTls::new()
+            .with_ca_cert_pem("-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n")
+            .with_client_identity_sources(
+                IndexerTlsMaterial::File(PathBuf::from("/run/secrets/indexer-client.pem")),
+                IndexerTlsMaterial::Inline(SecretString::from(
+                    "-----BEGIN PRIVATE KEY-----\nclient-key\n-----END PRIVATE KEY-----\n",
+                )),
+            )
+            .with_server_name("zakura.internal");
+        assert_eq!(target.indexer_tls, Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tls_rejects_simultaneous_path_and_pem_for_same_credential() {
+        for (conflict, expected_field) in [
+            (
+                NodeIndexerTlsSection {
+                    ca_cert_path: Some(PathBuf::from("/ca.pem")),
+                    ca_cert_pem: Some("-----BEGIN CERTIFICATE-----\nca\n".to_owned()),
+                    ..NodeIndexerTlsSection::default()
+                },
+                "ca_cert",
+            ),
+            (
+                NodeIndexerTlsSection {
+                    client_cert_path: Some(PathBuf::from("/client.pem")),
+                    client_cert_pem: Some("-----BEGIN CERTIFICATE-----\nclient\n".to_owned()),
+                    client_key_pem: Some("-----BEGIN PRIVATE KEY-----\nkey\n".to_owned()),
+                    ..NodeIndexerTlsSection::default()
+                },
+                "client_cert",
+            ),
+            (
+                NodeIndexerTlsSection {
+                    client_cert_pem: Some("-----BEGIN CERTIFICATE-----\nclient\n".to_owned()),
+                    client_key_path: Some(PathBuf::from("/client.key")),
+                    client_key_pem: Some("-----BEGIN PRIVATE KEY-----\nkey\n".to_owned()),
+                    ..NodeIndexerTlsSection::default()
+                },
+                "client_key",
+            ),
+        ] {
+            let outcome = NodeTarget::resolve(
+                Network::ZcashRegtest,
+                indexer_tls_section(Some("https://zakura:8230"), conflict),
+            );
+            assert!(matches!(
+                outcome,
+                Err(NodeConfigError::IndexerTlsPathAndPemConflict { field })
+                    if field == expected_field
+            ));
+        }
+    }
+
+    #[test]
+    fn debug_formatting_redacts_inline_pems_and_node_secrets() -> Result<(), NodeConfigError> {
+        let tls_section = NodeIndexerTlsSection {
+            ca_cert_pem: Some("ca-secret-pem".to_owned()),
+            client_cert_pem: Some("client-cert-secret".to_owned()),
+            client_key_pem: Some("client-key-secret".to_owned()),
+            server_name: Some("zakura.internal".to_owned()),
+            ..NodeIndexerTlsSection::default()
+        };
+        let auth_section = NodeAuthSection {
+            method: Some("basic".to_owned()),
+            username: Some("zebra".to_owned()),
+            password: Some("password-secret".to_owned()),
+            path: None,
+            cookie: Some("cookie-secret".to_owned()),
+        };
+        let section_debug = format!("{tls_section:?} {auth_section:?}");
+        for secret in [
+            "ca-secret-pem",
+            "client-cert-secret",
+            "client-key-secret",
+            "password-secret",
+            "cookie-secret",
+        ] {
+            assert!(!section_debug.contains(secret), "{section_debug}");
+        }
+        let target = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            indexer_tls_section(
+                Some("https://zakura:8230"),
+                NodeIndexerTlsSection {
+                    ca_cert_pem: Some("ca-secret-pem".to_owned()),
+                    client_cert_pem: Some("client-cert-secret".to_owned()),
+                    client_key_pem: Some("client-key-secret".to_owned()),
+                    ..NodeIndexerTlsSection::default()
+                },
+            ),
+        )?;
+        let target_debug = format!("{target:?}");
+        for secret in ["ca-secret-pem", "client-cert-secret", "client-key-secret"] {
+            assert!(!target_debug.contains(secret), "{target_debug}");
+        }
+        assert!(target_debug.contains("[REDACTED]"), "{target_debug}");
         Ok(())
     }
 
@@ -1230,8 +1499,11 @@ mod tests {
     fn blank_indexer_tls_fields_count_as_absent() -> Result<(), NodeConfigError> {
         let blank = NodeIndexerTlsSection {
             ca_cert_path: Some(PathBuf::new()),
+            ca_cert_pem: Some("   ".to_owned()),
             client_cert_path: Some(PathBuf::from("   ")),
+            client_cert_pem: Some(String::new()),
             client_key_path: Some(PathBuf::new()),
+            client_key_pem: Some(" \n ".to_owned()),
             server_name: Some(String::new()),
         };
 

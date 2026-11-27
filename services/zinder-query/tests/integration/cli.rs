@@ -357,16 +357,26 @@ fn forwarded_read_settings_default_and_are_bounded() -> eyre::Result<()> {
 fn wallet_profiles_render_without_injected_retention() -> eyre::Result<()> {
     let temporary = TempDir::new()?;
     let secondary = temporary.path().join("canonical-secondary");
-    for profile in ["wallet", "wallet-archive"] {
-        let output = query_command(&temporary, &secondary)
-            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
-            .output()?;
+    for (profile, full_blocks) in [
+        ("wallet", None),
+        ("wallet", Some("true")),
+        ("explorer", None),
+    ] {
+        let mut command = query_command(&temporary, &secondary);
+        command.env("ZINDER_DEPLOYMENT__PROFILE", profile);
+        if let Some(full_blocks) = full_blocks {
+            command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+        }
+        let output = command.output()?;
         assert!(output.status.success(), "{output:?}");
         let stdout = String::from_utf8(output.stdout)?;
         assert!(
             stdout.contains(&format!("profile = \"{profile}\"")),
             "{stdout}"
         );
+        if full_blocks == Some("true") {
+            assert!(stdout.contains("full_blocks = true"), "{stdout}");
+        }
         assert!(!stdout.contains("raw_blob_policy ="), "{stdout}");
         let conflict = query_command(&temporary, &secondary)
             .env("ZINDER_DEPLOYMENT__PROFILE", profile)
@@ -375,6 +385,47 @@ fn wallet_profiles_render_without_injected_retention() -> eyre::Result<()> {
         assert!(!conflict.status.success(), "{conflict:?}");
         assert!(String::from_utf8(conflict.stderr)?.contains("storage.raw_blob_policy"));
     }
+
+    let root = temporary.path().join("derived-root");
+    let derived = Command::new(zinder_testkit::bin_exe!("zinder-query"))
+        .env_clear()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .env("ZINDER_STORAGE__DATA_DIR", &root)
+        .env("ZINDER_INGEST_CONTROL__BEARER_TOKEN", "query-inline-token")
+        .env("ZINDER_COMPAT__SERVING", "wallet")
+        .output()?;
+    assert!(derived.status.success(), "{derived:?}");
+    let derived_stdout = String::from_utf8(derived.stdout)?;
+    assert!(
+        derived_stdout.contains(&format!("path = \"{}\"", root.join("canonical").display())),
+        "{derived_stdout}"
+    );
+    assert!(
+        derived_stdout.contains(&format!(
+            "secondary_path = \"{}\"",
+            root.join("canonical-secondary/query").display()
+        )),
+        "{derived_stdout}"
+    );
+    assert!(
+        derived_stdout.contains(&format!("path = \"{}\"", root.join("wallet").display())),
+        "{derived_stdout}"
+    );
+    assert!(
+        derived_stdout.contains(&format!(
+            "secondary_path = \"{}\"",
+            root.join("wallet-secondary/query").display()
+        )),
+        "{derived_stdout}"
+    );
+    assert!(
+        derived_stdout.contains("bearer_token = \"[REDACTED]\""),
+        "{derived_stdout}"
+    );
+    assert!(
+        !derived_stdout.contains("query-inline-token"),
+        "{derived_stdout}"
+    );
     Ok(())
 }
 
@@ -392,9 +443,10 @@ async fn wallet_profiles_refuse_checkpointed_canonical_history() -> eyre::Result
     let network = Network::ZcashRegtest;
     let control = IngestControlFixture::spawn(network).await?;
     let activations = sample_regtest_upgrade_activations();
-    for (profile, retention) in [
-        ("wallet", RawBlobRetention::None),
-        ("wallet-archive", RawBlobRetention::All),
+    for (profile, full_blocks, retention) in [
+        ("wallet", None, RawBlobRetention::None),
+        ("wallet", Some("true"), RawBlobRetention::All),
+        ("explorer", Some("true"), RawBlobRetention::All),
     ] {
         let chain = ChainFixture::new(network)
             .with_raw_blob_retention(retention)
@@ -406,32 +458,32 @@ async fn wallet_profiles_refuse_checkpointed_canonical_history() -> eyre::Result
             .reorg_policy()
             .reorg_window_blocks();
         let directory = tempfile::tempdir()?;
-        let output = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-query"))
-                .env_clear()
-                .env("ZINDER_DEPLOYMENT__PROFILE", profile)
-                .env("ZINDER_NETWORK__NAME", "zcash-regtest")
-                .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
-                .env(
-                    "ZINDER_STORAGE__SECONDARY_PATH",
-                    directory.path().join("canonical-secondary"),
-                )
-                .env("ZINDER_WALLET__PATH", directory.path().join("wallet"))
-                .env(
-                    "ZINDER_WALLET__SECONDARY_PATH",
-                    directory.path().join("wallet-secondary"),
-                )
-                .env("ZINDER_INGEST_CONTROL__ADDR", control.endpoint())
-                .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:1")
-                .env(
-                    "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
-                    reorg_window.to_string(),
-                )
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await??;
+        let mut command = tokio::process::Command::new(zinder_testkit::bin_exe!("zinder-query"));
+        command
+            .env_clear()
+            .env("ZINDER_DEPLOYMENT__PROFILE", profile)
+            .env("ZINDER_NETWORK__NAME", "zcash-regtest")
+            .env("ZINDER_STORAGE__PATH", writer.canonical_primary_path())
+            .env(
+                "ZINDER_STORAGE__SECONDARY_PATH",
+                directory.path().join("canonical-secondary"),
+            )
+            .env("ZINDER_WALLET__PATH", directory.path().join("wallet"))
+            .env(
+                "ZINDER_WALLET__SECONDARY_PATH",
+                directory.path().join("wallet-secondary"),
+            )
+            .env("ZINDER_INGEST_CONTROL__ADDR", control.endpoint())
+            .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:1")
+            .env(
+                "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
+                reorg_window.to_string(),
+            )
+            .kill_on_drop(true);
+        if let Some(full_blocks) = full_blocks {
+            command.env("ZINDER_STORAGE__FULL_BLOCKS", full_blocks);
+        }
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output()).await??;
         assert!(!output.status.success(), "{profile} unexpectedly started");
         let stderr = String::from_utf8(output.stderr)?;
         assert!(
@@ -440,5 +492,46 @@ async fn wallet_profiles_refuse_checkpointed_canonical_history() -> eyre::Result
         );
     }
     control.shutdown().await?;
+    Ok(())
+}
+
+#[test]
+fn omitted_paths_default_from_data_dir_and_partial_explicit_paths_fail() -> eyre::Result<()> {
+    let default_output = Command::new(zinder_testkit::bin_exe!("zinder-query"))
+        .env_clear()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .output()?;
+    assert!(default_output.status.success(), "{default_output:?}");
+    let stdout = String::from_utf8(default_output.stdout)?;
+    assert!(
+        stdout.contains("path = \"/var/lib/zinder/canonical\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("secondary_path = \"/var/lib/zinder/canonical-secondary/query\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("path = \"/var/lib/zinder/wallet\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("secondary_path = \"/var/lib/zinder/wallet-secondary/query\""),
+        "{stdout}"
+    );
+
+    let temporary = TempDir::new()?;
+    let partial_output = Command::new(zinder_testkit::bin_exe!("zinder-query"))
+        .env_clear()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .arg("--canonical-secondary-root")
+        .arg(temporary.path().join("canon-sec"))
+        .output()?;
+    assert!(!partial_output.status.success(), "{partial_output:?}");
+    let stderr = String::from_utf8(partial_output.stderr)?;
+    assert!(
+        stderr.contains("missing configuration field: storage.path"),
+        "{stderr}"
+    );
     Ok(())
 }

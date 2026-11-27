@@ -28,11 +28,13 @@ use zinder_runtime::{
     DeploymentToml, IngestControlReaderToml, IngestControlSection, NetworkSection, NetworkToml,
     NodeFallbacksToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
     ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    RuntimeService, SecuritySection, SecurityToml, StorageRoleToml, guard_optional_serving_bind,
-    guard_serving_bind, parse_socket_addr, require_field, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_canonical_secondary_storage,
-    resolve_ingest_control_reader, resolve_ops_listen_addr,
-    resolve_wallet_projection_reader_rocksdb_budget,
+    RuntimeService, SecuritySection, SecurityToml, StorageRoleToml, derive_canonical_path,
+    derive_canonical_secondary_path, derive_wallet_path, derive_wallet_secondary_path,
+    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
+    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
+    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
+    resolve_wallet_projection_reader_rocksdb_budget, section_defaults::DEFAULT_DATA_DIR,
+    validate_optional_data_dir,
 };
 use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{
@@ -263,7 +265,8 @@ pub(super) fn load_history_publisher_config(
     config_path: Option<PathBuf>,
     overrides: LightwalletdConfigOverrides,
 ) -> Result<HistoryPublisherConfig, LightwalletdConfigError> {
-    let config = load_raw_config(config_path, overrides)?;
+    let mut config = load_raw_config(config_path, overrides)?;
+    derive_storage_paths(CompatServing::CompactBlocks, &mut config.storage, None)?;
     Ok(HistoryPublisherConfig {
         network: config.network.resolve()?,
         primary_path: require_field(config.storage.path, "storage.path")?,
@@ -489,6 +492,47 @@ struct WalletSection {
     rocksdb: RocksDbResourceBudgetSection,
 }
 
+fn derive_storage_paths(
+    serving: CompatServing,
+    storage: &mut CanonicalSecondaryStorageSection,
+    wallet: Option<&mut WalletSection>,
+) -> Result<(), ConfigError> {
+    storage.data_dir = validate_optional_data_dir(storage.data_dir.take())?;
+    let all_wallet_unset = wallet
+        .as_deref()
+        .is_none_or(|section| section.path.is_none() && section.secondary_path.is_none());
+    let all_paths_unset = storage.path.is_none()
+        && storage.secondary_path.is_none()
+        && (serving != CompatServing::Wallet || all_wallet_unset);
+    let effective_data_dir = storage
+        .data_dir
+        .as_deref()
+        .or_else(|| all_paths_unset.then_some(Path::new(DEFAULT_DATA_DIR)));
+    if let Some(dir) = effective_data_dir {
+        storage
+            .path
+            .get_or_insert_with(|| derive_canonical_path(dir));
+        storage
+            .secondary_path
+            .get_or_insert_with(|| derive_canonical_secondary_path(dir, "compat-lightwalletd"));
+        if serving == CompatServing::Wallet
+            && let Some(wallet_section) = wallet
+        {
+            wallet_section
+                .path
+                .get_or_insert_with(|| derive_wallet_path(dir));
+            wallet_section
+                .secondary_path
+                .get_or_insert_with(|| derive_wallet_secondary_path(dir, "compat-lightwalletd"));
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "lightwalletd config resolution keeps storage, wallet, and serving admission in one function"
+)]
 fn resolve_lightwalletd_config(
     mut config: LightwalletdRawConfig,
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
@@ -500,10 +544,17 @@ fn resolve_lightwalletd_config(
         ))
         .into());
     }
+    let mut wallet = wallet.unwrap_or_default();
     let network = config.network.resolve()?;
+    derive_storage_paths(
+        serving,
+        &mut config.storage,
+        (serving == CompatServing::Wallet).then_some(&mut wallet),
+    )?;
+    let full_blocks = config.storage.full_blocks;
     let storage = resolve_canonical_secondary_storage(config.storage)?;
     let (wallet_primary_path, wallet_secondary_root, wallet_rocksdb_budget) =
-        resolve_wallet_storage(serving, wallet.unwrap_or_default(), &storage)?;
+        resolve_wallet_storage(serving, wallet, &storage)?;
     let (tree_state_replay_wait, tree_state_replay_waiters_per_slot) =
         resolve_tree_state_replay(serving, &config.compat)?;
     let forwarded_reads = resolve_forwarded_reads(serving, &config.compat)?;
@@ -530,10 +581,18 @@ fn resolve_lightwalletd_config(
     let (broadcaster, node_fallbacks) =
         resolve_node_list(serving, network, config.node, config.node_fallbacks)?;
 
-    if config.deployment.profile == Some(DeploymentProfile::Wallet) && broadcaster.is_none() {
-        return Err(ConfigError::invalid(
-            "the wallet profile requires [node] for verified mined transaction bytes",
+    if let Some(profile) = config.deployment.profile
+        && matches!(
+            profile,
+            DeploymentProfile::Wallet | DeploymentProfile::Explorer
         )
+        && full_blocks != Some(true)
+        && broadcaster.is_none()
+    {
+        return Err(ConfigError::invalid(format!(
+            "the {} profile requires [node] for verified mined transaction bytes",
+            profile.as_str(),
+        ))
         .into());
     }
 
@@ -601,8 +660,10 @@ fn resolve_serving(config: &mut LightwalletdRawConfig) -> Result<CompatServing, 
             serving.as_str(),
         )));
     }
-    config.storage.raw_blob_policy =
-        Some(profile.resolve_raw_blob_retention(config.storage.raw_blob_policy)?);
+    config.storage.raw_blob_policy = Some(profile.resolve_raw_blob_retention_with_full_blocks(
+        config.storage.full_blocks,
+        config.storage.raw_blob_policy,
+    )?);
     Ok(serving)
 }
 
@@ -710,10 +771,11 @@ impl LightwalletdConfigToml {
                     secondary_path: secondary_path.clone(),
                     rocksdb: RocksDbResourceBudgetToml::from_resolved(rocksdb),
                 }),
-            ingest_control: IngestControlReaderToml::from_resolved(
-                config.ingest_control_addr.clone(),
-                config.ingest_control_bearer_token_path.as_deref(),
-            ),
+            ingest_control: IngestControlReaderToml::from_reader(&ResolvedIngestControlReader {
+                addr: config.ingest_control_addr.clone(),
+                bearer_token_path: config.ingest_control_bearer_token_path.clone(),
+                bearer_token: config.ingest_control_bearer_token.clone(),
+            }),
             compat: CompatToml {
                 shielded_history: config.shielded_history.clone(),
                 listen_addr: config.listen_addr.to_string(),

@@ -8,14 +8,17 @@
 //! - [`CanonicalSecondaryStorageSection`] for readers that open only the
 //!   canonical store (`zinder-query`).
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use zinder_store::{RawBlobRetention, RocksDbResourceBudget, RocksDbStatisticsLevel};
 
 use crate::{
     ConfigError, canonical_reader_block_cache_bytes, canonical_reader_max_open_files,
-    config::duration_as_millis_u64,
+    config::duration_as_millis_u64, sections::deployment::resolve_manual_raw_blob_retention,
 };
 
 const DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS: u64 = 1_000;
@@ -114,12 +117,16 @@ pub struct StorageRoleSection {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecondaryStorageSection {
+    /// Base data directory from which unset storage paths are derived.
+    pub data_dir: Option<PathBuf>,
     /// Filesystem path of the canonical primary instance the reader opens
     /// as a `RocksDB` secondary.
     pub path: Option<PathBuf>,
     /// Reader-local secondary metadata path; must be unique per reader
     /// process per ADR-0003.
     pub secondary_path: Option<PathBuf>,
+    /// Orthogonal opt-in for full-block retention (shared-env compatibility).
+    pub full_blocks: Option<bool>,
     /// Catchup tick cadence in milliseconds.
     pub secondary_catchup_interval_ms: Option<u64>,
     /// Maximum startup catchup duration in milliseconds before the reader
@@ -139,12 +146,17 @@ pub struct SecondaryStorageSection {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CanonicalSecondaryStorageSection {
+    /// Base data directory from which unset storage and wallet paths are
+    /// derived.
+    pub data_dir: Option<PathBuf>,
     /// Filesystem path of the canonical primary instance the reader opens
     /// as a `RocksDB` secondary.
     pub path: Option<PathBuf>,
     /// Reader-local secondary metadata path; must be unique per reader
     /// process per ADR-0003.
     pub secondary_path: Option<PathBuf>,
+    /// Orthogonal opt-in to require full raw-block retention alongside any preset.
+    pub full_blocks: Option<bool>,
     /// Minimum raw-blob coverage required from the canonical primary.
     pub raw_blob_policy: Option<RawBlobRetention>,
     /// Catchup tick cadence in milliseconds.
@@ -167,6 +179,8 @@ pub struct CanonicalSecondaryStorageSection {
 /// Resolved secondary storage location with catchup cadence.
 #[derive(Clone, Debug)]
 pub struct ResolvedSecondaryStorage {
+    /// Base data directory, when explicitly configured.
+    pub data_dir: Option<PathBuf>,
     /// Canonical primary path the reader opens as secondary.
     pub path: PathBuf,
     /// Reader-local secondary metadata path.
@@ -186,10 +200,14 @@ pub struct ResolvedSecondaryStorage {
 /// Resolved canonical-secondary storage location with catchup cadence.
 #[derive(Clone, Debug)]
 pub struct ResolvedCanonicalSecondaryStorage {
+    /// Base data directory, when explicitly configured.
+    pub data_dir: Option<PathBuf>,
     /// Canonical primary path the reader opens as secondary.
     pub path: PathBuf,
     /// Reader-local secondary metadata path.
     pub secondary_path: PathBuf,
+    /// Explicit `storage.full_blocks` setting, when configured.
+    pub full_blocks: Option<bool>,
     /// Persisted raw-blob retention required during secondary admission.
     pub expected_raw_blob_retention: RawBlobRetention,
     /// Catchup tick cadence.
@@ -203,6 +221,54 @@ pub struct ResolvedCanonicalSecondaryStorage {
     pub serving_pair_staleness_ceiling: Duration,
     /// Bounded `RocksDB` resource budget for the canonical store.
     pub canonical_rocksdb_budget: RocksDbResourceBudget,
+}
+
+/// Rejects an explicit blank `storage.data_dir` and returns `Ok(None)` when unset.
+pub fn validate_optional_data_dir(
+    data_dir: Option<PathBuf>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    match data_dir {
+        Some(directory) if directory.as_os_str().to_string_lossy().trim().is_empty() => {
+            Err(ConfigError::invalid("storage.data_dir must not be empty"))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Derives `<data_dir>/canonical`.
+#[must_use]
+pub fn derive_canonical_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("canonical")
+}
+
+/// Derives `<data_dir>/canonical-secondary/<service_slug>`.
+#[must_use]
+pub fn derive_canonical_secondary_path(data_dir: &Path, service_slug: &str) -> PathBuf {
+    data_dir.join("canonical-secondary").join(service_slug)
+}
+
+/// Derives `<data_dir>/wallet`.
+#[must_use]
+pub fn derive_wallet_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("wallet")
+}
+
+/// Derives `<data_dir>/wallet-secondary/<service_slug>`.
+#[must_use]
+pub fn derive_wallet_secondary_path(data_dir: &Path, service_slug: &str) -> PathBuf {
+    data_dir.join("wallet-secondary").join(service_slug)
+}
+
+/// Derives `<data_dir>/explorer`.
+#[must_use]
+pub fn derive_explorer_secondary_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("explorer")
+}
+
+/// Derives `<data_dir>/checkpoints`.
+#[must_use]
+pub fn derive_checkpoints_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("checkpoints")
 }
 
 fn resolve_rocksdb_resource_budget(
@@ -298,6 +364,7 @@ pub fn resolve_wallet_projection_reader_rocksdb_budget(
 pub fn resolve_secondary_storage(
     section: SecondaryStorageSection,
 ) -> Result<ResolvedSecondaryStorage, ConfigError> {
+    let data_dir = validate_optional_data_dir(section.data_dir)?;
     let path = section
         .path
         .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
@@ -328,6 +395,7 @@ pub fn resolve_secondary_storage(
     let materialized_view_rocksdb_budget =
         resolve_materialized_view_reader_rocksdb_budget(section.materialized_views.rocksdb)?;
     Ok(ResolvedSecondaryStorage {
+        data_dir,
         path,
         secondary_path,
         secondary_catchup_interval: Duration::from_millis(catchup_ms),
@@ -346,15 +414,16 @@ pub fn resolve_secondary_storage(
 pub fn resolve_canonical_secondary_storage(
     section: CanonicalSecondaryStorageSection,
 ) -> Result<ResolvedCanonicalSecondaryStorage, ConfigError> {
+    let data_dir = validate_optional_data_dir(section.data_dir)?;
     let path = section
         .path
         .ok_or_else(|| ConfigError::missing_field("storage.path"))?;
     let secondary_path = section
         .secondary_path
         .ok_or_else(|| ConfigError::missing_field("storage.secondary_path"))?;
-    let expected_raw_blob_retention = section
-        .raw_blob_policy
-        .unwrap_or(DEFAULT_CANONICAL_SECONDARY_RAW_BLOB_RETENTION);
+    let expected_raw_blob_retention =
+        resolve_manual_raw_blob_retention(section.full_blocks, section.raw_blob_policy)?
+            .unwrap_or(DEFAULT_CANONICAL_SECONDARY_RAW_BLOB_RETENTION);
     let catchup_ms = section
         .secondary_catchup_interval_ms
         .unwrap_or(DEFAULT_SECONDARY_CATCHUP_INTERVAL_MS);
@@ -385,8 +454,10 @@ pub fn resolve_canonical_secondary_storage(
     let canonical_rocksdb_budget =
         resolve_canonical_reader_rocksdb_budget(section.canonical.rocksdb)?;
     Ok(ResolvedCanonicalSecondaryStorage {
+        data_dir,
         path,
         secondary_path,
+        full_blocks: section.full_blocks,
         expected_raw_blob_retention,
         secondary_catchup_interval: Duration::from_millis(catchup_ms),
         initial_catchup_timeout: Duration::from_millis(initial_catchup_timeout_ms),
@@ -456,6 +527,9 @@ impl StorageRoleToml {
 /// Redacted TOML projection of the reader-side `[storage]` section.
 #[derive(Debug, Serialize)]
 pub struct SecondaryStorageToml {
+    /// Configured base data directory, when explicitly set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
     /// Canonical primary path.
     pub path: String,
     /// Reader-local secondary metadata path.
@@ -478,6 +552,10 @@ impl SecondaryStorageToml {
     #[must_use]
     pub fn from_resolved(resolved: &ResolvedSecondaryStorage) -> Self {
         Self {
+            data_dir: resolved
+                .data_dir
+                .as_ref()
+                .map(|path| path.display().to_string()),
             path: resolved.path.display().to_string(),
             secondary_path: resolved.secondary_path.display().to_string(),
             secondary_catchup_interval_ms: duration_as_millis_u64(
@@ -497,10 +575,16 @@ impl SecondaryStorageToml {
 /// Redacted TOML projection of a canonical-secondary `[storage]` section.
 #[derive(Debug, Serialize)]
 pub struct CanonicalSecondaryStorageToml {
+    /// Configured base data directory, when explicitly set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
     /// Canonical primary path.
     pub path: String,
     /// Reader-local secondary metadata path.
     pub secondary_path: String,
+    /// Explicit full-block retention flag, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_blocks: Option<bool>,
     /// Minimum raw-blob coverage required from the canonical primary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_blob_policy: Option<RawBlobRetention>,
@@ -522,8 +606,13 @@ impl CanonicalSecondaryStorageToml {
     #[must_use]
     pub fn from_resolved(resolved: &ResolvedCanonicalSecondaryStorage) -> Self {
         Self {
+            data_dir: resolved
+                .data_dir
+                .as_ref()
+                .map(|path| path.display().to_string()),
             path: resolved.path.display().to_string(),
             secondary_path: resolved.secondary_path.display().to_string(),
+            full_blocks: resolved.full_blocks,
             raw_blob_policy: Some(resolved.expected_raw_blob_retention),
             secondary_catchup_interval_ms: duration_as_millis_u64(
                 resolved.secondary_catchup_interval,
@@ -853,6 +942,28 @@ mod tests {
             statistics_level: Some("verbose".to_owned()),
             ..RocksDbResourceBudgetSection::default()
         });
+        assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
+    }
+
+    #[test]
+    fn data_dir_derives_subpaths() {
+        let root = std::path::Path::new("/mnt/zinder");
+        assert_eq!(derive_canonical_path(root), root.join("canonical"));
+        assert_eq!(
+            derive_canonical_secondary_path(root, "query"),
+            root.join("canonical-secondary/query")
+        );
+        assert_eq!(derive_wallet_path(root), root.join("wallet"));
+        assert_eq!(
+            derive_wallet_secondary_path(root, "compat-lightwalletd"),
+            root.join("wallet-secondary/compat-lightwalletd")
+        );
+        assert_eq!(derive_explorer_secondary_path(root), root.join("explorer"));
+    }
+
+    #[test]
+    fn blank_data_dir_is_rejected() {
+        let outcome = validate_optional_data_dir(Some(std::path::PathBuf::from("   ")));
         assert!(matches!(outcome, Err(ConfigError::Invalid { .. })));
     }
 }
