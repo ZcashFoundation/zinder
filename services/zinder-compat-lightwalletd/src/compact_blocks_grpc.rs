@@ -13,7 +13,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use tokio::sync::watch;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, codec::CompressionEncoding};
 use zinder_core::{ChainEpoch, CompactBlockArtifact, NetworkUpgradeActivations};
 use zinder_proto::compat::lightwalletd::{self, EncodedBlock, compact_tx_streamer_server};
 use zinder_query::{
@@ -486,9 +486,14 @@ impl CompactBlocksGrpcAdapter {
     ) -> RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>> {
         RepeatedFieldGuard::new(
             compact_tx_streamer_server::CompactTxStreamerServer::new(self)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Zstd)
                 .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
             COMPACT_TX_STREAMER_FIELD_LIMITS,
         )
+        .with_request_compression()
     }
 }
 

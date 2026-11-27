@@ -65,6 +65,7 @@ mod wallet_rpc_metrics;
 use std::{
     convert::Infallible,
     future::Future,
+    hash::{BuildHasher as _, RandomState},
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
@@ -681,8 +682,39 @@ fn remote_address<B>(request: &http::Request<B>) -> Option<SocketAddr> {
         })
 }
 
+/// Server guidance for retrying a refused gRPC call.
+#[derive(Clone, Copy, Debug)]
+pub enum RetryPushback {
+    /// Wait for a server-selected delay of 500 to 1,500 milliseconds.
+    Backoff,
+    /// Wait for this duration, rounded down to milliseconds and capped at `i32::MAX`.
+    After(Duration),
+    /// Stop retrying this call.
+    DoNotRetry,
+}
+
+impl RetryPushback {
+    /// Attaches gRPC retry pushback without changing the status code or details.
+    #[must_use]
+    pub fn apply(self, mut status: Status) -> Status {
+        let delay_ms = match self {
+            Self::Backoff => {
+                i32::try_from(500 + RandomState::new().hash_one(()) % 1_001).unwrap_or(1_000)
+            }
+            Self::After(delay) => i32::try_from(delay.as_millis()).unwrap_or(i32::MAX),
+            Self::DoNotRetry => -1,
+        };
+        status
+            .metadata_mut()
+            .insert("grpc-retry-pushback-ms", delay_ms.into());
+        status
+    }
+}
+
 fn too_many_requests() -> Status {
-    Status::unavailable("server is receiving too many requests at once; retry with backoff")
+    RetryPushback::Backoff.apply(Status::unavailable(
+        "server is receiving too many requests at once; retry with backoff",
+    ))
 }
 
 #[derive(Clone, Debug)]

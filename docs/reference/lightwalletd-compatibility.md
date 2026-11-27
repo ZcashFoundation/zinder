@@ -175,7 +175,7 @@ In light-wallet serving, forwarded `GetAddressUtxos`, `GetAddressUtxosStream`, `
 
 A hash-only selector never waits and keeps its immediate `NOT_FOUND`. `GetLatestBlock`, `GetLightdInfo`, `GetLatestTreeState`, `GetTransaction`, `SendTransaction`, the mempool methods, `GetTaddressTxids`, `GetTaddressTransactions`, wallet-serving transparent-address reads, `GetSubtreeRoots`, and native `WalletQuery` never wait.
 
-A request waits only when its height is above the visible tip by at most `compat.tip_wait_max_blocks` blocks (default 2). It waits up to `compat.tip_wait_ms` milliseconds (default 3000, and 0 turns the wait off). At most `compat.tip_wait_max_waiters` requests (default 256) wait at once, and a request that finds them all taken answers at once. [Configuration](configuration.md) lists the settings and their limits. The default wait is provisional until cross-region skew has been measured, and operators can raise it.
+A request waits only when its height is above the visible tip by at most `compat.tip_wait_max_blocks` blocks (default 2). It waits up to `compat.tip_wait_ms` milliseconds (default 3000, and 0 turns the wait off). At most `compat.tip_wait_max_waiters` requests (default 256) wait at once, and a request that finds them all taken immediately returns `UNAVAILABLE` with [retry pushback](error-vocabulary.md#retry-pushback). [Configuration](configuration.md) lists the settings and their limits. The default wait is provisional until cross-region skew has been measured, and operators can raise it.
 
 A waiting request wakes each time the reader publishes a new tip and checks the fresh tip, with no polling:
 
@@ -258,6 +258,8 @@ A stalled stream keeps its range-stream slot until the server ends it at the sen
 <a id="canonical-settled-segments-and-live-tail-wire-streaming"></a>
 
 #### Canonical settled segments and live-tail wire streaming
+
+[Message compression](integration-surfaces.md#what-every-client-must-handle) is optional. Identity clients use the direct range path described below. A full block-range admission queue or an expired admission wait returns `UNAVAILABLE` with [retry pushback](error-vocabulary.md#retry-pushback).
 
 All three serving modes answer every non-transparent `GetBlockRange` pool selection, and wallet and light-wallet serving answer every `GetBlockRangeNullifiers` pool selection, directly from `zinder-store`'s canonical `ZSHRNG02` settled segments and `live_tail_block` (`ZSLVTL01`) column family via `encoded_compact_block_range_up_to`, without a separate `history-publisher` process, `ZSHRNG01` sidecar catalog, or standalone encoded tail buffer.
 

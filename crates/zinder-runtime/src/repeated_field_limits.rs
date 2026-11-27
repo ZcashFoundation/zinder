@@ -10,14 +10,16 @@
 //! [`RepeatedFieldGuard`] wraps a generated tonic server. For each method it
 //! names, it scans every request frame with an allocation-free protobuf wire
 //! walk and refuses the request with `INVALID_ARGUMENT` when a bounded field
-//! holds more elements than allowed. Accepted frames reach tonic unchanged.
+//! holds more elements than allowed. Accepted compressed messages are
+//! reframed as identity before tonic decodes the protobuf.
 
 use std::{
+    io,
     pin::Pin,
     task::{Context, Poll, ready},
 };
 
-use bytes::{Buf as _, Bytes, BytesMut};
+use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use tonic::{
     Status,
@@ -165,16 +167,18 @@ impl MethodFieldLimits {
 /// A generated tonic server whose bounded requests are scanned before tonic
 /// decodes them.
 ///
-/// Requests to methods without [`MethodFieldLimits`] pass straight through.
-/// For a bounded method, every gRPC frame in the request body is buffered up
+/// Identity requests to methods without [`MethodFieldLimits`] pass straight
+/// through. For a bounded method, every gRPC frame is buffered up
 /// to [`MAX_DECODING_MESSAGE_BYTES`](crate::MAX_DECODING_MESSAGE_BYTES), the
-/// same cap tonic applies, scanned without allocating, and released unchanged
-/// when every bounded field is within its limit. Otherwise the body ends with
+/// same cap tonic applies, and scanned without allocating decoded protobuf
+/// values. Uncompressed frames that pass the scan are released unchanged.
+/// When a repeated field exceeds its limit, the body ends with
 /// an `INVALID_ARGUMENT` status, which tonic returns before the handler runs.
 #[derive(Clone, Debug)]
 pub struct RepeatedFieldGuard<S> {
     inner: S,
     method_limits: &'static [MethodFieldLimits],
+    request_compression: bool,
 }
 
 impl<S> RepeatedFieldGuard<S> {
@@ -184,7 +188,19 @@ impl<S> RepeatedFieldGuard<S> {
         Self {
             inner,
             method_limits,
+            request_compression: false,
         }
+    }
+
+    /// Decompress gzip and zstd requests under the message cap before scanning.
+    ///
+    /// Enable this when the wrapped server accepts both request encodings.
+    /// The guard also bounds the zstd decoder window. It applies these limits
+    /// to all methods, including those without repeated-field limits.
+    #[must_use]
+    pub const fn with_request_compression(mut self) -> Self {
+        self.request_compression = true;
+        self
     }
 }
 
@@ -218,24 +234,113 @@ where
         self.inner.poll_ready(context)
     }
 
-    fn call(&mut self, request: http::Request<RequestBody>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<RequestBody>) -> Self::Future {
         let limits = self.limits_for(request.uri().path());
-        let request = request.map(|body| {
+        let compression = self
+            .request_compression
+            .then(|| RequestCompression::from_headers(request.headers()))
+            .flatten();
+        if compression.is_some() {
+            request.headers_mut().remove(http::header::CONTENT_LENGTH);
+        }
+        self.inner.call(request.map(|body| {
             let body = TonicBody::new(body);
-            match limits {
-                Some(limits) => TonicBody::new(BoundedRequestBody::new(body, limits)),
-                None => body,
+            if limits.is_some() || compression.is_some() {
+                TonicBody::new(BoundedRequestBody::new(body, limits, compression))
+            } else {
+                body
             }
-        });
-        self.inner.call(request)
+        }))
     }
+}
+
+#[derive(Clone, Copy)]
+enum RequestCompression {
+    Gzip,
+    Zstd,
+}
+
+impl RequestCompression {
+    fn from_headers(headers: &http::HeaderMap) -> Option<Self> {
+        match headers.get("grpc-encoding")?.as_bytes() {
+            b"gzip" => Some(Self::Gzip),
+            b"zstd" => Some(Self::Zstd),
+            _ => None,
+        }
+    }
+
+    fn decode(self, payload: &[u8]) -> Result<Bytes, Status> {
+        match self {
+            Self::Gzip => decode_frame(flate2::bufread::MultiGzDecoder::new(payload)),
+            Self::Zstd => {
+                validate_zstd_frames(payload)?;
+                let mut decoder = zstd::stream::read::Decoder::with_buffer(payload)
+                    .map_err(|error| compression_status(error.kind()))?;
+                // A small frame can declare a much larger decoder window.
+                decoder
+                    .window_log_max(MAX_DECODING_MESSAGE_BYTES.ilog2())
+                    .map_err(|error| compression_status(error.kind()))?;
+                decode_frame(decoder)
+            }
+        }
+    }
+}
+
+fn validate_zstd_frames(mut payload: &[u8]) -> Result<(), Status> {
+    use zstd::zstd_safe::{FrameHeaderStatus, find_frame_compressed_size, get_frame_header};
+
+    while !payload.is_empty() {
+        // The legacy zstd decoder bypasses the configured window limit.
+        let Ok(FrameHeaderStatus::Complete(header)) = get_frame_header(payload) else {
+            return Err(invalid_compressed_message());
+        };
+        if header.windowSize > MAX_DECODING_MESSAGE_BYTES as u64 {
+            return Err(Status::resource_exhausted(
+                "zstd request exceeds the gRPC decoder window limit",
+            ));
+        }
+        let frame_bytes =
+            find_frame_compressed_size(payload).map_err(|_| invalid_compressed_message())?;
+        payload = payload
+            .get(frame_bytes..)
+            .ok_or_else(invalid_compressed_message)?;
+    }
+    Ok(())
+}
+
+fn decode_frame(mut decoder: impl io::Read) -> Result<Bytes, Status> {
+    let mut frame = BytesMut::with_capacity(GRPC_FRAME_HEADER_BYTES + 8 * 1024);
+    frame.put_bytes(0, GRPC_FRAME_HEADER_BYTES);
+    io::copy(
+        &mut decoder,
+        &mut (&mut frame).limit(MAX_DECODING_MESSAGE_BYTES).writer(),
+    )
+    .map_err(|error| compression_status(error.kind()))?;
+    let length = u32::try_from(frame.len() - GRPC_FRAME_HEADER_BYTES).map_err(|_| {
+        Status::resource_exhausted("decompressed request exceeds the gRPC frame size")
+    })?;
+    frame[1..GRPC_FRAME_HEADER_BYTES].copy_from_slice(&length.to_be_bytes());
+    Ok(frame.freeze())
+}
+
+fn compression_status(kind: io::ErrorKind) -> Status {
+    if kind == io::ErrorKind::WriteZero {
+        Status::resource_exhausted("decompressed request exceeds the gRPC message size limit")
+    } else {
+        invalid_compressed_message()
+    }
+}
+
+fn invalid_compressed_message() -> Status {
+    Status::invalid_argument("invalid or unsupported compressed gRPC message")
 }
 
 /// Request body that releases each gRPC frame only after its bounded repeated
 /// fields pass their limits.
 struct BoundedRequestBody {
     inner: TonicBody,
-    limits: &'static MethodFieldLimits,
+    limits: Option<&'static MethodFieldLimits>,
+    compression: Option<RequestCompression>,
     pending: BytesMut,
     state: BodyState,
 }
@@ -264,12 +369,10 @@ enum Tail {
 enum PendingFrame {
     /// The frame header or message is not complete yet.
     Incomplete,
-    /// A complete uncompressed frame of this many bytes, header included.
+    /// A complete frame of this many bytes, header included.
     Complete(usize),
-    /// A compressed frame, or one over the decoding cap. tonic refuses both
-    /// before decoding: no compression encoding is enabled on Zinder servers,
-    /// and the length check precedes the read. If a server ever accepts a
-    /// compression encoding, this guard must decompress before scanning.
+    /// A frame over the decoding cap or with an unsupported compression flag.
+    /// Tonic refuses it before decoding.
     Unscannable,
 }
 
@@ -282,10 +385,15 @@ enum ScanStep {
 }
 
 impl BoundedRequestBody {
-    fn new(inner: TonicBody, limits: &'static MethodFieldLimits) -> Self {
+    fn new(
+        inner: TonicBody,
+        limits: Option<&'static MethodFieldLimits>,
+        compression: Option<RequestCompression>,
+    ) -> Self {
         Self {
             inner,
             limits,
+            compression,
             pending: BytesMut::new(),
             state: BodyState::Scanning,
         }
@@ -295,11 +403,11 @@ impl BoundedRequestBody {
         let Some(mut header) = self.pending.get(..GRPC_FRAME_HEADER_BYTES) else {
             return PendingFrame::Incomplete;
         };
-        let compressed = header.get_u8() != 0;
+        let flag = header.get_u8();
         let Ok(message_bytes) = usize::try_from(header.get_u32()) else {
             return PendingFrame::Unscannable;
         };
-        if compressed || message_bytes > MAX_DECODING_MESSAGE_BYTES {
+        if !scannable_flag(flag, self.compression) || message_bytes > MAX_DECODING_MESSAGE_BYTES {
             return PendingFrame::Unscannable;
         }
         let frame_bytes = GRPC_FRAME_HEADER_BYTES + message_bytes;
@@ -319,7 +427,7 @@ impl BoundedRequestBody {
     fn buffer(&mut self, chunk: &[u8]) {
         let needed = self.pending.len().saturating_add(chunk.len());
         if needed > self.pending.capacity() {
-            let declared = declared_frame_bytes(&self.pending, chunk);
+            let declared = declared_frame_bytes(&self.pending, chunk, self.compression);
             let mut grown = BytesMut::with_capacity(needed.max(declared));
             grown.extend_from_slice(&self.pending);
             self.pending = grown;
@@ -327,18 +435,30 @@ impl BoundedRequestBody {
         self.pending.extend_from_slice(chunk);
     }
 
+    fn scan_frame(&self, frame: Bytes) -> Result<Bytes, Status> {
+        let frame = match (frame.first(), self.compression) {
+            (Some(1), Some(compression)) => {
+                compression.decode(&frame[GRPC_FRAME_HEADER_BYTES..])?
+            }
+            _ => frame,
+        };
+        if let Some(limits) = self.limits {
+            limits.check(&frame[GRPC_FRAME_HEADER_BYTES..])?;
+        }
+        Ok(frame)
+    }
+
     /// Releases the next complete frame, or reads more of the inner body.
     fn poll_scanning(&mut self, context: &mut Context<'_>) -> Poll<ScanStep> {
         match self.pending_frame() {
             PendingFrame::Complete(frame_bytes) => {
                 let frame = self.pending.split_to(frame_bytes).freeze();
-                let message = frame.get(GRPC_FRAME_HEADER_BYTES..).unwrap_or_default();
-                if let Err(status) = self.limits.check(message) {
+                let checked = self.scan_frame(frame).map(Frame::data);
+                if checked.is_err() {
                     self.pending = BytesMut::new();
                     self.state = BodyState::Refused;
-                    return Poll::Ready(ScanStep::Release(Err(status)));
                 }
-                return Poll::Ready(ScanStep::Release(Ok(Frame::data(frame))));
+                return Poll::Ready(ScanStep::Release(checked));
             }
             PendingFrame::Unscannable => {
                 self.state = BodyState::PassThrough(Tail::Inner);
@@ -368,7 +488,11 @@ impl BoundedRequestBody {
 /// The length of the scannable frame whose header starts `buffered` and
 /// continues into `chunk`, or zero while that header is incomplete or
 /// declares a frame the guard passes through unscanned.
-fn declared_frame_bytes(buffered: &[u8], chunk: &[u8]) -> usize {
+fn declared_frame_bytes(
+    buffered: &[u8],
+    chunk: &[u8],
+    compression: Option<RequestCompression>,
+) -> usize {
     let mut header = [0_u8; GRPC_FRAME_HEADER_BYTES];
     let mut header_bytes = buffered.iter().chain(chunk);
     for byte in &mut header {
@@ -378,13 +502,19 @@ fn declared_frame_bytes(buffered: &[u8], chunk: &[u8]) -> usize {
         *byte = next;
     }
     let mut header = &header[..];
-    let compressed = header.get_u8() != 0;
+    let flag = header.get_u8();
     match usize::try_from(header.get_u32()) {
-        Ok(message_bytes) if !compressed && message_bytes <= MAX_DECODING_MESSAGE_BYTES => {
+        Ok(message_bytes)
+            if scannable_flag(flag, compression) && message_bytes <= MAX_DECODING_MESSAGE_BYTES =>
+        {
             GRPC_FRAME_HEADER_BYTES + message_bytes
         }
         Ok(_) | Err(_) => 0,
     }
+}
+
+const fn scannable_flag(flag: u8, compression: Option<RequestCompression>) -> bool {
+    flag == 0 || (flag == 1 && compression.is_some())
 }
 
 impl HttpBody for BoundedRequestBody {
@@ -593,6 +723,20 @@ mod tests {
     }
 
     #[test]
+    fn oversized_zstd_frame_with_known_content_size_is_resource_exhausted() -> io::Result<()> {
+        let compressed = zstd::bulk::compress(&vec![0; MAX_DECODING_MESSAGE_BYTES + 1], 3)?;
+        assert_eq!(
+            RequestCompression::Zstd
+                .decode(&compressed)
+                .err()
+                .as_ref()
+                .map(Status::code),
+            Some(tonic::Code::ResourceExhausted)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn counts_length_delimited_elements() {
         let message = [key(1, 2), 0, key(1, 2), 1, b'a', key(2, 0), 7, key(1, 2), 0];
         assert_eq!(count(&message, ADDRESSES), 3);
@@ -727,8 +871,11 @@ mod tests {
             .map(|chunk| Ok(Frame::data(Bytes::copy_from_slice(chunk))))
             .collect();
         script.push_back(Ok(Frame::trailers(trailers())));
-        let mut body =
-            BoundedRequestBody::new(TonicBody::new(ScriptedBody(script)), &BALANCE_LIMITS);
+        let mut body = BoundedRequestBody::new(
+            TonicBody::new(ScriptedBody(script)),
+            Some(&BALANCE_LIMITS),
+            None,
+        );
         let mut drained = Drained {
             bytes: Vec::new(),
             trailers: None,
@@ -752,7 +899,7 @@ mod tests {
     #[test]
     fn buffering_a_frame_never_reserves_past_its_declared_size() {
         let frame = grpc_frame(&vec![0; 600_000]);
-        let mut body = BoundedRequestBody::new(TonicBody::empty(), &BALANCE_LIMITS);
+        let mut body = BoundedRequestBody::new(TonicBody::empty(), Some(&BALANCE_LIMITS), None);
         for chunk in frame.chunks(16 * 1024) {
             body.buffer(chunk);
             assert!(

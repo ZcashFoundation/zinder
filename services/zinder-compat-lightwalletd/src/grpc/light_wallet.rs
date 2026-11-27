@@ -41,6 +41,7 @@ use zinder_query::{
     VerifiedNodeTarget, parse_receivable_transparent_address, read_on_blocking_thread,
     status_from_query_error,
 };
+use zinder_runtime::RetryPushback;
 use zinder_source::{
     SourceError, SourceTransparentUnspentOutput, SourceTransparentUtxoPage,
     TransactionBroadcaster as _, TransparentAddressLookup, TransparentAddressRowLimit,
@@ -531,7 +532,7 @@ impl NodeReads<'_> {
 /// wallet retries every admission limit the same way. `RESOURCE_EXHAUSTED`
 /// stays reserved for deterministic size and row caps.
 fn forwarded_read_refused(refused: ForwardedReadRefused) -> Status {
-    Status::unavailable(refused.to_string())
+    RetryPushback::Backoff.apply(Status::unavailable(refused.to_string()))
 }
 
 #[allow(
@@ -540,7 +541,9 @@ fn forwarded_read_refused(refused: ForwardedReadRefused) -> Status {
 )]
 fn forwarded_query_status(error: QueryError) -> Status {
     match error {
-        QueryError::ForwardedReadLimitReached { .. } => Status::unavailable(error.to_string()),
+        QueryError::ForwardedReadLimitReached { .. } => {
+            RetryPushback::Backoff.apply(Status::unavailable(error.to_string()))
+        }
         QueryError::Node(error) => node_status(error),
         error => status_from_query_error(&error),
     }
@@ -1023,10 +1026,6 @@ fn history_changed() -> Status {
     )
 }
 
-/// Retry pushback hint in milliseconds attached to `SERVED_TIP_MISMATCH`
-/// refusals as `grpc-retry-pushback-ms` metadata.
-const SERVED_TIP_MISMATCH_RETRY_PUSHBACK_MS: u64 = 1_000;
-const GRPC_RETRY_PUSHBACK_MS_HEADER: &str = "grpc-retry-pushback-ms";
 const TIP_MISMATCH_MESSAGE: &str =
     "node answered at another tip than the served tip; retry shortly";
 const PAGES_DISAGREED_MESSAGE: &str = "node UTXO pages at the served tip disagree; retry shortly";
@@ -1054,12 +1053,8 @@ impl UtxoAttemptError {
 /// view (or whose pages disagreed) with `SERVED_TIP_MISMATCH` and retry
 /// pushback guidance.
 fn served_tip_mismatch(message: &str) -> Status {
-    let mut status = status_for_reason(ErrorReason::ServedTipMismatch, message);
-    status.metadata_mut().insert(
-        GRPC_RETRY_PUSHBACK_MS_HEADER,
-        tonic::metadata::MetadataValue::from(SERVED_TIP_MISMATCH_RETRY_PUSHBACK_MS),
-    );
-    status
+    RetryPushback::After(Duration::from_secs(1))
+        .apply(status_for_reason(ErrorReason::ServedTipMismatch, message))
 }
 
 #[allow(

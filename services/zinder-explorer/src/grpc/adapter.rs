@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
+use tonic::{
+    Code, Request, Response, Status, codec::CompressionEncoding,
+    service::interceptor::InterceptedService,
+};
 use zinder_core::{
     BlockHeight, Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name,
 };
@@ -299,9 +302,14 @@ impl ExplorerQueryGrpcAdapter {
     > {
         let interceptor = BearerTokenServerInterceptor::new(self.bearer_token.clone());
         let server = ExplorerQueryServer::new(self)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd)
+            .send_compressed(CompressionEncoding::Gzip)
+            .send_compressed(CompressionEncoding::Zstd)
             .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES);
         InterceptedService::new(
-            RepeatedFieldGuard::new(server, super::EXPLORER_QUERY_FIELD_LIMITS),
+            RepeatedFieldGuard::new(server, super::EXPLORER_QUERY_FIELD_LIMITS)
+                .with_request_compression(),
             interceptor,
         )
     }
