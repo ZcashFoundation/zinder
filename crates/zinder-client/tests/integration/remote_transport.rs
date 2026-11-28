@@ -331,6 +331,7 @@ async fn compact_range_retries_opening_but_surfaces_errors_after_a_block() -> ey
             start_height: range.start.value(),
             end_height: range.end.value(),
             at_epoch_id: Some(epoch_id.value()),
+            pool_types: Vec::new(),
         }
     );
     assert_eq!(second_request, first_request);
