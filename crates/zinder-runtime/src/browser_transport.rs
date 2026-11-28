@@ -207,6 +207,7 @@ fn browser_cors(origins: &[HeaderValue]) -> CorsLayer {
             Status::GRPC_MESSAGE,
             Status::GRPC_STATUS_DETAILS,
             HeaderName::from_static(CHAIN_EVENT_FAMILY_HEADER),
+            HeaderName::from_static("grpc-encoding"),
             HeaderName::from_static("grpc-retry-pushback-ms"),
         ])
 }
@@ -316,11 +317,23 @@ mod tests {
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
             .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
             .body(Body::empty())?;
-        let response = service.oneshot(preflight).await?;
+        let response = service.clone().oneshot(preflight).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let headers = response.headers();
         assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
         assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+        let post = Request::post("/wallet.Query/ServerInfo")
+            .header(header::ORIGIN, "https://wallet.example")
+            .header(header::CONTENT_TYPE, "application/grpc-web+proto")
+            .body(Body::empty())?;
+        let response = service.oneshot(post).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS]
+                .to_str()?
+                .split(',')
+                .any(|name| name.trim() == "grpc-encoding")
+        );
         Ok(())
     }
 

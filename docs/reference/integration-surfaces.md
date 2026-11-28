@@ -104,6 +104,10 @@ WalletQuery's `CompactBlocksInRange` and `ChainEvents` or ExplorerQuery's
 `RecentTransactions`, choose an encoding your client supports for streaming.
 Read through the terminal gRPC status before treating a stream as complete.
 
+If your gRPC-Web client supports message compression, it can advertise
+`gzip` or `zstd` in `grpc-accept-encoding`. Read the exposed
+`grpc-encoding` response header to identify the selected codec.
+
 On settled `ChainEvents` streams, browsers can read the
 `zinder-chain-event-family` response header. If ExplorerQuery requires a
 bearer token, send it in the RPC's `authorization` metadata.

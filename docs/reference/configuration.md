@@ -356,6 +356,8 @@ request with an unlisted `Origin` receives HTTP 403. Use `*` alone to allow
 every origin on a listener without Explorer bearer authentication. When you
 configure an inline or file-backed Explorer bearer token, list specific
 origins to enable gRPC-Web. ExplorerQuery checks the token on each RPC.
+See [Browser clients for the native APIs](integration-surfaces.md#browser-clients-for-the-native-apis)
+for the response headers used by browser clients.
 
 ## Listener and request limits
 
@@ -407,7 +409,7 @@ Once a write to a connection blocks, the connection must write 16 KiB, or finish
 
 ### Wallet block-range admission
 
-`compat.range_admission` covers `GetBlockRange` and `GetBlockRangeNullifiers` together. `query.range_admission` covers `CompactBlocksInRange` and `FullBlocksInRange` together. The listener admits up to four concurrent calls per client by default, counting calls waiting to start and calls streaming a response. Keep the per-client cap below the shared stream limit to reserve capacity for other wallets. Each listener tracks up to 4,096 clients with open calls and removes entries as soon as their last call ends.
+`compat.range_admission` covers `GetBlockRange` and `GetBlockRangeNullifiers` together. `query.range_admission` covers `CompactBlocksInRange`, `CompactNullifiersInRange`, and `FullBlocksInRange` together. The listener admits up to four concurrent calls per client by default, counting calls waiting to start and calls streaming a response. Keep the per-client cap below the shared stream limit to reserve capacity for other wallets. Each listener tracks up to 4,096 clients with open calls and removes entries as soon as their last call ends.
 
 The default `connection` key groups calls by source IP and port, so wallets behind the same Tor exit can use separate connections. A trusted HTTP proxy supplying only a bare IP groups all calls from that address. Select `subnet` to share a quota across ports and connections by IPv4 address or IPv6 /64. Apply connection limits at your edge when using connection keys.
 
