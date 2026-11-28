@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, path::Path};
+use std::{cell::Cell, num::NonZeroU32, path::Path};
 
 use rust_rocksdb::{DEFAULT_COLUMN_FAMILY_NAME, statistics::Ticker};
 use tempfile::TempDir;
@@ -97,25 +97,10 @@ fn missing_live_tail_replay_fails_closed_when_a_reopen_cannot_admit_it()
 fn catch_up_attempts_one_reopen_when_the_new_ready_tip_row_is_missing()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
-    let store_path = temporary.path().join("canonical");
-    let store = published_store(
-        &store_path,
-        REORG_WINDOW,
-        BlockHeight::new(4),
-        BlockHeight::new(2),
-    )?;
-    let mut secondary = open_adopting_secondary(&store_path, temporary.path().join("secondary"))??;
+    let (store, mut secondary, _) = advancing_ready_with_missing_tip(temporary.path())?;
     let before = secondary.event_fence();
-    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
-    let store = append_block_five(store, &activations)?;
     let height = store.event_fence().visible_tip().height;
     assert!(height > before.visible_tip().height);
-    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
-    store.bounded_open.db.delete_cf(
-        &family,
-        zinder_core::wire::encode_height_key_ascending(height),
-    )?;
-    drop(family);
 
     let capture = zinder_testkit::LogCapture::install_for_target("zinder::store");
     assert!(matches!(
@@ -132,6 +117,121 @@ fn catch_up_attempts_one_reopen_when_the_new_ready_tip_row_is_missing()
     assert_eq!(attempts[0].field("replay_tip_height"), Some("5"));
     assert_eq!(secondary.event_fence(), before);
     Ok(())
+}
+
+#[test]
+fn catch_up_recovers_the_new_ready_tip_after_one_reopen() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = TempDir::new()?;
+    let (store, mut secondary, row) = advancing_ready_with_missing_tip(temporary.path())?;
+    let before = secondary.event_fence();
+    let after = store.event_fence();
+    let height = after.visible_tip().height;
+    assert!(height > before.visible_tip().height);
+    let key = zinder_core::wire::encode_height_key_ascending(height);
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    let attempts = Cell::new(0_u32);
+    let restored = Cell::new(Ok(()));
+    let recorder = OnLiveTailReopen(|| {
+        attempts.set(attempts.get() + 1);
+        restored.set(store.bounded_open.db.put_cf(&family, key, &row));
+    });
+
+    let catchup = metrics::with_local_recorder(&recorder, || secondary.try_catch_up_following());
+    restored.into_inner()?;
+    let catchup = catchup?;
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(catchup.before(), before);
+    assert_eq!(catchup.after(), after);
+    assert_eq!(secondary.event_fence(), after);
+    let range = BlockHeightRange::inclusive(height, height);
+    let replay = secondary
+        .scan_canonical_replay_range(range)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let [replay] = replay.as_slice() else {
+        return Err("recovered range must contain exactly one replay row".into());
+    };
+    assert_eq!(replay.facts().block_header.height, height);
+    assert_eq!(
+        replay.facts().block_header.block_hash,
+        after.visible_tip().hash
+    );
+    Ok(())
+}
+
+fn advancing_ready_with_missing_tip(
+    root: &Path,
+) -> Result<(RocksDbCanonicalStore, RocksDbCanonicalSecondary, Vec<u8>), Box<dyn std::error::Error>>
+{
+    let store_path = root.join("canonical");
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let secondary = open_adopting_secondary(&store_path, root.join("secondary"))??;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = append_block_five(store, &activations)?;
+    let key =
+        zinder_core::wire::encode_height_key_ascending(store.event_fence().visible_tip().height);
+    let family = column_family(&store.bounded_open.db, LIVE_TAIL_BLOCK_COLUMN_FAMILY)?;
+    let row = store
+        .bounded_open
+        .db
+        .get_cf(&family, key)?
+        .ok_or("fixture needs the newest live replay row")?;
+    store.bounded_open.db.delete_cf(&family, key)?;
+    drop(family);
+    Ok((store, secondary, row))
+}
+
+// Restores the row after catch-up observes the miss and before the fresh open.
+struct OnLiveTailReopen<F>(F);
+
+impl<F: Fn()> metrics::Recorder for OnLiveTailReopen<F> {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        if key.name() == "zinder_store_canonical_secondary_live_tail_reopens_total" {
+            (self.0)();
+        }
+        metrics::Counter::noop()
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
 }
 
 fn hide_admitted_live_tail_row(
