@@ -485,6 +485,11 @@ where
     ) -> Result<Response<Self::CompactBlocksInRangeStream>, Status> {
         self.require_endpoint_capability(capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2)?;
         let request = request.into_inner();
+        if !request.pool_types.is_empty() {
+            return Err(Status::unimplemented(
+                "pool selection is unavailable for compact block ranges",
+            ));
+        }
         let block_range = BlockHeightRange::inclusive(
             BlockHeight::new(request.start_height),
             BlockHeight::new(request.end_height),
