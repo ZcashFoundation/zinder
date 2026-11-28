@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use futures_util::stream;
 use tonic::{Request, Response, Status, Streaming};
-use zinder_compat_lightwalletd::MempoolExclusions;
+use zinder_compat_lightwalletd::{MempoolExclusions, address_utxo_height_limit_exceeded};
 use zinder_core::{
     BlockHash,
     wire::{
@@ -271,8 +271,17 @@ impl Darkside {
             .collect();
         drop(scenario);
         utxos.sort_by_key(|utxo| utxo.height);
-        if request.max_entries != 0 {
-            utxos.truncate(request.max_entries as usize);
+        let max_entries = request.max_entries as usize;
+        if max_entries != 0
+            && let Some(first_excluded) = utxos.get(max_entries)
+        {
+            let height = first_excluded.height;
+            let page_len = utxos.partition_point(|utxo| utxo.height < height);
+            if page_len == 0 {
+                let count = utxos.partition_point(|utxo| utxo.height == height);
+                return Err(address_utxo_height_limit_exceeded(height, count));
+            }
+            utxos.truncate(page_len);
         }
         Ok(utxos)
     }

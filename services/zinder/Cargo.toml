@@ -65,6 +65,7 @@ flate2.workspace = true
 reqwest = { workspace = true, features = ["http2"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tonic-types.workspace = true
 zinder-materialized-views.workspace = true
 zinder-store.workspace = true
 zinder-testkit.workspace = true

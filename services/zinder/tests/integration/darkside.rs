@@ -9,6 +9,7 @@ use tokio::{
     time::timeout,
 };
 use tonic::{Code, transport::Channel};
+use tonic_types::StatusExt as _;
 use zebra_chain::{serialization::ZcashDeserializeInto as _, transaction::Transaction};
 use zinder_core::{
     TransactionId,
@@ -258,6 +259,97 @@ async fn darkside_reorg_replaces_blocks_and_removes_orphaned_fixtures() -> Resul
             .map(|status| status.code()),
         Some(Code::NotFound)
     );
+    Ok(())
+}
+
+async fn assert_utxo_page(
+    wallet: &mut CompactTxStreamerClient<Channel>,
+    request: GetAddressUtxosArg,
+    expected: &[GetAddressUtxosReply],
+) -> Result<()> {
+    assert_eq!(
+        wallet
+            .get_address_utxos(request.clone())
+            .await?
+            .into_inner()
+            .address_utxos,
+        expected
+    );
+    let mut stream = wallet.get_address_utxos_stream(request).await?.into_inner();
+    for utxo in expected {
+        assert_eq!(stream.message().await?.as_ref(), Some(utxo));
+    }
+    assert_eq!(stream.message().await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn darkside_address_utxos_page_only_at_height_boundaries() -> Result<()> {
+    let process = TestProcess::start(&[]).await?;
+    let (mut control, mut wallet) = process.clients().await?;
+    control.reset(metadata(100)).await?;
+    stage_blocks(&mut control, 100, 10, 2).await?;
+    control.apply_staged(DarksideHeight { height: 101 }).await?;
+
+    let utxo = |height, txid_byte| GetAddressUtxosReply {
+        address: "test-address".to_owned(),
+        txid: vec![txid_byte; 32],
+        height,
+        value_zat: 50,
+        script: vec![0x51],
+        ..GetAddressUtxosReply::default()
+    };
+    let first = utxo(100, 1);
+    let mut next_height = vec![utxo(101, 2), utxo(101, 3)];
+    for output in std::iter::once(&first).chain(&next_height) {
+        control.add_address_utxo(output.clone()).await?;
+    }
+
+    let request = |start_height, max_entries| GetAddressUtxosArg {
+        addresses: vec![first.address.clone()],
+        start_height,
+        max_entries,
+    };
+    assert_utxo_page(&mut wallet, request(100, 2), std::slice::from_ref(&first)).await?;
+    assert_utxo_page(&mut wallet, request(101, 2), &next_height).await?;
+
+    let extra = utxo(101, 4);
+    control.add_address_utxo(extra.clone()).await?;
+    next_height.push(extra);
+    let unary = wallet
+        .get_address_utxos(request(101, 2))
+        .await
+        .err()
+        .wrap_err("unary RPC accepted an oversized first height")?;
+    let streaming = wallet
+        .get_address_utxos_stream(request(101, 2))
+        .await
+        .err()
+        .wrap_err("streaming RPC opened a stream for an oversized first height")?;
+    for status in [unary, streaming] {
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            "height 101 has 3 unspent outputs, exceeding maxEntries"
+        );
+        let details = status.get_error_details();
+        let error_info = details
+            .error_info()
+            .wrap_err("missing UTXO error details")?;
+        assert_eq!(error_info.reason, "MAX_ENTRIES_EXCEEDED_AT_HEIGHT");
+        assert_eq!(error_info.domain, "cash.z.wallet.sdk.rpc");
+        assert_eq!(
+            error_info.metadata.get("height").map(String::as_str),
+            Some("101")
+        );
+        assert_eq!(
+            error_info.metadata.get("count").map(String::as_str),
+            Some("3")
+        );
+    }
+
+    assert_utxo_page(&mut wallet, request(101, 3), &next_height).await?;
+    assert_utxo_page(&mut wallet, request(101, 0), &next_height).await?;
     Ok(())
 }
 

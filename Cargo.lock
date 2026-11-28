@@ -6295,6 +6295,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-reflection",
+ "tonic-types",
  "tonic-web",
  "tower",
  "tower-http",

@@ -33,6 +33,7 @@ pub use grpc::light_wallet::NodeBackedLightWallet;
 pub use grpc::{
     DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS, DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,
     LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,
+    address_utxo_height_limit_exceeded,
 };
 pub use mempool::{
     IngestControlMempoolSurface, MempoolEventEnvelopeStream, MempoolExclusions,

@@ -2049,7 +2049,11 @@ impl ResponseSource for AddressUtxoMerge {
     }
 }
 
-fn address_utxo_height_limit_exceeded(height: u64, count: usize) -> Status {
+/// Builds the wallet RPC error for a first matching height that exceeds `maxEntries`.
+///
+/// The error details include the height and full output count so clients can size a retry.
+#[must_use]
+pub fn address_utxo_height_limit_exceeded(height: u64, count: usize) -> Status {
     let mut details = ErrorDetails::new();
     details.set_error_info(
         "MAX_ENTRIES_EXCEEDED_AT_HEIGHT",
